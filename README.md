@@ -1,14 +1,14 @@
 # cre8-atp-backend
 
 CRE8 ATP 的鏈下後端（第一刀）。Bun + TypeScript + Postgres，直接用 `pg`，**不用 ORM**（與 web app 一致）。
-預設鏈是 BNB Chain mainnet（chain 56）。目前做策略資料層、版本發布與 v1 錢包簽章 auth（共七個路由）。
+預設鏈是 BNB Chain mainnet（chain 56）。目前做策略資料層、版本發布與 SIWE（EIP-4361）錢包簽章 auth（共七個路由）。
 
 ## 架構
 
 ```
 HTTP → src/index.ts（啟動：config → migrate → listen）
          └─ src/server.ts（node:http 路由、JSON、錯誤映射、auth 守門）
-              ├─ src/auth.ts（nonce、EIP-191 驗簽、session token）
+              ├─ src/auth.ts（SIWE nonce、EIP-4361 驗簽、session token）
               └─ src/strategies.ts（領域邏輯 + 純函式校驗）
                    └─ src/db.ts（pg Pool、query、transaction、migrate）
                         └─ Postgres（schema 在 ../db/migrations）
@@ -16,8 +16,8 @@ HTTP → src/index.ts（啟動：config → migrate → listen）
 
 | 檔案 | 職責 |
 | --- | --- |
-| `src/config.ts` | 讀 env；`DATABASE_URL` 必填，`PORT` 預設 8080，`CHAIN_ID` 預設 56。 |
-| `src/auth.ts` | nonce／session 的 in-memory store、`personal_sign` 驗簽（viem `recoverMessageAddress`）、`authenticate()`。 |
+| `src/config.ts` | 讀 env；`DATABASE_URL` 必填，`PORT` 預設 8080，`CHAIN_ID` 預設 56，`AUTH_DOMAIN` 預設 `localhost`。 |
+| `src/auth.ts` | nonce／session 的 in-memory store、EIP-4361（SIWE）驗簽（viem `parseSiweMessage` + `recoverMessageAddress`）、`authenticate()`。 |
 | `src/db.ts` | 單一 `Pool`、`query()`、`withTransaction()`、`migrate()`（checksum + advisory lock）。 |
 | `src/errors.ts` | `AppError`／`ValidationError`／`NotFoundError`，讓領域層不必知道 HTTP。 |
 | `src/strategies.ts` | `listStrategies`、`getStrategy`、`createStrategy`、`publishVersion`，以及 allocation／schedule 校驗。 |
@@ -25,7 +25,7 @@ HTTP → src/index.ts（啟動：config → migrate → listen）
 | `src/index.ts` | 啟動與優雅關閉（SIGINT／SIGTERM）。 |
 | `src/migrate.ts` | `bun run migrate`：只跑 migration，不啟 server。 |
 | `test/strategies.test.ts` | 校驗純函式與 HTTP 路由單測（路由層可注入 `createStrategy`／`publishVersion`，不需 DB）；DB 整合測試以 `DATABASE_URL` 為 gate。 |
-| `test/auth.test.ts` | nonce／login／session 與 provider ownership；用 viem 隨機錢包在測試內簽名，走完整 HTTP 流程。 |
+| `test/auth.test.ts` | SIWE nonce／login／session 與 provider ownership；用 viem `createSiweMessage` + 隨機錢包在測試內簽名，走完整 HTTP 流程。 |
 
 選擇 `node:http` 而不是 express：這一刀只有七個路由，少一層依賴；`server.ts` 的 `route()` 是唯一需要換掉的
 地方，之後要上 express/Fastify 不會動到領域層。
@@ -36,7 +36,9 @@ HTTP → src/index.ts（啟動：config → migrate → listen）
 | --- | --- | --- | --- |
 | `DATABASE_URL` | ✅ | — | Postgres 連線字串；缺少時 `getConfig()` 直接 throw。 |
 | `PORT` | | `8080` | HTTP 埠，1–65535。 |
-| `CHAIN_ID` | | `56` | EIP-155 chain id；56 = BSC mainnet，97 = testnet。 |
+| `CHAIN_ID` | | `56` | EIP-155 chain id；56 = BSC mainnet，97 = testnet。SIWE 訊息必須綁同一個 chain。 |
+| `AUTH_DOMAIN` | | `localhost` | EIP-4361 `domain`：錢包要簽的站台 authority（純 host，可帶 port，不含 scheme／path）。部署時必填自己的網域。 |
+| `AUTH_URI` | | `http://<AUTH_DOMAIN>` | EIP-4361 `uri`：這次登入指涉的資源。必須是 http/https 絕對 URI；部署時建議設 `https://app…`。 |
 | `RPC_URL` | | 空 | JSON-RPC endpoint；目前只用於 `/health` 回報是否設定。 |
 
 複製 `.env.example` 為 `.env` 即可；`.env` 不進版控。**不要**把真的 RPC URL 或連線字串寫進 repo。
@@ -77,43 +79,70 @@ DATABASE_URL='postgres://postgres@127.0.0.1:5432/cre8_atp_test' bun test
 | Method | Path | 說明 | 成功碼 |
 | --- | --- | --- | --- |
 | `GET` | `/health` | Postgres 可連線時 200，否則 503（`db: "down"`） | 200 |
-| `GET` | `/strategies` | 列表；`limit`（1–100，預設 50）、`offset`、`provider`、`public=true\|false` | 200 |
+| `GET` | `/strategies` | 列表；`limit`（1–100，預設 50）、`offset`、`provider`（不分大小寫）、`public=true\|false` | 200 |
 | `GET` | `/strategies/:id` | 單一策略 + 版本歷史（新到舊） | 200 |
-| `POST` | `/auth/nonce` | 取得一次性 nonce（32 bytes hex，TTL 5 分鐘）；不需 body | 200 |
-| `POST` | `/auth/login` | body `{wallet, nonce, signature}`；回 `{token, expiresAt}` | 200 |
+| `POST` | `/auth/nonce` | 取得一次性 nonce 與 SIWE 欄位（`domain`／`chainId`／`uri`／`statement`／`issuedAt`，TTL 5 分鐘）；不需 body | 200 |
+| `POST` | `/auth/login` | body `{message, signature}`（完整 EIP-4361 訊息）；回 `{token, expiresAt}` | 200 |
 | `POST` | `/strategies` | 建立策略 metadata；**需** `Authorization: Bearer <token>` | 201 + `Location` |
 | `POST` | `/strategies/:id/versions` | 發布新版本；**需** token 且必須是該策略的 provider | 201 |
 
-### Auth（v1：錢包簽章 + session token）
+### Auth（SIWE／EIP-4361 + session token）
 
-沒有密碼、沒有第三方服務。流程是「拿 nonce → 錢包簽 → 換 token → 帶 token 打寫入路由」：
+沒有密碼、沒有第三方服務。流程是「拿 SIWE 欄位 → 前端用 viem 組 EIP-4361 訊息 → 錢包簽 → 換 token →
+帶 token 打寫入路由」。訊息綁住 **domain + chainId + nonce + issuedAt**，被釣到別的站台或別的鏈都簽不出可用的
+訊息。
 
-1. `POST /auth/nonce` 取得一次性 nonce（32 bytes hex，TTL 5 分鐘）：
+1. `POST /auth/nonce` 取得一次性 nonce（32 bytes hex，TTL 5 分鐘）與組訊息所需的欄位：
    ```bash
    curl -s -X POST localhost:8080/auth/nonce
-   # {"nonce":"<64 hex>","expiresAt":"..."}
+   # {"nonce":"<64 hex>","domain":"localhost","chainId":56,"uri":"http://localhost",
+   #  "statement":"Sign in to CRE8 ATP","version":"1",
+   #  "issuedAt":"2026-11-06T01:00:00.000Z","expiresAt":"2026-11-06T01:05:00.000Z"}
    ```
-2. 錢包用 EIP-191 `personal_sign` 簽這段**完全相同**的 UTF-8 字串（viem：`account.signMessage({ message })`）：
-   ```
-   Sign in to CRE8 ATP
+   `domain`／`chainId`／`uri`／`statement` 來自伺服器設定（`AUTH_DOMAIN`、`CHAIN_ID`、`AUTH_URI`）；
+   `issuedAt` 是伺服器時間，前端直接拿來用就不會被本機時鐘偏差影響。
+2. 前端用 viem 把這些欄位加上**自己的地址**組成完整 EIP-4361 訊息並簽名
+   （`viem/siwe` 的 `createSiweMessage`，`version: "1"`）：
+   ```ts
+   import { createSiweMessage } from 'viem/siwe';
 
-   Nonce: <nonce>
+   const challenge = await (await fetch('/auth/nonce', { method: 'POST' })).json();
+   const message = createSiweMessage({
+     address: account.address,          // 簽名者自己填
+     chainId: challenge.chainId,
+     domain: challenge.domain,
+     uri: challenge.uri,
+     statement: challenge.statement,
+     version: '1',
+     nonce: challenge.nonce,
+     issuedAt: new Date(challenge.issuedAt),   // 或用 new Date()
+   });
+   const signature = await walletClient.signMessage({ account, message });
    ```
-   （第一行、空行、`Nonce: ` 加一個空格、nonce 值；換行是 `\n\n`。）
-3. `POST /auth/login`，body 是 `{"wallet":"0x…","nonce":"…","signature":"0x…"}`：
+   錢包顯示的是標準 SIWE 版面（`<domain> wants you to sign in with your Ethereum account:` + 地址 +
+   `Sign in to CRE8 ATP` + `URI`／`Version`／`Chain ID`／`Nonce`／`Issued At`）。
+3. `POST /auth/login`，body 只有 `{"message":"<完整 EIP-4361 訊息>","signature":"0x…"}`：
    ```bash
    curl -s -X POST localhost:8080/auth/login -H 'content-type: application/json' -d '{
-     "wallet": "0xYourWallet",
-     "nonce": "<nonce>",
+     "message": "<完整 SIWE 訊息，含換行>",
      "signature": "0x<65-byte signature>"
    }'
    # {"token":"<64 hex>","expiresAt":"..."}
    ```
-   後端用 `recoverMessageAddress({ message, signature })` 解出地址，轉小寫後必須等於 `wallet`，
-   否則 401 `INVALID_SIGNATURE`；nonce 成功後立即刪除（再重用 → 400 `INVALID_NONCE`，過期 → 400 `NONCE_EXPIRED`）。
-   token TTL 24 小時。
+   後端依序檢查（順序刻意如此：先驗信封，再燒 nonce）：
+   - 訊息可解析，且 `version=1`、`statement`、`domain`、`uri`、`chainId` 都等於本伺服器設定，
+     否則 400 `INVALID_SIWE_MESSAGE`（**此時不消耗 nonce**，釣魚訊息燒不掉使用者的 challenge）。
+   - 訊息裡的 nonce 存在（否則 400 `INVALID_NONCE`）且未過 TTL（否則 400 `NONCE_EXPIRED`）。
+   - `issuedAt` 不在未來、不超過 nonce TTL + 2 分鐘時鐘容差，`expirationTime`／`notBefore` 若填了也要成立，
+     否則 400 `SIWE_EXPIRED`／`INVALID_SIWE_MESSAGE`。
+   - `recoverMessageAddress({ message, signature })` 解出的地址必須等於**訊息內**的地址，
+     否則 401 `INVALID_SIGNATURE`。
+   - 通過後立即刪除 nonce（重放 → 400 `INVALID_NONCE`），簽發 TTL 24 小時的 token。
 4. 寫入路由帶 `Authorization: Bearer <token>`；伺服器把 token 換回錢包地址，**provider 一律由 session 推導**，
    body 裡的 `provider` 會被忽略。不是策略 owner 卻發布版本 → 403 `FORBIDDEN`。
+
+驗簽只用 `recoverMessageAddress`（EOA），**不支援 EIP-1271 合約錢包**：那需要 RPC 去問合約。
+要支援就得把 `verifySiweMessage`（viem，帶 `publicClient`）接上 `RPC_URL`，屬於下一刀。
 
 nonce 與 session 目前是**單一 process 的 in-memory Map**：重啟即失效，也只能跑單實例。水平擴展前必須換成
 Redis 或其它共享 store（見 TODO）。
@@ -172,7 +201,8 @@ curl -s -X POST localhost:8080/strategies/1/versions -H "authorization: Bearer $
 `DUPLICATE_ASSET`、`WEIGHT_OUT_OF_RANGE`、`WEIGHT_SUM`、`INVALID_SCHEDULE`、`INVALID_VERSION`、
 `INVALID_STRATEGY`、`INVALID_SWAP_FEE`、`INVALID_ID`、`INVALID_QUERY`、`INVALID_JSON`、`NOT_FOUND`、
 `METHOD_NOT_ALLOWED`、`PAYLOAD_TOO_LARGE`、`DB_UNAVAILABLE`、`INTERNAL`、`UNAUTHORIZED`、
-`FORBIDDEN`、`INVALID_AUTH`、`INVALID_NONCE`、`NONCE_EXPIRED`、`INVALID_SIGNATURE`。
+`FORBIDDEN`、`INVALID_AUTH`、`INVALID_NONCE`、`NONCE_EXPIRED`、`INVALID_SIGNATURE`、
+`INVALID_SIWE_MESSAGE`、`SIWE_EXPIRED`。
 
 ## Migration
 
@@ -182,6 +212,8 @@ curl -s -X POST localhost:8080/strategies/1/versions -H "authorization: Bearer $
   filename + sha256、已套用就跳過、已套用檔案被改動則報錯。
 - `pg_advisory_lock` 避免多個 instance 同時 migrate。
 - 檔案內不要寫 `BEGIN`/`COMMIT`，也不要用 `CREATE INDEX CONCURRENTLY`。細節見 [`../db/README.md`](../db/README.md)。
+- 目前兩個檔案：`0001_init.sql`（初始 schema）、`0002_normalize_provider.sql`（既有 `provider` 轉小寫，
+  並加上 `strategies_provider_lowercase` CHECK，之後插入／更新都只能是小寫）。
 
 ## 設計取捨
 
@@ -195,16 +227,22 @@ curl -s -X POST localhost:8080/strategies/1/versions -H "authorization: Bearer $
   ＋ 應用層校驗兩道把關。
 - **路由依賴注入**：`createServer(deps)` 的 deps 是 `Partial<ServerDeps>`（`createStrategy`、`publishVersion`），
   讓路由層測試（201／401／403／404／405）不需要 DB；正式啟動用預設 deps，跑真正的實作。
-- **auth 用記憶體 store**：nonce／session 都是 process 內的 Map，驗簽用 viem 的 `recoverMessageAddress`，
-  不引入 JWT 或 session 資料表。好處是零額外基礎設施、auth 測試不必連 DB；代價是重啟後 token 全失效、
-  不能水平擴展——單實例 v1 成立，多實例要換共享 store（TODO）。
+- **auth 用記憶體 store ＋ SIWE**：nonce／session 都是 process 內的 Map，訊息是標準 EIP-4361，
+  驗簽用 `parseSiweMessage` ＋ `recoverMessageAddress`，不引入 JWT 或 session 資料表。好處是零額外基礎設施、
+  auth 測試不必連 DB；代價是重啟後 token 全失效、不能水平擴展——單實例 v1 成立，多實例要換共享 store（TODO）。
+- **SIWE 訊息由前端組**：`/auth/nonce` 只回欄位，地址由錢包自己填。若後端代填一個示範地址，前端就得重組
+  訊息，等於多一份可能不同步的字串樣板；而 `createSiweMessage` 本來就是 viem 的公開 API。
+- **不用 `verifySiweMessage`**：它需要 `publicClient`／RPC（合約錢包走 ERC-6492），而這一刀不保證有
+  `RPC_URL`；EOA + `recoverMessageAddress` 對目前的使用者足夠，合約錢包列在 TODO。
+- **provider 一律小寫**：寫入時 `validateCreateStrategyInput` 轉小寫，DB 再加
+  `check (provider = lower(provider))`（0002）當第二道；查詢參數也先轉小寫再精確比對，走得到索引。
 - **provider 由 session 推導**：`createStrategy(body, provider)`、`publishVersion(id, body, provider)` 的
   provider 是參數，不採信 body；`publishVersion` 先讀策略列比對 owner 再寫入，不符回 403。
 
 ## TODO（後續硬化）
 
-1. SIWE（EIP-4361）：目前訊息是自訂的 `Sign in to CRE8 ATP` + nonce；改用 EIP-4361 可帶 domain、uri、
-   chainId、issuedAt、expirationTime，防釣魚與跨站重用。在此之前，錢包顯示的訊息無法自我描述來源。
+1. 合約錢包（EIP-1271／ERC-6492）：現在只認 EOA 的 `recoverMessageAddress`；接 `RPC_URL` 後改用 viem
+   `verifySiweMessage`，讓 smart account 也能登入。
 2. Session／nonce 共享 store：in-memory Map 只支援單實例；多實例前換 Redis（或 Postgres），處理 TTL 與併發。
 3. CORS、rate limit、request id（`correlation_id` 已有欄位）、body size 以外的防護。
 4. `GET /strategies/:id` 要不要把 private 策略也公開？目前是；已有 auth，可據此收斂可見性。

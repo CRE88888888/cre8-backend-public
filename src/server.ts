@@ -149,15 +149,15 @@ async function health(res: ServerResponse): Promise<void> {
   });
 }
 
-/** POST /auth/nonce — mint a single-use nonce. No body: the wallet only signs what it gets back. */
+/** POST /auth/nonce — mint a single-use nonce plus the EIP-4361 fields the wallet must sign. */
 function nonceRoute(res: ServerResponse): void {
   sendJson(res, 200, issueNonce());
 }
 
-/** POST /auth/login — exchange { wallet, nonce, signature } for a bearer session token. */
+/** POST /auth/login — exchange { message, signature } for a bearer session token. */
 async function loginRoute(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const credentials = parseLoginBody(await readJsonBody(req));
-  const session = await login(credentials.wallet, credentials.nonce, credentials.signature);
+  const session = await login(credentials.message, credentials.signature);
   sendJson(res, 200, session);
 }
 

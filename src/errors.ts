@@ -46,6 +46,26 @@ export class NonceExpiredError extends ValidationError {
   }
 }
 
+/**
+ * The EIP-4361 message is unusable: unparseable, or bound to another domain / uri / chain id /
+ * statement than this deployment expects (HTTP 400, INVALID_SIWE_MESSAGE). The nonce is NOT
+ * consumed, so a forged message cannot burn a caller's challenge.
+ */
+export class SiweInvalidMessageError extends ValidationError {
+  constructor(message = 'invalid SIWE message') {
+    super('INVALID_SIWE_MESSAGE', message);
+    this.name = 'SiweInvalidMessageError';
+  }
+}
+
+/** The EIP-4361 message is outside its validity window: issuedAt too old, or expirationTime passed (HTTP 400, SIWE_EXPIRED). */
+export class SiweExpiredError extends ValidationError {
+  constructor(message = 'SIWE message has expired') {
+    super('SIWE_EXPIRED', message);
+    this.name = 'SiweExpiredError';
+  }
+}
+
 /** The caller is not authenticated (HTTP 401, UNAUTHORIZED). */
 export class UnauthorizedError extends AppError {
   constructor(message = 'authentication required') {
@@ -54,7 +74,7 @@ export class UnauthorizedError extends AppError {
   }
 }
 
-/** The EIP-191 signature does not recover to the claimed wallet (HTTP 401, INVALID_SIGNATURE). */
+/** The signature does not recover to the address inside the SIWE message (HTTP 401, INVALID_SIGNATURE). */
 export class InvalidSignatureError extends AppError {
   constructor(message = 'signature does not match the wallet') {
     super(401, 'INVALID_SIGNATURE', message);

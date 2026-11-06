@@ -3,17 +3,21 @@ import { randomUUID } from 'node:crypto';
 import { after, test } from 'node:test';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import type { PrivateKeyAccount } from 'viem/accounts';
+import { createSiweMessage } from 'viem/siwe';
+import type { SiweMessage } from 'viem/siwe';
 import {
   AuthStore,
   NONCE_TTL_MS,
   SESSION_TTL_MS,
+  SIWE_CLOCK_SKEW_MS,
+  SIWE_STATEMENT,
   authenticate,
-  buildLoginMessage,
   issueNonce,
   login,
   parseLoginBody,
 } from '../src/auth.js';
-import type { NonceChallenge, SessionCredentials } from '../src/auth.js';
+import type { SiweChallenge, SessionCredentials } from '../src/auth.js';
+import type { AuthConfig } from '../src/config.js';
 import { closePool, migrate, query } from '../src/db.js';
 import { ForbiddenError, UnauthorizedError, ValidationError } from '../src/errors.js';
 import { createServer } from '../src/server.js';
@@ -38,13 +42,72 @@ const PUBLISH_BODY = {
 /** DB-backed tests only run when DATABASE_URL is present; otherwise they are reported as skipped. */
 const skipDb: boolean | string = process.env.DATABASE_URL ? false : 'DATABASE_URL is not set';
 
+/**
+ * Fixed SIWE bindings for store-level tests, so the assertions do not depend on the shell env
+ * (an AUTH_DOMAIN in .env must not change the expected challenge).
+ */
+const TEST_AUTH: AuthConfig = {
+  authDomain: 'atp.test',
+  authUri: 'https://atp.test/sign-in',
+  chainId: 97,
+};
+
 /** Fresh random wallet per test: no key material is ever written to the repository. */
 function newAccount(): PrivateKeyAccount {
   return privateKeyToAccount(generatePrivateKey());
 }
 
-async function signMessage(account: PrivateKeyAccount, nonce: string): Promise<string> {
-  return account.signMessage({ message: buildLoginMessage(nonce) });
+function newStore(options: { now?: () => number } = {}): AuthStore {
+  return new AuthStore({ ...options, auth: { ...TEST_AUTH } });
+}
+
+type SiweOverrides = Partial<Omit<SiweMessage, 'address'>>;
+
+/**
+ * Build the exact EIP-4361 message a client would sign: every field from the challenge, the
+ * client's own address, and `issuedAt` taken from the server so a skewed local clock is moot.
+ */
+function buildMessage(
+  challenge: SiweChallenge,
+  address: `0x${string}`,
+  overrides: SiweOverrides = {},
+): string {
+  return createSiweMessage({
+    address,
+    chainId: challenge.chainId,
+    domain: challenge.domain,
+    uri: challenge.uri,
+    statement: challenge.statement,
+    version: '1',
+    nonce: challenge.nonce,
+    issuedAt: new Date(challenge.issuedAt),
+    ...overrides,
+  });
+}
+
+async function signChallenge(
+  account: PrivateKeyAccount,
+  challenge: SiweChallenge,
+  overrides: SiweOverrides = {},
+): Promise<{ message: string; signature: string }> {
+  const message = buildMessage(challenge, account.address, overrides);
+  return { message, signature: await account.signMessage({ message }) };
+}
+
+/**
+ * Sign the challenge for `account` and try to redeem it: resolves with the session, or rejects
+ * with the store's AppError. Keeps the negative tests to one line each.
+ */
+function attemptLogin(
+  store: AuthStore,
+  account: PrivateKeyAccount,
+  challenge: SiweChallenge,
+  overrides: SiweOverrides = {},
+): Promise<SessionCredentials> {
+  return (async () => {
+    const { message, signature } = await signChallenge(account, challenge, overrides);
+    return store.login(message, signature);
+  })();
 }
 
 function isAppError(err: unknown, status: number, code: string): boolean {
@@ -59,126 +122,272 @@ function isAppError(err: unknown, status: number, code: string): boolean {
 // Nonce challenge
 // ---------------------------------------------------------------------------
 
-test('issueNonce returns 64 hex chars with a 5 minute TTL, unique per call', () => {
+test('issueNonce returns 64 hex chars with a 5 minute TTL, unique per call, plus the SIWE fields', () => {
+  const store = newStore();
   const before = Date.now();
-  const challenge = issueNonce();
+  const challenge = store.issueNonce();
 
   assert.match(challenge.nonce, /^[0-9a-f]{64}$/);
   const ttl = Date.parse(challenge.expiresAt) - before;
   assert.ok(ttl > NONCE_TTL_MS - 2_000, `TTL too short: ${ttl}`);
   assert.ok(ttl <= NONCE_TTL_MS + 2_000, `TTL too long: ${ttl}`);
-  assert.notEqual(issueNonce().nonce, challenge.nonce);
+
+  // The client rebuilds the message from these fields; they must describe this deployment.
+  assert.equal(challenge.domain, TEST_AUTH.authDomain);
+  assert.equal(challenge.uri, TEST_AUTH.authUri);
+  assert.equal(challenge.chainId, TEST_AUTH.chainId);
+  assert.equal(challenge.statement, SIWE_STATEMENT);
+  assert.equal(challenge.version, '1');
+  assert.ok(!Number.isNaN(Date.parse(challenge.issuedAt)), 'issuedAt must be an ISO-8601 instant');
+
+  assert.notEqual(store.issueNonce().nonce, challenge.nonce);
 });
 
-test('buildLoginMessage is the exact EIP-191 personal_sign payload', () => {
-  assert.equal(buildLoginMessage('abc123'), 'Sign in to CRE8 ATP\n\nNonce: abc123');
+test('the challenge composes into an EIP-4361 message that a wallet can display', () => {
+  const store = newStore();
+  const account = newAccount();
+  const message = buildMessage(store.issueNonce(), account.address);
+
+  assert.equal(
+    message.startsWith(`${TEST_AUTH.authDomain} wants you to sign in with your Ethereum account:\n`),
+    true,
+    `unexpected SIWE prefix: ${message.split('\n')[0]}`,
+  );
+  assert.ok(message.includes(`\n\n${SIWE_STATEMENT}\n\nURI: `), message);
+  assert.ok(message.includes(`\nVersion: 1\nChain ID: ${TEST_AUTH.chainId}\n`), message);
+  assert.ok(message.includes('\nIssued At: '), message);
 });
 
 // ---------------------------------------------------------------------------
 // login / authenticate (store level)
 // ---------------------------------------------------------------------------
 
-test('login recovers the wallet from a personal_sign signature and mints a 24h session', async () => {
-  const store = new AuthStore();
+test('login recovers the wallet from a SIWE signature and mints a 24h session', async () => {
+  const store = newStore();
   const account = newAccount();
-  const { nonce } = store.issueNonce();
+  const challenge = store.issueNonce();
 
-  const session = await store.login(account.address, nonce, await signMessage(account, nonce));
+  const session = await attemptLogin(store, account, challenge);
 
   assert.match(session.token, /^[0-9a-f]{64}$/);
   const ttl = Date.parse(session.expiresAt) - Date.now();
   assert.ok(ttl > SESSION_TTL_MS - 2_000, `TTL too short: ${ttl}`);
   assert.ok(ttl <= SESSION_TTL_MS + 2_000, `TTL too long: ${ttl}`);
 
-  // The trusted identity is the lowercased recovered address, not the casing the client sent.
+  // The trusted identity is the lowercased address from the message.
   assert.equal(store.authenticate(`Bearer ${session.token}`), account.address.toLowerCase());
   assert.equal(store.authenticate(`Bearer   ${session.token}`), account.address.toLowerCase());
 });
 
-test('login accepts any address casing for the wallet', async () => {
-  const store = new AuthStore();
+test('the session wallet is the address from the message, lowercased', async () => {
+  const store = newStore();
   const account = newAccount();
-  const { nonce } = store.issueNonce();
+  const challenge = store.issueNonce();
 
+  // The message carries the wallet; there is no separate `wallet` field to disagree with it.
   const session = await store.login(
-    ` ${account.address.toLowerCase()} `,
-    nonce,
-    await signMessage(account, nonce),
+    buildMessage(challenge, account.address),
+    await account.signMessage({ message: buildMessage(challenge, account.address) }),
   );
 
   assert.equal(store.authenticate(`Bearer ${session.token}`), account.address.toLowerCase());
 });
 
 test('login rejects a signature from another wallet with 401 INVALID_SIGNATURE', async () => {
-  const store = new AuthStore();
+  const store = newStore();
   const alice = newAccount();
   const mallory = newAccount();
-  const { nonce } = store.issueNonce();
+  const challenge = store.issueNonce();
+  const message = buildMessage(challenge, alice.address);
 
   await assert.rejects(
-    store.login(alice.address, nonce, await signMessage(mallory, nonce)),
+    store.login(message, await mallory.signMessage({ message })),
     (err: unknown) => isAppError(err, 401, 'INVALID_SIGNATURE'),
   );
 });
 
 test('login rejects a malformed signature with 401 INVALID_SIGNATURE', async () => {
-  const store = new AuthStore();
+  const store = newStore();
   const account = newAccount();
-  const { nonce } = store.issueNonce();
+  const challenge = store.issueNonce();
 
   await assert.rejects(
-    store.login(account.address, nonce, '0xdeadbeef'),
+    store.login(buildMessage(challenge, account.address), '0xdeadbeef'),
     (err: unknown) => isAppError(err, 401, 'INVALID_SIGNATURE'),
   );
 });
 
-test('login rejects an unknown nonce with 400 INVALID_NONCE', async () => {
-  const store = new AuthStore();
+test('login rejects an unparseable message with 400 INVALID_SIWE_MESSAGE', async () => {
+  const store = newStore();
+
+  for (const message of ['', '   ', 'hello', `${TEST_AUTH.authDomain} wants you to sign in`]) {
+    await assert.rejects(
+      store.login(message, '0xdeadbeef'),
+      (err: unknown) => isAppError(err, 400, 'INVALID_SIWE_MESSAGE'),
+      `expected INVALID_SIWE_MESSAGE for ${JSON.stringify(message)}`,
+    );
+  }
+});
+
+test('login rejects a message bound to another domain with 400 INVALID_SIWE_MESSAGE', async () => {
+  const store = newStore();
   const account = newAccount();
-  const unknownNonce = 'ab'.repeat(32);
+  const challenge = store.issueNonce();
 
   await assert.rejects(
-    store.login(account.address, unknownNonce, await signMessage(account, unknownNonce)),
+    attemptLogin(store, account, challenge, { domain: 'evil.example' }),
+    (err: unknown) => isAppError(err, 400, 'INVALID_SIWE_MESSAGE'),
+  );
+});
+
+test('login rejects a message bound to another uri with 400 INVALID_SIWE_MESSAGE', async () => {
+  const store = newStore();
+  const account = newAccount();
+  const challenge = store.issueNonce();
+
+  await assert.rejects(
+    attemptLogin(store, account, challenge, { uri: 'https://evil.example/sign-in' }),
+    (err: unknown) => isAppError(err, 400, 'INVALID_SIWE_MESSAGE'),
+  );
+});
+
+test('login rejects a message bound to another chainId with 400 INVALID_SIWE_MESSAGE', async () => {
+  const store = newStore();
+  const account = newAccount();
+  const challenge = store.issueNonce();
+
+  await assert.rejects(
+    attemptLogin(store, account, challenge, { chainId: TEST_AUTH.chainId + 1 }),
+    (err: unknown) => isAppError(err, 400, 'INVALID_SIWE_MESSAGE'),
+  );
+});
+
+test('login rejects a message with a different statement with 400 INVALID_SIWE_MESSAGE', async () => {
+  const store = newStore();
+  const account = newAccount();
+  const challenge = store.issueNonce();
+
+  await assert.rejects(
+    attemptLogin(store, account, challenge, { statement: 'Approve unlimited transfer' }),
+    (err: unknown) => isAppError(err, 400, 'INVALID_SIWE_MESSAGE'),
+  );
+});
+
+test('a rejected envelope does not consume the nonce', async () => {
+  const store = newStore();
+  const account = newAccount();
+  const challenge = store.issueNonce();
+
+  await assert.rejects(
+    attemptLogin(store, account, challenge, { domain: 'evil.example' }),
+    (err: unknown) => isAppError(err, 400, 'INVALID_SIWE_MESSAGE'),
+  );
+
+  // The challenge is still redeemable with the correct domain: a phishing attempt cannot burn it.
+  const session = await attemptLogin(store, account, challenge);
+  assert.equal(store.authenticate(`Bearer ${session.token}`), account.address.toLowerCase());
+});
+
+test('login rejects a nonce that was never issued with 400 INVALID_NONCE', async () => {
+  const store = newStore();
+  const account = newAccount();
+  const other = newStore();
+  // A well-formed nonce issued by a different store (or another process): unknown here.
+  const foreign = other.issueNonce();
+
+  await assert.rejects(
+    attemptLogin(store, account, foreign),
     (err: unknown) => isAppError(err, 400, 'INVALID_NONCE'),
   );
 });
 
 test('a nonce is single use: replaying it after login is 400 INVALID_NONCE', async () => {
-  const store = new AuthStore();
+  const store = newStore();
   const account = newAccount();
-  const { nonce } = store.issueNonce();
-  const signature = await signMessage(account, nonce);
+  const challenge = store.issueNonce();
+  const signed = await signChallenge(account, challenge);
 
-  await store.login(account.address, nonce, signature);
+  await store.login(signed.message, signed.signature);
 
   await assert.rejects(
-    store.login(account.address, nonce, signature),
+    store.login(signed.message, signed.signature),
     (err: unknown) => isAppError(err, 400, 'INVALID_NONCE'),
   );
 });
 
 test('an expired nonce is 400 NONCE_EXPIRED', async () => {
   let now = 1_700_000_000_000;
-  const store = new AuthStore({ now: () => now });
+  const store = newStore({ now: () => now });
   const account = newAccount();
-  const { nonce } = store.issueNonce();
-  const signature = await signMessage(account, nonce);
+  const challenge = store.issueNonce();
+  const signed = await signChallenge(account, challenge);
 
   now += NONCE_TTL_MS + 1;
 
   await assert.rejects(
-    store.login(account.address, nonce, signature),
+    store.login(signed.message, signed.signature),
     (err: unknown) => isAppError(err, 400, 'NONCE_EXPIRED'),
+  );
+});
+
+test('a stale issuedAt is 400 SIWE_EXPIRED even when the nonce is still fresh', async () => {
+  const now = 1_700_000_000_000;
+  const store = newStore({ now: () => now });
+  const account = newAccount();
+  const challenge = store.issueNonce();
+
+  const stale = now - NONCE_TTL_MS - SIWE_CLOCK_SKEW_MS - 1;
+  const signed = await signChallenge(account, challenge, { issuedAt: new Date(stale) });
+
+  await assert.rejects(
+    store.login(signed.message, signed.signature),
+    (err: unknown) => isAppError(err, 400, 'SIWE_EXPIRED'),
+  );
+});
+
+test('an issuedAt slightly ahead of the server is tolerated, a far-future one is not', async () => {
+  const now = 1_700_000_000_000;
+  const store = newStore({ now: () => now });
+  const account = newAccount();
+
+  const withinSkew = await signChallenge(account, store.issueNonce(), {
+    issuedAt: new Date(now + SIWE_CLOCK_SKEW_MS - 1_000),
+  });
+  await assert.doesNotReject(store.login(withinSkew.message, withinSkew.signature));
+
+  const farFuture = await signChallenge(account, store.issueNonce(), {
+    issuedAt: new Date(now + SIWE_CLOCK_SKEW_MS + 60_000),
+  });
+  await assert.rejects(
+    store.login(farFuture.message, farFuture.signature),
+    (err: unknown) => isAppError(err, 400, 'INVALID_SIWE_MESSAGE'),
+  );
+});
+
+test('an expirationTime in the past is 400 SIWE_EXPIRED', async () => {
+  const now = 1_700_000_000_000;
+  const store = newStore({ now: () => now });
+  const account = newAccount();
+  const challenge = store.issueNonce();
+
+  const signed = await signChallenge(account, challenge, {
+    issuedAt: new Date(now),
+    expirationTime: new Date(now - 1_000),
+  });
+
+  await assert.rejects(
+    store.login(signed.message, signed.signature),
+    (err: unknown) => isAppError(err, 400, 'SIWE_EXPIRED'),
   );
 });
 
 test('an expired session is 401 UNAUTHORIZED', async () => {
   let now = 1_700_000_000_000;
-  const store = new AuthStore({ now: () => now });
+  const store = newStore({ now: () => now });
   const account = newAccount();
-  const { nonce } = store.issueNonce();
+  const challenge = store.issueNonce();
 
-  const session = await store.login(account.address, nonce, await signMessage(account, nonce));
+  const session = await attemptLogin(store, account, challenge);
 
   now += SESSION_TTL_MS + 1;
 
@@ -189,7 +398,7 @@ test('an expired session is 401 UNAUTHORIZED', async () => {
 });
 
 test('authenticate rejects missing, malformed and unknown bearer tokens with 401 UNAUTHORIZED', () => {
-  const store = new AuthStore();
+  const store = newStore();
 
   for (const header of [null, undefined, '', 'Bearer', 'Bearer ', 'Basic abc', 'deadbeef', 'Bearer deadbeef']) {
     assert.throws(
@@ -202,8 +411,9 @@ test('authenticate rejects missing, malformed and unknown bearer tokens with 401
 
 test('the module-level store shares sessions between issueNonce, login and authenticate', async () => {
   const account = newAccount();
-  const { nonce } = issueNonce();
-  const session = await login(account.address, nonce, await signMessage(account, nonce));
+  const challenge = issueNonce();
+  const signed = await signChallenge(account, challenge);
+  const session = await login(signed.message, signed.signature);
 
   assert.equal(authenticate(`Bearer ${session.token}`), account.address.toLowerCase());
   assert.throws(
@@ -212,13 +422,22 @@ test('the module-level store shares sessions between issueNonce, login and authe
   );
 });
 
-test('parseLoginBody requires string fields and reports 400 INVALID_AUTH', () => {
-  assert.deepEqual(
-    parseLoginBody({ wallet: ' 0xabc ', nonce: 'n', signature: '0xsig' }),
-    { wallet: '0xabc', nonce: 'n', signature: '0xsig' },
-  );
+test('parseLoginBody requires message and signature strings, reporting 400 INVALID_AUTH', () => {
+  assert.deepEqual(parseLoginBody({ message: ' siwe ', signature: '0xsig' }), {
+    message: 'siwe',
+    signature: '0xsig',
+  });
 
-  for (const body of [null, [], 'x', {}, { wallet: '0xabc', nonce: 'n' }, { wallet: 1, nonce: 'n', signature: 's' }]) {
+  for (const body of [
+    null,
+    [],
+    'x',
+    {},
+    { message: 'siwe' },
+    { signature: '0xsig' },
+    { message: 1, signature: '0xsig' },
+    { message: 'siwe', signature: '  ' },
+  ]) {
     assert.throws(
       () => parseLoginBody(body),
       (err: unknown) => err instanceof ValidationError && err.code === 'INVALID_AUTH',
@@ -279,10 +498,10 @@ function postJson(
   });
 }
 
-async function requestNonce(baseUrl: string): Promise<NonceChallenge> {
+async function requestNonce(baseUrl: string): Promise<SiweChallenge> {
   const response = await postJson(baseUrl, '/auth/nonce');
   assert.equal(response.status, 200);
-  return (await response.json()) as NonceChallenge;
+  return (await response.json()) as SiweChallenge;
 }
 
 async function loginOverHttp(
@@ -290,11 +509,8 @@ async function loginOverHttp(
   account: PrivateKeyAccount,
 ): Promise<SessionCredentials> {
   const challenge = await requestNonce(baseUrl);
-  const response = await postJson(baseUrl, '/auth/login', {
-    wallet: account.address,
-    nonce: challenge.nonce,
-    signature: await signMessage(account, challenge.nonce),
-  });
+  const signed = await signChallenge(account, challenge);
+  const response = await postJson(baseUrl, '/auth/login', signed);
   assert.equal(response.status, 200);
   return (await response.json()) as SessionCredentials;
 }
@@ -403,11 +619,11 @@ test('HTTP: login with a bad signature is 401 INVALID_SIGNATURE', async () => {
     const alice = newAccount();
     const mallory = newAccount();
     const challenge = await requestNonce(baseUrl);
+    const message = buildMessage(challenge, alice.address);
 
     const response = await postJson(baseUrl, '/auth/login', {
-      wallet: alice.address,
-      nonce: challenge.nonce,
-      signature: await signMessage(mallory, challenge.nonce),
+      message,
+      signature: await mallory.signMessage({ message }),
     });
 
     assert.equal(response.status, 401);
@@ -416,15 +632,27 @@ test('HTTP: login with a bad signature is 401 INVALID_SIGNATURE', async () => {
   });
 });
 
+test('HTTP: a SIWE message for another domain is 400 INVALID_SIWE_MESSAGE', async () => {
+  await withServer(async (baseUrl) => {
+    const account = newAccount();
+    const challenge = await requestNonce(baseUrl);
+
+    const response = await postJson(
+      baseUrl,
+      '/auth/login',
+      await signChallenge(account, challenge, { domain: 'phishing.example' }),
+    );
+
+    assert.equal(response.status, 400);
+    assert.equal(((await response.json()) as { error: { code: string } }).error.code, 'INVALID_SIWE_MESSAGE');
+  });
+});
+
 test('HTTP: replaying a used nonce is 400 INVALID_NONCE', async () => {
   await withServer(async (baseUrl) => {
     const account = newAccount();
     const challenge = await requestNonce(baseUrl);
-    const body = {
-      wallet: account.address,
-      nonce: challenge.nonce,
-      signature: await signMessage(account, challenge.nonce),
-    };
+    const body = await signChallenge(account, challenge);
 
     const first = await postJson(baseUrl, '/auth/login', body);
     assert.equal(first.status, 200);
@@ -460,15 +688,16 @@ test('HTTP: an authenticated non-owner publishing a version is 403 FORBIDDEN', a
   );
 });
 
-test('HTTP: POST /auth/login requires a JSON object body', async () => {
+test('HTTP: POST /auth/login requires a JSON object body with message and signature', async () => {
   await withServer(async (baseUrl) => {
     const noBody = await postJson(baseUrl, '/auth/login');
     assert.equal(noBody.status, 400);
     assert.equal(((await noBody.json()) as { error: { code: string } }).error.code, 'INVALID_JSON');
 
-    const missing = await postJson(baseUrl, '/auth/login', { wallet: '0xabc' });
-    assert.equal(missing.status, 400);
-    assert.equal(((await missing.json()) as { error: { code: string } }).error.code, 'INVALID_AUTH');
+    // The pre-SIWE body shape is gone: { wallet, nonce, signature } is no longer accepted.
+    const legacy = await postJson(baseUrl, '/auth/login', { wallet: '0xabc', nonce: 'n', signature: '0xsig' });
+    assert.equal(legacy.status, 400);
+    assert.equal(((await legacy.json()) as { error: { code: string } }).error.code, 'INVALID_AUTH');
   });
 });
 

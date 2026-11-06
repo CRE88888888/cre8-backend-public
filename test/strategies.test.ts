@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, test } from 'node:test';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
-import { buildLoginMessage } from '../src/auth.js';
+import { createSiweMessage } from 'viem/siwe';
+import type { SiweChallenge } from '../src/auth.js';
 import { loadConfig } from '../src/config.js';
 import { closePool, migrate, query } from '../src/db.js';
 import { ForbiddenError, NotFoundError, ValidationError } from '../src/errors.js';
@@ -154,6 +155,12 @@ test('validateCreateStrategyInput applies defaults and trims strings', () => {
   });
 });
 
+test('validateCreateStrategyInput lowercases the provider, matching the 0002 check constraint', () => {
+  // EIP-55 casing is cosmetic: one wallet must not become two provider rows.
+  assert.equal(validateCreateStrategyInput({ name: 'Index 500' }, '0xAbCdEf0123').provider, '0xabcdef0123');
+  assert.equal(validateCreateStrategyInput({ name: 'Index 500' }, ' Mixed-Case ').provider, 'mixed-case');
+});
+
 test('validateCreateStrategyInput takes the provider from the session and ignores the body', () => {
   const input = validateCreateStrategyInput(
     { provider: '0xattacker', name: 'Index 500' },
@@ -190,7 +197,32 @@ test('loadConfig requires DATABASE_URL and defaults to chain 56 / port 8080', ()
   const config = loadConfig({ DATABASE_URL: 'postgres://localhost/cre8' });
   assert.equal(config.chainId, 56);
   assert.equal(config.port, 8080);
+  assert.equal(config.authDomain, 'localhost');
+  assert.equal(config.authUri, 'http://localhost');
   assert.equal(config.rpcUrl, null);
+
+  // AUTH_DOMAIN/AUTH_URI only affect the SIWE challenge, never the DATABASE_URL requirement.
+  const siwe = loadConfig({
+    DATABASE_URL: 'postgres://localhost/cre8',
+    AUTH_DOMAIN: 'app.cre8.xyz',
+    AUTH_URI: ' https://app.cre8.xyz/sign-in ',
+  });
+  assert.equal(siwe.authDomain, 'app.cre8.xyz');
+  assert.equal(siwe.authUri, 'https://app.cre8.xyz/sign-in');
+  // AUTH_URI is optional: without it the uri is the domain over http.
+  assert.equal(
+    loadConfig({ DATABASE_URL: 'postgres://localhost/cre8', AUTH_DOMAIN: 'app.cre8.xyz' }).authUri,
+    'http://app.cre8.xyz',
+  );
+
+  assert.throws(
+    () => loadConfig({ DATABASE_URL: 'postgres://localhost/cre8', AUTH_DOMAIN: 'https://app.cre8.xyz' }),
+    /AUTH_DOMAIN/,
+  );
+  assert.throws(
+    () => loadConfig({ DATABASE_URL: 'postgres://localhost/cre8', AUTH_URI: 'not a uri' }),
+    /AUTH_URI/,
+  );
 
   const custom = loadConfig({
     DATABASE_URL: 'postgres://localhost/cre8',
@@ -201,6 +233,8 @@ test('loadConfig requires DATABASE_URL and defaults to chain 56 / port 8080', ()
   assert.deepEqual(custom, {
     databaseUrl: 'postgres://localhost/cre8',
     port: 9090,
+    authDomain: 'localhost',
+    authUri: 'http://localhost',
     chainId: 97,
     rpcUrl: 'https://rpc.example',
   });
@@ -265,13 +299,23 @@ const ROUTE_WALLET = privateKeyToAccount(generatePrivateKey());
 async function loginToken(baseUrl: string): Promise<string> {
   const nonceResponse = await fetch(`${baseUrl}/auth/nonce`, { method: 'POST' });
   assert.equal(nonceResponse.status, 200);
-  const { nonce } = (await nonceResponse.json()) as { nonce: string };
+  const challenge = (await nonceResponse.json()) as SiweChallenge;
 
-  const signature = await ROUTE_WALLET.signMessage({ message: buildLoginMessage(nonce) });
+  // The client composes the EIP-4361 message from the challenge fields and signs that exact text.
+  const message = createSiweMessage({
+    address: ROUTE_WALLET.address,
+    chainId: challenge.chainId,
+    domain: challenge.domain,
+    uri: challenge.uri,
+    statement: challenge.statement,
+    version: '1',
+    nonce: challenge.nonce,
+    issuedAt: new Date(challenge.issuedAt),
+  });
+
   const loginResponse = await postJson(baseUrl, '/auth/login', {
-    wallet: ROUTE_WALLET.address,
-    nonce,
-    signature,
+    message,
+    signature: await ROUTE_WALLET.signMessage({ message }),
   });
   assert.equal(loginResponse.status, 200);
   const { token } = (await loginResponse.json()) as { token: string };
@@ -458,6 +502,11 @@ test('DB: strategy and version round trip', { skip: skipDb }, async () => {
 
     const page = await listStrategies({ provider: 'it-provider', isPublic: false, limit: 100 });
     assert.ok(page.items.some((item) => item.id === strategy.id));
+
+    // The provider filter is case-insensitive: the API lowercases it and matches exactly.
+    const upperCase = await listStrategies({ provider: 'IT-Provider', isPublic: false, limit: 100 });
+    assert.ok(upperCase.items.some((item) => item.id === strategy.id));
+    assert.equal(upperCase.total, page.total);
 
     // Another wallet cannot publish, even with a perfectly valid payload.
     await assert.rejects(

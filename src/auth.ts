@@ -1,9 +1,14 @@
 import { randomBytes } from 'node:crypto';
 import { recoverMessageAddress } from 'viem';
+import { parseSiweMessage } from 'viem/siwe';
+import { getAuthConfig } from './config.js';
+import type { AuthConfig } from './config.js';
 import {
   InvalidNonceError,
   InvalidSignatureError,
   NonceExpiredError,
+  SiweExpiredError,
+  SiweInvalidMessageError,
   UnauthorizedError,
   ValidationError,
 } from './errors.js';
@@ -12,8 +17,15 @@ import {
 export const NONCE_TTL_MS = 5 * 60 * 1_000;
 /** How long a session token stays valid. */
 export const SESSION_TTL_MS = 24 * 60 * 60 * 1_000;
-/** First line of the signed message. The exact text is part of the auth contract: change it and every client breaks. */
-export const LOGIN_MESSAGE_INTRO = 'Sign in to CRE8 ATP';
+/**
+ * Tolerance for a client clock that is ahead of ours. A wallet builds `issuedAt` on the user's
+ * machine, so an exact comparison would reject honest clients with a fast clock.
+ */
+export const SIWE_CLOCK_SKEW_MS = 2 * 60 * 1_000;
+/** EIP-4361 message version. Part of the wire contract: parsers must see `Version: 1`. */
+export const SIWE_VERSION = '1';
+/** EIP-4361 `statement` (the human-readable line the wallet shows). Part of the auth contract. */
+export const SIWE_STATEMENT = 'Sign in to CRE8 ATP';
 
 /** 32 random bytes as hex (64 chars), for both nonces and session tokens. */
 function randomToken(): string {
@@ -21,22 +33,29 @@ function randomToken(): string {
 }
 
 /**
- * The EIP-191 personal_sign message for a nonce challenge. The wallet displays this verbatim:
+ * What POST /auth/nonce hands to the client. The client passes every field back into
+ * `createSiweMessage` from viem (plus its own address and `issuedAt`) and signs the result:
  *
- *   Sign in to CRE8 ATP
+ *   createSiweMessage({ address, chainId, domain, uri, statement, nonce, version, issuedAt })
  *
- *   Nonce: <nonce>
- *
- * `recoverMessageAddress({ message })` re-applies the EIP-191 prefix, so the client must sign this
- * exact UTF-8 string with personal_sign and nothing else.
+ * The signing address is the client's, so the server never guesses it — that keeps one message
+ * shape for EOA and smart-account wallets.
  */
-export function buildLoginMessage(nonce: string): string {
-  return `${LOGIN_MESSAGE_INTRO}\n\nNonce: ${nonce}`;
-}
-
-export type NonceChallenge = {
-  /** 32-byte random hex nonce; single use. */
+export type SiweChallenge = {
+  /** 32-byte random hex nonce; alphanumeric as EIP-4361 requires, single use. */
   nonce: string;
+  /** EIP-4361 `domain`; must come back unchanged. */
+  domain: string;
+  /** EIP-4361 `chain ID`; the wallet must be on this chain. */
+  chainId: number;
+  /** EIP-4361 `uri`; the resource the sign-in is for. */
+  uri: string;
+  /** EIP-4361 `statement`; must come back unchanged. */
+  statement: string;
+  /** EIP-4361 `version`, always "1". */
+  version: typeof SIWE_VERSION;
+  /** Server time at issuance; clients may use it as `issuedAt` so a skewed local clock is moot. */
+  issuedAt: string;
   /** ISO-8601 instant after which the nonce is rejected with NONCE_EXPIRED. */
   expiresAt: string;
 };
@@ -48,23 +67,37 @@ export type SessionCredentials = {
 };
 
 export type LoginCredentials = {
-  /** Wallet address as the client knows it; compared case-insensitively. */
-  wallet: string;
-  nonce: string;
-  /** 65-byte EIP-191 personal_sign signature (0x + 130 hex chars). */
+  /** Complete EIP-4361 message, exactly as signed. */
+  message: string;
+  /** 65-byte signature over the EIP-191 hash of that message. */
   signature: string;
 };
 
 export type AuthStoreOptions = {
   /** Injectable clock (ms since epoch). Tests use it to expire nonces and sessions without waiting. */
   now?: () => number;
+  /** Override the SIWE binding (domain/uri/chainId). Defaults to the process config. */
+  auth?: AuthConfig;
 };
 
 type NonceEntry = { expiresAt: number };
 type SessionEntry = { wallet: string; expiresAt: number };
 
+/** Fields of a parsed EIP-4361 message that survived structural validation. */
+type ParsedSiwe = {
+  address: string;
+  domain: string;
+  uri: string;
+  chainId: number;
+  nonce: string;
+  statement: string;
+  issuedAt: Date;
+  expirationTime?: Date;
+  notBefore?: Date;
+};
+
 /**
- * In-memory nonce and session store.
+ * In-memory nonce and session store, plus EIP-4361 verification.
  *
  * v1 deliberately keeps this in the process: one API instance, no shared state. TODO: a
  * multi-instance deployment must move both maps to Redis (or another shared store) before it
@@ -73,48 +106,91 @@ type SessionEntry = { wallet: string; expiresAt: number };
  */
 export class AuthStore {
   readonly #now: () => number;
+  readonly #auth: AuthConfig;
   readonly #nonces = new Map<string, NonceEntry>();
   readonly #sessions = new Map<string, SessionEntry>();
 
   constructor(options: AuthStoreOptions = {}) {
     this.#now = options.now ?? Date.now;
+    this.#auth = options.auth ?? getAuthConfig();
   }
 
-  /** Mint a fresh single-use nonce valid for NONCE_TTL_MS. */
-  issueNonce(): NonceChallenge {
+  /** The bindings this store accepts, so the HTTP layer and clients describe the same challenge. */
+  get auth(): AuthConfig {
+    return this.#auth;
+  }
+
+  /** Mint a fresh single-use nonce valid for NONCE_TTL_MS, together with its SIWE fields. */
+  issueNonce(): SiweChallenge {
     this.#pruneExpired();
     const nonce = randomToken();
-    const expiresAt = this.#now() + NONCE_TTL_MS;
+    const now = this.#now();
+    const expiresAt = now + NONCE_TTL_MS;
     this.#nonces.set(nonce, { expiresAt });
-    return { nonce, expiresAt: new Date(expiresAt).toISOString() };
+    return {
+      nonce,
+      domain: this.#auth.authDomain,
+      chainId: this.#auth.chainId,
+      uri: this.#auth.authUri,
+      statement: SIWE_STATEMENT,
+      version: SIWE_VERSION,
+      issuedAt: new Date(now).toISOString(),
+      expiresAt: new Date(expiresAt).toISOString(),
+    };
   }
 
   /**
-   * Redeem a nonce for a session token:
-   *   1. the nonce must exist (INVALID_NONCE) and be unexpired (NONCE_EXPIRED),
-   *   2. the signature must recover to the claimed wallet (INVALID_SIGNATURE),
-   *   3. the nonce is then deleted, so it can never mint a second session.
+   * Redeem a signed EIP-4361 message for a session token:
+   *   1. the message must parse and be bound to this deployment (domain/uri/chainId/statement/version),
+   *   2. its nonce must exist (INVALID_NONCE) and be unexpired (NONCE_EXPIRED),
+   *   3. issuedAt/expirationTime must be current (SIWE_EXPIRED),
+   *   4. the signature must recover to the address inside the message (INVALID_SIGNATURE),
+   *   5. the nonce is then deleted, so it can never mint a second session.
    * Sessions live SESSION_TTL_MS; the returned wallet is lowercased and is the only trusted
    * identity for provider-scoped writes.
    */
-  async login(wallet: string, nonce: string, signature: string): Promise<SessionCredentials> {
-    const owner = wallet.trim().toLowerCase();
+  async login(message: string, signature: string): Promise<SessionCredentials> {
+    const parsed = this.#parseMessage(message);
 
-    const challenge = this.#nonces.get(nonce);
+    // Bind the message to this deployment before touching the nonce: a phishing message must not
+    // be able to consume a challenge the user is legitimately trying to redeem.
+    if (parsed.domain.toLowerCase() !== this.#auth.authDomain.toLowerCase()) {
+      throw new SiweInvalidMessageError(
+        `SIWE message domain "${parsed.domain}" does not match this server (${this.#auth.authDomain})`,
+      );
+    }
+    if (parsed.uri !== this.#auth.authUri) {
+      throw new SiweInvalidMessageError(
+        `SIWE message uri "${parsed.uri}" does not match this server (${this.#auth.authUri})`,
+      );
+    }
+    if (parsed.chainId !== this.#auth.chainId) {
+      throw new SiweInvalidMessageError(
+        `SIWE message chainId ${parsed.chainId} does not match this server (${this.#auth.chainId})`,
+      );
+    }
+    if (parsed.statement !== SIWE_STATEMENT) {
+      throw new SiweInvalidMessageError(`SIWE message statement must be "${SIWE_STATEMENT}"`);
+    }
+
+    const challenge = this.#nonces.get(parsed.nonce);
     if (challenge === undefined) {
       throw new InvalidNonceError(
         'nonce is unknown or was already used; request a new one from POST /auth/nonce',
       );
     }
-    if (challenge.expiresAt <= this.#now()) {
-      this.#nonces.delete(nonce);
+    const now = this.#now();
+    if (challenge.expiresAt <= now) {
+      this.#nonces.delete(parsed.nonce);
       throw new NonceExpiredError('nonce has expired; request a new one from POST /auth/nonce');
     }
+
+    this.#assertMessageIsCurrent(parsed, now);
 
     let recovered: string;
     try {
       recovered = await recoverMessageAddress({
-        message: buildLoginMessage(nonce),
+        message,
         signature: signature as `0x${string}`,
       });
     } catch {
@@ -122,15 +198,16 @@ export class AuthStore {
       throw new InvalidSignatureError('signature could not be verified for this wallet');
     }
 
-    if (recovered.toLowerCase() !== owner) {
-      throw new InvalidSignatureError('signature does not match the wallet');
+    if (recovered.toLowerCase() !== parsed.address.toLowerCase()) {
+      throw new InvalidSignatureError('signature does not match the address in the SIWE message');
     }
 
-    this.#nonces.delete(nonce);
+    this.#nonces.delete(parsed.nonce);
 
+    const wallet = parsed.address.toLowerCase();
     const token = randomToken();
-    const expiresAt = this.#now() + SESSION_TTL_MS;
-    this.#sessions.set(token, { wallet: owner, expiresAt });
+    const expiresAt = now + SESSION_TTL_MS;
+    this.#sessions.set(token, { wallet, expiresAt });
     return { token, expiresAt: new Date(expiresAt).toISOString() };
   }
 
@@ -161,7 +238,101 @@ export class AuthStore {
       if (entry.expiresAt <= now) this.#sessions.delete(token);
     }
   }
+
+  /**
+   * Structural parse of an EIP-4361 message. `parseSiweMessage` returns a partial object, so every
+   * field the auth contract depends on is checked for presence and shape here.
+   */
+  #parseMessage(message: string): ParsedSiwe {
+    if (typeof message !== 'string' || message.trim() === '') {
+      throw new SiweInvalidMessageError('message is required and must be a non-empty string');
+    }
+
+    const parsed = parseSiweMessage(message);
+
+    if (typeof parsed.version !== 'string' || parsed.version !== SIWE_VERSION) {
+      throw new SiweInvalidMessageError(`SIWE message version must be "${SIWE_VERSION}"`);
+    }
+    if (typeof parsed.address !== 'string' || !ADDRESS_PATTERN.test(parsed.address)) {
+      throw new SiweInvalidMessageError('SIWE message must carry a 0x-prefixed 20-byte address');
+    }
+    if (typeof parsed.domain !== 'string' || parsed.domain === '') {
+      throw new SiweInvalidMessageError('SIWE message is missing its domain');
+    }
+    if (typeof parsed.uri !== 'string' || parsed.uri === '') {
+      throw new SiweInvalidMessageError('SIWE message is missing its uri');
+    }
+    if (
+      typeof parsed.chainId !== 'number' ||
+      !Number.isSafeInteger(parsed.chainId) ||
+      parsed.chainId < 1
+    ) {
+      throw new SiweInvalidMessageError('SIWE message is missing a valid Chain ID');
+    }
+    if (typeof parsed.nonce !== 'string' || !NONCE_PATTERN.test(parsed.nonce)) {
+      throw new SiweInvalidMessageError('SIWE message is missing a valid nonce');
+    }
+    if (typeof parsed.statement !== 'string') {
+      throw new SiweInvalidMessageError('SIWE message is missing its statement');
+    }
+    if (!(parsed.issuedAt instanceof Date) || Number.isNaN(parsed.issuedAt.getTime())) {
+      throw new SiweInvalidMessageError('SIWE message is missing a valid Issued At');
+    }
+
+    return {
+      address: parsed.address,
+      domain: parsed.domain,
+      uri: parsed.uri,
+      chainId: parsed.chainId,
+      nonce: parsed.nonce,
+      statement: parsed.statement,
+      issuedAt: parsed.issuedAt,
+      ...(parsed.expirationTime === undefined ? {} : { expirationTime: parsed.expirationTime }),
+      ...(parsed.notBefore === undefined ? {} : { notBefore: parsed.notBefore }),
+    };
+  }
+
+  /**
+   * `issuedAt` bounds the age of the message (a stolen message cannot outlive a nonce window) and
+   * `expirationTime`/`notBefore` are honoured when the client sets them. The clock-skew allowance
+   * only ever widens the window by SIWE_CLOCK_SKEW_MS.
+   */
+  #assertMessageIsCurrent(parsed: ParsedSiwe, now: number): void {
+    const issuedAtMs = parsed.issuedAt.getTime();
+    if (issuedAtMs > now + SIWE_CLOCK_SKEW_MS) {
+      throw new SiweInvalidMessageError('SIWE message Issued At is in the future');
+    }
+    if (now - issuedAtMs > NONCE_TTL_MS + SIWE_CLOCK_SKEW_MS) {
+      throw new SiweExpiredError(
+        `SIWE message Issued At is older than ${NONCE_TTL_MS} ms; sign a fresh challenge`,
+      );
+    }
+
+    if (parsed.expirationTime !== undefined) {
+      const expiresAtMs = parsed.expirationTime.getTime();
+      if (Number.isNaN(expiresAtMs)) {
+        throw new SiweInvalidMessageError('SIWE message has an invalid Expiration Time');
+      }
+      if (expiresAtMs <= now) {
+        throw new SiweExpiredError('SIWE message has passed its Expiration Time');
+      }
+    }
+
+    if (parsed.notBefore !== undefined) {
+      const notBeforeMs = parsed.notBefore.getTime();
+      if (Number.isNaN(notBeforeMs)) {
+        throw new SiweInvalidMessageError('SIWE message has an invalid Not Before');
+      }
+      if (notBeforeMs > now + SIWE_CLOCK_SKEW_MS) {
+        throw new SiweInvalidMessageError('SIWE message is not valid yet (Not Before)');
+      }
+    }
+  }
 }
+
+const ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
+/** EIP-4361 nonce: alphanumeric, at least 8 characters. Our nonces are 64 hex chars. */
+const NONCE_PATTERN = /^[a-zA-Z0-9]{8,}$/;
 
 /** Validate the POST /auth/login body before any crypto runs, so shape errors are 400 and not 401. */
 export function parseLoginBody(body: unknown): LoginCredentials {
@@ -171,8 +342,7 @@ export function parseLoginBody(body: unknown): LoginCredentials {
 
   const record = body as Record<string, unknown>;
   return {
-    wallet: requireField(record.wallet, 'wallet'),
-    nonce: requireField(record.nonce, 'nonce'),
+    message: requireField(record.message, 'message'),
     signature: requireField(record.signature, 'signature'),
   };
 }
@@ -198,19 +368,26 @@ function unauthorized(message: string): UnauthorizedError {
 }
 
 /**
- * Process-wide store used by the HTTP layer. Tests that need to expire nonces or sessions build
- * their own `new AuthStore({ now })`; route tests go through this singleton.
+ * Process-wide store used by the HTTP layer. Created lazily so importing this module never forces
+ * config resolution (tests that never call an auth function stay side-effect free). Tests that need
+ * to expire nonces or sessions build their own `new AuthStore({ now })`; route tests go through
+ * this singleton.
  */
-const defaultStore = new AuthStore();
+let defaultStore: AuthStore | null = null;
 
-export function issueNonce(): NonceChallenge {
-  return defaultStore.issueNonce();
+function store(): AuthStore {
+  defaultStore ??= new AuthStore();
+  return defaultStore;
 }
 
-export function login(wallet: string, nonce: string, signature: string): Promise<SessionCredentials> {
-  return defaultStore.login(wallet, nonce, signature);
+export function issueNonce(): SiweChallenge {
+  return store().issueNonce();
+}
+
+export function login(message: string, signature: string): Promise<SessionCredentials> {
+  return store().login(message, signature);
 }
 
 export function authenticate(authHeader: string | null | undefined): string {
-  return defaultStore.authenticate(authHeader);
+  return store().authenticate(authHeader);
 }

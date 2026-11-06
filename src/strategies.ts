@@ -243,6 +243,8 @@ export function validateSchedule(input: unknown): RebalanceSchedule {
  *
  * `provider` comes from the authenticated session, never from the body: any `provider` field in
  * the payload is ignored, so a client cannot create a strategy under another wallet's address.
+ * It is lowercased here — migration 0002 makes lowercase the only storable form
+ * (`check (provider = lower(provider))`), so this is the single normalisation point for writes.
  */
 export function validateCreateStrategyInput(
   input: unknown,
@@ -252,7 +254,7 @@ export function validateCreateStrategyInput(
     throw new ValidationError('INVALID_STRATEGY', 'request body must be a JSON object');
   }
 
-  const owner = requireString(provider, 'provider', MAX_PROVIDER_LENGTH);
+  const owner = requireString(provider, 'provider', MAX_PROVIDER_LENGTH).toLowerCase();
   const name = requireString(input.name, 'name', MAX_NAME_LENGTH);
 
   let description = '';
@@ -329,7 +331,12 @@ export async function createStrategy(rawInput: unknown, provider: string): Promi
   return mapStrategy(row);
 }
 
-/** Paginated list. `total` is the row count matching the filter, not the page size. */
+/**
+ * Paginated list. `total` is the row count matching the filter, not the page size.
+ *
+ * The `provider` filter is case-insensitive: the parameter is lowercased and matched exactly,
+ * which stays index-friendly and agrees with the lowercase-only storage enforced by migration 0002.
+ */
 export async function listStrategies(params: ListStrategiesParams = {}): Promise<StrategyPage> {
   const limit = params.limit ?? 50;
   const offset = params.offset ?? 0;
@@ -341,6 +348,8 @@ export async function listStrategies(params: ListStrategiesParams = {}): Promise
     throw new ValidationError('INVALID_PAGINATION', 'offset must be an integer >= 0');
   }
 
+  const provider = params.provider === undefined ? null : params.provider.trim().toLowerCase();
+
   const { rows } = await query<StrategyRow>(
     `select ${STRATEGY_COLUMNS}, count(*) over() as total_count
        from strategies
@@ -348,7 +357,7 @@ export async function listStrategies(params: ListStrategiesParams = {}): Promise
         and ($2::boolean is null or is_public = $2)
       order by created_at desc, id desc
       limit $3 offset $4`,
-    [params.provider ?? null, params.isPublic ?? null, limit, offset],
+    [provider, params.isPublic ?? null, limit, offset],
   );
 
   const first = rows[0];

@@ -1,7 +1,7 @@
 # cre8-atp-backend
 
 CRE8 ATP 的鏈下後端（第一刀）。Bun + TypeScript + Postgres，直接用 `pg`，**不用 ORM**（與 web app 一致）。
-預設鏈是 BNB Chain mainnet（chain 56）。目前只做策略資料層與四個唯讀／建立路由，**尚無 auth**。
+預設鏈是 BNB Chain mainnet（chain 56）。目前只做策略資料層與五個路由（含版本發布），**尚無 auth**。
 
 ## 架構
 
@@ -22,9 +22,9 @@ HTTP → src/index.ts（啟動：config → migrate → listen）
 | `src/server.ts` | 路由、body 解析（上限 1 MB）、錯誤 → JSON、access log。 |
 | `src/index.ts` | 啟動與優雅關閉（SIGINT／SIGTERM）。 |
 | `src/migrate.ts` | `bun run migrate`：只跑 migration，不啟 server。 |
-| `test/strategies.test.ts` | 校驗純函式單測；DB 整合測試以 `DATABASE_URL` 為 gate。 |
+| `test/strategies.test.ts` | 校驗純函式與 HTTP 路由單測（路由層可注入 `publishVersion`，不需 DB）；DB 整合測試以 `DATABASE_URL` 為 gate。 |
 
-選擇 `node:http` 而不是 express：這一刀只有四個路由，少一層依賴；`server.ts` 的 `route()` 是唯一需要換掉的
+選擇 `node:http` 而不是 express：這一刀只有五個路由，少一層依賴；`server.ts` 的 `route()` 是唯一需要換掉的
 地方，之後要上 express/Fastify 不會動到領域層。
 
 ## 環境變數
@@ -77,6 +77,7 @@ DATABASE_URL='postgres://postgres@127.0.0.1:5432/cre8_atp_test' bun test
 | `GET` | `/strategies` | 列表；`limit`（1–100，預設 50）、`offset`、`provider`、`public=true\|false` | 200 |
 | `GET` | `/strategies/:id` | 單一策略 + 版本歷史（新到舊） | 200 |
 | `POST` | `/strategies` | 建立策略 metadata | 201 + `Location` |
+| `POST` | `/strategies/:id/versions` | 發布新版本；回傳建立的版本紀錄 | 201 |
 
 ```bash
 curl -s localhost:8080/health
@@ -90,7 +91,21 @@ curl -s -X POST localhost:8080/strategies -H 'content-type: application/json' -d
   "swapFeeBps": 25
 }'
 # {"id":1,...,"swapFeeBps":25,"createdAt":"..."}
+
+curl -s -X POST localhost:8080/strategies/1/versions -H 'content-type: application/json' -d '{
+  "allocation": {"assets": [
+    {"address": "0x00000000000000000000000000000000000000a1", "symbol": "AAPLB", "weightBps": 6000},
+    {"address": "0x00000000000000000000000000000000000000b2", "weightBps": 4000}
+  ]},
+  "schedule": {"kind": "interval", "intervalSeconds": 86400},
+  "changeLog": "initial weights"
+}'
+# {"strategyId":1,"version":1,"allocation":{...},"schedule":{...},"changeLog":"initial weights","activeAt":"...","createdAt":"..."}
 ```
+
+`POST /strategies/:id/versions` 回傳的是**建立的版本紀錄本身**（`strategyId`、`version`、`allocation`、
+`schedule`、`changeLog`、`activeAt`、`createdAt`），不是 strategy detail。版本號由後端配置
+（`max(version)+1`，併發時靠唯一鍵重試），策略不存在回 404、allocation／schedule 校驗失敗回 400。
 
 列表回傳 `{ items, total, limit, offset }`；`total` 是符合條件的總筆數，不是本頁筆數。
 
@@ -103,8 +118,9 @@ curl -s -X POST localhost:8080/strategies -H 'content-type: application/json' -d
 - `isPublic` 必須是 boolean，預設 `true`。
 - `swapFeeBps` 必須是 0–300 的整數（3% 上限，對齊 `MAX_SWAP_FEE_BPS`），預設 0。
 
-`publishVersion()`（目前只有函式與測試，尚無 HTTP 路由）：
+`POST /strategies/:id/versions`（`publishVersion()`）：
 
+- 請求 body 必須是物件；`allocation`、`schedule` 必填，`changeLog`、`activeAt` 選填。
 - `allocation` 必須是 `{"assets":[{"address":"0x…","symbol"?:"  ≤32 字","weightBps":2500}]}`。
 - 1–16 個資產（`MAX_VERSION_ASSETS`）；address 必須是 0x + 40 hex，入庫前轉小寫。
 - 同一版本內資產不可重複（address 不分大小寫）。
@@ -113,8 +129,8 @@ curl -s -X POST localhost:8080/strategies -H 'content-type: application/json' -d
 - `changeLog` 選填，≤ 2000 字；`activeAt` 選填，預設 `now()`。
 
 錯誤碼：`INVALID_ALLOCATION`、`ALLOCATION_EMPTY`、`TOO_MANY_ASSETS`、`INVALID_ASSET`、
-`DUPLICATE_ASSET`、`WEIGHT_OUT_OF_RANGE`、`WEIGHT_SUM`、`INVALID_SCHEDULE`、`INVALID_STRATEGY`、
-`INVALID_SWAP_FEE`、`INVALID_ID`、`INVALID_QUERY`、`INVALID_JSON`、`NOT_FOUND`、
+`DUPLICATE_ASSET`、`WEIGHT_OUT_OF_RANGE`、`WEIGHT_SUM`、`INVALID_SCHEDULE`、`INVALID_VERSION`、
+`INVALID_STRATEGY`、`INVALID_SWAP_FEE`、`INVALID_ID`、`INVALID_QUERY`、`INVALID_JSON`、`NOT_FOUND`、
 `METHOD_NOT_ALLOWED`、`PAYLOAD_TOO_LARGE`、`DB_UNAVAILABLE`、`INTERNAL`。
 
 ## Migration
@@ -136,15 +152,16 @@ curl -s -X POST localhost:8080/strategies -H 'content-type: application/json' -d
   不需要額外鎖。
 - **jsonb 不另開表**：allocation／schedule 是「版本的一份快照」，用 jsonb 保留原樣；形狀由 DB CHECK
   ＋ 應用層校驗兩道把關。
+- **路由依賴注入**：`createServer(deps)` 只注入 `publishVersion`，讓路由層測試（201／404／405）不需要 DB；
+  正式啟動用預設 deps，跑真正的 `publishVersion`。
 - **無 auth**：`provider`、`user_id` 目前是宣稱值；API 對外開放前必須補錢包簽章／session。
 
 ## TODO（下一刀）
 
-1. **`POST /strategies/:id/versions`**：`publishVersion()` 已完成並有測試，但尚未接路由。
-2. Auth：provider 只能發布／修改自己的策略；`user_id` 由 session 推導，不由 body 傳入。
-3. CORS、rate limit、request id（`correlation_id` 已有欄位）、body size 以外的防護。
-4. `GET /strategies/:id` 要不要把 private 策略也公開？目前是；需要 auth 後再收斂可見性。
-5. operations／positions／performance 的讀寫 API（schema 已就緒，尚無程式）。
-6. 錯誤回應加上 `details`（哪個 asset 出錯），方便 web app 顯示。
-7. 用 OpenAPI 描述 API；現在 README 是唯一契約。
-8. `portfolios.version` 的複合 FK（見 `db/README.md` 的已知缺口）。
+1. Auth：provider 只能發布／修改自己的策略；`user_id` 由 session 推導，不由 body 傳入。
+2. CORS、rate limit、request id（`correlation_id` 已有欄位）、body size 以外的防護。
+3. `GET /strategies/:id` 要不要把 private 策略也公開？目前是；需要 auth 後再收斂可見性。
+4. operations／positions／performance 的讀寫 API（schema 已就緒，尚無程式）。
+5. 錯誤回應加上 `details`（哪個 asset 出錯），方便 web app 顯示。
+6. 用 OpenAPI 描述 API；現在 README 是唯一契約。
+7. `portfolios.version` 的複合 FK（見 `db/README.md` 的已知缺口）。

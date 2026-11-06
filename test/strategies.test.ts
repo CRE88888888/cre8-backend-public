@@ -4,6 +4,8 @@ import { after, test } from 'node:test';
 import { loadConfig } from '../src/config.js';
 import { closePool, migrate, query } from '../src/db.js';
 import { NotFoundError, ValidationError } from '../src/errors.js';
+import { createServer } from '../src/server.js';
+import type { ServerDeps } from '../src/server.js';
 import {
   createStrategy,
   getStrategy,
@@ -13,6 +15,7 @@ import {
   validateCreateStrategyInput,
   validateSchedule,
 } from '../src/strategies.js';
+import type { PublishVersionInput, StrategyVersion } from '../src/strategies.js';
 
 const ASSET_A = '0x00000000000000000000000000000000000000a1';
 const ASSET_B = '0x00000000000000000000000000000000000000b2';
@@ -193,6 +196,152 @@ test('loadConfig requires DATABASE_URL and defaults to chain 56 / port 8080', ()
 });
 
 // ---------------------------------------------------------------------------
+// HTTP routes (no DB: DB-backed paths inject publishVersion; validation runs first)
+// ---------------------------------------------------------------------------
+
+const PUBLISH_BODY = {
+  allocation: {
+    assets: [
+      { address: ASSET_A, symbol: 'AAPLB', weightBps: 6000 },
+      { address: ASSET_B, weightBps: 4000 },
+    ],
+  },
+  schedule: { kind: 'interval', intervalSeconds: 86_400 },
+  changeLog: 'rebalance',
+};
+
+/** Bind a throwaway server on port 0, hand its base URL to `run`, then close it. */
+async function withServer<T>(run: (baseUrl: string) => Promise<T>, deps?: ServerDeps): Promise<T> {
+  const server = createServer(deps);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+
+  const address = server.address();
+  if (address === null || typeof address === 'string') {
+    throw new Error('test server did not bind to a TCP port');
+  }
+
+  try {
+    return await run(`http://127.0.0.1:${address.port}`);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
+function postJson(baseUrl: string, path: string, body: unknown): Promise<Response> {
+  return fetch(`${baseUrl}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+test('POST /strategies/:id/versions returns 201 with the created version record', async () => {
+  const published: StrategyVersion = {
+    strategyId: 1,
+    version: 7,
+    allocation: { assets: [{ address: ASSET_A, weightBps: 10_000 }] },
+    schedule: { kind: 'cron', cron: '0 0 * * *' },
+    changeLog: 'rebalance',
+    activeAt: '2026-01-01T00:00:00.000Z',
+    createdAt: '2026-01-01T00:00:00.000Z',
+  };
+  const calls: Array<{ id: number; input: PublishVersionInput }> = [];
+
+  await withServer(
+    async (baseUrl) => {
+      const response = await postJson(baseUrl, '/strategies/1/versions', PUBLISH_BODY);
+
+      assert.equal(response.status, 201);
+      assert.match(response.headers.get('content-type') ?? '', /^application\/json/);
+      assert.deepEqual(await response.json(), published);
+      // The route hands the parsed body to publishVersion untouched (id from the path).
+      assert.deepEqual(calls, [{ id: 1, input: PUBLISH_BODY }]);
+    },
+    {
+      publishVersion: async (strategyId, input) => {
+        calls.push({ id: strategyId, input });
+        return published;
+      },
+    },
+  );
+});
+
+test('POST /strategies/:id/versions returns 404 when publishVersion reports the strategy missing', async () => {
+  await withServer(
+    async (baseUrl) => {
+      const response = await postJson(baseUrl, '/strategies/999/versions', PUBLISH_BODY);
+
+      assert.equal(response.status, 404);
+      assert.deepEqual(await response.json(), {
+        error: { code: 'NOT_FOUND', message: 'strategy 999 not found' },
+      });
+    },
+    {
+      publishVersion: async () => {
+        throw new NotFoundError('strategy 999 not found');
+      },
+    },
+  );
+});
+
+test('POST /strategies/:id/versions is 400 for bad allocations without touching the DB', async () => {
+  // Default deps: the real publishVersion validates before it queries, so no DATABASE_URL is needed.
+  await withServer(async (baseUrl) => {
+    const cases: Array<{ body: unknown; code: string }> = [
+      {
+        body: { ...PUBLISH_BODY, allocation: { assets: [{ address: ASSET_A, weightBps: 9999 }] } },
+        code: 'WEIGHT_SUM',
+      },
+      {
+        body: {
+          ...PUBLISH_BODY,
+          allocation: {
+            assets: [
+              { address: ASSET_A, weightBps: 5000 },
+              { address: ASSET_A, weightBps: 5000 },
+            ],
+          },
+        },
+        code: 'DUPLICATE_ASSET',
+      },
+      {
+        body: { ...PUBLISH_BODY, allocation: 'not-an-object' },
+        code: 'INVALID_ALLOCATION',
+      },
+    ];
+
+    for (const testCase of cases) {
+      const response = await postJson(baseUrl, '/strategies/1/versions', testCase.body);
+      assert.equal(response.status, 400);
+      const payload = (await response.json()) as { error: { code: string } };
+      assert.equal(payload.error.code, testCase.code);
+    }
+  });
+});
+
+test('POST /strategies/:id/versions is 400 for a non-object JSON body', async () => {
+  await withServer(async (baseUrl) => {
+    const response = await postJson(baseUrl, '/strategies/1/versions', null);
+
+    assert.equal(response.status, 400);
+    const payload = (await response.json()) as { error: { code: string } };
+    assert.equal(payload.error.code, 'INVALID_VERSION');
+  });
+});
+
+test('GET /strategies/:id/versions is 405 with Allow: POST', async () => {
+  await withServer(async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/strategies/1/versions`);
+
+    assert.equal(response.status, 405);
+    assert.equal(response.headers.get('allow'), 'POST');
+    const payload = (await response.json()) as { error: { code: string } };
+    assert.equal(payload.error.code, 'METHOD_NOT_ALLOWED');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // DB integration (gated on DATABASE_URL)
 // ---------------------------------------------------------------------------
 
@@ -266,6 +415,52 @@ test('DB: strategy and version round trip', { skip: skipDb }, async () => {
       }),
       (err: unknown) => err instanceof NotFoundError,
     );
+  } finally {
+    await query('delete from strategies where id = $1', [strategy.id]);
+  }
+});
+
+test('DB: POST /strategies/:id/versions publishes a version over HTTP', { skip: skipDb }, async () => {
+  await migrate();
+  const strategy = await createStrategy({
+    provider: 'it-http',
+    name: `it-http-${randomUUID()}`,
+    isPublic: false,
+  });
+
+  try {
+    await withServer(async (baseUrl) => {
+      const created = await postJson(baseUrl, `/strategies/${strategy.id}/versions`, PUBLISH_BODY);
+      assert.equal(created.status, 201);
+
+      const version = (await created.json()) as StrategyVersion;
+      assert.equal(version.strategyId, strategy.id);
+      assert.equal(version.version, 1);
+      assert.equal(version.changeLog, 'rebalance');
+      assert.deepEqual(
+        version.allocation.assets.map((asset) => [asset.address, asset.weightBps]),
+        [
+          [ASSET_A, 6000],
+          [ASSET_B, 4000],
+        ],
+      );
+
+      // The version is visible through the strategy detail route as well.
+      const detail = await fetch(`${baseUrl}/strategies/${strategy.id}`);
+      assert.equal(detail.status, 200);
+      const payload = (await detail.json()) as { versions: Array<{ version: number }> };
+      assert.deepEqual(payload.versions.map((entry) => entry.version), [1]);
+
+      // A missing strategy surfaces as 404 through the domain error, not a 500.
+      const missing = await postJson(
+        baseUrl,
+        `/strategies/${strategy.id + 1_000_000}/versions`,
+        PUBLISH_BODY,
+      );
+      assert.equal(missing.status, 404);
+      const missingPayload = (await missing.json()) as { error: { code: string } };
+      assert.equal(missingPayload.error.code, 'NOT_FOUND');
+    });
   } finally {
     await query('delete from strategies where id = $1', [strategy.id]);
   }

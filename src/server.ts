@@ -3,7 +3,8 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { getConfig } from './config.js';
 import { query } from './db.js';
 import { AppError, ValidationError } from './errors.js';
-import { createStrategy, getStrategy, listStrategies } from './strategies.js';
+import { createStrategy, getStrategy, listStrategies, publishVersion } from './strategies.js';
+import type { PublishVersionInput } from './strategies.js';
 
 /** Hard cap on request bodies: strategy payloads are small; anything bigger is a mistake or an attack. */
 const MAX_BODY_BYTES = 1_000_000;
@@ -24,13 +25,27 @@ const DB_DOWN_CODES = new Set([
   '57P03',
 ]);
 
-export function createServer(): Server {
+/**
+ * Dependencies the routes need. Injectable so route tests can run without a database;
+ * production calls `createServer()` and gets the real `publishVersion`.
+ */
+export type ServerDeps = {
+  publishVersion: typeof publishVersion;
+};
+
+const defaultDeps: ServerDeps = { publishVersion };
+
+export function createServer(deps: ServerDeps = defaultDeps): Server {
   return createHttpServer((req, res) => {
-    void handleRequest(req, res);
+    void handleRequest(req, res, deps);
   });
 }
 
-async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: ServerDeps,
+): Promise<void> {
   const startedAt = Date.now();
   const method = req.method ?? 'GET';
   let path = req.url ?? '/';
@@ -52,13 +67,18 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   try {
     const url = new URL(req.url ?? '/', 'http://localhost');
     path = url.pathname;
-    await route(req, res, url);
+    await route(req, res, url, deps);
   } catch (err) {
     sendError(res, err);
   }
 }
 
-async function route(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+async function route(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  deps: ServerDeps,
+): Promise<void> {
   const method = req.method ?? 'GET';
   const segments = url.pathname.split('/').filter((segment) => segment.length > 0);
   const [root] = segments;
@@ -77,6 +97,15 @@ async function route(req: IncomingMessage, res: ServerResponse, url: URL): Promi
     if (segments.length === 2) {
       if (method !== 'GET') return methodNotAllowed(res, ['GET']);
       return detailRoute(res, parsePositiveInteger(segments[1] ?? '', 'strategy id'));
+    }
+    if (segments.length === 3 && segments[2] === 'versions') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      return publishVersionRoute(
+        req,
+        res,
+        parsePositiveInteger(segments[1] ?? '', 'strategy id'),
+        deps,
+      );
     }
   }
 
@@ -127,6 +156,22 @@ async function createRoute(req: IncomingMessage, res: ServerResponse): Promise<v
   const body = await readJsonBody(req);
   const strategy = await createStrategy(body);
   sendJson(res, 201, strategy, { location: `/strategies/${strategy.id}` });
+}
+
+/** POST /strategies/:id/versions — append a version; the created version record is the response. */
+async function publishVersionRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  id: number,
+  deps: ServerDeps,
+): Promise<void> {
+  const body = await readJsonBody(req);
+  // publishVersion expects an object; without this guard a JSON `null` body would be a 500.
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    throw new ValidationError('INVALID_VERSION', 'request body must be a JSON object');
+  }
+  const version = await deps.publishVersion(id, body as PublishVersionInput);
+  sendJson(res, 201, version);
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {

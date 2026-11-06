@@ -19,8 +19,12 @@ export type Config = AuthConfig & {
   databaseUrl: string;
   /** HTTP port, 1-65535. Default 8080. */
   port: number;
-  /** Optional JSON-RPC endpoint; null when unset. */
+  /** Optional JSON-RPC endpoint; null when unset (chain features disabled). */
   rpcUrl: string | null;
+  /** Relayer/operator private key that signs on-chain transactions; null = chain disabled. */
+  operatorPrivateKey: string | null;
+  /** On-chain AtpRegistry address; null = chain disabled. */
+  registryAddress: string | null;
 };
 
 export const DEFAULT_PORT = 8080;
@@ -42,8 +46,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 
   const port = parseInteger(env, 'PORT', DEFAULT_PORT, { min: 1, max: 65_535 });
   const rpcUrl = env.RPC_URL?.trim() ? env.RPC_URL.trim() : null;
+  const operatorPrivateKey = env.OPERATOR_PRIVATE_KEY?.trim() ? env.OPERATOR_PRIVATE_KEY.trim() : null;
+  const registryAddress = parseOptionalAddress(env, 'REGISTRY_ADDRESS');
 
-  return { databaseUrl, port, ...loadAuthConfig(env), rpcUrl };
+  return {
+    databaseUrl,
+    port,
+    ...loadAuthConfig(env),
+    rpcUrl,
+    operatorPrivateKey,
+    registryAddress,
+  };
 }
 
 /**
@@ -90,6 +103,19 @@ function parseInteger(
     throw new Error(`${name} must be an integer ${range}, got "${raw}"`);
   }
   return value;
+}
+
+/**
+ * Optional on-chain address (0x + 40 hex), normalised to lowercase. Empty means "not configured".
+ * Used for REGISTRY_ADDRESS; the chain layer treats a null value as "chain disabled".
+ */
+function parseOptionalAddress(env: NodeJS.ProcessEnv, name: string): string | null {
+  const raw = env[name]?.trim();
+  if (raw === undefined || raw === '') return null;
+  if (!/^0x[0-9a-fA-F]{40}$/.test(raw)) {
+    throw new Error(`${name} must be a 0x-prefixed 20-byte hex address, got "${raw}"`);
+  }
+  return raw.toLowerCase();
 }
 
 /**

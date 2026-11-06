@@ -1,3 +1,4 @@
+import { isChainConfigured, publishVersionOnchain, registerStrategyOnchain } from './chain.js';
 import { isForeignKeyViolation, isUniqueViolation, query } from './db.js';
 import { ForbiddenError, NotFoundError, ValidationError } from './errors.js';
 
@@ -38,6 +39,8 @@ export type Strategy = {
   description: string;
   isPublic: boolean;
   swapFeeBps: number;
+  /** On-chain AtpRegistry id; null until registerStrategyOnchain() succeeds. */
+  onchainId: number | null;
   createdAt: string;
 };
 
@@ -83,7 +86,7 @@ export type StrategyPage = {
   offset: number;
 };
 
-const STRATEGY_COLUMNS = 'id, provider, name, description, is_public, swap_fee_bps, created_at';
+const STRATEGY_COLUMNS = 'id, provider, name, description, is_public, swap_fee_bps, onchain_id, created_at';
 const VERSION_COLUMNS =
   'strategy_id, version, allocation, schedule, change_log, active_at, created_at';
 
@@ -94,6 +97,7 @@ type StrategyRow = {
   description: string;
   is_public: boolean;
   swap_fee_bps: number;
+  onchain_id: string | null;
   created_at: Date;
   total_count?: string;
 };
@@ -315,15 +319,29 @@ export function assertProviderOwns(strategyProvider: string, provider: string): 
 /**
  * Create a strategy owned by `provider` (the authenticated session wallet). The body is validated
  * for everything else; a `provider` field inside it is ignored.
+ *
+ * When the chain is configured (RPC_URL / OPERATOR_PRIVATE_KEY / REGISTRY_ADDRESS), the strategy is
+ * also registered on the on-chain AtpRegistry first, and its on-chain id is stored on the row. When
+ * the chain is not configured the row is created with `onchainId: null` (offline mode); enrollment
+ * of such a strategy fails until it is mirrored.
  */
 export async function createStrategy(rawInput: unknown, provider: string): Promise<Strategy> {
   const input = validateCreateStrategyInput(rawInput, provider);
 
+  let onchainId: number | null = null;
+  if (isChainConfigured()) {
+    onchainId = await registerStrategyOnchain({
+      name: input.name,
+      description: input.description,
+      isPublic: input.isPublic,
+    });
+  }
+
   const { rows } = await query<StrategyRow>(
-    `insert into strategies (provider, name, description, is_public, swap_fee_bps)
-     values ($1, $2, $3, $4, $5)
+    `insert into strategies (provider, name, description, is_public, swap_fee_bps, onchain_id)
+     values ($1, $2, $3, $4, $5, $6)
      returning ${STRATEGY_COLUMNS}`,
-    [input.provider, input.name, input.description, input.isPublic, input.swapFeeBps],
+    [input.provider, input.name, input.description, input.isPublic, input.swapFeeBps, onchainId],
   );
 
   const row = rows[0];
@@ -407,12 +425,14 @@ export async function publishVersion(
   const changeLog = validateChangeLog(input.changeLog);
   const activeAt = validateActiveAt(input.activeAt);
 
-  const owner = await query<{ provider: string }>('select provider from strategies where id = $1', [
-    strategyId,
-  ]);
+  const owner = await query<{ provider: string; onchain_id: string | null }>(
+    'select provider, onchain_id from strategies where id = $1',
+    [strategyId],
+  );
   const ownerRow = owner.rows[0];
   if (ownerRow === undefined) throw new NotFoundError(`strategy ${strategyId} not found`);
   assertProviderOwns(ownerRow.provider, provider);
+  const onchainId = ownerRow.onchain_id === null ? null : Number(ownerRow.onchain_id);
 
   const attempts = 3;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -433,7 +453,19 @@ export async function publishVersion(
       );
       const row = rows[0];
       if (!row) throw new Error('insert into strategy_versions returned no row');
-      return mapVersion(row);
+      const mapped = mapVersion(row);
+
+      // Mirror to chain when the strategy is already registered on-chain (onchain_id set).
+      if (onchainId !== null && isChainConfigured()) {
+        await publishVersionOnchain(onchainId, {
+          assets: allocation.assets.map((a) => a.address as `0x${string}`),
+          weightsBps: allocation.assets.map((a) => a.weightBps),
+          schedule,
+          activeAt,
+        });
+      }
+
+      return mapped;
     } catch (err) {
       if (isUniqueViolation(err)) continue;
       if (isForeignKeyViolation(err)) throw new NotFoundError(`strategy ${strategyId} not found`);
@@ -456,6 +488,7 @@ function mapStrategy(row: StrategyRow): Strategy {
     description: row.description,
     isPublic: row.is_public,
     swapFeeBps: row.swap_fee_bps,
+    onchainId: row.onchain_id === null ? null : Number(row.onchain_id),
     createdAt: row.created_at.toISOString(),
   };
 }

@@ -528,6 +528,7 @@ test('HTTP: nonce → login → POST /strategies creates a strategy owned by the
       description: '',
       isPublic: true,
       swapFeeBps: 0,
+      onchainId: null,
       createdAt: '2026-01-01T00:00:00.000Z',
     };
   };

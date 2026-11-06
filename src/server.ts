@@ -6,6 +6,7 @@ import { query } from './db.js';
 import { AppError, ValidationError } from './errors.js';
 import { createStrategy, getStrategy, listStrategies, publishVersion } from './strategies.js';
 import type { PublishVersionInput } from './strategies.js';
+import { enrollPortfolio } from './portfolios.js';
 
 /** Hard cap on request bodies: strategy payloads are small; anything bigger is a mistake or an attack. */
 const MAX_BODY_BYTES = 1_000_000;
@@ -34,9 +35,10 @@ const DB_DOWN_CODES = new Set([
 export type ServerDeps = {
   createStrategy: typeof createStrategy;
   publishVersion: typeof publishVersion;
+  enrollPortfolio: typeof enrollPortfolio;
 };
 
-const defaultDeps: ServerDeps = { createStrategy, publishVersion };
+const defaultDeps: ServerDeps = { createStrategy, publishVersion, enrollPortfolio };
 
 export function createServer(overrides: Partial<ServerDeps> = {}): Server {
   const deps: ServerDeps = { ...defaultDeps, ...overrides };
@@ -121,6 +123,13 @@ async function route(
         parsePositiveInteger(segments[1] ?? '', 'strategy id'),
         deps,
       );
+    }
+  }
+
+  if (root === 'portfolios') {
+    if (segments.length === 1) {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      return enrollRoute(req, res, deps);
     }
   }
 
@@ -213,6 +222,21 @@ async function publishVersionRoute(
   }
   const version = await deps.publishVersion(id, body as PublishVersionInput, provider);
   sendJson(res, 201, version);
+}
+
+/**
+ * POST /portfolios — enroll the authenticated wallet into a strategy (on-chain + DB).
+ * Body is { strategyId }. Requires a bearer token; the wallet is the session wallet.
+ */
+async function enrollRoute(req: IncomingMessage, res: ServerResponse, deps: ServerDeps): Promise<void> {
+  const provider = authenticate(req.headers.authorization);
+  const body = await readJsonBody(req);
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    throw new ValidationError('INVALID_PORTFOLIO', 'request body must be a JSON object');
+  }
+  const strategyId = parsePositiveInteger(String((body as Record<string, unknown>).strategyId ?? ''), 'strategyId');
+  const portfolio = await deps.enrollPortfolio(strategyId, provider);
+  sendJson(res, 201, portfolio, { location: `/portfolios/${portfolio.id}` });
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {

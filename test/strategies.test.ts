@@ -237,6 +237,8 @@ test('loadConfig requires DATABASE_URL and defaults to chain 56 / port 8080', ()
     authUri: 'http://localhost',
     chainId: 97,
     rpcUrl: 'https://rpc.example',
+    operatorPrivateKey: null,
+    registryAddress: null,
   });
 
   assert.throws(() => loadConfig({ DATABASE_URL: 'postgres://localhost/cre8', PORT: 'abc' }), /PORT/);

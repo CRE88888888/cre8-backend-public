@@ -29,3 +29,43 @@ export class NotFoundError extends AppError {
     this.name = 'NotFoundError';
   }
 }
+
+/** The login nonce is unknown or was already redeemed (HTTP 400, INVALID_NONCE). */
+export class InvalidNonceError extends ValidationError {
+  constructor(message = 'nonce is unknown or was already used') {
+    super('INVALID_NONCE', message);
+    this.name = 'InvalidNonceError';
+  }
+}
+
+/** The login nonce is older than its TTL (HTTP 400, NONCE_EXPIRED). */
+export class NonceExpiredError extends ValidationError {
+  constructor(message = 'nonce has expired') {
+    super('NONCE_EXPIRED', message);
+    this.name = 'NonceExpiredError';
+  }
+}
+
+/** The caller is not authenticated (HTTP 401, UNAUTHORIZED). */
+export class UnauthorizedError extends AppError {
+  constructor(message = 'authentication required') {
+    super(401, 'UNAUTHORIZED', message);
+    this.name = 'UnauthorizedError';
+  }
+}
+
+/** The EIP-191 signature does not recover to the claimed wallet (HTTP 401, INVALID_SIGNATURE). */
+export class InvalidSignatureError extends AppError {
+  constructor(message = 'signature does not match the wallet') {
+    super(401, 'INVALID_SIGNATURE', message);
+    this.name = 'InvalidSignatureError';
+  }
+}
+
+/** The caller is authenticated but may not touch this resource (HTTP 403, FORBIDDEN). */
+export class ForbiddenError extends AppError {
+  constructor(message = 'forbidden') {
+    super(403, 'FORBIDDEN', message);
+    this.name = 'ForbiddenError';
+  }
+}

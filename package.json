@@ -16,7 +16,8 @@
   },
   "dependencies": {
     "dotenv": "^16.6.1",
-    "pg": "^8.23.1"
+    "pg": "^8.23.1",
+    "viem": "^2.57.16"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",

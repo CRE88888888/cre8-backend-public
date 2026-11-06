@@ -1,5 +1,5 @@
 import { isForeignKeyViolation, isUniqueViolation, query } from './db.js';
-import { NotFoundError, ValidationError } from './errors.js';
+import { ForbiddenError, NotFoundError, ValidationError } from './errors.js';
 
 /** Basis-point denominator. On-chain AtpRegistry uses the same TOTAL_WEIGHT_BPS. */
 export const BPS_DENOMINATOR = 10_000;
@@ -238,13 +238,21 @@ export function validateSchedule(input: unknown): RebalanceSchedule {
   throw new ValidationError('INVALID_SCHEDULE', 'schedule.kind must be "interval" or "cron"');
 }
 
-/** Validate POST /strategies input and apply defaults (public, 0 bps, empty description). */
-export function validateCreateStrategyInput(input: unknown): Required<CreateStrategyInput> {
+/**
+ * Validate POST /strategies input and apply defaults (public, 0 bps, empty description).
+ *
+ * `provider` comes from the authenticated session, never from the body: any `provider` field in
+ * the payload is ignored, so a client cannot create a strategy under another wallet's address.
+ */
+export function validateCreateStrategyInput(
+  input: unknown,
+  provider: string,
+): Required<CreateStrategyInput> {
   if (!isRecord(input)) {
     throw new ValidationError('INVALID_STRATEGY', 'request body must be a JSON object');
   }
 
-  const provider = requireString(input.provider, 'provider', MAX_PROVIDER_LENGTH);
+  const owner = requireString(provider, 'provider', MAX_PROVIDER_LENGTH);
   const name = requireString(input.name, 'name', MAX_NAME_LENGTH);
 
   let description = '';
@@ -285,15 +293,29 @@ export function validateCreateStrategyInput(input: unknown): Required<CreateStra
     swapFeeBps = input.swapFeeBps;
   }
 
-  return { provider, name, description, isPublic, swapFeeBps };
+  return { provider: owner, name, description, isPublic, swapFeeBps };
 }
 
 // ---------------------------------------------------------------------------
 // Data access
 // ---------------------------------------------------------------------------
 
-export async function createStrategy(rawInput: unknown): Promise<Strategy> {
-  const input = validateCreateStrategyInput(rawInput);
+/**
+ * Ownership gate shared by every provider-scoped write: the session wallet must be the strategy's
+ * provider. Addresses are compared case-insensitively because EIP-55 casing is cosmetic.
+ */
+export function assertProviderOwns(strategyProvider: string, provider: string): void {
+  if (strategyProvider.trim().toLowerCase() !== provider.trim().toLowerCase()) {
+    throw new ForbiddenError('strategy belongs to another provider');
+  }
+}
+
+/**
+ * Create a strategy owned by `provider` (the authenticated session wallet). The body is validated
+ * for everything else; a `provider` field inside it is ignored.
+ */
+export async function createStrategy(rawInput: unknown, provider: string): Promise<Strategy> {
+  const input = validateCreateStrategyInput(rawInput, provider);
 
   const { rows } = await query<StrategyRow>(
     `insert into strategies (provider, name, description, is_public, swap_fee_bps)
@@ -362,18 +384,26 @@ export async function getStrategy(id: number): Promise<StrategyDetail> {
  * (strategy_id, version) primary key: on a concurrent publish the unique violation is retried.
  *
  * The strategy row stays untouched; existing portfolios keep the version they pinned.
+ *
+ * `provider` is the authenticated session wallet: publishing requires ownership, so a caller can
+ * only append versions to its own strategies (403 FORBIDDEN otherwise).
  */
 export async function publishVersion(
   strategyId: number,
   input: PublishVersionInput,
+  provider: string,
 ): Promise<StrategyVersion> {
   const allocation = validateAllocation(input.allocation);
   const schedule = validateSchedule(input.schedule);
   const changeLog = validateChangeLog(input.changeLog);
   const activeAt = validateActiveAt(input.activeAt);
 
-  const exists = await query('select 1 from strategies where id = $1', [strategyId]);
-  if (exists.rowCount === 0) throw new NotFoundError(`strategy ${strategyId} not found`);
+  const owner = await query<{ provider: string }>('select provider from strategies where id = $1', [
+    strategyId,
+  ]);
+  const ownerRow = owner.rows[0];
+  if (ownerRow === undefined) throw new NotFoundError(`strategy ${strategyId} not found`);
+  assertProviderOwns(ownerRow.provider, provider);
 
   const attempts = 3;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {

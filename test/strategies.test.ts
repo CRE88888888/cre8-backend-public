@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, test } from 'node:test';
+import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
+import { buildLoginMessage } from '../src/auth.js';
 import { loadConfig } from '../src/config.js';
 import { closePool, migrate, query } from '../src/db.js';
-import { NotFoundError, ValidationError } from '../src/errors.js';
+import { ForbiddenError, NotFoundError, ValidationError } from '../src/errors.js';
 import { createServer } from '../src/server.js';
 import type { ServerDeps } from '../src/server.js';
 import {
@@ -142,7 +144,7 @@ test('validateSchedule rejects unknown kinds, sub-minute intervals and empty cro
 // ---------------------------------------------------------------------------
 
 test('validateCreateStrategyInput applies defaults and trims strings', () => {
-  const input = validateCreateStrategyInput({ provider: ' 0xprovider ', name: ' Index 500 ' });
+  const input = validateCreateStrategyInput({ name: ' Index 500 ' }, ' 0xprovider ');
   assert.deepEqual(input, {
     provider: '0xprovider',
     name: 'Index 500',
@@ -152,17 +154,28 @@ test('validateCreateStrategyInput applies defaults and trims strings', () => {
   });
 });
 
+test('validateCreateStrategyInput takes the provider from the session and ignores the body', () => {
+  const input = validateCreateStrategyInput(
+    { provider: '0xattacker', name: 'Index 500' },
+    '0xsession',
+  );
+  assert.equal(input.provider, '0xsession');
+});
+
 test('validateCreateStrategyInput rejects bad fees, names and booleans', () => {
-  const base = { provider: '0xprovider', name: 'Index 500' };
+  const base = { name: 'Index 500' };
   for (const swapFeeBps of [-1, 301, 1.5]) {
     expectValidationError(
-      () => validateCreateStrategyInput({ ...base, swapFeeBps }),
+      () => validateCreateStrategyInput({ ...base, swapFeeBps }, '0xprovider'),
       'INVALID_SWAP_FEE',
     );
   }
-  expectValidationError(() => validateCreateStrategyInput({ ...base, name: '   ' }), 'INVALID_STRATEGY');
   expectValidationError(
-    () => validateCreateStrategyInput({ ...base, isPublic: 'yes' }),
+    () => validateCreateStrategyInput({ ...base, name: '   ' }, '0xprovider'),
+    'INVALID_STRATEGY',
+  );
+  expectValidationError(
+    () => validateCreateStrategyInput({ ...base, isPublic: 'yes' }, '0xprovider'),
     'INVALID_STRATEGY',
   );
 });
@@ -211,7 +224,10 @@ const PUBLISH_BODY = {
 };
 
 /** Bind a throwaway server on port 0, hand its base URL to `run`, then close it. */
-async function withServer<T>(run: (baseUrl: string) => Promise<T>, deps?: ServerDeps): Promise<T> {
+async function withServer<T>(
+  run: (baseUrl: string) => Promise<T>,
+  deps?: Partial<ServerDeps>,
+): Promise<T> {
   const server = createServer(deps);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
 
@@ -228,12 +244,38 @@ async function withServer<T>(run: (baseUrl: string) => Promise<T>, deps?: Server
   }
 }
 
-function postJson(baseUrl: string, path: string, body: unknown): Promise<Response> {
+function postJson(
+  baseUrl: string,
+  path: string,
+  body: unknown,
+  token?: string,
+): Promise<Response> {
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (token !== undefined) headers.authorization = `Bearer ${token}`;
   return fetch(`${baseUrl}${path}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers,
     body: JSON.stringify(body),
   });
+}
+
+/** Route tests are authenticated now: sign a nonce with a throwaway wallet and mint a session. */
+const ROUTE_WALLET = privateKeyToAccount(generatePrivateKey());
+
+async function loginToken(baseUrl: string): Promise<string> {
+  const nonceResponse = await fetch(`${baseUrl}/auth/nonce`, { method: 'POST' });
+  assert.equal(nonceResponse.status, 200);
+  const { nonce } = (await nonceResponse.json()) as { nonce: string };
+
+  const signature = await ROUTE_WALLET.signMessage({ message: buildLoginMessage(nonce) });
+  const loginResponse = await postJson(baseUrl, '/auth/login', {
+    wallet: ROUTE_WALLET.address,
+    nonce,
+    signature,
+  });
+  assert.equal(loginResponse.status, 200);
+  const { token } = (await loginResponse.json()) as { token: string };
+  return token;
 }
 
 test('POST /strategies/:id/versions returns 201 with the created version record', async () => {
@@ -246,21 +288,25 @@ test('POST /strategies/:id/versions returns 201 with the created version record'
     activeAt: '2026-01-01T00:00:00.000Z',
     createdAt: '2026-01-01T00:00:00.000Z',
   };
-  const calls: Array<{ id: number; input: PublishVersionInput }> = [];
+  const calls: Array<{ id: number; input: PublishVersionInput; provider: string }> = [];
 
   await withServer(
     async (baseUrl) => {
-      const response = await postJson(baseUrl, '/strategies/1/versions', PUBLISH_BODY);
+      const token = await loginToken(baseUrl);
+      const response = await postJson(baseUrl, '/strategies/1/versions', PUBLISH_BODY, token);
 
       assert.equal(response.status, 201);
       assert.match(response.headers.get('content-type') ?? '', /^application\/json/);
       assert.deepEqual(await response.json(), published);
-      // The route hands the parsed body to publishVersion untouched (id from the path).
-      assert.deepEqual(calls, [{ id: 1, input: PUBLISH_BODY }]);
+      // The route hands the parsed body to publishVersion untouched (id from the path), and the
+      // provider is the session wallet, never a body field.
+      assert.deepEqual(calls, [
+        { id: 1, input: PUBLISH_BODY, provider: ROUTE_WALLET.address.toLowerCase() },
+      ]);
     },
     {
-      publishVersion: async (strategyId, input) => {
-        calls.push({ id: strategyId, input });
+      publishVersion: async (strategyId, input, provider) => {
+        calls.push({ id: strategyId, input, provider });
         return published;
       },
     },
@@ -270,7 +316,8 @@ test('POST /strategies/:id/versions returns 201 with the created version record'
 test('POST /strategies/:id/versions returns 404 when publishVersion reports the strategy missing', async () => {
   await withServer(
     async (baseUrl) => {
-      const response = await postJson(baseUrl, '/strategies/999/versions', PUBLISH_BODY);
+      const token = await loginToken(baseUrl);
+      const response = await postJson(baseUrl, '/strategies/999/versions', PUBLISH_BODY, token);
 
       assert.equal(response.status, 404);
       assert.deepEqual(await response.json(), {
@@ -288,6 +335,7 @@ test('POST /strategies/:id/versions returns 404 when publishVersion reports the 
 test('POST /strategies/:id/versions is 400 for bad allocations without touching the DB', async () => {
   // Default deps: the real publishVersion validates before it queries, so no DATABASE_URL is needed.
   await withServer(async (baseUrl) => {
+    const token = await loginToken(baseUrl);
     const cases: Array<{ body: unknown; code: string }> = [
       {
         body: { ...PUBLISH_BODY, allocation: { assets: [{ address: ASSET_A, weightBps: 9999 }] } },
@@ -312,7 +360,7 @@ test('POST /strategies/:id/versions is 400 for bad allocations without touching 
     ];
 
     for (const testCase of cases) {
-      const response = await postJson(baseUrl, '/strategies/1/versions', testCase.body);
+      const response = await postJson(baseUrl, '/strategies/1/versions', testCase.body, token);
       assert.equal(response.status, 400);
       const payload = (await response.json()) as { error: { code: string } };
       assert.equal(payload.error.code, testCase.code);
@@ -322,7 +370,8 @@ test('POST /strategies/:id/versions is 400 for bad allocations without touching 
 
 test('POST /strategies/:id/versions is 400 for a non-object JSON body', async () => {
   await withServer(async (baseUrl) => {
-    const response = await postJson(baseUrl, '/strategies/1/versions', null);
+    const token = await loginToken(baseUrl);
+    const response = await postJson(baseUrl, '/strategies/1/versions', null, token);
 
     assert.equal(response.status, 400);
     const payload = (await response.json()) as { error: { code: string } };
@@ -359,13 +408,15 @@ test('DB: migrate records 0001_init.sql', { skip: skipDb }, async () => {
 
 test('DB: strategy and version round trip', { skip: skipDb }, async () => {
   const name = `it-strategy-${randomUUID()}`;
-  const strategy = await createStrategy({
-    provider: 'it-provider',
-    name,
-    description: 'integration test',
-    isPublic: false,
-    swapFeeBps: 25,
-  });
+  const strategy = await createStrategy(
+    {
+      name,
+      description: 'integration test',
+      isPublic: false,
+      swapFeeBps: 25,
+    },
+    'it-provider',
+  );
 
   try {
     assert.equal(strategy.name, name);
@@ -374,23 +425,31 @@ test('DB: strategy and version round trip', { skip: skipDb }, async () => {
     const empty = await getStrategy(strategy.id);
     assert.deepEqual(empty.versions, []);
 
-    const first = await publishVersion(strategy.id, {
-      allocation: {
-        assets: [
-          { address: ASSET_A, symbol: 'AAPLB', weightBps: 7000 },
-          { address: ASSET_B, weightBps: 3000 },
-        ],
+    const first = await publishVersion(
+      strategy.id,
+      {
+        allocation: {
+          assets: [
+            { address: ASSET_A, symbol: 'AAPLB', weightBps: 7000 },
+            { address: ASSET_B, weightBps: 3000 },
+          ],
+        },
+        schedule: { kind: 'interval', intervalSeconds: 86_400 },
+        changeLog: 'initial weights',
       },
-      schedule: { kind: 'interval', intervalSeconds: 86_400 },
-      changeLog: 'initial weights',
-    });
+      'it-provider',
+    );
     assert.equal(first.version, 1);
     assert.equal(first.activeAt !== null, true);
 
-    const second = await publishVersion(strategy.id, {
-      allocation: { assets: [{ address: ASSET_A, weightBps: 10_000 }] },
-      schedule: { kind: 'cron', cron: '0 0 * * *' },
-    });
+    const second = await publishVersion(
+      strategy.id,
+      {
+        allocation: { assets: [{ address: ASSET_A, weightBps: 10_000 }] },
+        schedule: { kind: 'cron', cron: '0 0 * * *' },
+      },
+      'it-provider',
+    );
     assert.equal(second.version, 2);
 
     const detail = await getStrategy(strategy.id);
@@ -400,19 +459,40 @@ test('DB: strategy and version round trip', { skip: skipDb }, async () => {
     const page = await listStrategies({ provider: 'it-provider', isPublic: false, limit: 100 });
     assert.ok(page.items.some((item) => item.id === strategy.id));
 
+    // Another wallet cannot publish, even with a perfectly valid payload.
     await assert.rejects(
-      publishVersion(strategy.id, {
-        allocation: { assets: [{ address: ASSET_A, weightBps: 9_999 }] },
-        schedule: { kind: 'interval', intervalSeconds: 3_600 },
-      }),
+      publishVersion(
+        strategy.id,
+        {
+          allocation: { assets: [{ address: ASSET_A, weightBps: 10_000 }] },
+          schedule: { kind: 'interval', intervalSeconds: 3_600 },
+        },
+        '0xsomeone-else',
+      ),
+      (err: unknown) => err instanceof ForbiddenError && err.code === 'FORBIDDEN',
+    );
+
+    await assert.rejects(
+      publishVersion(
+        strategy.id,
+        {
+          allocation: { assets: [{ address: ASSET_A, weightBps: 9_999 }] },
+          schedule: { kind: 'interval', intervalSeconds: 3_600 },
+        },
+        'it-provider',
+      ),
       (err: unknown) => err instanceof ValidationError && err.code === 'WEIGHT_SUM',
     );
 
     await assert.rejects(
-      publishVersion(strategy.id + 1_000_000, {
-        allocation: { assets: [{ address: ASSET_A, weightBps: 10_000 }] },
-        schedule: { kind: 'interval', intervalSeconds: 3_600 },
-      }),
+      publishVersion(
+        strategy.id + 1_000_000,
+        {
+          allocation: { assets: [{ address: ASSET_A, weightBps: 10_000 }] },
+          schedule: { kind: 'interval', intervalSeconds: 3_600 },
+        },
+        'it-provider',
+      ),
       (err: unknown) => err instanceof NotFoundError,
     );
   } finally {
@@ -422,15 +502,20 @@ test('DB: strategy and version round trip', { skip: skipDb }, async () => {
 
 test('DB: POST /strategies/:id/versions publishes a version over HTTP', { skip: skipDb }, async () => {
   await migrate();
-  const strategy = await createStrategy({
-    provider: 'it-http',
-    name: `it-http-${randomUUID()}`,
-    isPublic: false,
-  });
+  const strategy = await createStrategy(
+    { name: `it-http-${randomUUID()}`, isPublic: false },
+    ROUTE_WALLET.address.toLowerCase(),
+  );
 
   try {
     await withServer(async (baseUrl) => {
-      const created = await postJson(baseUrl, `/strategies/${strategy.id}/versions`, PUBLISH_BODY);
+      const token = await loginToken(baseUrl);
+      const created = await postJson(
+        baseUrl,
+        `/strategies/${strategy.id}/versions`,
+        PUBLISH_BODY,
+        token,
+      );
       assert.equal(created.status, 201);
 
       const version = (await created.json()) as StrategyVersion;
@@ -456,6 +541,7 @@ test('DB: POST /strategies/:id/versions publishes a version over HTTP', { skip: 
         baseUrl,
         `/strategies/${strategy.id + 1_000_000}/versions`,
         PUBLISH_BODY,
+        token,
       );
       assert.equal(missing.status, 404);
       const missingPayload = (await missing.json()) as { error: { code: string } };

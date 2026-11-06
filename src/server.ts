@@ -1,5 +1,6 @@
 import { createServer as createHttpServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
+import { authenticate, issueNonce, login, parseLoginBody } from './auth.js';
 import { getConfig } from './config.js';
 import { query } from './db.js';
 import { AppError, ValidationError } from './errors.js';
@@ -27,15 +28,18 @@ const DB_DOWN_CODES = new Set([
 
 /**
  * Dependencies the routes need. Injectable so route tests can run without a database;
- * production calls `createServer()` and gets the real `publishVersion`.
+ * production calls `createServer()` and gets the real implementations. Partial overrides are
+ * merged over the defaults, so a test can stub one dependency and leave the rest real.
  */
 export type ServerDeps = {
+  createStrategy: typeof createStrategy;
   publishVersion: typeof publishVersion;
 };
 
-const defaultDeps: ServerDeps = { publishVersion };
+const defaultDeps: ServerDeps = { createStrategy, publishVersion };
 
-export function createServer(deps: ServerDeps = defaultDeps): Server {
+export function createServer(overrides: Partial<ServerDeps> = {}): Server {
+  const deps: ServerDeps = { ...defaultDeps, ...overrides };
   return createHttpServer((req, res) => {
     void handleRequest(req, res, deps);
   });
@@ -88,10 +92,21 @@ async function route(
     return health(res);
   }
 
+  if (root === 'auth') {
+    if (segments.length === 2 && segments[1] === 'nonce') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      return nonceRoute(res);
+    }
+    if (segments.length === 2 && segments[1] === 'login') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      return loginRoute(req, res);
+    }
+  }
+
   if (root === 'strategies') {
     if (segments.length === 1) {
       if (method === 'GET') return listRoute(res, url);
-      if (method === 'POST') return createRoute(req, res);
+      if (method === 'POST') return createRoute(req, res, deps);
       return methodNotAllowed(res, ['GET', 'POST']);
     }
     if (segments.length === 2) {
@@ -134,6 +149,18 @@ async function health(res: ServerResponse): Promise<void> {
   });
 }
 
+/** POST /auth/nonce — mint a single-use nonce. No body: the wallet only signs what it gets back. */
+function nonceRoute(res: ServerResponse): void {
+  sendJson(res, 200, issueNonce());
+}
+
+/** POST /auth/login — exchange { wallet, nonce, signature } for a bearer session token. */
+async function loginRoute(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const credentials = parseLoginBody(await readJsonBody(req));
+  const session = await login(credentials.wallet, credentials.nonce, credentials.signature);
+  sendJson(res, 200, session);
+}
+
 /** GET /strategies?limit=50&offset=0&provider=0x…&public=true */
 async function listRoute(res: ServerResponse, url: URL): Promise<void> {
   const provider = url.searchParams.get('provider')?.trim() ?? '';
@@ -151,26 +178,40 @@ async function detailRoute(res: ServerResponse, id: number): Promise<void> {
   sendJson(res, 200, await getStrategy(id));
 }
 
-/** POST /strategies — create metadata only; versions are published separately. */
-async function createRoute(req: IncomingMessage, res: ServerResponse): Promise<void> {
+/**
+ * POST /strategies — create metadata only; versions are published separately.
+ * Requires a bearer token: the provider is the session wallet, and any `provider` in the body is
+ * ignored (authenticate() runs before the body is read, so an unauthenticated call is 401 even
+ * when the payload is invalid).
+ */
+async function createRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: ServerDeps,
+): Promise<void> {
+  const provider = authenticate(req.headers.authorization);
   const body = await readJsonBody(req);
-  const strategy = await createStrategy(body);
+  const strategy = await deps.createStrategy(body, provider);
   sendJson(res, 201, strategy, { location: `/strategies/${strategy.id}` });
 }
 
-/** POST /strategies/:id/versions — append a version; the created version record is the response. */
+/**
+ * POST /strategies/:id/versions — append a version; the created version record is the response.
+ * Requires a bearer token; publishVersion enforces that the session wallet owns the strategy.
+ */
 async function publishVersionRoute(
   req: IncomingMessage,
   res: ServerResponse,
   id: number,
   deps: ServerDeps,
 ): Promise<void> {
+  const provider = authenticate(req.headers.authorization);
   const body = await readJsonBody(req);
   // publishVersion expects an object; without this guard a JSON `null` body would be a 500.
   if (typeof body !== 'object' || body === null || Array.isArray(body)) {
     throw new ValidationError('INVALID_VERSION', 'request body must be a JSON object');
   }
-  const version = await deps.publishVersion(id, body as PublishVersionInput);
+  const version = await deps.publishVersion(id, body as PublishVersionInput, provider);
   sendJson(res, 201, version);
 }
 

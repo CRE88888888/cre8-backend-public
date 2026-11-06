@@ -1,6 +1,6 @@
 # cre8-atp-backend
 
-CRE8 ATP 的鏈下後端（第一刀）。Node 22 + TypeScript + Postgres，直接用 `pg`，**不用 ORM**（與 web app 一致）。
+CRE8 ATP 的鏈下後端（第一刀）。Bun + TypeScript + Postgres，直接用 `pg`，**不用 ORM**（與 web app 一致）。
 預設鏈是 BNB Chain mainnet（chain 56）。目前只做策略資料層與四個唯讀／建立路由，**尚無 auth**。
 
 ## 架構
@@ -21,7 +21,7 @@ HTTP → src/index.ts（啟動：config → migrate → listen）
 | `src/strategies.ts` | `listStrategies`、`getStrategy`、`createStrategy`、`publishVersion`，以及 allocation／schedule 校驗。 |
 | `src/server.ts` | 路由、body 解析（上限 1 MB）、錯誤 → JSON、access log。 |
 | `src/index.ts` | 啟動與優雅關閉（SIGINT／SIGTERM）。 |
-| `src/migrate.ts` | `npm run migrate`：只跑 migration，不啟 server。 |
+| `src/migrate.ts` | `bun run migrate`：只跑 migration，不啟 server。 |
 | `test/strategies.test.ts` | 校驗純函式單測；DB 整合測試以 `DATABASE_URL` 為 gate。 |
 
 選擇 `node:http` 而不是 express：這一刀只有四個路由，少一層依賴；`server.ts` 的 `route()` 是唯一需要換掉的
@@ -41,27 +41,26 @@ HTTP → src/index.ts（啟動：config → migrate → listen）
 ## 指令
 
 ```bash
-npm install
+bun install
 cp .env.example .env       # 填入 DATABASE_URL
 
-npm run dev                # tsx watch src/index.ts（啟動時先 migrate）
-npm run migrate            # 只套用 migration
-npm run build              # tsc → dist/
-npm start                  # node dist/index.js
-npm run typecheck          # tsc --noEmit（src + test 兩份 tsconfig）
-npm test                   # node:test；沒有 DATABASE_URL 時 DB 測試會 skip
+bun run dev                # bun --watch src/index.ts（啟動時先 migrate）
+bun run migrate            # 只套用 migration
+bun run start              # bun src/index.ts
+bun run typecheck          # tsc --noEmit（src + test 兩份 tsconfig）
+bun test                   # bun 內建 test runner；沒有 DATABASE_URL 時 DB 測試會 skip
 ```
 
-需求：Node >= 22（`package.json` 的 `engines`）。`tsx` 只用在 dev／test，production 跑 `dist/`。
+需求：Bun >= 1.4（`package.json` 的 `engines`）。bun 原生跑 TypeScript，不需 build 步驟、不需 tsx。
 
 ### 測試與 DB
 
 ```bash
 # 純函式測試（不需 DB）
-npm test
+bun test
 
 # 加上 DB 整合測試；請用可拋棄的資料庫，測試會跑 migration 並建立／刪除資料
-DATABASE_URL='postgres://postgres@127.0.0.1:5432/cre8_atp_test' npm test
+DATABASE_URL='postgres://postgres@127.0.0.1:5432/cre8_atp_test' bun test
 ```
 
 沒有 `DATABASE_URL` 時，`node:test` 會把 DB 測試標成 skipped（不是 passed）。整合測試會自己
@@ -122,7 +121,7 @@ curl -s -X POST localhost:8080/strategies -H 'content-type: application/json' -d
 
 - SQL 在 **`../db/migrations`**（`db/` 必須與 `backend/` 並排 checkout）。路徑由 `src/db.ts` 以
   `import.meta.url` 解析，`src/`（tsx）與 `dist/`（tsc）都指向同一個資料夾。
-- 啟動時與 `npm run migrate` 都會跑：依檔名排序、每個檔案一個交易、`schema_migrations` 記錄
+- 啟動時與 `bun run migrate` 都會跑：依檔名排序、每個檔案一個交易、`schema_migrations` 記錄
   filename + sha256、已套用就跳過、已套用檔案被改動則報錯。
 - `pg_advisory_lock` 避免多個 instance 同時 migrate。
 - 檔案內不要寫 `BEGIN`/`COMMIT`，也不要用 `CREATE INDEX CONCURRENTLY`。細節見 [`../db/README.md`](../db/README.md)。

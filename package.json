@@ -5,15 +5,14 @@
   "type": "module",
   "description": "CRE8 ATP off-chain API: strategies, versions and the operation log (Postgres, no ORM).",
   "engines": {
-    "node": ">=22"
+    "bun": ">=1.4"
   },
   "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "build": "tsc",
-    "start": "node dist/index.js",
-    "migrate": "tsx src/migrate.ts",
+    "dev": "bun --watch src/index.ts",
+    "start": "bun src/index.ts",
+    "migrate": "bun src/migrate.ts",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
-    "test": "node --import tsx --test test/*.test.ts"
+    "test": "bun test"
   },
   "dependencies": {
     "dotenv": "^16.6.1",
@@ -22,7 +21,6 @@
   "devDependencies": {
     "@types/node": "^22.20.5",
     "@types/pg": "^8.23.1",
-    "tsx": "^4.23.15",
     "typescript": "^5.9.3"
   }
 }

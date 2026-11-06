@@ -47,7 +47,7 @@ const message = createSiweMessage({
   statement: challenge.statement,
   nonce: challenge.nonce,
   version: challenge.version,
-  issuedAt: challenge.issuedAt,
+  issuedAt: new Date(challenge.issuedAt),
 });
 const signature = await account.signMessage({ message });
 console.log('[3] signed SIWE message for', account.address);

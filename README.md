@@ -68,6 +68,41 @@ bun test
 DATABASE_URL='postgres://postgres@127.0.0.1:5432/cre8_atp_test' bun test
 ```
 
+### Fork 鏈上整合測試（Anvil fork BSC mainnet）
+
+需要三個終端／背景程序：Anvil fork、帶鏈設定的 backend、整合腳本。
+
+```bash
+# 1. 起 Anvil fork（chain 56，常駐）
+cd ../cre8-contracts
+/Users/jareklin/.foundry/bin/anvil --fork-url https://bsc-rpc.publicnode.com --chain-id 56 --port 8545
+
+# 2. 部署三個合約，記下 registry 地址（另一終端）
+/Users/jareklin/.foundry/bin/forge script script/DeployAtp.s.sol \
+  --rpc-url http://127.0.0.1:8545 --broadcast --skip-simulation \
+  --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+
+# 3. 起帶鏈設定的 backend（8081，避免撞到 8080）
+cd ../backend
+DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/cre8_atp' \
+RPC_URL='http://127.0.0.1:8545' \
+OPERATOR_PRIVATE_KEY='0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80' \
+REGISTRY_ADDRESS='<第 2 步印出的 registry>' \
+PORT=8081 AUTH_DOMAIN=localhost bun src/index.ts
+
+# 4. 跑端到端整合（auth → 建策略 → 發版本 → enroll）
+bun run scripts/integration-fork.ts
+```
+
+驗證鏈上狀態：
+
+```bash
+cast call $REGISTRY 'enrollments(address)(uint256,uint16,bool)' $WALLET --rpc-url http://127.0.0.1:8545
+# → 1 / 1 / false（strategyId / version / paused）
+```
+
+注意：Anvil fork 的帳戶私鑰是公開的測試金鑰，**只用在本地 fork**；真實鏈上要用自己的錢包。
+
 沒有 `DATABASE_URL` 時，`node:test` 會把 DB 測試標成 skipped（不是 passed）。整合測試會自己
 `migrate()`，並在 `finally` 清掉建立的 strategy（versions 由 FK cascade）。
 

@@ -266,7 +266,7 @@ async function route(
     // 而且這支 API 的其他資料也全部要 token（只有 /health 是公開的）。
   if (root === 'assets' && segments.length === 1) {
     if (method !== 'GET') return methodNotAllowed(res, ['GET']);
-    authenticate(req.headers.authorization);
+    await authenticate(req.headers.authorization);
     sendJson(res, 200, { assets: await deps.listAssets() });
     return;
   }
@@ -424,7 +424,7 @@ async function createRoute(
   res: ServerResponse,
   deps: ServerDeps,
 ): Promise<void> {
-  const provider = authenticate(req.headers.authorization);
+  const provider = await authenticate(req.headers.authorization);
   const body = await readJsonBody(req);
   const strategy = await deps.createStrategy(body, provider);
   sendJson(res, 201, strategy, { location: `/strategies/${strategy.id}` });
@@ -440,7 +440,7 @@ async function publishVersionRoute(
   id: number,
   deps: ServerDeps,
 ): Promise<void> {
-  const provider = authenticate(req.headers.authorization);
+  const provider = await authenticate(req.headers.authorization);
   const body = await readJsonBody(req);
   // publishVersion expects an object; without this guard a JSON `null` body would be a 500.
   if (typeof body !== 'object' || body === null || Array.isArray(body)) {
@@ -455,7 +455,7 @@ async function publishVersionRoute(
  * Body is { strategyId }. Requires a bearer token; the wallet is the session wallet.
  */
 async function enrollRoute(req: IncomingMessage, res: ServerResponse, deps: ServerDeps): Promise<void> {
-  const provider = authenticate(req.headers.authorization);
+  const provider = await authenticate(req.headers.authorization);
   const body = await readJsonBody(req);
   if (typeof body !== 'object' || body === null || Array.isArray(body)) {
     throw new ValidationError('INVALID_PORTFOLIO', 'request body must be a JSON object');
@@ -476,7 +476,7 @@ async function listPortfoliosRoute(
   res: ServerResponse,
   deps: ServerDeps,
 ): Promise<void> {
-  const wallet = authenticate(req.headers.authorization);
+  const wallet = await authenticate(req.headers.authorization);
   sendJson(res, 200, { portfolios: await deps.listPortfolios(wallet) });
 }
 
@@ -491,7 +491,7 @@ async function renewalParamsRoute(
   id: number,
   deps: ServerDeps,
 ): Promise<void> {
-  const wallet = authenticate(req.headers.authorization);
+  const wallet = await authenticate(req.headers.authorization);
   sendJson(res, 200, await deps.buildRenewalParams(id, wallet));
 }
 
@@ -506,7 +506,7 @@ async function renewalResultRoute(
   id: number,
   deps: ServerDeps,
 ): Promise<void> {
-  const wallet = authenticate(req.headers.authorization);
+  const wallet = await authenticate(req.headers.authorization);
   const body = await readJsonBody(req);
   if (typeof body !== 'object' || body === null || Array.isArray(body)) {
     throw new ValidationError('INVALID_RENEWAL', 'request body must be a JSON object');
@@ -533,7 +533,7 @@ async function portfolioStatusRoute(
   id: number,
   deps: ServerDeps,
 ): Promise<void> {
-  const wallet = authenticate(req.headers.authorization);
+  const wallet = await authenticate(req.headers.authorization);
   sendJson(res, 200, await deps.portfolioStatus(id, wallet));
 }
 
@@ -552,7 +552,7 @@ async function planPreviewRoute(
   id: number,
   deps: ServerDeps,
 ): Promise<void> {
-  const wallet = authenticate(req.headers.authorization);
+  const wallet = await authenticate(req.headers.authorization);
   sendJson(res, 200, await deps.planPreview(id, wallet));
 }
 
@@ -578,7 +578,7 @@ async function operatorRebalanceRoute(
   id: number,
   deps: ServerDeps,
 ): Promise<void> {
-  const wallet = authenticate(req.headers.authorization);
+  const wallet = await authenticate(req.headers.authorization);
   const enabled = deps.operatorRebalanceEnabled ?? operatorRebalanceEnabled;
   if (!enabled()) {
     throw new AppError(
@@ -613,7 +613,7 @@ async function bundlerRelayRoute(
   deps: ServerDeps,
 ): Promise<void> {
   // token 先驗、body 後讀：順序與其他寫入路由一致（沒 token 又不合法的 body 是 401，不是 400）。
-  authenticate(req.headers.authorization);
+  await authenticate(req.headers.authorization);
 
   const raw = await readBodyText(req);
   let request: unknown;

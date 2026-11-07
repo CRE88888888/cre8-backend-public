@@ -15,6 +15,7 @@ import {
   issueNonce,
   login,
   parseLoginBody,
+  type SessionRepository,
 } from '../src/auth.js';
 import type { SiweChallenge, SessionCredentials } from '../src/auth.js';
 import type { AuthConfig } from '../src/config.js';
@@ -79,8 +80,31 @@ function newAccount(): PrivateKeyAccount {
   return privateKeyToAccount(generatePrivateKey());
 }
 
+/**
+ * 記憶體版本的 session repository。
+ *
+ * 單元測試不該為了「登入」而需要 Postgres：`AuthStore` 吃的是一個 `SessionRepository` 介面，
+ * 這裡給它一個 Map 就夠了。真正打 DB 的那一份由 `auth_sessions` 的整合測試與 HTTP 測試覆蓋。
+ */
+function memorySessions(): SessionRepository & { readonly rows: Map<string, { wallet: string; expiresAt: Date }> } {
+  const rows = new Map<string, { wallet: string; expiresAt: Date }>();
+  return {
+    rows,
+    save: async (tokenHash, wallet, expiresAt) => {
+      rows.set(tokenHash, { wallet, expiresAt });
+    },
+    find: async (tokenHash) => rows.get(tokenHash) ?? null,
+    remove: async (tokenHash) => {
+      rows.delete(tokenHash);
+    },
+    prune: async (now) => {
+      for (const [hash, row] of rows) if (row.expiresAt <= now) rows.delete(hash);
+    },
+  };
+}
+
 function newStore(options: { now?: () => number } = {}): AuthStore {
-  return new AuthStore({ ...options, auth: { ...TEST_AUTH } });
+  return new AuthStore({ ...options, auth: { ...TEST_AUTH }, sessions: memorySessions() });
 }
 
 type SiweOverrides = Partial<Omit<SiweMessage, 'address'>>;
@@ -197,8 +221,8 @@ test('login recovers the wallet from a SIWE signature and mints a 24h session', 
   assert.ok(ttl <= SESSION_TTL_MS + 2_000, `TTL too long: ${ttl}`);
 
   // The trusted identity is the lowercased address from the message.
-  assert.equal(store.authenticate(`Bearer ${session.token}`), account.address.toLowerCase());
-  assert.equal(store.authenticate(`Bearer   ${session.token}`), account.address.toLowerCase());
+  assert.equal(await store.authenticate(`Bearer ${session.token}`), account.address.toLowerCase());
+  assert.equal(await store.authenticate(`Bearer   ${session.token}`), account.address.toLowerCase());
 });
 
 test('the session wallet is the address from the message, lowercased', async () => {
@@ -212,7 +236,7 @@ test('the session wallet is the address from the message, lowercased', async () 
     await account.signMessage({ message: buildMessage(challenge, account.address) }),
   );
 
-  assert.equal(store.authenticate(`Bearer ${session.token}`), account.address.toLowerCase());
+  assert.equal(await store.authenticate(`Bearer ${session.token}`), account.address.toLowerCase());
 });
 
 test('login rejects a signature from another wallet with 401 INVALID_SIGNATURE', async () => {
@@ -307,7 +331,7 @@ test('a rejected envelope does not consume the nonce', async () => {
 
   // The challenge is still redeemable with the correct domain: a phishing attempt cannot burn it.
   const session = await attemptLogin(store, account, challenge);
-  assert.equal(store.authenticate(`Bearer ${session.token}`), account.address.toLowerCase());
+  assert.equal(await store.authenticate(`Bearer ${session.token}`), account.address.toLowerCase());
 });
 
 test('login rejects a nonce that was never issued with 400 INVALID_NONCE', async () => {
@@ -413,17 +437,17 @@ test('an expired session is 401 UNAUTHORIZED', async () => {
 
   now += SESSION_TTL_MS + 1;
 
-  assert.throws(
+  await assert.rejects(
     () => store.authenticate(`Bearer ${session.token}`),
     (err: unknown) => isAppError(err, 401, 'UNAUTHORIZED'),
   );
 });
 
-test('authenticate rejects missing, malformed and unknown bearer tokens with 401 UNAUTHORIZED', () => {
+test('authenticate rejects missing, malformed and unknown bearer tokens with 401 UNAUTHORIZED', async () => {
   const store = newStore();
 
   for (const header of [null, undefined, '', 'Bearer', 'Bearer ', 'Basic abc', 'deadbeef', 'Bearer deadbeef']) {
-    assert.throws(
+    await assert.rejects(
       () => store.authenticate(header),
       (err: unknown) => isAppError(err, 401, 'UNAUTHORIZED'),
       `expected 401 for header ${String(header)}`,
@@ -437,8 +461,8 @@ test('the module-level store shares sessions between issueNonce, login and authe
   const signed = await signChallenge(account, challenge);
   const session = await login(signed.message, signed.signature);
 
-  assert.equal(authenticate(`Bearer ${session.token}`), account.address.toLowerCase());
-  assert.throws(
+  assert.equal(await authenticate(`Bearer ${session.token}`), account.address.toLowerCase());
+  await assert.rejects(
     () => authenticate('Bearer not-a-session'),
     (err: unknown) => err instanceof UnauthorizedError && err.code === 'UNAUTHORIZED',
   );

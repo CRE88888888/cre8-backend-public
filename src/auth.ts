@@ -1,4 +1,5 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { query } from './db.js';
 import { recoverMessageAddress } from 'viem';
 import { parseSiweMessage } from 'viem/siwe';
 import { getAuthConfig } from './config.js';
@@ -73,11 +74,23 @@ export type LoginCredentials = {
   signature: string;
 };
 
+/** Where sessions are persisted. Injected so unit tests need no database. */
+export type SessionRepository = {
+  save(tokenHash: string, wallet: string, expiresAt: Date): Promise<void>;
+  /** `null` = unknown or expired. The caller treats both the same (401). */
+  find(tokenHash: string): Promise<{ wallet: string; expiresAt: Date } | null>;
+  remove(tokenHash: string): Promise<void>;
+  /** Best-effort cleanup of expired rows. Never throws into the request path. */
+  prune(now: Date): Promise<void>;
+};
+
 export type AuthStoreOptions = {
   /** Injectable clock (ms since epoch). Tests use it to expire nonces and sessions without waiting. */
   now?: () => number;
   /** Override the SIWE binding (domain/uri/chainId). Defaults to the process config. */
   auth?: AuthConfig;
+  /** Session persistence. Defaults to Postgres; tests pass an in-memory fake. */
+  sessions?: SessionRepository;
 };
 
 type NonceEntry = { expiresAt: number };
@@ -99,20 +112,67 @@ type ParsedSiwe = {
 /**
  * In-memory nonce and session store, plus EIP-4361 verification.
  *
- * v1 deliberately keeps this in the process: one API instance, no shared state. TODO: a
- * multi-instance deployment must move both maps to Redis (or another shared store) before it
- * scales out, because a nonce issued by instance A cannot be redeemed on instance B and a session
- * minted by A is unknown to B.
+ * Nonces stay in the process (5-minute lifetime, single-use, no value after the login round).
+ * **Sessions live in Postgres** (`auth_sessions`): keeping them in memory meant every restart logged
+ * everyone out, and a second instance would reject the first instance's tokens.
+ *
+ * The token itself is never stored — `sha256(token)` is. A database dump then leaks hashes, not
+ * usable sessions.
  */
+
+/** `sha256(token)` 的十六進位。**存這個，不存 token** —— DB 洩漏不等於 session 洩漏。 */
+export function sha256Hex(token: string): string {
+  return createHash('sha256').update(token, 'utf8').digest('hex');
+}
+
+/**
+ * Postgres 版本的 session 存放區。
+ *
+ * 為什麼是 DB 而不是 Redis：這個部署已經有 Postgres，而 session 的寫入頻率是「每次登入一次」、
+ * 讀取頻率是「每個請求一次」—— 一張小表 + 主鍵查詢完全夠。多一個 Redis 只是多一個要維運的東西。
+ *
+ * `find` 用 `now()` 過濾：**過期由資料庫判斷**，不是由應用程式的時鐘。兩個實例的時鐘差幾秒時，
+ * 使用者不會在 A 還能用、在 B 不能用。
+ */
+export class PostgresSessionRepository implements SessionRepository {
+  async save(tokenHash: string, wallet: string, expiresAt: Date): Promise<void> {
+    await query(
+      `insert into auth_sessions (token_hash, wallet, expires_at)
+       values ($1, $2, $3)
+       on conflict (token_hash) do update set wallet = excluded.wallet, expires_at = excluded.expires_at`,
+      [tokenHash, wallet.toLowerCase(), expiresAt],
+    );
+  }
+
+  async find(tokenHash: string): Promise<{ wallet: string; expiresAt: Date } | null> {
+    const result = await query<{ wallet: string; expires_at: Date }>(
+      'select wallet, expires_at from auth_sessions where token_hash = $1 and expires_at > now()',
+      [tokenHash],
+    );
+    const row = result.rows[0];
+    return row === undefined ? null : { wallet: row.wallet, expiresAt: row.expires_at };
+  }
+
+  async remove(tokenHash: string): Promise<void> {
+    await query('delete from auth_sessions where token_hash = $1', [tokenHash]);
+  }
+
+  async prune(now: Date): Promise<void> {
+    await query('delete from auth_sessions where expires_at <= $1', [now]);
+  }
+}
+
+/** 認證相關的 import（放在檔案尾端的 class 之前，避免動到既有順序）。 */
 export class AuthStore {
   readonly #now: () => number;
   readonly #auth: AuthConfig;
   readonly #nonces = new Map<string, NonceEntry>();
-  readonly #sessions = new Map<string, SessionEntry>();
+  readonly #sessions: SessionRepository;
 
   constructor(options: AuthStoreOptions = {}) {
     this.#now = options.now ?? Date.now;
     this.#auth = options.auth ?? getAuthConfig();
+    this.#sessions = options.sessions ?? new PostgresSessionRepository();
   }
 
   /** The bindings this store accepts, so the HTTP layer and clients describe the same challenge. */
@@ -207,7 +267,9 @@ export class AuthStore {
     const wallet = parsed.address.toLowerCase();
     const token = randomToken();
     const expiresAt = now + SESSION_TTL_MS;
-    this.#sessions.set(token, { wallet, expiresAt });
+    // 先把過期列清掉：這是唯一的寫入路徑，順手做就不需要一個背景排程。
+    await this.#sessions.prune(new Date(now)).catch(() => undefined);
+    await this.#sessions.save(sha256Hex(token), wallet, new Date(expiresAt));
     return { token, expiresAt: new Date(expiresAt).toISOString() };
   }
 
@@ -215,27 +277,26 @@ export class AuthStore {
    * Resolve `Authorization: Bearer <token>` to the session wallet (lowercase).
    * Every failure — missing header, wrong scheme, unknown or expired token — is 401 UNAUTHORIZED.
    */
-  authenticate(authHeader: string | null | undefined): string {
+  async authenticate(authHeader: string | null | undefined): Promise<string> {
     const token = parseBearerToken(authHeader);
+    const tokenHash = sha256Hex(token);
 
-    const session = this.#sessions.get(token);
-    if (session === undefined) throw unauthorized('missing or invalid session token');
-    if (session.expiresAt <= this.#now()) {
-      this.#sessions.delete(token);
+    const session = await this.#sessions.find(tokenHash);
+    if (session === null) throw unauthorized('missing or invalid session token');
+    if (session.expiresAt.getTime() <= this.#now()) {
+      // 過期列留著也不會被接受（上面已經擋掉），這裡刪掉只是不要讓它累積。
+      await this.#sessions.remove(tokenHash).catch(() => undefined);
       throw unauthorized('session token has expired');
     }
 
     return session.wallet;
   }
 
-  /** Drop expired entries so an idle process does not grow forever. Called on the write paths. */
+  /** Drop expired nonces (sessions are pruned by the repository). Called on the write paths. */
   #pruneExpired(): void {
     const now = this.#now();
     for (const [nonce, entry] of this.#nonces) {
       if (entry.expiresAt <= now) this.#nonces.delete(nonce);
-    }
-    for (const [token, entry] of this.#sessions) {
-      if (entry.expiresAt <= now) this.#sessions.delete(token);
     }
   }
 
@@ -388,6 +449,6 @@ export function login(message: string, signature: string): Promise<SessionCreden
   return store().login(message, signature);
 }
 
-export function authenticate(authHeader: string | null | undefined): string {
+export function authenticate(authHeader: string | null | undefined): Promise<string> {
   return store().authenticate(authHeader);
 }

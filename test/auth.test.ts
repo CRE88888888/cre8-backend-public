@@ -43,6 +43,28 @@ const PUBLISH_BODY = {
 const skipDb: boolean | string = process.env.DATABASE_URL ? false : 'DATABASE_URL is not set';
 
 /**
+ * 這個 DB 測試走真的 createStrategy / publishVersion：只要 RPC_URL / OPERATOR_PRIVATE_KEY /
+ * REGISTRY_ADDRESS 都設好，它就會真的送鏈上交易。所以除了 DATABASE_URL 之外再要 RUN_CHAIN_TESTS=1。
+ */
+const skipDbChainWrites: boolean | string =
+  skipDb !== false
+    ? skipDb
+    : process.env.RUN_CHAIN_TESTS === '1'
+      ? false
+      : 'RUN_CHAIN_TESTS=1 才會執行（這個測試會真的送鏈上交易、共用 operator 帳號的 nonce，所以預設關閉；要跑請用 RUN_CHAIN_TESTS=1 bun test --timeout=120000，不要加 --concurrent（預設 5 秒逾時太短，逾時的測試還在背景送交易，會和下一個測試撞 nonce））';
+
+/**
+ * bun 只印 `(skip) <測試名>`，不印 `skip` 的字串理由 —— 看到 `(skip)` 的人不知道為什麼、也不知道怎麼開。
+ * 所以在模組載入時自己印一次（gate 關閉才印）。
+ */
+if (skipDbChainWrites !== false) {
+  console.log(`[skip] 鏈上寫入測試未執行（${String(skipDbChainWrites)}）`);
+  console.log(
+    '[skip] 要跑請用：RUN_CHAIN_TESTS=1 bun test --timeout=120000（不要加 --concurrent：會真的送交易、共用 operator nonce）',
+  );
+}
+
+/**
  * Fixed SIWE bindings for store-level tests, so the assertions do not depend on the shell env
  * (an AUTH_DOMAIN in .env must not change the expected challenge).
  */
@@ -710,7 +732,7 @@ after(async () => {
   await closePool();
 });
 
-test('DB: provider ownership is enforced end to end over HTTP', { skip: skipDb }, async () => {
+test('DB: provider ownership is enforced end to end over HTTP', { skip: skipDbChainWrites }, async () => {
   await migrate();
   const owner = newAccount();
   const stranger = newAccount();

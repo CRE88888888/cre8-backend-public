@@ -11,10 +11,14 @@
     "dev": "bun --watch src/index.ts",
     "start": "bun src/index.ts",
     "migrate": "bun src/migrate.ts",
-    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json && tsc -p tsconfig.scripts.json",
     "test": "bun test"
   },
   "dependencies": {
+    "@scure/bip32": "1.7.0",
+    "@zerodev/ecdsa-validator": "^5.4.9",
+    "@zerodev/permissions": "5.5.11",
+    "@zerodev/sdk": "^5.5.11",
     "dotenv": "^16.6.1",
     "pg": "^8.23.1",
     "viem": "^2.57.16"
@@ -22,6 +26,7 @@
   "devDependencies": {
     "@types/node": "^22.20.5",
     "@types/pg": "^8.23.1",
+    "permissionless": "^0.5.2",
     "typescript": "^5.9.3"
   }
 }

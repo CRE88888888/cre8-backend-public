@@ -1,7 +1,8 @@
 # cre8-atp-backend
 
 CRE8 ATP 的鏈下後端（第一刀）。Bun + TypeScript + Postgres，直接用 `pg`，**不用 ORM**（與 web app 一致）。
-預設鏈是 BNB Chain mainnet（chain 56）。目前做策略資料層、版本發布與 SIWE（EIP-4361）錢包簽章 auth（共七個路由）。
+預設鏈是 BNB Chain mainnet（chain 56）。目前做策略資料層、版本發布、SIWE（EIP-4361）錢包簽章 auth、
+portfolio 續期，以及 **bundler relay**（`POST /bundler`：瀏覽器不能直連 alto，見 §bundler relay）。
 
 ## 架構
 
@@ -21,11 +22,14 @@ HTTP → src/index.ts（啟動：config → migrate → listen）
 | `src/db.ts` | 單一 `Pool`、`query()`、`withTransaction()`、`migrate()`（checksum + advisory lock）。 |
 | `src/errors.ts` | `AppError`／`ValidationError`／`NotFoundError`，讓領域層不必知道 HTTP。 |
 | `src/strategies.ts` | `listStrategies`、`getStrategy`、`createStrategy`、`publishVersion`，以及 allocation／schedule 校驗。 |
-| `src/server.ts` | 路由、body 解析（上限 1 MB）、錯誤 → JSON、access log。 |
+| `src/portfolios.ts` | `enrollPortfolio`、`listPortfolios`、`requireOwnedPortfolio`：portfolio 的讀寫與擁有者檢查。 |
+| `src/renewal.ts` | 續期：派生新 session key（`nextRenewalKeyIndex`／`buildRenewalKey`）、`buildRenewalParams`、`recordRenewalResult`。 |
+| `src/server.ts` | 路由、body 解析（上限 1 MB）、錯誤 → JSON、CORS、access log、`POST /bundler` 的 relay 與方法白名單。 |
 | `src/index.ts` | 啟動與優雅關閉（SIGINT／SIGTERM）。 |
 | `src/migrate.ts` | `bun run migrate`：只跑 migration，不啟 server。 |
 | `test/strategies.test.ts` | 校驗純函式與 HTTP 路由單測（路由層可注入 `createStrategy`／`publishVersion`，不需 DB）；DB 整合測試以 `DATABASE_URL` 為 gate。 |
 | `test/auth.test.ts` | SIWE nonce／login／session 與 provider ownership；用 viem `createSiweMessage` + 隨機錢包在測試內簽名，走完整 HTTP 流程。 |
+| `test/renewal.test.ts` | `/portfolios` 列表、`renewal-params`／`renewal-result`、路由分派、CORS 與 `/bundler` relay（含「白名單外不轉發」）；DB／鏈／時鐘／bundler 上游都以 DI 換成假替身。 |
 
 選擇 `node:http` 而不是 express：這一刀只有七個路由，少一層依賴；`server.ts` 的 `route()` 是唯一需要換掉的
 地方，之後要上 express/Fastify 不會動到領域層。
@@ -40,6 +44,10 @@ HTTP → src/index.ts（啟動：config → migrate → listen）
 | `AUTH_DOMAIN` | | `localhost` | EIP-4361 `domain`：錢包要簽的站台 authority（純 host，可帶 port，不含 scheme／path）。部署時必填自己的網域。 |
 | `AUTH_URI` | | `http://<AUTH_DOMAIN>` | EIP-4361 `uri`：這次登入指涉的資源。必須是 http/https 絕對 URI；部署時建議設 `https://app…`。 |
 | `RPC_URL` | | 空 | JSON-RPC endpoint；目前只用於 `/health` 回報是否設定。 |
+| `EXECUTOR_ADDRESS` | 續期／enroll 時 ✅ | 空 | session key CallPolicy 允許呼叫的 target（rebalance executor）。缺它時 enroll 與 `renewal-params` 會帶著變數名失敗。 |
+| `SESSION_KEY_MASTER_SEED` | 續期／enroll 時 ✅ | 空 | 派生 session key 的 HD master seed（`0x` + 64 hex）。私鑰永不落 DB，DB 只存派生路徑 `m/44'/60'/0'/0/<index>`。 |
+| `BUNDLER_URL` | | `http://127.0.0.1:3001` | `POST /bundler` 轉發的上游（alto）。`renewal-params` 也把它回給前端當**資訊**顯示。留空 = 這個預設值。 |
+| `CORS_ALLOWED_ORIGINS` | | `http://localhost:5173,http://127.0.0.1:5173` | 逗號分隔的允許 origin（完整 origin，不分大小寫）。未設定 = dev 預設；不支援 `*`。 |
 
 複製 `.env.example` 為 `.env` 即可；`.env` 不進版控。**不要**把真的 RPC URL 或連線字串寫進 repo。
 
@@ -67,6 +75,48 @@ bun test
 # 加上 DB 整合測試；請用可拋棄的資料庫，測試會跑 migration 並建立／刪除資料
 DATABASE_URL='postgres://postgres@127.0.0.1:5432/cre8_atp_test' bun test
 ```
+
+### 會送鏈上交易的測試（`RUN_CHAIN_TESTS=1`）
+
+有四個測試會**真的送出鏈上交易**：`createStrategy` 會 mirror 到 `AtpRegistry`、`publishVersion`
+會上鏈、`enrollPortfolio` 會走 counterfactual deploy。它們預設**關閉**，就算 `.env` 齊全也一樣：
+
+| 測試 | 檔案 |
+| --- | --- |
+| `DB: strategy and version round trip` | `test/strategies.test.ts` |
+| `DB: POST /strategies/:id/versions publishes a version over HTTP` | `test/strategies.test.ts` |
+| `DB: provider ownership is enforced end to end over HTTP` | `test/auth.test.ts` |
+| `enrollPortfolio mirrors to chain and writes portfolio + smart account` | `test/portfolios.test.ts` |
+
+為什麼要另外一個開關：「後端設定齊全」（`RPC_URL` / `OPERATOR_PRIVATE_KEY` / `REGISTRY_ADDRESS`）
+只代表**伺服器**能用，不代表**測試**可以動鏈。把 `.env` 補齊就自動開跑，等於讓 `bun test` 變成一支
+會寫鏈的腳本，而這幾條測試共用同一個 operator 帳號的 nonce。
+
+```bash
+# 預設：上面四個測試 skip，其餘照跑（0 fail）
+bun test
+
+# 真的跑鏈上寫入：一定要給足 timeout，而且不要開 --concurrent
+RUN_CHAIN_TESTS=1 bun test --timeout=120000
+```
+
+兩個細節，都是實測踩出來的：
+
+- **`--timeout` 不能省。** 每筆送交易 + 等 receipt 是幾秒的事（`enrollPortfolio` 那條整體實測 13–15
+  秒），bun 預設每測試 5 秒一定逾時。而逾時的測試**底層的送交易不會停**，於是下一個測試用同一個
+  operator 帳號讀到舊 nonce，就變成 `NonceTooLowError`。實測：`RUN_CHAIN_TESTS=1 bun test`
+  （不加 `--timeout`）是 4 fail，加上 `--timeout=120000` 連兩輪都是 410 pass / 0 fail。
+- **不要用 `--concurrent`。** 它會讓同一檔案內的測試並行，nonce 直接對撞。順帶一提
+  `bun test --concurrent 1` 在 bun 1.4 是**無效**的寫法：`--concurrent` 不吃值，那個 `1` 會被當成
+  檔名 filter，結果是「The following filters did not match any test files: 1」。bun 預設就是一個檔案
+  跑完再換下一個，所以正確做法是**只給 `--timeout`、不要碰 `--concurrent`**。
+
+⚠ 這四個測試會把交易送到 `RPC_URL` 指的鏈，並且在 `DATABASE_URL` 的資料庫留下 strategy 資料列。
+**只對著本機 anvil fork（例如 `http://127.0.0.1:8545`）跑，不要對著主網跑。**
+
+只**讀**鏈的測試（`test/pricing.crosscheck.test.ts`、`test/rebalance-plan.test.ts` 的真鏈驗證、
+`test/snapshot.integration.test.ts`）不受這個開關影響：它們不送交易、不佔 nonce，可以安全並行，
+skip 條件只看 fork 可不可用。
 
 ### Fork 鏈上整合測試（Anvil fork BSC mainnet）
 
@@ -120,6 +170,13 @@ cast call $REGISTRY 'enrollments(address)(uint256,uint16,bool)' $WALLET --rpc-ur
 | `POST` | `/auth/login` | body `{message, signature}`（完整 EIP-4361 訊息）；回 `{token, expiresAt}` | 200 |
 | `POST` | `/strategies` | 建立策略 metadata；**需** `Authorization: Bearer <token>` | 201 + `Location` |
 | `POST` | `/strategies/:id/versions` | 發布新版本；**需** token 且必須是該策略的 provider | 201 |
+| `GET` | `/portfolios` | 目前登入錢包的 portfolio 列表（含 gas 狀態與現行 session key）；**需** token | 200 |
+| `POST` | `/portfolios` | enroll 一個策略；**需** token，body `{strategyId}` | 201 + `Location` |
+| `GET` | `/portfolios/:id/renewal-params` | 派生一把新的 session key，回傳前端組續期 UserOp 所需的全部材料；**需** token 且必須是擁有者 | 200 |
+| `POST` | `/portfolios/:id/renewal-result` | 前端回報續期 UserOp 已上鏈，後端記進 `session_keys`；**需** token 且必須是擁有者 | 200 |
+| `POST` | `/bundler` | bundler relay：把 JSON-RPC 原樣轉給 `BUNDLER_URL` 並原樣回傳；**需** token，方法必須在白名單內 | 上游的 status |
+
+所有需要 token 的路徑都在讀 body **之前**驗證：沒帶 token 的請求即使 body 不合法也是 401，不是 400。
 
 ### Auth（SIWE／EIP-4361 + session token）
 
@@ -237,7 +294,193 @@ curl -s -X POST localhost:8080/strategies/1/versions -H "authorization: Bearer $
 `INVALID_STRATEGY`、`INVALID_SWAP_FEE`、`INVALID_ID`、`INVALID_QUERY`、`INVALID_JSON`、`NOT_FOUND`、
 `METHOD_NOT_ALLOWED`、`PAYLOAD_TOO_LARGE`、`DB_UNAVAILABLE`、`INTERNAL`、`UNAUTHORIZED`、
 `FORBIDDEN`、`INVALID_AUTH`、`INVALID_NONCE`、`NONCE_EXPIRED`、`INVALID_SIGNATURE`、
-`INVALID_SIWE_MESSAGE`、`SIWE_EXPIRED`。
+`INVALID_SIWE_MESSAGE`、`SIWE_EXPIRED`、`INVALID_RENEWAL`、`KEY_REF_CONFLICT`、`SESSION_KEY_CONFIG`、
+`BUNDLER_METHOD_NOT_ALLOWED`、`BUNDLER_UNAVAILABLE`。
+
+
+## Portfolio 與 session key 續期
+
+三支 endpoint，全部需要 `Authorization: Bearer <token>`。設計原則：**後端只做前端做不到的事** ——
+派生新的 session key（要 master seed，絕不進瀏覽器）。UserOp 的組裝、簽章、送 bundler 全在前端。
+
+### `GET /portfolios`
+
+目前登入錢包的所有 portfolio。只回 token 對應錢包的列（`lower(portfolios.user_id) = token 的錢包`），
+沒有任何「查誰」的參數，所以不存在改一個 query string 就讀到別人 portfolio 這條路。
+
+```bash
+curl -s localhost:8080/portfolios -H "authorization: Bearer $TOKEN"
+```
+
+```json
+{ "portfolios": [
+  { "id": 3, "userId": "0xabc…", "strategyId": 11, "version": 1, "scheduleState": "active",
+    "createdAt": "2026-11-06T00:00:00.000Z",
+    "smartAccounts": [ { "chainId": 56, "address": "0xdef…", "owner": "0xabc…", "accountType": "KERNEL" } ],
+    "gas": { "address": "0xdef…", "balanceWei": "50000000000000000", "minimumWei": "10000000000000000",
+             "ready": true, "shortfallWei": "0", "estimatedOps": 163, "gasPriceKnown": true },
+    "sessionKey": { "permissionId": "0xc0449df6", "sessionKeyAddress": "0x123…",
+                    "keyRef": "m/44'/60'/0'/0/787718448", "expiresAt": "2028-01-15T08:00:00.000Z",
+                    "status": "active" } }
+] }
+```
+
+- `gas` 與 `sessionKey` 取不到時是 **`null`**，不是整個請求失敗：`null` 代表「暫時查不到」，不是
+  「餘額 0」或「沒有 key」。
+- `sessionKey` 是**現行**的那一把（`status = 'active'` 優先，其次到期日新到舊）。
+- 錯誤：401 `UNAUTHORIZED`；DB 不可用 503 `DB_UNAVAILABLE`。
+
+### `GET /portfolios/:id/renewal-params`
+
+**派生一把新的 session key，回傳前端組 UserOp 所需的一切。不簽章、不上鏈、不寫 DB。**
+
+```bash
+curl -s localhost:8080/portfolios/3/renewal-params -H "authorization: Bearer $TOKEN"
+```
+
+```json
+{
+  "portfolioId": 3,
+  "strategyId": 11,
+  "chainId": 56,
+  "ownerAddress": "0xabc…",
+  "accountAddress": "0xdef…",
+  "executorAddress": "0x6069…",
+  "entryPoint": "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
+  "kernelVersion": "0.3.3",
+  "sessionKeyAddress": "0x123…",
+  "keyRef": "m/44'/60'/0'/0/787718449",
+  "validUntil": 1825512345,
+  "expiresAt": "2027-11-06T00:00:00.000Z",
+  "permissionId": "0x9ab4cdef",
+  "policySnapshot": { "version": 1, "entryPoint": "0x…", "kernelVersion": "0.3.3", "flag": "0x0000",
+                      "call": { "…": "…" }, "gas": { "…": "…" }, "timestamp": { "…": "…" },
+                      "permissionId": "0x9ab4cdef", "sessionKeyAddress": "0x123…",
+                      "expiresAt": "2027-11-06T00:00:00.000Z" },
+  "initConfig": ["0x9198bdf5…", "0xe9ae5c53…"],
+  "bundlerUrl": "http://127.0.0.1:3001"
+}
+```
+
+- `accountAddress` 是 **DB `smart_accounts.address` 的權威值，不是重新推導**：已部署帳戶的位址取決於
+  當初那組 `initConfig`，重算會落到另一個（沒部署過）的地址，見 `docs/pitfalls` §4.7。
+- `initConfig` 是兩筆 calldata，`to` 都是**帳戶自己**（帳戶內的 `msg.sender == self`）。
+- `validUntil` 是 `sessionValidUntil()` = now + 365 天（Unix 秒，uint48），`expiresAt` 是同一個瞬間的 ISO。
+- `policySnapshot` 前端不需要解，但**必須原樣回傳**給 `renewal-result`。
+- **新 key 的索引一定與既有那把不同**：`max(既有所有 key_ref 的索引, base) + 1`，其中
+  `base = keccak256(owner, strategyId) % 2^31`。同一秒內重打這支 endpoint 會回**完全相同**的 key
+  （索引只依賴 DB 狀態、`validUntil` 只到秒），所以前端逾時重試不會拿到另一把 key 去簽前一個 op。
+- 錯誤：401 `UNAUTHORIZED`；404 `NOT_FOUND`（portfolio 不存在，或它沒有任何 smart account）；
+  403 `FORBIDDEN`（不是你的）；400 `INVALID_ID`；500 `SESSION_KEY_CONFIG`（缺 `EXECUTOR_ADDRESS` 或
+  `SESSION_KEY_MASTER_SEED`，訊息會指出缺哪一個）。
+
+### `POST /portfolios/:id/renewal-result`
+
+前端把已上鏈的續期結果記回 DB。**鏈是權威**，所以這裡不驗證 txHash 是否真的上鏈，只記錄。
+
+```bash
+curl -s -X POST localhost:8080/portfolios/3/renewal-result \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{
+  "txHash": "0x…", "userOpHash": "0x…",
+  "permissionId": "0x9ab4cdef", "sessionKeyAddress": "0x123…",
+  "keyRef": "m/44'\''/60'\''/0'\''/0/787718449", "validUntil": 1825512345,
+  "policySnapshot": { "…": "…" }
+}'
+# {"ok":true,"recorded":{"keyRef":"m/44'/60'/0'/0/787718449","permissionId":"0x9ab4cdef"}}
+# 重複提交（同一個 keyRef 再送一次）：
+# {"ok":true,"recorded":{"…":"…"},"duplicate":true}
+```
+
+寫入的是一列**新的** `session_keys`（`permissions` = `policySnapshot`，`expires_at` = `validUntil`，
+`status = 'active'`），SQL 是 `insert … on conflict (key_ref) do nothing`：
+
+- **舊的那一列一個字都不動**：舊權限在鏈上仍然有效到它自己的 `expires_at`，改它的 status 會讓 DB 說一件
+  鏈上不成立的事。
+- 重複提交不是錯誤：`on conflict do nothing` 之後 `returning` 是空的，回應帶 `duplicate: true`，列的數量
+  不變。
+- 同一個 `keyRef` 已屬於**別的** portfolio 時回 409 `KEY_REF_CONFLICT`（那不是重複提交，是兩個 portfolio
+  搶同一把 key）。
+- 錯誤：401 `UNAUTHORIZED`；404 `NOT_FOUND`；403 `FORBIDDEN`；400 `INVALID_RENEWAL`（缺 `keyRef`／
+  `permissionId`、`validUntil` 不在 uint48 內、`policySnapshot` 不是物件）、`INVALID_ID`、`INVALID_JSON`。
+
+### 前端拿到 `renewal-params` 之後還缺什麼
+
+缺兩樣，而且**全部刻意放在前端**：`ownerAddress` 的 **sudo 簽章者**（後端沒有使用者的 owner 私鑰，
+也不該有）、以及 **gas 參數**（`maxFeePerGas`／`maxPriorityFeePerGas`，前端讀鏈現況）。UserOp 的
+`sender` 是 `accountAddress`、`callData` 由 `initConfig` 那兩筆 call 組成 —— 這些都在前端組，後端不碰。
+
+**送 bundler 的傳輸層是後端的 `POST /bundler`**，不是前端自己連 alto：回應裡的 `bundlerUrl` 只是
+「後端會打哪裡」的資訊，前端不拿它發請求（原因見下一節）。
+
+## CORS
+
+瀏覽器從別的 origin（vite dev 的 `http://localhost:5173`）打這支 API 時，preflight 由
+`src/server.ts` 回答：
+
+- 允許的 origin 來自 `CORS_ALLOWED_ORIGINS`（逗號分隔的**完整 origin**；未設定 = 上面那組 dev 預設）。
+- `OPTIONS` → `204`，帶 `Access-Control-Allow-Methods`（`GET, POST, OPTIONS`）、
+  `Access-Control-Allow-Headers`（`authorization, content-type`）、`Access-Control-Max-Age`（600）、
+  `Access-Control-Allow-Origin`（**回具體 origin**）與 `Access-Control-Allow-Credentials: true`。
+- 每個回應（含 401／404／405）都帶 `Access-Control-Allow-Origin` 與 `Vary: Origin`：同一條 URL 會因為
+  Origin 不同而回應不同標頭，快取必須按 Origin 分開。
+- **不在清單裡的 origin 不會拿到任何 CORS 標頭**（讓瀏覽器自己擋），但請求照常處理完 —— CORS 是瀏覽器的
+  規則，不是認證；能不能存取由 `Authorization` 決定。
+- 刻意不支援 `*`：請求帶 `Authorization`，而 `*` 不能與 credentials 併用。
+
+## bundler relay（`POST /bundler`）
+
+### 為什麼需要
+
+**alto v1.2.5 完全沒有 CORS 支援**：`--help` 沒有相關選項，`OPTIONS` 請求回 404 且回應不帶任何
+`access-control-*` 標頭（v1.2.8 才有 `enable-cors`，但它對 EntryPoint v0.7 的 SafeValidator 是壞的）。
+所以瀏覽器直連 bundler 一律被 preflight 擋掉：
+
+```
+Access to fetch at 'http://127.0.0.1:3001/' from origin 'http://localhost:5173'
+has been blocked by CORS policy: No 'Access-Control-Allow-Origin' header
+```
+
+**這不是 dev 問題 —— 生產環境一樣。** 瀏覽器永遠無法直連 bundler，所以 UserOp 只能由這支 API 代送。
+這支 API 自己已經有 CORS（上一節），前端只需要一個 same-origin（或已列入允許清單）的 `/bundler`。
+
+### 契約
+
+```bash
+curl -s -X POST localhost:8080/bundler   -H "authorization: Bearer $TOKEN" -H 'content-type: application/json'   -d '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
+# {"jsonrpc":"2.0","id":1,"result":"0x38"}
+```
+
+- 請求 body **就是** JSON-RPC 信封（`{jsonrpc, id, method, params}`），後端**原樣轉發**收到的 bytes
+  （不重新序列化），到 `BUNDLER_URL`。
+- 回應也是**上游的 status 與原始 bytes**，含 `result` 或 `error`。**JSON-RPC 的錯誤形狀不改寫**——
+  前端要靠 `{code, message, data}` 的原文診斷 AA 錯誤，重新包一層等於把唯一有用的線索丟掉。
+- 需要 `Authorization: Bearer <token>`（順序與其他寫入路由一致：先驗 token，再讀 body）。
+- 上游 timeout 30 秒。
+
+### 方法白名單
+
+只有這六個會被轉發，其餘一律 `403` 且**不轉發**（檢查在 `fetch` 之前）：
+
+```
+eth_sendUserOperation   eth_estimateUserOperationGas   eth_getUserOperationReceipt
+eth_getUserOperationByHash   eth_supportedEntryPoints   eth_chainId
+```
+
+是**白名單**而不是黑名單：這支 relay 帶著使用者的 session token，能碰到 bundler 就等於能代替使用者發
+UserOp；黑名單永遠會漏一個方法，白名單漏掉的代價只是一個 403。
+
+### 錯誤碼
+
+| 情況 | status | code |
+| --- | --- | --- |
+| 沒帶／帶錯 token | 401 | `UNAUTHORIZED` |
+| body 不是合法 JSON、或不是物件 | 400 | `INVALID_JSON` |
+| `method` 不在白名單、或沒有 `method` | **403** | `BUNDLER_METHOD_NOT_ALLOWED` |
+| 上游連不上／timeout | **502** | `BUNDLER_UNAVAILABLE` |
+
+502 的訊息帶上游位址（例：`bundler http://127.0.0.1:3001/ 無法連上（eth_chainId，timeout 30000ms）：…`），
+但 URL 的 userinfo 會被剝掉——bundler 的 API key 常常就嵌在那裡，印出去等於寫進 log 與瀏覽器。
+這條路徑不碰任何私鑰，回應裡也不會出現 `0x` + 64 hex 這種東西。
 
 ## Migration
 

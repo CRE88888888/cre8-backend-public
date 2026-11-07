@@ -28,6 +28,29 @@ const skipDb: boolean | string = process.env.DATABASE_URL
   ? false
   : 'DATABASE_URL is not set';
 
+/**
+ * 會送鏈上交易的測試要另外 opt-in：createStrategy 會 mirror 到 AtpRegistry、publishVersion 會上鏈，
+ * 只要 RPC_URL / OPERATOR_PRIVATE_KEY / REGISTRY_ADDRESS 都設好（＝後端設定齊全）就會真的送出去。
+ * 「後端有設定」不該等於「測試可以送交易」，所以這裡再要一個明確的 RUN_CHAIN_TESTS=1。
+ */
+const skipChainWrites: boolean | string =
+  skipDb !== false
+    ? skipDb
+    : process.env.RUN_CHAIN_TESTS === '1'
+      ? false
+      : 'RUN_CHAIN_TESTS=1 才會執行（這個測試會真的送鏈上交易、共用 operator 帳號的 nonce，所以預設關閉；要跑請用 RUN_CHAIN_TESTS=1 bun test --timeout=120000，不要加 --concurrent（預設 5 秒逾時太短，逾時的測試還在背景送交易，會和下一個測試撞 nonce））';
+
+/**
+ * bun 只印 `(skip) <測試名>`，不印 `skip` 的字串理由 —— 看到 `(skip)` 的人不知道為什麼、也不知道怎麼開。
+ * 所以在模組載入時自己印一次（gate 關閉才印）。
+ */
+if (skipChainWrites !== false) {
+  console.log(`[skip] 鏈上寫入測試未執行（${String(skipChainWrites)}）`);
+  console.log(
+    '[skip] 要跑請用：RUN_CHAIN_TESTS=1 bun test --timeout=120000（不要加 --concurrent：會真的送交易、共用 operator nonce）',
+  );
+}
+
 function expectValidationError(fn: () => unknown, code: string): void {
   assert.throws(fn, (err: unknown) => {
     assert.ok(err instanceof ValidationError, `expected ValidationError, got ${String(err)}`);
@@ -452,7 +475,7 @@ test('DB: migrate records 0001_init.sql', { skip: skipDb }, async () => {
   assert.equal(rows.length, 1);
 });
 
-test('DB: strategy and version round trip', { skip: skipDb }, async () => {
+test('DB: strategy and version round trip', { skip: skipChainWrites }, async () => {
   const name = `it-strategy-${randomUUID()}`;
   const strategy = await createStrategy(
     {
@@ -551,7 +574,7 @@ test('DB: strategy and version round trip', { skip: skipDb }, async () => {
   }
 });
 
-test('DB: POST /strategies/:id/versions publishes a version over HTTP', { skip: skipDb }, async () => {
+test('DB: POST /strategies/:id/versions publishes a version over HTTP', { skip: skipChainWrites }, async () => {
   await migrate();
   const strategy = await createStrategy(
     { name: `it-http-${randomUUID()}`, isPublic: false },

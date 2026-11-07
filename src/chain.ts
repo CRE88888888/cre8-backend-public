@@ -8,8 +8,11 @@ import {
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { bsc } from 'viem/chains';
-import type { PublicClient, WalletClient, Address, Account } from 'viem';
+import type { PublicClient, WalletClient, Address, Account, Hex } from 'viem';
+import { kernelAddressesForChain } from './addresses.js';
 import { getConfig } from './config.js';
+import { assertKernelInfraDeployed, computeSalt, getKernelAccountParams } from './kernel.js';
+import type { KernelAccountOptions } from './kernel.js';
 import type { RebalanceSchedule } from './strategies.js';
 
 /**
@@ -79,11 +82,14 @@ const REGISTRY_ABI = [
 ] as const;
 
 export type ChainConfig = {
+  chainId: number;
   rpcUrl: string;
   registryAddress: Address;
   account: Account;
   wallet: WalletClient;
   publicClient: PublicClient;
+  /** Kernel v3.3 canonical addresses for `chainId` (throws while resolving an unsupported chain). */
+  kernel: ReturnType<typeof kernelAddressesForChain>;
 };
 
 let cached: ChainConfig | null = null;
@@ -108,11 +114,13 @@ export function getChain(): ChainConfig {
   const wallet = createWalletClient({ chain: bsc, transport: http(config.rpcUrl), account });
 
   cached = {
+    chainId: config.chainId,
     rpcUrl: config.rpcUrl,
     registryAddress: config.registryAddress as Address,
     account,
     wallet,
     publicClient,
+    kernel: kernelAddressesForChain(config.chainId),
   };
   return cached;
 }
@@ -187,7 +195,7 @@ export async function publishVersionOnchain(
   return decodeReturnedId(receipt.logs, 'VersionPublished', 'version');
 }
 
-/** Enroll `account` (the authenticated wallet, an EOA for now) into `onchainId`. */
+/** Enroll `account` (the user's Kernel smart account) into `onchainId`. */
 export async function enrollOnchain(account: Address, onchainId: number): Promise<void> {
   const { wallet, publicClient, registryAddress, account: operator } = getChain();
 
@@ -200,6 +208,84 @@ export async function enrollOnchain(account: Address, onchainId: number): Promis
     args: [account, BigInt(onchainId)],
   });
   await publicClient.waitForTransactionReceipt({ hash });
+}
+
+/**
+ * `deploySmartAccount` 的選配。
+ *
+ * 第三個參數從 `ChainConfig` 改成這包物件，是為了讓「帳戶上要裝什麼」擠得進來：`plugins` 決定誰簽，
+ * `initConfig` 決定權限有沒有安裝。production 兩者必須一起給（見 src/kernel.ts 的說明）：
+ * 只給 `plugins` 會得到「有 validator、但權限沒安裝」的帳戶，而且地址不變、不會有任何錯誤提示。
+ */
+export type DeploySmartAccountOptions = {
+  /** 測試注入用；production 走 `getChain()`。 */
+  chain?: ChainConfig;
+  /** sudo（owner 的 ECDSA）＋ regular（session key 的 permission validator）。不給 = 只有 owner 的 sudo。 */
+  plugins?: KernelAccountOptions['plugins'];
+  /** 隨帳戶建立一起安裝的權限 calldata：**唯一**會改變 counterfactual 地址的東西。 */
+  initConfig?: Hex[];
+};
+
+/**
+ * Resolve the caller's Kernel v3.3 counterfactual account, deploying it if the chain has no code
+ * there yet. One account per (owner, strategyId): `computeSalt` bakes strategyId into the salt, so
+ * the address is a pure function of the pair and a redeploy is impossible.
+ *
+ * `options.chain` is an injection seam for unit tests; production always uses getChain().
+ */
+export async function deploySmartAccount(
+  owner: Address,
+  strategyId: bigint,
+  options: DeploySmartAccountOptions = {},
+): Promise<{ address: Address; deployed: boolean }> {
+  const chain = options.chain ?? getChain();
+  const { publicClient, wallet, account: operator } = chain;
+
+  // Fail fast when EntryPoint / MetaFactory are missing: computing the address would revert opaquely.
+  await assertKernelInfraDeployed(publicClient);
+
+  // One SDK call yields the address and the deployment bytes, so the address is derived from exactly
+  // the calldata that is about to be sent (a second derivation could silently disagree). `initConfig`
+  // is part of that derivation: with it the new account also installs the session-key permissions,
+  // which is why such an account has a different (and correct) address.
+  const salt = computeSalt(owner, strategyId);
+  const { address, factory, factoryData } = await getKernelAccountParams(publicClient, owner, salt, {
+    plugins: options.plugins,
+    initConfig: options.initConfig,
+  });
+
+  const code = await publicClient.getCode({ address });
+  if (code !== undefined && code !== '0x') return { address, deployed: false };
+
+  // factoryData is the MetaFactory `deployWithFactory(KernelFactory, initData, salt)` calldata, built
+  // by the SDK; getKernelAccountParams has already refused anything but the MetaFactory.
+  const hash = await wallet.sendTransaction({ account: operator, chain: bsc, to: factory, data: factoryData });
+  await publicClient.waitForTransactionReceipt({ hash });
+
+  return { address, deployed: true };
+}
+
+/**
+ * 某個地址的 BNB 餘額（wei）。對 smart account 而言這就是 UserOp 的 gas 預付餘額 —— gas 由
+ * `sender` 付，不是簽名的 session key 付（見 docs/pitfalls.zh-TW.md §3.10）。
+ *
+ * `chain` 是單元測試注入用的接縫：production 一律走 `getChain()`，形狀與
+ * `deploySmartAccount` 的 `options.chain` 相同。
+ */
+export async function getAccountGasBalance(address: Address, chain?: ChainConfig): Promise<bigint> {
+  const { publicClient } = chain ?? getChain();
+  return publicClient.getBalance({ address });
+}
+
+/**
+ * 當前有效 gas price（wei），用來估「這筆餘額還能跑幾次 op」。
+ *
+ * 不在這裡吞錯誤：取不到 gas price 的處理方式取決於呼叫端（enroll 選擇讓整包成功、gas 狀態留白，
+ * 腳本選擇直接失敗），所以這裡失敗就拋。
+ */
+export async function getGasPriceWei(chain?: ChainConfig): Promise<bigint> {
+  const { publicClient } = chain ?? getChain();
+  return publicClient.getGasPrice();
 }
 
 /** Deterministic keccak256 of a canonical schedule string, mirroring what a keeper would read. */

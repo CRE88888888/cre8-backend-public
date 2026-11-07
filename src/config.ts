@@ -1,4 +1,5 @@
 import { config as loadDotenv } from 'dotenv';
+import type { Address, Hex } from 'viem';
 
 /**
  * Settings the auth layer needs to build and check an EIP-4361 (SIWE) challenge. Kept separate
@@ -12,6 +13,35 @@ export type AuthConfig = {
   authUri: string;
   /** EIP-155 chain id the signed message must be bound to. Default 56 (BNB Chain mainnet). */
   chainId: number;
+};
+
+/**
+ * Session key（Kernel permission validator）需要的兩個設定。
+ *
+ * 與 `AuthConfig` 分開、**不進 `Config`** 的理由有二：`src/permissions.ts` 不該為了算一個派生地址
+ * 去要 `DATABASE_URL`；而且這兩個值在「沒有開啟 session key 功能」的行程裡完全用不到，設成必填會讓
+ * 啟動與既有測試一起掛掉。取用請走 `requireSessionKeyConfig()`：真的需要時才失敗，訊息帶著缺哪一個。
+ */
+export type SessionKeyConfig = {
+  /** Session key CallPolicy 的 target（rebalance executor）；null = 未設定。 */
+  executorAddress: Address | null;
+  /** HD 派生的 master seed（32-byte hex）；null = 未設定。私鑰不落 DB，DB 只存派生路徑。 */
+  sessionKeyMasterSeed: Hex | null;
+};
+
+/**
+ * 「這個 smart account 還能不能發 UserOp」的門檻，只有一個值：帳戶至少要有的 BNB 餘額（wei）。
+ *
+ * 為什麼不進 `Config`：`loadConfig` 的回傳形狀被 `test/strategies.test.ts` 用 `deepEqual` 釘死，
+ * 而且沒有開啟 session key 的行程完全不看這個值。取用請走 `getGasConfig()`（同 `AuthConfig` /
+ * `SessionKeyConfig` 的模式）。
+ *
+ * 為什麼是 bigint：預設 0.01 BNB = 10^16 wei 已經超過 `Number.MAX_SAFE_INTEGER`（≈9.007×10^15），
+ * 用 `Number`/`parseInt` 解析會安靜地失真，所以整條路徑都是 bigint。
+ */
+export type GasConfig = {
+  /** 帳戶餘額門檻（wei）。與 session key GasPolicy 的 1 BNB 上限是同一個量級，存更多也用不到。 */
+  minSessionGasWei: bigint;
 };
 
 export type Config = AuthConfig & {
@@ -30,9 +60,13 @@ export type Config = AuthConfig & {
 export const DEFAULT_PORT = 8080;
 export const DEFAULT_CHAIN_ID = 56;
 export const DEFAULT_AUTH_DOMAIN = 'localhost';
+/** 0.01 BNB ≈ 33 次 rebalance op（一次約 250k gasUsed @ ~1.22 gwei ≈ 0.0003 BNB）。 */
+export const DEFAULT_MIN_SESSION_GAS_WEI = 10n ** 16n;
 
 let cachedConfig: Config | null = null;
 let cachedAuthConfig: AuthConfig | null = null;
+let cachedSessionKeyConfig: SessionKeyConfig | null = null;
+let cachedGasConfig: GasConfig | null = null;
 
 /**
  * Pure parser: reads the given env object, applies defaults, throws on bad values.
@@ -86,6 +120,67 @@ export function getAuthConfig(): AuthConfig {
   return cachedAuthConfig;
 }
 
+/**
+ * Pure parser for the session-key settings alone. Independent of `DATABASE_URL`, like `loadAuthConfig`,
+ * so `src/permissions.ts` and its unit tests work with no database configured.
+ */
+export function loadSessionKeyConfig(env: NodeJS.ProcessEnv = process.env): SessionKeyConfig {
+  return {
+    executorAddress: parseOptionalAddress(env, 'EXECUTOR_ADDRESS'),
+    sessionKeyMasterSeed: parseOptionalSeed(env, 'SESSION_KEY_MASTER_SEED'),
+  };
+}
+
+/** Cached session-key config. Same lazy pattern as getConfig(), minus the DATABASE_URL requirement. */
+export function getSessionKeyConfig(): SessionKeyConfig {
+  if (cachedSessionKeyConfig) return cachedSessionKeyConfig;
+  loadDotenv({ override: false });
+  cachedSessionKeyConfig = loadSessionKeyConfig(process.env);
+  return cachedSessionKeyConfig;
+}
+
+/**
+ * Pure parser for the gas-threshold settings alone. Independent of `DATABASE_URL`, like the other
+ * small loaders, so a process that only reads balances needs no database.
+ */
+export function loadGasConfig(env: NodeJS.ProcessEnv = process.env): GasConfig {
+  return { minSessionGasWei: parseBigInt(env, 'MIN_SESSION_GAS_WEI', DEFAULT_MIN_SESSION_GAS_WEI) };
+}
+
+/** Cached gas config. Same lazy pattern as getConfig(), minus the DATABASE_URL requirement. */
+export function getGasConfig(): GasConfig {
+  if (cachedGasConfig) return cachedGasConfig;
+  loadDotenv({ override: false });
+  cachedGasConfig = loadGasConfig(process.env);
+  return cachedGasConfig;
+}
+
+/**
+ * 真正要用 session key 時才呼叫的守門員：兩個設定缺任何一個就拋錯，訊息指出缺哪一個與它的用途。
+ *
+ * 刻意不在 `loadConfig` 做這件事 —— 那會讓「沒用到 session key」的行程（含既有測試）因為一個
+ * 空值而啟動失敗。這裡接受 `env` 參數，讓測試不必動 `process.env`。
+ */
+export function requireSessionKeyConfig(env: NodeJS.ProcessEnv = process.env): {
+  executorAddress: Address;
+  masterSeed: Hex;
+} {
+  const { executorAddress, sessionKeyMasterSeed } = loadSessionKeyConfig(env);
+
+  const missing: string[] = [];
+  if (executorAddress === null) missing.push('EXECUTOR_ADDRESS');
+  if (sessionKeyMasterSeed === null) missing.push('SESSION_KEY_MASTER_SEED');
+  if (executorAddress === null || sessionKeyMasterSeed === null) {
+    throw new Error(
+      `Session key 設定不完整：缺少 ${missing.join(' 與 ')}（見 backend/.env.example）。` +
+        `EXECUTOR_ADDRESS 是 session key CallPolicy 允許呼叫的 target；` +
+        `SESSION_KEY_MASTER_SEED 是派生 session key 的 HD master seed（0x + 64 hex）`,
+    );
+  }
+
+  return { executorAddress, masterSeed: sessionKeyMasterSeed };
+}
+
 function parseInteger(
   env: NodeJS.ProcessEnv,
   name: string,
@@ -106,16 +201,48 @@ function parseInteger(
 }
 
 /**
- * Optional on-chain address (0x + 40 hex), normalised to lowercase. Empty means "not configured".
- * Used for REGISTRY_ADDRESS; the chain layer treats a null value as "chain disabled".
+ * Wei 等級的整數解析：只收純十進位數字。
+ *
+ * 不能沿用 `parseInteger`：它的 `Number(raw)` 對 10^16 以上會失真。也不直接丟給 `BigInt`，因為
+ * `BigInt('0x10')` 會成功（當成 hex）、`BigInt(' 1 ')` 又會吞掉空白，兩者都讓一個打錯的 wei 值
+ * 安靜地變成另一個數字。先擋形狀，再交給 BigInt（它自己不會溢位）。
  */
-function parseOptionalAddress(env: NodeJS.ProcessEnv, name: string): string | null {
+function parseBigInt(env: NodeJS.ProcessEnv, name: string, fallback: bigint): bigint {
+  const raw = env[name]?.trim();
+  if (raw === undefined || raw === '') return fallback;
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`${name} must be a decimal integer amount of wei (digits only), got "${raw}"`);
+  }
+  return BigInt(raw);
+}
+
+/**
+ * Optional on-chain address (0x + 40 hex), normalised to lowercase. Empty means "not configured".
+ * Used for REGISTRY_ADDRESS and EXECUTOR_ADDRESS; callers treat a null value as "not configured".
+ */
+function parseOptionalAddress(env: NodeJS.ProcessEnv, name: string): Address | null {
   const raw = env[name]?.trim();
   if (raw === undefined || raw === '') return null;
   if (!/^0x[0-9a-fA-F]{40}$/.test(raw)) {
     throw new Error(`${name} must be a 0x-prefixed 20-byte hex address, got "${raw}"`);
   }
-  return raw.toLowerCase();
+  // 上面那條 regex 已保證形狀與長度，這裡只是把驗證過的結果收窄成 viem 的 Address。
+  return raw.toLowerCase() as Address;
+}
+
+/**
+ * Optional 32-byte hex seed (0x + 64 hex), lowercased. Empty means "not configured".
+ *
+ * 形狀在這裡就驗掉：截斷或打錯的 seed 會派生出一組「看起來正常但對不上鏈上帳戶」的地址，
+ * 等到那時才發現要查很久，所以在解析階段就帶著變數名炸掉。
+ */
+function parseOptionalSeed(env: NodeJS.ProcessEnv, name: string): Hex | null {
+  const raw = env[name]?.trim();
+  if (raw === undefined || raw === '') return null;
+  if (!/^0x[0-9a-fA-F]{64}$/.test(raw)) {
+    throw new Error(`${name} must be a 0x-prefixed 32-byte hex seed (64 hex chars), got "${raw}"`);
+  }
+  return raw.toLowerCase() as Hex;
 }
 
 /**

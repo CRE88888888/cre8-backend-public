@@ -1578,9 +1578,9 @@ async function runOne(
     const followUpAt = new Date(ctx.now.getTime() + followUpSeconds * 1_000);
     if (followUpAt.getTime() < result.nextRunAt.getTime()) {
       const note =
-        `部分執行：執行後預估漂移仍有 ${result.partial.remainingDriftBps} bps` +
-        `（${result.partial.shrunk.length === 0 ? '缺口是被跳過而不是被縮小' : `其中 ${result.partial.shrunk.length} 步被價格衝擊上限縮小`}），` +
-        `next_run_at 提前到 ${followUpAt.toISOString()}（${followUpSeconds}s，完整間隔是 ${due.intervalSeconds}s）`;
+        `Partial execution: estimated drift is still ${result.partial.remainingDriftBps} bps after this round` +
+        ` (${result.partial.shrunk.length === 0 ? 'the gap was skipped rather than shrunk' : `${result.partial.shrunk.length} step(s) were shrunk by the impact budget`});` +
+        ` next_run_at moved up to ${followUpAt.toISOString()} (${followUpSeconds}s, full interval is ${due.intervalSeconds}s)`;
       try {
         await ctx.deps.query(SQL_ADVANCE_CLAIMED, [[due.portfolioId], [followUpAt.toISOString()]]);
         result = { ...result, nextRunAt: followUpAt, reason: `${result.reason}；${note}` };
@@ -1642,14 +1642,14 @@ async function decideAndMaybeExecute(
       ...base,
       outcome: 'noop',
       reason:
-        `漂移 ${plan.report.grossDriftBps}bps 未達門檻 ${plan.report.thresholdBps}bps（最大單一資產差 ` +
-        `${plan.report.maxAbsDeltaBps}bps），不需要再平衡`,
+        `Drift ${plan.report.grossDriftBps} bps is below the ${plan.report.thresholdBps} bps threshold ` +
+        `(largest single delta ${plan.report.maxAbsDeltaBps} bps); nothing to rebalance`,
     };
   }
 
   const rebalance = await ctx.deps.planRebalance({ portfolioId: due.portfolioId, account: due.account, plan });
   if (rebalance.kind === 'noop') {
-    return { ...base, outcome: 'noop', reason: `規劃器回 noop：${rebalance.reason}` };
+    return { ...base, outcome: 'noop', reason: `Planner returned noop: ${rebalance.reason}` };
   }
   if (rebalance.kind === 'blocked') {
     return { ...base, outcome: 'blocked', reason: `規劃器擋下（不執行）：${rebalance.reason}` };
@@ -1657,7 +1657,12 @@ async function decideAndMaybeExecute(
   if (rebalance.steps.length === 0) {
     // planRebalance 的型別結構保證非空；這一條是給「未來有人改了那份保證」的防線。
     // 空 steps 的 executeRebalance 在鏈上**正常返回、什麼都不換**（docs/pitfalls §8.1），所以它必須 blocked。
-    return { ...base, outcome: 'blocked', reason: '規劃器回 ready 但 steps 是空的：空 steps 在鏈上會「成功」而什麼都沒換，拒絕送出' };
+    return {
+      ...base,
+      outcome: 'blocked',
+      reason:
+        'Planner returned ready but the steps are empty: empty steps "succeed" on-chain while swapping nothing, so nothing is sent',
+    };
   }
 
   // ---- ⑤ 送出前重問地板：`rebalance.steps` 的 `amountOutMin` 是**規劃當時**的地板 --------------
@@ -1735,8 +1740,8 @@ async function decideAndMaybeExecute(
       outcome: 'blocked',
       reason:
         (ctx.dryRun
-          ? '前置檢查未通過（dry-run 也擋：`--live` 時同樣不會送出，所以這裡不顯示 ready）'
-          : '前置檢查未通過（不送一筆注定失敗的交易）') +
+          ? 'Pre-checks failed (dry-run blocks it too: `--live` would not send either, so this is not reported as ready)'
+          : 'Pre-checks failed (not sending a transaction that is certain to fail)') +
         '：' +
         prechecks.failures.map((failure) => `[${failure.code}] ${failure.detail}`).join('；'),
     };
@@ -1754,10 +1759,10 @@ async function decideAndMaybeExecute(
       ...withPlan,
       outcome: 'ready-dry-run',
       reason:
-        `將要執行 ${steps.length} 個 step（dry-run：沒有送出任何交易；parameters 見 plan，` +
-        `live 時 idempotency_key 會是 ${idempotencyKey}）；前置檢查 a/a2/b/c 都通過 —— ` +
-        `session key ${sessionKey.keyRef}(${sessionKey.permissionId}) 在鏈上已安裝、seed 派生相符、` +
-        `allowance 與餘額都夠`,
+        `Would execute ${steps.length} step(s) (dry-run: nothing is sent; see the plan for the parameters; ` +
+        `when live the idempotency_key would be ${idempotencyKey}). Pre-checks a/a2/b/c all pass — ` +
+        `session key ${sessionKey.keyRef}(${sessionKey.permissionId}) is installed on-chain, derives from the seed, ` +
+        `and allowance plus balance are sufficient`,
     };
   }
 
@@ -1804,7 +1809,12 @@ async function decideAndMaybeExecute(
     }
   }
   if (execution.status === 'success') {
-    return { ...withPlan, outcome: 'executed', reason: `已上鏈：tx ${execution.txHash ?? '(unknown)'}（第 ${gate.attempts} 次嘗試）`, execution };
+    return {
+      ...withPlan,
+      outcome: 'executed',
+      reason: `Landed on-chain: tx ${execution.txHash ?? '(unknown)'} (attempt ${gate.attempts})`,
+      execution,
+    };
   }
   if (execution.status === 'reverted') {
     return {
@@ -1820,7 +1830,7 @@ async function decideAndMaybeExecute(
     ...withPlan,
     outcome: 'failed',
     reason:
-      `送出失敗（沒有上鏈）：${execution.error ?? '(沒有錯誤訊息)'}` +
+      `Send failed (nothing landed): ${execution.error ?? '(no error message)'}` +
       `（第 ${gate.attempts} 次嘗試，operations 記為 failed）`,
     execution,
   };

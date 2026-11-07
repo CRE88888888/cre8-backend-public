@@ -757,8 +757,8 @@ function partialNoteOf(
   const shrunk = leg.shrunk;
   if (shrunk === null) return '';
   return (
-    `（⚠ 部分執行：理想 ${shrunk.idealAmountIn} 的估算衝擊 ${shrunk.idealImpactBps} bps 超過上限 ${maxImpactBps} bps，` +
-    `本次只送 ${leg.amountIn}（${shrunk.impactBps} bps）；剩餘由下一輪處理）`
+    `(⚠ partial execution: the ideal ${shrunk.idealAmountIn} would have an estimated impact of ${shrunk.idealImpactBps} bps, ` +
+    `which exceeds the ${maxImpactBps} bps budget; sending ${leg.amountIn} instead (${shrunk.impactBps} bps), the rest goes to the next round)`
   );
 }
 
@@ -830,8 +830,8 @@ function sameAsset(a: string, b: string): boolean {
  */
 function noImprovementReason(pre: DriftReport, post: DriftReport, stepCount: number, tail: string): string {
   return (
-    `不送：這個計畫（${stepCount} 個 step）執行後預估漂移 ${post.grossDriftBps} bps，` +
-    `不比現在的 ${pre.grossDriftBps} bps 低 —— 送出去只是付 gas${tail}`
+    `Not sending: this plan (${stepCount} step(s)) would leave estimated drift at ${post.grossDriftBps} bps, ` +
+    `which is not below the current ${pre.grossDriftBps} bps — sending it would only cost gas${tail}`
   );
 }
 
@@ -843,13 +843,13 @@ function describePostDrift(pre: DriftReport, post: DriftReport | null, partial: 
       '這一輪要買進現在沒有持倉的資產，那筆到手量沒有價格可估 → 不套用「不改善就不送」的守衛'
     );
   }
-  const head = `執行後預估漂移 ${post.grossDriftBps} bps（現在 ${pre.grossDriftBps}、門檻 ${post.thresholdBps} bps）`;
-  if (partial === null) return `${head} → 預估已收斂，這一輪就是完整的一輪`;
+  const head = `Estimated drift after this round ${post.grossDriftBps} bps (now ${pre.grossDriftBps}, threshold ${post.thresholdBps} bps)`;
+  if (partial === null) return `${head} → converged; this round is the whole job`;
   const shrunkNote =
     partial.shrunk.length === 0
-      ? '缺口是被跳過而不是被縮小'
-      : `其中 ${partial.shrunk.length} 步被價格衝擊上限縮小`;
-  return `${head} → 仍高於門檻，還有缺口（${shrunkNote}），剩下的留給下一輪`;
+      ? 'the gap was skipped rather than shrunk'
+      : `${partial.shrunk.length} step(s) were shrunk by the impact budget`;
+  return `${head} → still above the threshold; work remains (${shrunkNote}), the rest goes to the next round`;
 }
 
 /**
@@ -903,7 +903,7 @@ async function detectOracleShape(
     kind: 'unknown',
     detail:
       `oracle ${short(oracle)} 既沒有單池介面（pool/token0/token1）也沒有 numeraire()：` +
-      `判不出它報得岀哪些 pair（${detail}）`,
+      `cannot tell which pairs it can quote (${detail})`,
   };
 }
 
@@ -983,7 +983,7 @@ async function quoteHub(
     const name = revertNameOf(quote.error);
     return {
       skip:
-        `previewSwap(${short(tokenIn)} → ${short(tokenOut)}, ${amountIn}) 現在報不出價` +
+        `previewSwap(${short(tokenIn)} → ${short(tokenOut)}, ${amountIn}) cannot quote right now` +
         `（${name ?? (quote.error instanceof Error ? quote.error.message : String(quote.error))}）`,
     };
   }
@@ -1086,18 +1086,18 @@ async function capLegByImpact(params: {
   if (cap.amountIn === 0n || cap.amountIn * BPS_BIG < amountIn * BigInt(MIN_STEP_BPS_OF_IDEAL)) {
     return {
       skip:
-        `${label}：估算衝擊 ${cap.idealEstimate.impactBps} bps 超過上限 ${maxImpactBps} bps，` +
-        `縮小之後只剩 ${cap.amountIn}（理想 ${amountIn}），` +
+        `${label}: estimated impact ${cap.idealEstimate.impactBps} bps exceeds the ${maxImpactBps} bps budget; ` +
+        `shrinking leaves ${cap.amountIn} (ideal ${amountIn}), ` +
         (cap.noSizeFits
-          ? `連 1 個最小單位都超預算：現貨相對 TWAP 的既有偏差 + 池子 fee 已經是 ${cap.idealEstimate.baselineBps} bps，` +
-            '切多小都救不回來（不是量的問題），這一輪不送'
-          : `不到理想量的 ${MIN_STEP_BPS_OF_IDEAL} bp（dust），送了也只是付 gas`),
+          ? `even one minimal unit is over budget: the existing spot-vs-TWAP gap plus pool fee is already ${cap.idealEstimate.baselineBps} bps, ` +
+            'no size fixes that (it is not a size problem), so this round sends nothing'
+          : `below ${MIN_STEP_BPS_OF_IDEAL} bp of the ideal amount (dust); sending it would only cost gas`),
     };
   }
 
   const requoted = await params.requote(cap.amountIn);
   if ('skip' in requoted) {
-    return { skip: `${label}：縮小到 ${cap.amountIn} 之後重新要 floor 失敗（${requoted.skip}）` };
+    return { skip: `${label}: re-quoting a floor after shrinking to ${cap.amountIn} failed (${requoted.skip})` };
   }
   // 用**重問回來的** quoted 再算一次：那才是真正要拿去跟地板比的那個量。
   const finalEstimate = estimateImpact(state, cap.amountIn, requoted.quoted);
@@ -1251,7 +1251,7 @@ async function planHub(
       };
     }
     const capped = await priceAndCap({
-      label: `賣 ${short(leg.asset)} 換 USDT`,
+      label: `sell ${short(leg.asset)} for USDT`,
       asset: leg.asset,
       tokenIn: leg.asset,
       tokenOut: hub,
@@ -1315,7 +1315,7 @@ async function planHub(
       continue;
     }
     const capped = await priceAndCap({
-      label: `買 ${short(leg.asset)}（付 USDT）`,
+      label: `buy ${short(leg.asset)} (paying USDT)`,
       asset: leg.asset,
       tokenIn: hub,
       tokenOut: leg.asset,
@@ -1346,8 +1346,8 @@ async function planHub(
     return {
       kind: 'noop',
       reason:
-        `hub 模式（numeraire ${short(hub)}）算不出任何可執行的 step：` +
-        `${notes.length === 0 ? '沒有非 numeraire 的目標資產，或所有 deltaUsd 都是 0' : notes.join('；')}。不送空 steps。`,
+        `Hub mode (numeraire ${short(hub)}) produced no executable step: ` +
+        `${notes.length === 0 ? 'no non-numeraire target assets, or every deltaUsd is 0' : notes.join('; ')}. Not sending empty steps.`,
     };
   }
 
@@ -1395,7 +1395,7 @@ async function planHub(
         drift,
         postDrift,
         steps.length,
-        notes.length === 0 ? '' : `；被跳過 ${notes.length} 筆：${notes.join('；')}`,
+        notes.length === 0 ? '' : `; ${notes.length} skipped: ${notes.join('; ')}`,
       ),
     };
   }
@@ -1551,8 +1551,8 @@ function preflightPinned(input: {
       plan: {
         kind: 'noop',
         reason:
-          `算出來的賣出量是 0（要搬 ${valueToMoveE8} E8 USD，${seller.asset} 價格 ${sellerHolding.usdPriceE8} E8、` +
-          `持倉 ${sellerHolding.amountWei} 個最小單位）：合約對 amountIn == 0 會 revert ZeroAmount，不送。`,
+          `The computed sell amount is 0 (need to move ${valueToMoveE8} E8 USD; ${seller.asset} price ${sellerHolding.usdPriceE8} E8, ` +
+          `holding ${sellerHolding.amountWei} minimal units): the contract reverts ZeroAmount for amountIn == 0, so nothing is sent.`,
       },
     };
   }
@@ -1611,8 +1611,8 @@ export async function planRebalance(
     return {
       kind: 'noop',
       reason:
-        `不需要再平衡：gross drift ${drift.grossDriftBps} bps < 門檻 ${drift.thresholdBps} bps` +
-        `（max |Δ| ${drift.maxAbsDeltaBps} bps）。不送空 steps。`,
+        `No rebalance needed: gross drift ${drift.grossDriftBps} bps < threshold ${drift.thresholdBps} bps` +
+        ` (max |Δ| ${drift.maxAbsDeltaBps} bps). Not sending empty steps.`,
     };
   }
   if (thresholdBps !== drift.thresholdBps) {
@@ -1627,8 +1627,8 @@ export async function planRebalance(
     return {
       kind: 'noop',
       reason:
-        `投組總價值 0（空倉或全部無價）：gross drift ${drift.grossDriftBps} bps 是 drift.ts 對 total = 0 ` +
-        '的定義結果，不是「已對齊」，但沒有部位可以搬。不送空 steps。',
+        `Portfolio value is 0 (empty, or everything unpriced): gross drift ${drift.grossDriftBps} bps is what ` +
+        'drift.ts defines for total = 0 — not "aligned" — but there are no positions to move. Not sending empty steps.',
     };
   }
 
@@ -1648,9 +1648,9 @@ export async function planRebalance(
     return {
       kind: 'blocked',
       reason:
-        `目標權重有 ${targets.length} 個資產，但 executor 的 oracle 只釘一個 pool（D-23）：` +
-        '目前只能再平衡 oracle pair 的那兩個資產；>2 資產要等 per-call oracle（D-23）' +
-        ' —— 那個 oracle 就是 AtpMultiPoolOracle，接上它這裡會自動走 hub 模式。',
+        `The target weights have ${targets.length} assets, but the executor's oracle pins a single pool (D-23): ` +
+        'only the two assets of that oracle pair can be rebalanced today; more than two needs the per-call oracle (D-23) ' +
+        '— that oracle is AtpMultiPoolOracle, and wiring it in makes this path use hub mode automatically.',
     };
   }
   const leg = preflight.leg;
@@ -1663,8 +1663,8 @@ export async function planRebalance(
       kind: 'blocked',
       reason:
         `oracle ${short(oracle)} 綁的 pool 是 ${short(shape.token0)} / ${short(shape.token1)}，` +
-        `不是 ${short(tokenIn)} / ${short(tokenOut)}：目前 oracle 只釘一個 pool，` +
-        '>2 資產要等 per-call oracle（D-23）',
+        `not ${short(tokenIn)} / ${short(tokenOut)}: the oracle currently pins a single pool, ` +
+        'and more than two assets needs the per-call oracle (D-23)',
     };
   }
 
@@ -1699,7 +1699,7 @@ export async function planRebalance(
     }
     return {
       kind: 'blocked',
-      reason: `oracle.previewSwap 現在報不出價（${name}）：沒有地板就不能送，合約會 revert NoFloor`,
+      reason: `oracle.previewSwap cannot quote right now (${name}): without a floor nothing can be sent — the contract reverts NoFloor`,
     };
   }
 
@@ -1717,7 +1717,7 @@ export async function planRebalance(
     client: publicClient,
     blockNumber,
     maxImpactBps,
-    label: `賣 ${short(tokenIn)} 換 ${short(tokenOut)}`,
+    label: `sell ${short(tokenIn)} for ${short(tokenOut)}`,
     pool: oraclePool,
     tokenIn,
     amountIn,
@@ -1748,7 +1748,7 @@ export async function planRebalance(
   });
   if ('skip' in capped) {
     // 縮小救不回來 → 這一輪不送。**不是 blocked**：市場狀態，下一輪 TWAP 吸收衝擊後可能就好了。
-    return { kind: 'noop', reason: `${capped.skip}。不送空 steps。` };
+    return { kind: 'noop', reason: `${capped.skip}. Not sending empty steps.` };
   }
 
   const finalAmountIn = capped.amountIn;

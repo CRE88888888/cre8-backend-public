@@ -403,7 +403,7 @@ test('R1 未達門檻 → noop，而且不回空的 steps、不讀鏈', async ()
 
   assert.equal(plan.kind, 'noop');
   if (plan.kind !== 'noop') throw new Error('unreachable');
-  assert.match(plan.reason, /不需要再平衡/);
+  assert.match(plan.reason, /No rebalance needed/);
   // 關鍵：noop 沒有 steps 這個欄位。空陣列會是「成功但什麼都沒做」（pitfalls §8.1）。
   assert.equal('steps' in plan, false);
   // noop 是純決策：連一次鏈上讀取都不該發生。
@@ -420,7 +420,7 @@ test('R1 空倉（total = 0）→ noop，不是 blocked 也不是空 steps', asy
 
   assert.equal(plan.kind, 'noop');
   if (plan.kind !== 'noop') throw new Error('unreachable');
-  assert.match(plan.reason, /總價值 0/);
+  assert.match(plan.reason, /value is 0/);
   assert.equal('steps' in plan, false);
   assert.equal(chain.calls.length, 0);
 });
@@ -463,9 +463,9 @@ test('R2 目標 3 個資產 → blocked，理由寫明 D-23', async () => {
 
   assert.equal(plan.kind, 'blocked');
   if (plan.kind !== 'blocked') throw new Error('unreachable');
-  assert.match(plan.reason, /3 個資產/);
-  assert.match(plan.reason, /只釘一個 pool/);
-  assert.match(plan.reason, /per-call oracle（D-23）/);
+  assert.match(plan.reason, /3 assets/);
+  assert.match(plan.reason, /pins a single pool/);
+  assert.match(plan.reason, /per-call oracle \(D-23\)/);
   assert.equal('steps' in plan, false);
 });
 
@@ -482,8 +482,8 @@ test('R2 oracle 的 pool 不是這兩個代幣 → blocked（不靠 revert，靠
 
   assert.equal(plan.kind, 'blocked');
   if (plan.kind !== 'blocked') throw new Error('unreachable');
-  assert.match(plan.reason, /不是 .* \/ /);
-  assert.match(plan.reason, /per-call oracle（D-23）/);
+  assert.match(plan.reason, /not .* \/ /);
+  assert.match(plan.reason, /per-call oracle \(D-23\)/);
   // pair 不對時不該去打 previewSwap：先擋掉，省一次註定失敗的呼叫。
   assert.equal(chain.calls.some((call) => call.functionName === 'previewSwap'), false);
 });
@@ -518,7 +518,7 @@ test('R2 oracle 報不出價（TwapUnavailable）→ blocked，理由與 pair �
 
   assert.equal(plan.kind, 'blocked');
   if (plan.kind !== 'blocked') throw new Error('unreachable');
-  assert.match(plan.reason, /報不出價/);
+  assert.match(plan.reason, /cannot quote/);
   assert.match(plan.reason, /NoFloor/);
 });
 
@@ -624,7 +624,7 @@ test('R3 amountIn 算出來是 0 → noop（合約對 amountIn == 0 會 revert Z
 
   assert.equal(plan.kind, 'noop');
   if (plan.kind !== 'noop') throw new Error('unreachable');
-  assert.match(plan.reason, /賣出量是 0/);
+  assert.match(plan.reason, /sell amount is 0/);
   assert.match(plan.reason, /ZeroAmount/);
   assert.equal('steps' in plan, false);
   // 一次鏈上讀取都不該發生：算不出量就不必問 oracle。
@@ -1231,7 +1231,7 @@ test('H5 全部步驟都被跳過 → noop（永不回空的 steps）', async ()
 
   assert.equal(plan.kind, 'noop');
   if (plan.kind !== 'noop') throw new Error('unreachable');
-  assert.match(plan.reason, /算不出任何可執行的 step/);
+  assert.match(plan.reason, /produced no executable step/);
   assert.match(plan.reason, /OracleNotSet/);
   assert.equal('steps' in plan, false);
 });
@@ -1367,7 +1367,7 @@ test('H9 hub 模式：判不出 oracle 形狀 → blocked（不猜、不送）',
 
   assert.equal(plan.kind, 'blocked');
   if (plan.kind !== 'blocked') throw new Error('unreachable');
-  assert.match(plan.reason, /判不出/);
+  assert.match(plan.reason, /cannot tell which pairs/);
   assert.equal('steps' in plan, false);
 });
 
@@ -1554,10 +1554,10 @@ test('pinned：理想量超過預算 → step 被縮小、impact ≤ 預算、pa
   // 兩次報價：理想量一次、縮小後再一次。
   assert.equal(chain.calls.filter((call) => call.functionName === 'previewSwap').length, 2);
 
-  assert.match(plan.rationale, /⚠ 部分執行/);
-  assert.match(plan.rationale, /剩餘由下一輪處理/);
+  assert.match(plan.rationale, /⚠ partial execution/);
+  assert.match(plan.rationale, /rest goes to the next round/);
   // 這一條測的是「預算怎麼作用」，所以預算要**明確給**，不要依賴預設值（預設改了不該讓它變義意）。
-  assert.match(plan.rationale, /超過上限 50 bps/);
+  assert.match(plan.rationale, /exceeds the 50 bps budget/);
 });
 
 test('pinned：沒超過預算 → 與關掉上限（maxImpactBps: null）的結果完全相同（回歸）', async () => {
@@ -1576,8 +1576,8 @@ test('pinned：沒超過預算 → 與關掉上限（maxImpactBps: null）的結
   assert.equal(on.deadline, off.deadline);
   // 判準是結果：賣對了就收斂，所以沒有 partial（不是「沒被縮小」，那是舊定義）。
   assert.equal(on.partial, undefined, '執行後收斂就不該帶 partial');
-  assert.match(on.rationale, /預估已收斂/);
-  assert.doesNotMatch(on.rationale, /部分執行/);
+  assert.match(on.rationale, /converged/);
+  assert.doesNotMatch(on.rationale, /partial execution/);
   // 而且真的沒有縮：量就是理想量。
   assert.equal(on.steps[0]?.amountIn, 100_000_000_000_000_000n);
 });
@@ -1609,7 +1609,7 @@ test('pinned：縮小後只剩 dust（< 理想量的 1 bp）→ 跳過那一步�
   assert.equal(plan.kind, 'noop', `全部縮到 dust 要回 noop（實際 ${plan.kind}）`);
   if (plan.kind !== 'noop') throw new Error('unreachable');
   assert.match(plan.reason, /dust/);
-  assert.match(plan.reason, /不送空 steps/);
+  assert.match(plan.reason, /Not sending empty steps/);
   assert.equal('steps' in plan, false, '絕不回空 steps');
 });
 
@@ -1621,8 +1621,8 @@ test('pinned：baseline（fee + 現貨 vs TWAP）本身就超預算 → noop 並
   );
   assert.equal(plan.kind, 'noop');
   if (plan.kind !== 'noop') throw new Error('unreachable');
-  assert.match(plan.reason, /不是量的問題/);
-  assert.match(plan.reason, /切多小都救不回來/);
+  assert.match(plan.reason, /not a size problem/);
+  assert.match(plan.reason, /no size fixes that/);
   assert.match(plan.reason, /197 bps/); // 現貨 P = 1.0201 → 邊際到手 98.02% → baseline 197 bps
 });
 
@@ -1679,7 +1679,7 @@ test('hub：賣的 leg 被縮小 → 買的 USDT 預算跟著縮（不能拿理�
     buyStep.amountIn <= sellStep.oracleFloor,
     `買的 USDT 不能超過這一輪賣到的保證淨額：買 ${buyStep.amountIn} > 賣 ${sellStep.oracleFloor}`,
   );
-  assert.match(plan.rationale, /部分執行/);
+  assert.match(plan.rationale, /partial execution/);
 });
 
 // ---------------------------------------------------- partial 的判準是「結果」，不是「過程」
@@ -1706,9 +1706,9 @@ test('收斂：完整一輪把兩個缺口都補掉 → 執行後預估漂移降
   );
   assert.equal(plan.steps.length, 2, '賣 + 買各一個 step');
   assert.equal(plan.partial, undefined, '執行後就收斂 → 不該帶 partial（排程器用完整間隔）');
-  assert.match(plan.rationale, /執行後預估漂移 12 bps/);
-  assert.match(plan.rationale, /預估已收斂/);
-  assert.doesNotMatch(plan.rationale, /仍高於門檻/);
+  assert.match(plan.rationale, /Estimated drift after this round 12 bps/);
+  assert.match(plan.rationale, /converged/);
+  assert.doesNotMatch(plan.rationale, /still above the threshold/);
 });
 
 test('縮小但收斂：step 真的被衝擊上限縮小，執行後仍收斂 → **不是** partial（舊定義會誤判）', async () => {
@@ -1731,8 +1731,8 @@ test('縮小但收斂：step 真的被衝擊上限縮小，執行後仍收斂 �
   assert.ok(step.amountIn < 100n * 10n ** 18n, `要被縮小（實際 ${step.amountIn} < 理想 1e20）`);
   assert.ok(step.amountIn > 0n);
   assert.equal(plan.partial, undefined, '縮小不是判準：執行後收斂就沒有 partial');
-  assert.match(plan.rationale, /⚠ 部分執行/, '縮小的證據仍然留在理由裡');
-  assert.match(plan.rationale, /預估已收斂/);
+  assert.match(plan.rationale, /⚠ partial execution/, '縮小的證據仍然留在理由裡');
+  assert.match(plan.rationale, /converged/);
 });
 
 test('主要缺口被跳過（不是被縮小）→ partial 存在，且 remainingDriftBps 說得出還差多少', async () => {
@@ -1763,8 +1763,8 @@ test('主要缺口被跳過（不是被縮小）→ partial 存在，且 remaini
   const remaining = plan.partial?.remainingDriftBps ?? 0;
   assert.ok(remaining > 100, `執行後預估漂移 ${remaining} 必須仍高於門檻 100`);
   assert.ok(remaining > 1_500, `賣掉 297 USDT 之後還差得遠（實際 ${remaining}）`);
-  assert.match(plan.rationale, /仍高於門檻/);
-  assert.match(plan.rationale, /缺口是被跳過而不是被縮小/);
+  assert.match(plan.rationale, /still above the threshold/);
+  assert.match(plan.rationale, /skipped rather than shrunk/);
   assert.match(plan.rationale, /被跳過 1 筆/);
 });
 
@@ -1791,9 +1791,9 @@ test('計畫不改善漂移（賣超配的錢去補另一個也超配的資產�
   const plan = await planRebalance(hubArgs(chain, { holdings, targets, thresholdBps: 100 }));
   assert.equal(plan.kind, 'noop', `不改善就不送（實際 ${plan.kind}）`);
   if (plan.kind !== 'noop') throw new Error('unreachable');
-  assert.match(plan.reason, /執行後預估漂移 1000 bps/);
-  assert.match(plan.reason, /不比現在的 1000 bps 低/);
-  assert.match(plan.reason, /付 gas/);
+  assert.match(plan.reason, /would leave estimated drift at 1000 bps/);
+  assert.match(plan.reason, /not below the current 1000 bps/);
+  assert.match(plan.reason, /only cost gas/);
   assert.equal('steps' in plan, false, '絕不回空 steps');
 });
 

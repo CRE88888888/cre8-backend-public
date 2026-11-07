@@ -840,7 +840,7 @@ test('needsRebalance === false → noop，不呼叫規劃器', async () => {
 
   const round = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain));
   assert.deepEqual(outcomes(round), ['noop']);
-  assert.match(round.results[0]?.reason ?? '', /3000bps 未達門檻 100bps/);
+  assert.match(round.results[0]?.reason ?? '', /3000 bps is below the 100 bps threshold/);
   assert.equal(chain.planRebalanceCalls, 0);
   assert.equal(chain.executeCalls.length, 0);
   console.log(`[noop] ${round.results[0]?.reason}`);
@@ -868,7 +868,7 @@ test('planRebalance 回 ready 但 steps 是空的 → blocked（空 steps 在鏈
 
   const round = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain));
   assert.deepEqual(outcomes(round), ['blocked']);
-  assert.match(round.results[0]?.reason ?? '', /steps 是空的/);
+  assert.match(round.results[0]?.reason ?? '', /the steps are empty/);
   assert.equal(chain.executeCalls.length, 0, '空 steps 送出去會是「成功但沒換幣」（docs/pitfalls §8.1）');
   assert.equal(db.operations.length, 0);
   console.log(`[empty-steps] ${round.results[0]?.reason}`);
@@ -1113,8 +1113,8 @@ test('缺陷 4：四條都過才 ready，而且 reason 說得出驗過什麼（r
   assert.deepEqual(outcomes(round), ['ready-dry-run']);
   assert.ok(reason.includes(KEY_REF), 'reason 要指名通過的是哪一把 key');
   assert.ok(reason.includes(PERMISSION_ID), 'reason 要指名 permissionId（重建 permissionId 用的就是它）');
-  assert.match(reason, /seed 派生相符/);
-  assert.match(reason, /allowance 與餘額都夠/);
+  assert.match(reason, /derives from the seed/);
+  assert.match(reason, /allowance plus balance are sufficient/);
   // ready 仍然只是「算好了」：dry-run 的邊界一條都不能鬆。
   assert.equal(chain.executeCalls.length, 0);
   assert.equal(db.operations.length, 0);
@@ -1648,10 +1648,10 @@ test('排程：部分執行 → next_run_at 用短間隔（不是完整的一天
     expected.getTime() < NOW.getTime() + ONE_DAY_SECONDS * 1_000,
     '短間隔必須**早於**完整間隔（不然等於沒改）',
   );
-  assert.match(round.results[0]?.reason ?? '', /部分執行/);
+  assert.match(round.results[0]?.reason ?? '', /Partial execution/);
   // 理由要說得出「執行後還剩多少」——這才是排程器提早再跑的原因（不是「有 step 被縮小」）。
-  assert.match(round.results[0]?.reason ?? '', /執行後預估漂移仍有 1000 bps/);
-  assert.match(round.results[0]?.reason ?? '', /提前到/, '要說清楚為什麼下一次那麼近');
+  assert.match(round.results[0]?.reason ?? '', /estimated drift is still 1000 bps/);
+  assert.match(round.results[0]?.reason ?? '', /moved up to/, '要說清楚為什麼下一次那麼近');
 
   // 認領那一條仍在 transaction 內（語意不變）；把時間拉近的是**第二條**、在 transaction 之後。
   const advance = db.statements.filter((entry) => entry.sql.includes('set next_run_at = claimed.next_run_at'));
@@ -1684,7 +1684,7 @@ test('排程：部分執行但被前置檢查擋下（blocked）→ 仍然用完
     new Date(NOW.getTime() + ONE_DAY_SECONDS * 1_000).toISOString(),
     'blocked 用完整間隔（不是 15 分鐘的熱迴圈）',
   );
-  assert.doesNotMatch(round.results[0]?.reason ?? '', /提前到/);
+  assert.doesNotMatch(round.results[0]?.reason ?? '', /moved up to/);
 });
 
 test('排程：部分執行但送出失敗（failed）→ 完整間隔（別把 operations 的嘗試次數燒光）', async () => {

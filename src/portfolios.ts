@@ -17,6 +17,11 @@ export type Portfolio = {
   id: number;
   userId: string;
   strategyId: number;
+  /**
+   * `strategies.name`（使用者替基金取的名字）。列表頁要顯示名字，不是 `Strategy 516 · v1` 這種內部 id。
+   * `null` = 這一列沒有 join 到策略（例如 enroll 剛寫入時沒有再查一次）—— 前端要退回顯示 id。
+   */
+  strategyName: string | null;
   version: number;
   scheduleState: string;
   createdAt: string;
@@ -43,6 +48,8 @@ type PortfolioRow = {
   id: string;
   user_id: string;
   strategy_id: string;
+  /** 只有列表查詢會 join 出來；enroll 的回應沒有，所以是 optional。 */
+  strategy_name?: string | null;
   version: number;
   schedule_state: string;
   created_at: Date;
@@ -398,8 +405,10 @@ export async function listPortfolios(
 
   const portfolios = await find<PortfolioListRow>(
     `select p.id, p.user_id, p.strategy_id, p.version, p.schedule_state, p.created_at,
+            st.name as strategy_name,
             sa.chain_id, sa.address, sa.owner, sa.account_type
        from portfolios p
+       left join strategies st on st.id = p.strategy_id
        left join smart_accounts sa on sa.portfolio_id = p.id
       where lower(p.user_id) = $1
       order by p.id, sa.chain_id`,
@@ -585,6 +594,7 @@ function toPortfolio(row: PortfolioRow, accounts: SmartAccountRow[], gas: GasSta
     id: Number(row.id),
     userId: row.user_id,
     strategyId: Number(row.strategy_id),
+    strategyName: typeof row.strategy_name === 'string' ? row.strategy_name : null,
     version: row.version,
     scheduleState: row.schedule_state,
     createdAt: row.created_at.toISOString(),

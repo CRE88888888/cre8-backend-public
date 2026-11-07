@@ -105,6 +105,7 @@ function samplePortfolio(id = PORTFOLIO_ID): Portfolio {
     id,
     userId: WALLET_LOWER,
     strategyId: STRATEGY_ID,
+    strategyName: 'Test fund',
     version: 1,
     scheduleState: 'active',
     createdAt: '2026-11-06T00:00:00.000Z',
@@ -474,6 +475,7 @@ test('GET /portfolios requires a bearer token and returns the { portfolios: [...
         'sessionKey',
         'smartAccounts',
         'strategyId',
+        'strategyName',
         'userId',
         'version',
       ]);

@@ -114,6 +114,7 @@ function samplePortfolio(id = 1): Portfolio {
     id,
     userId: ROUTE_WALLET.address.toLowerCase(),
     strategyId: 1,
+    strategyName: 'Test fund',
     version: 1,
     scheduleState: 'active',
     createdAt: '2026-01-01T00:00:00.000Z',

@@ -314,12 +314,18 @@ async function probeFork(): Promise<string | null> {
     }
     const blockNumber = await publicClient.getBlockNumber();
     if (blockNumber === 0n) return `anvil fork ${RPC_URL} 的塊高是 0：fork 沒有真的接上上游`;
-    // **必須做一次冷讀**：暖查詢（池子 slot0、已快取的帳戶）在上游 archive 視窗過期之後**仍會成功**
-    // —— anvil 直接回快取。只做暖查詢的探針會回報「健康」，然後 6 條測試在真正冷讀時一起變紅
-    // （實測：fork 過 75 分鐘後 `eth_getBalance` 一個沒被碰過的位址就 403）。
-    // 這個 sentinel 不被任何測試用到，所以 anvil 沒有它的快取。
-    const sentinel = '0x00000000000000000000000000000000DeaDBeef' as Address;
-    await publicClient.getBalance({ address: sentinel });
+    // **必須做一次「永遠冷」的讀取。**
+    //
+    // 暖查詢（池子 slot0、已快取的帳戶）在上游 archive 視窗過期之後**仍會成功** —— anvil 直接回快取，
+    // 所以只做暖查詢的探針會回報「健康」，然後測試在真正冷讀時一起變紅。
+    //
+    // ⚠ 這裡踩過一次：原本用固定 sentinel（0x…DeaDBeef），但**探針自己把那個位址查暖了**
+    //   —— 第一次有效，之後每次都誤報健康。所以位址必須每次不同：隨機位址永遠不在快取裡，
+    //   要回答它就得回上游，而那正是 403 發生的地方。
+    const coldProbeAddress = `0x${Array.from({ length: 40 }, () =>
+      '0123456789abcdef'[Math.floor(Math.random() * 16)],
+    ).join('')}` as Address;
+    await publicClient.getBalance({ address: coldProbeAddress });
     // 這條路徑的價格一律走 NVDAB 的池；池子讀不到就整組 skip，不要讓 suite 紅。
     const quote = await twapPriceInUsdt(publicClient, { token: NVDAB, usdtPool: NVDAB_USDT_POOL, expectedQuoteToken: USDT });
     return quote.priceE8 > 0n ? null : `NVDAB 的 TWAP 報價是 0：池子狀態不對`;

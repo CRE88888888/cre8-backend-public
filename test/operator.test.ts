@@ -14,6 +14,7 @@ import {
   narrowClaimToPortfolio,
   operatorRebalanceEnabled,
   resolveStatusSessionKey,
+  previewOperatorRebalance,
   runOperatorRebalance,
   singlePortfolioClaim,
 } from '../src/operator.js';
@@ -621,6 +622,48 @@ test('portfolios 列表不包含狀態端點的欄位（貴的路徑不能被列
   );
 });
 
+test('GET /portfolios/:id/plan 不受 ENABLE_OPERATOR_REBALANCE 限制（唯讀），但沒有 token 仍是 401', async () => {
+  const preview = {
+    portfolioId: PORTFOLIO_ID,
+    outcome: 'noop' as const,
+    reason: '規劃器回 noop：預估漂移不會下降，送出去只是付 gas',
+    steps: [],
+  };
+  let called = 0;
+  await withServer(
+    async (baseUrl) => {
+      const anonymous = await getJson(baseUrl, `/portfolios/${PORTFOLIO_ID}/plan`);
+      assert.equal(anonymous.status, 401, '唯讀也要認人：它會透漏持倉與規劃結果');
+
+      const token = await loginToken(baseUrl);
+      const response = await getJson(baseUrl, `/portfolios/${PORTFOLIO_ID}/plan`, token);
+      assert.equal(response.status, 200);
+      assert.deepEqual(await response.json(), preview);
+    },
+    {
+      // 動錢的開關關著，但診斷照樣要看得到 —— 生產環境正是這個組合。
+      operatorRebalanceEnabled: () => false,
+      planPreview: async () => {
+        called += 1;
+        return preview;
+      },
+    },
+  );
+  assert.equal(called, 1, '開關關著也要能預覽：它唯讀，而且正是「為什麼投組停住」的答案');
+});
+
+test('GET /portfolios/:id/plan 用 POST 是 405', async () => {
+  await withServer(
+    async (baseUrl) => {
+      const token = await loginToken(baseUrl);
+      const response = await postJson(baseUrl, `/portfolios/${PORTFOLIO_ID}/plan`, {}, token);
+      assert.equal(response.status, 405);
+      assert.equal(response.headers.get('allow'), 'GET');
+    },
+    { planPreview: async () => ({ portfolioId: PORTFOLIO_ID, outcome: 'ready' as const, reason: 'x', steps: [] }) },
+  );
+});
+
 test('POST /portfolios/:id/rebalance 預設關閉：403，而且 rebalance 一次都沒被叫到', async () => {
   let called = 0;
   await withServer(
@@ -867,3 +910,50 @@ test('不是我的投組：擁有者檢查先炸，排程器一次都不會被�
   assert.equal(ran, 0, '動錢之前一定要先確認這是誰的投組');
 });
 
+test('plan 預覽：dryRun 明確是 true，ready-dry-run 對外叫 ready，而且不會帶 execution', async () => {
+  const seen: { dryRun?: boolean | undefined; limit?: number | undefined } = {};
+  const preview = await previewOperatorRebalance(PORTFOLIO_ID, WALLET.address, {
+    requireOwnedPortfolio: OWNED,
+    runSchedulerOnce: schedulerStub(
+      runResult({ outcome: 'ready-dry-run', execution: null, reason: '將要執行 2 個 step（dry-run）' }),
+      seen,
+    ),
+  });
+
+  assert.equal(seen.dryRun, true, '預覽是唯讀：dryRun 必須明確傳 true（不是靠排程器的預設值）');
+  assert.equal(seen.limit, 1);
+  assert.equal(preview.outcome, 'ready');
+  assert.equal(preview.steps.length, 2);
+  assert.match(preview.reason, /dry-run/);
+});
+
+test('plan 預覽：noop 的重現原文照回（使用者要知道「為什麼這一輪不動」）', async () => {
+  const reason = '規劃器回 noop：不送：這個計畫執行後預估漂移 595 bps，不比現在的 595 bps 低';
+  const preview = await previewOperatorRebalance(PORTFOLIO_ID, WALLET.address, {
+    requireOwnedPortfolio: OWNED,
+    // noop 時排程器不帶 plan（沒有要送的東西），所以預覽的 steps 一定是空的 —— fixture 要照這個事實。
+    runSchedulerOnce: schedulerStub(runResult({ outcome: 'noop', execution: null, plan: null, reason }), {}),
+  });
+  assert.equal(preview.outcome, 'noop');
+  assert.equal(preview.reason, reason);
+  assert.deepEqual(preview.steps, []);
+});
+
+test('plan 預覽：沒被認領（不是 active／沒有 smart account）→ blocked 並說出原因', async () => {
+  const preview = await previewOperatorRebalance(PORTFOLIO_ID, WALLET.address, {
+    requireOwnedPortfolio: OWNED,
+    runSchedulerOnce: schedulerStub(null, {}),
+  });
+  assert.equal(preview.outcome, 'blocked');
+  assert.match(preview.reason, /沒有認領/);
+});
+
+test('plan 預覽：dry-run 竟然回報 executed → 拋錯，不把它講成 noop', async () => {
+  await assert.rejects(
+    previewOperatorRebalance(PORTFOLIO_ID, WALLET.address, {
+      requireOwnedPortfolio: OWNED,
+      runSchedulerOnce: schedulerStub(runResult({ outcome: 'executed' }), {}),
+    }),
+    /PLAN_PREVIEW_CONTRACT|dry-run/,
+  );
+});

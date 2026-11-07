@@ -14,9 +14,10 @@ import {
   OPERATOR_REBALANCE_ENV,
   createPortfolioStatusReader,
   operatorRebalanceEnabled,
+  previewOperatorRebalance,
   runOperatorRebalance,
 } from './operator.js';
-import type { OperatorRebalanceResult, PortfolioStatusReader } from './operator.js';
+import type { OperatorPlanPreview, OperatorRebalanceResult, PortfolioStatusReader } from './operator.js';
 
 /** Hard cap on request bodies: strategy payloads are small; anything bigger is a mistake or an attack. */
 const MAX_BODY_BYTES = 1_000_000;
@@ -157,6 +158,8 @@ export type ServerDeps = {
   portfolioStatus: PortfolioStatusReader;
   /** `POST /portfolios/:id/rebalance`（會動錢；預設實作見 `operator.ts`）。 */
   operatorRebalance: (portfolioId: number, wallet: string) => Promise<OperatorRebalanceResult>;
+  /** 這一輪會做什麼（dry-run）。唯讀，所以**不**受 `ENABLE_OPERATOR_REBALANCE` 限制。 */
+  planPreview: (portfolioId: number, wallet: string) => Promise<OperatorPlanPreview>;
   /**
    * operator rebalance 的部署開關。不給 = 每次請求讀 `ENABLE_OPERATOR_REBALANCE`
    * （與 CORS／bundler URL 同一個做法：env 的解析留在 server 層）。
@@ -186,6 +189,7 @@ const defaultDeps: ServerDeps = {
   // 只有這一個是在 import 時就建好的：快取要跨請求存活，不能每個請求重建一份。
   portfolioStatus: createPortfolioStatusReader(),
   operatorRebalance: runOperatorRebalance,
+  planPreview: previewOperatorRebalance,
   operatorRebalanceEnabled,
 };
 
@@ -311,6 +315,10 @@ async function route(
       if (segments[2] === 'rebalance') {
         if (method !== 'POST') return methodNotAllowed(res, ['POST']);
         return operatorRebalanceRoute(req, res, portfolioId(), deps);
+      }
+      if (segments[2] === 'plan') {
+        if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+        return planPreviewRoute(req, res, portfolioId(), deps);
       }
     }
   }
@@ -513,6 +521,25 @@ async function portfolioStatusRoute(
 ): Promise<void> {
   const wallet = authenticate(req.headers.authorization);
   sendJson(res, 200, await deps.portfolioStatus(id, wallet));
+}
+
+/**
+ * `GET /portfolios/:id/plan` — **dry-run**：這一輪會做什麼、不會做什麼、以及為什麼。
+ *
+ * 唯讀，所以**不**受 `ENABLE_OPERATOR_REBALANCE` 限制：它不寫 operations、不推進 `next_run_at`、
+ * 不送交易。生產環境（開關關著、排程器自己在跑）正是最需要它的情境 ——
+ * 「為什麼我的投組停住了」的答案不該要求先開一個能動錢的開關。
+ *
+ * 慢（實測 2–3 秒，要讀鏈、估價、算 impact），但它回答的正是「現在按下去會怎樣」。
+ */
+async function planPreviewRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  id: number,
+  deps: ServerDeps,
+): Promise<void> {
+  const wallet = authenticate(req.headers.authorization);
+  sendJson(res, 200, await deps.planPreview(id, wallet));
 }
 
 /**

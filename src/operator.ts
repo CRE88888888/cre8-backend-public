@@ -553,6 +553,17 @@ export type OperatorRebalanceResult = {
   steps: { tokenIn: string; tokenOut: string; amountIn: string; amountOutMin: string }[];
 };
 
+/** `GET /portfolios/:id/plan` 的回應：這一輪**會做什麼、不會做什麼，以及為什麼**。 */
+export type OperatorPlanPreview = {
+  portfolioId: number;
+  /** dry-run 的結論：`ready` = 現在按下去會送交易；`noop` = 不需要動；`blocked` = 被前置檢查擋下。 */
+  outcome: 'ready' | 'noop' | 'blocked';
+  /** 排程器寫的那一句話，**原文照回**。這是這支端點存在的全部理由。 */
+  reason: string;
+  /** 這一輪會送的 step（`ready` 才有）。前端不該自己猜，規劃在後端。 */
+  steps: { tokenIn: string; tokenOut: string; amountIn: string; amountOutMin: string }[];
+};
+
 export type RebalanceDeps = {
   requireOwnedPortfolio?: typeof requireOwnedPortfolio;
   runSchedulerOnce?: typeof runSchedulerOnce;
@@ -737,6 +748,72 @@ export async function runOperatorRebalance(
     swapExecuted: await swapExecutedFor(deps, execution),
     expectedSwaps: result.plan?.steps.length ?? 0,
     gasUsed: execution?.gasUsed ?? null,
+    steps: (result.plan?.steps ?? []).map((step) => ({
+      tokenIn: step.tokenIn,
+      tokenOut: step.tokenOut,
+      amountIn: step.amountIn,
+      amountOutMin: step.amountOutMin,
+    })),
+  };
+}
+
+/**
+ * `GET /portfolios/:id/plan` —— 跑一次 **dry-run**，回報這一輪會做什麼、不會做什麼、以及為什麼。
+ *
+ * 為什麼需要它：使用者按「執行」之前，唯一能看到「這一輪不會動」的地方是**按下之後**的結果卡。
+ * 實測的形狀是「漂移 595 bps、但預估漂移不會下降 → 不送」，那不是錯誤，卻要按一次才知道 ——
+ * 而按下去本身有成本（一輪規劃要讀鏈、估價、算 impact）。
+ *
+ * 為什麼**不**被 `ENABLE_OPERATOR_REBALANCE` 擋：它唯讀（dry-run 不寫 operations、不推進
+ * `next_run_at`、不送交易），而且生產環境正是「開關關著、排程器自己在跑」——
+ * 那時使用者最需要知道的就是「為什麼我的投組停住了」。把唯讀診斷綁在動錢的開關上會讓它失去用途。
+ *
+ * 走的是**排程器同一條路**（`runSchedulerOnce({ dryRun: true })` 且只認領這一個 portfolio），
+ * 不是另寫一份規劃。兩份實作會在第一次改動時分岔，而分岔的後果是「預覽說會動、真的按下去不動」。
+ */
+export async function previewOperatorRebalance(
+  portfolioId: number,
+  wallet: string,
+  deps: RebalanceDeps = {},
+): Promise<OperatorPlanPreview> {
+  const find = deps.requireOwnedPortfolio ?? requireOwnedPortfolio;
+  await find(portfolioId, wallet);
+
+  const run = deps.runSchedulerOnce ?? runSchedulerOnce;
+  const round = await run(
+    // `dryRun: true` 逐字寫出來：這支端點**不會**動錢，而排程器的預設也是 dry-run（不靠預設值表達意圖）。
+    { dryRun: true, limit: 1 },
+    {
+      withTransaction: singlePortfolioClaim(portfolioId, deps.withTransaction),
+      ...(deps.log === undefined ? {} : { log: deps.log }),
+    },
+  );
+
+  const result = round.results[0];
+  if (result === undefined || result.portfolioId !== portfolioId) {
+    return {
+      portfolioId,
+      outcome: 'blocked',
+      reason:
+        `排程器沒有認領 portfolio ${portfolioId}：schedule_state 不是 'active'，或這個 chain 上沒有它的 smart account。`,
+      steps: [],
+    };
+  }
+
+  if (result.outcome === 'executed' || result.outcome === 'failed') {
+    // dry-run 不可能執行；真的出現就是契約被改動了。不要把它講成 noop —— 那會讓「預覽說沒事、實際送了交易」
+    // 變成一個安靜的謊。
+    throw new AppError(
+      500,
+      'PLAN_PREVIEW_CONTRACT',
+      `dry-run 回報 ${result.outcome}：排程器的契約被改動了（dry-run 不該執行任何交易）`,
+    );
+  }
+
+  return {
+    portfolioId,
+    outcome: result.outcome === 'ready-dry-run' ? 'ready' : result.outcome,
+    reason: result.reason,
     steps: (result.plan?.steps ?? []).map((step) => ({
       tokenIn: step.tokenIn,
       tokenOut: step.tokenOut,

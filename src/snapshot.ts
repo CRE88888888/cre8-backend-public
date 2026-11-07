@@ -192,8 +192,26 @@ function asAddress(value: unknown, what: string): Address {
   return value.toLowerCase() as Address;
 }
 
-/** strategy_versions.allocation → 目標權重。形狀不對就拋錯，不猜、不補 0。 */
-function parseAllocation(raw: unknown, strategyId: number, version: number): PlanTarget[] {
+/**
+ * strategy_versions.allocation → 目標權重。形狀不對就拋錯，不猜、不補 0。
+ *
+ * ## symbol 從哪來（踩過的坑）
+ * allocation 只**必須**有 `address` 與 `weightBps`；`symbol` 是選填的顯示資料。早期手動建立的策略
+ * 把它寫進去了，而 API 建立的（`validateAllocation` 只讀 address/weightBps）沒有 —— 於是同一個
+ * 狀態頁，舊策略顯示 `WBNB`、新策略顯示 `0xbb4C…095c`。
+ *
+ * 修正的方向是**不要讓顯示資料住在策略裡**：`priceable_assets` 才是 symbol 的權威
+ * （同一顆代幣在每個策略裡都該叫同一個名字）。所以順序是：
+ *   ① `symbolByAddress`（priceable_assets，權威）
+ *   ② allocation 裡若有 `symbol`（舊資料，退而求其次）
+ *   ③ 短地址（真的一個都沒有時）
+ */
+function parseAllocation(
+  raw: unknown,
+  strategyId: number,
+  version: number,
+  symbolByAddress: ReadonlyMap<string, string> = new Map(),
+): PlanTarget[] {
   const assets = (raw as { assets?: unknown } | null)?.assets;
   if (!Array.isArray(assets) || assets.length === 0) {
     throw new Error(`strategy_versions(${strategyId}, ${version}).allocation 沒有 assets 陣列`);
@@ -207,10 +225,11 @@ function parseAllocation(raw: unknown, strategyId: number, version: number): Pla
       throw new Error(`allocation.assets[${index}].weightBps 不是整數（收到 ${JSON.stringify(weightBps)}）`);
     }
     const asset = asAddress(address, `allocation.assets[${index}].address`);
+    const stored = typeof symbol === 'string' && symbol.trim() !== '' ? symbol : null;
     return {
       asset,
       weightBps,
-      symbol: typeof symbol === 'string' && symbol.trim() !== '' ? symbol : shortAddress(asset),
+      symbol: symbolByAddress.get(asset.toLowerCase()) ?? stored ?? shortAddress(asset),
     };
   });
 }
@@ -336,7 +355,18 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
   if (allocationRow === undefined) {
     throw new Error(`DB 沒有 strategy_versions(${strategyId}, ${pinned})：鏈上釘住的版本還沒鏡像到 off-chain`);
   }
-  const targets = parseAllocation((allocationRow as { allocation?: unknown }).allocation, strategyId, pinned);
+  // 先讀 priceable_assets：targets 的 symbol 以它為權威（見 `parseAllocation` 的註解）。
+  // 這一次查詢本來就會發生（後面定價要用），提前到這裡只是把同一個結果用在兩處。
+  const priceTableForSymbols = await loadPriceTable(query);
+  const symbolByAddress = new Map(
+    [...priceTableForSymbols.entries()].map(([address, asset]) => [address.toLowerCase(), asset.symbol]),
+  );
+  const targets = parseAllocation(
+    (allocationRow as { allocation?: unknown }).allocation,
+    strategyId,
+    pinned,
+    symbolByAddress,
+  );
 
   const onchainVersion = await client.readContract({
     address: registryAddress,

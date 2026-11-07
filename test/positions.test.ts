@@ -906,8 +906,8 @@ test('writeSnapshot：表頭與明細同一句寫入；numeraire 記 numeraire�
   const insert = captured[0];
   assert.ok(insert);
   assert.match(insert.text, /with header as/);
-  assert.match(insert.text, /on conflict \(portfolio_id, block\) do update/);
-  assert.match(insert.text, /on conflict \(portfolio_id, asset, block\) do update/);
+  assert.match(insert.text, /on conflict \(portfolio_id, block, phase\) do update/);
+  assert.match(insert.text, /on conflict \(portfolio_id, asset, block, phase\) do update/);
 
   // $1..$13 是表頭。拒算（report = null）→ complete = false，漂移欄位一律 0（0008 的 CHECK 綁住）。
   assert.deepEqual(insert.params.slice(0, 13), [
@@ -929,25 +929,24 @@ test('writeSnapshot：表頭與明細同一句寫入；numeraire 記 numeraire�
     false,
   ]);
 
-  // 明細：3 列 × 6 欄，接在表頭後面（$1 的 portfolio_id 與表頭共用）。
-  assert.equal(insert.params.length, 13 + 3 * 6);
-  assert.deepEqual(insert.params.slice(13, 19), [
+  // 明細：3 列 × 5 欄，接在表頭後面（$1 的 portfolio_id 與 $14 的 phase 由表頭共用）。
+  assert.equal(insert.params.length, 15 + 3 * 5);  // 表頭 15（含 phase/operation_id）＋ 3 列 × 5 欄
+  assert.deepEqual(insert.params.slice(15, 20), [
     AAA.toLowerCase(),
     '2.000000000000000000',
     '2.000000000000000000',
     'pancakeswap-v3',
     pricedAt,
-    '1000',
   ]);
-  assert.deepEqual(insert.params.slice(19, 25), [
+  assert.deepEqual(insert.params.slice(20, 25), [
     USDT.toLowerCase(),
     '750.000000000000000000',
     '750.000000000000000000',
     'numeraire',
     pricedAt,
-    '1000',
   ]);
-  assert.deepEqual(insert.params.slice(25), [NOPOOL.toLowerCase(), '5.000000000000000000', null, null, null, '1000']);
+  // 每列 5 欄（block 與 phase 由表頭共用），所以第三列從索引 25 開始。
+  assert.deepEqual(insert.params.slice(25), [NOPOOL.toLowerCase(), '5.000000000000000000', null, null, null]);
 });
 
 test('writeSnapshot：空倉 → 寫 1 列表頭、0 列明細（這就是「跑過且是空的」的證據）', async () => {
@@ -971,7 +970,7 @@ test('writeSnapshot：空倉 → 寫 1 列表頭、0 列明細（這就是「跑
   const insert = captured[0];
   assert.ok(insert);
   assert.doesNotMatch(insert.text, /positions_snapshots/, '空倉不該寫任何明細列');
-  assert.match(insert.text, /on conflict \(portfolio_id, block\) do update/);
+  assert.match(insert.text, /on conflict \(portfolio_id, block, phase\) do update/);
   assert.deepEqual(insert.params, [
     '5',
     '1000',
@@ -987,6 +986,9 @@ test('writeSnapshot：空倉 → 寫 1 列表頭、0 列明細（這就是「跑
     // 沒帶 scan：unknown_token_count = 0、universe_complete = false（沒掃描不宣稱宇宙完整）。
     0,
     false,
+    // 沒帶 phase / operationId：預設 manual（CLI 手動 index）、沒有對應的 operation。
+    'manual',
+    null,
   ]);
 });
 
@@ -1045,5 +1047,5 @@ test('writeSnapshot：同一個 block 第二次寫是 UPDATE（表頭與明細�
 
   assert.deepEqual(first, { headerInserted: true, inserted: 1, updated: 0 });
   assert.deepEqual(second, { headerInserted: false, inserted: 0, updated: 1 });
-  assert.match(captured[1]?.text ?? '', /on conflict \(portfolio_id, block\) do update/);
+  assert.match(captured[1]?.text ?? '', /on conflict \(portfolio_id, block, phase\) do update/);
 });

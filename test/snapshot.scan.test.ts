@@ -411,7 +411,7 @@ test('策略外持倉（空投）→ 不 blocked、drift 照算；unknown_token_
 
   // 表頭：觀測訊號仍然要落地（真的 DB 寫入在 snapshot.integration.test.ts 與實跑）。
   const header = await captureHeaderParams(result, db);
-  assert.equal(header.params.length, 13, '表頭參數個數（$1..$13）');
+  assert.equal(header.params.length, 15, '表頭參數個數（$1..$15，含 phase 與 operation_id）');
   assert.equal(header.params[8], true, 'complete = true：策略資產都有價');
   assert.equal(header.params[11], 1, 'unknown_token_count = 1：空投仍然被記錄');
   assert.equal(header.params[12], true, 'universe_complete = true');

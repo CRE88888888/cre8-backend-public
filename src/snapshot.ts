@@ -506,6 +506,16 @@ export type WriteSnapshotDeps = {
   /** 鏈上 `enrollment.version`。表頭允許 NULL，但排程器一律會給（那是漂移的對齊依據）。 */
   pinnedVersion?: number | null;
   /**
+   * 這張快照是哪一個時點：`manual`（CLI 手動 index）| `before`（送出前）| `after`（落地後）。
+   * 預設 `manual` —— 既有呼叫端不必改就能繼續運作。
+   */
+  phase?: 'manual' | 'before' | 'after';
+  /**
+   * 對應的 `operations.id`。`before` / `after` 共用同一個值，所以「這一輪做了什麼」＝ 兩張的差。
+   * 手動 index 沒有 operation，留 null。
+   */
+  operationId?: number | bigint | null;
+  /**
    * 這一輪的持有掃描（`planPortfolio` 的 `scan`）。表頭的 `unknown_token_count` 與
    * `universe_complete` 從這裡來：兩者都是**觀測訊號**，都不影響 `complete`
    * （`complete` 只回答「策略資產是否都有價」）。
@@ -533,10 +543,10 @@ const SQL_HEADER_UPSERT = `
   insert into portfolio_snapshots (
     portfolio_id, block, native_balance_wei, total_usd_e8, gross_drift_bps, max_abs_delta_bps,
     threshold_bps, needs_rebalance, complete, unpriced_count, pinned_version,
-    unknown_token_count, universe_complete
+    unknown_token_count, universe_complete, phase, operation_id
   )
-  values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-  on conflict (portfolio_id, block) do update
+  values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+  on conflict (portfolio_id, block, phase) do update
     set native_balance_wei = excluded.native_balance_wei,
         total_usd_e8       = excluded.total_usd_e8,
         gross_drift_bps    = excluded.gross_drift_bps,
@@ -547,10 +557,11 @@ const SQL_HEADER_UPSERT = `
         unpriced_count     = excluded.unpriced_count,
         pinned_version     = excluded.pinned_version,
         unknown_token_count = excluded.unknown_token_count,
-        universe_complete   = excluded.universe_complete`;
+        universe_complete   = excluded.universe_complete,
+        operation_id        = coalesce(excluded.operation_id, portfolio_snapshots.operation_id)`;
 
-/** 表頭吃掉 $1..$13，明細列從 $14 開始。 */
-const HEADER_PARAM_COUNT = 13;
+/** 表頭吃掉 $1..$15（含 phase 與 operation_id），明細列從 $16 開始。 */
+const HEADER_PARAM_COUNT = 15;
 
 /** pg 對 `count(*)::int` 回 number、對 bigint 回字串；一律收成非負整數，收不到就拋錯而不是回 0。 */
 function toCount(value: unknown, what: string): number {
@@ -605,6 +616,10 @@ export async function writeSnapshot(
   const query = deps.query ?? dbQuery;
   const pricedAt = deps.pricedAt ?? new Date();
   const pinnedVersion = deps.pinnedVersion ?? null;
+  const phase = deps.phase ?? 'manual';
+  if (phase !== 'manual' && phase !== 'before' && phase !== 'after') {
+    throw new RangeError(`phase 必須是 manual / before / after（收到 ${String(phase)}）`);
+  }
   if (pinnedVersion !== null && (!Number.isInteger(pinnedVersion) || pinnedVersion < 1)) {
     throw new RangeError(`pinnedVersion 必須是 >= 1 的整數或 null（收到 ${String(pinnedVersion)}）`);
   }
@@ -670,6 +685,8 @@ export async function writeSnapshot(
     // 所以不在漂移的分母裡；運維仍然要看得到「這帳戶收到過什麼」。
     deps.scan?.unknownHoldings.length ?? 0,
     deps.scan?.universeComplete ?? false,
+    phase,
+    deps.operationId === undefined || deps.operationId === null ? null : String(deps.operationId),
   ];
 
   if (rows.length === 0) {
@@ -681,10 +698,11 @@ export async function writeSnapshot(
 
   const params: unknown[] = [...headerParams];
   const tuples = rows.map((row, index) => {
-    const base = HEADER_PARAM_COUNT + index * 6;
-    params.push(row.asset, row.amount, row.usdValue, row.priceSource, row.pricedAt, snapshot.block.toString());
-    // $1 是 portfolio_id（表頭與明細共用同一個參數），其餘六欄逐列。
-    return `($1, $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6})`;
+    const base = HEADER_PARAM_COUNT + index * 5;
+    params.push(row.asset, row.amount, row.usdValue, row.priceSource, row.pricedAt);
+    // $1 = portfolio_id、$14 = phase（表頭與明細共用這兩個參數），其餘逐列。
+    // phase 共用是刻意的：明細的 phase 與它所屬的表頭不一致時，兩張快照的差額會算錯而沒人發現。
+    return `($1, $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $2, $14)`;
   });
 
   const result = await query(
@@ -693,9 +711,9 @@ export async function writeSnapshot(
        returning (xmax = 0) as inserted
      ),
      detail as (
-       insert into positions_snapshots (portfolio_id, asset, amount, usd_value, price_source, priced_at, block)
+       insert into positions_snapshots (portfolio_id, asset, amount, usd_value, price_source, priced_at, block, phase)
        values ${tuples.join(', ')}
-       on conflict (portfolio_id, asset, block) do update
+       on conflict (portfolio_id, asset, block, phase) do update
          set amount = excluded.amount,
              usd_value = excluded.usd_value,
              price_source = excluded.price_source,

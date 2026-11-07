@@ -98,6 +98,7 @@ import { getConfig, getSessionKeyConfig, requireSessionKeyConfig } from './confi
 import { errorMessage, query as dbQuery, withTransaction } from './db.js';
 import { buildSessionPermissions } from './permissions.js';
 import { DEFAULT_DEADLINE_SECONDS as PLAN_DEFAULT_DEADLINE_SECONDS, planRebalance, refreshFloors } from './rebalance-plan.js';
+import { writeSnapshot as writeSnapshotImpl } from './snapshot.js';
 import type { PlanPartial, PlannedStep, RebalancePlan, RefreshFloorsResult } from './rebalance-plan.js';
 import { DEFAULT_THRESHOLD_BPS, planPortfolio } from './snapshot.js';
 import type { PortfolioPlan } from './snapshot.js';
@@ -531,6 +532,12 @@ export type SchedulerDeps = {
    * dry-run 也需要它（前置檢查 b 的 spender，見檔頭 ③-bis），而預設的 planRebalance 本來就在讀。
    */
   executor?: Address;
+  /**
+   * 稽核快照的 writer。預設是 `snapshot.ts` 的 `writeSnapshot`；測試注入 stub 就不必真的寫 DB。
+   * 失敗不會讓這一輪失敗（快照是觀測，不是這一輪的目的）。
+   */
+  writeSnapshot?: typeof writeSnapshotImpl;
+
   planPortfolio?: (portfolioId: number) => Promise<PortfolioPlan>;
   planRebalance?: (input: RebalancePlanningInput) => Promise<RebalancePlan>;
   /** live 前置檢查 a：鏈上的 permissionConfig（不看 DB 的 status）。 */
@@ -1342,6 +1349,8 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
     executor: provided.executor ?? null,
     withTransaction: provided.withTransaction ?? defaultWithTransaction,
     log: provided.log ?? ((line: string) => console.log(line)),
+    /** 稽核快照的writer。可注入，所以排程器測試不必真的寫 DB。 */
+    writeSnapshot: provided.writeSnapshot ?? writeSnapshotImpl,
     planPortfolio:
       provided.planPortfolio ??
       ((portfolioId: number) =>
@@ -1757,6 +1766,16 @@ async function decideAndMaybeExecute(
     return { ...withPlan, outcome: gate.outcome, reason: `operations 閘門擋下：${gate.reason}` };
   }
 
+  // 稽核軌跡：送出前先記一張（用剛剛算好的觀測，不額外讀鏈）。
+  await recordAuditSnapshot({
+    deps: ctx.deps,
+    portfolioId: due.portfolioId,
+    phase: 'before',
+    plan,
+    idempotencyKey,
+    thresholdBps: ctx.thresholdBps,
+  });
+
   const execution = await executeAndSettle(ctx.deps, {
     portfolioId: due.portfolioId,
     account: due.account,
@@ -1766,6 +1785,24 @@ async function decideAndMaybeExecute(
     deadline: rebalance.deadline,
     idempotencyKey,
   });
+
+  // 落地後再記一張 —— **重新讀鏈**，不沿用送出前的觀測：這一張的全部意義就是「交易真的改變了什麼」。
+  // 只有真的上鏈（success / reverted）才有 after；送出失敗（error）時鏈上沒變，寫一張相同的只是噪音。
+  if (execution.status === 'success' || execution.status === 'reverted') {
+    try {
+      const afterPlan = await ctx.deps.planPortfolio(due.portfolioId);
+      await recordAuditSnapshot({
+        deps: ctx.deps,
+        portfolioId: due.portfolioId,
+        phase: 'after',
+        plan: afterPlan,
+        idempotencyKey,
+        thresholdBps: ctx.thresholdBps,
+      });
+    } catch (error) {
+      ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} 的 after 快照讀鏈失敗：${oneLine(error)}（這一輪照常）`);
+    }
+  }
   if (execution.status === 'success') {
     return { ...withPlan, outcome: 'executed', reason: `已上鏈：tx ${execution.txHash ?? '(unknown)'}（第 ${gate.attempts} 次嘗試）`, execution };
   }
@@ -1787,6 +1824,49 @@ async function decideAndMaybeExecute(
       `（第 ${gate.attempts} 次嘗試，operations 記為 failed）`,
     execution,
   };
+}
+
+
+/**
+ * 寫一張稽核快照（`before` 或 `after`），並連回這一輪的 `operations` 列。
+ *
+ * 為什麼在排程器寫而不是在 `writeSnapshot` 自己找 operation：快照不該知道 `idempotency_key` 這種
+ * 排程器的概念。這裡用 key 查出 id 再傳進去，兩層的責任就分開了。
+ *
+ * **失敗不往外拋**：快照是觀測，不是這一輪的目的。寫不進去時留一行 log，這一輪的再平衡照常 ——
+ * 反過來（為了一張快照讓一筆已經規劃好的再平衡失敗）才是真正不可接受的。
+ */
+async function recordAuditSnapshot(args: {
+  deps: ResolvedDeps;
+  portfolioId: number;
+  phase: 'before' | 'after';
+  plan: PortfolioPlan;
+  idempotencyKey: string;
+  thresholdBps: number;
+}): Promise<void> {
+  try {
+    const { rows } = await args.deps.query(
+      'select id::text as id from operations where idempotency_key = $1',
+      [args.idempotencyKey],
+    );
+    const first = rows[0] as { id?: unknown } | undefined;
+    const rawId = typeof first?.id === 'string' ? first.id : undefined;
+    await args.deps.writeSnapshot(args.plan.snapshot, args.plan.report, {
+      query: args.deps.query as never,
+      phase: args.phase,
+      operationId: rawId === undefined ? null : BigInt(rawId),
+      // `PortfolioPlan.pinnedVersion` 是物件（version + 鏈上 id + paused），表頭只要 version。
+      pinnedVersion: args.plan.pinnedVersion.version,
+      thresholdBps: args.thresholdBps,
+    });
+    args.deps.log(
+      `[scheduler] portfolio ${args.portfolioId} 的 ${args.phase} 快照已寫入（block ${args.plan.snapshot.block.toString()}）`,
+    );
+  } catch (error) {
+    args.deps.log(
+      `[scheduler] portfolio ${args.portfolioId} 的 ${args.phase} 快照沒寫成：${oneLine(error)}（這一輪照常）`,
+    );
+  }
 }
 
 /** 送出 → 標 submitted → 等 receipt → 標 confirmed / reverted / failed。 */

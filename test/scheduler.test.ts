@@ -1819,6 +1819,72 @@ function dueRound(chain: StubChain): { db: StubDb; round: Promise<{ results: Por
   return { db, round: runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain)) };
 }
 
+test('稽核快照：executed 的一輪寫 before + after，兩張共用 operationId，after 是重新讀鏈的觀測', async () => {
+  const chain = stubChain({ rebalance: readyPlan([encodableStep()]) });
+  const db = stubDb({ portfolios: [portfolio({ nextRunAt: null })], sessionKeys: [sessionKey()] });
+  const base = deps(db, chain);
+  const written: { phase: string; operationId: unknown; block: bigint; pinned: unknown }[] = [];
+
+  const round = await runSchedulerOnce(
+    { dryRun: false, now: NOW },
+    deps(db, chain, {
+      // 排程器用 idempotency_key 反查 operations.id；stub 只認這一句，其餘交回原本的 stub。
+      query: async (text, params) => {
+        if (text.includes('from operations where idempotency_key')) return { rows: [{ id: '42' }] };
+        if (base.query === undefined) throw new Error('base.query 不見了');
+        return base.query(text, params);
+      },
+      writeSnapshot: async (snapshot, _report, options) => {
+        written.push({
+          phase: options?.phase ?? 'manual',
+          operationId: options?.operationId ?? null,
+          block: snapshot.block,
+          pinned: options?.pinnedVersion ?? null,
+        });
+        return { headerInserted: true, inserted: 0, updated: 0 };
+      },
+    }),
+  );
+
+  assert.equal(round.results[0]?.outcome, 'executed');
+  assert.deepEqual(
+    written.map((row) => row.phase),
+    ['before', 'after'],
+    '一次成功的一輪要留下前後兩張：只有一張時「這一輪做了什麼」算不出來',
+  );
+  assert.equal(written[0]?.operationId, 42n, 'before 要連回 operations.id');
+  assert.equal(written[1]?.operationId, 42n, 'before/after 共用同一個 operationId，才能配成前後');
+  assert.equal(written[0]?.pinned, 1, '表頭要拿到 enrollment.version，不是 {version,...} 物件');
+  assert.equal(
+    chain.planPortfolioCalls.length,
+    2,
+    'after 那張必須重新讀鏈（沿用送出前的觀測等於自己抄一份給自己）',
+  );
+});
+
+test('稽核快照：writeSnapshot 失敗不會讓已經上鏈的那一輪變成失敗', async () => {
+  const chain = stubChain({ rebalance: readyPlan([encodableStep()]) });
+  const db = stubDb({ portfolios: [portfolio({ nextRunAt: null })], sessionKeys: [sessionKey()] });
+
+  const base = deps(db, chain);
+  const round = await runSchedulerOnce(
+    { dryRun: false, now: NOW },
+    deps(db, chain, {
+      query: async (text, params) => {
+        if (text.includes('from operations where idempotency_key')) return { rows: [{ id: '42' }] };
+        if (base.query === undefined) throw new Error('base.query 不見了');
+        return base.query(text, params);
+      },
+      writeSnapshot: async () => {
+        throw new Error('stub：快照表寫不進去');
+      },
+    }),
+  );
+
+  assert.equal(round.results[0]?.outcome, 'executed', '快照是觀測，不該決定這一輪的成敗');
+  assert.equal(chain.executeCalls.length, 1);
+});
+
 test('重問地板：排程器送出的 amountOutMin 是**新鮮值**，planHash／idempotency_key 也跟著它（不是規劃值）', async () => {
   const planned = encodableStep();
   const fresh = encodableStep({ amountOutMin: 510_000_000_000_000_000n, oracleFloor: 510_000_000_000_000_000n });

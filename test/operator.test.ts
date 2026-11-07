@@ -957,3 +957,22 @@ test('plan 預覽：dry-run 竟然回報 executed → 拋錯，不把它講成 n
     /PLAN_PREVIEW_CONTRACT|dry-run/,
   );
 });
+
+test('GET /assets：要認證；回 priceable_assets 的清單（create fund 的選單來源）', async () => {
+  const assets = [
+    { address: '0x55d398326f99059ff775485246999027b3197955', symbol: 'USDT', decimals: 18, isNumeraire: true },
+    { address: '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c', symbol: 'WBNB', decimals: 18, isNumeraire: false },
+  ];
+  await withServer(
+    async (baseUrl) => {
+      const anonymous = await getJson(baseUrl, '/assets');
+      assert.equal(anonymous.status, 401, '資產清單在登入後才看得到');
+
+      const token = await loginToken(baseUrl);
+      const response = await getJson(baseUrl, '/assets', token);
+      assert.equal(response.status, 200);
+      assert.deepEqual(await response.json(), { assets });
+    },
+    { listAssets: async () => assets },
+  );
+});

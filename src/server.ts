@@ -2,6 +2,8 @@ import { createServer as createHttpServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { alertCounts, healthStatusFor, listOpenAlerts } from './alerts.js';
 import type { AlertCounts } from './alerts.js';
+import { listPriceableAssets } from './assets.js';
+import type { PriceableAsset } from './assets.js';
 import { authenticate, issueNonce, login, parseLoginBody } from './auth.js';
 import { getConfig } from './config.js';
 import { query } from './db.js';
@@ -177,6 +179,8 @@ export type ServerDeps = {
    * 那是「不轉發」唯一能證明的方式，光看回應碼證明不了。
    */
   bundlerFetch?: typeof fetch;
+  /** `GET /assets`：create fund 的資產選單。注入讓路由測試不必連 DB。 */
+  listAssets: () => Promise<PriceableAsset[]>;
 };
 
 const defaultDeps: ServerDeps = {
@@ -191,6 +195,7 @@ const defaultDeps: ServerDeps = {
   operatorRebalance: runOperatorRebalance,
   planPreview: previewOperatorRebalance,
   operatorRebalanceEnabled,
+  listAssets: listPriceableAssets,
 };
 
 export function createServer(overrides: Partial<ServerDeps> = {}): Server {
@@ -255,6 +260,15 @@ async function route(
   if (root === 'health' && segments.length === 1) {
     if (method !== 'GET') return methodNotAllowed(res, ['GET']);
     return health(res);
+  }
+
+  // GET /assets — create fund 的資產選單。要認證：它是「站上可交易的東西」的內部清單，
+    // 而且這支 API 的其他資料也全部要 token（只有 /health 是公開的）。
+  if (root === 'assets' && segments.length === 1) {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    authenticate(req.headers.authorization);
+    sendJson(res, 200, { assets: await deps.listAssets() });
+    return;
   }
 
   if (root === 'auth') {

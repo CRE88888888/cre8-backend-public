@@ -190,7 +190,16 @@ export type PlanRebalanceArgs = {
   numeraire?: Address;
   /**
    * 每一步的價格衝擊上限（bps，量法是 `(TWAP 報價 − 估算到手)/TWAP 報價`，
-   * 與合約 `maxSlippageBps` 同一個空間）。預設 `DEFAULT_MAX_IMPACT_BPS` = 50 = 半個滑價預算。
+   * 與合約 `maxSlippageBps` 同一個空間）。預設 `DEFAULT_MAX_IMPACT_BPS` = 80。
+   *
+   * 為什麼是 80 而不是 50：50 在「現貨偏離 TWAP 60–80 bps」這種很常見的盤況下會讓**每一輪都做不了事**
+   * （baseline 就吃掉全部預算），投組於是長期停在漂移裡（D-25 說「等市場」，但沒有終點保證）。
+   * 80 仍然**嚴格小於** per-pair oracle 的 `maxSlippageBps`（100），所以合約的 `BelowFloor` 仍然是最後
+   * 一道、且**永遠比我們寬鬆** —— 我們不會送出一個必定 revert 的計畫。
+   *
+   * ⚠ 這個值不是「越大越能動」：真正的上限是 oracle 的 100，而 baseline 是市場決定的。
+   *   實測某輪 baseline 92 bps 時，即使把這裡調到 80 也一樣做不了事 —— 那種情況要動的是 oracle 的
+   *   `maxSlippageBps`（換 per-pair oracle），不是這裡。
    *
    *   * `undefined` → 用預設值 50（**預設就是開的**）。
    *   * `null`      → 關掉：不讀池子狀態、一步都不縮（既有行為的完全等價開關）。
@@ -237,7 +246,7 @@ export const V3_SWAP_EXACT_IN: Hex = '0x00';
  * 池子手續費（2500 → 25 bps）、現貨相對 TWAP 的既有偏差、以及這一筆自己的衝擊。留一半給衝擊，
  * 剩下的才是給 fee 與雜訊的 —— 50 bps 的衝擊在 2500 的池子上剛好留 25 bps 的餘裕。
  */
-export const DEFAULT_MAX_IMPACT_BPS = 50;
+export const DEFAULT_MAX_IMPACT_BPS = 80;
 /**
  * 縮小之後如果連理想量的 **1 bp**（萬分之一）都不到，就當成 dust 跳過。
  * 理由：那種量對漂移的貢獻等於 0，卻要付一次完整的 swap gas 與一次 `BelowFloor` 的風險。

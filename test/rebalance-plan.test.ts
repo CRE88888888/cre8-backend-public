@@ -1524,7 +1524,8 @@ function pinnedHoldings(): Holding[] {
 test('pinned：理想量超過預算 → step 被縮小、impact ≤ 預算、partial 有記錄、rationale 標「部分執行」', async () => {
   const chain = impactChain({ liquidity: 10n ** 18n });
   const plan = expectReady(
-    await planRebalance(argsOf(chain, { holdings: pinnedHoldings(), targets: targetsOf(WBNB, USDT), thresholdBps: 100 })),
+    await planRebalance(argsOf(chain, {
+      maxImpactBps: 50, holdings: pinnedHoldings(), targets: targetsOf(WBNB, USDT), thresholdBps: 100 })),
   );
   const step = plan.steps[0];
   assert.ok(step !== undefined);
@@ -1555,6 +1556,7 @@ test('pinned：理想量超過預算 → step 被縮小、impact ≤ 預算、pa
 
   assert.match(plan.rationale, /⚠ 部分執行/);
   assert.match(plan.rationale, /剩餘由下一輪處理/);
+  // 這一條測的是「預算怎麼作用」，所以預算要**明確給**，不要依賴預設值（預設改了不該讓它變義意）。
   assert.match(plan.rationale, /超過上限 50 bps/);
 });
 
@@ -1637,9 +1639,10 @@ test('pinned：池子狀態讀不到（slot0/liquidity 沒有）→ 放行原量
   assert.match(plan.rationale, /上限未套用/);
 });
 
-test('maxImpactBps 的解析：省略 = 50、null = 關掉、非法值 → RangeError', () => {
+test('maxImpactBps 的解析：省略 = 80、null = 關掉、非法值 → RangeError', () => {
   assert.equal(resolveMaxImpactBps(undefined), DEFAULT_MAX_IMPACT_BPS);
-  assert.equal(DEFAULT_MAX_IMPACT_BPS, 50);
+  // 80 嚴格小於 per-pair oracle 的 maxSlippageBps（100）：合約的 BelowFloor 永遠比我們寬鬆。
+  assert.equal(DEFAULT_MAX_IMPACT_BPS, 80);
   assert.equal(resolveMaxImpactBps(null), null);
   assert.equal(resolveMaxImpactBps(25), 25);
   for (const bad of [0, -1, 10_000, 1.5, Number.NaN]) {
@@ -1719,7 +1722,8 @@ test('縮小但收斂：step 真的被衝擊上限縮小，執行後仍收斂 �
 
   const plan = expectReady(
     await planRebalance(
-      argsOf(chain, { holdings, targets: targetsOf(WBNB, USDT), thresholdBps: 600 }),
+      argsOf(chain, {
+      maxImpactBps: 50, holdings, targets: targetsOf(WBNB, USDT), thresholdBps: 600 }),
     ),
   );
   const step = plan.steps[0];

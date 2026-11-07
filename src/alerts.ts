@@ -25,7 +25,11 @@ import { perOperationCostWei } from './funding.js';
 /** DB 的最小介面：只要 `{ rows }`。`db.query` 與 `scheduler.ts` 的 `SchedulerQueryFn` 都接得上。 */
 export type QueryFn = (text: string, params?: readonly unknown[]) => Promise<{ rows: unknown[] }>;
 
-export type AlertKind = 'portfolio_repeatedly_failing' | 'session_key_expiring' | 'gas_low';
+export type AlertKind =
+  | 'portfolio_repeatedly_failing'
+  | 'session_key_expiring'
+  | 'gas_low'
+  | 'portfolio_stuck';
 export type AlertSeverity = 'warn' | 'critical';
 
 export type AlertFinding = {
@@ -59,10 +63,12 @@ export type AlertThresholds = {
   keyExpiryDays: number;
   /** smart account 的 BNB 只剩不到幾次操作的 gas 就告警。 */
   minOps: number;
+  /** 最新快照仍 `needs_rebalance` 而且已經超過幾小時沒有成功執行就告警（D-25 的「等」沒有終點）。 */
+  stuckHours: number;
 };
 
 /** 與 `ALERT_*` 沒設時的行為逐字對應（測試釘住它們，改預設值要有意識）。 */
-export const DEFAULT_ALERT_THRESHOLDS: AlertThresholds = { failingOps: 3, keyExpiryDays: 30, minOps: 10 };
+export const DEFAULT_ALERT_THRESHOLDS: AlertThresholds = { failingOps: 3, keyExpiryDays: 30, minOps: 10, stuckHours: 6 };
 
 /**
  * session key 剩不到這麼多天 → `critical`（否則 `warn`）。
@@ -93,6 +99,7 @@ export function loadAlertThresholds(env: NodeJS.ProcessEnv = process.env): Alert
     failingOps: positiveInteger(env, 'ALERT_FAILING_OPS', DEFAULT_ALERT_THRESHOLDS.failingOps),
     keyExpiryDays: positiveInteger(env, 'ALERT_KEY_EXPIRY_DAYS', DEFAULT_ALERT_THRESHOLDS.keyExpiryDays),
     minOps: positiveInteger(env, 'ALERT_MIN_OPS', DEFAULT_ALERT_THRESHOLDS.minOps),
+    stuckHours: positiveInteger(env, 'ALERT_STUCK_HOURS', DEFAULT_ALERT_THRESHOLDS.stuckHours),
   };
 }
 
@@ -139,6 +146,9 @@ export async function detectAlerts(
       readNativeBalance: args.readNativeBalance ?? getAccountGasBalance,
       readGasPrice: args.readGasPrice ?? getGasPriceWei,
     })),
+    // 卡住：最新快照仍 needs_rebalance 而太久沒有成功執行。放最後是因為它與前三個都不同源
+    // （前三個看 operations / session_keys / 鏈上餘額，這個看快照）。
+    ...(await detectPortfolioStuck(query, thresholds.stuckHours)),
   ];
 }
 
@@ -169,6 +179,55 @@ export async function detectPortfolioFailures(query: QueryFn, failingOps: number
     } satisfies AlertFinding;
   });
 }
+
+/**
+ * 規則 4：**卡住**。最新一張快照仍 `needs_rebalance`，而且已經超過 N 小時沒有成功執行。
+ *
+ * 為什麼用快照而不是計數器：成功的執行會寫一張 `after` 快照，所以「最新快照仍需要再平衡而且很舊」
+ * 就等於「這段時間內一次都沒成功動過，而上一次觀測說它還需要動」。不需要新的欄位，也不會因為
+ * 重啟／`kill -9` 而歸零（記憶體裡的計數器就有那個問題）。
+ *
+ * 這個告警蓋到兩種對人來說一樣的狀況：**排程器一直 noop**（例如現貨偏離 TWAP 讓 impact 預算
+ * 做不了事）與**排程器根本沒在跑**。
+ */
+export async function detectPortfolioStuck(query: QueryFn, stuckHours: number): Promise<AlertFinding[]> {
+  const { rows } = await query(SQL_STUCK, [stuckHours]);
+
+  return rows.map((row) => {
+    const fields = row as Record<string, unknown>;
+    const portfolioId = toInteger(fields.portfolio_id, 'portfolio_id');
+    const hours = Number(fields.hours_since);
+    const drift = toInteger(fields.gross_drift_bps, 'gross_drift_bps');
+    // 一天沒進展不是「今天運氣不好」：24 小時是「需要有人去看」的門檻。
+    const severity: AlertSeverity = Number.isFinite(hours) && hours >= 24 ? 'critical' : 'warn';
+    return {
+      kind: 'portfolio_stuck',
+      severity,
+      portfolioId,
+      detail:
+        `portfolio ${portfolioId} 上次觀測漂移 ${drift} bps（仍高於門檻）距今 ${Number.isFinite(hours) ? hours.toFixed(1) : '?'} 小時，` +
+        '期間沒有任何一次成功執行 —— 可能是市場讓 impact 預算做不了事（看 `GET /portfolios/:id/plan`），' +
+        '或排程器沒在跑',
+    } satisfies AlertFinding;
+  });
+}
+
+const SQL_STUCK = `
+  with latest as (
+    select distinct on (portfolio_id) portfolio_id, created_at, needs_rebalance, gross_drift_bps
+      from portfolio_snapshots
+     order by portfolio_id, created_at desc
+  )
+  select l.portfolio_id,
+         l.gross_drift_bps,
+         extract(epoch from (now() - l.created_at)) / 3600.0 as hours_since
+    from latest l
+    join portfolios p on p.id = l.portfolio_id
+   where p.schedule_state = 'active'
+     and l.needs_rebalance
+     and l.created_at < now() - make_interval(hours => $1::int)
+   order by l.created_at asc
+`;
 
 /**
  * 規則 2：`status='active'` 且 `expires_at` 在 N 天內的 session key。剩不到 7 天 → `critical`。

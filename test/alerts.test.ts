@@ -14,6 +14,7 @@ import {
   loadAlertThresholds,
   recordAlerts,
   resolveAlerts,
+  detectPortfolioStuck,
 } from '../src/alerts.js';
 import type { AlertFinding, QueryFn } from '../src/alerts.js';
 import { OPS_GAS_PER_OPERATION, perOperationCostWei } from '../src/funding.js';
@@ -733,4 +734,38 @@ test('真 Postgres：同一個 (kind, portfolio) 連跑兩次 = 一列 occurrenc
       }),
     /rollback：這一組不留任何列/,
   );
+});
+
+test('portfolio_stuck：最新快照仍 needs_rebalance 且已超過 N 小時 → 告警（<24h 是 warn）', async () => {
+  const { query, seen } = stubQuery(() => [{ portfolio_id: '305', gross_drift_bps: 595, hours_since: '7.4' }]);
+  const findings = await detectPortfolioStuck(query, 6);
+  // 判定條件本身要看得到：needs_rebalance、schedule_state、以及「超過 N 小時」都在 SQL 裡。
+  const sql = findSeen(seen, 'portfolio_snapshots').sql;
+  assert.match(sql, /needs_rebalance/);
+  assert.match(sql, /schedule_state = 'active'/);
+  assert.match(sql, /make_interval\(hours => \$1::int\)/);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0]?.kind, 'portfolio_stuck');
+  assert.equal(findings[0]?.severity, 'warn');
+  assert.equal(findings[0]?.portfolioId, 305);
+  assert.match(String(findings[0]?.detail), /595 bps/);
+  assert.match(String(findings[0]?.detail), /7\.4 小時/);
+});
+
+test('portfolio_stuck：一整天沒有進展 → critical（不是「今天運氣不好」）', async () => {
+  const { query } = stubQuery(() => [{ portfolio_id: '305', gross_drift_bps: 595, hours_since: '26.0' }]);
+  const findings = await detectPortfolioStuck(query, 6);
+  assert.equal(findings[0]?.severity, 'critical');
+});
+
+test('portfolio_stuck：一切正常時不產生告警', async () => {
+  const { query } = stubQuery(() => []);
+  const findings = await detectPortfolioStuck(query, 6);
+  assert.deepEqual(findings, []);
+});
+
+test('ALERT_STUCK_HOURS 可覆寫；格式錯誤要拋錯（不要靜默用預設值）', () => {
+  assert.equal(loadAlertThresholds({}).stuckHours, 6);
+  assert.equal(loadAlertThresholds({ ALERT_STUCK_HOURS: '12' }).stuckHours, 12);
+  assert.throws(() => loadAlertThresholds({ ALERT_STUCK_HOURS: '12h' }), /ALERT_STUCK_HOURS/);
 });

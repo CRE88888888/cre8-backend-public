@@ -1660,6 +1660,35 @@ test('排程：部分執行 → next_run_at 用短間隔（不是完整的一天
   assert.equal(advance[1]?.inTransaction, false, '部分執行的修正發生在結果已知之後（transaction 外）');
 });
 
+// 回歸（實測踩到）：這一輪**買進帳戶沒持有的資產** → 執行後的漂移算不出來。
+//
+// 錯的做法：拿「執行前的漂移」當剩餘量，於是理由寫「still 6600 bps after this round」並把下一次
+// 提前到 30 分鐘後 —— 而實際那一輪把 6600 收斂到 6 bps。用算不出來的缺口去調度，等於用猜的。
+test('排程：執行後漂移算不出來（remainingDriftBps 是 null）→ 不提前 next_run_at，並說明算不出來', async () => {
+  const db = stubDb({ portfolios: [portfolio({ nextRunAt: null })], sessionKeys: [sessionKey()] });
+  // `partialPlan()` 的 partial 一定有 `remainingDriftBps: number`；這裡要的是「算不出來」那種，
+  // 所以直接改欄位再組回去（`RebalancePlan` 是聯合型別，展開後 kind 會被放寬）。
+  const base = partialPlan();
+  const withNull: RebalancePlan = { ...base, partial: { remainingDriftBps: null, shrunk: [] } } as RebalancePlan;
+  const chain = stubChain({ rebalance: withNull });
+  const round = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain));
+
+  assert.deepEqual(outcomes(round), ['executed']);
+  const claimed = round.results[0]?.nextRunAt.toISOString();
+  assert.equal(
+    db.portfolios[0]?.nextRunAt?.toISOString(),
+    claimed,
+    '算不出來就不該改 next_run_at —— 維持認領時寫入的完整間隔',
+  );
+  const reason = round.results[0]?.reason ?? '';
+  assert.match(reason, /cannot be estimated yet/, `理由要說算不出來（實際：${reason}）`);
+  assert.doesNotMatch(reason, /estimated drift is still/, '不能把算不出來的缺口講成一個具體數字');
+  assert.doesNotMatch(reason, /moved up to/, '沒有提前，就不該說提前');
+
+  const advance = db.statements.filter((entry) => entry.sql.includes('set next_run_at = claimed.next_run_at'));
+  assert.equal(advance.length, 1, '只有認領那一條，沒有第二條修正');
+});
+
 test('排程：完全收斂（執行後預估漂移已回到門檻下）→ 完整間隔，寫入的還是認領算好的那個值', async () => {
   const db = stubDb({ portfolios: [portfolio({ nextRunAt: null })], sessionKeys: [sessionKey()] });
   const chain = stubChain(); // readyPlan()：沒有 partial

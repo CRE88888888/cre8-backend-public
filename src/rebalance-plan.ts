@@ -149,8 +149,14 @@ export type ShrunkStep = {
 };
 
 export type PlanPartial = {
-  /** 執行後的預估漂移（bps）—— 仍然高於門檻，所以還有事要做。 */
-  remainingDriftBps: number;
+  /**
+   * 執行後的預估漂移（bps）。
+   *
+   * `null` = **算不出來**，不是「沒有改善」。最常見的情況是這一輪要買進帳戶現在沒有的資產：
+   * 買到的量沒有價格可以估，所以算不出執行後的漂移。此時**不要**拿執行前的漂移假裝成預測值 ——
+   * 實際發生過：漂移 6600 → 6 bps 的一輪，卡片卻寫「still 6600 bps」，還把 next_run_at 提前。
+   */
+  remainingDriftBps: number | null;
   /** 被縮小的 step（可能為空：缺口可能是「被跳過」而不是「被縮小」）。 */
   shrunk: ShrunkStep[];
 };
@@ -1402,7 +1408,8 @@ async function planHub(
   // 算不出來時用**現在的**漂移當剩餘量的上界：不宣稱收斂，也不謊報一個算不出來的數字。
   const partial: PlanPartial | null =
     postDrift === null
-      ? { remainingDriftBps: drift.grossDriftBps, shrunk: shrunkStepsOf(priced) }
+      ? // 算不出來就說算不出來：`null` 而不是拿 pre 的數字濫竽充數。
+        { remainingDriftBps: null, shrunk: shrunkStepsOf(priced) }
       : postDrift.needsRebalance
         ? { remainingDriftBps: postDrift.grossDriftBps, shrunk: shrunkStepsOf(priced) }
         : null;
@@ -1797,7 +1804,8 @@ export async function planRebalance(
   const partial: PlanPartial | null =
     postDrift === null
       ? {
-          remainingDriftBps: drift.grossDriftBps,
+          // 同上：算不出來就 `null`，不要用 pre 的數字冒充預測。
+          remainingDriftBps: null,
           shrunk: shrunkStepsOf([{ amountIn: finalAmountIn, shrunk: capped.shrunk }]),
         }
       : postDrift.needsRebalance

@@ -1768,6 +1768,35 @@ test('主要缺口被跳過（不是被縮小）→ partial 存在，且 remaini
   assert.match(plan.rationale, /被跳過 1 筆/);
 });
 
+// 回歸（實測踩到）：投組只持有 numeraire，這一輪要**買進兩個沒持有的資產**。
+//
+// 買到的量沒有價格可以估 → 執行後的漂移算不出來。錯的做法是拿「執行前的漂移」當預測值講出來：
+// 使用者看到「still 6600 bps after this round」，而實際那一輪把 6600 收斂到 6。
+test('買進沒持有的資產 → partial.remainingDriftBps 是 null（算不出來），不是執行前的數字', async () => {
+  const holdings = [holding(USDT, 5_000_000_000_000_000_000_000n, 18, PRICE_1_USD)];
+  const targets: TargetWeight[] = [
+    { asset: USDT, weightBps: 3_400 },
+    { asset: WBNB, weightBps: 3_300 },
+    { asset: TOKEN3, weightBps: 3_300 },
+  ];
+  // hub 模式（numeraire = USDT），報價要給：兩個買入腿都要有 minimum 才走得下去。
+  const chain = hubChain({
+    quotes: {
+      // 買入腿的方向是 USDT → 資產，key 用 (tokenIn:tokenOut)。
+      [`${USDT}:${WBNB}`]: { minimum: 1_600_000_000_000_000_000n },
+      [`${USDT}:${TOKEN3}`]: { minimum: 3_000_000_000_000_000_000_000n },
+    },
+  });
+  const plan = expectReady(await planRebalance(hubArgs(chain, { holdings, targets, thresholdBps: 100 })));
+  assert.equal(plan.steps.length, 2);
+  assert.notEqual(plan.partial, undefined, '要帶 partial（還有事沒做完）');
+  assert.equal(
+    plan.partial?.remainingDriftBps,
+    null,
+    '算不出來就是 null —— 拿執行前的漂移冒充預測值是錯的（實際上是 6600 → 6 bps 收斂的一輪）',
+  );
+});
+
 test('計畫不改善漂移（賣超配的錢去補另一個也超配的資產）→ noop，不送出去付 gas', async () => {
   // WBNB +500 / NVDAB -1000 / USDT +500。這一輪只賣 $50 的 WBNB 換 USDT（買 NVDAB 那一步被跳過）：
   // WBNB 的偏差減少、USDT 的偏差等量增加 ⇒ Σ|delta| 完全不動，gross drift 1000 → 1000。

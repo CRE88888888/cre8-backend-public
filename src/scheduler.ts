@@ -1573,7 +1573,20 @@ async function runOne(
   // ---- 部分執行 → 把 next_run_at 拉近（只拉近，不延後；只在真的做了一部分之後）----
   // 認領時已經在**同一個 transaction 內**寫入完整間隔（那個語意不動，crash 時留在完整間隔＝
   // 不會變成熱迴圈）。這裡是在結果已知之後把它**提前**，屬於同一條推進路上的第二段。
+  //
+  // ⚠ 只有**算得出**執行後漂移時才提前。`remainingDriftBps === null` 代表「算不出來」（這一輪買進
+  // 帳戶沒持有的資產，到手量沒有價格可估）—— 拿一個算不出來的缺口去排一輪 1800s 後的執行，
+  // 等於用猜的調度。實際發生過：6600 → 6 bps 收斂的一輪，卻被排成「還在 6600，30 分鐘後再來」。
   if (!ctx.dryRun && result.outcome === 'executed' && result.partial !== null) {
+    if (result.partial.remainingDriftBps === null) {
+      result = {
+        ...result,
+        reason:
+          `${result.reason}；Partial execution: the drift after this round cannot be estimated yet ` +
+          '(it buys assets the portfolio did not hold, so the received amount has no price to value it). ' +
+          'Kept the full interval; the next round will measure it.',
+      };
+    } else {
     const followUpSeconds = Math.min(due.intervalSeconds, PARTIAL_FOLLOW_UP_SECONDS);
     const followUpAt = new Date(ctx.now.getTime() + followUpSeconds * 1_000);
     if (followUpAt.getTime() < result.nextRunAt.getTime()) {
@@ -1588,6 +1601,7 @@ async function runOne(
         // 寫不進去不代表這一輪白做：留在完整間隔，下一輪照排程跑，只是收斂慢一點。
         result = { ...result, reason: `${result.reason}；${note}（但寫回失敗：${oneLine(error)}）` };
       }
+    }
     }
   }
 

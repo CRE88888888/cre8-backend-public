@@ -461,6 +461,7 @@ const SAMPLE_STATUS: PortfolioStatus = {
   blocked: [],
   complete: false,
   sessionKey: { configured: null, usable: null, error: null },
+  gas: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -982,6 +983,41 @@ test('GET /assets：要認證；回 priceable_assets 的清單（create fund 的
 
 // `GET /portfolios/:id/activity`：把 operations 與 before/after 快照 join 起來。
 // 沒有這條的話，「這一輪到底做了什麼」只能靠手動 SQL —— 而那是 UI 的主要內容之一。
+// status 的 gas 一列：讀不到就是 null（不是 0），而且不讓整份狀態變 503。
+// gas 是**每個帳戶自己付**的（ERC-4337 sender 模型），所以這是「這檔基金還能不能動」的答案。
+test('portfolioStatus：gas 算得出來就帶上，讀不到是 null 而不是 0 或 503', async () => {
+  const makeReader = (balance: (() => Promise<bigint>) | null) =>
+    createPortfolioStatusReader({
+      planPortfolio: async () => samplePlan(),
+      requireOwnedPortfolio: async () => undefined as never,
+      query: symbolQuery(),
+      // session key 的讀取會打鏈；這條測試只關心 gas，所以讓它失敗（status 會記在 sessionKey.error）。
+      publicClient: {
+        readContract: async () => {
+          throw new Error('not needed for this test');
+        },
+      } as never,
+      executor: EXECUTOR,
+      minGasWei: 10n ** 16n,
+      gasPrice: async () => 1_000_000_000n,
+      ...(balance === null ? {} : { accountGasBalance: balance }),
+    });
+
+  const ok = await makeReader(async () => 5n * 10n ** 16n)(PORTFOLIO_ID, WALLET.address);
+  assert.equal(ok.gas?.ready, true);
+  assert.equal(ok.gas?.balanceWei, (5n * 10n ** 16n).toString());
+  assert.equal(ok.gas?.shortfallWei, '0');
+
+  const low = await makeReader(async () => 1n * 10n ** 15n)(PORTFOLIO_ID, WALLET.address);
+  assert.equal(low.gas?.ready, false);
+  assert.equal(low.gas?.shortfallWei, (9n * 10n ** 15n).toString(), '不足時要說出還差多少');
+
+  const broken = await makeReader(async () => {
+    throw new Error('rpc is down');
+  })(PORTFOLIO_ID, WALLET.address);
+  assert.equal(broken.gas, null, '讀不到是 null —— 不是 0（那會被讀成「沒錢」），也不是 503');
+});
+
 test('listPortfolioActivity：join 前後快照、新到舊、沒有快照的輪次留 null', async () => {
   const seen: { sql: string; params: readonly unknown[] }[] = [];
   const fakeQuery = async (sql: string, params: readonly unknown[] = []) => {

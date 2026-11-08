@@ -14,6 +14,10 @@ import { getConfig, getSessionKeyConfig } from './config.js';
 import { query as dbQuery, withTransaction } from './db.js';
 import { AppError } from './errors.js';
 import { requireOwnedPortfolio } from './portfolios.js';
+import { describeGasStatus } from './funding.js';
+import type { GasStatus } from './funding.js';
+import { getAccountGasBalance, getGasPriceWei } from './chain.js';
+import { getGasConfig } from './config.js';
 import { countSwapExecuted, runSchedulerOnce } from './scheduler.js';
 import type { ExecutionOutcome, PortfolioRunResult, WithTransactionFn } from './scheduler.js';
 import { planPortfolio } from './snapshot.js';
@@ -114,6 +118,14 @@ export type PortfolioStatus = {
    * 只顯示 DB 那一把會騙人：實測 portfolio 5 的 DB key 在鏈上沒安裝，排程器會退回舊的那把。
    */
   sessionKey: StatusSessionKey;
+  /**
+   * 這個帳戶的 gas 狀態（原生 BNB）。
+   *
+   * 為什麼放在 status：**gas 是每個帳戶自己付的**（ERC-4337 的 sender 模型），而一個帳戶 = 一個
+   * 「owner + 策略」組合。所以「這檔基金還能不能動」= 「它自己還有沒有 BNB」，跟別的投組無關。
+   * `null` = 查不到（RPC 掛），不是「餘額 0」—— 使用者要能分辨這兩件事。
+   */
+  gas: GasStatus | null;
 };
 
 export type StatusDeps = {
@@ -126,6 +138,12 @@ export type StatusDeps = {
   now?: () => number;
   /** executor 位址（app 組 approve 用）；省略 = `EXECUTOR_ADDRESS`。 */
   executor?: Address;
+  /** 讀帳戶的原生幣餘額；省略 = `getAccountGasBalance`。 */
+  accountGasBalance?: (address: Address) => Promise<bigint>;
+  /** 讀 gas price；省略 = `getGasPriceWei`。 */
+  gasPrice?: () => Promise<bigint>;
+  /** `gas.ready` 的門檻；省略 = `MIN_SESSION_GAS_WEI`。 */
+  minGasWei?: bigint;
   log?: (line: string) => void;
 };
 
@@ -455,6 +473,18 @@ async function statusOf(portfolioId: number, deps: StatusDeps): Promise<Portfoli
   // 唯讀的附加資訊：讀不到也只記進 `sessionKey.error`，不讓一份算得出來的狀態變成 503。
   const sessionKey = await resolveStatusSessionKey(plan.portfolioId, plan.account, deps);
   const executor = deps.executor ?? getSessionKeyConfig().executorAddress ?? null;
+  // gas 讀不到（RPC 掛）不該讓整份狀態變 503：留 null，前端顯示「未知」。
+  const gas = await (async () => {
+    try {
+      const readBalance = deps.accountGasBalance ?? getAccountGasBalance;
+      const readPrice = deps.gasPrice ?? getGasPriceWei;
+      const minimumWei = deps.minGasWei ?? getGasConfig().minSessionGasWei;
+      const [balanceWei, gasPriceWei] = await Promise.all([readBalance(plan.account), readPrice()]);
+      return describeGasStatus({ address: plan.account, balanceWei, minimumWei, gasPriceWei });
+    } catch {
+      return null;
+    }
+  })();
 
   return {
     portfolioId: plan.portfolioId,
@@ -469,6 +499,7 @@ async function statusOf(portfolioId: number, deps: StatusDeps): Promise<Portfoli
     blocked: plan.blocked.map((block) => ({ code: block.code, detail: block.detail })),
     complete: report !== null && plan.blocked.length === 0,
     sessionKey,
+    gas,
   };
 }
 

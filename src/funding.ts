@@ -12,7 +12,16 @@ import type { Address } from 'viem';
  */
 
 /** 一次 rebalance UserOp 的實測 gasUsed（約 250k）。估算用，不是帳務數字。 */
-export const OPS_GAS_PER_OPERATION = 250_000n;
+/**
+ * 一次 rebalance 大約用多少 gas —— **取自實測，不是猜的**。
+ *
+ * 三次真實執行（含 approve 與 swap）：`actualGasUsed` 870,901 / 938,431 / 935k 左右。
+ * 舊值是 250,000（只算了 handleOps 的骨架，沒算 calldata 與兩筆 swap），讓 `estimatedOps`
+ * 高估 3.5 倍 —— 而那個數字會顯示給使用者（portfolio 頁的 gas 一列），所以必須是誠實的。
+ *
+ * 取 900,000 而不是平均值：寧可略微保守，因為低估的後果是「以為還能跑，結果付不出 gas」。
+ */
+export const OPS_GAS_PER_OPERATION = 900_000n;
 
 /** `Number` 的安全上限；超過就 clamp，避免把一個巨大的 bigint 轉成看似精確的錯數字。 */
 const MAX_SAFE_OPS = Number.MAX_SAFE_INTEGER;

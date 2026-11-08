@@ -913,8 +913,9 @@ test('enrollPortfolio reports gas status for the deployed smart account after th
   assert.equal(portfolio.gas.minimumWei, DEFAULT_MIN_SESSION_GAS_WEI.toString());
   assert.equal(portfolio.gas.ready, true);
   assert.equal(portfolio.gas.shortfallWei, '0');
-  // 0.05 BNB @ 1.22 gwei / (250k gas) = 163 次 op（向下取整）。
-  assert.equal(portfolio.gas.estimatedOps, 163);
+  // 0.05 BNB @ 1.22 gwei / (900k gas) = 45 次 op（向下取整）。
+  // 900k 是實測：三次真實 rebalance 的 actualGasUsed 是 870,901 / 938,431 / 935k。
+  assert.equal(portfolio.gas.estimatedOps, 45);
   assert.equal(portfolio.gas.gasPriceKnown, true);
   // DB 已經寫完才去查：三筆寫入都在，而且查餘額不改變任何寫入。
   assert.ok(calls.writes.some((w) => w.text.includes('insert into portfolios')));

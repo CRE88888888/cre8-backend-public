@@ -7,14 +7,17 @@ import { OPS_GAS_PER_OPERATION, describeGasStatus, perOperationCostWei } from '.
 /**
  * 這支測試只碰純函式與純解析器：不連 DB、不連鏈。
  *
- * 一次 op 的實測數字（見 docs/pitfalls.zh-TW.md §3.10）：gasUsed ≈ 250,000、gas price ≈ 1.22 gwei，
+ * 一次 op 的實測數字：gasUsed ≈ 900,000（含 calldata 與兩筆 swap 的 rebalance）、gas price ≈ 1.22 gwei，
  * 所以一次 op ≈ 0.0003 BNB。下面的固定值都繞著這組數字，讓「這條算式算錯了」與「市場變了」分得開。
  */
 
 const ACCOUNT = getAddress('0x1234567890abcdef1234567890abcdef12345678');
 const MINIMUM_WEI = 10n ** 16n; // 0.01 BNB
 const GAS_PRICE_WEI = 1_220_000_000n; // 1.22 gwei
-const OP_GAS = 250_000n; // 不 import 常數，獨立寫死，否則常數本身錯了測試還是綠
+// 獨立寫死（不 import 常數），否則常數本身錯了測試還是綠。
+// 900k 的來源：三次真實 rebalance 的 actualGasUsed 是 870,901 / 938,431 / 935k 左右。
+// 舊值 250k 只算了 handleOps 的骨架（不含 calldata 與 swap），會讓 estimatedOps 高估 3.5 倍。
+const OP_GAS = 900_000n;
 
 test('describeGasStatus: 餘額低於門檻時 ready=false，shortfall 是還缺多少 wei', () => {
   const balanceWei = 4n * 10n ** 15n; // 0.004 BNB
@@ -50,8 +53,8 @@ test('describeGasStatus: 餘額剛好等於門檻就算 ready，shortfall 是 "0
   assert.equal(above.balanceWei, '500000000000000000');
 });
 
-test('describeGasStatus: estimatedOps = balance / (250k gas * gasPrice)，向下取整', () => {
-  const costPerOp = OP_GAS * GAS_PRICE_WEI; // 305,000,000,000,000 wei ≈ 0.000305 BNB
+test('describeGasStatus: estimatedOps = balance / (900k gas * gasPrice)，向下取整', () => {
+  const costPerOp = OP_GAS * GAS_PRICE_WEI; // 1,098,000,000,000,000 wei ≈ 0.0011 BNB
 
   const exactlySeven = describeGasStatus({
     address: ACCOUNT,
@@ -69,14 +72,15 @@ test('describeGasStatus: estimatedOps = balance / (250k gas * gasPrice)，向下
   });
   assert.equal(sevenAndABit.estimatedOps, 7);
 
-  // 錨點：1 BNB（GasPolicy 的 1 BNB 預算上限）在這裡大約是 3278 次 op。
+  // 錨點：1 BNB（GasPolicy 的 1 BNB 預算上限）在這裡大約是 910 次 op。
+  // 舊的估算（250k gas/op）會說 3278 —— 那是高估 3.5 倍，而這個數字會顯示給使用者。
   const oneBnb = describeGasStatus({
     address: ACCOUNT,
     balanceWei: 10n ** 18n,
     minimumWei: MINIMUM_WEI,
     gasPriceWei: GAS_PRICE_WEI,
   });
-  assert.equal(oneBnb.estimatedOps, 3278);
+  assert.equal(oneBnb.estimatedOps, 910);
 });
 
 test('describeGasStatus: gasPrice 是 0 時 estimatedOps 回 0，不除以零也不拋', () => {

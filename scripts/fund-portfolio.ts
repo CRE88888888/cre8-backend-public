@@ -275,7 +275,40 @@ async function main(): Promise<void> {
     if (args.dryRun) log('5', '（dry-run）會呼叫 approve-assets.ts 開 allowance');
     else await approveAssets(args.portfolioId, account);
   } else {
-    log('5', '沒有開 allowance（沒帶 --approve）。第一次再平衡會以 [ALLOWANCE_TOO_LOW] 擋下。');
+    // 不要無條件說「沒開」：allowance 可能已經由 app 的 approve UserOp 開好了（create 流程會自動做）。
+    // 印一個確定的結論，而不是一個會誤導人的假設。
+    const executor = process.env.EXECUTOR_ADDRESS ?? '';
+    const allowances: string[] = [];
+    for (const asset of assets) {
+      const symbol = byAddress.get(asset.address.toLowerCase())?.symbol ?? asset.address.slice(0, 10);
+      if (executor === '') {
+        allowances.push(`${symbol}=?`);
+        continue;
+      }
+      const raw = (await client.readContract({
+        address: asset.address as Address,
+        abi: [
+          {
+            type: 'function',
+            name: 'allowance',
+            stateMutability: 'view',
+            inputs: [
+              { name: 'owner', type: 'address' },
+              { name: 'spender', type: 'address' },
+            ],
+            outputs: [{ name: '', type: 'uint256' }],
+          },
+        ] as const,
+        functionName: 'allowance',
+        args: [account, executor as Address],
+      })) as bigint;
+      allowances.push(`${symbol}=${raw > 0n ? 'ok' : '0'}`);
+    }
+    const missing = allowances.filter((entry) => entry.endsWith('=0'));
+    log('5', `沒有呼叫 --approve。目前 allowance：${allowances.join(' · ')}`);
+    if (missing.length > 0) {
+      log('5', `⚠ ${missing.length} 個資產還沒 approve → 第一次再平衡會以 [ALLOWANCE_TOO_LOW] 擋下（--approve 或 app 的 Allowance 卡片）`);
+    }
   }
 
   log('i', `完成。下一步：看 https://…/portfolios/${args.portfolioId} 按 Re-analyse，或跑一輪排程器`);

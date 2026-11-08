@@ -5,6 +5,7 @@ import { bsc } from 'viem/chains';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { alertCounts, healthStatusFor, listOpenAlerts } from './alerts.js';
 import type { AlertCounts } from './alerts.js';
+import { listPortfolioActivity } from './operator.js';
 import { EXECUTOR_ORACLE_ABI, ORACLE_OF_ABI, listPriceableAssets } from './assets.js';
 import type { PriceableAsset, TradableProbe } from './assets.js';
 import { authenticate, issueNonce, login, parseLoginBody } from './auth.js';
@@ -160,6 +161,7 @@ export type ServerDeps = {
    * `GET /portfolios/:id/status`。預設的那一份**帶 TTL 快取**（`createPortfolioStatusReader` 在
    * `createServer()` 之前建好，所以快取跨請求存活）；測試換成 stub 就不必真的讀鏈。
    */
+  portfolioActivity: (id: number, wallet: string) => Promise<unknown>;
   portfolioStatus: PortfolioStatusReader;
   /** `POST /portfolios/:id/rebalance`（會動錢；預設實作見 `operator.ts`）。 */
   operatorRebalance: (portfolioId: number, wallet: string) => Promise<OperatorRebalanceResult>;
@@ -245,6 +247,7 @@ const defaultDeps: ServerDeps = {
   planPreview: previewOperatorRebalance,
   operatorRebalanceEnabled,
   listAssets: defaultListAssets,
+  portfolioActivity: (id, wallet) => listPortfolioActivity(id, wallet),
 };
 
 export function createServer(overrides: Partial<ServerDeps> = {}): Server {
@@ -378,6 +381,10 @@ async function route(
       if (segments[2] === 'rebalance') {
         if (method !== 'POST') return methodNotAllowed(res, ['POST']);
         return operatorRebalanceRoute(req, res, portfolioId(), deps);
+      }
+      if (segments[2] === 'activity') {
+        if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+        return portfolioActivityRoute(req, res, portfolioId(), deps);
       }
       if (segments[2] === 'plan') {
         if (method !== 'GET') return methodNotAllowed(res, ['GET']);
@@ -576,6 +583,17 @@ async function renewalResultRoute(
  * 擁有者檢查在 `portfolioStatus` 裡（`requireOwnedPortfolio`，與 `renewal-params` 同一條），
  * 而且**在快取之前**：快取以 portfolioId 為 key，先查快取就等於讓別的錢包讀到算好的狀態。
  */
+/** `GET /portfolios/:id/activity` — 最近幾輪的執行紀錄（含前後快照的漂移與總值）。 */
+async function portfolioActivityRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  id: number,
+  deps: ServerDeps,
+): Promise<void> {
+  const wallet = await authenticate(req.headers.authorization);
+  sendJson(res, 200, { activity: await deps.portfolioActivity(id, wallet) });
+}
+
 async function portfolioStatusRoute(
   req: IncomingMessage,
   res: ServerResponse,

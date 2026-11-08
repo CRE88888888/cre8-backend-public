@@ -17,6 +17,7 @@ import {
   previewOperatorRebalance,
   runOperatorRebalance,
   singlePortfolioClaim,
+  listPortfolioActivity,
 } from '../src/operator.js';
 import type { OperatorRebalanceResult, PortfolioStatus } from '../src/operator.js';
 import { NUMERAIRE_PRICE_SOURCE, TWAP_PRICE_SOURCE } from '../src/positions.js';
@@ -976,4 +977,61 @@ test('GET /assets：要認證；回 priceable_assets 的清單（create fund 的
     },
     { listAssets: async () => assets },
   );
+});
+
+// `GET /portfolios/:id/activity`：把 operations 與 before/after 快照 join 起來。
+// 沒有這條的話，「這一輪到底做了什麼」只能靠手動 SQL —— 而那是 UI 的主要內容之一。
+test('listPortfolioActivity：join 前後快照、新到舊、沒有快照的輪次留 null', async () => {
+  const seen: { sql: string; params: readonly unknown[] }[] = [];
+  const fakeQuery = async (sql: string, params: readonly unknown[] = []) => {
+    seen.push({ sql, params });
+    return {
+      rows: [
+        {
+          id: '12',
+          state: 'confirmed',
+          tx_hash: '0xabc',
+          user_op_hash: '0xdef',
+          attempts: 1,
+          created_at: '2026-11-08T12:58:49.000Z',
+          drift_before: 6600,
+          drift_after: 6,
+          usd_before: '500000000000',
+          usd_after: '499469000000',
+        },
+        {
+          id: '11',
+          state: 'noop',
+          tx_hash: null,
+          user_op_hash: null,
+          attempts: 0,
+          created_at: '2026-11-08T11:00:00.000Z',
+          drift_before: null,
+          drift_after: null,
+          usd_before: null,
+          usd_after: null,
+        },
+      ],
+      rowCount: 2,
+    };
+  };
+
+  const activity = await listPortfolioActivity(
+    1682,
+    '0xowner',
+    { query: fakeQuery as never, requireOwnedPortfolio: (async () => undefined) as never },
+    20,
+  );
+
+  assert.equal(activity.length, 2);
+  assert.deepEqual(
+    { id: activity[0]?.id, state: activity[0]?.state, drift: [activity[0]?.driftBeforeBps, activity[0]?.driftAfterBps] },
+    { id: 12, state: 'confirmed', drift: [6600, 6] },
+  );
+  // 沒有快照的輪次（noop / blocked 不寫快照）要留 null —— 不是 0。
+  assert.equal(activity[1]?.driftBeforeBps, null);
+  assert.equal(activity[1]?.usdAfterE8, null);
+  assert.match(seen[0]?.sql ?? '', /left join portfolio_snapshots b/);
+  assert.match(seen[0]?.sql ?? '', /order by o\.id desc/);
+  assert.deepEqual(seen[0]?.params, [1682, 20]);
 });

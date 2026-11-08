@@ -836,3 +836,90 @@ export async function previewOperatorRebalance(
     })),
   };
 }
+
+// ---------------------------------------------------------------------------
+// 投組的活動紀錄（原站 portfolio 頁的 Activity 區塊）
+// ---------------------------------------------------------------------------
+
+export type PortfolioActivity = {
+  id: number;
+  state: string;
+  txHash: string | null;
+  userOpHash: string | null;
+  attempts: number;
+  createdAt: string;
+  /** 那一輪前後的漂移（bps）。`null` = 沒有對應的快照（noop / blocked 不會寫）。 */
+  driftBeforeBps: number | null;
+  driftAfterBps: number | null;
+  /** 前後總值（USD，1e8 定點）。差額就是這一輪的成本。 */
+  usdBeforeE8: string | null;
+  usdAfterE8: string | null;
+};
+
+export type ActivityDeps = {
+  requireOwnedPortfolio?: typeof requireOwnedPortfolio;
+  query?: typeof dbQuery;
+};
+
+type ActivityRow = {
+  id: unknown;
+  state: unknown;
+  tx_hash: unknown;
+  user_op_hash: unknown;
+  attempts: unknown;
+  created_at: unknown;
+  drift_before: unknown;
+  drift_after: unknown;
+  usd_before: unknown;
+  usd_after: unknown;
+};
+
+/**
+ * 這個投組最近的執行紀錄，新到舊。
+ *
+ * 為什麼把前後快照 join 進來：`operations` 只說「送出去了、成功或失敗」，而那張前後快照表
+ * （`phase = before / after`，用 `operation_id` 綁定）才是「這一輪到底做了什麼」。
+ * 前端不該為了拼這件事再打三個端點。
+ */
+export async function listPortfolioActivity(
+  portfolioId: number,
+  wallet: string,
+  deps: ActivityDeps = {},
+  limit = 20,
+): Promise<PortfolioActivity[]> {
+  const owned = deps.requireOwnedPortfolio ?? requireOwnedPortfolio;
+  const find = deps.query ?? dbQuery;
+  await owned(portfolioId, wallet, undefined);
+
+  const { rows } = await find<ActivityRow>(
+    `select o.id, o.state, o.tx_hash, o.user_op_hash, o.attempts, o.created_at,
+            b.gross_drift_bps as drift_before, a.gross_drift_bps as drift_after,
+            b.total_usd_e8 as usd_before, a.total_usd_e8 as usd_after
+       from operations o
+       left join portfolio_snapshots b
+              on b.portfolio_id = o.portfolio_id and b.operation_id = o.id and b.phase = 'before'
+       left join portfolio_snapshots a
+              on a.portfolio_id = o.portfolio_id and a.operation_id = o.id and a.phase = 'after'
+      where o.portfolio_id = $1
+      order by o.id desc
+      limit $2`,
+    [portfolioId, limit],
+  );
+
+  return rows.map((row) => {
+    const num = (value: unknown): number | null => (value === null || value === undefined ? null : Number(value));
+    const text = (value: unknown): string | null => (typeof value === 'string' ? value : null);
+    return {
+      id: Number(row.id),
+      state: String(row.state),
+      txHash: text(row.tx_hash),
+      userOpHash: text(row.user_op_hash),
+      attempts: Number(row.attempts),
+      createdAt: new Date(row.created_at as string | Date).toISOString(),
+      driftBeforeBps: num(row.drift_before),
+      driftAfterBps: num(row.drift_after),
+      usdBeforeE8: text(row.usd_before),
+      usdAfterE8: text(row.usd_after),
+    };
+  });
+}

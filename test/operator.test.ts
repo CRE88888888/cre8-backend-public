@@ -960,8 +960,8 @@ test('plan 預覽：dry-run 竟然回報 executed → 拋錯，不把它講成 n
 
 test('GET /assets：要認證；回 priceable_assets 的清單（create fund 的選單來源）', async () => {
   const assets = [
-    { address: '0x55d398326f99059ff775485246999027b3197955', symbol: 'USDT', decimals: 18, isNumeraire: true },
-    { address: '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c', symbol: 'WBNB', decimals: 18, isNumeraire: false },
+    { address: '0x55d398326f99059ff775485246999027b3197955', symbol: 'USDT', decimals: 18, isNumeraire: true, tradable: true },
+    { address: '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c', symbol: 'WBNB', decimals: 18, isNumeraire: false, tradable: true },
   ];
   await withServer(
     async (baseUrl) => {

@@ -1,11 +1,14 @@
 import { createServer as createHttpServer } from 'node:http';
+import { createPublicClient, http } from 'viem';
+import type { Address } from 'viem';
+import { bsc } from 'viem/chains';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { alertCounts, healthStatusFor, listOpenAlerts } from './alerts.js';
 import type { AlertCounts } from './alerts.js';
-import { listPriceableAssets } from './assets.js';
-import type { PriceableAsset } from './assets.js';
+import { EXECUTOR_ORACLE_ABI, ORACLE_OF_ABI, listPriceableAssets } from './assets.js';
+import type { PriceableAsset, TradableProbe } from './assets.js';
 import { authenticate, issueNonce, login, parseLoginBody } from './auth.js';
-import { getConfig } from './config.js';
+import { getConfig, getSessionKeyConfig } from './config.js';
 import { query } from './db.js';
 import { AppError, ValidationError } from './errors.js';
 import { createStrategy, getStrategy, listStrategies, publishVersion } from './strategies.js';
@@ -183,6 +186,52 @@ export type ServerDeps = {
   listAssets: () => Promise<PriceableAsset[]>;
 };
 
+/**
+ * `GET /assets` 的預設實作：DB 那一份 + 鏈上的「這個資產有沒有註冊 oracle」。
+ *
+ * 為什麼要問鏈：create fund 讓使用者選一個 router 報不出價的資產，等於建了一個**永遠不會執行**的策略，
+ * 而錯誤要到第一次再平衡才會以 `OracleNotSet` 出現（實際發生過：CRCLB / MUB）。
+ *
+ * 沒有 RPC 或沒有 executor 時回 `tradable: null`（未知）—— **不要預設成 true**：
+ * 那會把「查不到」變成「可以交易」。
+ */
+async function defaultListAssets(): Promise<PriceableAsset[]> {
+  let probe: TradableProbe | undefined;
+  try {
+    const config = getConfig();
+    // executor 位址在 session-key 設定裡（`getSessionKeyConfig` 才會檢查它有沒有設）。
+    const executor = (() => {
+      try {
+        return getSessionKeyConfig().executorAddress;
+      } catch {
+        return null;
+      }
+    })();
+    if (config.rpcUrl !== null && executor !== null) {
+      const client = createPublicClient({ chain: bsc, transport: http(config.rpcUrl) });
+      const router = (await client.readContract({
+        address: executor,
+        abi: EXECUTOR_ORACLE_ABI,
+        functionName: 'oracle',
+      })) as Address;
+      probe = {
+        router,
+        oracleOf: async (asset) =>
+          (await client.readContract({
+            address: router,
+            abi: ORACLE_OF_ABI,
+            functionName: 'oracleOf',
+            args: [asset as Address],
+          })) as string,
+      };
+    }
+  } catch {
+    // 查不到就回 null：讓 UI 顯示「未知」，而不是謊報可交易。
+    probe = undefined;
+  }
+  return listPriceableAssets(undefined, probe);
+}
+
 const defaultDeps: ServerDeps = {
   createStrategy,
   publishVersion,
@@ -195,7 +244,7 @@ const defaultDeps: ServerDeps = {
   operatorRebalance: runOperatorRebalance,
   planPreview: previewOperatorRebalance,
   operatorRebalanceEnabled,
-  listAssets: listPriceableAssets,
+  listAssets: defaultListAssets,
 };
 
 export function createServer(overrides: Partial<ServerDeps> = {}): Server {

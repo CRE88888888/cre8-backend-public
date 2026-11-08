@@ -15,6 +15,14 @@ export type PriceableAsset = {
   decimals: number;
   /** true = 計價的基準幣（USDT）。策略的每一條腿都是 `資產 ↔ numeraire`。 */
   isNumeraire: boolean;
+  /**
+   * executor 的 oracle router 有沒有為這個資產註冊 per-pair oracle。
+   *
+   * `false` = 合約會 revert `OracleNotSet`，**買不進去也賣不掉** —— 在 create fund 的選單裡
+   * 這種資產等於一個永遠不會執行的策略。`null` = 查不到（沒有 RPC 或沒設 executor），
+   * UI 應該當成「未知」而不是「可以」。
+   */
+  tradable: boolean | null;
 };
 
 type QueryFn = (text: string, params?: readonly unknown[]) => Promise<{ rows: unknown[] }>;
@@ -26,10 +34,47 @@ const SQL_ASSETS = `
    order by is_numeraire desc, symbol asc
 `;
 
-export async function listPriceableAssets(query: QueryFn = dbQuery): Promise<PriceableAsset[]> {
+export const ORACLE_OF_ABI = [
+  {
+    type: 'function',
+    name: 'oracleOf',
+    stateMutability: 'view',
+    inputs: [{ name: 'asset', type: 'address' }],
+    outputs: [{ name: '', type: 'address' }],
+  },
+] as const;
+
+export const EXECUTOR_ORACLE_ABI = [
+  {
+    type: 'function',
+    name: 'oracle',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ name: '', type: 'address' }],
+  },
+] as const;
+
+export type TradableProbe = {
+  /** executor 的 oracle router 位址（`AtpMultiPoolOracle`）。 */
+  router: string;
+  /** 對 router 呼叫 `oracleOf(asset)`；未註冊時回 `0x0`。 */
+  oracleOf: (asset: string) => Promise<string>;
+};
+
+/**
+ * 有 `probe` 就順便問鏈上「這個資產有沒有註冊 oracle」。沒有 probe → `tradable: null`（未知）。
+ *
+ * ⚠ 這一欄**不能預設成 true**：create fund 讓使用者選一個 router 報不出價的資產，等於建了一個
+ * 永遠不會執行的策略 —— 而且錯誤要到第一次再平衡才會出現（`OracleNotSet`）。
+ */
+export async function listPriceableAssets(
+  query: QueryFn = dbQuery,
+  probe?: TradableProbe,
+): Promise<PriceableAsset[]> {
   const { rows } = await query(SQL_ASSETS);
 
-  return rows.map((row) => {
+  const assets: PriceableAsset[] = [];
+  for (const row of rows) {
     const fields = row as Record<string, unknown>;
     const address = fields.address;
     const symbol = fields.symbol;
@@ -38,6 +83,18 @@ export async function listPriceableAssets(query: QueryFn = dbQuery): Promise<Pri
       // 這張表是自己維護的；一列壞掉代表有人手動改過 DB。大聲失敗比回一個 `undefined` 的 symbol 好。
       throw new Error(`priceable_assets 有一列形狀不對：${JSON.stringify(row)}`);
     }
-    return { address, symbol, decimals, isNumeraire: fields.is_numeraire === true };
-  });
+    const isNumeraire = fields.is_numeraire === true;
+    let tradable: boolean | null = null;
+    if (probe !== undefined) {
+      if (isNumeraire) {
+        // numeraire 不需要 per-pair oracle：它本身就是計價單位。
+        tradable = true;
+      } else {
+        const oracle = await probe.oracleOf(address);
+        tradable = oracle !== '0x0000000000000000000000000000000000000000';
+      }
+    }
+    assets.push({ address, symbol, decimals, isNumeraire, tradable });
+  }
+  return assets;
 }

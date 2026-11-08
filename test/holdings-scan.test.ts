@@ -512,9 +512,38 @@ async function dbReason(): Promise<string | null> {
 }
 
 const dbSkip = await dbReason();
+const hasDb = dbSkip === null;
 if (dbSkip !== null) console.warn(`[holdings-scan] 游標測試 skip：${dbSkip}`);
 const gate = dbSkip === null ? {} : { skip: dbSkip };
-const TEST_PORTFOLIO = 5;
+/**
+ * 測試用的 portfolio id。
+ *
+ * 原本寫死 `5` —— 那只有在「dev 資料庫剛好有 portfolio 5」時才會過（這兩個表都有 FK）。
+ * 在乾淨的資料庫上會直接撞 FK，測試看起來像壞掉，其實是它一直在借別人的資料。
+ * 所以改成當場造一列（策略 + portfolio），並在 `after` 清掉。
+ */
+async function seedTestPortfolio(): Promise<number> {
+  const strategy =
+    (await query<{ id: string }>('select id from strategies order by id limit 1')).rows[0] ??
+    (
+      await query<{ id: string }>(
+        `insert into strategies (provider, name) values ($1, $2) returning id`,
+        ['0xholdings-scan-test', 'holdings-scan fixture'],
+      )
+    ).rows[0];
+  if (strategy === undefined) throw new Error('造不出測試用的 strategy');
+  const row = (
+    await query<{ id: string }>(
+      `insert into portfolios (user_id, strategy_id, version, schedule_state)
+       values ('0xholdings-scan-test', $1, 1, 'idle') returning id`,
+      [strategy.id],
+    )
+  ).rows[0];
+  if (row === undefined) throw new Error('造不出測試用的 portfolio');
+  return Number(row.id);
+}
+
+const TEST_PORTFOLIO = hasDb ? await seedTestPortfolio() : 0;
 
 after(async () => {
   await closePool().catch(() => {

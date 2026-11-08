@@ -371,7 +371,26 @@ async function probeDeal(): Promise<string | null> {
   }
 }
 
-const skipReason = (await probeFork()) ?? (await probeDb());
+/**
+ * 這組測試綁在 **dev fixture**（portfolio 5 的鏈上策略與 smart account）。
+ *
+ * 那不是自足的：在乾淨的資料庫上 portfolio 5 不存在，`smartAccountOf` 會在檔案層級拋錯 ——
+ * 表現出來是「1 error」而且**沒有測試名**，比紅燈更難查。
+ * 所以在整理 skip 原因時就把「fixture 不在」當成一種 skip，並說清楚缺什麼。
+ * TODO：改成自己 enroll 一個 portfolio（成本較高，見 D-35）。
+ */
+const FIXTURE = `dev fixture 不在：portfolio ${PORTFOLIO_ID} 在 chain ${EXPECTED_CHAIN_ID} 上沒有 smart account（這組測試綁在 dev seed 的資料上）`;
+
+async function probeFixture(): Promise<string | null> {
+  try {
+    await smartAccountOf(PORTFOLIO_ID, EXPECTED_CHAIN_ID);
+    return null;
+  } catch {
+    return FIXTURE;
+  }
+}
+
+const skipReason = (await probeFork()) ?? (await probeDb()) ?? (await probeFixture());
 if (skipReason !== null) {
   console.warn(`[snapshot.integration] 整組 skip：${skipReason}`);
 }

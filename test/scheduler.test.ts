@@ -1481,8 +1481,30 @@ async function seedPortfolio(args: {
   nextRunAt: Date | null;
   serial: number;
 }): Promise<{ id: number; account: Address }> {
-  const strategy = (await query<{ id: string }>('select id from strategies order by id limit 1')).rows[0];
-  if (strategy === undefined) throw new Error('DB 裡沒有任何 strategy，這支測試需要至少一個（外鍵）');
+  // 這支測試要一個 strategy 只是為了 portfolio 的外鍵。**不要借別的測試留下的資料**：
+  // 在乾淨的資料庫上（例如 CI 開一個新的）「select … limit 1」會回空，測試就變成
+  // 「只有在別人的資料還在的時候才會過」—— 那不是測試，那是巧合。
+  const strategy =
+    (await query<{ id: string }>('select id from strategies order by id limit 1')).rows[0] ??
+    (
+      await query<{ id: string }>(
+        `insert into strategies (provider, name) values ($1, $2) returning id`,
+        ['0xscheduler-test', 'scheduler test fixture'],
+      )
+    ).rows[0];
+  if (strategy === undefined) throw new Error('造不出測試用的 strategy（外鍵）');
+  // portfolio.version = 1，而認領查詢會 join `strategy_versions` 拿 interval（DB 決定節奏）。
+  // 少這一列 → join 不到 → next_run_at 的斷言會拿到 undefined。所以 fixture 要含版本。
+  await query(
+    `insert into strategy_versions (strategy_id, version, allocation, schedule, active_at)
+     values ($1, 1, $2::jsonb, $3::jsonb, now())
+     on conflict (strategy_id, version) do nothing`,
+    [
+      strategy.id,
+      JSON.stringify({ assets: [{ address: '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c', weightBps: 10_000 }] }),
+      JSON.stringify({ kind: 'interval', intervalSeconds: 3_600 }),
+    ],
+  );
   // 地址必須是 unique(chain_id, address) 且符合 0x+40 hex：用 serial 造一個可預期的。
   const account = `0x${args.serial.toString(16).padStart(40, '0')}` as Address;
   const inserted = (

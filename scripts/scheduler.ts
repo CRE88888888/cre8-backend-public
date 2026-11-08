@@ -166,16 +166,16 @@ async function listAlerts(): Promise<void> {
   const open = await listOpenAlerts(query);
   const counts = alertCounts(open);
   if (open.length === 0) {
-    console.log('[ALERT] 沒有未解決的警示。');
+    console.log('[ALERT] No unresolved alerts.');
     return;
   }
 
-  console.log(`[ALERT] 未解決的警示：${counts.open} 筆（critical ${counts.critical}、warn ${counts.warn}）`);
+  console.log(`[ALERT] Unresolved alerts: ${counts.open} (critical ${counts.critical}, warn ${counts.warn})`);
   for (const alert of open) {
     console.log(formatAlert(alert));
     console.log(
-      `        第一次 ${alert.firstSeenAt.toISOString()}、最後 ${alert.lastSeenAt.toISOString()}、看到 ${alert.occurrences} 次`
-      + `（${alert.kind}${alert.portfolioId === null ? '' : `，portfolio ${alert.portfolioId}`}）`,
+      `        first ${alert.firstSeenAt.toISOString()}, last ${alert.lastSeenAt.toISOString()}, seen ${alert.occurrences} time(s)`
+      + ` (${alert.kind}${alert.portfolioId === null ? '' : `, portfolio ${alert.portfolioId}`})`,
     );
   }
 }

@@ -15,6 +15,7 @@ import {
   recordAlerts,
   resolveAlerts,
   detectPortfolioStuck,
+  ALERT_KINDS,
 } from '../src/alerts.js';
 import type { AlertFinding, QueryFn } from '../src/alerts.js';
 import { OPS_GAS_PER_OPERATION, perOperationCostWei } from '../src/funding.js';
@@ -472,6 +473,10 @@ test('listOpenAlerts：pg 的字串／Date 會被正規化，critical 先', asyn
     { kind: 'session_key_expiring', severity: 'warn', portfolio_id: null, detail: '無 portfolio', occurrences: 1, first_seen_at: '2026-11-07T09:00:00.000Z', last_seen_at: '2026-11-07T09:30:00.000Z' },
   ]);
 
+  // 用 stub 回傳的 pg 形狀（bigint 是字串、時間是 Date 或 ISO 字串）來驗正規化。
+  // 不能打真 DB：那會讓斷言依賴「資料庫剛好只有這兩列」——實際上有 7 筆真實的 gas_low 告警，
+  // 測試就會紅，而且紅的原因與它要驗的東西無關。真 DB 的 round-trip 由上面那條
+  // 「每一種 AlertKind 都能寫進 DB 再讀回來」覆蓋。
   const open = await listOpenAlerts(query);
 
   assert.equal(open.length, 2);
@@ -620,6 +625,49 @@ after(async () => {
   await closePool().catch(() => {
     // DB 不可用時整組本來就 skip 了；這裡的失敗不該蓋掉測試結果。
   });
+});
+
+
+/** 造一個只屬於這支測試的 portfolio（scheduler_alerts 有 FK）。沒有 strategy 就自己建一個。 */
+async function seedAlertPortfolio(): Promise<number> {
+  const strategy =
+    (await dbQuery<{ id: string }>('select id from strategies order by id limit 1')).rows[0] ??
+    (
+      await dbQuery<{ id: string }>(
+        `insert into strategies (provider, name) values ($1, $2) returning id`,
+        ['0xalerts-test', 'alerts test fixture'],
+      )
+    ).rows[0];
+  if (strategy === undefined) throw new Error('造不出測試用的 strategy');
+  const row = (
+    await dbQuery<{ id: string }>(
+      `insert into portfolios (user_id, strategy_id, version, schedule_state)
+       values ('0xalerts-kind-test', $1, 1, 'idle') returning id`,
+      [strategy.id],
+    )
+  ).rows[0];
+  if (row === undefined) throw new Error('造不出測試用的 portfolio');
+  return Number(row.id);
+}
+
+// 回歸（實測踩到）：`AlertKind` 型別有 `portfolio_stuck`，但 `asKind` 的執行期白名單忘了加。
+// 後果不是「少一則告警」——是一有 stuck 告警，`--alerts` 直接拋錯、`/health` 的 alerts 變 null，
+// 也就是**監控在真的有東西要看的那一刻瞎掉**。所以型別與執行期白名單現在同一個來源（ALERT_KINDS）。
+test('每一種 AlertKind 都能寫進 DB 再讀回來（型別與執行期白名單不得分岔）', dbGate, async () => {
+  const portfolioId = await seedAlertPortfolio();
+  try {
+    for (const kind of ALERT_KINDS) {
+      await dbQuery('delete from scheduler_alerts where portfolio_id = $1', [portfolioId]);
+      // `portfolio_repeatedly_failing` 的 key 是 (kind, portfolio)；其餘也用同一個 portfolio，
+      // 所以一輪一輪清掉再寫，避免 key 衝突蓋掉前一筆。
+      await recordAlerts(dbQuery, [{ kind, severity: 'warn', portfolioId, detail: `${kind} probe` }], NOW);
+      const open = await listOpenAlerts(dbQuery);
+      const found = open.filter((alert) => alert.portfolioId === portfolioId && alert.kind === kind);
+      assert.equal(found.length, 1, `kind ${kind} 應該寫得進去也讀得回來（讀回來失敗＝白名單漏了它）`);
+    }
+  } finally {
+    await dbQuery('delete from scheduler_alerts where portfolio_id = $1', [portfolioId]);
+  }
 });
 
 test('真 Postgres：同一個 (kind, portfolio) 連跑兩次 = 一列 occurrences 2；條件消失 → resolve', dbGate, async () => {

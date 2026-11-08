@@ -25,11 +25,21 @@ import { perOperationCostWei } from './funding.js';
 /** DB 的最小介面：只要 `{ rows }`。`db.query` 與 `scheduler.ts` 的 `SchedulerQueryFn` 都接得上。 */
 export type QueryFn = (text: string, params?: readonly unknown[]) => Promise<{ rows: unknown[] }>;
 
-export type AlertKind =
-  | 'portfolio_repeatedly_failing'
-  | 'session_key_expiring'
-  | 'gas_low'
-  | 'portfolio_stuck';
+/**
+ * 告警種類的**唯一來源**：型別從這個陣列推導，執行期的白名單也用它。
+ *
+ * 兩者分開寫過一次，代價是：新增 `portfolio_stuck` 時只加了型別與 DB 的 CHECK，忘了改
+ * `asKind` 的執行期判斷 → 一有 stuck 告警，`--alerts` 就拋錯、`/health` 的 alerts 變 null。
+ * 也就是說**監控會在「真的有東西要看」的那一刻瞎掉**。用 `typeof ALERT_KINDS[number]` 讓它不可能再分岔。
+ */
+export const ALERT_KINDS = [
+  'portfolio_repeatedly_failing',
+  'session_key_expiring',
+  'gas_low',
+  'portfolio_stuck',
+] as const;
+
+export type AlertKind = (typeof ALERT_KINDS)[number];
 export type AlertSeverity = 'warn' | 'critical';
 
 export type AlertFinding = {
@@ -630,8 +640,10 @@ function asSeverity(value: unknown): AlertSeverity {
 }
 
 function asKind(value: unknown): AlertKind {
-  if (value === 'portfolio_repeatedly_failing' || value === 'session_key_expiring' || value === 'gas_low') return value;
-  throw new Error(`scheduler_alerts.kind 不是已知種類（收到 ${JSON.stringify(value)}）`);
+  if (typeof value === 'string' && (ALERT_KINDS as readonly string[]).includes(value)) return value as AlertKind;
+  throw new Error(
+    `scheduler_alerts.kind 不是已知種類（收到 ${JSON.stringify(value)}；已知：${ALERT_KINDS.join(', ')}）`,
+  );
 }
 
 /** 鏈 id：與 config.ts 同一個預設（56），但不必為了讀 env 而要求 DATABASE_URL。 */

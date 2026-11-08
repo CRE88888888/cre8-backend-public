@@ -90,8 +90,17 @@ export async function listPriceableAssets(
         // numeraire 不需要 per-pair oracle：它本身就是計價單位。
         tradable = true;
       } else {
-        const oracle = await probe.oracleOf(address);
-        tradable = oracle !== '0x0000000000000000000000000000000000000000';
+        // ⚠ 這裡一定要自己 try/catch。`probe.oracleOf` 每一次都是鏈上讀取，而它失敗的原因
+        // 與「這個部署沒有 executor」無關 —— fork 的 archive 窗口過了（publicnode 對歷史 storage
+        // 回 403）、RPC 抖一下、節點換了，都會讓它拋。把例外漏出去，整個 `GET /assets` 就變 500，
+        // 而這個端點要回答的是「有哪些資產可以選」，不是「鏈現在好不好」。
+        // 查不到就是 `null`（未知），前端會顯示 unknown 並允許選 —— 那比整頁壞掉好。
+        try {
+          const oracle = await probe.oracleOf(address);
+          tradable = oracle !== '0x0000000000000000000000000000000000000000';
+        } catch {
+          tradable = null;
+        }
       }
     }
     assets.push({ address, symbol, decimals, isNumeraire, tradable });

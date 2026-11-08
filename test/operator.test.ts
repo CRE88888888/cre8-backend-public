@@ -19,6 +19,7 @@ import {
   singlePortfolioClaim,
   listPortfolioActivity,
 } from '../src/operator.js';
+import { listPriceableAssets } from '../src/assets.js';
 import type { OperatorRebalanceResult, PortfolioStatus } from '../src/operator.js';
 import { NUMERAIRE_PRICE_SOURCE, TWAP_PRICE_SOURCE } from '../src/positions.js';
 import type { PortfolioRunResult, runSchedulerOnce } from '../src/scheduler.js';
@@ -1034,4 +1035,30 @@ test('listPortfolioActivity：join 前後快照、新到舊、沒有快照的輪
   assert.match(seen[0]?.sql ?? '', /left join portfolio_snapshots b/);
   assert.match(seen[0]?.sql ?? '', /order by o\.id desc/);
   assert.deepEqual(seen[0]?.params, [1682, 20]);
+});
+
+// 回歸（實測踩到）：`GET /assets` 回 500，因為 probe 的**每一次** `oracleOf` 都是鏈上讀取，
+// 而失敗原因與「這個部署有沒有 executor」無關 —— fork 的 archive 窗口過了（publicnode 回 403）、
+// RPC 抖一下，都會讓它拋。那個端點要回答的是「有哪些資產可以選」，不是「鏈現在好不好」。
+test('listPriceableAssets：probe.oracleOf 拋錯 → tradable 是 null（未知），不是整個請求失敗', async () => {
+  const rows = [
+    { address: '0x55d398326f99059ff775485246999027b3197955', symbol: 'USDT', decimals: 18, is_numeraire: true },
+    { address: '0xbb4cdb9cbd39b01bd1cbaebf2de08d9173bc095c', symbol: 'WBNB', decimals: 18, is_numeraire: false },
+    { address: '0x02fca66c1d1afb4e2a7884261eb00f63598a7436', symbol: 'NVDAB', decimals: 18, is_numeraire: false },
+  ];
+  const query = async () => ({ rows, rowCount: rows.length });
+  const probe = {
+    router: '0x132cDfCe34d385f783dAB7F011B2E66E78A2f87f',
+    oracleOf: async (asset: string) => {
+      // 模擬 archive 403：USDT 是 numeraire 不會被問到，其他兩個都炸。
+      if (asset !== rows[0]?.address) throw new Error('HTTP error 403 — Archive requests require a personal token');
+      return '0x0000000000000000000000000000000000000000';
+    },
+  };
+
+  const assets = await listPriceableAssets(query as never, probe as never);
+  assert.equal(assets.length, 3);
+  assert.equal(assets[0]?.tradable, true, 'numeraire 不需要 oracle，永遠可交易');
+  assert.equal(assets[1]?.tradable, null, '查不到就是未知 —— 不是 false（那會讓它變成不可選）');
+  assert.equal(assets[2]?.tradable, null);
 });

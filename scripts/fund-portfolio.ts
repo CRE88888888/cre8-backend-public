@@ -19,7 +19,15 @@
  *     --portfolio 1599 --usd 20000
  *
  * Flags: --portfolio <id>（必填）--usd <amount>（預設 20000）--dry-run --gas-bnb <amount>（預設 1）
+ *        --approve（同時把 allowance 開給 executor；需要 SUDO_PRIVATE_KEY）
+ *
+ * ## 為什麼需要 `--approve`
+ * `AtpExecutor._swap` 用 ERC-20 `safeTransferFrom` 從帳戶拉幣，所以帳戶必須先對 executor 有 allowance。
+ * **session key 給不了**：它的 CallPolicy 只白名單 `executeRebalance`，`approve` 是另一個 target+selector。
+ * 而 `POST /portfolios`（enroll）也不會開 —— 於是每個新投組的第一次再平衡都會卡在
+ * `[ALLOWANCE_TOO_LOW]`。實測就是這樣卡住的（portfolio 1617）。
  */
+import { spawn } from 'node:child_process';
 import { createPublicClient, encodeAbiParameters, http, keccak256, parseUnits, toHex } from 'viem';
 import type { Address, Hex, PublicClient } from 'viem';
 import { closePool, query } from '../src/db.js';
@@ -31,6 +39,8 @@ type Args = {
   usd: number;
   gasBnb: number;
   dryRun: boolean;
+  /** 順便把 allowance 開給 executor（需要 SUDO_PRIVATE_KEY）。 */
+  approve: boolean;
 };
 
 function flag(argv: readonly string[], name: string): string | undefined {
@@ -52,7 +62,7 @@ function parseArgs(argv: readonly string[]): Args {
   const gasBnb = Number(gasRaw);
   if (!Number.isFinite(gasBnb) || gasBnb < 0) throw new Error(`--gas-bnb 必須是 >= 0 的數（收到 ${gasRaw}）`);
 
-  return { portfolioId, usd, gasBnb, dryRun: argv.includes('--dry-run') };
+  return { portfolioId, usd, gasBnb, dryRun: argv.includes('--dry-run'), approve: argv.includes('--approve') };
 }
 
 /**
@@ -97,10 +107,22 @@ async function setBalance(
   amount: bigint,
   maxSlot = 12n,
 ): Promise<bigint> {
+  // 用一個**不可能剛好等於現有餘額**的哨兵值來定位 slot。
+  //
+  // 為什麼不能直接寫目標值：若帳戶原本的餘額剛好等於 amount（重跑這支腳本時就會），
+  // 每一個候選 slot 讀回來都會「符合」—— 第一次就誤判成 slot 0。實際踩過。
+  const sentinel = 123_456_789_012_345_678_901_234_567_890n;
   for (let slot = 0n; slot <= maxSlot; slot += 1n) {
     const key = balanceSlot(holder, slot);
-    await rpc(client, 'anvil_setStorageAt', [token, key, toHex(amount, { size: 32 })]);
-    if ((await readBalance(client, token, holder)) === amount) return slot;
+    await rpc(client, 'anvil_setStorageAt', [token, key, toHex(sentinel, { size: 32 })]);
+    if ((await readBalance(client, token, holder)) === sentinel) {
+      // 找到真正的 mapping slot，再寫入目標值並確認。
+      await rpc(client, 'anvil_setStorageAt', [token, key, toHex(amount, { size: 32 })]);
+      if ((await readBalance(client, token, holder)) !== amount) {
+        throw new Error(`slot ${slot} 寫入 ${amount} 後回讀不符：代幣的 balanceOf 不是單一 storage word`);
+      }
+      return slot;
+    }
   }
   throw new Error(
     `試過 slot 0..${maxSlot} 都寫不進 ${token} 的 balanceOf（回讀不是 ${amount}）：這個代幣的佈局不是 ` +
@@ -112,12 +134,61 @@ async function rpc(client: PublicClient, method: string, params: readonly unknow
   return client.request({ method: method as never, params: params as never });
 }
 
+/** 用既有的 `approve-assets.ts` 開 allowance（不重寫一份簽名/送 op 的邏輯）。 */
+async function approveAssets(portfolioId: number, account: Address): Promise<void> {
+  const sudo = process.env.SUDO_PRIVATE_KEY;
+  if (sudo === undefined || !/^0x[0-9a-fA-F]{64}$/.test(sudo)) {
+    throw new Error(
+      '--approve 需要 SUDO_PRIVATE_KEY（0x + 64 hex）：approve 是 target+selector 不同的呼叫，session key 做不了，' +
+        '只能由 owner 簽。',
+    );
+  }
+  const executor = process.env.EXECUTOR_ADDRESS;
+  if (executor === undefined || !/^0x[0-9a-fA-F]{40}$/.test(executor)) {
+    throw new Error('--approve 需要 EXECUTOR_ADDRESS（allowance 的 spender）');
+  }
+
+  const stdout = await new Promise<string>((resolve, reject) => {
+    let out = '';
+    const child = spawn(
+      process.execPath,
+      [
+        'run',
+        new URL('./approve-assets.ts', import.meta.url).pathname,
+        '--account',
+        account,
+        '--executor',
+        executor,
+        '--submit',
+        'direct',
+      ],
+      { env: { ...process.env, SUDO_PRIVATE_KEY: sudo } },
+    );
+    let stderr = '';
+    child.stdout?.on('data', (chunk: Buffer) => {
+      out += chunk.toString();
+    });
+    child.stderr?.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code === 0) resolve(out);
+      else reject(new Error(`approve-assets 失敗（exit ${String(code)}）\n${stdout.slice(-800)}\n${stderr.slice(-800)}`));
+    });
+  });
+  const confirmed = stdout.split('\n').filter((line) => line.includes('allowance') || line.includes('"after"')).slice(-4);
+  log('5', `allowance 已開給 executor ${executor}（portfolio ${portfolioId}）`);
+  for (const line of confirmed) log('5', `  ${line.trim().slice(0, 160)}`);
+}
+
 function log(tag: string, message: string): void {
   console.log(`[${tag}] ${message}`);
 }
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
+  const approve = args.approve;
   const rpcUrl = process.env.RPC_URL ?? '';
   if (!/^https?:\/\/(127\.0\.0\.1|localhost)(:|$)/.test(rpcUrl)) {
     // 這支腳本會直接改 storage —— 在任何不是本機 fork 的鏈上都是災難。
@@ -197,6 +268,14 @@ async function main(): Promise<void> {
     const slot = await setBalance(client, token, account, amount);
     const after = await readBalance(client, token, account);
     log('4', `${numeraire.symbol} 餘額 ${before} → ${after} ✓（mapping 在 slot ${slot}）`);
+  }
+
+  // ---- [5] allowance（可選）----
+  if (approve) {
+    if (args.dryRun) log('5', '（dry-run）會呼叫 approve-assets.ts 開 allowance');
+    else await approveAssets(args.portfolioId, account);
+  } else {
+    log('5', '沒有開 allowance（沒帶 --approve）。第一次再平衡會以 [ALLOWANCE_TOO_LOW] 擋下。');
   }
 
   log('i', `完成。下一步：看 https://…/portfolios/${args.portfolioId} 按 Re-analyse，或跑一輪排程器`);

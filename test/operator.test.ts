@@ -506,12 +506,15 @@ test('sessionKey：DB 記的那把沒安裝 → configured 標 installed:false�
     ),
   );
   assert.equal(result.error, null);
-  assert.deepEqual(result.configured, {
-    permissionId: '0x7db20115',
-    keyRef: "m/44'/60'/0'/0/9",
-    installed: false,
-  });
-  assert.deepEqual(result.usable, { permissionId: '0xf67556bf', keyRef: "m/44'/60'/0'/0/5" });
+  assert.equal(result.configured?.permissionId, '0x7db20115');
+  assert.equal(result.configured?.keyRef, "m/44'/60'/0'/0/9");
+  assert.equal(result.configured?.installed, false);
+  // 到期日**一定要有**：那是使用者唯一能行動的資訊（key 過期 → 每輪 blocked 且不會自己好）。
+  assert.ok(result.configured?.expiresAt, 'configured 必須帶 expiresAt');
+  assert.equal(result.configured?.status, 'active');
+  assert.equal(result.usable?.permissionId, '0xf67556bf');
+  assert.equal(result.usable?.keyRef, "m/44'/60'/0'/0/5");
+  assert.ok(result.usable?.expiresAt, 'usable 也必須帶 expiresAt');
 });
 
 test('sessionKey：DB 記的那把有安裝 → installed:true，usable 就是同一把', async () => {
@@ -522,7 +525,9 @@ test('sessionKey：DB 記的那把有安裝 → installed:true，usable 就是�
   );
   assert.equal(result.error, null);
   assert.equal(result.configured?.installed, true);
-  assert.deepEqual(result.usable, { permissionId: '0x7db20115', keyRef: "m/44'/60'/0'/0/9" });
+  assert.equal(result.usable?.permissionId, '0x7db20115');
+  assert.equal(result.usable?.keyRef, "m/44'/60'/0'/0/9");
+  assert.ok(result.usable?.expiresAt);
 });
 
 test('sessionKey：一把都沒安裝 → usable 是 null（不是「讀不到」）', async () => {

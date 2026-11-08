@@ -237,8 +237,21 @@ const SQL_SESSION_KEYS_NEWEST_FIRST = `
    order by (split_part(k.key_ref, '/', 6))::bigint desc
 `;
 
-/** 一支 session key 在 DB 裡記的樣子（不含「鏈上裝了沒」）。 */
-export type StatusSessionKeyRef = { permissionId: string; keyRef: string };
+/**
+ * 一支 session key 在 DB 裡記的樣子（不含「鏈上裝了沒」）。
+ *
+ * `expiresAt` 是**唯一有時效性、使用者能行動的資訊**：key 一過期，這個投組每一輪都會 blocked
+ * 而且不會自己好（要靠 owner 簽一筆續期）。原本這份型別只有 permissionId 與 keyRef ——
+ * 也就是「使用者看不懂的內部 id」有，而「他該注意的到期日」沒有。
+ */
+export type StatusSessionKeyRef = {
+  permissionId: string;
+  keyRef: string;
+  /** ISO 時間。`null` = DB 那一列沒有可解析的到期日。 */
+  expiresAt: string | null;
+  /** DB 的 status（`active` / 其他）。 */
+  status: string | null;
+};
 
 /**
  * 「DB 記的 key」與「實際會用的 key」，加上 configured 那把的鏈上安裝狀態。
@@ -274,7 +287,13 @@ function toStatusKeyRef(row: SessionKeyRow): StatusSessionKeyRef | null {
   const permissionId = permissions?.permissionId;
   if (typeof permissionId !== 'string' || !/^0x[0-9a-fA-F]{8}$/.test(permissionId)) return null;
   if (typeof row.key_ref !== 'string' || row.key_ref === '') return null;
-  return { permissionId, keyRef: row.key_ref };
+  const ms = expiryMs(row);
+  return {
+    permissionId,
+    keyRef: row.key_ref,
+    expiresAt: ms === 0 ? null : new Date(ms).toISOString(),
+    status: typeof row.status === 'string' ? row.status : null,
+  };
 }
 
 function expiryMs(row: SessionKeyRow): number {

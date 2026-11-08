@@ -170,12 +170,12 @@ export async function detectPortfolioFailures(query: QueryFn, failingOps: number
     const portfolioId = toInteger(fields.portfolio_id, 'portfolio_id');
     const failedCount = toInteger(fields.failed_count, 'failed_count');
     const state = typeof fields.last_state === 'string' ? fields.last_state : '(unknown)';
-    const error = typeof fields.last_error === 'string' ? truncate(fields.last_error, MAX_ERROR_CHARS) : '（沒有錯誤訊息）';
+    const error = typeof fields.last_error === 'string' ? truncate(fields.last_error, MAX_ERROR_CHARS) : '(no error message)';
     return {
       kind: 'portfolio_repeatedly_failing',
       severity: 'critical',
       portfolioId,
-      detail: `portfolio ${portfolioId} 連續 ${failedCount} 筆操作沒有成功（最後一次 ${state}：${error}）`,
+      detail: `portfolio ${portfolioId}: ${failedCount} consecutive operations did not succeed (last one ${state}: ${error})`,
     } satisfies AlertFinding;
   });
 }
@@ -205,9 +205,9 @@ export async function detectPortfolioStuck(query: QueryFn, stuckHours: number): 
       severity,
       portfolioId,
       detail:
-        `portfolio ${portfolioId} 上次觀測漂移 ${drift} bps（仍高於門檻）距今 ${Number.isFinite(hours) ? hours.toFixed(1) : '?'} 小時，` +
-        '期間沒有任何一次成功執行 —— 可能是市場讓 impact 預算做不了事（看 `GET /portfolios/:id/plan`），' +
-        '或排程器沒在跑',
+        `portfolio ${portfolioId}: last observation showed ${drift} bps drift (still above the threshold) ` +
+        `${Number.isFinite(hours) ? hours.toFixed(1) : '?'} hours ago, with no successful execution since — ` +
+        'the market may be making the impact budget unusable (see `GET /portfolios/:id/plan`), or the scheduler is not running',
     } satisfies AlertFinding;
   });
 }
@@ -280,15 +280,15 @@ export async function detectSessionKeyExpiry(
 
     const when =
       remainingMs <= 0
-        ? `已經過期（expires_at ${earliest?.expiresAt.toISOString()}）`
+        ? `has already expired (expires_at ${earliest?.expiresAt.toISOString()})`
         : Math.floor(remainingMs / DAY_MS) < 1
-          ? '將在不到 1 天後到期'
-          : `將在 ${Math.floor(remainingMs / DAY_MS)} 天後到期`;
+          ? 'expires in less than a day'
+          : `expires in ${Math.floor(remainingMs / DAY_MS)} day(s)`;
 
     const detail =
       keys.length === 1
-        ? `portfolio ${portfolioId} 的 session key ${earliest?.label} ${when}`
-        : `portfolio ${portfolioId} 有 ${keys.length} 把 session key 都在門檻 ${args.expiryDays} 天內到期（最早 ${earliest?.label} ${when}）`;
+        ? `portfolio ${portfolioId}: session key ${earliest?.label} ${when}`
+        : `portfolio ${portfolioId}: all ${keys.length} session keys expire within the ${args.expiryDays} day threshold (earliest ${earliest?.label} ${when})`;
 
     return { kind: 'session_key_expiring', severity, portfolioId, detail } satisfies AlertFinding;
   });
@@ -367,11 +367,11 @@ export async function detectLowGas(
       severity: lastSuccessfulRun === null ? 'warn' : 'critical',
       portfolioId,
       detail:
-        `portfolio ${portfolioId} 的 smart account ${address} 只剩 ${estimatedOps} 次操作的 gas` +
-        `（門檻 ${args.minOps} 次；餘額 ${balanceWei} wei，gas price ${gasPriceWei} wei）` +
+        `portfolio ${portfolioId}: smart account ${address} has gas left for only ${estimatedOps} operation(s)` +
+        ` (threshold ${args.minOps}; balance ${balanceWei} wei, gas price ${gasPriceWei} wei)` +
         (lastSuccessfulRun === null
-          ? '—— 這個 portfolio 沒有任何成功執行的紀錄，可能還沒開始運作'
-          : `—— 上次成功執行是 ${alertClock(lastSuccessfulRun)}`),
+          ? ' — this portfolio has no successful execution on record; it may not be running yet'
+          : ` — last successful execution was ${alertClock(lastSuccessfulRun)}`),
     });
   }
   return findings;

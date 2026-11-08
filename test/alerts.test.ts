@@ -54,7 +54,7 @@ function finding(overrides: Partial<AlertFinding> = {}): AlertFinding {
     kind: 'portfolio_repeatedly_failing',
     severity: 'critical',
     portfolioId: PORTFOLIO_ID,
-    detail: 'portfolio 305 連續 3 筆操作沒有成功（最後一次 failed：HTTP request failed）',
+    detail: 'portfolio 305: 3 consecutive operations did not succeed (last one failed: HTTP request failed)',
     ...overrides,
   };
 }
@@ -95,8 +95,8 @@ test('detectPortfolioFailures：最近 N 筆全部不是 confirmed → 一筆 cr
   assert.equal(only?.kind, 'portfolio_repeatedly_failing');
   assert.equal(only?.severity, 'critical');
   assert.equal(only?.portfolioId, PORTFOLIO_ID);
-  assert.match(only?.detail ?? '', /^portfolio 305 連續 3 筆操作沒有成功/);
-  assert.match(only?.detail ?? '', /最後一次 failed：An error occurred while executing user operation/);
+  assert.match(only?.detail ?? '', /^portfolio 305: 3 consecutive operations did not succeed/);
+  assert.match(only?.detail ?? '', /last one failed: An error occurred while executing user operation/);
 
   // SQL 的形狀就是規則本身：「最近 N 筆」＝ row_number by id desc；「全部沒成功」＝ bool_and。
   const sql = findSeen(seen, 'row_number() over').sql;
@@ -120,9 +120,9 @@ test('detectPortfolioFailures：last_error 太長會截斷（一行 log 要看�
   const [long, noError] = await detectPortfolioFailures(query, 3);
 
   assert.ok((long?.detail.length ?? 0) < 250, `detail 應該被截斷，實際 ${long?.detail.length}`);
-  assert.match(long?.detail ?? '', /…）$/, '截斷要有省略號，不能看起來像完整的訊息');
+  assert.match(long?.detail ?? '', /…\)$/, '截斷要有省略號，不能看起來像完整的訊息');
   assert.equal((long?.detail.match(/x/g) ?? []).length, 120, '錯誤訊息最多 120 字（一行 log 要看得完）');
-  assert.match(noError?.detail ?? '', /最後一次 failed：（沒有錯誤訊息）/);
+  assert.match(noError?.detail ?? '', /last one failed: \(no error message\)/);
   assert.equal(noError?.portfolioId, 8, 'bigint 字串要轉成數字（pg 對 bigint 回字串）');
 });
 
@@ -145,7 +145,7 @@ test('detectSessionKeyExpiry：30 天內到期 → warn，portfolioId 有填（�
   assert.equal(only?.portfolioId, OTHER_PORTFOLIO_ID, 'portfolioId 一定要有，否則收到的人不知道續哪一把');
   assert.equal(
     formatAlert(only!),
-    '[ALERT][warn]     portfolio 5 的 session key 0xf67556bf 將在 12 天後到期',
+    '[ALERT][warn]     portfolio 5: session key 0xf67556bf expires in 12 day(s)',
     '這一行就是 stdout 的樣子（[ALERT][warn] 補到 critical 的寬度，所以對齊）',
   );
 
@@ -163,7 +163,7 @@ test('detectSessionKeyExpiry：剩不到 7 天 → critical', async () => {
 
   const [only] = await detectSessionKeyExpiry(query, { now: NOW, expiryDays: 30 });
   assert.equal(only?.severity, 'critical');
-  assert.match(only?.detail ?? '', /將在 3 天後到期/);
+  assert.match(only?.detail ?? '', /expires in 3 day\(s\)/);
 });
 
 test('detectSessionKeyExpiry：已經過期的 active key（DB 說活著、其實不能用）→ critical，而且說得出什麼時候過期', async () => {
@@ -174,7 +174,7 @@ test('detectSessionKeyExpiry：已經過期的 active key（DB 說活著、其�
 
   const [only] = await detectSessionKeyExpiry(query, { now: NOW, expiryDays: 30 });
   assert.equal(only?.severity, 'critical');
-  assert.match(only?.detail ?? '', /已經過期（expires_at 2026-11-06T12:00:00\.000Z）/);
+  assert.match(only?.detail ?? '', /has already expired \(expires_at 2026-11-06T12:00:00\.000Z\)/);
 });
 
 test('detectSessionKeyExpiry：同一個 portfolio 的多把 key 收斂成一筆，detail 說清楚「幾把、最早哪一把」', async () => {
@@ -193,7 +193,7 @@ test('detectSessionKeyExpiry：同一個 portfolio 的多把 key 收斂成一筆
   assert.equal(findings[0]?.severity, 'critical', '最早的那把剩 2 天 → critical');
   assert.equal(
     findings[0]?.detail,
-    'portfolio 5 有 3 把 session key 都在門檻 30 天內到期（最早 0x4ddb1075 將在 2 天後到期）',
+    'portfolio 5: all 3 session keys expire within the 30 day threshold (earliest 0x4ddb1075 expires in 2 day(s))',
   );
 });
 
@@ -225,8 +225,8 @@ test('detectSessionKeyExpiry：detail 裡的數字是「門檻」不是「剩幾
   assert.equal(findings[0]?.severity, 'warn', '還有 363 天 → warn，不是 critical');
   assert.equal(
     findings[0]?.detail,
-    'portfolio 5 有 4 把 session key 都在門檻 400 天內到期（最早 0x4ddb1075 將在 363 天後到期）',
-    '門檻 400 是設定值，寫成「門檻」才不會被讀成「剩 400 天就要到期」',
+    'portfolio 5: all 4 session keys expire within the 400 day threshold (earliest 0x4ddb1075 expires in 363 day(s))',
+    'the threshold must be named as a threshold, otherwise it reads as "expires in 400 days"',
   );
 });
 
@@ -262,9 +262,9 @@ test('detectLowGas：沒有成功紀錄的 portfolio 缺 gas → warn（「還�
   assert.equal(only?.portfolioId, PORTFOLIO_ID);
   assert.equal(
     only?.detail,
-    `portfolio 305 的 smart account ${SMART_ACCOUNT} 只剩 9 次操作的 gas` +
-      `（門檻 10 次；餘額 ${COST_PER_OP * 9n} wei，gas price ${GAS_PRICE_WEI} wei）` +
-      '—— 這個 portfolio 沒有任何成功執行的紀錄，可能還沒開始運作',
+    `portfolio 305: smart account ${SMART_ACCOUNT} has gas left for only 9 operation(s)` +
+      ` (threshold 10; balance ${COST_PER_OP * 9n} wei, gas price ${GAS_PRICE_WEI} wei)` +
+      ' — this portfolio has no successful execution on record; it may not be running yet',
   );
   assert.equal(COST_PER_OP, perOperationCostWei(GAS_PRICE_WEI), '算式必須是同一個（不是複製一份）');
 
@@ -297,10 +297,10 @@ test('detectLowGas：有過 confirmed 卻沒 gas → critical，detail 帶上次
   assert.equal(only?.severity, 'critical', '它本來跑得動、現在沒錢了 → 這是回歸，要叫醒人');
   assert.equal(
     only?.detail,
-    `portfolio 305 的 smart account ${SMART_ACCOUNT} 只剩 3 次操作的 gas` +
-      `（門檻 10 次；餘額 ${COST_PER_OP * 3n} wei，gas price ${GAS_PRICE_WEI} wei）` +
-      '—— 上次成功執行是 2026-11-07T15:33Z',
-    '「上次成功執行的時間」是看到 critical 之後最想知道的第一件事',
+    `portfolio 305: smart account ${SMART_ACCOUNT} has gas left for only 3 operation(s)` +
+      ` (threshold 10; balance ${COST_PER_OP * 3n} wei, gas price ${GAS_PRICE_WEI} wei)` +
+      ' — last successful execution was 2026-11-07T15:33Z',
+    'the last successful execution time is the first thing you want after seeing a critical',
   );
 });
 
@@ -392,7 +392,7 @@ test('detectAlerts：三條規則合成一份 findings，閾值從 env 來（覆
     'ALERT_KEY_EXPIRY_DAYS 覆寫了預設 30',
   );
   const [gas] = findings.filter((entry) => entry.kind === 'gas_low');
-  assert.match(gas?.detail ?? '', /門檻 3 次/, 'ALERT_MIN_OPS 覆寫了預設 10');
+  assert.match(gas?.detail ?? '', /threshold 3/, 'ALERT_MIN_OPS 覆寫了預設 10');
 });
 
 test('detectAlerts：env 的閾值格式錯誤 → 拋錯（打錯的門檻不能被靜默忽略）', async () => {
@@ -503,11 +503,11 @@ test('healthStatusFor：critical 未解決 → degraded（HTTP 仍 200）；讀�
 test('formatAlert：一行看得出來（嚴重度對齊，detail 原樣）', () => {
   assert.equal(
     formatAlert(finding()),
-    '[ALERT][critical] portfolio 305 連續 3 筆操作沒有成功（最後一次 failed：HTTP request failed）',
+    '[ALERT][critical] portfolio 305: 3 consecutive operations did not succeed (last one failed: HTTP request failed)',
   );
   assert.equal(
-    formatAlert(finding({ severity: 'warn', portfolioId: OTHER_PORTFOLIO_ID, detail: 'portfolio 5 的 session key 0xf67556bf 將在 12 天後到期' })),
-    '[ALERT][warn]     portfolio 5 的 session key 0xf67556bf 將在 12 天後到期',
+    formatAlert(finding({ severity: 'warn', portfolioId: OTHER_PORTFOLIO_ID, detail: 'portfolio 5: session key 0xf67556bf expires in 12 day(s)' })),
+    '[ALERT][warn]     portfolio 5: session key 0xf67556bf expires in 12 day(s)',
   );
 });
 
@@ -535,7 +535,7 @@ test('announceAlerts：一輪結束會印 [ALERT][severity] 行（acceptance 7�
 
   assert.equal(
     lines[0],
-    '[ALERT][critical] portfolio 305 連續 3 筆操作沒有成功（最後一次 failed：HTTP request failed）',
+    '[ALERT][critical] portfolio 305: 3 consecutive operations did not succeed (last one failed: HTTP request failed)',
   );
   assert.equal(lines.length, 1, '沒有其他警示就只印這一行');
   assert.ok(seen.some((entry) => entry.sql.includes('insert into scheduler_alerts')), '偵測到就要寫進去（不只印出來）');
@@ -649,7 +649,7 @@ test('真 Postgres：同一個 (kind, portfolio) 連跑兩次 = 一列 occurrenc
         const detected = await detectPortfolioFailures(q, 3);
         const mine = detected.find((entry) => entry.portfolioId === portfolioId);
         assert.ok(mine !== undefined, '最近 3 筆都不是 confirmed → 必須被偵測到（window function 在真的 PG 上跑一次）');
-        assert.match(mine.detail, /連續 3 筆操作沒有成功（最後一次 failed：HTTP request failed）/);
+        assert.match(mine.detail, /3 consecutive operations did not succeed \(last one failed: HTTP request failed\)/);
 
         // ---- 規則 3 對真的 Postgres：confirmed 的歷史靠 lateral 聚合接得起來 ----
         // stub 證明不了 `cross join lateral` 的語意（尤其是「0 筆 confirmed 也回一列」），
@@ -668,7 +668,7 @@ test('真 Postgres：同一個 (kind, portfolio) 連跑兩次 = 一列 occurrenc
         const noHistory = (await detectLowGas(q, gasSeams)).find((entry) => entry.portfolioId === portfolioId);
         assert.ok(noHistory !== undefined, '餘額 0 → 一定要被偵測到（lateral 沒有把 0 筆 confirmed 的列 join 掉）');
         assert.equal(noHistory.severity, 'warn', '三筆都是 failed/reverted、沒有任何 confirmed → warn');
-        assert.match(noHistory.detail, /沒有任何成功執行的紀錄，可能還沒開始運作/);
+        assert.match(noHistory.detail, /no successful execution on record; it may not be running yet/);
 
         await q(
           `insert into operations (portfolio_id, type, state, idempotency_key)
@@ -677,14 +677,14 @@ test('真 Postgres：同一個 (kind, portfolio) 連跑兩次 = 一列 occurrenc
         );
         const withHistory = (await detectLowGas(q, gasSeams)).find((entry) => entry.portfolioId === portfolioId);
         assert.equal(withHistory?.severity, 'critical', '有了 confirmed → 同一個 portfolio 從 warn 升級成回歸 critical');
-        assert.match(withHistory?.detail ?? '', /上次成功執行是 \d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z/);
+        assert.match(withHistory?.detail ?? '', /last successful execution was \d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z/);
 
         // ---- upsert 去重 ----
         const gasFinding: AlertFinding = {
           kind: 'gas_low',
           severity: 'critical',
           portfolioId,
-          detail: '第一次：只剩 4 次操作的 gas',
+          detail: 'first seen: gas left for 4 operations',
         };
         await recordAlerts(q, [gasFinding], NOW);
         const first = await q('select id, occurrences, detail from scheduler_alerts where kind = $1 and portfolio_id = $2', ['gas_low', portfolioId]);
@@ -749,7 +749,7 @@ test('portfolio_stuck：最新快照仍 needs_rebalance 且已超過 N 小時 �
   assert.equal(findings[0]?.severity, 'warn');
   assert.equal(findings[0]?.portfolioId, 305);
   assert.match(String(findings[0]?.detail), /595 bps/);
-  assert.match(String(findings[0]?.detail), /7\.4 小時/);
+  assert.match(String(findings[0]?.detail), /7\.4 hours/);
 });
 
 test('portfolio_stuck：一整天沒有進展 → critical（不是「今天運氣不好」）', async () => {

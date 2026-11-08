@@ -448,6 +448,7 @@ async function loginToken(baseUrl: string): Promise<string> {
 
 const SAMPLE_STATUS: PortfolioStatus = {
   portfolioId: PORTFOLIO_ID,
+  executorAddress: '0x9C41696ea7FaA5470eAfb77415D063beEef83f4a',
   block: '1',
   account: ACCOUNT,
   holdings: [],

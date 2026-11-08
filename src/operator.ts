@@ -81,6 +81,16 @@ export type StatusDrift = {
 
 export type PortfolioStatus = {
   portfolioId: number;
+  /**
+   * executor 位址 —— app 要靠它組 `approve(spender = executor)`。
+   *
+   * 為什麼放在 status 而不是另一個端點：approve 是「這個投組能不能動」的一部分，
+   * 而 app 已經在讀 status 了；多一支端點只是多一次 round-trip 與一個要同步的欄位。
+   *
+   * `null` = 這個部署沒有設 `EXECUTOR_ADDRESS`（那就連 session key 都裝不起來）—— app 要顯示
+   * 「不知道 spender」而不是自己猜一個位址去 approve。
+   */
+  executorAddress: string | null;
   /** 這次觀測釘住的塊高（十進位字串：`bigint` 不進 JSON 數字）。 */
   block: string;
   account: string;
@@ -114,6 +124,8 @@ export type StatusDeps = {
   publicClient?: PublicClient;
   /** 毫秒時鐘；測試注入假時鐘就能驗 TTL。 */
   now?: () => number;
+  /** executor 位址（app 組 approve 用）；省略 = `EXECUTOR_ADDRESS`。 */
+  executor?: Address;
   log?: (line: string) => void;
 };
 
@@ -442,9 +454,11 @@ async function statusOf(portfolioId: number, deps: StatusDeps): Promise<Portfoli
 
   // 唯讀的附加資訊：讀不到也只記進 `sessionKey.error`，不讓一份算得出來的狀態變成 503。
   const sessionKey = await resolveStatusSessionKey(plan.portfolioId, plan.account, deps);
+  const executor = deps.executor ?? getSessionKeyConfig().executorAddress ?? null;
 
   return {
     portfolioId: plan.portfolioId,
+    executorAddress: executor,
     block: plan.snapshot.block.toString(),
     account: plan.account,
     holdings,
@@ -678,7 +692,7 @@ async function swapExecutedFor(
   // 沒有 txHash ＝ 這一輪根本沒有送出（blocked / noop / 送出失敗），換了 0 筆是事實，不是「不知道」。
   if (txHash === null) return 0;
 
-  const executor = deps.executor ?? getSessionKeyConfig().executorAddress;
+  const executor = deps.executor ?? getSessionKeyConfig().executorAddress ?? null;
   if (executor === null) return null;
 
   try {

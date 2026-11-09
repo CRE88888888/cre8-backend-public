@@ -19,6 +19,7 @@ import { alertCounts, formatAlert, listOpenAlerts } from '../src/alerts.js';
 import { closePool, query } from '../src/db.js';
 import { getConfig, getSessionKeyConfig } from '../src/config.js';
 import { DEFAULT_ROUND_LIMIT, runSchedulerOnce } from '../src/scheduler.js';
+import { writeHeartbeat } from '../src/scheduler-status.js';
 import { DEFAULT_THRESHOLD_BPS } from '../src/snapshot.js';
 import type { PortfolioOutcome, SchedulerRound } from '../src/scheduler.js';
 
@@ -193,6 +194,7 @@ async function main(): Promise<number> {
 
   describeEnvironment(args);
 
+  const startedAt = new Date();
   const runRound = (): Promise<SchedulerRound> =>
     runSchedulerOnce({
       dryRun: !args.live,
@@ -200,8 +202,39 @@ async function main(): Promise<number> {
       thresholdBps: args.thresholdBps,
     });
 
+  /**
+   * 跑一輪並寫心跳。
+   *
+   * 心跳**失敗不能讓這一輪失敗**：排程器的工作是再平衡，寫狀態是觀測。反過來（因為寫不了心跳
+   * 就不跑）會變成「DB 一時讀寫慢 → 所有使用者的部位都不再平衡」。
+   */
+  const runRoundWithHeartbeat = async (rounds: number): Promise<SchedulerRound> => {
+    let round: SchedulerRound | null = null;
+    let error: string | null = null;
+    try {
+      round = await runRound();
+      return round;
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : String(cause);
+      throw cause;
+    } finally {
+      await writeHeartbeat({
+        startedAt,
+        dryRun: !args.live,
+        limit: args.limit,
+        thresholdBps: args.thresholdBps,
+        intervalSeconds: args.intervalSeconds,
+        round,
+        rounds,
+        error,
+      }).catch((cause: unknown) => {
+        console.error(`[scheduler] 心跳寫入失敗（不影響這一輪）：${cause instanceof Error ? cause.message : String(cause)}`);
+      });
+    }
+  };
+
   if (args.mode === 'once') {
-    const round = await runRound();
+    const round = await runRoundWithHeartbeat(1);
     summarize(round);
     return round.results.some((result) => result.outcome === 'failed') ? 1 : 0;
   }
@@ -227,7 +260,7 @@ async function main(): Promise<number> {
     roundIndex += 1;
     console.log(`[scheduler] 第 ${roundIndex} 輪（${new Date().toISOString()}）`);
     try {
-      const round = await runRound();
+      const round = await runRoundWithHeartbeat(roundIndex);
       summarize(round);
       lastExit = round.results.some((result) => result.outcome === 'failed') ? 1 : 0;
     } catch (error) {

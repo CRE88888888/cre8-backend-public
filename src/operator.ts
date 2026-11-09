@@ -16,6 +16,8 @@ import { AppError } from './errors.js';
 import { requireOwnedPortfolio } from './portfolios.js';
 import { describeGasStatus } from './funding.js';
 import { listOpenAlerts } from './alerts.js';
+import { readSchedulerStatus } from './scheduler-status.js';
+import type { SchedulerStatus } from './scheduler-status.js';
 import type { GasStatus } from './funding.js';
 import { getAccountGasBalance, getGasPriceWei } from './chain.js';
 import { getGasConfig } from './config.js';
@@ -1014,6 +1016,13 @@ export type OperatorPortfolioRow = {
 
 export type OperatorOverview = {
   generatedAt: string;
+  /**
+   * 排程器心跳。`null` = 從來沒寫過（沒跑過），不是「死了」。
+   *
+   * 為什麼不從 `portfolios.last_checked_at` 推算：所有投組都還沒到期時那個時間是舊的，
+   * 看起來就像排程器死了 —— 而「死掉」與「沒事做」是兩種完全不同的處置。
+   */
+  scheduler: SchedulerStatus | null;
   alerts: { critical: number; warn: number; open: number } | null;
   /** 最近一次有投組被檢查的時間 —— 排程器有心跳的最直接證據。 */
   lastCheckedAt: string | null;
@@ -1064,8 +1073,9 @@ export async function readOperatorOverview(deps: OperatorOverviewDeps = {}): Pro
   const find = deps.query ?? dbQuery;
   const readBalance = deps.accountGasBalance ?? getAccountGasBalance;
 
-  const [{ rows }, alerts] = await Promise.all([
+  const [{ rows }, scheduler, alerts] = await Promise.all([
     find(SQL_OPERATOR_ROWS),
+    readSchedulerStatus().catch(() => null),
     listOpenAlerts(find).then((open) => {
       let critical = 0;
       let warn = 0;
@@ -1131,7 +1141,7 @@ export async function readOperatorOverview(deps: OperatorOverviewDeps = {}): Pro
     .sort()
     .at(-1) ?? null;
 
-  return { generatedAt: new Date().toISOString(), alerts, lastCheckedAt, portfolios };
+  return { generatedAt: new Date().toISOString(), scheduler, alerts, lastCheckedAt, portfolios };
 }
 
 // ---------------------------------------------------------------------------

@@ -115,7 +115,17 @@ async function setBalance(
   for (let slot = 0n; slot <= maxSlot; slot += 1n) {
     const key = balanceSlot(holder, slot);
     await rpc(client, 'anvil_setStorageAt', [token, key, toHex(sentinel, { size: 32 })]);
-    if ((await readBalance(client, token, holder)) === sentinel) {
+    // ⚠ 回讀可能**拋錯**，而且那不是「slot 不對」而是「這個 key 還沒被本地快取」：
+    // fork 對沒碰過的 storage 會回源查 BSC，而上游（免費 RPC）只服務約 1 分鐘的歷史，
+    // 之後就 `missing trie node`。新建立的帳戶正是這種情況。
+    // 把「讀不到」當成「這一格不對」繼續試下一個候選 —— 寫對的那一格會讓回讀變成純本地。
+    let observed: bigint | null = null;
+    try {
+      observed = await readBalance(client, token, holder);
+    } catch {
+      observed = null;
+    }
+    if (observed === sentinel) {
       // 找到真正的 mapping slot，再寫入目標值並確認。
       await rpc(client, 'anvil_setStorageAt', [token, key, toHex(amount, { size: 32 })]);
       if ((await readBalance(client, token, holder)) !== amount) {

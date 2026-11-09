@@ -39,8 +39,17 @@ pkill -f "anvil --fork-url" 2>/dev/null || true
 sleep 2
 
 echo "  [2/4] 起新 anvil（$UPSTREAM, --hardfork cancun）"
-# `--hardfork cancun` 是必要的：BSC 最新的 Bpo1 會在每個區塊觸發 blockhash 系統合約呼叫，
-# 而在 fork 上那個呼叫會因為取不到歷史 storage 而失敗（實測：registerStrategy revert）。
+# `--hardfork cancun` 是必要的，實測三次才定下來：
+#   * 預設（BSC 的 Bpo1）→ 每塊觸發 blockhash 系統合約呼叫，fork 上取不到歷史 storage →
+#     registerStrategy 這類寫入直接 revert。
+#   * `shanghai` → **Kernel v3.3 的帳戶合約跑不起來**：`getSenderAddress` 回零地址
+#     （算不出 counterfactual 地址）、既有帳戶 `validateUserOp` revert。原因是 Kernel 的 bytecode
+#     需要 Cancun 之後的 opcode，shanghai 沒有。
+#   * `cancun` + **loadState** → 載入的區塊缺 `excessBlobGas` → 所有 eth_call 失敗
+#     （`error code -32602: Excess blob gas not set`）。
+#
+# 所以正確組合是：**cancun + 不載入舊 dump**。要恢復狀態就重新部署（`DeployAtp.s.sol`），
+# 不要靠 loadState。下面 [3/4] 的 loadState 只在「dump 是這個硬分叉下產生」時才安全。
 nohup anvil --fork-url "$UPSTREAM" --chain-id 56 --port 8545 --hardfork cancun > .shots/logs/anvil-boot.log 2>&1 &
 sleep 9
 

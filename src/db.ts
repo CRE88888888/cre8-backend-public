@@ -9,11 +9,22 @@ import { getConfig } from './config.js';
 const { Pool } = pg;
 
 /**
- * db/migrations lives in a sibling project (cre8-protocol/db), so the path is resolved relative
- * to this module: both src/db.ts (tsx) and dist/db.js (tsc) sit two levels below backend/.
- * backend/README.md documents that db/ must be checked out next to backend/.
+ * `db/migrations` 住在**隔壁的 repo**（`cre8-protocol/db`），所以預設路徑相對這個模組解析：
+ * `src/db.ts` 與 `dist/db.js` 都在 `backend/` 底下兩層。`backend/README.md` 說明 db/ 要 checkout 在旁邊。
+ *
+ * ⚠ 但這在容器裡會失效：Docker 的 build context 只有 `backend/`，`../db/migrations` 不存在。
+ * 所以允許 `MIGRATIONS_DIR` 覆寫 —— 兩條路都留著：
+ *
+ *   * 本機 / CI：省略，走預設的相對路徑
+ *   * 容器：把 migration 檔一起放進 image，並設 `MIGRATIONS_DIR=/app/migrations`
+ *
+ * 另一條路是「migration 當成部署步驟，不由容器執行」（見 `docs/deploy-railway.zh-TW.md`）——
+ * 這在只有 backend 建置脈絡時是唯一可行的做法。
  */
-export const MIGRATIONS_DIR = fileURLToPath(new URL('../../db/migrations/', import.meta.url));
+export const MIGRATIONS_DIR =
+  process.env.MIGRATIONS_DIR?.trim() !== undefined && process.env.MIGRATIONS_DIR?.trim() !== ''
+    ? (process.env.MIGRATIONS_DIR as string)
+    : fileURLToPath(new URL('../../db/migrations/', import.meta.url));
 
 /** App-wide advisory lock so two processes never apply migrations at the same time. */
 const MIGRATION_LOCK_ID = 8_121_956_001;

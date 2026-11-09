@@ -13,8 +13,22 @@ RUN bun install --frozen-lockfile --production
 
 COPY . .
 
-# 啟動前套用 migration：多實例同時啟動時，`migrate` 的 checksum 表會讓後到的實例直接跳過。
 ENV NODE_ENV=production
+# image 裡沒有 ../db/migrations（build context 只有 backend/）→ 啟動時不跑 migration，
+# 改由部署步驟套用（見 docs/deploy-railway.zh-TW.md）。
+ENV MIGRATIONS_ENABLED=0
 EXPOSE 8081
 
-CMD ["sh", "-c", "bun src/migrate.ts && bun src/index.ts"]
+# ⚠ 這裡**刻意不跑 migration**。
+#
+# `db/migrations` 住在隔壁的 repo（`cre8-protocol/db`），而 Docker 的 build context 只有
+# `backend/` —— 建置脈絡裡根本沒有那個目錄，`bun src/migrate.ts` 會在啟動時失敗，
+# 容器連不起來（而且錯誤長得像「DB 連不上」，很難查）。
+#
+# 所以 migration 是**部署步驟**：本機或 CI 用 Railway 的 DATABASE_URL 跑一次
+#
+#     DATABASE_URL=<railway> bun run src/migrate.ts
+#
+# （或用 `railway run bun run src/migrate.ts`，見 docs/deploy-railway.zh-TW.md）。
+# 若之後要把 migration 一起放進 image，COPY 一份到 /app/migrations 並設 MIGRATIONS_DIR。
+CMD ["bun", "src/index.ts"]

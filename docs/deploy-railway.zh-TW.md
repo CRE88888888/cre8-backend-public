@@ -42,9 +42,37 @@ last round  claimed 3  executed 2  noop 1  blocked 0  failed 0   · finished 42s
 心跳落後超過 **180 秒**（`HEARTBEAT_STALE_SECONDS`）就會顯示 `stale` —— 那代表進程死了或卡住，
 Railway 的 `restartPolicyType: ON_FAILURE` 會重啟它。
 
+## ⚠ migration 不在容器裡跑（實測踩過）
+
+`db/migrations` 住在**隔壁的 repo**（`cre8-protocol/db`），而 Docker / Railway 的 build context
+只有 `backend/` —— image 裡沒有那些 .sql。所以：
+
+* `Dockerfile` 設 `MIGRATIONS_ENABLED=0`
+* migration 是**部署步驟**，用 Railway 的 DATABASE_URL 跑：
+
+```bash
+railway run bun run src/migrate.ts      # 用服務的環境變數跑（不需要把連線字串貼出來）
+# 或
+DATABASE_URL=<railway-postgres-url> bun run src/migrate.ts
+```
+
+`railway run` 是首選：它把 Railway 服務的環境變數注入本地指令，連線字串不必經過終端機歷史。
+
 ## 首次部署順序
 
 1. 建 Postgres → 拿到 `DATABASE_URL`
-2. 部署 **api**（Dockerfile 會先跑 `src/migrate.ts`）→ `/health` 應回 `status: ok`
-3. 部署 **scheduler**，先不帶 `--live`，確認 `/operator` 的 `last round` 有數字
-4. 確認無誤後把 `--live` 加上，並觀察第一輪的 `executed`
+2. **先跑 migration**：`railway run bun run src/migrate.ts`（在 image 部署之前跑也可以，
+   migration 只依賴 DB）
+3. 部署 **api** → `/health` 應回 `status: ok`
+4. 部署 **scheduler**，先不帶 `--live`，確認 `/operator` 的 `last round` 有數字
+5. 確認無誤後把 `--live` 加上，並觀察第一輪的 `executed`
+
+## 部署前後都要跑一次
+
+```bash
+MIGRATIONS_ENABLED=0 railway run bun run scripts/preflight.ts --strict
+```
+
+`--strict`：任何 warn 都算失敗（主網不接受「知道但先不管」）。它會檢查
+RPC 的 chainId 是否與 CHILD_ID 一致、合約位址上是否真的有 code、registry owner 是不是
+單一 EOA、executor.oracle 是否為零位址、DB migration 套了幾個。

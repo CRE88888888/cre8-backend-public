@@ -22,6 +22,7 @@
     "@zerodev/sdk": "^5.5.11",
     "dotenv": "^16.6.1",
     "pg": "^8.23.1",
+    "tslib": "^2.9.1",
     "viem": "^2.57.16"
   },
   "devDependencies": {

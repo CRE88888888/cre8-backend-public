@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { createPublicClient, http } from 'viem';
 import type { Address } from 'viem';
 import { bsc } from 'viem/chains';
+import { getConfig, getSessionKeyConfig } from '../src/config.js';
 import {
   DEFAULT_TWAP_WINDOW_SECONDS,
   PricingError,
@@ -32,7 +33,49 @@ import {
 const RPC_URL = process.env.ANVIL_RPC_URL ?? 'http://127.0.0.1:8545';
 const EXPECTED_CHAIN_ID = 56;
 
-const ORACLE = '0x3D79c9BE8c087097Cbb1A8Be0D2714cf8BA95B84' as Address;
+/**
+ * oracle 位址**不寫死**：每次重建環境（重新部署 ATP）位址都會變，寫死會讓這組測試在部署一換就紅。
+ * 它要驗的是「我們的 TWAP 計算與已部署 oracle 逐位相同」，不是某個特定位址。
+ * 反查路徑：EXECUTOR_ADDRESS → executor.oracle() → router.oracleOf(WBNB)。
+ */
+let ORACLE = '0x0000000000000000000000000000000000000000' as Address;
+
+async function resolveOracle(): Promise<Address | null> {
+  try {
+    // 自建 client：這個函式在**模組頂層**被呼叫，那時檔案下方的 `client` 還在 TDZ 裡，
+    // 直接用它會丟 ReferenceError，然後被下面的 catch 吞掉 → ORACLE 永遠是零地址。
+    const probe = createPublicClient({ chain: bsc, transport: http(getConfig().rpcUrl ?? 'http://127.0.0.1:8545') });
+    // 走設定模組而不是 process.env：`.env` 由 src/config.ts 載入，測試進程的 process.env 未必有值。
+    const executor = (getSessionKeyConfig().executorAddress ?? '') as Address;
+    if (!/^0x[0-9a-fA-F]{40}$/.test(executor)) return null;
+    const router = (await probe.readContract({
+      address: executor,
+      abi: [{ type: 'function', name: 'oracle', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] }],
+      functionName: 'oracle',
+    })) as Address;
+    const pair = (await probe.readContract({
+      address: router,
+      abi: [
+        {
+          type: 'function',
+          name: 'oracleOf',
+          stateMutability: 'view',
+          inputs: [{ name: '', type: 'address' }],
+          outputs: [{ type: 'address' }],
+        },
+      ],
+      functionName: 'oracleOf',
+      args: ['0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c'],
+    })) as Address;
+    if (!/^0x[0-9a-fA-F]{40}$/.test(pair) || pair === '0x0000000000000000000000000000000000000000') return null;
+    return pair;
+  } catch {
+    return null;
+  }
+}
+
+const resolvedOracle = await resolveOracle();
+if (resolvedOracle !== null) ORACLE = resolvedOracle;
 const WBNB = '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c' as Address;
 const USDT = '0x55d398326f99059fF775485246999027B3197955' as Address;
 /** PancakeSwap V3 WBNB/USDT，fee 500。 */

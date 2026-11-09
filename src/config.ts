@@ -61,7 +61,13 @@ export const DEFAULT_PORT = 8080;
 export const DEFAULT_CHAIN_ID = 56;
 export const DEFAULT_AUTH_DOMAIN = 'localhost';
 /** 0.01 BNB ≈ 33 次 rebalance op（一次約 250k gasUsed @ ~1.22 gwei ≈ 0.0003 BNB）。 */
-export const DEFAULT_MIN_SESSION_GAS_WEI = 10n ** 16n;
+/**
+ * 每個 Kernel 帳戶建議持有的最低 gas（0.002 BNB）。
+ *
+ * 原本是 0.01。BSC 的 gas 是 0.05 gwei，一筆 sudo UserOp（約 500k gas）成本約 0.000025 BNB ——
+ * 0.002 已經夠跑 ~80 筆。0.01 只是讓使用者多鎖住 5 倍的錢，沒有換到任何安全邊際。
+ */
+export const DEFAULT_MIN_SESSION_GAS_WEI = 2n * 10n ** 15n;
 
 let cachedConfig: Config | null = null;
 let cachedAuthConfig: AuthConfig | null = null;

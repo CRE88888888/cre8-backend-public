@@ -1423,3 +1423,115 @@ export async function runOperatorClose(
   }
   return runOperatorRedeem(portfolioId, wallet, totalE8, deps);
 }
+
+/**
+ * 營運端的全域活動流：**誰**（owner 錢包）在**哪個策略**上被再平衡了。
+ *
+ * 為什麼需要：`operations` 只有 `portfolio_id`，要回答「這輪排程器動了誰」得自己 join
+ * portfolios → strategies。`/operator` 的表格是「現況」（誰現在 drift 多少），
+ * 這裡是「歷史」（誰在什麼時候被處理、成功還是失敗）。
+ *
+ * 刻意**不**做 owner 驗證：營運端要能看全部。這也是為什麼它放在 `/operator` 底下
+ * 而不是 `/portfolios/:id/activity`。
+ */
+export type OperatorActivityRow = {
+  id: number;
+  portfolioId: number;
+  /** owner 錢包。 */
+  wallet: string;
+  strategyId: number;
+  strategyName: string | null;
+  /** `rebalance` / `approve` / … */
+  type: string;
+  state: string;
+  txHash: string | null;
+  attempts: number;
+  error: string | null;
+  createdAt: string;
+  /** 這一輪前後的漂移（bps）。`null` = noop/blocked 不寫快照。 */
+  driftBeforeBps: number | null;
+  driftAfterBps: number | null;
+  usdBeforeE8: string | null;
+  usdAfterE8: string | null;
+};
+
+type OperatorActivityDbRow = {
+  id: unknown;
+  portfolio_id: unknown;
+  wallet: unknown;
+  strategy_id: unknown;
+  strategy_name: unknown;
+  type: unknown;
+  state: unknown;
+  tx_hash: unknown;
+  attempts: unknown;
+  last_error: unknown;
+  created_at: unknown;
+  drift_before: unknown;
+  drift_after: unknown;
+  usd_before: unknown;
+  usd_after: unknown;
+};
+
+/**
+ * 最近 N 筆操作（跨所有投組）。
+ *
+ * `limit` 有上限：這是給人看的列表，不是匯出工具 —— 一次拉一萬筆只會讓瀏覽器卡住。
+ */
+export async function readOperatorActivity(
+  limit = 50,
+  deps: OperatorOverviewDeps = {},
+): Promise<OperatorActivityRow[]> {
+  const find = deps.query ?? dbQuery;
+  const capped = Math.min(Math.max(1, Math.trunc(limit)), 200);
+
+  // `QueryFn` 沒有泛型（回傳 `rows: unknown[]`），所以這裡自己轉型。
+  const { rows } = await find(
+    `select o.id, o.portfolio_id, p.user_id as wallet, p.strategy_id,
+            st.name as strategy_name,
+            o.type, o.state, o.tx_hash, o.attempts, o.last_error, o.created_at,
+            b.gross_drift_bps as drift_before, a.gross_drift_bps as drift_after,
+            b.total_usd_e8 as usd_before, a.total_usd_e8 as usd_after
+       from operations o
+       join portfolios p on p.id = o.portfolio_id
+       left join strategies st on st.id = p.strategy_id
+       left join portfolio_snapshots b
+              on b.portfolio_id = o.portfolio_id and b.operation_id = o.id and b.phase = 'before'
+       left join portfolio_snapshots a
+              on a.portfolio_id = o.portfolio_id and a.operation_id = o.id and a.phase = 'after'
+      order by o.id desc
+      limit $1`,
+    [capped],
+  );
+  const data = rows as OperatorActivityDbRow[];
+
+  const num = (value: unknown): number | null => {
+    if (value === null || value === undefined) return null;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+  const str = (value: unknown): string | null =>
+    value === null || value === undefined ? null : String(value);
+  const iso = (value: unknown): string => {
+    if (value === null || value === undefined) return new Date(0).toISOString();
+    return value instanceof Date ? value.toISOString() : new Date(String(value)).toISOString();
+  };
+
+  return data.map((row) => ({
+    id: Number(row.id),
+    portfolioId: Number(row.portfolio_id),
+    wallet: String(row.wallet ?? ''),
+    strategyId: Number(row.strategy_id),
+    strategyName: str(row.strategy_name),
+    type: String(row.type),
+    state: String(row.state),
+    txHash: str(row.tx_hash),
+    attempts: Number(row.attempts ?? 0),
+    error: str(row.last_error),
+    createdAt: iso(row.created_at),
+    driftBeforeBps: num(row.drift_before),
+    driftAfterBps: num(row.drift_after),
+    usdBeforeE8: str(row.usd_before),
+    usdAfterE8: str(row.usd_after),
+  }));
+}

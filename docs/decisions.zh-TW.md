@@ -846,6 +846,56 @@ snapshot 寫入被驗過，這個決策就是錯的。要恢復它的價值，�
 
 ---
 
+## D-36 · deposit 時 gas 不足**自動補**，不擋下
+
+| 項目 | 內容 |
+|---|---|
+| 決策 | deposit 前偵測 Kernel 帳戶的 BNB，不足就自動送一筆 top-up，再轉 USDT |
+| 觸發點 | 清倉會把 BNB 掃回錢包（只留 0.003 給當次 gas），下一次 deposit 之後再平衡就付不出 gas |
+| 實測症狀 | `Send failed: Smart Account does not have sufficient funds` —— 錢到了、配置失敗 |
+
+### 為什麼不是「擋下叫使用者自己補」
+
+第一版是擋下並顯示：
+
+    This fund's account has only 0.0016 BNB for gas (needs 0.05).
+    Top up 0.0484 BNB first — your first rebalance would run out of gas.
+
+這在**技術上正確**，但把我們的內部概念（Kernel 帳戶、gas 儲備）丟給使用者處理。
+使用者剛按下 Deposit，被告知「請先去別的地方按另一顆按鈕」—— 而那顆按鈕之所以需要存在，
+只是因為我們的清倉會把 gas 掃走。**是我們造成的，就該我們收尾。**
+
+### 代價（明講）
+
+deposit 的簽名次數變成**取決於帳戶狀態**：
+
+| 情境 | 簽名次數 |
+|---|---|
+| gas 足夠 | 1 次（USDT 轉帳） |
+| gas 不足 | **2 次**（先補 BNB，再轉 USDT） |
+
+「同一個動作有時要簽兩次」在錢包體驗上是缺點。接受的理由是：它只發生在「清倉後再入金」
+這個我們自己造成的路徑上；而且 toast 會明講 `Topping up gas`，不是偷偷多彈一次。
+
+### 補多少
+
+    topUpWei = (minimumWei − balanceWei) + 0.01 BNB
+
+`minimumWei` 是後端算的「一輪再平衡需要的最低 gas」；`+0.01` 是餘裕，避免補完立刻又低於門檻。
+
+### 新帳戶也要補
+
+剛 `enroll` 的帳戶 gas 一定是 0。第一版對它**跳過檢查**（否則第一次存款永遠過不去），
+但那個理由在「自動補」之後消失了 —— 現在新帳戶也走同一條補 gas 路徑，
+`minimumWei` 查不到時用 `0.01 BNB` 當下限。
+
+### 什麼情況會失效
+
+* owner 錢包的 BNB 也不足 → top-up 交易本身會失敗（錯誤會顯示在 toast）
+* RPC 讀不到 gas 狀態（`gas === null`）→ 當作餘額 0 處理，**會**補 gas（寧可多補，不要半套）
+
+---
+
 ## 待決（尚未拍板）
 
 ### 待決-1 · 使用者簽名通道要用什麼

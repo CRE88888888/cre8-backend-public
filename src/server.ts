@@ -5,7 +5,7 @@ import { activeChain } from './chain-object.js';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { alertCounts, healthStatusFor, listOpenAlerts } from './alerts.js';
 import type { AlertCounts } from './alerts.js';
-import { listPortfolioActivity, readOperatorOverview, runOperatorClose, runOperatorRedeem } from './operator.js';
+import { listPortfolioActivity, readOperatorActivity, readOperatorOverview, runOperatorClose, runOperatorRedeem } from './operator.js';
 import { EXECUTOR_ORACLE_ABI, ORACLE_OF_ABI, listPriceableAssets } from './assets.js';
 import type { PriceableAsset, TradableProbe } from './assets.js';
 import { authenticate, issueNonce, login, parseLoginBody } from './auth.js';
@@ -23,7 +23,7 @@ import {
   previewOperatorRebalance,
   runOperatorRebalance,
 } from './operator.js';
-import type { OperatorPlanPreview, OperatorRebalanceResult, PortfolioStatusReader } from './operator.js';
+import type { OperatorActivityRow, OperatorPlanPreview, OperatorRebalanceResult, PortfolioStatusReader } from './operator.js';
 
 /** Hard cap on request bodies: strategy payloads are small; anything bigger is a mistake or an attack. */
 const MAX_BODY_BYTES = 1_000_000;
@@ -180,6 +180,8 @@ export type ServerDeps = {
    * enrollment / asset allowlist / oracle 地板；這支端點只能「觸發排程器跑一輪」。
    */
   operatorForceRebalance: (portfolioId: number) => Promise<OperatorRebalanceResult>;
+  /** 營運端全域活動流：誰、在哪個策略上被處理（含成敗與前後漂移）。 */
+  operatorActivity: (limit: number) => Promise<OperatorActivityRow[]>;
   /** 這一輪會做什麼（dry-run）。唯讀，所以**不**受 `ENABLE_OPERATOR_REBALANCE` 限制。 */
   planPreview: (portfolioId: number, wallet: string) => Promise<OperatorPlanPreview>;
   /**
@@ -259,6 +261,7 @@ const defaultDeps: ServerDeps = {
   // 只有這一個是在 import 時就建好的：快取要跨請求存活，不能每個請求重建一份。
   portfolioStatus: createPortfolioStatusReader(),
   operatorRebalance: runOperatorRebalance,
+  operatorActivity: (limit) => readOperatorActivity(limit),
   // 營運端：同樣的送出管線，只是換掉 owner 檢查（見型別上的說明）。
   operatorForceRebalance: (portfolioId) =>
     runOperatorRebalance(portfolioId, 'operator', {
@@ -434,6 +437,19 @@ async function route(
     const id = Number(segments[2]);
     if (!Number.isInteger(id) || id <= 0) throw new AppError(400, 'INVALID_ID', 'portfolio id must be a positive integer');
     sendJson(res, 200, await deps.operatorForceRebalance(id));
+    return;
+  }
+
+  // `GET /operator/activity?limit=50` —— 跨所有投組的操作歷史（誰、哪個策略、成敗）。
+  if (root === 'operator' && segments.length === 2 && segments[1] === 'activity') {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    await authenticate(req.headers.authorization);
+    const rawLimit = url.searchParams.get('limit');
+    const limit = rawLimit === null ? 50 : Number(rawLimit);
+    if (!Number.isFinite(limit) || limit <= 0) {
+      throw new AppError(400, 'INVALID_LIMIT', 'limit must be a positive integer');
+    }
+    sendJson(res, 200, { activity: await deps.operatorActivity(limit) });
     return;
   }
 

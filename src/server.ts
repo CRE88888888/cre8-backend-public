@@ -1,7 +1,7 @@
 import { createServer as createHttpServer } from 'node:http';
 import { createPublicClient, http } from 'viem';
 import type { Address } from 'viem';
-import { bsc } from 'viem/chains';
+import { activeChain } from './chain-object.js';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { alertCounts, healthStatusFor, listOpenAlerts } from './alerts.js';
 import type { AlertCounts } from './alerts.js';
@@ -214,7 +214,7 @@ async function defaultListAssets(): Promise<PriceableAsset[]> {
       }
     })();
     if (config.rpcUrl !== null && executor !== null) {
-      const client = createPublicClient({ chain: bsc, transport: http(config.rpcUrl) });
+      const client = createPublicClient({ chain: activeChain(), transport: http(config.rpcUrl) });
       const router = (await client.readContract({
         address: executor,
         abi: EXECUTOR_ORACLE_ABI,

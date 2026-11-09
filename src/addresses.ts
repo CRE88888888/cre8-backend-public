@@ -26,10 +26,10 @@ export const SALT_DOMAIN_TAG = 'cre8-atp:kernel-v3.3';
 
 /**
  * 回傳該 chain 可用的 Kernel v3.3 位址組。
- * 目前只支援 BSC mainnet（56）與 anvil fork（31337，fork 自 BSC，鏈上位址相同）。
+ * 支援 BSC mainnet（56）與本機 fork（**1337** 或舊的 31337）：Kernel 的 canonical 位址在所有鏈相同。
  */
 export function kernelAddressesForChain(chainId: number): typeof KERNEL_V3_3_ADDRESSES {
-  if (chainId === 56 || chainId === 31337) {
+  if (chainId === 56 || chainId === 31337 || chainId === 1337) {
     return KERNEL_V3_3_ADDRESSES;
   }
   throw new Error(

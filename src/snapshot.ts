@@ -1,6 +1,6 @@
 import { createPublicClient, http } from 'viem';
 import type { Address, PublicClient } from 'viem';
-import { bsc } from 'viem/chains';
+import { activeChain } from './chain-object.js';
 import { getConfig } from './config.js';
 import { query as dbQuery } from './db.js';
 import { computeDrift } from './drift.js';
@@ -296,7 +296,7 @@ async function loadPriceTable(query: QueryFn): Promise<Map<string, PriceableAsse
 function defaultPublicClient(): PublicClient {
   const { rpcUrl } = getConfig();
   if (!rpcUrl) throw new Error('chain 未設定：RPC_URL 是讀持倉與 enrollment 的必要條件');
-  return createPublicClient({ chain: bsc, transport: http(rpcUrl) });
+  return createPublicClient({ chain: activeChain(), transport: http(rpcUrl) });
 }
 
 /**

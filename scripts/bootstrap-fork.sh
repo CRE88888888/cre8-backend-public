@@ -11,6 +11,9 @@ export PATH="$HOME/.foundry/bin:$PATH"
 cd "$(dirname "$0")/../.."
 
 RPC=http://127.0.0.1:8545
+# 與 backend/.env 的 CHAIN_ID 一致。1337 是刻意的：MetaMask 不認識這個 id，
+# 才會用我們的 RPC 讀代幣餘額與做模擬（chainId 56 會走它自家後端 → 主網 → 永遠 0）。
+CHAIN_ID="${CHAIN_ID:-1337}"
 # 上游用 **NodeReal 的公開 demo key**：實測（2026-11）它是唯一同時滿足
 #   * archive（舊區塊的 eth_getStorageAt / eth_getBalance / eth_code 都讀得到）
 #   * eth_getLogs（單次 ≤500 塊；我們的掃描器正好用 500）
@@ -50,7 +53,7 @@ echo "  [2/4] 起新 anvil（$UPSTREAM, --hardfork cancun）"
 #
 # 所以正確組合是：**cancun + 不載入舊 dump**。要恢復狀態就重新部署（`DeployAtp.s.sol`），
 # 不要靠 loadState。下面 [3/4] 的 loadState 只在「dump 是這個硬分叉下產生」時才安全。
-nohup anvil --fork-url "$UPSTREAM" --chain-id 56 --port 8545 --hardfork cancun > .shots/logs/anvil-boot.log 2>&1 &
+nohup anvil --fork-url "$UPSTREAM" --chain-id "$CHAIN_ID" --port 8545 --hardfork cancun > .shots/logs/anvil-boot.log 2>&1 &
 sleep 9
 
 echo "  [3/4] 載入 dump：$(basename "$DUMP")"

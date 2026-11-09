@@ -4,7 +4,8 @@ import { decodeAbiParameters, encodeAbiParameters, encodePacked, keccak256, toBy
 import type { Address, Hex, PublicClient } from 'viem';
 import { closePool, query } from '../src/db.js';
 import { TWAP_PRICE_SOURCE } from '../src/positions.js';
-import { DEFAULT_DEADLINE_SECONDS as PLANNER_DEFAULT_DEADLINE_SECONDS, MAX_FLOOR_WORSENING_BPS, refreshFloors } from '../src/rebalance-plan.js';
+import { DEFAULT_DEADLINE_SECONDS as PLANNER_DEFAULT_DEADLINE_SECONDS, MAX_FLOOR_WORSENING_BPS, refreshFloors, amountOutMinWithBuffer,
+} from '../src/rebalance-plan.js';
 import type { PlannedStep, RebalancePlan, RefreshFloorsResult } from '../src/rebalance-plan.js';
 import {
   DEFAULT_DEADLINE_SECONDS,
@@ -2016,13 +2017,13 @@ test('refreshFloors：用**新鮮值**（不是 max(規劃, 新鮮)），並重�
 
   assert.equal(refreshed.ok, true);
   if (!refreshed.ok) return;
-  assert.equal(refreshed.steps[0]?.amountOutMin, freshFloor, '用新鮮值覆寫（max 會留 500e15）');
+  assert.equal(refreshed.steps[0]?.amountOutMin, amountOutMinWithBuffer(freshFloor), '用新鮮值覆寫（max 會留 500e15），再加 buildStep 的緩衝');
   assert.equal(refreshed.steps[0]?.oracleFloor, freshFloor, 'oracleFloor 也換成新鮮值（它是稽核欄位）');
   const [, inputAmountIn, inputAmountOutMin, inputPath, payerIsUser] = decodeAbiParameters(
     V3_INPUT_ABI,
     refreshed.steps[0]!.inputs[0]!,
   );
-  assert.equal(inputAmountOutMin, freshFloor, 'inputs 裡的 amountOutMin 必須一起換：那是 router 的地板');
+  assert.equal(inputAmountOutMin, amountOutMinWithBuffer(freshFloor), 'inputs 裡的 amountOutMin 必須一起換：那是 router 的地板');
   assert.equal(inputAmountIn, planned.amountIn, 'amountIn 不該被動到');
   assert.equal(
     inputPath,
@@ -2044,7 +2045,7 @@ test('refreshFloors：地板變好時 deltaBps 是正的（規劃值與新鮮值
   assert.equal(refreshed.ok, true);
   if (!refreshed.ok) return;
   assert.equal(refreshed.refreshes[0]?.deltaBps, 100, '505/500 − 1 ＝ +100 bps');
-  assert.equal(refreshed.steps[0]?.amountOutMin, 505_000_000_000_000_000n);
+  assert.equal(refreshed.steps[0]?.amountOutMin, amountOutMinWithBuffer(505_000_000_000_000_000n));
   assert.match(refreshed.note, /\+100 bps/);
 });
 
@@ -2120,5 +2121,9 @@ test('refreshFloors：feeBps 走 minGrossFor（fee 0 ≠ fee 2500），而且每
   if (!refreshed.ok) return;
   assert.equal(quoted.length, 2, '每一個 step 都要各問一次（地板是逐 step 的）');
   // ceil(500e15 * 10000 / 7500) ＝ 666_666_666_666_666_667
-  assert.equal(refreshed.steps[0]?.amountOutMin, 666_666_666_666_666_667n, 'minGross = ceil(floor * 10000/(10000−feeBps))');
+  assert.equal(
+    refreshed.steps[0]?.amountOutMin,
+    amountOutMinWithBuffer(666_666_666_666_666_667n),
+    'minGross = ceil(floor * 10000/(10000−feeBps))，再加 buildStep 的 10 bps 緩衝',
+  );
 });

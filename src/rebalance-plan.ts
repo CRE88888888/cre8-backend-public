@@ -493,6 +493,25 @@ async function readHead(
   return { feeBps, blockTimestamp };
 }
 
+/**
+ * `amountOutMin` 相對地板的緩衝（bps）。
+ *
+ * 為什麼需要：合約的 pre-check 是
+ *   `step.amountOutMin >= minGross（執行時重算的 oracle 地板）`
+ * 而我們的 `amountOutMin` 是**規劃時**算的。TWAP 只要在「規劃 → 上鏈」這幾秒內往上動一點，
+ * pre-check 就破線 —— 實測只差 **100 ppm（0.01%）** 就 revert `BelowFloor(step.min, minGross)`，
+ * 而真正的成交其實遠高於地板（池子手續費 0.25%、oracle 地板有 3% 折扣）。
+ *
+ * 10 bps 遠大於實測漂移（1 bp），又遠小於「地板 → 成交價」之間約 275 bps 的裕度，
+ * 所以不會把 router 的 min 逼到成交價之上（那會變成 `V3TooLittleReceived`）。
+ */
+export const AMOUNT_OUT_MIN_BUFFER_BPS = 10n;
+
+/** 把地板加上緩衝，得到實際帶給合約/路由的 `amountOutMin`（見上面的說明）。 */
+export function amountOutMinWithBuffer(minGross: bigint): bigint {
+  return minGross + ceilDiv(minGross * AMOUNT_OUT_MIN_BUFFER_BPS, BPS_BIG);
+}
+
 /** 一個 step 的 commands / inputs：`recipient` 必須是 executor（`_checkRecipient`），`payerIsUser = true`。 */
 export function buildStep(params: {
   executor: Address;
@@ -504,18 +523,22 @@ export function buildStep(params: {
   poolFee: number;
 }): PlannedStep {
   const path = encodePacked(['address', 'uint24', 'address'], [params.tokenIn, params.poolFee, params.tokenOut]);
+  // ⚠ 這個值必須**同時**放進 struct 欄位與 calldata：合約的 pre-check 讀 `step.amountOutMin`，
+  // 真正約束成交的是 router 從 `inputs` 解出來的 `amountOutMin`。兩者分岔就是「合約以為有地板、
+  // router 卻用另一個值」—— 曾經只加在欄位上，於是 router 仍用未緩衝值（實測差 100 ppm 就 revert）。
+  const amountOutMin = amountOutMinWithBuffer(params.minGross);
   return {
     tokenIn: params.tokenIn,
     tokenOut: params.tokenOut,
     amountIn: params.amountIn,
-    amountOutMin: params.minGross,
+    amountOutMin,
     oracleFloor: params.oracleFloor,
     commands: V3_SWAP_EXACT_IN,
     inputs: [
       encodeAbiParameters(V3_SWAP_EXACT_IN_INPUT, [
         getAddress(params.executor),
         params.amountIn,
-        params.minGross,
+        amountOutMin,
         path,
         true,
       ]),

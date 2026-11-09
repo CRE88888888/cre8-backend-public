@@ -7,7 +7,7 @@ import {
   toHex,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import { bsc } from 'viem/chains';
+import { activeChain } from './chain-object.js';
 import type { PublicClient, WalletClient, Address, Account, Hex } from 'viem';
 import { kernelAddressesForChain } from './addresses.js';
 import { getConfig } from './config.js';
@@ -110,8 +110,8 @@ export function getChain(): ChainConfig {
   }
 
   const account = privateKeyToAccount(ensureHex(config.operatorPrivateKey));
-  const publicClient = createPublicClient({ chain: bsc, transport: http(config.rpcUrl) });
-  const wallet = createWalletClient({ chain: bsc, transport: http(config.rpcUrl), account });
+  const publicClient = createPublicClient({ chain: activeChain(), transport: http(config.rpcUrl) });
+  const wallet = createWalletClient({ chain: activeChain(), transport: http(config.rpcUrl), account });
 
   cached = {
     chainId: config.chainId,
@@ -149,7 +149,7 @@ export async function registerStrategyOnchain(meta: {
 
   const hash = await wallet.writeContract({
     account: operator,
-    chain: bsc,
+    chain: activeChain(),
     address: registryAddress,
     abi: REGISTRY_ABI,
     functionName: 'registerStrategy',
@@ -178,7 +178,7 @@ export async function publishVersionOnchain(
 
   const hash = await wallet.writeContract({
     account: operator,
-    chain: bsc,
+    chain: activeChain(),
     address: registryAddress,
     abi: REGISTRY_ABI,
     functionName: 'publishVersion',
@@ -201,7 +201,7 @@ export async function enrollOnchain(account: Address, onchainId: number): Promis
 
   const hash = await wallet.writeContract({
     account: operator,
-    chain: bsc,
+    chain: activeChain(),
     address: registryAddress,
     abi: REGISTRY_ABI,
     functionName: 'enroll',
@@ -259,7 +259,7 @@ export async function deploySmartAccount(
 
   // factoryData is the MetaFactory `deployWithFactory(KernelFactory, initData, salt)` calldata, built
   // by the SDK; getKernelAccountParams has already refused anything but the MetaFactory.
-  const hash = await wallet.sendTransaction({ account: operator, chain: bsc, to: factory, data: factoryData });
+  const hash = await wallet.sendTransaction({ account: operator, chain: activeChain(), to: factory, data: factoryData });
   await publicClient.waitForTransactionReceipt({ hash });
 
   return { address, deployed: true };

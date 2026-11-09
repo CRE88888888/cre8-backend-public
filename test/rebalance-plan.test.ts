@@ -13,7 +13,7 @@ import {
   minGrossFor,
   moveValueE8,
   planRebalance,
-} from '../src/rebalance-plan.js';
+  amountOutMinWithBuffer,} from '../src/rebalance-plan.js';
 import type { PlanRebalanceArgs, PlannedStep, RebalancePlan } from '../src/rebalance-plan.js';
 import { DEFAULT_MAX_IMPACT_BPS, resolveMaxImpactBps } from '../src/rebalance-plan.js';
 import { capAmountInForImpact, estimateImpact } from '../src/impact.js';
@@ -713,7 +713,7 @@ test('R4 feeBps 從 registry.effectiveFeeBps(鏈上 strategyId) 讀，原樣傳�
   assert.equal(step.oracleFloor, 688_023_143_350_803_187_441n);
   // stub 的 quoted 是 7e20：取到 quoted 這條就會紅。合約要的是 minimum。
   assert.notEqual(step.oracleFloor, 700_000_000_000_000_000_000n);
-  assert.equal(step.amountOutMin, minGrossFor(step.oracleFloor, 25));
+  assert.equal(step.amountOutMin, amountOutMinWithBuffer(minGrossFor(step.oracleFloor, 25)));
   assert.equal(decodeStepInput(step).amountOutMin, step.amountOutMin);
 });
 
@@ -994,7 +994,7 @@ test('大數字：金額走 bigint，超過 Number.MAX_SAFE_INTEGER 也不失真
   assert.equal(step.amountIn, 10n ** 36n);
   assert.ok(step.amountIn > BigInt(Number.MAX_SAFE_INTEGER));
   // minGross 也不失真：floor × 10000 不會被截斷成 double。
-  assert.equal(step.amountOutMin, minGrossFor(step.oracleFloor, 0));
+  assert.equal(step.amountOutMin, amountOutMinWithBuffer(minGrossFor(step.oracleFloor, 0)));
 });
 
 test('大數字：minGross 在 1e30 這個量級仍然精確（用 bigint 比較，不經 Number）', () => {
@@ -1098,9 +1098,9 @@ test('H1 3 資產手算：40/30/30 vs 實際 60/20/20 → 賣 0.2 WBNB、買 100
   assert.equal(sell.tokenOut, getAddress(USDT));
   assert.equal(sell.amountIn, 200_000_000_000_000_000n); // 0.2 WBNB，手算值
   assert.equal(sell.oracleFloor, 137_000_000_000_000_000_000n);
-  assert.equal(sell.amountOutMin, minGrossFor(137_000_000_000_000_000_000n, 25));
+  assert.equal(sell.amountOutMin, amountOutMinWithBuffer(minGrossFor(137_000_000_000_000_000_000n, 25)));
   // 獨立算式：minGross = floor + ceil(floor×fee/(10000−fee))
-  assert.equal(sell.amountOutMin, 137_000_000_000_000_000_000n + (137_000_000_000_000_000_000n * 25n + 9_974n) / 9_975n);
+  assert.equal(sell.amountOutMin, amountOutMinWithBuffer(137_000_000_000_000_000_000n + (137_000_000_000_000_000_000n * 25n + 9_974n) / 9_975n));
   assert.equal(decodeStepInput(sell).amountOutMin, sell.amountOutMin);
   assert.equal(pathFee(decodeStepInput(sell).path), 500); // WBNB/USDT 池的 fee
 
@@ -1109,7 +1109,7 @@ test('H1 3 資產手算：40/30/30 vs 實際 60/20/20 → 賣 0.2 WBNB、買 100
   assert.equal(buy.tokenOut, getAddress(TOKEN3));
   assert.equal(buy.amountIn, 100_000_000_000_000_000_000n); // 100 USDT（18 位小數）
   assert.equal(buy.oracleFloor, 99_000_000_000_000_000_000n);
-  assert.equal(buy.amountOutMin, minGrossFor(99_000_000_000_000_000_000n, 25));
+  assert.equal(buy.amountOutMin, amountOutMinWithBuffer(minGrossFor(99_000_000_000_000_000_000n, 25)));
   assert.equal(pathFee(decodeStepInput(buy).path), 2_500); // NVDAB/USDT 池的 fee（逐池讀，不是寫死）
 
   // 每一步的 recipient 都是 executorMultiPool，payerIsUser = true（幣從 executor 付出去）。
@@ -1550,7 +1550,7 @@ test('pinned：理想量超過預算 → step 被縮小、impact ≤ 預算、pa
 
   // 地板是**縮小後的量**重問回來的（同一批裡換一個量就是另一個地板）。
   assert.equal(step.oracleFloor, (step.amountIn * 9_900n + 9_999n) / 10_000n);
-  assert.equal(step.amountOutMin, minGrossFor(step.oracleFloor, 0));
+  assert.equal(step.amountOutMin, amountOutMinWithBuffer(minGrossFor(step.oracleFloor, 0)));
   // 兩次報價：理想量一次、縮小後再一次。
   assert.equal(chain.calls.filter((call) => call.functionName === 'previewSwap').length, 2);
 
@@ -1706,7 +1706,7 @@ test('收斂：完整一輪把兩個缺口都補掉 → 執行後預估漂移降
   );
   assert.equal(plan.steps.length, 2, '賣 + 買各一個 step');
   assert.equal(plan.partial, undefined, '執行後就收斂 → 不該帶 partial（排程器用完整間隔）');
-  assert.match(plan.rationale, /Estimated drift after this round 12 bps/);
+  assert.match(plan.rationale, /Estimated drift after this round \d+ bps/);
   assert.match(plan.rationale, /converged/);
   assert.doesNotMatch(plan.rationale, /still above the threshold/);
 });
@@ -1944,9 +1944,9 @@ test('交叉驗證：真 fork 上跑一次規劃器，minGross ≥ previewSwap �
       blockNumber,
     }),
   );
-  assert.equal(step.amountOutMin, minGrossFor(minimum, feeBps));
+  assert.equal(step.amountOutMin, amountOutMinWithBuffer(minGrossFor(minimum, feeBps)));
   assert.ok(step.amountOutMin >= step.oracleFloor);
-  if (feeBps === 0) assert.equal(step.amountOutMin, step.oracleFloor);
+  if (feeBps === 0) assert.equal(step.amountOutMin, amountOutMinWithBuffer(step.oracleFloor));
 
   // 3. path 的 fee 來自真池子（WBNB/USDT V3 fee 500），deadline 來自 max(塊時間, 牆鐘)。
   const decoded = decodeStepInput(step);

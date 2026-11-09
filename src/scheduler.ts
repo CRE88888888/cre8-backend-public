@@ -91,7 +91,7 @@ import {
 } from 'viem';
 import type { Address, Hex, PublicClient } from 'viem';
 import { hdKeyToAccount } from 'viem/accounts';
-import { bsc } from 'viem/chains';
+import { activeChain } from './chain-object.js';
 import { KERNEL_V3_3_ADDRESSES } from './addresses.js';
 import { detectAlerts, formatAlert, recordAlerts, resolveAlerts } from './alerts.js';
 import { getConfig, getSessionKeyConfig, requireSessionKeyConfig } from './config.js';
@@ -1160,7 +1160,8 @@ async function runPrechecks(
 async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<ExecutionOutcome> {
   const { masterSeed } = requireSessionKeyConfig();
   const publicClient = defaultPublicClient();
-  const network = bsc;
+  // 簽 UserOp 用的鏈物件必須與 RPC 的 chainId 一致（userOpHash 含 chainId）。
+  const network = activeChain();
 
   const keyAccount = hdKeyToAccount(HDKey.fromMasterSeed(hexToBytes(masterSeed)), { path: args.sessionKey.keyRef });
   if (!isAddressEqual(keyAccount.address, args.sessionKey.sessionKeyAddress)) {
@@ -1298,7 +1299,7 @@ function defaultPublicClient(): PublicClient {
   if (rpcUrl === null) {
     throw new Error('chain 未設定：排程器要讀鏈（RPC_URL 是空的——空字串等於沒設，見 docs/pitfalls §8.12）');
   }
-  cachedPublicClient = createPublicClient({ chain: bsc, transport: http(rpcUrl) });
+  cachedPublicClient = createPublicClient({ chain: activeChain(), transport: http(rpcUrl) });
   return cachedPublicClient;
 }
 

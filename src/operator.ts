@@ -8,7 +8,7 @@
 
 import { createPublicClient, http } from 'viem';
 import type { Address, Hex, PublicClient } from 'viem';
-import { bsc } from 'viem/chains';
+import { activeChain } from './chain-object.js';
 
 import { getConfig, getSessionKeyConfig } from './config.js';
 import { query as dbQuery, withTransaction } from './db.js';
@@ -709,7 +709,7 @@ function defaultPublicClient(): PublicClient {
   if (!rpcUrl) {
     throw new Error('chain 未設定：RPC_URL 是讀 receipt 的必要條件');
   }
-  return createPublicClient({ chain: bsc, transport: http(rpcUrl) });
+  return createPublicClient({ chain: activeChain(), transport: http(rpcUrl) });
 }
 
 function operatorOutcome(result: PortfolioRunResult): OperatorRebalanceOutcome {

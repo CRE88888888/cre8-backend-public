@@ -15,6 +15,7 @@ import { query as dbQuery, withTransaction } from './db.js';
 import { AppError } from './errors.js';
 import { requireOwnedPortfolio } from './portfolios.js';
 import { describeGasStatus } from './funding.js';
+import { listOpenAlerts } from './alerts.js';
 import type { GasStatus } from './funding.js';
 import { getAccountGasBalance, getGasPriceWei } from './chain.js';
 import { getGasConfig } from './config.js';
@@ -972,4 +973,159 @@ export async function listPortfolioActivity(
       usdAfterE8: text(row.usd_after),
     };
   });
+}
+
+// ---------------------------------------------------------------------------
+// Operator 總覽（rebalance dashboard）
+// ---------------------------------------------------------------------------
+
+/**
+ * 一排 = 一個投組。刻意**不**逐個呼叫 `portfolioStatus`：那條路徑會掃 Transfer 日誌 + 定價，
+ * 實測 2–3 秒／投組，八個投組就是 20 秒以上 —— 儀表板要的是「快速看一眼現在怎麼樣」。
+ *
+ * 所以這裡讀**已經落地的資料**：最新的 before/after 快照（排程器每輪都寫）、最後一筆 operation、
+ * session key 的到期日、next_run_at。只有 gas 是即時讀的（一次 `eth_getBalance`，很便宜）。
+ * 代價是「觀測時間」可能是幾分鐘前 —— 所以每一列都帶 `observedAt`，使用者自己看得到新鮮度。
+ */
+export type OperatorPortfolioRow = {
+  id: number;
+  strategyId: number;
+  strategyName: string | null;
+  version: number;
+  scheduleState: string;
+  account: string | null;
+  nextRunAt: string | null;
+  lastCheckedAt: string | null;
+  /** 最新快照的觀測點。`null` = 從來沒跑過。 */
+  observedAt: string | null;
+  driftBps: number | null;
+  totalUsdE8: string | null;
+  needsRebalance: boolean | null;
+  blockedCount: number | null;
+  /** 帳戶的原生幣餘額（即時）。`null` = 讀不到。 */
+  gasWei: string | null;
+  sessionKeyExpiresAt: string | null;
+  lastOperation: { id: number; state: string; txHash: string | null; createdAt: string } | null;
+};
+
+export type OperatorOverview = {
+  generatedAt: string;
+  alerts: { critical: number; warn: number; open: number } | null;
+  /** 最近一次有投組被檢查的時間 —— 排程器有心跳的最直接證據。 */
+  lastCheckedAt: string | null;
+  portfolios: OperatorPortfolioRow[];
+};
+
+export type OperatorOverviewDeps = {
+  query?: QueryFn;
+  /** 讀帳戶原生幣餘額；省略 = `getAccountGasBalance`。 */
+  accountGasBalance?: (address: Address) => Promise<bigint>;
+};
+
+const SQL_OPERATOR_ROWS = `
+  select p.id, p.strategy_id, s.name as strategy_name, p.version, p.schedule_state,
+         p.next_run_at, p.last_checked_at,
+         sa.address as account,
+         snap.created_at as observed_at, snap.gross_drift_bps, snap.total_usd_e8, snap.needs_rebalance,
+         (select count(*)::int from portfolio_snapshots b
+           where b.portfolio_id = p.id and b.phase = 'before' and b.operation_id = snap.operation_id) as blocked_count,
+         key.expires_at as key_expires_at,
+         op.id as op_id, op.state as op_state, op.tx_hash as op_tx, op.created_at as op_created_at
+    from portfolios p
+    left join strategies s on s.id = p.strategy_id
+    left join smart_accounts sa on sa.portfolio_id = p.id
+    left join lateral (
+      select created_at, gross_drift_bps, total_usd_e8, needs_rebalance, operation_id
+        from portfolio_snapshots
+       where portfolio_id = p.id
+       order by created_at desc
+       limit 1
+    ) snap on true
+    left join lateral (
+      select expires_at from session_keys
+       where portfolio_id = p.id and status = 'active'
+       order by expires_at desc
+       limit 1
+    ) key on true
+    left join lateral (
+      select id, state, tx_hash, created_at from operations
+       where portfolio_id = p.id
+       order by id desc
+       limit 1
+    ) op on true
+   order by p.id
+`;
+
+export async function readOperatorOverview(deps: OperatorOverviewDeps = {}): Promise<OperatorOverview> {
+  const find = deps.query ?? dbQuery;
+  const readBalance = deps.accountGasBalance ?? getAccountGasBalance;
+
+  const [{ rows }, alerts] = await Promise.all([
+    find(SQL_OPERATOR_ROWS),
+    listOpenAlerts(find).then((open) => {
+      let critical = 0;
+      let warn = 0;
+      for (const alert of open) {
+        if (alert.severity === 'critical') critical += 1;
+        else warn += 1;
+      }
+      return { critical, warn, open: critical + warn };
+    }).catch(() => null),
+  ]);
+
+  const iso = (value: unknown): string | null => {
+    if (value === null || value === undefined) return null;
+    const time = value instanceof Date ? value.getTime() : Date.parse(String(value));
+    return Number.isFinite(time) ? new Date(time).toISOString() : null;
+  };
+  const num = (value: unknown): number | null => (value === null || value === undefined ? null : Number(value));
+
+  const portfolios: OperatorPortfolioRow[] = await Promise.all(
+    (rows as Record<string, unknown>[]).map(async (row) => {
+      const account = typeof row.account === 'string' ? row.account : null;
+      // gas 讀不到（RPC 掛、fork 過期）→ null。儀表板不該因為一個 RPC 失敗就整頁掛掉。
+      const gasWei =
+        account === null
+          ? null
+          : await readBalance(account as Address)
+              .then((wei) => wei.toString())
+              .catch(() => null);
+
+      const opId = num(row.op_id);
+      return {
+        id: Number(row.id),
+        strategyId: Number(row.strategy_id),
+        strategyName: typeof row.strategy_name === 'string' ? row.strategy_name : null,
+        version: Number(row.version),
+        scheduleState: String(row.schedule_state),
+        account,
+        nextRunAt: iso(row.next_run_at),
+        lastCheckedAt: iso(row.last_checked_at),
+        observedAt: iso(row.observed_at),
+        driftBps: num(row.gross_drift_bps),
+        totalUsdE8: row.total_usd_e8 === null || row.total_usd_e8 === undefined ? null : String(row.total_usd_e8),
+        needsRebalance: row.needs_rebalance === null || row.needs_rebalance === undefined ? null : row.needs_rebalance === true,
+        blockedCount: num(row.blocked_count),
+        gasWei,
+        sessionKeyExpiresAt: iso(row.key_expires_at),
+        lastOperation:
+          opId === null
+            ? null
+            : {
+                id: opId,
+                state: String(row.op_state),
+                txHash: typeof row.op_tx === 'string' ? row.op_tx : null,
+                createdAt: iso(row.op_created_at) ?? '',
+              },
+      };
+    }),
+  );
+
+  const lastCheckedAt = portfolios
+    .map((row) => row.lastCheckedAt)
+    .filter((value): value is string => value !== null)
+    .sort()
+    .at(-1) ?? null;
+
+  return { generatedAt: new Date().toISOString(), alerts, lastCheckedAt, portfolios };
 }

@@ -5,7 +5,7 @@ import { bsc } from 'viem/chains';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { alertCounts, healthStatusFor, listOpenAlerts } from './alerts.js';
 import type { AlertCounts } from './alerts.js';
-import { listPortfolioActivity } from './operator.js';
+import { listPortfolioActivity, readOperatorOverview } from './operator.js';
 import { EXECUTOR_ORACLE_ABI, ORACLE_OF_ABI, listPriceableAssets } from './assets.js';
 import type { PriceableAsset, TradableProbe } from './assets.js';
 import { authenticate, issueNonce, login, parseLoginBody } from './auth.js';
@@ -162,6 +162,8 @@ export type ServerDeps = {
    * `createServer()` 之前建好，所以快取跨請求存活）；測試換成 stub 就不必真的讀鏈。
    */
   portfolioActivity: (id: number, wallet: string) => Promise<unknown>;
+  /** operator 總覽（rebalance dashboard）。 */
+  operatorOverview: () => Promise<unknown>;
   portfolioStatus: PortfolioStatusReader;
   /** `POST /portfolios/:id/rebalance`（會動錢；預設實作見 `operator.ts`）。 */
   operatorRebalance: (portfolioId: number, wallet: string) => Promise<OperatorRebalanceResult>;
@@ -248,6 +250,7 @@ const defaultDeps: ServerDeps = {
   operatorRebalanceEnabled,
   listAssets: defaultListAssets,
   portfolioActivity: (id, wallet) => listPortfolioActivity(id, wallet),
+  operatorOverview: () => readOperatorOverview(),
 };
 
 export function createServer(overrides: Partial<ServerDeps> = {}): Server {
@@ -391,6 +394,14 @@ async function route(
         return planPreviewRoute(req, res, portfolioId(), deps);
       }
     }
+  }
+
+  if (root === 'operator' && segments.length === 2 && segments[1] === 'overview') {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    // 只要求登入，不依 owner 過濾：這是內部儀表板。之後要做 `OPERATOR_WALLETS` 白名單就加在這裡。
+    await authenticate(req.headers.authorization);
+    sendJson(res, 200, await deps.operatorOverview());
+    return;
   }
 
   if (root === 'bundler' && segments.length === 1) {

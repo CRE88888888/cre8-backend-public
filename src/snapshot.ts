@@ -422,6 +422,23 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
     };
   });
 
+  // numeraire **一律**納入讀取範圍，即使它不在配置裡。
+  //
+  // 為什麼：`universe` 原本只由策略成分組成，於是「沒有現金腿」的配置（例如
+  // TSLA 35 / SPCX 35 / BTC 15 / DOGE 10 / ETH 5 = 100%）完全看不到 USDT 餘額。
+  // 後果是一個死結：使用者剛存進來的 USDT 不被算進總值 → 規劃器認為「投組價值 0，沒東西可搬」
+  // → 一輪都不跑 → 那筆錢永遠停在現金。實測（主網首次存款 5 USDT）就是這樣。
+  //
+  // numeraire 是**出資貨幣**：任何一輪的第一筆動作都是「用 USDT 買標的」，
+  // 所以它的餘額永遠是規劃的輸入，不管權重表裡有沒有它。
+  const numeraire = [...priceTable.values()].find((asset) => asset.isNumeraire);
+  if (
+    numeraire !== undefined &&
+    !universe.some((asset) => asset.address.toLowerCase() === numeraire.address.toLowerCase())
+  ) {
+    universe.push(numeraire);
+  }
+
   // 這裡是整個檔案唯一「決定塊高」的兩份觀測，而且兩份都吃上面那個 `block`：
   //   ① `readPositions`：宇宙內的餘額與價格；
   //   ② `scanPortfolioHoldings`：宇宙**外**的轉入日誌（`head: block` ⇒ 它的 getLogs 到塊與候選

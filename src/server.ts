@@ -171,6 +171,15 @@ export type ServerDeps = {
   portfolioStatus: PortfolioStatusReader;
   /** `POST /portfolios/:id/rebalance`（會動錢；預設實作見 `operator.ts`）。 */
   operatorRebalance: (portfolioId: number, wallet: string) => Promise<OperatorRebalanceResult>;
+  /**
+   * 營運端觸發某一輪再平衡（**不檢查 owner**）。
+   *
+   * `POST /portfolios/:id/rebalance` 會 `requireOwnedPortfolio`（那是給使用者的）。
+   * 營運端要跑的是別人的投組，所以另開一條：傳一個 no-op 的 `requireOwnedPortfolio`。
+   * 安全性仍由**鏈上**保證 —— 送出去的是 session key 的 UserOp，executor 會驗
+   * enrollment / asset allowlist / oracle 地板；這支端點只能「觸發排程器跑一輪」。
+   */
+  operatorForceRebalance: (portfolioId: number) => Promise<OperatorRebalanceResult>;
   /** 這一輪會做什麼（dry-run）。唯讀，所以**不**受 `ENABLE_OPERATOR_REBALANCE` 限制。 */
   planPreview: (portfolioId: number, wallet: string) => Promise<OperatorPlanPreview>;
   /**
@@ -250,6 +259,12 @@ const defaultDeps: ServerDeps = {
   // 只有這一個是在 import 時就建好的：快取要跨請求存活，不能每個請求重建一份。
   portfolioStatus: createPortfolioStatusReader(),
   operatorRebalance: runOperatorRebalance,
+  // 營運端：同樣的送出管線，只是換掉 owner 檢查（見型別上的說明）。
+  operatorForceRebalance: (portfolioId) =>
+    runOperatorRebalance(portfolioId, 'operator', {
+      // 回傳一個假的 portfolio：這個路徑不讀它的欄位，只是要讓 owner 檢查通過。
+      requireOwnedPortfolio: async () => ({ id: portfolioId }) as never,
+    }),
   planPreview: previewOperatorRebalance,
   operatorRebalanceEnabled,
   listAssets: defaultListAssets,
@@ -410,6 +425,16 @@ async function route(
         return planPreviewRoute(req, res, portfolioId(), deps);
       }
     }
+  }
+
+  // `POST /operator/portfolios/:id/rebalance` —— 營運端手動觸發一輪（不檢查 owner）。
+  if (root === 'operator' && segments.length === 4 && segments[1] === 'portfolios' && segments[3] === 'rebalance') {
+    if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+    await authenticate(req.headers.authorization);
+    const id = Number(segments[2]);
+    if (!Number.isInteger(id) || id <= 0) throw new AppError(400, 'INVALID_ID', 'portfolio id must be a positive integer');
+    sendJson(res, 200, await deps.operatorForceRebalance(id));
+    return;
   }
 
   if (root === 'operator' && segments.length === 2 && segments[1] === 'overview') {

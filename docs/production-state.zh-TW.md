@@ -12,6 +12,7 @@
 | Oracle WBNB/USDT | `0x7c7df82b4c27251db247af363f99e595d42a8d78` | 主網 |
 | Oracle NVDAB/USDT | `0xebf5a243e79436b49dcfb8092968b161e323d873` | 主網 |
 | **api 服務** | `https://api-production-7f13.up.railway.app` | Railway，SUCCESS |
+| **alto bundler** | `https://alto-production-c309.up.railway.app` | Railway，SUCCESS（v1.2.5 + safe-mode） |
 | **Postgres** | Railway（私有網路） | SUCCESS，18 個 migration |
 
 健康檢查實測：
@@ -24,15 +25,21 @@
 部署者：`0x70fc55f8BF3BE3E599566417A1a58c9bf6a7c60c`（全新錢包，非 anvil 測試帳號）
 部署成本：0.000299 BNB（7 筆交易）
 
+bundler 實測：
+
+    eth_supportedEntryPoints → ["0x0000000071727De22E5E9d8BAf0edAc6f37da032"]
+    eth_chainId              → 0x38 (56)
+
 ## 還沒做
 
 | # | 項目 | 阻礙 |
 |---|---|---|
-| 1 | **alto bundler** | 使用者決定自架在 Railway；尚未建立服務。沒有 bundler 就送不出 UserOp |
-| 2 | **scheduler 服務** | 等 bundler（`--live` 需要它） |
+| 1 | ~~alto bundler~~ | ✅ 已完成 |
+| 2 | **scheduler 服務** | 可開始（bundler 已就緒） |
 | 3 | 前端部署 | `VITE_CHAIN_ID=56` + `VITE_RPC_URL` + `VITE_API_BASE` |
 | 4 | 第一筆真錢驗證 | 等 1–3 |
-| 5 | registry owner → Safe | 主網前 TODO §4 |
+| 5 | registry owner → Safe | 使用者裁定：測試完再轉（見 todo §4） |
+| 7 | **alto 與部署者共用私鑰** | 目前 `EXECUTOR_PRIVATE_KEY` = 部署者金鑰。正式前應拆開：alto 的熱錢包只放少量 BNB |
 | 6 | alert 投遞 | TODO §3 |
 
 ## 部署紀錄的重要教訓

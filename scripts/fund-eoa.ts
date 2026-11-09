@@ -140,6 +140,57 @@ async function main(): Promise<void> {
       console.log(`  ${address}  USDT ${Number(after) / 1e18}（slot ${slot}）${after === amount ? '✓' : '✗'}`);
     }
   }
+
+  await mineUntilFinalized(client, addresses as Address[]);
+}
+
+/**
+ * 挖塊，讓 `finalized` / `safe` 標籤追上我們剛才寫入的狀態。
+ *
+ * ## 為什麼非做不可
+ * MetaMask **讀 `eth_getBalance` 用的是 `finalized`（或 `safe`）區塊**，不是 `latest`。
+ * anvil 的 finalized 落後 head 約 64 塊，所以剛補完幣時：
+ *
+ *     eth_getBalance(addr, "latest")     → 10 BNB  ✓
+ *     eth_getBalance(addr, "finalized")  → 0 BNB   ✗ ← 錢包看這個
+ *
+ * 結果就是錢包顯示「You do not have enough BNB in your account to pay for network fees」，
+ * 而鏈上明明有 10 BNB。USDT 的 `balanceOf` 與交易的 `eth_call` 模擬也一樣會讀 finalized，
+ * 所以不挖塊的話，錢包連「這筆會不會成功」都判斷錯（顯示 likely to fail）。
+ *
+ * 實測：`anvil_mine 0x78`（120 塊）之後，finalized 的 BNB 與 USDT 都正確，模擬也通過。
+ */
+async function mineUntilFinalized(client: PublicClient, addresses: readonly Address[]): Promise<void> {
+  const probe = addresses[0];
+  if (probe === undefined) return;
+  const finalizedBalance = async (): Promise<bigint | null> => {
+    try {
+      const res = await fetch(ANVIL_RPC, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'eth_getBalance',
+          params: [probe, 'finalized'],
+        }),
+      });
+      const body = (await res.json()) as { result?: string };
+      return typeof body.result === 'string' ? BigInt(body.result) : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const balance = await client.getBalance({ address: probe });
+  if ((await finalizedBalance()) === balance) return;
+
+  await client.request({ method: 'anvil_mine' as never, params: ['0x78'] as never });
+  const after = await finalizedBalance();
+  console.log(
+    `  挖 120 塊讓 finalized 追上：finalized 餘額 ${after === null ? '?' : Number(after) / 1e18} BNB` +
+      `（MetaMask 讀的是 finalized，不是 latest）${after === balance ? ' ✓' : ' ✗'}`,
+  );
 }
 
 await main();

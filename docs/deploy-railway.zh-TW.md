@@ -42,6 +42,31 @@ last round  claimed 3  executed 2  noop 1  blocked 0  failed 0   · finished 42s
 心跳落後超過 **180 秒**（`HEARTBEAT_STALE_SECONDS`）就會顯示 `stale` —— 那代表進程死了或卡住，
 Railway 的 `restartPolicyType: ON_FAILURE` 會重啟它。
 
+## ⚠ `railway up` 上傳的是「連結時的專案根目錄」，不是當前目錄
+
+實測踩了很久：在 `.deploy/` 裡跑 `railway up`，上傳的卻是 `backend/`（`railway link` 記錄的根目錄），
+於是 image 裡**永遠沒有 migration**，容器啟動時：
+
+    ENOENT: no such file or directory, scandir '/app/migrations'
+
+本地 `docker build` 完全正常，所以這個錯誤很容易被誤判成 Dockerfile 有問題。
+
+正確做法（`--path-as-root` 讓 PATH 成為 archive 根）：
+
+```bash
+bun run scripts/prepare-deploy.ts                      # 產生 .deploy/（含 migrations）
+railway up .deploy --path-as-root -d --service api     # 注意這三個參數
+```
+
+其他踩過的坑，一併記在這裡：
+
+| 症狀 | 原因 |
+|---|---|
+| 部署到 Postgres 服務、把資料庫打掉 | `railway up` 預設部署到**已連結的服務**；建完 Postgres 後它就是唯一服務。**先 `railway add --service api`，再 `--service api`** |
+| 上傳被過濾成空 | `.gitignore` 會參與上傳過濾；`.deploy/.gitignore` 若含 `.deploy/` 規則會把整個目錄排除 → 用 `--no-gitignore`，且 `prepare-deploy` 不複製 `.gitignore` |
+| `railway` 一直 `Failed to set permissions on ~/.railway` | 沙箱不能寫家目錄 → `HOME=<可寫目錄> railway ...` |
+| `postgres.railway.internal` 解析失敗（本地） | Railway 私有網路只在平台內可解析；migration 必須由**容器**執行，不能當本機步驟 |
+
 ## ⚠ migration 不在容器裡跑（實測踩過）
 
 `db/migrations` 住在**隔壁的 repo**（`cre8-protocol/db`），而 Docker / Railway 的 build context

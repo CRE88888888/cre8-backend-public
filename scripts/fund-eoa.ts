@@ -13,10 +13,27 @@
  * 所以正確順序是「先 refresh，再補幣」。
  *
  * 用法：
- *   bun run scripts/fund-eoa.ts --address 0xabc… [--address 0xdef…] [--bnb 10]
+ *   bun run scripts/fund-eoa.ts --address 0xabc… [--address 0xdef…] [--bnb 10] [--usdt 1000]
+ *
+ * `--usdt` 用 `anvil_setStorageAt` 直接寫 USDT 的 `balanceOf` slot（BSC USDT 是 slot 1）。
+ * 這和 `fund-portfolio.ts` 給 smart account 入金是同一招：**本地狀態就是真相**，
+ * 差別只在這次寫的是使用者自己的 EOA。
  */
-import { createPublicClient, http, parseEther } from 'viem';
-import type { Address } from 'viem';
+import { createPublicClient, http, parseEther, parseUnits } from 'viem';
+import type { Address, Hex, PublicClient } from 'viem';
+import { encodeAbiParameters, keccak256, toHex } from 'viem';
+
+/** BSC 上的 USDT（18 decimals）。用常數是因為這支腳本不接 DB。 */
+const BSC_USDT = '0x55d398326f99059fF775485246999027B3197955' as Address;
+const ERC20_BALANCE_ABI = [
+  {
+    type: 'function',
+    name: 'balanceOf',
+    stateMutability: 'view',
+    inputs: [{ name: '', type: 'address' }],
+    outputs: [{ name: '', type: 'uint256' }],
+  },
+] as const;
 
 const ANVIL_RPC = process.env.ANVIL_RPC_URL ?? process.env.RPC_URL ?? 'http://127.0.0.1:8545';
 
@@ -29,6 +46,58 @@ function flags(name: string): string[] {
     }
   }
   return out;
+}
+
+
+/**
+ * 直接寫 ERC-20 的 `balanceOf` slot。
+ *
+ * slot 用**哨兵值探測**而不是寫死：不同代幣的 mapping slot 不一樣（BSC USDT 是 1，但那不是通則）。
+ * 哨兵取一個「不可能剛好等於現有餘額」的值，才不會像先前那樣「重跑時剛好相符」而誤判成 slot 0。
+ */
+async function setErc20Balance(args: {
+  client: PublicClient;
+  token: Address;
+  holder: Address;
+  amount: bigint;
+  maxSlot?: bigint;
+}): Promise<bigint> {
+  const sentinel = 123_456_789_012_345_678_901_234_567_890n;
+  const maxSlot = args.maxSlot ?? 12n;
+  const read = async (): Promise<bigint | null> => {
+    try {
+      return (await args.client.readContract({
+        address: args.token,
+        abi: ERC20_BALANCE_ABI,
+        functionName: 'balanceOf',
+        args: [args.holder],
+      })) as bigint;
+    } catch {
+      // 讀不到 ≠ slot 不對：新位址的 slot 還沒被本地快取時會回源失敗。
+      return null;
+    }
+  };
+
+  for (let slot = 0n; slot <= maxSlot; slot += 1n) {
+    const key: Hex = keccak256(
+      encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }], [args.holder, slot]),
+    );
+    await args.client.request({
+      method: 'anvil_setStorageAt' as never,
+      params: [args.token, key, toHex(sentinel, { size: 32 })] as never,
+    });
+    if ((await read()) !== sentinel) continue;
+    await args.client.request({
+      method: 'anvil_setStorageAt' as never,
+      params: [args.token, key, toHex(args.amount, { size: 32 })] as never,
+    });
+    const after = await read();
+    if (after !== args.amount) {
+      throw new Error(`slot ${slot} 寫入 ${args.amount} 後回讀不符（${after}）`);
+    }
+    return slot;
+  }
+  throw new Error(`試過 slot 0..${maxSlot} 都寫不進 ${args.token} 的 balanceOf`);
 }
 
 async function main(): Promise<void> {
@@ -52,6 +121,23 @@ async function main(): Promise<void> {
         '回讀不符：fork 可能已經過期（上游 archive 窗口約 75 分鐘）。先跑 refresh-anvil.sh 再試 —— ' +
           '寫入看起來成功但讀不到，就是這個症狀。',
       );
+    }
+  }
+
+  const usdtAmount = flags('usdt')[0];
+  if (usdtAmount !== undefined) {
+    const token = (flags('token')[0] ?? BSC_USDT) as Address;
+    const amount = parseUnits(usdtAmount, 18);
+    for (const raw of addresses) {
+      const address = raw as Address;
+      const slot = await setErc20Balance({ client, token, holder: address, amount });
+      const after = (await client.readContract({
+        address: token,
+        abi: ERC20_BALANCE_ABI,
+        functionName: 'balanceOf',
+        args: [address],
+      })) as bigint;
+      console.log(`  ${address}  USDT ${Number(after) / 1e18}（slot ${slot}）${after === amount ? '✓' : '✗'}`);
     }
   }
 }

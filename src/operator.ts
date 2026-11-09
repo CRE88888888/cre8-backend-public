@@ -1376,3 +1376,40 @@ async function buildRedeemPlan(
       (notes.length === 0 ? '' : `；略過：${notes.join('; ')}`),
   };
 }
+
+/**
+ * `POST /portfolios/:id/close` —— 清倉：把**全部**部位賣成 numeraire。
+ *
+ * 與 redeem 的差別只在比例：redeem 賣 `A / T`（保留投組形狀），close 賣 **100%**。
+ * 所以它直接沿用同一條管線（`runOperatorRedeem` + `forcePlan`），只是把「要提領的美元」
+ * 換成「目前的總價值」——`amountIn = balance × T / T = balance`，也就是整筆。
+ *
+ * 為什麼不是另寫一份「全部賣出」：賣出涉及 oracle 地板、impact 上限、地板重問、operations 記錄，
+ * 那些全都已經在 redeem/planRebalance 裡；另寫一份一定會分岔（這個 repo 已經吃過兩次同樣的虧）。
+ *
+ * 賣不掉的部分（流動性不足、報不出價）**留在帳戶裡**並回報，由前端接著把它們直接轉回錢包 ——
+ * 清倉的語意是「錢包裡什麼都不剩」，不是「帳戶裡什麼都不剩」。
+ */
+export async function runOperatorClose(
+  portfolioId: number,
+  wallet: string,
+  deps: RebalanceDeps = {},
+): Promise<RedeemResult> {
+  const find = deps.requireOwnedPortfolio ?? requireOwnedPortfolio;
+  await find(portfolioId, wallet);
+
+  // 先讀一次現值：清倉要賣的就是「全部」，而金額必須先知道才能交給同一條管線。
+  const status = await statusOf(portfolioId, {});
+  const totalE8 = status.totalUsdE8 === null ? 0n : BigInt(status.totalUsdE8);
+  if (totalE8 <= 0n) {
+    return {
+      portfolioId,
+      outcome: 'noop',
+      reason: '投組價值是 0，沒有東西可以清倉',
+      txHash: null,
+      steps: [],
+      redeemedUsdE8: '0',
+    };
+  }
+  return runOperatorRedeem(portfolioId, wallet, totalE8, deps);
+}

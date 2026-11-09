@@ -5,7 +5,7 @@ import { activeChain } from './chain-object.js';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { alertCounts, healthStatusFor, listOpenAlerts } from './alerts.js';
 import type { AlertCounts } from './alerts.js';
-import { listPortfolioActivity, readOperatorOverview, runOperatorRedeem } from './operator.js';
+import { listPortfolioActivity, readOperatorOverview, runOperatorClose, runOperatorRedeem } from './operator.js';
 import { EXECUTOR_ORACLE_ABI, ORACLE_OF_ABI, listPriceableAssets } from './assets.js';
 import type { PriceableAsset, TradableProbe } from './assets.js';
 import { authenticate, issueNonce, login, parseLoginBody } from './auth.js';
@@ -166,6 +166,8 @@ export type ServerDeps = {
   operatorOverview: () => Promise<unknown>;
   /** 把部位按比例賣成 numeraire（提領成 USDT 的前半段）。 */
   operatorRedeem: (portfolioId: number, wallet: string, usdE8: bigint) => Promise<unknown>;
+  /** 清倉：把全部部位賣成 numeraire。 */
+  operatorClose: (portfolioId: number, wallet: string) => Promise<unknown>;
   portfolioStatus: PortfolioStatusReader;
   /** `POST /portfolios/:id/rebalance`（會動錢；預設實作見 `operator.ts`）。 */
   operatorRebalance: (portfolioId: number, wallet: string) => Promise<OperatorRebalanceResult>;
@@ -254,6 +256,7 @@ const defaultDeps: ServerDeps = {
   portfolioActivity: (id, wallet) => listPortfolioActivity(id, wallet),
   operatorOverview: () => readOperatorOverview(),
   operatorRedeem: (portfolioId, wallet, usdE8) => runOperatorRedeem(portfolioId, wallet, usdE8),
+  operatorClose: (portfolioId, wallet) => runOperatorClose(portfolioId, wallet),
 };
 
 export function createServer(overrides: Partial<ServerDeps> = {}): Server {
@@ -387,6 +390,12 @@ async function route(
       if (segments[2] === 'rebalance') {
         if (method !== 'POST') return methodNotAllowed(res, ['POST']);
         return operatorRebalanceRoute(req, res, portfolioId(), deps);
+      }
+      if (segments[2] === 'close') {
+        if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+        const closeWallet = await authenticate(req.headers.authorization);
+        sendJson(res, 200, await deps.operatorClose(portfolioId(), closeWallet));
+        return;
       }
       if (segments[2] === 'redeem') {
         if (method !== 'POST') return methodNotAllowed(res, ['POST']);

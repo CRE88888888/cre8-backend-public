@@ -423,7 +423,8 @@ async function statusOf(portfolioId: number, deps: StatusDeps): Promise<Portfoli
     throw new AppError(
       503,
       'STATUS_UNAVAILABLE',
-      `算不出 portfolio ${portfolioId} 的狀態（planPortfolio 失敗，通常是 RPC 不通、anvil fork 過期或 DB 不一致）：${oneLine(error)}`,
+      `Cannot compute the status of portfolio ${portfolioId}: the planner failed (usually the RPC is down, the ` +
+        `anvil fork has expired, or the database is inconsistent). Underlying error: ${oneLine(error)}`,
       { cause: error },
     );
   }

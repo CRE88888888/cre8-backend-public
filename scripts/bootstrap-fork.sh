@@ -108,6 +108,19 @@ echo "      預熱 ${#CANONICAL[@]} 個地址"
 echo "  [4/5] 部署 oracle 並註冊"
 bash backend/scripts/deploy-elon-oracles.sh
 
+echo "  [4.5/5] 補幣給測試錢包（重啟後 dump 會把他們的餘額蓋回去，所以在這裡重新補）"
+# 為什麼要固定補：`loadState` 載入的是舊 dump，之後才入金/發幣的餘額都會消失。
+# 症狀是 MetaMask 顯示「BNB 不足」，而鏈上其實是 `BEP20: transfer amount exceeds balance`
+# —— 錢包把 ERC-20 revert 誤報成 gas 問題，非常容易誤導。
+FUND_ADDRESSES=(
+  0x90F79bf6EB2c4f870365E785982E1f101E93b906   # anvil #3（使用者匯入 MetaMask 的那把）
+  0x8e91fa86b79377b51c774237d0ef262421602c5e   # 使用者的另一個登入位址
+  0xa2d0553d393b9c672c3d45516aaa07feb3f8bc21
+)
+FUND_ARGS=()
+for addr in "${FUND_ADDRESSES[@]}"; do FUND_ARGS+=(--address "$addr"); done
+RPC_URL="$RPC" bun run backend/scripts/fund-eoa.ts "${FUND_ARGS[@]}" --bnb 10 --usdt 1000 2>&1 | sed 's/^/      /'
+
 echo "  [5/5] 把當前狀態存成新 dump（下一次開機就不用再搶那 1 分鐘窗口）"
 python3 - <<'PYEOF'
 import json, pathlib, subprocess, time

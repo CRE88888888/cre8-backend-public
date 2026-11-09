@@ -896,6 +896,47 @@ deposit 的簽名次數變成**取決於帳戶狀態**：
 
 ---
 
+## D-37 · 跳過 testnet，直接主網部署
+
+| 項目 | 內容 |
+|---|---|
+| 決策 | 不做 BSC testnet 驗證，直接在 chainId 56 部署並用小額真錢驗證 |
+| 理由 | **我們依賴的資產在 testnet 上不存在**：bStock 代幣（TSLAB/SPCXB）、以及真實的 PancakeSwap 池子與 aggregator 路由 |
+| 代價 | 部署錯誤要花真錢修（但 BSC gas 極低，實測 0.05 gwei，整組合約 < 0.001 BNB） |
+
+### 為什麼 testnet 測不出東西
+
+testnet 上會驗證到的只有「合約能不能部署、函式能不能呼叫」——那些在 fork 上已經反覆驗過幾十次。
+真正會出事的地方全部依賴主網才有的東西：
+
+* bStock 代幣合約本身（testnet 沒有）
+* 這些代幣對 WBNB 的**池子與 fee tier**（testnet 沒有流動性）
+* aggregator 路由（testnet 沒有真實路由可走）
+
+在 testnet 上跑一輪「成功」的再平衡，只能證明我們的合約能跟**假的**池子互動 —— 那不是這次要驗的東西。
+
+### 部署前已驗證的主網事實
+
+    主網 RPC       chainId 56，可達
+    位址簿        腳本裡那 4 個 fork 位址在主網**全是空的** → 會乾淨重新部署
+                   （若有 code 會被誤認成「可重用」，腳本會 revert 而不是靜默用錯）
+    TSLAB 池       liquidity 8.12e23
+    SPCXB 池       liquidity 5.19e23
+    BTCB  池       liquidity 9.43e23
+    ETH   池       liquidity 3.39e23
+
+最後一項是關鍵：`AtpExecutor._checkStep` 會在執行期 re-quote oracle，而 oracle 綁的是
+**特定池子**。池子若沒有流動性，報價會爆掉、再平衡必然 revert（fork 上踩過：死池的 slot0
+停在 MAX_TICK，報價變成天文數字）。四個池子都有流動性 → 這條路是通的。
+
+### 部署錢包不能用 anvil 測試帳號
+
+anvil 的測試私鑰（`0xac0974…`、`0x7c8521…` 等）是**公開的**，主網上任何人看到餘額就能搬走。
+所以另外產生了全新的錢包，金鑰只存在 `.env.mainnet`（chmod 600、已 gitignore），
+只放部署所需的少量 BNB。
+
+---
+
 ## 待決（尚未拍板）
 
 ### 待決-1 · 使用者簽名通道要用什麼

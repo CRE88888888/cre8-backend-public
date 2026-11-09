@@ -55,10 +55,41 @@
 - `DeployAtp.s.sol` 已在 fork 上反覆驗證；主網要確認 pool fee tier / permit2 / universal router 位址
 - 第一筆用最小金額（例如 20 USDT）走完 deposit → rebalance → withdraw，並對帳 gas
 
+## 8. bundler safe-mode（見上）
+
 ## 6. 文件進版控 `[x]`
 
 - `backend/docs/pitfalls.zh-TW.md`（43 條踩坑記錄）
 - `backend/docs/decisions.zh-TW.md`（35 條架構決策）
+
+## 8. bundler 的 `safe-mode` 目前是關的 `[ ]` — 免費 RPC 不支援 tracing
+
+| 項目 | 內容 |
+|---|---|
+| 現況 | Railway 的 alto 跑 `SAFE_MODE=false`（NodeReal 免費 RPC） |
+| 為什麼 | alto 的 `safe-mode=true` 用 `debug_traceCall` 執行 ERC-7562 的儲存存取規則檢查 |
+| 實測 | publicnode / bsc-dataseed / 1rpc / ankr / meowrpc / blastapi / blxrbdn 全部**不支援** `debug_traceCall`；drpc 支援但免費額度立刻被限流；NodeReal 免費層「not available at your level」 |
+
+### 這個開關實際少了什麼
+
+`safe-mode=false` 不強制 ERC-4337 的驗證規則（ERC-7562 的 opcode / 儲存存取白名單）。
+後果：一個惡意或寫壞的 UserOp 可以做到嚴格 bundler 會拒絕的事。
+**EntryPoint 本身仍然驗簽章、nonce、prefund** —— 少的是「bundle 前的規則檢查」。
+
+### 為什麼現在可以接受
+
+* 我們的 bundler **只服務自家後端**送出的 UserOp，不對外開放給第三方
+* 主網目前只有測試資金
+
+### 上線前必須做的事
+
+1. 換一個支援 `debug_traceCall` 的**付費** RPC（NodeReal / QuickNode / Ankr 的付費層，
+   或 drpc 付費方案）
+2. 把 alto 的 `SAFE_MODE` 改回 `true` 並重新部署
+3. 用一個**故意違規**的 UserOp 驗證它會被擋（偽造簽章應回 `AA23 reverted - 0x8baa579f`；
+   這個案例在 fork 上已驗證過，見 `spike/alto/V125-VERDICT.md`）
+
+---
 
 ## 7. 擴容：多使用者同時再平衡 `[ ]`
 

@@ -1509,7 +1509,8 @@ export async function runSchedulerOnce(
 
   const results: PortfolioRunResult[] = [];
   for (const due of claimed) {
-    const result = await runOne(due, { dryRun, now, thresholdBps, deps: resolved });
+    // `forcePlan` 要一路傳到 runOne：它決定「漂移低於門檻時要不要照樣規劃」（redeem 用）。
+    const result = await runOne(due, { dryRun, now, thresholdBps, deps: resolved, forcePlan: deps.forcePlan === true });
     results.push(result);
     resolved.log(formatResult(result, dryRun));
   }

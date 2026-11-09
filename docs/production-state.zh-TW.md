@@ -13,6 +13,7 @@
 | Oracle NVDAB/USDT | `0xebf5a243e79436b49dcfb8092968b161e323d873` | 主網 |
 | **api 服務** | `https://api-production-7f13.up.railway.app` | Railway，SUCCESS |
 | **alto bundler** | `https://alto-production-c309.up.railway.app` | Railway，SUCCESS（v1.2.5 + safe-mode） |
+| **scheduler** | Railway 內部（無公開網域） | SUCCESS，**dry-run**，60 秒一輪 |
 | **Postgres** | Railway（私有網路） | SUCCESS，18 個 migration |
 
 健康檢查實測：
@@ -35,7 +36,7 @@ bundler 實測：
 | # | 項目 | 阻礙 |
 |---|---|---|
 | 1 | ~~alto bundler~~ | ✅ 已完成 |
-| 2 | **scheduler 服務** | 可開始（bundler 已就緒） |
+| 2 | ~~scheduler 服務~~ | ✅ 已部署，**dry-run**；要 `SCHEDULER_LIVE=1` 才會真的送交易 |
 | 3 | 前端部署 | `VITE_CHAIN_ID=56` + `VITE_RPC_URL` + `VITE_API_BASE` |
 | 4 | 第一筆真錢驗證 | 等 1–3 |
 | 5 | registry owner → Safe | 使用者裁定：測試完再轉（見 todo §4） |
@@ -48,3 +49,29 @@ bundler 實測：
 * `railway up` 預設用**已連結的服務** → 先 `railway add --service api` 再指定
 * 沙箱不能寫 `~/.railway` → `HOME=<工作區> railway ...`
 * publicnode 對 archive 查詢要 token：`forge` 驗證 receipt 時噴 403，但交易成功
+
+## 同一個 image、兩種角色
+
+`SERVICE_ROLE` 決定啟動什麼（`docker-entrypoint.sh`）：
+
+| 服務 | SERVICE_ROLE | 啟動 |
+|---|---|---|
+| api | `api`（預設） | `bun src/index.ts` |
+| scheduler | `scheduler` | `bun run scripts/scheduler.ts --loop --interval $SCHEDULER_INTERVAL …` |
+
+**`--live` 必須由 `SCHEDULER_LIVE=1` 明確開啟。** 沒設就只觀察不動手 ——
+「部署時忘記某個變數」的代價應該是「它不會動錢」，不是「它動了錢」。
+
+驗證（本地 docker）：
+
+    SERVICE_ROLE=api        → [entrypoint] role=api port=8081
+    SERVICE_ROLE=scheduler  → [entrypoint] role=scheduler interval=60s dry-run
+    SERVICE_ROLE=bogus      → 明確報錯並 exit 1（不靜默 fallback 到 api）
+
+線上實測：第 1/2/3 輪各間隔 60 秒、無錯誤、`認領 0 個 portfolio`（還沒有任何投組）。
+
+## 下一步
+
+1. 前端部署（`VITE_CHAIN_ID=56` + API 位址）
+2. 第一筆真錢：部署者建立一個投組、存入小額 USDT
+3. 確認 scheduler 在 `--live` 下能真的送出第一輪

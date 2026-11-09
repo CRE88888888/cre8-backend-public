@@ -21,6 +21,9 @@ ENV NODE_ENV=production
 ENV MIGRATIONS_DIR=/app/migrations
 EXPOSE 8081
 
-# `src/index.ts` 啟動時會自己套用 migration（MIGRATIONS_DIR 指向 image 內的路徑）。
-# 多實例同時啟動時，`schema_migrations` 的 advisory lock 讓後到的實例直接跳過。
-CMD ["bun", "src/index.ts"]
+# 同一個 image 兩種角色（api / scheduler），由 SERVICE_ROLE 決定 —— 見 docker-entrypoint.sh。
+# api 啟動時會自己套用 migration（MIGRATIONS_DIR 指向 image 內的路徑）；
+# 多實例同時啟動時 `schema_migrations` 的 advisory lock 讓後到的實例直接跳過。
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
+ENTRYPOINT ["/app/docker-entrypoint.sh"]

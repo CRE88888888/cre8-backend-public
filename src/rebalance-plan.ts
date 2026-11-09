@@ -1000,6 +1000,51 @@ async function quoteHub(
 }
 
 
+
+/**
+ * TWAP 與現價偏離的容忍上限（bps）。
+ *
+ * 為什麼需要：`previewSwap` 只看 TWAP。池子的觀察歷史若壞掉（ring buffer 沒填、fork 上時間軸
+ * 不一致），`observe` 會回一個極端 tick，TWAP 就被夾到 MAX/MIN_TICK，報價變成天文數字。
+ * 那不是「價格不好」，是**報價壞了**，而合約只會在下限檢查時 revert 整批 —— 一個壞掉的 leg
+ * 會把其他四個好的 leg 一起拖下水（實測：DOGE 池在 fork 塊上 TWAP = MAX_TICK，報價 1.6e57）。
+ *
+ * 30 分鐘均價偏離現價 50% 已經不是「走勢」，是資料問題；跳過該 leg 讓排程器下一輪再試，
+ * 比送一筆必然 revert 的交易好。
+ */
+const MAX_TWAP_SPOT_DEVIATION_BPS = 5000n;
+
+/**
+ * 用池子的 `slot0` 算現價報價（raw 單位，含小數），再跟 TWAP 報價比。
+ * 讀不到 `slot0` 就回 `null`（放行：沒有證據說它壞）。
+ */
+async function twapSpotDeviationBps(params: {
+  client: PublicClient;
+  pool: Address;
+  tokenIn: Address;
+  amountIn: bigint;
+  quoted: bigint;
+  blockNumber: bigint;
+}): Promise<number | null> {
+  const [token0, slot0] = await Promise.allSettled([
+    params.client.readContract({ address: params.pool, abi: V3_POOL_ABI, functionName: 'token0', blockNumber: params.blockNumber }),
+    params.client.readContract({ address: params.pool, abi: V3_POOL_ABI, functionName: 'slot0', blockNumber: params.blockNumber }),
+  ]);
+  if (token0.status !== 'fulfilled' || slot0.status !== 'fulfilled') return null;
+
+  const sqrtPriceX96 = BigInt(slot0.value[0]);
+  if (sqrtPriceX96 === 0n) return null;
+  const ratioX128 = (sqrtPriceX96 * sqrtPriceX96) >> 64n;
+  if (ratioX128 === 0n) return null;
+
+  const inIsToken0 = String(token0.value).toLowerCase() === params.tokenIn.toLowerCase();
+  const spot = inIsToken0 ? (params.amountIn * ratioX128) >> 128n : (params.amountIn << 128n) / ratioX128;
+  if (spot === 0n) return null;
+
+  const diff = params.quoted > spot ? params.quoted - spot : spot - params.quoted;
+  return Number((diff * 10_000n) / spot);
+}
+
 /**
  * 讀估算衝擊所需的池子狀態：`slot0()`（現貨 √P）、`liquidity()`（當前 tick 區間）、`token0()`
  * （決定這筆是 token0 進還是 token1 進）。三個都是唯讀，全部釘在同一個 `blockNumber`。
@@ -1202,6 +1247,22 @@ async function planHub(
       blockNumber,
     });
     if ('skip' in first) return first;
+    // TWAP 壞掉時報價會是天文數字；先跟現價比一下再決定要不要用這一步。
+    const deviationBps = await twapSpotDeviationBps({
+      client: publicClient,
+      pool: pair.pool,
+      tokenIn: params.tokenIn,
+      amountIn: params.amountIn,
+      quoted: first.quoted,
+      blockNumber,
+    });
+    if (deviationBps !== null && deviationBps > Number(MAX_TWAP_SPOT_DEVIATION_BPS)) {
+      return {
+        skip:
+          `${params.label} 的 TWAP 報價與池子現價偏離 ${deviationBps} bps（上限 ${MAX_TWAP_SPOT_DEVIATION_BPS}）：` +
+          '池子的觀察歷史可能壞了，這一輪跳過（合約會用 TWAP 地板，送出去必然 revert 整批）',
+      };
+    }
     const capped = await capLegByImpact({
       client: publicClient,
       blockNumber,

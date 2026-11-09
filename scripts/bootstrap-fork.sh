@@ -29,6 +29,8 @@ RPC=http://127.0.0.1:8545
 #   blastapi public   archive ✓，getLogs 限流
 #   nodereal 公開 key  archive ✓，但 anvil 重放會把共用 key 打到 429
 #   blockpi / bscrpc / zan.top  要註冊或 key
+# 有 backend/.env.fork 就用它（該檔被 .gitignore 忽略，用來放自己的 RPC key，不入版控）。
+[ -f backend/.env.fork ] && set -a && . backend/.env.fork && set +a
 UPSTREAM="${BSC_RPC_URL:-https://bsc-dataseed.bnbchain.org}"
 DUMP="$(ls -t spike/anvil/state-dump-*.json | head -1)"
 

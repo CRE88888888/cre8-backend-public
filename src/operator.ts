@@ -22,6 +22,9 @@ import { getGasConfig } from './config.js';
 import { countSwapExecuted, runSchedulerOnce } from './scheduler.js';
 import type { ExecutionOutcome, PortfolioRunResult, WithTransactionFn } from './scheduler.js';
 import { planPortfolio } from './snapshot.js';
+import { buildStep, minGrossFor } from './rebalance-plan.js';
+import type { PlannedStep, RebalancePlan } from './rebalance-plan.js';
+import type { RebalancePlanningInput } from './scheduler.js';
 import type { PortfolioPlan, QueryFn } from './snapshot.js';
 
 // ---------------------------------------------------------------------------
@@ -1129,4 +1132,247 @@ export async function readOperatorOverview(deps: OperatorOverviewDeps = {}): Pro
     .at(-1) ?? null;
 
   return { generatedAt: new Date().toISOString(), alerts, lastCheckedAt, portfolios };
+}
+
+// ---------------------------------------------------------------------------
+// Redeem：把部位賣成 numeraire（提領成 USDT 的前半段）
+// ---------------------------------------------------------------------------
+
+/**
+ * 為什麼需要「先賣再提」而不是直接提領資產。
+ *
+ * 使用者要的是「存 USDT、提 USDT」。但錢在部位裡（TSLAB/SPCXB/…），要變成 USDT 只能在鏈上賣掉。
+ * 賣這一步是 executor 的工作、由 **session key** 簽（owner 的 CallPolicy 不允許，反過來也一樣），
+ * 所以它是「一輪再平衡」而不是「一筆轉帳」。
+ *
+ * 關鍵是**按比例賣**：每一檔非 numeraire 的部位都賣掉 `A / T` 的比例（A=要提領的美元、T=總價值）。
+ * 這樣賣完之後每個資產的**權重不變**，因此：
+ *   * 合規上仍然貼著 mandate（不會變成 100% 現金）
+ *   * 排程器不會立刻把它買回來（漂移沒有變大）
+ *   * 使用者拿到的是「按比例縮小後的基金 + 一筆 USDT」
+ *
+ * 走的是排程器同一條路（`runSchedulerOnce` 只認領這一個 portfolio），只是把
+ * `planRebalance` 換成「按比例賣出」—— 送出、地板重問、operations 記錄、快照全部沿用，
+ * 不另寫一份執行路徑（兩份實作一定會分岔）。
+ */
+export type RedeemResult = {
+  portfolioId: number;
+  outcome: OperatorRebalanceOutcome;
+  reason: string;
+  txHash: string | null;
+  /** 賣出的步驟（每一檔一筆）。 */
+  steps: { tokenIn: string; tokenOut: string; amountIn: string; amountOutMin: string }[];
+  /** 這一輪賣出的估算美元（= 使用者要提領的金額）。 */
+  redeemedUsdE8: string;
+};
+
+export async function runOperatorRedeem(
+  portfolioId: number,
+  wallet: string,
+  usdE8: bigint,
+  deps: RebalanceDeps = {},
+): Promise<RedeemResult> {
+  if (usdE8 <= 0n) throw new AppError(400, 'INVALID_AMOUNT', 'redeem amount must be greater than zero');
+  const find = deps.requireOwnedPortfolio ?? requireOwnedPortfolio;
+  await find(portfolioId, wallet);
+
+  const run = deps.runSchedulerOnce ?? runSchedulerOnce;
+  const round = await run(
+    { dryRun: false, limit: 1 },
+    {
+      withTransaction: singlePortfolioClaim(portfolioId, deps.withTransaction),
+      planRebalance: (input) => buildRedeemPlan(input, usdE8),
+      // 按比例賣不會讓漂移變大，所以「不需要再平衡」不代表「不用做」——不 force 就永遠 noop。
+      forcePlan: true,
+      ...(deps.log === undefined ? {} : { log: deps.log }),
+    },
+  );
+
+  const result = round.results[0];
+  if (result === undefined || result.portfolioId !== portfolioId) {
+    return {
+      portfolioId,
+      outcome: 'blocked',
+      reason: `排程器沒有認領 portfolio ${portfolioId}（schedule_state 不是 active，或鏈上沒有它的 smart account）`,
+      txHash: null,
+      steps: [],
+      redeemedUsdE8: usdE8.toString(),
+    };
+  }
+
+  return {
+    portfolioId,
+    outcome: operatorOutcome(result),
+    reason: result.reason,
+    txHash: result.execution?.txHash ?? null,
+    steps: (result.plan?.steps ?? []).map((step) => ({
+      tokenIn: step.tokenIn,
+      tokenOut: step.tokenOut,
+      amountIn: step.amountIn,
+      amountOutMin: step.amountOutMin,
+    })),
+    redeemedUsdE8: usdE8.toString(),
+  };
+}
+
+
+const ORACLE_ABI = [
+  {
+    type: 'function',
+    name: 'previewSwap',
+    stateMutability: 'view',
+    inputs: [{ name: 'tokenIn', type: 'address' }, { name: 'tokenOut', type: 'address' }, { name: 'amountIn', type: 'uint256' }],
+    outputs: [{ name: 'quoted', type: 'uint256' }, { name: 'minimum', type: 'uint256' }],
+  },
+  { type: 'function', name: 'oracleOf', stateMutability: 'view', inputs: [{ name: '', type: 'address' }], outputs: [{ type: 'address' }] },
+] as const;
+
+const POOL_FEE_ABI = [
+  { type: 'function', name: 'pool', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] },
+  { type: 'function', name: 'fee', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint24' }] },
+] as const;
+
+/**
+ * executor 抽成的 bps（＝`minGross` 的放大倍率）。
+ *
+ * 從 registry 讀 `effectiveFeeBps`，而不是從 DB 的 `strategies.swap_fee_bps`：後者是我們**送出去**
+ * 的值，前者是**鏈上實際生效**的值（中間可能有下限或治理調整）。用錯的那個會讓 `minGross` 偏低，
+ * 合約以 `BelowFloor` revert，而錯誤訊息完全看不出是這個原因。
+ */
+async function readExecutorFeeBps(strategyOnchainId: bigint): Promise<number> {
+  const registry = getConfig().registryAddress;
+  if (registry === null) throw new Error('沒有設定 REGISTRY_ADDRESS，讀不到 effectiveFeeBps');
+  const value = await defaultPublicClient().readContract({
+    address: registry as Address,
+    abi: [{ type: 'function', name: 'effectiveFeeBps', stateMutability: 'view', inputs: [{ name: '', type: 'uint256' }], outputs: [{ type: 'uint16' }] }] as const,
+    functionName: 'effectiveFeeBps',
+    args: [strategyOnchainId],
+  });
+  return Number(value);
+}
+
+/** path 的 fee 層：從該資產的 per-pair oracle 反查它綁的池子。 */
+async function readPoolFee(router: Address, asset: Address): Promise<number> {
+  const client = defaultPublicClient();
+  const pairOracle = (await client.readContract({
+    address: router,
+    abi: ORACLE_ABI,
+    functionName: 'oracleOf',
+    args: [asset],
+  })) as Address;
+  const pool = (await client.readContract({ address: pairOracle, abi: POOL_FEE_ABI, functionName: 'pool' })) as Address;
+  const fee = (await client.readContract({ address: pool, abi: POOL_FEE_ABI, functionName: 'fee' })) as number;
+  return Number(fee);
+}
+
+async function readStrategyOnchainId(portfolioId: number): Promise<bigint> {
+  const { rows } = await dbQuery<{ onchain_id: string | number }>(
+    `select s.onchain_id from portfolios p join strategies s on s.id = p.strategy_id where p.id = $1`,
+    [portfolioId],
+  );
+  const value = rows[0]?.onchain_id;
+  if (value === undefined || value === null) throw new Error(`portfolio ${portfolioId} 的 strategy 沒有 onchain_id`);
+  return BigInt(value);
+}
+
+/** `priceable_assets.is_numeraire` 的那一個地址（會計資產）。 */
+async function readNumeraireAddress(): Promise<Address> {
+  const { rows } = await dbQuery<{ address: string }>(
+    'select address from priceable_assets where is_numeraire order by symbol limit 1',
+  );
+  const address = rows[0]?.address;
+  if (typeof address !== 'string') throw new Error('priceable_assets 沒有 is_numeraire 的列，redeem 不知道要換成什麼');
+  return address as Address;
+}
+
+/** viem 錯誤裡的 revert 名稱（`UnsupportedPair` / `ZeroQuote` …），拿不到就回 null。 */
+function revertNameOfForLog(error: unknown): string | null {
+  const message = error instanceof Error ? error.message : String(error);
+  const match = /reverted with the following reason:\s*([A-Za-z0-9_]+)/.exec(message);
+  if (match?.[1] !== undefined) return match[1];
+  const custom = /reverted with custom error '([A-Za-z0-9_]+)/.exec(message);
+  return custom?.[1] ?? null;
+}
+
+/** 把 `wantUsdE8` 換成「每一檔按同一個比例賣」的 steps。 */
+async function buildRedeemPlan(
+  input: RebalancePlanningInput,
+  wantUsdE8: bigint,
+): Promise<RebalancePlan> {
+  const { account, snapshot, report, portfolioId } = input.plan;
+  const totalE8 = report?.totalUsdE8 ?? 0n;
+  if (totalE8 === 0n) return { kind: 'noop', reason: '投組價值是 0，沒有東西可以賣' };
+  if (wantUsdE8 > totalE8) {
+    return {
+      kind: 'blocked',
+      reason: `要提領 ${Number(wantUsdE8) / 1e8} 美元，但投組只有 ${Number(totalE8) / 1e8} 美元`,
+    };
+  }
+
+  const client = defaultPublicClient();
+  const executor = getSessionKeyConfig().executorAddress;
+  if (executor === null) return { kind: 'blocked', reason: '這個部署沒有設定 EXECUTOR_ADDRESS' };
+  const router = (await client.readContract({
+    address: executor,
+    abi: [{ type: 'function', name: 'oracle', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] }] as const,
+    functionName: 'oracle',
+  })) as Address;
+  const numeraire = await readNumeraireAddress();
+
+  const strategyOnchainId = await readStrategyOnchainId(portfolioId);
+  const block = await client.getBlockNumber();
+  const steps: PlannedStep[] = [];
+  const notes: string[] = [];
+
+  for (const holding of snapshot.holdings) {
+    if (holding.asset.toLowerCase() === numeraire.toLowerCase()) continue;
+    // 按比例：amountIn = balance × want / total（向下取整，絕不多賣）
+    const amountIn = (holding.amountWei * wantUsdE8) / totalE8;
+    if (amountIn <= 0n) continue;
+
+    const quoted = await client
+      .readContract({
+        address: router,
+        abi: ORACLE_ABI,
+        functionName: 'previewSwap',
+        args: [holding.asset as Address, numeraire, amountIn],
+      })
+      .catch((error: unknown) => {
+        notes.push(`${holding.asset} 報不出價（${revertNameOfForLog(error) ?? 'unknown'}）`);
+        return null;
+      });
+    if (quoted === null) continue;
+    const [quotedOut, floor] = quoted as readonly [bigint, bigint];
+    if (quotedOut === 0n || floor === 0n) {
+      notes.push(`${holding.asset} 的報價是 0`);
+      continue;
+    }
+    const feeBps = await readExecutorFeeBps(strategyOnchainId);
+    steps.push(
+      buildStep({
+        executor,
+        tokenIn: holding.asset as Address,
+        tokenOut: numeraire,
+        amountIn,
+        oracleFloor: floor,
+        minGross: minGrossFor(floor, feeBps),
+        poolFee: await readPoolFee(router, holding.asset as Address),
+      }),
+    );
+  }
+
+  if (steps.length === 0) {
+    return { kind: 'noop', reason: `沒有可賣的部位${notes.length === 0 ? '' : `：${notes.join('; ')}`}` };
+  }
+
+  const { timestamp } = await client.getBlock({ blockNumber: block });
+  return {
+    kind: 'ready',
+    steps,
+    deadline: timestamp + 1200n,
+    rationale:
+      `按比例賣出 ${steps.length} 檔以換成 numeraire（每檔賣掉 ${(Number(wantUsdE8) / Number(totalE8) * 100).toFixed(2)}%），` +
+      `權重不變所以排程器不會把它買回來` +
+      (notes.length === 0 ? '' : `；略過：${notes.join('; ')}`),
+  };
 }

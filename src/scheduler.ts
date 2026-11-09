@@ -522,6 +522,14 @@ export type FloorRefreshInput = {
 };
 
 export type SchedulerDeps = {
+  /**
+   * 即使漂移低於門檻也照樣呼叫 `planRebalance`。
+   *
+   * 為什麼需要：`needsRebalance === false` 是「不需要再平衡」的判準，但**不是**「這個投組沒有事要做」。
+   * `POST /portfolios/:id/redeem` 要按比例把部位賣成 numeraire —— 賣完權重不變、漂移不會變大，
+   * 所以在對齊的投組上它會被門檻短路掉，變成永遠 noop（實測：drift 2 bps 時 redeem 回 noop）。
+   */
+  forcePlan?: boolean;
   /** 認領用的 DB 介面（測試換成記憶體 stub）。 */
   withTransaction?: WithTransactionFn;
   query?: SchedulerQueryFn;
@@ -1549,7 +1557,7 @@ type ResolvedDeps = ReturnType<typeof resolveDeps>;
 
 async function runOne(
   due: DuePortfolio,
-  ctx: { dryRun: boolean; now: Date; thresholdBps: number; deps: ResolvedDeps },
+  ctx: { dryRun: boolean; now: Date; thresholdBps: number; deps: ResolvedDeps; forcePlan?: boolean },
 ): Promise<PortfolioRunResult> {
   const base = {
     portfolioId: due.portfolioId,
@@ -1615,7 +1623,7 @@ async function runOne(
 
 async function decideAndMaybeExecute(
   due: DuePortfolio,
-  ctx: { dryRun: boolean; now: Date; thresholdBps: number; deps: ResolvedDeps },
+  ctx: { dryRun: boolean; now: Date; thresholdBps: number; deps: ResolvedDeps; forcePlan?: boolean },
   base: Omit<PortfolioRunResult, 'outcome' | 'reason'>,
 ): Promise<PortfolioRunResult> {
   if (due.unsupportedReason !== null) {
@@ -1651,7 +1659,9 @@ async function decideAndMaybeExecute(
   if (plan.report === null) {
     return { ...base, outcome: 'blocked', reason: 'planPortfolio 沒有漂移報告，也沒有 blocked 原因：拒絕在不明狀態下執行' };
   }
-  if (!plan.report.needsRebalance) {
+  // `forcePlan`：呼叫端要用**同一條送出管線**做別的事（例如 redeem 按比例賣成 numeraire）。
+  // 那種動作不會讓漂移變大，所以「不需要再平衡」不代表「什麼都不用做」。
+  if (!plan.report.needsRebalance && ctx.forcePlan !== true) {
     return {
       ...base,
       outcome: 'noop',

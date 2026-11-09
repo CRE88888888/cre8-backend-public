@@ -5,7 +5,7 @@ import { bsc } from 'viem/chains';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { alertCounts, healthStatusFor, listOpenAlerts } from './alerts.js';
 import type { AlertCounts } from './alerts.js';
-import { listPortfolioActivity, readOperatorOverview } from './operator.js';
+import { listPortfolioActivity, readOperatorOverview, runOperatorRedeem } from './operator.js';
 import { EXECUTOR_ORACLE_ABI, ORACLE_OF_ABI, listPriceableAssets } from './assets.js';
 import type { PriceableAsset, TradableProbe } from './assets.js';
 import { authenticate, issueNonce, login, parseLoginBody } from './auth.js';
@@ -164,6 +164,8 @@ export type ServerDeps = {
   portfolioActivity: (id: number, wallet: string) => Promise<unknown>;
   /** operator 總覽（rebalance dashboard）。 */
   operatorOverview: () => Promise<unknown>;
+  /** 把部位按比例賣成 numeraire（提領成 USDT 的前半段）。 */
+  operatorRedeem: (portfolioId: number, wallet: string, usdE8: bigint) => Promise<unknown>;
   portfolioStatus: PortfolioStatusReader;
   /** `POST /portfolios/:id/rebalance`（會動錢；預設實作見 `operator.ts`）。 */
   operatorRebalance: (portfolioId: number, wallet: string) => Promise<OperatorRebalanceResult>;
@@ -251,6 +253,7 @@ const defaultDeps: ServerDeps = {
   listAssets: defaultListAssets,
   portfolioActivity: (id, wallet) => listPortfolioActivity(id, wallet),
   operatorOverview: () => readOperatorOverview(),
+  operatorRedeem: (portfolioId, wallet, usdE8) => runOperatorRedeem(portfolioId, wallet, usdE8),
 };
 
 export function createServer(overrides: Partial<ServerDeps> = {}): Server {
@@ -384,6 +387,10 @@ async function route(
       if (segments[2] === 'rebalance') {
         if (method !== 'POST') return methodNotAllowed(res, ['POST']);
         return operatorRebalanceRoute(req, res, portfolioId(), deps);
+      }
+      if (segments[2] === 'redeem') {
+        if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+        return redeemRoute(req, res, portfolioId(), deps);
       }
       if (segments[2] === 'activity') {
         if (method !== 'GET') return methodNotAllowed(res, ['GET']);
@@ -650,6 +657,30 @@ async function planPreviewRoute(
  * 回應一律 200：`blocked`／`noop` 是**請求被正常處理之後的結果**，不是這支 API 的錯誤。
  * 只有「沒開」「不是你的」「沒有這個 portfolio」「內部炸掉」才是 4xx/5xx。
  */
+/**
+ * `POST /portfolios/:id/redeem` —— 把部位**按比例**賣成 numeraire。
+ *
+ * 為什麼是「按比例」而不是「賣到剛好夠」：按比例賣完每個資產的權重不變，所以投組仍然貼著 mandate，
+ * 排程器也不會立刻把它買回來。使用者要提領 USDT，前端接著再送一筆 owner-signed 的 transfer
+ * （兩段分開是刻意的：賣出是 session key、轉出是 owner，權限本來就不同）。
+ */
+async function redeemRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  id: number,
+  deps: ServerDeps,
+): Promise<void> {
+  const wallet = await authenticate(req.headers.authorization);
+  const body = await readJsonBody(req);
+  const usd = (body as { usd?: unknown }).usd;
+  if (typeof usd !== 'number' || !Number.isFinite(usd) || usd <= 0) {
+    throw new AppError(400, 'INVALID_AMOUNT', 'body.usd must be a positive number');
+  }
+  // 8 位小數的整數（與 totalUsdE8 同一個刻度）。
+  const usdE8 = BigInt(Math.round(usd * 1e8));
+  sendJson(res, 200, await deps.operatorRedeem(id, wallet, usdE8));
+}
+
 async function operatorRebalanceRoute(
   req: IncomingMessage,
   res: ServerResponse,

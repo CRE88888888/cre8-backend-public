@@ -494,7 +494,7 @@ async function readHead(
 }
 
 /** 一個 step 的 commands / inputs：`recipient` 必須是 executor（`_checkRecipient`），`payerIsUser = true`。 */
-function buildStep(params: {
+export function buildStep(params: {
   executor: Address;
   tokenIn: Address;
   tokenOut: Address;

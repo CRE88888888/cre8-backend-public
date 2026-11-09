@@ -23,11 +23,32 @@
 - 現在只有 `scheduler_alerts` 表 + `GET /health` + `--alerts` CLI
 - 缺 email / Slack / pager。至少要有 critical 的主動通知，不然沒人會去看
 
-## 4. registry owner 換 multisig / timelock `[ ]`
+## 4. registry owner 換 multisig / timelock `[ ]` — 延後到主網測試結束
 
-- 現在 `AtpRegistry` owner 是單一 EOA（`OPERATOR_PRIVATE_KEY`）
+- 現在 `AtpRegistry` owner 是單一 EOA（部署者 `0x70fc55f8…7c60c`）
 - 合約層面：owner 可以 `setFee`、`registerStrategy`、`pause`
-- 待辦：轉移到 Safe（或 timelock），並確認 `setPaused` 這條緊急通道還走得通
+
+### 決策（2026-11，使用者裁定）
+
+**先維持單一 EOA，等主網測試全部跑完再轉 Safe。** 理由：
+
+* 測試階段會頻繁改設定（fee、策略註冊、pause），每次都要走 multisig 流程會拖垮迭代速度
+* 轉移之後要再改回來很麻煩，而現在還沒有真實使用者資金
+* 私鑰目前只存在 `backend/.env.mainnet`（chmod 600、gitignored），風險可控
+
+### 轉移前必須記得的三件事
+
+1. **轉移後 `setPaused` 這條緊急通道要還走得通** —— 如果 Safe 的簽名門檻設太高（例如 3/5 但只有 2 個 signer 在線），
+   出事時反而停不下來。緊急暫停應該是低門檻（1/2 或 2/3），日常設定變更才是高門檻。
+2. 轉移前先確認 `OPERATOR_PRIVATE_KEY`（部署者）不再需要任何 owner 權限，
+   否則轉移後會出現「合約 owned by Safe，但某支腳本還假設 EOA 是 owner」的隱性失敗。
+3. 轉移後跑一次 `preflight --strict` —— 它會檢查 registry owner 並在 `--strict` 下對單一 EOA 報 warn，
+   轉移完成後那個 warn 應該消失（這也是這個檢查存在的理由）。
+
+### 為什麼這條不能忘
+
+單一 EOA 的 owner 等於「一把私鑰控制整個協議」。現在可以接受，是因為**還沒有真實使用者資金**並且
+我們在密集測試。一旦開始對外，這條就是最高優先的風險項。
 
 ## 5. 真 BSC 部署驗證 + 第一筆小額真錢 `[ ]`
 

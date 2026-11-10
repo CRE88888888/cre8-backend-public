@@ -789,6 +789,13 @@ export async function runOperatorRebalance(
   const find = deps.requireOwnedPortfolio ?? requireOwnedPortfolio;
   await find(portfolioId, wallet);
 
+  // 使用者主動要求跑一輪 = 「請幫我管理這個投組」→ 若之前因為清倉被暫停，這裡接回來。
+  // 排程器只認領 `schedule_state = 'active'`，不接回來的話「入金後再也不會自動再平衡」。
+  // 只在使用者端（owner）做：營運端的 Run round 不該改變使用者設定的排程狀態。
+  await dbQuery(`update portfolios set schedule_state = 'active' where id = $1 and schedule_state = 'paused'`, [
+    portfolioId,
+  ]);
+
   const run = deps.runSchedulerOnce ?? runSchedulerOnce;
   const round = await run(
     // `dryRun: false` 是這支端點存在的理由，所以逐字寫出來（排程器的預設是 dry-run）。
@@ -1019,6 +1026,14 @@ export type OperatorPortfolioRow = {
   /** 最新快照的觀測點。`null` = 從來沒跑過。 */
   observedAt: string | null;
   driftBps: number | null;
+  /**
+   * 帳戶價值是 0（資金已全部提出，或從來沒入金）。
+   *
+   * 為什麼要獨立一欄：`drift.ts` 對空倉回 5000 bps 是**公式的結果**（空帳戶「完全不在目標上」），
+   * 但把它顯示成「9999 bps / rebalance due」會讓人以為壞了 —— 實際上它只是空。
+   * 呼叫端（operator 頁面）應該顯示「Empty」而不是「rebalance due」。
+   */
+  isEmpty: boolean;
   totalUsdE8: string | null;
   needsRebalance: boolean | null;
   blockedCount: number | null;
@@ -1132,8 +1147,16 @@ export async function readOperatorOverview(deps: OperatorOverviewDeps = {}): Pro
         lastCheckedAt: iso(row.last_checked_at),
         observedAt: iso(row.observed_at),
         driftBps: num(row.gross_drift_bps),
+        isEmpty: String(row.total_usd_e8 ?? '0') === '0',
         totalUsdE8: row.total_usd_e8 === null || row.total_usd_e8 === undefined ? null : String(row.total_usd_e8),
-        needsRebalance: row.needs_rebalance === null || row.needs_rebalance === undefined ? null : row.needs_rebalance === true,
+        // 空倉一律 needsRebalance = false：沒有部位就沒有東西可搬，標成「該再平衡」只會製造噪音
+        // （實測：清倉後兩檔都掛著「rebalance due」+ 9999 bps，看起來像壞掉）。
+        needsRebalance:
+          String(row.total_usd_e8 ?? '0') === '0'
+            ? false
+            : row.needs_rebalance === null || row.needs_rebalance === undefined
+              ? null
+              : row.needs_rebalance === true,
         blockedCount: num(row.blocked_count),
         gasWei,
         sessionKeyExpiresAt: iso(row.key_expires_at),
@@ -1427,16 +1450,34 @@ export async function runOperatorClose(
   const status = await statusOf(portfolioId, {});
   const totalE8 = status.totalUsdE8 === null ? 0n : BigInt(status.totalUsdE8);
   if (totalE8 <= 0n) {
+    // 已經是空的：仍然要「歸位」（pause），否則一個已清空但仍 active 的投組會永遠留在
+    // operator 的預設清單裡，掛著 drift 9999 bps 與 gas low。這也是 Close 的冪等語意。
+    await dbQuery(`update portfolios set schedule_state = 'paused' where id = $1`, [portfolioId]);
     return {
       portfolioId,
       outcome: 'noop',
-      reason: '投組價值是 0，沒有東西可以清倉',
+      reason: '投組價值是 0，沒有東西可以清倉（排程已暫停）',
       txHash: null,
       steps: [],
       redeemedUsdE8: '0',
     };
   }
-  return runOperatorRedeem(portfolioId, wallet, totalE8, deps);
+  const result = await runOperatorRedeem(portfolioId, wallet, totalE8, deps);
+
+  // 清倉成功了就把排程暫停：帳戶被搬到空，繼續讓排程器每 24 小時「再平衡一個 $0 的投組」
+  // 只會製造噪音（operator 頁面上會掛著 drift 9999 bps 與 gas low）。
+  //
+  // 這裡**不刪**投組：它是使用者的部位紀錄，而且 counterfactual 地址由 (owner, strategy) 決定，
+  // 下次入金會回到**同一個**帳戶 —— 刪掉反而會讓「重新入金」看起來像換了一個帳戶。
+  //
+  // 判準用「**現在**價值是不是 0」，而不是 outcome：已經空了的投組再按一次 Close 會回 noop，
+  // 那也該被歸位（否則舊的、已清空但仍 active 的投組永遠留在 operator 的預設清單裡）。
+  const after = await statusOf(portfolioId, {}).catch(() => null);
+  const nowEmpty = after === null ? result.outcome === 'executed' : String(after.totalUsdE8 ?? '0') === '0';
+  if (nowEmpty) {
+    await dbQuery(`update portfolios set schedule_state = 'paused' where id = $1`, [portfolioId]);
+  }
+  return result;
 }
 
 /**

@@ -1080,7 +1080,10 @@ const SQL_OPERATOR_ROWS = `
       select created_at, gross_drift_bps, total_usd_e8, needs_rebalance, operation_id
         from portfolio_snapshots
        where portfolio_id = p.id
-       order by created_at desc
+       -- 同一輪的 before/after 可能落在同一個 created_at（同一個交易），
+       -- 沒有 tiebreaker 時 Postgres 可以回任一張 —— 實測就看到「價值是清倉前的、
+       -- 漂移是清倉後」的組合。phase 決勝讓它永遠取 after（＝這一輪之後的真相）。
+       order by created_at desc, block desc, (phase = 'after') desc
        limit 1
     ) snap on true
     left join lateral (
@@ -1473,9 +1476,21 @@ export async function runOperatorClose(
   // 判準用「**現在**價值是不是 0」，而不是 outcome：已經空了的投組再按一次 Close 會回 noop，
   // 那也該被歸位（否則舊的、已清空但仍 active 的投組永遠留在 operator 的預設清單裡）。
   const after = await statusOf(portfolioId, {}).catch(() => null);
-  const nowEmpty = after === null ? result.outcome === 'executed' : String(after.totalUsdE8 ?? '0') === '0';
+  // `executed` 也算：清倉的後半段（把錢掃回錢包）是前端另一筆 owner UserOp，
+  // 可能在這一輪結束**之後**才上鏈。那時 `statusOf` 還看得到現金，但使用者按的是 Close ——
+  // 意圖明確，就該歸位。若真的只清了一半，下次入金/rebalance 會把 active 接回來。
+  const nowEmpty = result.outcome === 'executed' || after === null || String(after.totalUsdE8 ?? '0') === '0';
   if (nowEmpty) {
     await dbQuery(`update portfolios set schedule_state = 'paused' where id = $1`, [portfolioId]);
+    // 一併關掉這個投組的未解決警示。
+    //
+    // 為什麼：`resolveAlerts` 是「這一輪沒偵測到的警示 → 標成已解決」，而排程器只認領 active
+    // 的投組。所以一個被暫停的投組，它的 gas-low / 其它警示會**永遠**停在 open
+    // （實測：清倉並暫停後，operator 仍顯示 2 critical）。
+    await dbQuery(
+      `update scheduler_alerts set resolved_at = now() where portfolio_id = $1 and resolved_at is null`,
+      [portfolioId],
+    ).catch(() => undefined);
   }
   return result;
 }

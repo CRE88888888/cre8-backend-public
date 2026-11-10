@@ -190,6 +190,8 @@ export type ServerDeps = {
    * 權限模型與 `/operator/portfolios/:id/rebalance` 一致。
    */
   operatorPlanPreview: (portfolioId: number) => Promise<OperatorPlanPreview>;
+  /** 營運端代為清倉（**不檢查 owner**）。與 force rebalance 同一條權限模型。 */
+  operatorForceClose: (portfolioId: number) => Promise<unknown>;
   /** 這一輪會做什麼（dry-run）。唯讀，所以**不**受 `ENABLE_OPERATOR_REBALANCE` 限制。 */
   planPreview: (portfolioId: number, wallet: string) => Promise<OperatorPlanPreview>;
   /**
@@ -273,6 +275,8 @@ const defaultDeps: ServerDeps = {
   // 與 force rebalance 用同一個「不檢查 owner」的注入；差別是這支只讀不送。
   operatorPlanPreview: (portfolioId) =>
     previewOperatorRebalance(portfolioId, 'operator', { requireOwnedPortfolio: async () => ({ id: portfolioId }) as never }),
+  operatorForceClose: (portfolioId) =>
+    runOperatorClose(portfolioId, 'operator', { requireOwnedPortfolio: async () => ({ id: portfolioId }) as never }),
   // 營運端：同樣的送出管線，只是換掉 owner 檢查（見型別上的說明）。
   operatorForceRebalance: (portfolioId) =>
     runOperatorRebalance(portfolioId, 'operator', {
@@ -448,6 +452,16 @@ async function route(
     const id = Number(segments[2]);
     if (!Number.isInteger(id) || id <= 0) throw new AppError(400, 'INVALID_ID', 'portfolio id must be a positive integer');
     sendJson(res, 200, await deps.operatorPlanPreview(id));
+    return;
+  }
+
+  // `POST /operator/portfolios/:id/close` —— 營運端代為清倉（不檢查 owner）。
+  if (root === 'operator' && segments.length === 4 && segments[1] === 'portfolios' && segments[3] === 'close') {
+    if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+    await authenticate(req.headers.authorization);
+    const id = Number(segments[2]);
+    if (!Number.isInteger(id) || id <= 0) throw new AppError(400, 'INVALID_ID', 'portfolio id must be a positive integer');
+    sendJson(res, 200, await deps.operatorForceClose(id));
     return;
   }
 

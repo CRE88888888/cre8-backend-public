@@ -55,10 +55,58 @@
 - `DeployAtp.s.sol` 已在 fork 上反覆驗證；主網要確認 pool fee tier / permit2 / universal router 位址
 - 第一筆用最小金額（例如 20 USDT）走完 deposit → rebalance → withdraw，並對帳 gas
 
-## 9. `V2_SWAP_EXACT_IN` 在 Pancake Universal Router 上未驗證 `[ ]`
+## 9. `V2_SWAP_EXACT_IN` 需要 executor 多一層授權 `[ ]`
 
 | 項目 | 內容 |
 |---|---|
+| 現況 | `ROUTE_V2_ENABLED` 預設**關閉**（只走 V3） |
+| 真實原因 | **不是**「Router 不支援這個指令」—— 見下方更正 |
+
+### 更正：我先前的結論是錯的
+
+我原本的結論是「Pancake 的 Universal Router 不實作 `V2_SWAP_EXACT_IN`」。實測推翻了它：
+
+    ① 送 command 0x08 + 空 input
+       → revert 0x3b99b53d（SliceOutOfBounds，calldata 解析失敗）
+       若是「不認這個 command」，會回 0xd76a1e9e（InvalidCommandType）
+
+    ② 送 command 0x08 + 格式正確的 input（USDT→DOGE，payerIsUser=true）
+       → revert 0xd81b2f2e（Permit2 的 AllowanceExpired(0)）
+
+② 是決定性的：Router **認得**這個 command，並且把 V2 的資金腿也走 **Permit2**。
+錯的是「誰被授權」——那筆呼叫沒有任何授權，所以停在 Permit2 的額度檢查。
+
+### 那我們的 executor 為什麼會 revert
+
+executor 的 `_swap` 只做這兩件事：
+
+    tokenIn.forceApprove(address(permit2), step.amountIn);
+    permit2.approve(step.tokenIn, address(universalRouter), uint160(step.amountIn), deadline);
+
+那是為 **V3 那條腿**準備的。V2 的 payer leg 需要的是另一組授權
+（V2 路徑的 payer 不是 Permit2 的 spender，實際是哪個地址要用一次帶授權的真實呼叫確認）。
+所以 `payerIsUser=true` 在 V2 上會因為授權不對而 revert —— 而 EntryPoint 的模擬只回了裸 `0x`。
+
+### 要開啟 V2 必須做的事
+
+1. 用一個**持有 USDT 且已完成各種可能授權**的位址，對 UR 送一次真實的 V2 command，
+   看它在哪一層 revert（Permit2？V2 router 的 ERC20 allowance？）—— 這一步才知道要多授權給誰
+2. 據此改 `AtpExecutor._swap`（合約變更）→ 重新部署 executor
+3. 重新部署的代價：**每個使用者要重新 approve + 重新安裝 session key（各簽一次）**
+
+### 結論
+
+V2 的收益是 1.3%（DOGE 0.5 USDT 那筆），代價是全體使用者的遷移成本。
+**現在維持 V3-only**；等「多種資產」真的需要 V2 深度時，再一次性做這個合約變更。
+
+### 仍然成立的教訓
+
+「allowlist 允許一個 command」只代表我們的合約不擋它。要確認下游能不能執行，
+必須送一次**帶正確授權的真實呼叫** —— quoter 算得出數字與此無關。
+
+---
+
+|---|
 | 現況 | `ROUTE_V2_ENABLED` 預設**關閉**，路由只走 V3 |
 | 為什麼 | 打開後第一次真實執行就 revert 成裸 `0x`（`UserOperation reverted during simulation with reason: 0x.`）|
 

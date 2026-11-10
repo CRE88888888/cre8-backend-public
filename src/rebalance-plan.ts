@@ -93,6 +93,8 @@
  * 的 `AssetNotAllowed`），hub 不是策略資產就收不了賣出的 USDT、也付不出買的 USDT。
  */
 
+import { chooseBestPath, routeImpactBps, singleHopPath } from './routing.js';
+import { V2_FACTORY_ADDRESS, V3_FACTORY_ADDRESS, WBNB_ADDRESS } from './addresses.js';
 import { decodeAbiParameters, encodeAbiParameters, encodePacked, getAddress, isAddressEqual } from 'viem';
 import type { Address, Hex, PublicClient } from 'viem';
 import type { AssetDrift, DriftReport, Holding, TargetWeight } from './drift.js';
@@ -339,6 +341,17 @@ const V3_POOL_ABI = [
 
 
 /** `0x00` 的 input payload：`(recipient, amountIn, amountOutMin, path, payerIsUser)`。 */
+/** Universal Router 的 `V2_SWAP_EXACT_IN`（executor allowlist 已包含）。 */
+export const V2_SWAP_EXACT_IN: Hex = '0x08';
+
+const V2_SWAP_EXACT_IN_INPUT = [
+  { name: 'recipient', type: 'address' },
+  { name: 'amountIn', type: 'uint256' },
+  { name: 'amountOutMin', type: 'uint256' },
+  { name: 'path', type: 'address[]' },
+  { name: 'payerIsUser', type: 'bool' },
+] as const;
+
 const V3_SWAP_EXACT_IN_INPUT = [
   { name: 'recipient', type: 'address' },
   { name: 'amountIn', type: 'uint256' },
@@ -521,12 +534,41 @@ export function buildStep(params: {
   oracleFloor: bigint;
   minGross: bigint;
   poolFee: number;
+  /**
+   * 實際成交用的 V3 path（可多跳）。省略 = 用 `poolFee` 組單跳（既有行為）。
+   *
+   * 為什麼要能覆寫：地板價綁在 oracle 那個池子上（保守下界），但**成交**可以走更好的路徑。
+   * `AtpExecutor._checkCommands` 只驗指令類型、不驗 path 內容，所以換路徑不需要改合約。
+   */
+  path?: Hex;
+  /** 有值 = 走 V2 路線（command 0x08、path 是 address[]）；否則用 V3。 */
+  v2Tokens?: Address[] | null;
 }): PlannedStep {
-  const path = encodePacked(['address', 'uint24', 'address'], [params.tokenIn, params.poolFee, params.tokenOut]);
+  const path =
+    params.path ?? encodePacked(['address', 'uint24', 'address'], [params.tokenIn, params.poolFee, params.tokenOut]);
   // ⚠ 這個值必須**同時**放進 struct 欄位與 calldata：合約的 pre-check 讀 `step.amountOutMin`，
   // 真正約束成交的是 router 從 `inputs` 解出來的 `amountOutMin`。兩者分岔就是「合約以為有地板、
   // router 卻用另一個值」—— 曾經只加在欄位上，於是 router 仍用未緩衝值（實測差 100 ppm 就 revert）。
   const amountOutMin = amountOutMinWithBuffer(params.minGross);
+  if (params.v2Tokens !== undefined && params.v2Tokens !== null) {
+    return {
+      tokenIn: params.tokenIn,
+      tokenOut: params.tokenOut,
+      amountIn: params.amountIn,
+      amountOutMin,
+      oracleFloor: params.oracleFloor,
+      commands: V2_SWAP_EXACT_IN,
+      inputs: [
+        encodeAbiParameters(V2_SWAP_EXACT_IN_INPUT, [
+          getAddress(params.executor),
+          params.amountIn,
+          amountOutMin,
+          params.v2Tokens.map((token) => getAddress(token)),
+          true,
+        ]),
+      ],
+    };
+  }
   return {
     tokenIn: params.tokenIn,
     tokenOut: params.tokenOut,
@@ -622,11 +664,32 @@ function describeRefreshes(refreshes: readonly FloorRefresh[]): string {
  * 解不開就回 `problem`（呼叫端記成 `quote-failed`）：連自己要送什麼都讀不出來時，覆寫它比不覆寫危險。
  * 順帶驗 `path` 的兩端與 `inputs` 的 `amountIn` 與 step 一致 —— 這是「只換地板、不動別的」的機械保證。
  */
-function decodeStepIdentity(step: PlannedStep): { recipient: Address; poolFee: number } | { problem: string } {
+function decodeStepIdentity(
+  step: PlannedStep,
+):
+  | { recipient: Address; poolFee: number; path: Hex; v2Tokens: null }
+  | { recipient: Address; poolFee: number; path: null; v2Tokens: Address[] }
+  | { problem: string } {
   const payload = step.inputs[0];
   if (payload === undefined) return { problem: '沒有 inputs[0]，解不出 recipient 與 path' };
+  // V2 路線也要能重建（路由搜尋會選到它）。兩種 command 的 input 只有 path 型別不同。
+  if (step.commands === V2_SWAP_EXACT_IN) {
+    let v2decoded: readonly [Address, bigint, bigint, readonly Address[], boolean];
+    try {
+      v2decoded = decodeAbiParameters(V2_SWAP_EXACT_IN_INPUT, payload);
+    } catch (error) {
+      return { problem: `V2 inputs[0] 解不開（${revertNameOf(error) ?? (error instanceof Error ? error.message : String(error))}）` };
+    }
+    const [v2recipient, v2amountIn, , v2tokens] = v2decoded;
+    if (v2tokens.length < 2) return { problem: `V2 path 只有 ${v2tokens.length} 個代幣` };
+    if (!isAddressEqual(v2tokens[0]!, step.tokenIn) || !isAddressEqual(v2tokens[v2tokens.length - 1]!, step.tokenOut)) {
+      return { problem: 'V2 path 的頭尾與 step 的 tokenIn/tokenOut 不同' };
+    }
+    if (v2amountIn !== step.amountIn) return { problem: `V2 inputs 的 amountIn ${v2amountIn} 與 step 的不同` };
+    return { recipient: getAddress(v2recipient), poolFee: 0, path: null, v2Tokens: v2tokens.map((token) => getAddress(token)) };
+  }
   if (step.commands !== V3_SWAP_EXACT_IN) {
-    return { problem: `commands 是 ${step.commands}，這裡只重建得出 ${V3_SWAP_EXACT_IN}（V3_SWAP_EXACT_IN）的地板` };
+    return { problem: `commands 是 ${step.commands}，這裡只重建得出 V3/V2 的 swap` };
   }
   let decoded: readonly [Address, bigint, bigint, Hex, boolean];
   try {
@@ -635,14 +698,17 @@ function decodeStepIdentity(step: PlannedStep): { recipient: Address; poolFee: n
     return { problem: `inputs[0] 解不開（${revertNameOf(error) ?? (error instanceof Error ? error.message : String(error))}）` };
   }
   const [recipient, amountIn, , path] = decoded;
-  // path = packed(address, uint24, address) = 20 + 3 + 20 = 43 bytes = 86 hex（'0x' 之外）。
-  if (path.length !== 2 + 86) {
-    return { problem: `path 是 ${(path.length - 2) / 2} bytes，不是 packed(address,uint24,address) 的 43` };
+  // path 是 packed(tokenIn, fee1, [mid, fee2, …], tokenOut)：**可以多跳**（路由選擇會產生兩跳）。
+  // 只驗「第一個 token 是 step.tokenIn、最後一個是 step.tokenOut」與最小長度，
+  // 中間的 hop 一律原樣保留 —— refreshFloors 重建 step 時必須用同一條路徑，
+  // 否則會把「選好的兩跳成交」悄悄換回「單跳的差價」。
+  const pathBytes = (path.length - 2) / 2;
+  if (pathBytes < 43 || (pathBytes - 20) % 23 !== 0) {
+    return { problem: `path 是 ${pathBytes} bytes，不是 packed(address,uint24,…) 的合法長度` };
   }
-  // 20 bytes tokenIn（hex 0..40）｜3 bytes fee（hex 40..46）｜20 bytes tokenOut（hex 46..86）
   const pathTokenIn = getAddress(`0x${path.slice(2, 42)}` as Hex);
   const poolFee = Number(BigInt(`0x${path.slice(42, 48)}` as Hex));
-  const pathTokenOut = getAddress(`0x${path.slice(48, 88)}` as Hex);
+  const pathTokenOut = getAddress(`0x${path.slice(path.length - 40)}` as Hex);
   if (!isAddressEqual(pathTokenIn, step.tokenIn) || !isAddressEqual(pathTokenOut, step.tokenOut)) {
     return {
       problem:
@@ -651,7 +717,7 @@ function decodeStepIdentity(step: PlannedStep): { recipient: Address; poolFee: n
     };
   }
   if (amountIn !== step.amountIn) return { problem: `inputs 的 amountIn ${amountIn} 與 step 的 ${step.amountIn} 不同` };
-  return { recipient: getAddress(recipient), poolFee };
+  return { recipient: getAddress(recipient), poolFee, path, v2Tokens: null };
 }
 
 /**
@@ -758,6 +824,8 @@ export async function refreshFloors(params: {
         oracleFloor: minimum,
         minGross: freshAmountOutMin,
         poolFee: identity.poolFee,
+        // 逐字保留原本的路徑（V3 可能多跳；V2 是 address[]）。
+        ...(identity.v2Tokens === null ? { path: identity.path } : { v2Tokens: identity.v2Tokens }),
       }),
     );
   }
@@ -948,6 +1016,10 @@ type PricedLeg = {
   oracleQuoted: bigint;
   oracleFloor: bigint;
   poolFee: number;
+  /** 實際成交的 V3 path（可能多跳，見 routing.ts）。 */
+  path: Hex;
+  /** 有值 = 走 V2 路線；null = 走 `path` 的 V3 路線。 */
+  v2Tokens: Address[] | null;
   /** 被價格衝擊上限縮小的證據（null = 沒被縮）。 */
   shrunk: { idealAmountIn: bigint; idealImpactBps: number; impactBps: number } | null;
   /** 估不出衝擊（放行原量）的說明。 */
@@ -1259,7 +1331,7 @@ async function planHub(
     tokenIn: Address;
     tokenOut: Address;
     amountIn: bigint;
-  }): Promise<(ImpactCappedLeg & { poolFee: number }) | { skip: string }> => {
+  }): Promise<(ImpactCappedLeg & { poolFee: number; path: Hex; v2Tokens: Address[] | null }) | { skip: string }> => {
     const pair = await resolveHubPair(publicClient, { router: oracle, asset: params.asset, blockNumber });
     if ('skip' in pair) return pair;
     const first = await quoteHub(publicClient, {
@@ -1286,6 +1358,61 @@ async function planHub(
           '池子的觀察歷史可能壞了，這一輪跳過（合約會用 TWAP 地板，送出去必然 revert 整批）',
       };
     }
+    // 先選路徑，再用**那條路徑**估衝擊。
+    //
+    // 順序很重要：`capLegByImpact` 讀的是 oracle 釘住那個池子的 slot0/liquidity。
+    // 對 DOGE 來說那是 fee=10000（1%）的池子 —— 衝擊永遠 99 bps，不管我們實際走哪條路，
+    // 於是這一檔永遠被 80 bps 的預算擋下。改用「實際路徑的邊際價 vs 大額價」才量得準。
+    const route = await chooseBestPath(publicClient, {
+      tokenIn: params.tokenIn,
+      tokenOut: params.tokenOut,
+      amountIn: params.amountIn,
+      via: WBNB_ADDRESS,
+      factory: V3_FACTORY_ADDRESS,
+      v2Factory: V2_FACTORY_ADDRESS,
+      pinnedFee: pair.poolFee,
+      ...(blockNumber === undefined ? {} : { blockNumber }),
+    });
+    const routePath = route?.kind === 'v3' ? route.path : null;
+    const routeTokens = route?.kind === 'v2' ? route.tokens : null;
+    const path = routePath ?? singleHopPath(params.tokenIn, pair.poolFee, params.tokenOut);
+
+    // 衝擊只能用 V3 的 quoter 量（V2 沒有等價的邊際報價端點）。V2 路線時回 null →
+    // 下一段會退回池子數學（保守），而不是把 V2 路線當成 0 衝擊放行。
+    const routeImpact =
+      routePath === null
+        ? null
+        : await routeImpactBps(publicClient, {
+            path: routePath,
+            amountIn: params.amountIn,
+            ...(blockNumber === undefined ? {} : { blockNumber }),
+          });
+
+    if (routeImpact !== null) {
+      // 有了準確的路徑衝擊，直接用；不再退回池子數學（那會量到別人的手續費）。
+      if (maxImpactBps !== null && routeImpact > maxImpactBps) {
+        return {
+          skip:
+            `${params.label}: route impact ${routeImpact} bps exceeds the ${maxImpactBps} bps budget ` +
+            `(path ${route?.hops ?? 1} hop(s)) — the pool cannot absorb this size without moving the price`,
+        };
+      }
+      return {
+        amountIn: params.amountIn,
+        quoted: first.quoted,
+        floor: first.floor,
+        shrunk: null,
+        note:
+          route === null || route.hops === 1
+            ? null
+            : `routed via ${route.kind === 'v2' ? 'V2' : 'V3'} ${route.hops} hops, impact ${routeImpact} bps`,
+        poolFee: pair.poolFee,
+        path,
+        v2Tokens: routeTokens,
+      };
+    }
+
+    // 拿不到路徑報價（quoter 全 revert）→ 退回原本的池子數學，維持既有行為。
     const capped = await capLegByImpact({
       client: publicClient,
       blockNumber,
@@ -1309,7 +1436,7 @@ async function planHub(
       },
     });
     if ('skip' in capped) return capped;
-    return { ...capped, poolFee: pair.poolFee };
+    return { ...capped, poolFee: pair.poolFee, path, v2Tokens: null };
   };
 
   // ---- ① 先所有賣 ----
@@ -1360,6 +1487,8 @@ async function planHub(
       oracleQuoted: capped.quoted,
       oracleFloor: capped.floor,
       poolFee: capped.poolFee,
+      path: capped.path,
+      v2Tokens: capped.v2Tokens,
       shrunk: capped.shrunk,
       impactNote: capped.note,
     });
@@ -1424,6 +1553,8 @@ async function planHub(
       oracleQuoted: capped.quoted,
       oracleFloor: capped.floor,
       poolFee: capped.poolFee,
+      path: capped.path,
+      v2Tokens: capped.v2Tokens,
       shrunk: capped.shrunk,
       impactNote: capped.note,
     });
@@ -1457,6 +1588,8 @@ async function planHub(
       oracleFloor: leg.oracleFloor,
       minGross,
       poolFee: leg.poolFee,
+      path: leg.path,
+      v2Tokens: leg.v2Tokens,
     });
   });
 

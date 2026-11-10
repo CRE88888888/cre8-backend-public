@@ -182,6 +182,14 @@ export type ServerDeps = {
   operatorForceRebalance: (portfolioId: number) => Promise<OperatorRebalanceResult>;
   /** 營運端全域活動流：誰、在哪個策略上被處理（含成敗與前後漂移）。 */
   operatorActivity: (limit: number) => Promise<OperatorActivityRow[]>;
+  /**
+   * 營運端的 dry-run 預覽（**不送交易、不花錢**）。
+   *
+   * 為什麼需要：`/portfolios/:id/plan` 會做 owner 檢查，營運端排查「為什麼某一檔沒被買」
+   * 時完全看不到規劃器的 note（只有 owner 看得到）。這支用 no-op 的 owner 檢查繞過，
+   * 權限模型與 `/operator/portfolios/:id/rebalance` 一致。
+   */
+  operatorPlanPreview: (portfolioId: number) => Promise<OperatorPlanPreview>;
   /** 這一輪會做什麼（dry-run）。唯讀，所以**不**受 `ENABLE_OPERATOR_REBALANCE` 限制。 */
   planPreview: (portfolioId: number, wallet: string) => Promise<OperatorPlanPreview>;
   /**
@@ -262,6 +270,9 @@ const defaultDeps: ServerDeps = {
   portfolioStatus: createPortfolioStatusReader(),
   operatorRebalance: runOperatorRebalance,
   operatorActivity: (limit) => readOperatorActivity(limit),
+  // 與 force rebalance 用同一個「不檢查 owner」的注入；差別是這支只讀不送。
+  operatorPlanPreview: (portfolioId) =>
+    previewOperatorRebalance(portfolioId, 'operator', { requireOwnedPortfolio: async () => ({ id: portfolioId }) as never }),
   // 營運端：同樣的送出管線，只是換掉 owner 檢查（見型別上的說明）。
   operatorForceRebalance: (portfolioId) =>
     runOperatorRebalance(portfolioId, 'operator', {
@@ -428,6 +439,16 @@ async function route(
         return planPreviewRoute(req, res, portfolioId(), deps);
       }
     }
+  }
+
+  // `GET /operator/portfolios/:id/plan` —— 營運端 dry-run 預覽（不送交易、不檢查 owner）。
+  if (root === 'operator' && segments.length === 4 && segments[1] === 'portfolios' && segments[3] === 'plan') {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    await authenticate(req.headers.authorization);
+    const id = Number(segments[2]);
+    if (!Number.isInteger(id) || id <= 0) throw new AppError(400, 'INVALID_ID', 'portfolio id must be a positive integer');
+    sendJson(res, 200, await deps.operatorPlanPreview(id));
+    return;
   }
 
   // `POST /operator/portfolios/:id/rebalance` —— 營運端手動觸發一輪（不檢查 owner）。

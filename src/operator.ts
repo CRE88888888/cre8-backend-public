@@ -620,6 +620,8 @@ export type OperatorRebalanceResult = {
   /** 這一輪規劃了幾個 step（＝應該有幾筆 `SwapExecuted`）。 */
   expectedSwaps: number;
   gasUsed: string | null;
+  /** 規劃器的完整 rationale（含「為什麼某一檔沒被買」）。null = 這一輪沒有規劃。 */
+  rationale?: string | null;
   /** 真的被規劃出來（且送出）的參數；blocked/noop 時是空的。 */
   steps: { tokenIn: string; tokenOut: string; amountIn: string; amountOutMin: string }[];
 };
@@ -633,6 +635,14 @@ export type OperatorPlanPreview = {
   reason: string;
   /** 這一輪會送的 step（`ready` 才有）。前端不該自己猜，規劃在後端。 */
   steps: { tokenIn: string; tokenOut: string; amountIn: string; amountOutMin: string }[];
+  /**
+   * 規劃器的完整 rationale（含「為什麼某一檔沒被買」）。
+   *
+   * 為什麼一定要回：`reason` 只是一句話的結論（例如「Would execute 4 step(s)」），
+   * 而「5 檔目標卻只有 4 步」的原因（被跳過的腿、預算、衝擊上限）全在 rationale 裡。
+   * 沒有它，營運端只能猜 —— 實測就是這樣花了很久才發現「USDT 預算被算成 0.004」。
+   */
+  rationale?: string | null;
 };
 
 export type RebalanceDeps = {
@@ -804,6 +814,7 @@ export async function runOperatorRebalance(
       swapExecuted: 0,
       expectedSwaps: 0,
       gasUsed: null,
+      rationale: null,
       steps: [],
     };
   }
@@ -825,6 +836,7 @@ export async function runOperatorRebalance(
       amountIn: step.amountIn,
       amountOutMin: step.amountOutMin,
     })),
+    rationale: result.plan?.rationale ?? null,
   };
 }
 
@@ -868,6 +880,7 @@ export async function previewOperatorRebalance(
       reason:
         `排程器沒有認領 portfolio ${portfolioId}：schedule_state 不是 'active'，或這個 chain 上沒有它的 smart account。`,
       steps: [],
+      rationale: null,
     };
   }
 
@@ -891,6 +904,7 @@ export async function previewOperatorRebalance(
       amountIn: step.amountIn,
       amountOutMin: step.amountOutMin,
     })),
+    rationale: result.plan?.rationale ?? null,
   };
 }
 
@@ -1036,7 +1050,7 @@ export type OperatorOverviewDeps = {
 };
 
 const SQL_OPERATOR_ROWS = `
-  select p.id, p.strategy_id, s.name as strategy_name, p.version, p.schedule_state,
+  select p.id, p.user_id as wallet, p.strategy_id, s.name as strategy_name, p.version, p.schedule_state,
          p.next_run_at, p.last_checked_at,
          sa.address as account,
          snap.created_at as observed_at, snap.gross_drift_bps, snap.total_usd_e8, snap.needs_rebalance,
@@ -1108,6 +1122,7 @@ export async function readOperatorOverview(deps: OperatorOverviewDeps = {}): Pro
       const opId = num(row.op_id);
       return {
         id: Number(row.id),
+        wallet: String(row.wallet ?? ''),
         strategyId: Number(row.strategy_id),
         strategyName: typeof row.strategy_name === 'string' ? row.strategy_name : null,
         version: Number(row.version),

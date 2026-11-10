@@ -25,6 +25,18 @@ export const KERNEL_VERSION_STRING = '0.3.3';
 export const SALT_DOMAIN_TAG = 'cre8-atp:kernel-v3.3';
 
 /**
+ * PancakeSwap V3 的 factory 與 WBNB（**主網真實位址**；本機 fork 也是同一組，因為它 fork 自 BSC）。
+ *
+ * 路由選擇需要這兩個：factory 用來判斷某個 fee tier 的池子存不存在（避免對空池打 quoter），
+ * WBNB 是我們允許的中間幣（BSC 上流動性的樞紐）。
+ */
+export const V3_FACTORY_ADDRESS = '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865';
+export const WBNB_ADDRESS = '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c';
+
+/** PancakeSwap **V2** factory：V2 池的深度常常優於 V3 的某個 fee tier，路由搜尋要一起比。 */
+export const V2_FACTORY_ADDRESS = '0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73';
+
+/**
  * 回傳該 chain 可用的 Kernel v3.3 位址組。
  * 支援 BSC mainnet（56）與本機 fork（**1337** 或舊的 31337）：Kernel 的 canonical 位址在所有鏈相同。
  */

@@ -55,6 +55,41 @@
 - `DeployAtp.s.sol` 已在 fork 上反覆驗證；主網要確認 pool fee tier / permit2 / universal router 位址
 - 第一筆用最小金額（例如 20 USDT）走完 deposit → rebalance → withdraw，並對帳 gas
 
+## 9. `V2_SWAP_EXACT_IN` 在 Pancake Universal Router 上未驗證 `[ ]`
+
+| 項目 | 內容 |
+|---|---|
+| 現況 | `ROUTE_V2_ENABLED` 預設**關閉**，路由只走 V3 |
+| 為什麼 | 打開後第一次真實執行就 revert 成裸 `0x`（`UserOperation reverted during simulation with reason: 0x.`）|
+
+### 發生了什麼
+
+我加了「V2 + V3 全候選比較」之後，DOGE 被選中走 **V2 直連**（quoter 用 pair 儲備算出來的數字最漂亮）。
+但送出去後 UserOp 模擬直接 revert，**沒有任何 reason 字串**。
+
+裸 `0x` revert 的典型形狀是「路由器不認這個 command」。我們 executor 的 allowlist 有 `0x08`
+（`Cmd.V2_SWAP_EXACT_IN`）—— 那是照 Uniswap Universal Router 的文件寫的，
+但 **Pancake 的 fork 未必實作它**，而我們從來沒有在主網真的送出過這個 command。
+
+停用 V2 後同一個投組立刻成功：**5 筆 SwapExecuted**，DOGE 也買到了（走 V3 兩跳）。
+
+### 怎麼驗證（下次要做的事）
+
+不要靠猜，用 `eth_call` 直接對 Universal Router 送一筆 V2 command：
+
+1. 找一個持有 USDT 的地址（測試錢包）
+2. `USDT.approve(universalRouter, amount)`
+3. `cast call universalRouter "execute(bytes,bytes[],uint256)" 0x08 [<V2 input>] <deadline> --from <測試錢包>`
+4. 回 `0x` = 不支援；回正常 = 支援，這時才可以開 `ROUTE_V2_ENABLED=1`
+
+### 教訓
+
+**「A 的介面在 B 的 fork 上存在」不是事實，是假設。** allowlist 允許一個 command，
+只代表我們的合約不會擋它，不代表下游實作了它。這種假設要用一次真實呼叫驗證，
+而不是靠「quoter 算得出數字」—— quoter 是我們自己算的，跟 router 能不能執行無關。
+
+---
+
 ## 8. bundler safe-mode（見上）
 
 ## 6. 文件進版控 `[x]`

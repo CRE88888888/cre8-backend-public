@@ -1369,7 +1369,15 @@ async function planHub(
       amountIn: params.amountIn,
       via: WBNB_ADDRESS,
       factory: V3_FACTORY_ADDRESS,
-      v2Factory: V2_FACTORY_ADDRESS,
+      // ⚠ V2 預設**關閉**。
+      //
+      // 實測（主網，2026-11）：`Cmd.V2_SWAP_EXACT_IN`（0x08）在 Pancake 的 Universal Router 上
+      // 送出後，UserOp 模擬直接 revert 成裸 `0x`（無 reason）—— 那是「路由器不認這個 command」
+      // 的典型形狀。我們的 executor allowlist 有它，但**從來沒有在主網真的跑過**。
+      //
+      // 所以預設關閉、只走 V3；等用 `cast call` 對 Universal Router 驗證過 V2 指令真的可用，
+      // 再設 `ROUTE_V2_ENABLED=1` 打開。安全性優先：寧可走差一點的路，也不要送出一筆必 revert 的交易。
+      v2Factory: process.env.ROUTE_V2_ENABLED === '1' ? V2_FACTORY_ADDRESS : null,
       pinnedFee: pair.poolFee,
       ...(blockNumber === undefined ? {} : { blockNumber }),
     });

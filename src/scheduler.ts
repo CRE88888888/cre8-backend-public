@@ -1647,6 +1647,26 @@ async function decideAndMaybeExecute(
   }
 
   const plan = await ctx.deps.planPortfolio(due.portfolioId);
+
+  // 把「鏈上釘住的版本」同步回 DB。
+  //
+  // 為什麼需要：`portfolios.version` 是 enrollment 當下寫的，但 owner 可以在鏈上
+  // 重新 `registry.enroll` 換版本（我們就手動把 portfolio 1 從 v1 換到 v2 過）。
+  // 那時 DB 不會知道，於是 operator 頁顯示 `v1`、鏈上其實是 `v2` —— 實測就發生過。
+  //
+  // 規劃器讀的是**鏈上**版本（`snapshot.ts` 的 `enrollment[1]`），所以行為一直正確，
+  // 錯的只是標籤。這裡把它們對齊，讓「畫面上寫的」與「實際在跑的」一致。
+  //
+  // 失敗不影響這一輪：版本標籤不是交易的前置條件。
+  try {
+    await ctx.deps.query('update portfolios set version = $1 where id = $2 and version <> $1', [
+      plan.pinnedVersion.version,
+      due.portfolioId,
+    ]);
+  } catch (error) {
+    ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} 的 version 同步失敗：${oneLine(error)}`);
+  }
+
   if (plan.blocked.length > 0) {
     return {
       ...base,

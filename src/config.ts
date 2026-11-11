@@ -60,14 +60,16 @@ export type Config = AuthConfig & {
 export const DEFAULT_PORT = 8080;
 export const DEFAULT_CHAIN_ID = 56;
 export const DEFAULT_AUTH_DOMAIN = 'localhost';
-/** 0.01 BNB ≈ 33 次 rebalance op（一次約 250k gasUsed @ ~1.22 gwei ≈ 0.0003 BNB）。 */
 /**
- * 每個 Kernel 帳戶建議持有的最低 gas（0.002 BNB）。
+ * 每個 Kernel 帳戶建議持有的最低 gas（0.0005 BNB）。
  *
- * 原本是 0.01。BSC 的 gas 是 0.05 gwei，一筆 sudo UserOp（約 500k gas）成本約 0.000025 BNB ——
- * 0.002 已經夠跑 ~80 筆。0.01 只是讓使用者多鎖住 5 倍的錢，沒有換到任何安全邊際。
+ * BSC 的 gas 是 0.05 gwei，一筆 sudo UserOp（約 500k gas）成本約 0.000025 BNB ——
+ * 0.0005 已經夠跑 ~20 筆。這個值一路從 0.01 → 0.002 → 0.0005：
+ * 前面的門檻對「存個 1.5 USDT 測試」來說高到荒謬 —— 使用者得先花 0.0021 BNB 補 gas
+ * 才能入金，實測就卡在這裡（錢包 0.00188 BNB，夠 75 筆卻被 0.002 門檻擋住）。
+ * 20 筆的餘裕對「再平衡失敗後還剩幾輪可重試」綽綽有餘，又不逼使用者鎖大額。
  */
-export const DEFAULT_MIN_SESSION_GAS_WEI = 2n * 10n ** 15n;
+export const DEFAULT_MIN_SESSION_GAS_WEI = 5n * 10n ** 14n;
 
 let cachedConfig: Config | null = null;
 let cachedAuthConfig: AuthConfig | null = null;

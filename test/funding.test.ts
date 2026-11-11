@@ -123,11 +123,11 @@ test('describeGasStatus: estimatedOps 的 per-op 成本與 OPS_GAS_PER_OPERATION
   assert.equal(perOperationCostWei(-1n), 0n);
 });
 
-test('MIN_SESSION_GAS_WEI: bigint 解析，預設 0.002 BNB', () => {
-  // 預設值從 0.01 降到 0.002：BSC gas 0.05 gwei 下一筆 sudo UserOp 約 0.000025 BNB，
-  // 0.002 已經夠跑 ~80 筆 —— 0.01 只是讓使用者多鎖 5 倍的錢（見 config.ts 的說明）。
-  assert.equal(DEFAULT_MIN_SESSION_GAS_WEI, 2n * 10n ** 15n);
-  assert.equal(loadGasConfig({}).minSessionGasWei, 2000000000000000n);
+test('MIN_SESSION_GAS_WEI: bigint 解析，預設 0.0005 BNB', () => {
+  // 預設值一路 0.01 → 0.002 → 0.0005：一筆 sudo UserOp 約 0.000025 BNB，
+  // 0.0005 = 20 筆餘裕。前面的門檻對小額測試高到荒謬（見 config.ts 的說明）。
+  assert.equal(DEFAULT_MIN_SESSION_GAS_WEI, 5n * 10n ** 14n);
+  assert.equal(loadGasConfig({}).minSessionGasWei, 500000000000000n);
 
   // 精確到 wei：這些值用 Number 早就失真了（10^16 > Number.MAX_SAFE_INTEGER）。
   assert.equal(loadGasConfig({ MIN_SESSION_GAS_WEI: '25000000000000000' }).minSessionGasWei, 25n * 10n ** 15n);

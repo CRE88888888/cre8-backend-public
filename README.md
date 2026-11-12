@@ -52,8 +52,44 @@ HTTP → src/index.ts（啟動：config → migrate → listen）
 | `SESSION_KEY_MASTER_SEED` | 續期／enroll 時 ✅ | 空 | 派生 session key 的 HD master seed（`0x` + 64 hex）。私鑰永不落 DB，DB 只存派生路徑 `m/44'/60'/0'/0/<index>`。 |
 | `BUNDLER_URL` | | `http://127.0.0.1:3001` | `POST /bundler` 轉發的上游（alto）。`renewal-params` 也把它回給前端當**資訊**顯示。留空 = 這個預設值。 |
 | `CORS_ALLOWED_ORIGINS` | | `http://localhost:5173,http://127.0.0.1:5173` | 逗號分隔的允許 origin（完整 origin，不分大小寫）。未設定 = dev 預設；不支援 `*`。 |
+| `TELEGRAM_BOT_TOKEN` | 與 chat id 成對 | 空 | BotFather 給的 bot 密碼；只放本機 `.env` 或服務的 secret 設定。 |
+| `TELEGRAM_CHAT_ID` | 與 token 成對 | 空 | 收件私訊或群組的 id（保留負號）；設定方式見下方。 |
+| `TELEGRAM_API_BASE` | | `https://api.telegram.org` | 測試可指向本機假 Telegram 伺服器；正式使用留空。 |
 
 複製 `.env.example` 為 `.env` 即可；`.env` 不進版控。**不要**把真的 RPC URL 或連線字串寫進 repo。
+
+### Telegram 警示
+
+每輪結束後，新開的 critical 或 warn 升成 critical 會發一則；持續存在的同一個 critical 不重複發。
+critical 的條件消失時再發一則「已解除」。判斷來自 `scheduler_alerts`，重啟不會重送既有警示。
+訊息包含嚴重度、kind、portfolio id、detail、first_seen／last_seen、`CHAIN_ID`；
+dry-run 照樣通知並標 `[dry-run]`，live 標 `[live]`。一般 warn 不推。
+
+兩個收件設定都空白時不發送，首次嘗試通知只提示一次；只填一個會在啟動時報錯。
+通知逾時（5 秒）、HTTP 或 API 失敗只寫不含憑證的 log，不影響該輪，也不自動重試。
+因此通知是盡力送達；收件失敗請看 DB、`--alerts` 與 log，下一輪不會補送同一個 critical。
+既有未解除 critical 在啟用 Telegram 時也不補發。不新增資料表或欄位。
+
+設定步驟（由使用者本人操作，不把 token 貼到 issue、PR、截圖或聊天）：
+
+1. 在 Telegram 找官方 [@BotFather](https://t.me/BotFather)，輸入 `/newbot`，照提示取顯示名稱及以 `bot` 結尾的帳號。拿到的 token 就是這個 bot 的密碼，只填進本機 `.env` 的 `TELEGRAM_BOT_TOKEN=` 後方。
+2. 打開剛建立的 bot 對話，按「開始／Start」，傳一句「測試」。若要發到群組，先把 bot 加進群組，再在群組傳 `/start@你的bot帳號`。
+3. 在 backend 目錄貼上以下指令。它從 `.env` 讀 token，呼叫官方 `getUpdates`，只顯示 chat id 和私訊／群組名稱，不印 token 或完整回應。不要把 token 填進命令列或瀏覽器網址。
+
+   ```bash
+   bun -e 'import "dotenv/config"; const token = process.env.TELEGRAM_BOT_TOKEN?.trim(); if (!token) { console.error("請先填本機 .env 的 TELEGRAM_BOT_TOKEN"); process.exit(1); } try { const r = await fetch(`https://api.telegram.org/bot${token}/getUpdates`, { signal: AbortSignal.timeout(5000) }); const b = await r.json(); if (!r.ok || !b.ok) throw new Error(); for (const u of b.result) { const c = u.message?.chat; if (c) console.log(c.id, c.type, c.title ?? "私訊"); } } catch { console.error("無法取得 chat id；請確認 token，並先對 bot 傳訊息。已有 webhook 的 bot 請另建一個專用 bot。"); process.exitCode = 1; }'
+   ```
+
+4. 找到目標對話，把左邊的數字填到 `.env` 的 `TELEGRAM_CHAT_ID=` 後方；群組的負號要一起保留。沒有任何輸出時，重新傳一則訊息，再跑一次。`TELEGRAM_API_BASE` 保持空白。
+5. 儲存後，先用以下一行指令確認 Telegram 收到測試訊息；再重啟本機 scheduler 讓設定生效。A 段不改 Railway、不部署。
+
+   ```bash
+   bun -e 'import "dotenv/config"; import { sendTelegram } from "./src/notify.ts"; await sendTelegram("[dry-run][critical] CRE8 Telegram 手動驗收通知");'
+   ```
+
+建立 bot 的步驟參考 [Telegram 官方教學](https://core.telegram.org/bots/tutorial#obtain-your-bot-token)，
+收件與送件參數參考 [getUpdates](https://core.telegram.org/bots/api#getupdates) 與
+[sendMessage](https://core.telegram.org/bots/api#sendmessage)。
 
 ## 指令
 
@@ -128,6 +164,7 @@ DATABASE_URL=postgres://ci:ci@127.0.0.1:1/unused bun test \
   test/funding.test.ts \
   test/holdings-scan.test.ts \
   test/kernel.test.ts \
+  test/notify.test.ts \
   test/permissions.test.ts \
   test/positions.test.ts \
   test/preflight.test.ts \

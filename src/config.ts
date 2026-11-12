@@ -44,6 +44,31 @@ export type GasConfig = {
   minSessionGasWei: bigint;
 };
 
+export type TelegramConfig = {
+  botToken: string | null;
+  chatId: string | null;
+  apiBase: string;
+};
+
+/** 選填但必須成對設定；錯誤訊息只列變數名，不回顯憑證。 */
+export function loadTelegramConfig(env: NodeJS.ProcessEnv = process.env): TelegramConfig {
+  const botToken = env.TELEGRAM_BOT_TOKEN?.trim() || null;
+  const chatId = env.TELEGRAM_CHAT_ID?.trim() || null;
+  if ((botToken === null) !== (chatId === null)) {
+    throw new Error('TELEGRAM_BOT_TOKEN 與 TELEGRAM_CHAT_ID 必須一起設定或一起留空');
+  }
+  const apiBase = env.TELEGRAM_API_BASE?.trim() || 'https://api.telegram.org';
+  try {
+    const url = new URL(apiBase);
+    if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+      throw new Error('invalid URL');
+    }
+  } catch {
+    throw new Error('TELEGRAM_API_BASE 必須是 http/https URL，且不能含帳密、query 或 fragment');
+  }
+  return { botToken, chatId, apiBase: apiBase.replace(/\/+$/, '') };
+}
+
 export type Config = AuthConfig & {
   /** Postgres connection string. Required. */
   databaseUrl: string;
@@ -90,6 +115,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const rpcUrl = env.RPC_URL?.trim() ? env.RPC_URL.trim() : null;
   const operatorPrivateKey = env.OPERATOR_PRIVATE_KEY?.trim() ? env.OPERATOR_PRIVATE_KEY.trim() : null;
   const registryAddress = parseOptionalAddress(env, 'REGISTRY_ADDRESS');
+  // API 與 scheduler 的啟動都走這裡；不要等第一則警示才發現只填了一半。
+  loadTelegramConfig(env);
 
   return {
     databaseUrl,

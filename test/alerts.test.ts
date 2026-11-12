@@ -621,6 +621,52 @@ const dbSkip = await dbReason();
 if (dbSkip !== null) console.warn(`[alerts] 真 DB 的測試 skip：${dbSkip}`);
 const dbGate = dbSkip === null ? {} : { skip: dbSkip };
 
+test('真 Postgres：Telegram 新開／升級／重複／解除／再次發生與 NULL portfolio 的 returning 判斷', dbGate, async () => {
+  await assert.rejects(() => withTransaction(async (client) => {
+    const q: QueryFn = (sql, params = []) => client.query(sql, [...params]);
+    const strategy = await client.query<{ id: string }>("insert into strategies (provider, name) values ('0xnotify-test', 'notify fixture') returning id");
+    const portfolio = await client.query<{ id: string }>("insert into portfolios (user_id, strategy_id, version, schedule_state) values ('0xnotify-test', $1, 1, 'idle') returning id", [strategy.rows[0]?.id]);
+    const portfolioId = Number(portfolio.rows[0]?.id);
+    const messages: string[] = [];
+    const options = { dryRun: true, chainId: 1337, send: async (text: string) => { messages.push(text); } };
+    const critical = finding({ portfolioId });
+    const warn = { ...critical, severity: 'warn' as const };
+    const later = new Date(NOW.getTime() + 60_000);
+
+    await recordAlerts(q, [warn], NOW, options);
+    assert.equal(messages.length, 0, '新增 warn 不推');
+    await recordAlerts(q, [critical], later, options);
+    assert.equal(messages.length, 1, 'warn → critical 推一次');
+    assert.match(messages[0] ?? '', /first_seen: 2026-11-07T12:00:00.000Z/);
+    assert.match(messages[0] ?? '', /last_seen: 2026-11-07T12:01:00.000Z/);
+    await recordAlerts(q, [critical], later, options);
+    assert.equal(messages.length, 1, '持續 critical 不重推');
+    await resolveAlerts(q, [critical], later, options);
+    assert.equal(messages.length, 1, '還存在的警示不解除');
+    await resolveAlerts(q, [], later, options);
+    assert.equal(messages.length, 2, 'critical 解除推一次');
+    assert.match(messages[1] ?? '', /已解除/);
+    await resolveAlerts(q, [], later, options);
+    assert.equal(messages.length, 2, '已解除不重推');
+    await recordAlerts(q, [critical], later, options);
+    assert.equal(messages.length, 3, '解除後再發生是新警示');
+    await recordAlerts(q, [warn], later, options);
+    assert.equal(messages.length, 3, '降為 warn 不推');
+    await recordAlerts(q, [critical], later, options);
+    assert.equal(messages.length, 4, '再次升級 critical 再推');
+
+    const orphan = finding({ kind: 'gas_low', portfolioId: null });
+    await q("delete from scheduler_alerts where kind = 'gas_low' and portfolio_id is null");
+    await recordAlerts(q, [orphan], NOW, options);
+    await recordAlerts(q, [orphan], later, options);
+    assert.equal(messages.length, 5, 'NULL portfolio 也只推一次');
+    assert.match(messages[4] ?? '', /portfolio id: \(無\)/);
+    const rows = await client.query('select occurrences from scheduler_alerts where kind = $1 and portfolio_id is null and resolved_at is null', ['gas_low']);
+    assert.equal(rows.rows[0]?.occurrences, 2);
+    throw new Error('rollback notify fixture');
+  }), /rollback notify fixture/);
+});
+
 after(async () => {
   await closePool().catch(() => {
     // DB 不可用時整組本來就 skip 了；這裡的失敗不該蓋掉測試結果。

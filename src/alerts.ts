@@ -2,6 +2,7 @@ import type { Address } from 'viem';
 import { getAccountGasBalance, getGasPriceWei } from './chain.js';
 import { DEFAULT_CHAIN_ID } from './config.js';
 import { perOperationCostWei } from './funding.js';
+import { sendTelegram } from './notify.js';
 
 /**
  * 排程器的告警。**三個種類、全部從 DB 可推導**（不靠 process 記憶體）。
@@ -391,6 +392,33 @@ export async function detectLowGas(
 // 寫入：upsert / resolve
 // ---------------------------------------------------------------------------
 
+export type AlertNotificationOptions = {
+  dryRun: boolean;
+  chainId: number;
+  log?: (line: string) => void;
+  /** 測試注入；正式呼叫使用 sendTelegram。 */
+  send?: (text: string) => Promise<void>;
+};
+
+async function notifyAlert(row: Record<string, unknown>, resolved: boolean, options: AlertNotificationOptions): Promise<void> {
+  const log = options.log ?? console.warn;
+  try {
+    const text = [
+      `[${options.dryRun ? 'dry-run' : 'live'}][critical] ${resolved ? '已解除' : '警示'}`,
+      `kind: ${asKind(row.kind)}`,
+      `portfolio id: ${row.portfolio_id ?? '(無)'}`,
+      `CHAIN_ID: ${options.chainId}`,
+      `first_seen: ${toDate(row.first_seen_at, 'first_seen_at').toISOString()}`,
+      `last_seen: ${toDate(row.last_seen_at, 'last_seen_at').toISOString()}`,
+      ...(resolved ? [`resolved_at: ${toDate(row.resolved_at, 'resolved_at').toISOString()}`] : []),
+      `detail: ${String(row.detail ?? '')}`,
+    ].join('\n');
+    await (options.send ?? ((message) => sendTelegram(message, { log })))(text);
+  } catch {
+    log('[Telegram] 通知失敗；警示已保留在 DB，不重送');
+  }
+}
+
 /**
  * 寫入這一輪的 findings：已存在未解決的 → `occurrences + 1`、更新 `detail` 與 `last_seen_at`；
  * 否則新增一列。
@@ -406,10 +434,17 @@ export async function recordAlerts(
   query: QueryFn,
   findings: readonly AlertFinding[],
   now: Date = new Date(),
+  notifications?: AlertNotificationOptions,
 ): Promise<void> {
   const seenAt = now.toISOString();
   for (const finding of findings) {
-    await query(SQL_RECORD_ALERT, [finding.kind, finding.severity, finding.portfolioId, finding.detail, seenAt]);
+    const { rows } = await query(SQL_RECORD_ALERT, [finding.kind, finding.severity, finding.portfolioId, finding.detail, seenAt]);
+    for (const row of rows) {
+      const fields = row as Record<string, unknown>;
+      if (notifications && fields.severity === 'critical' && (fields.inserted === true || fields.previous_severity === 'warn')) {
+        await notifyAlert(fields, false, notifications);
+      }
+    }
   }
 }
 
@@ -424,10 +459,14 @@ export async function resolveAlerts(
   query: QueryFn,
   present: readonly AlertFinding[],
   now: Date = new Date(),
+  notifications?: AlertNotificationOptions,
 ): Promise<number> {
   const keys = present.map((finding) => alertKey(finding.kind, finding.portfolioId));
-  // `returning id` 只是為了數「解除了幾筆」；QueryFn 的形狀（只要 rows）不因此變複雜。
   const { rows } = await query(SQL_RESOLVE_ALERTS, [now.toISOString(), keys]);
+  for (const row of rows) {
+    const fields = row as Record<string, unknown>;
+    if (notifications && fields.severity === 'critical') await notifyAlert(fields, true, notifications);
+  }
   return rows.length;
 }
 
@@ -575,16 +614,26 @@ const SQL_SMART_ACCOUNTS = `
    order by sa.portfolio_id
 `;
 
-/** upsert。`on conflict` 的目標運算式與 WHERE 必須與 `scheduler_alerts_open_uniq` 逐字相同。 */
+/**
+ * upsert。先鎖既有列、取更新前 severity；RETURNING 的 xmax 分辨新增與衝突更新。
+ * 仍由部分唯一索引去重，不用 process 記憶體，也不增加 DB 欄位（支援 PostgreSQL 17）。
+ */
 const SQL_RECORD_ALERT = `
+  with previous as materialized (
+    select severity from scheduler_alerts
+     where kind = $1 and coalesce(portfolio_id, -1) = coalesce($3::bigint, -1)
+       and resolved_at is null
+     for update
+  )
   insert into scheduler_alerts as a
          (kind, severity, portfolio_id, detail, occurrences, first_seen_at, last_seen_at)
-  values ($1, $2, $3, $4, 1, $5, $5)
+  select $1, $2, $3, $4, 1, $5, $5 from (select count(*) from previous) as locked where true
   on conflict (kind, (coalesce(portfolio_id, -1))) where resolved_at is null
   do update set severity     = excluded.severity,
                 detail       = excluded.detail,
                 occurrences  = a.occurrences + 1,
                 last_seen_at = excluded.last_seen_at
+  returning a.*, (xmax = 0) as inserted, (select severity from previous) as previous_severity
 `;
 
 /** 「不在這一輪的 findings 裡」→ resolved。`empty` 陣列 = 全部解除（`<> all('{}')` 恆真）。 */
@@ -593,7 +642,7 @@ const SQL_RESOLVE_ALERTS = `
      set resolved_at = $1
    where resolved_at is null
      and (kind || ':' || coalesce(portfolio_id, -1)::text) <> all($2::text[])
-  returning id
+  returning id, kind, severity, portfolio_id, detail, first_seen_at, last_seen_at, resolved_at
 `;
 
 /** critical 先、再按最後看到的時間新到舊：`/health` 的計數與 `--alerts` 的清單都用這個順序。 */

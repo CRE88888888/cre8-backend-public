@@ -1518,7 +1518,7 @@ export async function runSchedulerOnce(
 
   // ---- 一輪的尾端：告警（偵測 → 寫入 → 解除 → 一行 stdout）----
   // 只加在這裡：認領、前置檢查、間隔推進的邏輯一個字都沒動。
-  await announceAlerts({ query: resolved.query, log: resolved.log, now });
+  await announceAlerts({ query: resolved.query, log: resolved.log, now, dryRun, chainId: resolved.chainId });
 
   return { claimed: claimed.length, dryRun, results };
 }
@@ -1538,11 +1538,14 @@ export async function announceAlerts(args: {
   query: SchedulerQueryFn;
   log: (line: string) => void;
   now: Date;
+  dryRun?: boolean;
+  chainId?: number;
 }): Promise<void> {
   try {
     const findings = await detectAlerts(args.query, { now: args.now });
-    await recordAlerts(args.query, findings, args.now);
-    const resolved = await resolveAlerts(args.query, findings, args.now);
+    const notifications = { dryRun: args.dryRun ?? true, chainId: args.chainId ?? getConfig().chainId, log: args.log };
+    await recordAlerts(args.query, findings, args.now, notifications);
+    const resolved = await resolveAlerts(args.query, findings, args.now, notifications);
 
     if (findings.length === 0) {
       args.log(`[ALERT] 沒有警示${resolved > 0 ? `（已解除 ${resolved} 筆）` : ''}`);

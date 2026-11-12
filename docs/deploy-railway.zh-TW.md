@@ -28,10 +28,28 @@ SESSION_KEY_MASTER_SEED= # ← secret
 AUTH_DOMAIN=             # SIWE 的 domain
 AUTH_URI=                # SIWE 的 uri
 ENABLE_OPERATOR_REBALANCE=true
+TELEGRAM_BOT_TOKEN=       # 選填 secret；與 CHAT_ID 必須一起填或一起留空
+TELEGRAM_CHAT_ID=         # 收件私訊／群組 id（負號要保留）
+TELEGRAM_API_BASE=        # 正式留空；預設 https://api.telegram.org，本機假伺服器驗收才覆寫
 ```
 
 **Secret 放 Railway Variables（等同 secret manager），不要放進 repo**。
 `.env` 已在 `.gitignore`；`backend/.env.fork` 也是。
+
+### Telegram critical 警示（A 段只做本機設定）
+
+1. 使用者本人在 Telegram 的官方 [@BotFather](https://t.me/BotFather) 傳 `/newbot`，照提示建立 bot。把拿到的 token 當密碼，只填進 backend 本機 `.env` 的 `TELEGRAM_BOT_TOKEN`。
+2. 對新 bot 按「開始／Start」並傳一句話。收件要用群組時，先加 bot 到群組，再在群組傳 `/start@你的bot帳號`。
+3. 照 [README 的 chat id 指令與說明](../README.md#telegram-警示) 執行 `getUpdates`，找到對話數字 id，連同負號填進 `TELEGRAM_CHAT_ID`。該指令只印 chat id，不印 token；不要在瀏覽器網址或命令列直接貼 token。
+4. 跑 README 的一行手動測試，確認收到訊息，再重啟本機 scheduler。兩個值都空白就停用；只填一個會在啟動時報錯。
+
+新 critical／warn 升級會通知一次，critical 解除再通知一次；持續存在不重送，重啟也不補發。
+dry-run 仍會通知並標 `[dry-run]`；live 標 `[live]`，通知含 `CHAIN_ID` 與 first_seen／last_seen。
+5 秒逾時或送件失敗只留安全 log，不影響排程器、不重試；請搭配 DB 與 `--alerts` 查閱。
+設定本功能不需要 migration。真的 token 不進 repo、log、PR 或 issue。
+
+B 段才由使用者本人在 Railway 的 scheduler Variables 填相同兩個值並重啟服務；
+API 若有設定也必須成對，否則保持兩個都空白。**A 段不改 Railway 變數、不部署。**
 
 ### ATP v2 的三把金鑰
 

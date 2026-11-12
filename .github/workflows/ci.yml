@@ -60,6 +60,7 @@ jobs:
           test/funding.test.ts
           test/holdings-scan.test.ts
           test/kernel.test.ts
+          test/notify.test.ts
           test/permissions.test.ts
           test/positions.test.ts
           test/preflight.test.ts

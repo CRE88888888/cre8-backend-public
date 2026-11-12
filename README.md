@@ -44,6 +44,7 @@ HTTP → src/index.ts（啟動：config → migrate → listen）
 | `AUTH_DOMAIN` | | `localhost` | EIP-4361 `domain`：錢包要簽的站台 authority（純 host，可帶 port，不含 scheme／path）。部署時必填自己的網域。 |
 | `AUTH_URI` | | `http://<AUTH_DOMAIN>` | EIP-4361 `uri`：這次登入指涉的資源。必須是 http/https 絕對 URI；部署時建議設 `https://app…`。 |
 | `RPC_URL` | | 空 | JSON-RPC endpoint；目前只用於 `/health` 回報是否設定。 |
+| `ATP_SAFE` | preflight `--strict` 時 ✅ | 空 | 唯讀檢查的預期 owner（公開 Safe 地址，不是私鑰）；registry 與 `executor.oracle()` 的 AtpMultiPoolOracle 都必須已交接給此地址，且該地址有 code。 |
 | `EXECUTOR_ADDRESS` | 續期／enroll 時 ✅ | 空 | session key CallPolicy 允許呼叫的 target（rebalance executor）。缺它時 enroll 與 `renewal-params` 會帶著變數名失敗。 |
 | `SESSION_KEY_MASTER_SEED` | 續期／enroll 時 ✅ | 空 | 派生 session key 的 HD master seed（`0x` + 64 hex）。私鑰永不落 DB，DB 只存派生路徑 `m/44'/60'/0'/0/<index>`。 |
 | `BUNDLER_URL` | | `http://127.0.0.1:3001` | `POST /bundler` 轉發的上游（alto）。`renewal-params` 也把它回給前端當**資訊**顯示。留空 = 這個預設值。 |
@@ -65,6 +66,18 @@ bun test                   # bun 內建 test runner；沒有 DATABASE_URL 時 DB
 ```
 
 需求：Bun >= 1.4（`package.json` 的 `engines`）。bun 原生跑 TypeScript，不需 build 步驟、不需 tsx。
+
+### ATP v2 起飛前角色檢查（唯讀）
+
+設定 `.env` 的 `ATP_SAFE` 後執行 `bun run preflight --strict`；腳本只讀鏈上狀態，不簽名、不送交易。
+registry 與 router（由 `executor.oracle()` 取得）的 `owner()` 必須等於 `ATP_SAFE`，且 Safe 地址有 code。
+部署者呼叫 `transferOwnership(ATP_SAFE)` 後，若 owner 尚未改變且 `pendingOwner() == ATP_SAFE`，
+會提示「Safe 尚未 acceptOwnership」；必須由 Safe 對兩個合約各呼叫 `acceptOwnership()` 才算交接完成。
+`pendingOwner()` 非零且不是 Safe 也會失敗。非 strict 模式下，這些 Safe 設定／交接問題降為 warn。
+
+registry 的 `operator()` 必須非零、等於 `OPERATOR_PRIVATE_KEY` 推導的 relayer 地址，且不能等於 owner；
+不符在兩種模式都 fail。讀不到 `operator()` 或 `pendingOwner()` 也一律 fail，提示「不是 v2 合約」並要求確認 RPC。
+輸出只列公開地址，不列私鑰。`ATP_SAFE` 僅供 preflight 使用，不改 API 或 scheduler 的設定。
 
 ### 測試與 DB
 

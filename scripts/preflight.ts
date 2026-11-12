@@ -15,7 +15,7 @@
  *   * 鏈一致（`CHAIN_ID` 與 RPC 實際回的 chainId 相同 —— 不一致時 UserOp 的簽章會對不上，
  *     錯誤訊息只會說 "signature invalid"，看不出是 chainId）
  *   * 合約位址真的有 code（打錯一個字 vs 鏈還沒部署，在這裡就分得出來）
- *   * registry 的 owner 是誰（主網前要換 multisig，這裡會提醒）
+ *   * registry / router 的 Safe 兩步交接與 registry operator 是否正確
  *   * executor 的 oracle / router 有沒有接上
  *   * 營運錢包有沒有 gas、DB 連不連得上、migration 跑過沒
  *
@@ -25,16 +25,19 @@
  * 在 fork（1337）與主網（56）都能用，只是檢查的門檻不同（見 `--strict`）。
  */
 
-import { createPublicClient, http, isAddress, getAddress } from 'viem';
+import { pathToFileURL } from 'node:url';
+import { createPublicClient, http, isAddress, getAddress, zeroAddress } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
 import type { Address } from 'viem';
 
+import { REGISTRY_ABI } from '../src/chain.js';
 import { activeChain } from '../src/chain-object.js';
 import { getConfig, requireSessionKeyConfig } from '../src/config.js';
 import { query } from '../src/db.js';
 
 type Level = 'ok' | 'warn' | 'fail';
 
-type Check = {
+export type Check = {
   level: Level;
   /** 一句話說明「檢查了什麼」。 */
   name: string;
@@ -43,6 +46,125 @@ type Check = {
   /** `warn`/`fail` 時：怎麼辦。 */
   fix?: string;
 };
+
+const OWNERSHIP_ABI = ['owner', 'pendingOwner'].map((name) => ({
+  type: 'function' as const,
+  name,
+  stateMutability: 'view' as const,
+  inputs: [],
+  outputs: [{ type: 'address' as const }],
+}));
+
+function sameAddress(a: Address | null, b: Address | null): boolean {
+  return a !== null && b !== null && a.toLowerCase() === b.toLowerCase();
+}
+
+/** 純判斷；null 代表讀取失敗，不可當成零地址或已交接。 */
+export function checkOwnership(input: {
+  label: 'registry' | 'router';
+  owner: Address | null;
+  pendingOwner: Address | null;
+  safe: Address | null;
+  safeHasCode: boolean | null;
+  strict: boolean;
+}): Check[] {
+  const { label, owner, pendingOwner, safe, safeHasCode, strict } = input;
+  const level = strict ? 'fail' : 'warn';
+  const checks: Check[] = [];
+  if (owner === null) {
+    checks.push({ level: 'fail', name: `${label} owner`, detail: '讀不到 owner()', fix: '確認合約位址與 RPC' });
+  } else if (safe === null || sameAddress(safe, zeroAddress)) {
+    checks.push({
+      level, name: `${label} owner`, detail: `${owner}；ATP_SAFE 未設定或不是合法非零地址`,
+      fix: 'ATP_SAFE 填預期接手的 Safe 合約地址（不是私鑰）',
+    });
+  } else if (!sameAddress(owner, safe)) {
+    checks.push({
+      level, name: `${label} owner`, detail: `${owner}；預期 ATP_SAFE=${safe}`,
+      fix: sameAddress(pendingOwner, safe)
+        ? 'Safe 尚未 acceptOwnership；由 Safe 呼叫 acceptOwnership()'
+        : '由現任 owner 呼叫 transferOwnership(ATP_SAFE)，再由 Safe 呼叫 acceptOwnership()',
+    });
+  } else {
+    checks.push({ level: 'ok', name: `${label} owner`, detail: `${owner} = ATP_SAFE` });
+  }
+
+  if (safe !== null && !sameAddress(safe, zeroAddress)) {
+    checks.push({
+      level: safeHasCode === true ? 'ok' : level,
+      name: `${label} owner code`,
+      detail: safeHasCode === true ? 'ATP_SAFE 有合約 code'
+        : safeHasCode === false ? 'ATP_SAFE 沒有合約 code（EOA）' : '讀不到 ATP_SAFE 的 code',
+      ...(safeHasCode === true ? {} : { fix: '確認 ATP_SAFE 是已部署的 Safe 合約，並確認 RPC' }),
+    });
+  }
+
+  if (pendingOwner === null) {
+    checks.push({
+      level: 'fail', name: `${label} pendingOwner`, detail: '讀不到 pendingOwner()：不是 v2 合約，或 RPC 讀取失敗',
+      fix: '使用 v2 registry / AtpMultiPoolOracle 位址並確認 RPC',
+    });
+  } else if (!sameAddress(pendingOwner, zeroAddress) && !sameAddress(pendingOwner, safe)) {
+    checks.push({
+      level, name: `${label} pendingOwner`, detail: `${pendingOwner}；非零且不是 ATP_SAFE`,
+      fix: '由現任 owner 取消錯誤交接或重新 transferOwnership(ATP_SAFE)',
+    });
+  } else {
+    checks.push({
+      level: 'ok', name: `${label} pendingOwner`,
+      detail: sameAddress(pendingOwner, zeroAddress) ? `${pendingOwner}（無待接受交接）` : `${pendingOwner} = ATP_SAFE（待接受）`,
+    });
+  }
+  return checks;
+}
+
+export function checkRegistryOperator(input: {
+  operator: Address | null;
+  owner: Address | null;
+  expectedOperator: Address | null;
+}): Check[] {
+  const { operator, owner, expectedOperator } = input;
+  if (operator === null) {
+    return [{
+      level: 'fail', name: 'registry operator', detail: '讀不到 operator()：不是 v2 合約，或 RPC 讀取失敗',
+      fix: '使用 v2 registry 位址並確認 RPC',
+    }];
+  }
+  const checks: Check[] = [];
+  if (sameAddress(operator, zeroAddress)) {
+    checks.push({ level: 'fail', name: 'registry operator', detail: '是零地址（未設定）', fix: '由 owner 呼叫 setOperator(<relayer 地址>)' });
+  } else if (expectedOperator === null) {
+    checks.push({
+      level: 'fail', name: 'registry operator', detail: `${operator}；無法從 OPERATOR_PRIVATE_KEY 推導預期地址`,
+      fix: '設定合法的 relayer 私鑰；不要將私鑰貼到 log 或 PR',
+    });
+  } else if (!sameAddress(operator, expectedOperator)) {
+    checks.push({
+      level: 'fail', name: 'registry operator', detail: `${operator}；OPERATOR_PRIVATE_KEY 的地址為 ${expectedOperator}（不符）`,
+      fix: '確認 relayer 設定，或由 owner 呼叫 setOperator(<relayer 地址>)',
+    });
+  } else {
+    checks.push({ level: 'ok', name: 'registry operator', detail: `${operator} = relayer 地址` });
+  }
+  if (sameAddress(operator, owner)) {
+    checks.push({
+      level: 'fail', name: 'registry operator / owner', detail: `${operator}；operator == owner`,
+      fix: 'Safe 管理 owner，relayer 擔任 operator；兩個角色必須分開',
+    });
+  }
+  return checks;
+}
+
+/** 不輸出 key 或底層錯誤（可能夾帶輸入值），只回傳可公開的地址。 */
+export function operatorAddress(raw: string | undefined): Address | null {
+  const key = raw?.trim().replace(/^0x/, '');
+  if (key === undefined || !/^[0-9a-fA-F]{64}$/.test(key)) return null;
+  try {
+    return privateKeyToAccount(`0x${key}`).address;
+  } catch {
+    return null;
+  }
+}
 
 const results: Check[] = [];
 
@@ -205,36 +327,39 @@ async function main(): Promise<number> {
     }
   }
 
-  // --- 6. registry owner（主網前要換 multisig）--------------------------
-  if (registry !== null) {
+  // --- 6. v2 Safe 交接與 registry operator（全部唯讀）-------------------
+  const safe = asAddressOrNull(process.env.ATP_SAFE);
+  let safeHasCode: boolean | null = null;
+  if (safe !== null && !sameAddress(safe, zeroAddress)) {
     try {
-      const owner = await client.readContract({
-        address: registry,
-        abi: [
-          {
-            type: 'function',
-            name: 'owner',
-            stateMutability: 'view',
-            inputs: [],
-            outputs: [{ type: 'address' }],
-          },
-        ] as const,
-        functionName: 'owner',
-      });
-      const operator = process.env.OPERATOR_PRIVATE_KEY?.trim();
-      if (args.strict) {
-        // 主網：owner 應該是 multisig/timelock，不是單一 EOA。
-        warn(
-          'registry owner',
-          `${owner}${operator === undefined ? '' : '（= OPERATOR_PRIVATE_KEY 的位址？）'}`,
-          '主網前轉移到 Safe / timelock —— 單一 EOA 的 owner 可以改 fee、換策略、pause（見 mainnet-todo §4）',
-        );
-      } else {
-        ok('registry owner', owner);
-      }
-    } catch (cause) {
-      warn('registry owner', `讀不到：${cause instanceof Error ? cause.message : String(cause)}`, '確認 registry ABI / 位址');
+      const code = await client.getCode({ address: safe });
+      safeHasCode = code !== undefined && code !== '0x';
+    } catch {
+      // null 與沒有 code 分開，純函式會依 strict 決定 fail / warn。
     }
+  }
+  async function readOwnership(address: Address) {
+    const read = async (functionName: 'owner' | 'pendingOwner'): Promise<Address | null> => {
+      try {
+        return await client.readContract({ address, abi: OWNERSHIP_ABI, functionName });
+      } catch {
+        return null;
+      }
+    };
+    return { owner: await read('owner'), pendingOwner: await read('pendingOwner') };
+  }
+
+  const expectedOperator = operatorAddress(process.env.OPERATOR_PRIVATE_KEY);
+  if (registry !== null) {
+    const ownership = await readOwnership(registry);
+    checkOwnership({ label: 'registry', ...ownership, safe, safeHasCode, strict: args.strict }).forEach(record);
+    let operator: Address | null = null;
+    try {
+      operator = await client.readContract({ address: registry, abi: REGISTRY_ABI, functionName: 'operator' });
+    } catch {
+      // 舊版合約或 RPC 錯誤一律 fail，不把讀不到當作未設定。
+    }
+    checkRegistryOperator({ operator, owner: ownership.owner, expectedOperator }).forEach(record);
   }
 
   // --- 7. executor 的 oracle / router 接上了嗎 --------------------------
@@ -261,6 +386,8 @@ async function main(): Promise<number> {
           fail('executor.oracle', `${oracle} 上沒有合約`, '重新部署 oracle 並呼叫 setOracle');
         } else {
           ok('executor.oracle', oracle);
+          const ownership = await readOwnership(oracle);
+          checkOwnership({ label: 'router', ...ownership, safe, safeHasCode, strict: args.strict }).forEach(record);
         }
       }
     } catch (cause) {
@@ -269,11 +396,10 @@ async function main(): Promise<number> {
   }
 
   // --- 8. 營運錢包有 gas 嗎 --------------------------------------------
-  const operatorKey = process.env.OPERATOR_PRIVATE_KEY?.trim();
-  if (operatorKey === undefined || operatorKey === '') {
-    fail('OPERATOR_PRIVATE_KEY', '未設定', '部署與 approve 都要它簽名');
+  if (expectedOperator === null) {
+    fail('OPERATOR_PRIVATE_KEY', '未設定或不是合法的 secp256k1 私鑰', '設定 relayer 私鑰；只在本機 fork 使用 anvil 公開測試金鑰');
   } else {
-    ok('OPERATOR_PRIVATE_KEY', `已設定（${operatorKey.length} chars）`);
+    ok('OPERATOR_PRIVATE_KEY', `relayer 地址 ${expectedOperator}`);
   }
 
   // --- 9. bundler -------------------------------------------------------
@@ -349,11 +475,13 @@ function exitCode(): number {
   return 0;
 }
 
-main()
-  .then((code) => {
-    process.exit(code);
-  })
-  .catch((cause: unknown) => {
-    console.error(`\n  preflight 自己壞了：${cause instanceof Error ? cause.message : String(cause)}\n`);
-    process.exit(1);
-  });
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main()
+    .then((code) => {
+      process.exit(code);
+    })
+    .catch((cause: unknown) => {
+      console.error(`\n  preflight 自己壞了：${cause instanceof Error ? cause.message : String(cause)}\n`);
+      process.exit(1);
+    });
+}

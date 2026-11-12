@@ -62,6 +62,7 @@ jobs:
           test/kernel.test.ts
           test/permissions.test.ts
           test/positions.test.ts
+          test/preflight.test.ts
           test/pricing.test.ts
           test/pricing.crosscheck.test.ts
           test/rebalance-plan.test.ts

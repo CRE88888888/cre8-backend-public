@@ -21,7 +21,15 @@ bun run scripts/preflight.ts          # 開發環境：warn 不擋
 bun run scripts/preflight.ts --strict # 主網：任何 warn 都算失敗
 ```
 
-**實測（本機 1337 fork）**：`16 ok · 1 warn · 0 fail`
+ATP v2 角色驗收需設定公開地址 `ATP_SAFE`（不是私鑰）。`--strict` 要求 registry 與 router
+（`executor.oracle()` 指向的 AtpMultiPoolOracle）各自 `owner() == ATP_SAFE`，且 Safe 地址有 code。
+兩步交接只做 `transferOwnership(ATP_SAFE)` 仍會 fail，提示「Safe 尚未 acceptOwnership」；
+必須由 Safe 對 registry、router 各呼叫一次 `acceptOwnership()`。
+`pendingOwner()` 非零且不是 Safe 也會 fail；非 strict 模式下，Safe 設定與交接問題降為 warn。
+
+registry `operator()` 必須非零、符合 `OPERATOR_PRIVATE_KEY` 推導的 relayer 地址，且與 owner 不同；
+operator 錯誤不因非 strict 降級。讀不到 `operator()`／`pendingOwner()` 一律 fail，
+提示「不是 v2 合約」（也需確認 RPC）。preflight 全程唯讀，只輸出公開地址，不輸出私鑰。
 
 ---
 
@@ -65,6 +73,7 @@ CHAIN_ID=56
 RPC_URL=<BSC 主網 RPC>          ← 要付費/有 archive 的
 BUNDLER_URL=<主網 bundler>
 REGISTRY_ADDRESS=<部署後拿到>
+ATP_SAFE=<預期接手 registry 與 router 的 Safe 公開地址>
 EXECUTOR_ADDRESS=<部署後拿到>
 OPERATOR_PRIVATE_KEY=0x...      ← secret
 SESSION_KEY_MASTER_SEED=0x...   ← secret（32 bytes 隨機）
@@ -96,7 +105,7 @@ openssl rand -hex 32 | sed 's/^/0x/'
 ### 我會在你完成後做
 
 - 跑 `bun run scripts/preflight.ts --strict`
-- 回報每一項檢查結果，包含 `registry owner` 與 `executor.oracle` 是否正確
+- 回報每一項檢查結果，包含 registry／router 的 owner、pendingOwner、registry operator 與 `executor.oracle` 是否正確
 
 ---
 

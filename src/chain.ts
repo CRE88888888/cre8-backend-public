@@ -26,7 +26,7 @@ import type { RebalanceSchedule } from './strategies.js';
 
 /** Minimal AtpRegistry ABI: the three write paths this slice drives, plus the events used to read
  *  return values (registerStrategy → id, publishVersion → version) from the receipt. */
-const REGISTRY_ABI = [
+export const REGISTRY_ABI = [
   {
     type: 'function',
     name: 'registerStrategy',

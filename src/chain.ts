@@ -53,6 +53,13 @@ const REGISTRY_ABI = [
   },
   {
     type: 'function',
+    name: 'operator',
+    inputs: [],
+    outputs: [{ name: '', type: 'address' }],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
     name: 'enroll',
     inputs: [
       { name: 'account', type: 'address' },
@@ -61,6 +68,7 @@ const REGISTRY_ABI = [
     outputs: [],
     stateMutability: 'nonpayable',
   },
+  { type: 'error', name: 'Unauthorized', inputs: [] },
   {
     type: 'event',
     name: 'StrategyRegistered',
@@ -195,9 +203,23 @@ export async function publishVersionOnchain(
   return decodeReturnedId(receipt.logs, 'VersionPublished', 'version');
 }
 
-/** Enroll `account` (the user's Kernel smart account) into `onchainId`. */
-export async function enrollOnchain(account: Address, onchainId: number): Promise<void> {
-  const { wallet, publicClient, registryAddress, account: operator } = getChain();
+/** Enroll using the registry's operator. `chain` is an injection seam for unit tests. */
+export async function enrollOnchain(account: Address, onchainId: number, chain?: ChainConfig): Promise<void> {
+  const { wallet, publicClient, registryAddress, account: operator } = chain ?? getChain();
+
+  // ATP v2 does not grant the owner enrollment rights. Read on every attempt so a revoked or
+  // rotated operator fails before a transaction is submitted, even with a cached ChainConfig.
+  const registryOperator = await publicClient.readContract({
+    address: registryAddress,
+    abi: REGISTRY_ABI,
+    functionName: 'operator',
+  });
+  if (registryOperator.toLowerCase() !== operator.address.toLowerCase()) {
+    throw new Error(
+      `enroll operator mismatch: signer ${operator.address}, registry.operator() ${registryOperator}; ` +
+        '需由 owner 呼叫 setOperator 將 registry operator 設為 signer 地址',
+    );
+  }
 
   const hash = await wallet.writeContract({
     account: operator,

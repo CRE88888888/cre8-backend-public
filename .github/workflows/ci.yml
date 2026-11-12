@@ -55,6 +55,7 @@ jobs:
         run: >-
           bun test
           test/alerts.test.ts
+          test/chain.enroll.test.ts
           test/drift.test.ts
           test/funding.test.ts
           test/holdings-scan.test.ts

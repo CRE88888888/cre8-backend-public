@@ -92,6 +92,20 @@ DATABASE_URL='postgres://postgres@127.0.0.1:5432/cre8_atp_test' bun test
 只代表**伺服器**能用，不代表**測試**可以動鏈。把 `.env` 補齊就自動開跑，等於讓 `bun test` 變成一支
 會寫鏈的腳本，而這幾條測試共用同一個 operator 帳號的 nonce。
 
+ATP v2 的 fork 前置：部署 registry 後，先由 owner（anvil #0）呼叫
+`setOperator(<anvil #4 地址>)`，再用 anvil #4 的公開測試金鑰設定 `OPERATOR_PRIVATE_KEY`。
+owner 身分本身不能代替 smart account enroll；operator 未設定（零地址）或與 signer 不同時，
+backend 會在送出 enroll 交易前報錯，列出 signer 與鏈上 operator 地址，提示「需由 owner 呼叫 setOperator」。
+以下指令只對 X1 本機 fork（8546）執行；`REGISTRY_ADDRESS` 是該 fork 剛部署的 registry，
+`ANVIL_OWNER_KEY` 只可填 anvil #0 的公開測試金鑰：
+
+```bash
+cast send "$REGISTRY_ADDRESS" 'setOperator(address)' \
+  0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65 \
+  --rpc-url http://127.0.0.1:8546 --private-key "$ANVIL_OWNER_KEY"
+cast call "$REGISTRY_ADDRESS" 'operator()(address)' --rpc-url http://127.0.0.1:8546
+```
+
 ```bash
 # 預設：上面四個測試 skip，其餘照跑（0 fail）
 bun test

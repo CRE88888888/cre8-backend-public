@@ -54,7 +54,7 @@ bun run preflight             # 讀 .env、打真鏈與 DB 檢查設定
 - 依賴版本：`@scure/bip32`、`@zerodev/permissions` 是精確版本；升級會影響 session key 派生與 Kernel 權限編碼，必須讓 `test/kernel.test.ts`（golden）通過。安裝一律 frozen lockfile。
 - `tsconfig.scripts.json` 排除了兩支已知有型別錯誤的 script，修好再拿掉 exclude，不要放寬 strict。
 - 先查 `docs/pitfalls.zh-TW.md`：bundler／Kernel／fork 的錯誤訊息常常誤導。
-- `.bun-cache/` 目前在版控裡，不要順手刪或改。
+- `.bun-cache/` 是本機套件快取，已排除版控；不要加入 commit。
 
 ## Commit / PR 慣例
 

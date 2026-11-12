@@ -27,9 +27,9 @@ HTTP → src/index.ts（啟動：config → migrate → listen）
 | `src/server.ts` | 路由、body 解析（上限 1 MB）、錯誤 → JSON、CORS、access log、`POST /bundler` 的 relay 與方法白名單。 |
 | `src/index.ts` | 啟動與優雅關閉（SIGINT／SIGTERM）。 |
 | `src/migrate.ts` | `bun run migrate`：只跑 migration，不啟 server。 |
-| `test/strategies.test.ts` | 校驗純函式與 HTTP 路由單測（路由層可注入 `createStrategy`／`publishVersion`，不需 DB）；DB 整合測試以 `DATABASE_URL` 為 gate。 |
+| `test/strategies.test.ts` | 校驗純函式與 HTTP 路由測試；路由層可注入 `createStrategy`／`publishVersion`，但登入 session 仍需 DB。部分 DB 整合測試以 `DATABASE_URL` 為 gate。 |
 | `test/auth.test.ts` | SIWE nonce／login／session 與 provider ownership；用 viem `createSiweMessage` + 隨機錢包在測試內簽名，走完整 HTTP 流程。 |
-| `test/renewal.test.ts` | `/portfolios` 列表、`renewal-params`／`renewal-result`、路由分派、CORS 與 `/bundler` relay（含「白名單外不轉發」）；DB／鏈／時鐘／bundler 上游都以 DI 換成假替身。 |
+| `test/renewal.test.ts` | `/portfolios` 列表、`renewal-params`／`renewal-result`、路由分派、CORS 與 `/bundler` relay（含「白名單外不轉發」）；領域依賴以 DI 換成假替身，登入 session 仍需 DB。 |
 
 選擇 `node:http` 而不是 express：這一刀只有七個路由，少一層依賴；`server.ts` 的 `route()` 是唯一需要換掉的
 地方，之後要上 express/Fastify 不會動到領域層。
@@ -54,18 +54,29 @@ HTTP → src/index.ts（啟動：config → migrate → listen）
 
 ## 指令
 
+程式的 HTTP 埠預設是 **8080**（`src/config.ts` 的 `DEFAULT_PORT` 與 `.env.example`）。
+本機協作以 [AGENT_COLLABORATION §4](https://github.com/CRE8Finance/docs/blob/main/docs/AGENT_COLLABORATION.zh-TW.md#4-本機環境)
+為準：A3／cre8-app 用 **8081**，X1 用 **8082**。以下先以 X1 示範，curl 統一使用 `$API`：
+
 ```bash
-bun install
+bun install --frozen-lockfile
 cp .env.example .env       # 填入 DATABASE_URL
 
+export PORT=8082            # X1；A3／cre8-app 改成 8081
+export API="http://localhost:$PORT"
 bun run dev                # bun --watch src/index.ts（啟動時先 migrate）
 bun run migrate            # 只套用 migration
 bun run start              # bun src/index.ts
-bun run typecheck          # tsc --noEmit（src + test 兩份 tsconfig）
-bun test                   # bun 內建 test runner；沒有 DATABASE_URL 時 DB 測試會 skip
+bun run typecheck          # tsc --noEmit（src + test + scripts 三份 tsconfig）
+bun test                   # 完整測試需要可拋棄的 Postgres；見「測試與 DB」
 ```
 
 需求：Bun >= 1.4（`package.json` 的 `engines`）。bun 原生跑 TypeScript，不需 build 步驟、不需 tsx。
+
+容器的 API 同樣由 `src/config.ts` 讀取 `PORT`，未設定時監聽 **8080**。
+`Dockerfile` 的 `EXPOSE 8081` 與 `docker-entrypoint.sh` 的 `port=${PORT:-8081}` 日誌都不會設定
+`PORT`；entrypoint 直接執行 `bun src/index.ts`，`railway.json` 也沒有指定埠。
+因此不能由 repo 判定 Railway 環境實際傳入的 `PORT`，也不能只靠這行日誌判斷監聽埠。
 
 ### ATP v2 起飛前角色檢查（唯讀）
 
@@ -81,12 +92,41 @@ registry 的 `operator()` 必須非零、等於 `OPERATOR_PRIVATE_KEY` 推導的
 
 ### 測試與 DB
 
-```bash
-# 純函式 + auth／路由測試（不需 DB）
-bun test
+完整 `bun test` 需要可拋棄的 Postgres 與 `../db/migrations`（或以 `MIGRATIONS_DIR` 指向該目錄）。
+auth／renewal／portfolios／operator／strategies 的 HTTP 測試會讀寫 `auth_sessions`，
+即使其他依賴已注入假替身，沒有 DB 仍會失敗，**不會自動全部 skip**。
+未設 `DATABASE_URL` 時還會出現 `DATABASE_URL is required`，以及測試之間的 unhandled error；
+設成不可連線的假值也無法讓完整測試通過，登入等 HTTP 請求會回 503。
+只有明確設 gate 的 DB／fork／鏈上寫入測試會依條件 skip。
 
-# 加上 DB 整合測試；請用可拋棄的資料庫，測試會跑 migration 並建立／刪除資料
-DATABASE_URL='postgres://postgres@127.0.0.1:5432/cre8_atp_test' bun test
+```bash
+# 完整測試：X1 使用可拋棄的 cre8_x1，測試會跑 migration 並建立／刪除資料
+DATABASE_URL='postgres://postgres@127.0.0.1:5432/cre8_x1' bun test
+```
+
+沒有 Postgres 時，照 [.github/workflows/ci.yml](.github/workflows/ci.yml) 的
+`Unit tests (no DB)` **完整檔案清單**跑；該檔是清單的依據。必須保留不可連線的假 `DATABASE_URL`，
+讓 scheduler／snapshot 的清理 hook 能處理連線失敗；完全不設會同步 throw，產生 unhandled error。
+這個假值只適用於以下清單，不能換成不指定檔案的 `bun test`：
+
+```bash
+DATABASE_URL=postgres://ci:ci@127.0.0.1:1/unused bun test \
+  test/alerts.test.ts \
+  test/chain.enroll.test.ts \
+  test/drift.test.ts \
+  test/funding.test.ts \
+  test/holdings-scan.test.ts \
+  test/kernel.test.ts \
+  test/permissions.test.ts \
+  test/positions.test.ts \
+  test/preflight.test.ts \
+  test/pricing.test.ts \
+  test/pricing.crosscheck.test.ts \
+  test/rebalance-plan.test.ts \
+  test/scheduler.test.ts \
+  test/server.test.ts \
+  test/snapshot.integration.test.ts \
+  test/snapshot.scan.test.ts
 ```
 
 ### 會送鏈上交易的測試（`RUN_CHAIN_TESTS=1`）
@@ -120,7 +160,7 @@ cast call "$REGISTRY_ADDRESS" 'operator()(address)' --rpc-url http://127.0.0.1:8
 ```
 
 ```bash
-# 預設：上面四個測試 skip，其餘照跑（0 fail）
+# 已備妥 Postgres 與 migration：預設四個鏈上寫入測試 skip，其餘照跑
 bun test
 
 # 真的跑鏈上寫入：一定要給足 timeout，而且不要開 --concurrent
@@ -159,16 +199,18 @@ cd ../cre8-contracts
   --rpc-url http://127.0.0.1:8545 --broadcast --skip-simulation \
   --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 
-# 3. 起帶鏈設定的 backend（8081，避免撞到 8080）
+# 3. 起帶鏈設定的 backend（以下用 A3／cre8-app 的 8081；X1 改用 8082、fork 8546、DB cre8_x1）
 cd ../backend
-DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/cre8_atp' \
+export PORT=8081
+export API="http://localhost:$PORT"
+DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/cre8_integration' \
 RPC_URL='http://127.0.0.1:8545' \
 OPERATOR_PRIVATE_KEY='0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80' \
 REGISTRY_ADDRESS='<第 2 步印出的 registry>' \
-PORT=8081 AUTH_DOMAIN=localhost bun src/index.ts
+AUTH_DOMAIN=localhost bun src/index.ts
 
 # 4. 跑端到端整合（auth → 建策略 → 發版本 → enroll）
-bun run scripts/integration-fork.ts
+BACKEND_URL="$API" bun run scripts/integration-fork.ts
 ```
 
 驗證鏈上狀態：
@@ -180,8 +222,9 @@ cast call $REGISTRY 'enrollments(address)(uint256,uint16,bool)' $WALLET --rpc-ur
 
 注意：Anvil fork 的帳戶私鑰是公開的測試金鑰，**只用在本地 fork**；真實鏈上要用自己的錢包。
 
-沒有 `DATABASE_URL` 時，`node:test` 會把 DB 測試標成 skipped（不是 passed）。整合測試會自己
-`migrate()`，並在 `finally` 清掉建立的 strategy（versions 由 FK cascade）。
+部分 DB 整合測試會依 `DATABASE_URL` 的 gate 標成 skipped；這不涵蓋需要真 DB session 的 HTTP 測試
+（見「測試與 DB」）。DB 整合測試會自己 `migrate()`，並在 `finally` 清掉建立的 strategy
+（versions 由 FK cascade）。
 
 ## API
 
@@ -213,7 +256,7 @@ cast call $REGISTRY 'enrollments(address)(uint256,uint16,bool)' $WALLET --rpc-ur
 
 1. `POST /auth/nonce` 取得一次性 nonce（32 bytes hex，TTL 5 分鐘）與組訊息所需的欄位：
    ```bash
-   curl -s -X POST localhost:8080/auth/nonce
+   curl -s -X POST "$API/auth/nonce"
    # {"nonce":"<64 hex>","domain":"localhost","chainId":56,"uri":"http://localhost",
    #  "statement":"Sign in to CRE8 ATP","version":"1",
    #  "issuedAt":"2026-11-06T01:00:00.000Z","expiresAt":"2026-11-06T01:05:00.000Z"}
@@ -242,7 +285,7 @@ cast call $REGISTRY 'enrollments(address)(uint256,uint16,bool)' $WALLET --rpc-ur
    `Sign in to CRE8 ATP` + `URI`／`Version`／`Chain ID`／`Nonce`／`Issued At`）。
 3. `POST /auth/login`，body 只有 `{"message":"<完整 EIP-4361 訊息>","signature":"0x…"}`：
    ```bash
-   curl -s -X POST localhost:8080/auth/login -H 'content-type: application/json' -d '{
+   curl -s -X POST "$API/auth/login" -H 'content-type: application/json' -d '{
      "message": "<完整 SIWE 訊息，含換行>",
      "signature": "0x<65-byte signature>"
    }'
@@ -267,10 +310,10 @@ nonce 與 session 目前是**單一 process 的 in-memory Map**：重啟即失�
 Redis 或其它共享 store（見 TODO）。
 
 ```bash
-curl -s localhost:8080/health
+curl -s "$API/health"
 # {"status":"ok","service":"cre8-atp-backend","chainId":56,"rpcConfigured":false,"db":"ok","uptimeSeconds":3}
 
-curl -s -X POST localhost:8080/strategies -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{
+curl -s -X POST "$API/strategies" -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{
   "name": "Index 500",
   "description": "BSC bStock index",
   "isPublic": true,
@@ -278,7 +321,7 @@ curl -s -X POST localhost:8080/strategies -H "authorization: Bearer $TOKEN" -H '
 }'
 # {"id":1,"provider":"0x<session wallet, lowercase>",...,"swapFeeBps":25,"createdAt":"..."}
 
-curl -s -X POST localhost:8080/strategies/1/versions -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{
+curl -s -X POST "$API/strategies/1/versions" -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{
   "allocation": {"assets": [
     {"address": "0x00000000000000000000000000000000000000a1", "symbol": "AAPLB", "weightBps": 6000},
     {"address": "0x00000000000000000000000000000000000000b2", "weightBps": 4000}
@@ -336,7 +379,7 @@ curl -s -X POST localhost:8080/strategies/1/versions -H "authorization: Bearer $
 沒有任何「查誰」的參數，所以不存在改一個 query string 就讀到別人 portfolio 這條路。
 
 ```bash
-curl -s localhost:8080/portfolios -H "authorization: Bearer $TOKEN"
+curl -s "$API/portfolios" -H "authorization: Bearer $TOKEN"
 ```
 
 ```json
@@ -362,7 +405,7 @@ curl -s localhost:8080/portfolios -H "authorization: Bearer $TOKEN"
 **派生一把新的 session key，回傳前端組 UserOp 所需的一切。不簽章、不上鏈、不寫 DB。**
 
 ```bash
-curl -s localhost:8080/portfolios/3/renewal-params -H "authorization: Bearer $TOKEN"
+curl -s "$API/portfolios/3/renewal-params" -H "authorization: Bearer $TOKEN"
 ```
 
 ```json
@@ -406,7 +449,7 @@ curl -s localhost:8080/portfolios/3/renewal-params -H "authorization: Bearer $TO
 前端把已上鏈的續期結果記回 DB。**鏈是權威**，所以這裡不驗證 txHash 是否真的上鏈，只記錄。
 
 ```bash
-curl -s -X POST localhost:8080/portfolios/3/renewal-result \
+curl -s -X POST "$API/portfolios/3/renewal-result" \
   -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{
   "txHash": "0x…", "userOpHash": "0x…",
   "permissionId": "0x9ab4cdef", "sessionKeyAddress": "0x123…",
@@ -473,7 +516,7 @@ has been blocked by CORS policy: No 'Access-Control-Allow-Origin' header
 ### 契約
 
 ```bash
-curl -s -X POST localhost:8080/bundler   -H "authorization: Bearer $TOKEN" -H 'content-type: application/json'   -d '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
+curl -s -X POST "$API/bundler"   -H "authorization: Bearer $TOKEN" -H 'content-type: application/json'   -d '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
 # {"jsonrpc":"2.0","id":1,"result":"0x38"}
 ```
 

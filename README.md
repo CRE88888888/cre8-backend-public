@@ -246,40 +246,49 @@ skip 條件只看 fork 可不可用。
 
 ### Fork 鏈上整合測試（Anvil fork BSC mainnet）
 
-需要三個終端／背景程序：Anvil fork、帶鏈設定的 backend、整合腳本。
+ATP v2 的部署與串接步驟統一維護在
+[A3_INTEGRATION](https://github.com/CRE8Finance/docs/blob/main/docs/A3_INTEGRATION.zh-TW.md)。
+依該文件第 2–5 節啟動 fork、部署 `script/DeployAtpMainnet.s.sol`、讓 Safe 接手 registry 與
+router，再設定 alto 和 backend；完整瀏覽器流程見第 6–8 節。本機工具使用 PATH 上的
+`anvil`／`forge`／`cast`，不依賴特定使用者的安裝路徑或既有 state dump。
+
+埠與 DB 依 [AGENT_COLLABORATION §4](https://github.com/CRE8Finance/docs/blob/main/docs/AGENT_COLLABORATION.zh-TW.md#4-本機環境)：
+
+| 環境 | fork | backend | Postgres DB |
+| --- | --- | --- | --- |
+| A3／cre8-app（A3 文件預設） | 8545 | 8081 | `cre8_integration` |
+| X1 後端獨立驗證 | 8546 | 8082 | `cre8_x1` |
+
+X1 執行時替換 A3 指令中的 RPC、backend 埠與 DB 名稱，不占用 C3 的服務；cre8-app dev proxy
+固定接 A3 的 8545／8081，瀏覽器整套串接由 C3 執行。fork、backend 與 app 的 chain id 均須為 **56**
+（`DeployAtpMainnet` 不接受 1337）。anvil 使用 `--hardfork cancun --block-time 2`；
+上游 RPC 與 alto `--max-block-range 100` 的原因見 [pitfalls §2](docs/pitfalls.zh-TW.md#二anvil-fork本機開發環境)。
+
+角色固定分開：部署者用 anvil #0、backend relayer 用 #4、alto bundler executor 用 #5。
+`DeployAtpMainnet` 已設定 `operator = #4`，Safe 必須對 registry 與 router 各呼叫一次
+`acceptOwnership()`。交接後 owner 是 `ATP_SAFE`，anvil #0 已無 owner 權限，
+不需再執行上方測試前置示範的 `setOperator`。交接與角色設定完成後可唯讀驗證：
 
 ```bash
-# 1. 起 Anvil fork（chain 56，常駐）
-cd ../cre8-contracts
-/Users/jareklin/.foundry/bin/anvil --fork-url https://bsc-rpc.publicnode.com --chain-id 56 --port 8545
-
-# 2. 部署三個合約，記下 registry 地址（另一終端）
-/Users/jareklin/.foundry/bin/forge script script/DeployAtp.s.sol \
-  --rpc-url http://127.0.0.1:8545 --broadcast --skip-simulation \
-  --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
-
-# 3. 起帶鏈設定的 backend（以下用 A3／cre8-app 的 8081；X1 改用 8082、fork 8546、DB cre8_x1）
-cd ../backend
-export PORT=8081
-export API="http://localhost:$PORT"
-DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/cre8_integration' \
-RPC_URL='http://127.0.0.1:8545' \
-OPERATOR_PRIVATE_KEY='0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80' \
-REGISTRY_ADDRESS='<第 2 步印出的 registry>' \
-AUTH_DOMAIN=localhost bun src/index.ts
-
-# 4. 跑端到端整合（auth → 建策略 → 發版本 → enroll）
-BACKEND_URL="$API" bun run scripts/integration-fork.ts
+# 先載入 A3 第 3 步產生的 contracts.env；以下使用 X1 fork
+export ETH_RPC_URL=http://127.0.0.1:8546
+cast chain-id                                              # 56
+cast call "$REGISTRY_ADDRESS" 'owner()(address)'            # ATP_SAFE
+cast call "$REGISTRY_ADDRESS" 'pendingOwner()(address)'     # 0x000…000
+cast call "$REGISTRY_ADDRESS" 'operator()(address)'         # anvil #4
+cast call "$ROUTER_ADDRESS" 'owner()(address)'              # ATP_SAFE
+cast call "$ROUTER_ADDRESS" 'pendingOwner()(address)'       # 0x000…000
+cast call "$EXECUTOR_ADDRESS" 'oracle()(address)'           # ROUTER_ADDRESS
+# backend env 依 A3 第 5 步設定後：
+bun run preflight --strict                                 # 0 warn · 0 fail
 ```
 
-驗證鏈上狀態：
+舊的 `bootstrap-fork.sh`、`refresh-anvil.sh`、`deploy-elon-oracles.sh` 已移除：前兩支依賴不在 repo
+的 v1 dump／baseline，且重載的 state 與 DB／alto 不保證一致；後者會改掉 `DeployAtpMainnet` 已註冊的
+7 個固定池 oracle，Safe 接手後也沒有權限執行。fork 過期時，停止自己這套服務，依 A3 從新 fork
+重新部署並重建測試 DB、重啟 alto 與 backend；舊 DB 的 onchain id 與 smart account 不可沿用。
 
-```bash
-cast call $REGISTRY 'enrollments(address)(uint256,uint16,bool)' $WALLET --rpc-url http://127.0.0.1:8545
-# → 1 / 1 / false（strategyId / version / paused）
-```
-
-注意：Anvil fork 的帳戶私鑰是公開的測試金鑰，**只用在本地 fork**；真實鏈上要用自己的錢包。
+所有簽名與交易都只在本機 anvil fork 上執行，只使用 anvil 公開測試金鑰。
 
 部分 DB 整合測試會依 `DATABASE_URL` 的 gate 標成 skipped；這不涵蓋需要真 DB session 的 HTTP 測試
 （見「測試與 DB」）。DB 整合測試會自己 `migrate()`，並在 `finally` 清掉建立的 strategy

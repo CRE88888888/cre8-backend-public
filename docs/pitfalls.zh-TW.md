@@ -1,6 +1,6 @@
 # 踩過的坑與注意事項
 
-最後更新：2026-11-06
+最後更新：2026-11-13
 
 這份文件記錄**已經實際踩過**的坑。每條都附「症狀 → 原因 → 解法/繞法」，因為這些坑的共同特色是**報錯訊息誤導**：你看到的錯誤幾乎都不是真正的原因。
 
@@ -113,7 +113,12 @@ WARN   user operation rejected   reason: "INTERNAL FAILURE"
 
 ## 二、anvil fork（本機開發環境）
 
-### 2.1 fork 有約 75 分鐘的保存期限 ⚠ 最容易讓人以為「昨天還能跑」
+ATP v2 的操作以 [A3_INTEGRATION](https://github.com/CRE8Finance/docs/blob/main/docs/A3_INTEGRATION.zh-TW.md)
+為準。舊 `bootstrap-fork.sh`、`refresh-anvil.sh`、`deploy-elon-oracles.sh` 已移除；
+其他歷史紀錄或測試訊息若提到這些工具，請改用 A3 的從零部署流程。
+`DeployAtpMainnet` 需要 chain id **56**、`--hardfork cancun`，部署後由 Safe 接手。
+
+### 2.1 fork 的保存期限取決於上游 RPC ⚠ 暖查詢正常不代表還能寫入
 
 **症狀**
 合約查詢正常，但一查**鏈上不存在的新地址**就爆：
@@ -127,17 +132,22 @@ failed to get account for 0x...: HTTP error 403 with body:
 **真正的原因**
 anvil 是拿**自己啟動當下釘住的塊號**去問上游，不是打 `latest` tag。fork 區塊一旦落後上游太遠，就被歸類成 archive 請求。
 
-**實測窗口**
-| 上游 | 歷史窗口 |
+**上游實測（A3 於 2026-11-13 重測）**
+| 上游 | 結果 |
 |---|---|
-| `bsc-rpc.publicnode.com` | **約 75–80 分鐘**（`head−10000` 可，`head−11000` 起 403） |
-| `bsc-dataseed.bnbchain.org` | **僅約 43–58 秒**（`head−96` 可，`head−128` 起 missing trie node）→ 不可用 |
-| `bsc-mainnet.public.blastapi.io` | 能讀歷史，但 `eth_getLogs` 會 429 |
+| `bsc-rpc.publicnode.com` | 舊測試可讀約 75–80 分鐘的歷史；A3 實測 fork 寫入仍一律 `403 Archive requests require a personal token`，不適合本流程 |
+| `bsc-dataseed.bnbchain.org` | 歷史僅約 1 分鐘，部署讀 TWAP observation 時會 `missing trie node` |
+| `bsc-mainnet.public.blastapi.io` | A3 可讀約 10000 塊前的 state，fork 部署與交易可用；兩輪各約 40 分鐘正常。`eth_getLogs` 仍須縮小範圍（§2.9） |
+| `bsc.drpc.org` | 可讀，但部署途中會 429 限流 |
 
 **解法**
-跑 `bash backend/scripts/refresh-anvil.sh`（約 10 秒）。它會 dump → 重啟到最新塊 → loadState → 驗證。**每約 55 分鐘一次。**
+依 A3 第 2 節使用當次驗證可用的上游，並設 `--retries 20 --fork-retry-backoff 1000`。
+公共端點能力會變；先在本機 fork 做一筆 anvil 測試帳號的轉帳，確認不只有讀取可用。
+冷位址／storage 查詢開始失敗時，停止自己這套服務，從新 fork 重新部署 v2 合約，
+重建測試 DB 並重啟 alto、backend，避免沿用失效的 onchain id 或 smart account。
 
-**根因層面的建議**：這是「用免費公共 RPC 跑生產級工作流」的本質問題，換有 archive 的 keyed RPC（Alchemy / QuickNode / Infura 的 BSC 端點）才是正解。refresh 腳本只是止痛。
+舊的 dump → loadState 刷新流程不再支援。它依賴缺失的 `spike/anvil/baseline.json`、
+把 owner 寫死為 anvil #0，也沒有保證 dump 與新 fork 的硬分叉相容；不能拿來保留 v2 的測試狀態。
 
 ---
 
@@ -157,13 +167,13 @@ anvil 是拿**自己啟動當下釘住的塊號**去問上游，不是打 `lates
 
 **症狀**：送 UserOp 時 alto 回 `INTERNAL FAILURE`，自己重放 `handleOps` 得到 `execution reverted, data: "0x"`（空白 revert）。**op 本身沒有任何問題。**
 
-**原因**：alto 的模擬要讀 EntryPoint / validator 的 **storage**。fork 的 75 分鐘窗口過期後，anvil 對冷 storage 回 `403 Archive requests`，模擬在中途失敗 → 回空資料。
+**原因**：alto 的模擬要讀 EntryPoint / validator 的 **storage**。超過上游保留的歷史窗口後，anvil 對冷 storage 回 `403 Archive requests`，模擬在中途失敗 → 回空資料。
 
 **怎麼確認**：直接查一個需要 storage 的 view：
 ```bash
 cast call <EntryPoint> "getNonce(address,uint192)(uint256)" <account> <key> --rpc-url http://127.0.0.1:8545
 ```
-若回 `failed to get storage ... HTTP error 403` → 就是這個。跑 `bash backend/scripts/refresh-anvil.sh` 後重試即可。
+若回 `failed to get storage ... HTTP error 403` → 就是這個。依 §2.1 從新 fork 重建整套測試環境。
 
 **為什麼難查**：`403` 在 eRPC 層被 anvil 吞掉，最後表現成一個**毫無資訊的空白 revert**。這條要記住，不然會花很久懷疑 op 或簽章。
 
@@ -200,6 +210,43 @@ cast call <EntryPoint> "getNonce(address,uint192)(uint256)" <account> <key> --rp
 - `:8080` → `rpcConfigured: false`（讀 `backend/.env`，但那個檔沒有 `REGISTRY_ADDRESS`）
 
 驗證前先確認你打的是 8081，否則會以為「後端沒接鏈」。
+
+---
+
+### 2.8 v2 已部署 7 個 oracle，Safe 接手後 anvil #0 不能再改 router
+
+**症狀**：舊 `deploy-elon-oracles.sh` 對 5 個資產呼叫 `clearOracle`／`setOracle`，
+全部 `NotOwner()`（`0x30cd7471`）。
+
+**原因**：`DeployAtpMainnet` 已設定 7 個固定池 oracle，並將 registry 與 router 的 ownership
+交給 `ATP_SAFE`（各需 `acceptOwnership()`）；部署者 anvil #0 不再有 owner 權限。
+舊腳本按當下流動性另挑池子，即使有權限，也會覆蓋部署時驗證過的 oracle。
+
+**解法**：只走 A3 第 3 節的 `DeployAtpMainnet` + Safe 交接，不另跑 oracle 部署工具。
+驗證 registry／router 的 `owner() == ATP_SAFE`、`pendingOwner() == 0`，
+registry 的 `operator() == anvil #4`；backend relayer 用 #4，alto executor 用 #5，部署者用 #0。
+
+### 2.9 alto 找 UserOp 收據卡在上游 `eth_getLogs`
+
+**症狀**：app 停在「Signing the approval…」，backend `/bundler` 約 30 秒後回 502。
+
+**原因**：alto 的 `eth_getUserOperationReceipt` 預設查最近 2000 塊；本地 fork 尚未出足夠的塊時，
+範圍會跨到 fork 前的歷史塊，anvil 轉問上游 `eth_getLogs` 而卡住。
+
+**解法**：本機 alto 加 `--max-block-range 100`，anvil 加 `--block-time 2`（也讓 app 等到
+存款的 2 個確認）；先確保本地已產生超過 100 塊，需要時只對自己的 fork 執行
+`cast rpc anvil_mine 120 --rpc-url http://127.0.0.1:8546`（X1 埠；A3 用 8545）。
+
+### 2.10 `--gas-price` 改不到 fork 的 priority fee，smart account 會缺 gas
+
+**症狀**：第一次配置回 `Smart Account does not have sufficient funds` 或 `AA21 didn't pay prefund`。
+
+**原因**：A3 實測 fork 的 `eth_maxPriorityFeePerGas` 是 1 gwei，約為當時主網的 20 倍；
+`--gas-price 50000000` 不會降低它，加 `--disable-min-priority-fee` 只會讓 `eth_gasPrice` 變 0。
+預設補的 0.0005 BNB 因此不足以支付一輪再平衡（實測約 0.00135 BNB）。
+
+**解法**：只在本機 fork 的 backend env 設 `MIN_SESSION_GAS_WEI=5000000000000000`（0.005 BNB），
+照 A3 第 5 節讓 app 補 gas。已缺 gas 的測試帳戶可由 anvil 使用者錢包補 0.01 BNB 再重試。
 
 ---
 
@@ -533,7 +580,8 @@ bash: /bin/ps: Operation not permitted
 - **不支援** `${var,,}` / `${var^^}` → 用 `tr '[:upper:]' '[:lower:]'`
 - **變數緊接全形標點會吃字**：`$NEW_PID，` 會把 UTF-8 位元組當成變數名的一部分 → `unbound variable`
 
-`refresh-anvil.sh` 第一版就因此失敗過一次，中途留下一個「活著但 9 個合約全 `0x`」的 anvil。現在已加 `trap on_exit EXIT` 安全網。
+已移除的 `refresh-anvil.sh` 第一版就因此失敗過一次，中途留下一個「活著但 9 個合約全 `0x`」的 anvil。
+寫 shell 清理流程時要用 `trap on_exit EXIT` 處理啟動後的失敗，避免留下不完整狀態。
 
 ### 6.3 `docker pull ghcr.io/pimlicolabs/alto` 會被拒
 
@@ -1327,10 +1375,10 @@ ERROR executor: error submitting bundle transaction
        is lower than the current nonce of the account. "transaction already imported"
 ```
 
-`refresh-anvil.sh` 會把鏈的狀態換掉，alto 快取的 executor nonce 就過期了。它會一直重送、
+重建 fork 會把鏈的狀態換掉，alto 快取的 executor nonce 就過期了。它會一直重送、
 一直撞到 dedupe，而**客戶端只看得到 timeout**（錯誤訊息完全不提 nonce）。
 
-修法：`bash backend/scripts/refresh-anvil.sh` **然後** `docker restart alto-app`，順序不要顛倒。
+修法：依 §2.1 從新 fork 重建 v2 合約與測試 DB，然後重啟該環境的 alto、backend；不要沿用舊 alto 程序。
 驗證：`cast nonce <alto executor> --rpc-url …` 與 alto 日誌一致，再送一筆 op。
 
 **教訓**：當一個 RPC 回 200 但行為錯時，答案在**服務端的日誌**，不在客戶端的錯誤訊息裡。

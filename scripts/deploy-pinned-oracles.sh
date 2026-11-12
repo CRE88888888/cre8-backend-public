@@ -9,15 +9,17 @@
 # 所以這裡把「哪個資產用哪個池子」寫死，並在部署前**斷言該池有流動性** ——
 # 選錯就立刻報錯，不要靜默地部署一顆註定失敗的 oracle。
 #
-# 用法：bash backend/scripts/deploy-pinned-oracles.sh
+# 用法：RPC=http://127.0.0.1:8546 ROUTER=<v2 router> bash backend/scripts/deploy-pinned-oracles.sh
 set -uo pipefail
-cd "$(dirname "$0")/../.."
 export PATH="$HOME/.foundry/bin:$PATH"
 
 RPC="${RPC:-http://127.0.0.1:8545}"
+if [[ ! "$RPC" =~ ^https?://(127\.0\.0\.1|localhost)(:[0-9]+)?(/[^[:space:]]*)?$ ]]; then
+  echo "只允許 127.0.0.1／localhost 的 anvil fork RPC" >&2
+  exit 1
+fi
+ROUTER="${ROUTER:?請以 ROUTER 指定 fork 上的 v2 router 地址}"
 KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
-ROUTER="${ROUTER:-$(grep -E '^EXECUTOR_ADDRESS=' backend/.env | cut -d= -f2)}"
-USDT=0x55d398326f99059fF775485246999027B3197955
 TWAP_WINDOW=1800
 MAX_SLIPPAGE="${MAX_SLIPPAGE:-300}"
 MAX_AGE=3600
@@ -30,13 +32,8 @@ TRIPLES=(
   "0x2170Ed0880ac9A755fd29B2688956BD959F933F8:0xBe141893E4c6AD9272e8C04BAB7E6a10604501a5:500:ETH"
 )
 
-CODE="$(cd cre8-contracts && forge inspect src/atp/PancakeV3TwapOracle.sol:PancakeV3TwapOracle bytecode 2>/dev/null)"
-[ -n "$CODE" ] || { echo "找不到 oracle bytecode（先 forge build）"; exit 1; }
-
-# router 的位址要從鏈上反查：executor.oracle() 才是真正的 router
-ROUTER="$(cast call "$(grep -E '^EXECUTOR_ADDRESS=' backend/.env | cut -d= -f2)" "oracle()(address)" --rpc-url "$RPC" 2>/dev/null)"
-[ -n "$ROUTER" ] || { echo "讀不到 router（executor.oracle()）"; exit 1; }
 echo "  router = $ROUTER"
+failures=0
 
 for triple in "${TRIPLES[@]}"; do
   asset="$(echo "$triple" | cut -d: -f1)"
@@ -47,17 +44,34 @@ for triple in "${TRIPLES[@]}"; do
   liq="$(cast call "$pool" "liquidity()(uint128)" --rpc-url "$RPC" 2>/dev/null | perl -pe 's/ \[.*//' | tr -dc '0-9')"
   if [ -z "$liq" ] || [ "$liq" = "0" ]; then
     echo "  ✗ ${sym}: 池 $pool (fee $fee) 的 liquidity 是 0 或讀不到 —— 拒絕部署（死池會讓報價爆掉）"
-    continue
+    failures=$((failures + 1)); continue
   fi
 
-  args="$(cast abi-encode "constructor(address,address,address,uint32,uint16,uint32)" \
-    "$pool" "$asset" "$USDT" "$TWAP_WINDOW" "$MAX_SLIPPAGE" "$MAX_AGE")"
-  out="$(cast send --rpc-url "$RPC" --private-key "$KEY" --json --create "${CODE}${args#0x}" 2>&1)"
-  oracle="$(echo "$out" | python3 -c "import sys,json;print(json.load(sys.stdin).get('contractAddress') or '')" 2>/dev/null)"
-  [ -n "$oracle" ] || { echo "  ✗ ${sym}: 部署失敗 → $(echo "$out" | head -c 140)"; continue; }
-
-  cast send --rpc-url "$RPC" --private-key "$KEY" --json "$ROUTER" "clearOracle(address)" "$asset" >/dev/null 2>&1
-  reg="$(cast send --rpc-url "$RPC" --private-key "$KEY" --json "$ROUTER" "setOracle(address,address)" "$asset" "$oracle" 2>&1)"
+  if ! oracle="$(cast call "$ROUTER" "oracleOf(address)(address)" "$asset" --rpc-url "$RPC")"; then
+    echo "  ✗ ${sym}：讀取 oracleOf 失敗"; failures=$((failures + 1)); continue
+  fi
+  # 已註冊的資產先 clearOracle；失敗必須顯示，不能把未更新的 oracle 當成成功。
+  if [ "$oracle" != "0x0000000000000000000000000000000000000000" ]; then
+    clear="$(cast send --rpc-url "$RPC" --private-key "$KEY" --json "$ROUTER" "clearOracle(address)" "$asset" 2>&1)"
+    status="$(echo "$clear" | python3 -c "import sys,json;print(json.load(sys.stdin).get('status','?'))" 2>/dev/null)"
+    if [ "$status" != "0x1" ] && [ "$status" != "1" ]; then
+      echo "  ✗ ${sym}：clearOracle 失敗 → $clear" >&2
+      failures=$((failures + 1)); continue
+    fi
+  fi
+  reg="$(cast send --rpc-url "$RPC" --private-key "$KEY" --json "$ROUTER" "setOracle(address,address,uint32,uint16,uint32)" \
+    "$asset" "$pool" "$TWAP_WINDOW" "$MAX_SLIPPAGE" "$MAX_AGE" 2>&1)"
   status="$(echo "$reg" | python3 -c "import sys,json;print(json.load(sys.stdin).get('status','?'))" 2>/dev/null)"
+  if [ "$status" != "0x1" ] && [ "$status" != "1" ]; then
+    echo "  ✗ ${sym}：setOracle 失敗 → $reg" >&2
+    failures=$((failures + 1)); continue
+  fi
+  if ! oracle="$(cast call "$ROUTER" "oracleOf(address)(address)" "$asset" --rpc-url "$RPC")" || \
+    [ -z "$oracle" ] || [ "$oracle" = "0x0000000000000000000000000000000000000000" ]; then
+    echo "  ✗ ${sym}：setOracle 後讀不到 oracle 地址" >&2
+    failures=$((failures + 1)); continue
+  fi
   echo "  ✓ ${sym}  pool=$pool fee=$fee  liq>0  oracle=$oracle  setOracle=$status"
 done
+
+[ "$failures" -eq 0 ]

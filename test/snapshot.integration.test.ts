@@ -333,7 +333,7 @@ async function probeFork(): Promise<string | null> {
     const message = cause instanceof Error ? cause.message : String(cause);
     return (
       `anvil fork ${RPC_URL} 不可用（${message}）：403 Archive requests 就是上游 archive 視窗過期，` +
-      `跑 \`bash backend/scripts/refresh-anvil.sh\` 刷新（會重啟 anvil 並載回 deployments 的狀態）`
+      `請依 docs repo 的 \`docs/A3_INTEGRATION.zh-TW.md\` 重建 fork 與測試環境`
     );
   }
 }

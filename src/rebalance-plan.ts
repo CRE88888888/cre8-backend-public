@@ -964,7 +964,7 @@ export function resolveMaxImpactBps(value: number | null | undefined): number | 
 
 /**
  * oracle 是哪一種形狀。**先問 pinned 的介面，再問 hub 的介面**，理由是可觀測性：
- * 舊堆疊（測試與 `refresh-anvil.sh` 釘住的那條路）因此一次多餘的呼叫都不花，
+ * pinned 堆疊（包含測試）因此一次多餘的呼叫都不花，
  * 而新堆疊只多花三次註定 revert 的呼叫（`AtpMultiPoolOracle` 沒有 `pool()`）。
  */
 type OracleShape =

@@ -283,8 +283,8 @@ cast call "$EXECUTOR_ADDRESS" 'oracle()(address)'           # ROUTER_ADDRESS
 bun run preflight --strict                                 # 0 warn · 0 fail
 ```
 
-舊的 `bootstrap-fork.sh`、`refresh-anvil.sh`、`deploy-elon-oracles.sh` 已移除：前兩支依賴不在 repo
-的 v1 dump／baseline，且重載的 state 與 DB／alto 不保證一致；後者會改掉 `DeployAtpMainnet` 已註冊的
+舊的 fork 還原與自動選池腳本已移除：還原腳本依賴不在 repo 的 v1 dump／baseline，且重載的 state
+與 DB／alto 不保證一致；自動選池腳本會改掉 `DeployAtpMainnet` 已註冊的
 7 個固定池 oracle，Safe 接手後也沒有權限執行。fork 過期時，停止自己這套服務，依 A3 從新 fork
 重新部署並重建測試 DB、重啟 alto 與 backend；舊 DB 的 onchain id 與 smart account 不可沿用。
 

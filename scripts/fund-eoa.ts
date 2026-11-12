@@ -7,10 +7,11 @@
  * 窗口只有約 75 分鐘 —— 過了之後任何新位址的讀寫都會 403，症狀是錢包說「沒有 gas coin」。
  *
  * 實測結論：
- *   * fork **年輕**（剛 refresh）時：`anvil_setBalance` 有效，任何位址都能補。
- *   * fork **過期**後：連 `anvil_setBalance` 的讀回都會 403 —— 那時只能先跑 `refresh-anvil.sh`。
+ *   * fork **年輕**（剛重建）時：`anvil_setBalance` 有效，任何位址都能補。
+ *   * fork **過期**後：連 `anvil_setBalance` 的讀回都會 403 —— 請依 docs repo 的
+ *     `docs/A3_INTEGRATION.zh-TW.md` 重建 fork 與測試環境。
  *
- * 所以正確順序是「先 refresh，再補幣」。
+ * 所以正確順序是「先重建 fork 與測試環境，再補幣」。
  *
  * 用法：
  *   bun run scripts/fund-eoa.ts --address 0xabc… [--address 0xdef…] [--bnb 10] [--usdt 1000]
@@ -118,7 +119,7 @@ async function main(): Promise<void> {
     console.log(`  ${address}  ${Number(balance) / 1e18} BNB  ${ok ? '✓' : '✗ 回讀不符'}`);
     if (!ok) {
       throw new Error(
-        '回讀不符：fork 可能已經過期（上游 archive 窗口約 75 分鐘）。先跑 refresh-anvil.sh 再試 —— ' +
+        '回讀不符：fork 可能已經過期（上游 archive 窗口約 75 分鐘）。請依 docs repo 的 docs/A3_INTEGRATION.zh-TW.md 重建 fork 與測試環境後再試 —— ' +
           '寫入看起來成功但讀不到，就是這個症狀。',
       );
     }

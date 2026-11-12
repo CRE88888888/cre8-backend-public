@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 為 Elon Universe 的成分資產部署 TWAP oracle，**池子是明確釘住的**（不自動挑）。
 #
-# 為什麼不用自動挑：`deploy-elon-oracles.sh` 會按 `liquidity()` 選最大的池子，但實測它在
+# 為什麼不用自動挑：舊的自動選池流程會按 `liquidity()` 選最大的池子，但實測它在
 # 鏈狀態剛重建、RPC 讀取失敗時會退化成「全部 0 → 取第一個候選」，於是綁到**流動性 0 的死池**
 # （TSLAB fee=500 的 liq 就是 0）。死池的 `slot0` 停在 MAX_TICK，報價會變天文數字，
 # 而合約的下限檢查會讓整批 rebalance revert（`V3TooLittleReceived`）。

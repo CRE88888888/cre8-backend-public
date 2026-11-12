@@ -204,7 +204,7 @@ async function probeFork(): Promise<string | null> {
  * 樣本塊必須同時滿足兩件事，而且**兩件都在這個函式裡驗**，不靠呼叫端假設：
  * 1. oracle 在該塊真的有 code。fresh fork 上 fork 塊之前的塊沒有 state（`eth_getCode` 回 `0x`、
  *    `eth_call` 回 `0x`），在那裡探測等於把「環境沒部署」誤讀成「實作錯了」——這條探針曾經靠人工
- *    `anvil_mine 3` 才走得通，`refresh-anvil.sh` 之後就變成沒人記得的隱形前置條件。
+ *    `anvil_mine 3` 才走得通，重建 fork 後就變成沒人記得的隱形前置條件。
  * 2. 該塊的 `observe([window, 0])` 讀得到，且 delta 對窗長有餘數。
  *
  * 兩者不成立就往下一個塊走；範圍（≤3 塊）用完就回 null + 逐塊原因，由呼叫端印出並**明確 skip**

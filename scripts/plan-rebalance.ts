@@ -78,9 +78,9 @@ function formatTokens(amountWei: bigint, decimals: number): string {
 
 /**
  * 「這台 fork 上 AtpExecutor / AtpRegistry 是哪一個」不是 env 一定有的事（`.env` 的兩個變數可能是空的）。
- * `spike/anvil/baseline.json` 就是這台 fork 的部署記錄 —— `refresh-anvil.sh` 在沒有 REGISTRY_ADDRESS
- * 時也是這樣取（它拿去做 owner() 驗證）。所以這裡把它當**退路**：只在旗標／env 都沒給時使用，
- * 而且一定會把「我是從哪裡拿到這個地址的」印出來 —— 猜合約地址不該是靜默行為。
+ * `spike/anvil/baseline.json` 只作為舊環境的相容退路：只在旗標／env 都沒給時使用。
+ * 新的 v2 fork 請依 docs repo 的 `docs/A3_INTEGRATION.zh-TW.md` 部署並設定地址。
+ * 取到地址時一定會把「我是從哪裡拿到這個地址的」印出來 —— 猜合約地址不該是靜默行為。
  *
  * 傳進來的 key 依序嘗試，第一個有地址的就用：executor 是 `['AtpExecutorMultiPool', 'AtpExecutor']`，
  * 也就是**預設接多池堆疊**（oracle = AtpMultiPoolOracle）。退回 v1 時呼叫端會印警告：v1 的 oracle

@@ -411,9 +411,14 @@ curl -s -X POST "$API/strategies/1/versions" -H "authorization: Bearer $TOKEN" -
 
 - 請求 body 必須是物件；`allocation`、`schedule` 必填，`changeLog`、`activeAt` 選填。
 - `allocation` 必須是 `{"assets":[{"address":"0x…","symbol"?:"  ≤32 字","weightBps":2500}]}`。
-- 1–16 個資產（`MAX_VERSION_ASSETS`）；address 必須是 0x + 40 hex，入庫前轉小寫。
+- 1–16 個資產（`MAX_VERSION_ASSETS`，包含自動補入的 USDT）；address 必須是 0x + 40 hex，入庫前轉小寫。
 - 同一版本內資產不可重複（address 不分大小寫）。
-- `weightBps` 必須是 1–10000 的整數，總和**必須剛好 10000**。
+- `weightBps` 必須是 1–10000 的整數，USDT 另允許 0；總和**必須剛好 10000**。
+- 未提供 BSC USDT（`0x55d398326f99059fF775485246999027B3197955`）時，自動在最後補上
+  `{ address: "0x55d398326f99059ff775485246999027b3197955", symbol: "USDT", weightBps: 0 }`，不調整原有權重。
+  回傳、DB 與鏈上 `version.assets` 都包含此列，讓存入的 USDT 能被核准並配置到目標資產。
+  已提供 USDT 時保留其權重、不重複補列；16 個資產且缺 USDT 時回 400 `TOO_MANY_ASSETS`。
+  建立基金的初版與後續版本皆走此發布規則；不修改既有版本或既有投組固定的版本。
 - `schedule` 是 `{"kind":"interval","intervalSeconds":>=60}` 或 `{"kind":"cron","cron":"…"}`。
 - `changeLog` 選填，≤ 2000 字；`activeAt` 選填，預設 `now()`。
 - 必須帶 token，且該策略 DB 的 `provider` 必須等於 session 錢包（不分大小寫），否則 403 `FORBIDDEN`。

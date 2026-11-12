@@ -22,6 +22,7 @@ import type { PublishVersionInput, StrategyVersion } from '../src/strategies.js'
 
 const ASSET_A = '0x00000000000000000000000000000000000000a1';
 const ASSET_B = '0x00000000000000000000000000000000000000b2';
+const USDT = '0x55d398326f99059ff775485246999027b3197955';
 
 /** DB-backed tests only run when DATABASE_URL is present; otherwise node:test reports them as skipped. */
 const skipDb: boolean | string = process.env.DATABASE_URL
@@ -71,13 +72,53 @@ test('validateAllocation accepts weights that sum to 10000 and normalises addres
     ],
   });
 
-  assert.equal(allocation.assets.length, 2);
+  assert.equal(allocation.assets.length, 3);
   assert.deepEqual(allocation.assets[0], {
     address: `0x${'0'.repeat(36)}abcd`,
     symbol: 'AAPLB',
     weightBps: 6000,
   });
   assert.equal(allocation.assets[1]?.symbol, undefined);
+  assert.deepEqual(allocation.assets[2], { address: USDT, symbol: 'USDT', weightBps: 0 });
+});
+
+test('validateAllocation preserves an explicit USDT weight and is idempotent without mutating input', () => {
+  for (const weightBps of [0, 1000, 10_000]) {
+    const assets = [
+      { address: '0x55d398326f99059fF775485246999027B3197955', symbol: ' cash ', weightBps },
+      ...(weightBps === 10_000 ? [] : [{ address: ASSET_A, weightBps: 10_000 - weightBps }]),
+    ];
+    const input = { assets };
+    const original = structuredClone(input);
+    const allocation = validateAllocation(input);
+    assert.deepEqual(input, original);
+    assert.equal(allocation.assets.length, assets.length);
+    assert.deepEqual(allocation.assets[0], { address: USDT, symbol: 'cash', weightBps });
+    assert.deepEqual(validateAllocation(allocation), allocation);
+  }
+  const input = { assets: [{ address: ASSET_A, weightBps: 10_000 }] };
+  const original = structuredClone(input);
+  const allocation = validateAllocation(input);
+  assert.deepEqual(input, original);
+  assert.deepEqual(validateAllocation(allocation), allocation);
+});
+
+test('validateAllocation counts the automatic USDT row toward the 16-asset ceiling', () => {
+  const assets = Array.from({ length: 16 }, (_, index) => ({
+    address: `0x${(index + 1).toString(16).padStart(40, '0')}`,
+    weightBps: 625,
+  }));
+  expectValidationError(() => validateAllocation({ assets }), 'TOO_MANY_ASSETS');
+  const fifteen = assets.slice(0, 15).map((asset, index) => ({
+    ...asset, weightBps: index === 0 ? 1250 : 625,
+  }));
+  assert.equal(validateAllocation({ assets: fifteen }).assets.length, 16);
+  assert.equal(validateAllocation({
+    assets: [...fifteen, { address: USDT, weightBps: 0 }],
+  }).assets.length, 16);
+  assert.equal(validateAllocation({
+    assets: [...assets.slice(0, 15), { address: USDT, weightBps: 625 }],
+  }).assets.length, 16);
 });
 
 test('validateAllocation rejects weights that do not sum to 10000', () => {
@@ -100,6 +141,15 @@ test('validateAllocation rejects weights outside 1..10000 (including zero and fr
   for (const weightBps of [0, 12.5, 10_001, -100]) {
     expectValidationError(
       () => validateAllocation({ assets: [{ address: ASSET_A, weightBps }] }),
+      'WEIGHT_OUT_OF_RANGE',
+    );
+  }
+});
+
+test('validateAllocation still rejects negative, fractional and oversized USDT weights', () => {
+  for (const weightBps of [-1, 0.5, 10_001]) {
+    expectValidationError(
+      () => validateAllocation({ assets: [{ address: USDT, weightBps }] }),
       'WEIGHT_OUT_OF_RANGE',
     );
   }
@@ -510,6 +560,7 @@ test('DB: strategy and version round trip', { skip: skipChainWrites }, async () 
     );
     assert.equal(first.version, 1);
     assert.equal(first.activeAt !== null, true);
+    assert.deepEqual(first.allocation.assets.at(-1), { address: USDT, symbol: 'USDT', weightBps: 0 });
 
     const second = await publishVersion(
       strategy.id,
@@ -520,10 +571,13 @@ test('DB: strategy and version round trip', { skip: skipChainWrites }, async () 
       'it-provider',
     );
     assert.equal(second.version, 2);
+    assert.deepEqual(second.allocation.assets.at(-1), { address: USDT, symbol: 'USDT', weightBps: 0 });
 
     const detail = await getStrategy(strategy.id);
     assert.equal(detail.versions.length, 2);
     assert.equal(detail.versions[0]?.version, 2);
+    assert.deepEqual(detail.versions[0]?.allocation, second.allocation);
+    assert.deepEqual(detail.versions[1]?.allocation, first.allocation);
 
     const page = await listStrategies({ provider: 'it-provider', isPublic: false, limit: 100 });
     assert.ok(page.items.some((item) => item.id === strategy.id));
@@ -601,6 +655,7 @@ test('DB: POST /strategies/:id/versions publishes a version over HTTP', { skip: 
         [
           [ASSET_A, 6000],
           [ASSET_B, 4000],
+          [USDT, 0],
         ],
       );
 

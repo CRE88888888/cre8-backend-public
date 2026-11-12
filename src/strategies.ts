@@ -12,6 +12,8 @@ export const MAX_SWAP_FEE_BPS = 300;
 export const MIN_INTERVAL_SECONDS = 60;
 
 const ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
+/** BSC USDT, the numeraire pinned by DeployAtpMainnet (also used on the local BSC fork). */
+const USDT_NUMERAIRE_ADDRESS = '0x55d398326f99059ff775485246999027b3197955';
 const MAX_PROVIDER_LENGTH = 200;
 const MAX_NAME_LENGTH = 120;
 const MAX_DESCRIPTION_LENGTH = 2_000;
@@ -21,7 +23,7 @@ export type AllocationAsset = {
   address: string;
   /** Optional display ticker, e.g. AAPLB. */
   symbol?: string;
-  /** Weight in basis points, 1-10000; every version's weights sum to exactly 10000. */
+  /** Weight in basis points, 1-10000 (USDT may be 0); weights sum to exactly 10000. */
   weightBps: number;
 };
 
@@ -119,8 +121,9 @@ type VersionRow = {
 /**
  * Validate and normalise an allocation:
  *   - exactly the shape { assets: [{ address, symbol?, weightBps }] }
- *   - 1..16 assets, addresses unique (case-insensitive), stored lowercase
- *   - integer weights in 1..10000 summing to exactly 10000
+ *   - 1..16 assets including USDT, addresses unique (case-insensitive), stored lowercase
+ *   - integer weights in 1..10000 (USDT may be 0) summing to exactly 10000
+ *   - append USDT at weight 0 if absent, so deposits can be spent by the executor
  */
 export function validateAllocation(input: unknown): Allocation {
   if (!isRecord(input)) {
@@ -164,15 +167,16 @@ export function validateAllocation(input: unknown): Allocation {
     seen.add(address);
 
     const weightBps = entry.weightBps;
+    const minWeightBps = address === USDT_NUMERAIRE_ADDRESS ? 0 : 1;
     if (
       typeof weightBps !== 'number' ||
       !Number.isInteger(weightBps) ||
-      weightBps < 1 ||
+      weightBps < minWeightBps ||
       weightBps > BPS_DENOMINATOR
     ) {
       throw new ValidationError(
         'WEIGHT_OUT_OF_RANGE',
-        `allocation.assets[${index}].weightBps must be an integer in 1..${BPS_DENOMINATOR}`,
+        `allocation.assets[${index}].weightBps must be an integer in ${minWeightBps}..${BPS_DENOMINATOR}`,
       );
     }
     sum += weightBps;
@@ -199,6 +203,16 @@ export function validateAllocation(input: unknown): Allocation {
       'WEIGHT_SUM',
       `allocation weights must sum to ${BPS_DENOMINATOR} bps, got ${sum}`,
     );
+  }
+
+  if (!seen.has(USDT_NUMERAIRE_ADDRESS)) {
+    if (normalised.length === MAX_VERSION_ASSETS) {
+      throw new ValidationError(
+        'TOO_MANY_ASSETS',
+        `allocation.assets must contain at most ${MAX_VERSION_ASSETS} assets including USDT; leave one slot for the automatic USDT row`,
+      );
+    }
+    normalised.push({ address: USDT_NUMERAIRE_ADDRESS, symbol: 'USDT', weightBps: 0 });
   }
 
   return { assets: normalised };

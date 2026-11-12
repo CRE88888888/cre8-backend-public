@@ -19,6 +19,7 @@ import { DEFAULT_MAX_IMPACT_BPS, resolveMaxImpactBps } from '../src/rebalance-pl
 import { capAmountInForImpact, estimateImpact } from '../src/impact.js';
 import type { PoolImpactState } from '../src/impact.js';
 import { twapPriceInUsdt } from '../src/pricing.js';
+import { validateAllocation } from '../src/strategies.js';
 
 /**
  * 規劃器的測試。三種結果（noop / blocked / ready）各自的**理由**與**數字**都要釘死：
@@ -1060,6 +1061,28 @@ test('永不回空 steps：noop / blocked 都沒有 steps 欄位，ready 一定 
 });
 
 // ---------------------------------------------------------------- hub 模式：N 資產、USDT 為中央
+
+test('#24 自動補入 0 權重 USDT：純存款視為超配，規劃買入兩個目標資產', async () => {
+  const allocation = validateAllocation({ assets: [
+    { address: WBNB, weightBps: 5000 },
+    { address: TOKEN3, weightBps: 5000 },
+  ] });
+  const targets = allocation.assets.map(({ address, weightBps }) => ({ asset: address as Address, weightBps }));
+  const holdings = [holding(USDT, 200n * 10n ** 18n, 18, PRICE_1_USD)];
+  const drift = computeDrift(holdings, targets, 100);
+  assert.equal(drift.assets.find((row) => row.asset.toLowerCase() === USDT)?.deltaBps, 10_000);
+  const chain = hubChain({ quotes: {
+    [`${USDT}:${WBNB}`]: { minimum: 99n * 10n ** 15n },
+    [`${USDT}:${TOKEN3}`]: { minimum: 99n * 10n ** 18n },
+  } });
+  const plan = expectReady(await planRebalance(hubArgs(chain, { holdings, targets, thresholdBps: 100 })));
+  assert.equal(plan.steps.length, 2);
+  assert.deepEqual(plan.steps.map((step) => step.tokenOut), [getAddress(WBNB), getAddress(TOKEN3)]);
+  for (const step of plan.steps) {
+    assert.equal(step.tokenIn, getAddress(USDT));
+    assert.equal(step.amountIn, 100n * 10n ** 18n);
+  }
+});
 
 test('H1 3 資產手算：40/30/30 vs 實際 60/20/20 → 賣 0.2 WBNB、買 100 USDT 的 NVDAB', async () => {
   // 手算（全部整數，1e8 定點 USD）：

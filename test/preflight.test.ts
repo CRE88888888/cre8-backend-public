@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { mnemonicToAccount } from 'viem/accounts';
 import { zeroAddress } from 'viem';
 import type { Address } from 'viem';
-import { checkOwnership, checkRegistryOperator, checkRoleSeparation, operatorAddress } from '../scripts/preflight.js';
+import { checkOwnership, checkRegistryOperator, checkRoleSeparation, checkSessionKeySeed, operatorAddress } from '../scripts/preflight.js';
 
 const OWNER: Address = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266';
 const SAFE: Address = '0x000000000000000000000000000000000000aBcD';
@@ -12,6 +12,24 @@ const OPERATOR: Address = '0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65';
 const BUNDLER: Address = '0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc';
 
 const separatedRoles = { relayer: OPERATOR, deployer: OWNER, bundler: BUNDLER, safe: SAFE, strict: true };
+
+test('seed 比對：部分或全部不符都 fail，訊息帶實際把數，無 key 時明說檢查 0 把', () => {
+  const report = { complete: true, checked: 3, mismatchedPortfolioIds: [5, 7], failedPortfolioIds: [], unavailable: 0 };
+  assert.equal(checkSessionKeySeed(report).level, 'fail');
+  assert.match(checkSessionKeySeed(report).detail, /檢查 3 把 session key：2 把不符/);
+  assert.equal(checkSessionKeySeed({ ...report, checked: 2 }).level, 'fail');
+  assert.equal(checkSessionKeySeed({ ...report, mismatchedPortfolioIds: [] }).level, 'ok');
+  const empty = checkSessionKeySeed({ ...report, checked: 0, mismatchedPortfolioIds: [] });
+  assert.equal(empty.level, 'ok');
+  assert.match(empty.detail, /檢查 0 把/);
+});
+
+test('seed 比對：不能派生必須 fail，沒有已安裝 key 必須 warn（strict 會擋）', () => {
+  const report = { complete: true, checked: 1, mismatchedPortfolioIds: [], failedPortfolioIds: [5], unavailable: 0 };
+  assert.equal(checkSessionKeySeed(report).level, 'fail');
+  assert.match(checkSessionKeySeed(report).detail, /1 個帳戶派生或讀取失敗/);
+  assert.equal(checkSessionKeySeed({ ...report, checked: 0, failedPortfolioIds: [], unavailable: 1 }).level, 'warn');
+});
 
 test('three distinct anvil roles separate from the Safe pass all nine key checks', () => {
   const checks = checkRoleSeparation(separatedRoles);

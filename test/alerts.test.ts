@@ -19,9 +19,11 @@ import {
 } from '../src/alerts.js';
 import type { AlertFinding, QueryFn } from '../src/alerts.js';
 import { OPS_GAS_PER_OPERATION, perOperationCostWei } from '../src/funding.js';
-import { announceAlerts, runSchedulerOnce } from '../src/scheduler.js';
+import { announceAlerts, inspectSessionKeyDerivation, runSchedulerOnce } from '../src/scheduler.js';
 import type { SchedulerQueryFn } from '../src/scheduler.js';
-import type { Address } from 'viem';
+import { deriveSessionKey } from '../src/permissions.js';
+import type { Address, Hex } from 'viem';
+import { checkSessionKeySeed } from '../scripts/preflight.js';
 
 /**
  * 告警的測試。三件事要證明，而且是分開證明的：
@@ -79,6 +81,141 @@ function findSeen(seen: readonly Seen[], fragment: string): Seen {
   assert.ok(hit !== undefined, `沒有發出包含「${fragment}」的 SQL（收到 ${seen.length} 條）`);
   return hit;
 }
+
+const TEST_SEED: Hex = `0x${'11'.repeat(32)}`;
+const OTHER_TEST_SEED: Hex = `0x${'22'.repeat(32)}`;
+
+function auditKey(index: number, masterSeed = TEST_SEED) {
+  const key = deriveSessionKey(index, { masterSeed });
+  return {
+    key_ref: key.keyRef, owner: SMART_ACCOUNT,
+    permissions: { permissionId: `0x${index.toString(16).padStart(8, '0')}`, sessionKeyAddress: key.address, timestamp: { validUntil: 2_000_000_000 } },
+  };
+}
+
+test('seed audit：所有 active 帳戶都比對，正確／部分錯誤／全部錯誤都帶真實把數', async () => {
+  let wrong = 0;
+  const { query, seen } = stubQuery((sql, params) => {
+    if (sql.includes('select sa.portfolio_id, sa.address')) {
+      return [1, 2].map((id) => ({ portfolio_id: String(id), address: SMART_ACCOUNT }));
+    }
+    if (sql.includes('from session_keys k')) {
+      const id = Number(params[0]);
+      return [auditKey(id, id <= wrong ? OTHER_TEST_SEED : TEST_SEED)];
+    }
+    return [];
+  });
+  const checks = {
+    query,
+    readPermissionConfig: async () => ({ signer: SMART_ACCOUNT, policyCount: 3 }),
+    deriveSessionKeyAddress: async (keyRef: string) => deriveSessionKey(Number(keyRef.split('/').at(-1)), { masterSeed: TEST_SEED }).address,
+  };
+  for (wrong of [0, 1, 2]) {
+    const report = await inspectSessionKeyDerivation(1337, checks);
+    assert.equal(report.checked, 2);
+    assert.equal(report.mismatchedPortfolioIds.length, wrong);
+    assert.equal(report.failedPortfolioIds.length, 0);
+  }
+  const inventory = findSeen(seen, 'select sa.portfolio_id, sa.address');
+  assert.deepEqual(inventory.params, [1337]);
+  assert.match(inventory.sql, /sa.chain_id = \$1/);
+  assert.match(inventory.sql, /p.schedule_state = 'active'/);
+  assert.match(inventory.sql, /sa.account_type = 'KERNEL'/);
+  assert.match(inventory.sql, /k.status = 'active' and k.expires_at > now\(\)/);
+  assert.ok(!inventory.sql.includes('next_run_at'), '未到期也要持續比對，不能在無認領的下一輪誤解除');
+});
+
+test('seed audit：最新 key 未安裝仍驗舊的；完成續期後只驗新 key，不因舊 seed 誤報', async () => {
+  const newer = auditKey(2);
+  const older = auditKey(1, OTHER_TEST_SEED);
+  let renewed = false;
+  const { query } = stubQuery((sql) => sql.includes('select sa.portfolio_id, sa.address')
+    ? [{ portfolio_id: '1', address: SMART_ACCOUNT }]
+    : sql.includes('from session_keys k') ? [newer, older] : []);
+  const checks = {
+    query,
+    readPermissionConfig: async ({ permissionId }: { permissionId: Hex }) => ({
+      signer: permissionId === newer.permissions.permissionId && !renewed ? `0x${'00'.repeat(20)}` as Address : SMART_ACCOUNT,
+      policyCount: 3,
+    }),
+    deriveSessionKeyAddress: async (keyRef: string) => deriveSessionKey(Number(keyRef.split('/').at(-1)), { masterSeed: TEST_SEED }).address,
+  };
+  assert.deepEqual((await inspectSessionKeyDerivation(1337, checks)).mismatchedPortfolioIds, [1]);
+  renewed = true;
+  assert.deepEqual((await inspectSessionKeyDerivation(1337, checks)).mismatchedPortfolioIds, []);
+});
+
+test('seed audit：無法派生計為失敗，沒有安裝 key 則明列 unavailable', async () => {
+  const { query } = stubQuery((sql) => sql.includes('select sa.portfolio_id, sa.address')
+    ? [{ portfolio_id: '1', address: SMART_ACCOUNT }]
+    : sql.includes('from session_keys k') ? [auditKey(1)] : []);
+  const checks = {
+    query, readPermissionConfig: async () => ({ signer: SMART_ACCOUNT, policyCount: 3 }),
+    deriveSessionKeyAddress: async (): Promise<Address> => { throw new Error(`sensitive test seed ${TEST_SEED}`); },
+  };
+  const report = await inspectSessionKeyDerivation(1337, checks);
+  assert.equal(report.complete, true, '派生本身失敗仍是完整報告，可產生 seed 警示');
+  assert.deepEqual(report.failedPortfolioIds, [1]);
+  assert.ok(!JSON.stringify(report).includes(TEST_SEED));
+  const unavailable = await inspectSessionKeyDerivation(1337, {
+    ...checks, readPermissionConfig: async () => ({ signer: `0x${'00'.repeat(20)}` as Address, policyCount: 0 }),
+  });
+  assert.equal(unavailable.unavailable, 1);
+  assert.equal(unavailable.checked, 0);
+  assert.deepEqual(unavailable.failedPortfolioIds, []);
+});
+
+for (const failureMode of ['DB', 'RPC'] as const) {
+  test(`seed audit：單戶 ${failureMode} 讀取失敗仍檢查後續帳戶，preflight 判 fail`, async () => {
+    const { query } = stubQuery((sql, params) => {
+      if (sql.includes('select sa.portfolio_id, sa.address')) {
+        return [1, 2, 3].map((id) => ({ portfolio_id: String(id), address: SMART_ACCOUNT }));
+      }
+      if (sql.includes('select k.key_ref, k.permissions')) {
+        const id = Number(params[0]);
+        if (failureMode === 'DB' && id === 1) throw new Error(`read failed ${TEST_SEED}`);
+        return [auditKey(id, id === 3 ? OTHER_TEST_SEED : TEST_SEED)];
+      }
+      return [];
+    });
+    const report = await inspectSessionKeyDerivation(1337, {
+      query,
+      readPermissionConfig: async ({ permissionId }) => {
+        if (failureMode === 'RPC' && permissionId === auditKey(1).permissions.permissionId) {
+          throw new Error(`read failed ${TEST_SEED}`);
+        }
+        return { signer: SMART_ACCOUNT, policyCount: 3 };
+      },
+      deriveSessionKeyAddress: async (keyRef) => deriveSessionKey(Number(keyRef.split('/').at(-1)), { masterSeed: TEST_SEED }).address,
+    });
+    assert.equal(report.complete, false);
+    assert.equal(report.checked, 2);
+    assert.deepEqual(report.failedPortfolioIds, [1]);
+    assert.deepEqual(report.mismatchedPortfolioIds, [3]);
+    assert.equal(checkSessionKeySeed(report).level, 'fail');
+    assert.ok(!JSON.stringify({ report, check: checkSessionKeySeed(report) }).includes(TEST_SEED));
+  });
+}
+
+test('announceAlerts：seed 比對拋錯仍記錄 gas_low，resolve 排除 seed kind', async () => {
+  const { query, seen } = stubQuery((sql) => {
+    if (sql.includes('h.confirmed_count')) return [{ portfolio_id: PORTFOLIO_ID, address: SMART_ACCOUNT }];
+    if (sql.includes('select sa.portfolio_id, sa.address')) throw new Error(`inventory unavailable ${TEST_SEED}`);
+    return [];
+  });
+  const lines: string[] = [];
+  await announceAlerts({
+    query, now: NOW, chainId: 1337, log: (line) => lines.push(line),
+    gasChecks: { readNativeBalance: async () => 0n, readGasPrice: async () => GAS_PRICE_WEI },
+  });
+  const inserts = seen.filter(({ sql }) => sql.includes('insert into scheduler_alerts'));
+  assert.equal(inserts.length, 1);
+  assert.equal(inserts[0]?.params[0], 'gas_low');
+  assert.deepEqual(findSeen(seen, 'update scheduler_alerts').params[2], ['session_key_derivation_mismatch']);
+  assert.equal(lines.filter((line) => line.includes('seed 比對失敗')).length, 1);
+  assert.ok(lines.some((line) => line.includes('[ALERT][warn]')));
+  assert.ok(!JSON.stringify(lines).includes(TEST_SEED), '失敗 log 不帶原始例外中的敏感內容');
+});
 
 // ---------------------------------------------------------------------------
 // 1. 規則 1：連續失敗
@@ -457,6 +594,15 @@ test('resolveAlerts：這一輪什麼都沒偵測到（空陣列）→ 全部解
   const { query, seen } = stubQuery(() => [{ id: '1' }]);
   assert.equal(await resolveAlerts(query, [], NOW), 1);
   assert.deepEqual(findSeen(seen, 'update scheduler_alerts').params[1], [], '空陣列＝現在沒有問題');
+  assert.deepEqual(findSeen(seen, 'update scheduler_alerts').params[2], [], '預設不排除任何 kind');
+});
+
+test('resolveAlerts：未完成偵測的 kind 從解除條件排除', async () => {
+  const { query, seen } = stubQuery(() => []);
+  await resolveAlerts(query, [], NOW, undefined, ['session_key_derivation_mismatch']);
+  const update = findSeen(seen, 'update scheduler_alerts');
+  assert.match(update.sql, /kind <> all\(\$3::text\[\]\)/);
+  assert.deepEqual(update.params[2], ['session_key_derivation_mismatch']);
 });
 
 test('listOpenAlerts：pg 的字串／Date 會被正規化，critical 先', async () => {
@@ -620,6 +766,143 @@ async function dbReason(): Promise<string | null> {
 const dbSkip = await dbReason();
 if (dbSkip !== null) console.warn(`[alerts] 真 DB 的測試 skip：${dbSkip}`);
 const dbGate = dbSkip === null ? {} : { skip: dbSkip };
+
+for (const failureMode of ['inventory', 'DB', 'RPC'] as const) {
+  test(`真 Postgres：seed ${failureMode} 讀取失敗仍記錄 gas_low、解除其他警示並保留 seed 警示`, dbGate, async () => {
+    await assert.rejects(() => withTransaction(async (client) => {
+      await client.query('delete from scheduler_alerts');
+      const strategy = await client.query("insert into strategies (provider, name) values ('0xseed-test', 'seed read failure fixture') returning id");
+      const portfolio = await client.query(`insert into portfolios (user_id, strategy_id, version)
+        values ('0xseed-test', $1, 1) returning id`, [strategy.rows[0]?.id]);
+      const portfolioId = Number(portfolio.rows[0]?.id);
+      const kind = 'session_key_derivation_mismatch';
+      const q: QueryFn = async (sql, params = []) => {
+        if (sql.includes('h.confirmed_count')) return { rows: [{
+          portfolio_id: portfolioId, address: SMART_ACCOUNT, confirmed_count: 1, last_confirmed_at: NOW,
+        }] };
+        if (sql.includes('row_number() over') || sql.includes('k.expires_at <= $1') || sql.includes('with latest as')) return { rows: [] };
+        if (sql.includes('select sa.portfolio_id, sa.address')) {
+          if (broken && failureMode === 'inventory') throw new Error('inventory unavailable');
+          return { rows: [1, 2].map((id) => ({ portfolio_id: id, address: SMART_ACCOUNT })) };
+        }
+        if (sql.includes('select k.key_ref, k.permissions')) {
+          const id = Number(params[0]);
+          if (broken && failureMode === 'DB' && id === 1) throw new Error('key query unavailable');
+          return { rows: [auditKey(id, broken && id === 2 ? OTHER_TEST_SEED : TEST_SEED)] };
+        }
+        return client.query(sql, [...params]);
+      };
+      let broken = true;
+      const lines: string[] = [];
+      const messages: string[] = [];
+      const round = () => announceAlerts({
+        query: q, now: NOW, chainId: 1337, log: (line) => lines.push(line),
+        gasChecks: { readNativeBalance: async () => 0n, readGasPrice: async () => GAS_PRICE_WEI },
+        sessionKeyChecks: {
+          readPermissionConfig: async ({ permissionId }) => {
+            if (broken && failureMode === 'RPC' && permissionId === auditKey(1).permissions.permissionId) throw new Error('RPC unavailable');
+            return { signer: SMART_ACCOUNT, policyCount: 3 };
+          },
+          deriveSessionKeyAddress: async (keyRef) => deriveSessionKey(Number(keyRef.split('/').at(-1)), { masterSeed: TEST_SEED }).address,
+        },
+        sendNotification: async (message) => { messages.push(message); },
+      });
+      await recordAlerts(q, [finding({ kind, portfolioId: null }), finding({ kind: 'portfolio_stuck', portfolioId })], NOW);
+      await round();
+      const open = await listOpenAlerts(q);
+      assert.deepEqual(open.map((alert) => alert.kind).sort(), ['gas_low', kind].sort());
+      assert.equal(open.find((alert) => alert.kind === kind)?.occurrences, 1, '未完成檢查不新增或累加 seed 警示');
+      assert.ok(messages.some((message) => message.includes('gas_low')));
+      assert.ok(messages.some((message) => message.includes('portfolio_stuck') && message.includes('已解除')));
+      assert.ok(!messages.some((message) => message.includes(kind)), 'seed 警示不誤發解除通知');
+      assert.equal(lines.filter((line) => /seed 比對.*(?:失敗|未完成)/.test(line)).length, 1);
+      broken = false;
+      await round();
+      assert.deepEqual((await listOpenAlerts(q)).map((alert) => alert.kind), ['gas_low']);
+      assert.ok(messages.some((message) => message.includes(kind) && message.includes('已解除')), '讀取恢復後可正常解除 seed 警示');
+      await client.query('delete from scheduler_alerts where kind = $1', [kind]);
+      broken = true;
+      await round();
+      const seedRows = await client.query('select id from scheduler_alerts where kind = $1', [kind]);
+      assert.equal(seedRows.rows.length, 0, '即使已知其他帳戶不符，未完成檢查也不能新增 seed 警示');
+      assert.ok(!JSON.stringify({ messages, lines }).includes(TEST_SEED));
+      throw new Error('rollback seed read failure fixture');
+    }), /rollback seed read failure fixture/);
+  });
+}
+
+test('真 Postgres：seed mismatch 彙整、去重、Telegram、health 與換回／續期自動解除', dbGate, async () => {
+  await assert.rejects(() => withTransaction(async (client) => {
+    const q: QueryFn = async (sql, params = []) => {
+      // 其他既有規則各有自己的整合測試，這裡只隔離 seed 規則與真實 alert 寫入。
+      if (sql.includes('row_number() over') || sql.includes('k.expires_at <= $1') ||
+          sql.includes('h.confirmed_count') || sql.includes('with latest as')) return { rows: [] };
+      return client.query(sql, [...params]);
+    };
+    const chainId = 999_028;
+    const kind = 'session_key_derivation_mismatch';
+    await client.query('delete from scheduler_alerts where kind = $1', [kind]);
+    const strategy = await client.query("insert into strategies (provider, name) values ('0xseed-test', 'seed audit fixture') returning id");
+    const ids: number[] = [];
+    for (const mode of ['active', 'active', 'paused', 'idle', 'expired', 'revoked', 'other-chain', 'EOA']) {
+      const state = mode === 'paused' || mode === 'idle' ? mode : 'active';
+      const p = await client.query(`insert into portfolios (user_id, strategy_id, version, schedule_state, next_run_at)
+        values ('0xseed-test', $1, 1, $2, now() + interval '1 day') returning id`, [strategy.rows[0]?.id, state]);
+      const id = Number(p.rows[0]?.id);
+      const key = auditKey(id * 10, OTHER_TEST_SEED);
+      ids.push(id);
+      await client.query(`insert into smart_accounts (portfolio_id, chain_id, address, owner, account_type)
+        values ($1, $2, $3, $4, $5)`, [id, mode === 'other-chain' ? chainId + 1 : chainId,
+        `0x${id.toString(16).padStart(40, '0')}`, SMART_ACCOUNT, mode === 'EOA' ? 'EOA' : 'KERNEL']);
+      await client.query(`insert into session_keys (portfolio_id, key_ref, permissions, expires_at, status)
+        values ($1, $2, $3::jsonb, $4, $5)`, [id, key.key_ref, JSON.stringify(key.permissions),
+        new Date(Date.now() + (mode === 'expired' ? -DAY_MS : 365 * DAY_MS)), mode === 'revoked' ? 'revoked' : 'active']);
+    }
+    let masterSeed = TEST_SEED;
+    const messages: string[] = [];
+    const lines: string[] = [];
+    const checks = {
+      readPermissionConfig: async () => ({ signer: SMART_ACCOUNT, policyCount: 3 }),
+      deriveSessionKeyAddress: async (keyRef: string) => deriveSessionKey(Number(keyRef.split('/').at(-1)), { masterSeed }).address,
+    };
+    const round = () => announceAlerts({
+      query: q, now: NOW, chainId, dryRun: true, log: (line) => lines.push(line),
+      sessionKeyChecks: checks, sendNotification: async (message) => { messages.push(message); },
+    });
+    const open = async () => (await listOpenAlerts(q)).filter((alert) => alert.kind === kind);
+    const report = await inspectSessionKeyDerivation(chainId, { ...checks, query: q });
+    assert.equal(report.checked, 2, 'paused／idle／過期／撤銷／別鏈／EOA 不參與比對');
+    await round();
+    await round();
+    assert.equal((await open()).length, 1);
+    assert.equal((await open())[0]?.portfolioId, null);
+    assert.equal((await open())[0]?.occurrences, 2);
+    assert.equal(messages.length, 1, 'critical 初次推送，持續不重送');
+    assert.match(messages[0] ?? '', /\[dry-run\]\[critical\]/);
+    assert.match(messages[0] ?? '', /2 把不符/);
+    assert.equal(healthStatusFor('ok', alertCounts(await open())), 'degraded');
+    masterSeed = OTHER_TEST_SEED;
+    await round();
+    assert.equal((await open()).length, 0);
+    assert.equal(messages.length, 2);
+    assert.match(messages[1] ?? '', /已解除/);
+    masterSeed = TEST_SEED;
+    await round();
+    assert.equal(messages.length, 3, '再次換錯會重開警示');
+    for (let index = 0; index < 2; index += 1) {
+      const key = auditKey(Number(ids[index]) * 10 + 1);
+      await client.query(`insert into session_keys (portfolio_id, key_ref, permissions, expires_at)
+        values ($1, $2, $3::jsonb, now() + interval '1 year')`, [ids[index], key.key_ref, JSON.stringify(key.permissions)]);
+      await round();
+      assert.equal((await open()).length, index === 0 ? 1 : 0);
+    }
+    assert.equal(messages.length, 4, '兩戶都續期後解除，即使舊 seed 的 active key 仍存在');
+    assert.ok(!JSON.stringify({ messages, lines }).includes(TEST_SEED));
+    const operations = await client.query('select count(*)::int as count from operations where portfolio_id = any($1::bigint[])', [ids]);
+    assert.equal(operations.rows[0]?.count, 0);
+    throw new Error('rollback seed audit fixture');
+  }), /rollback seed audit fixture/);
+});
 
 test('真 Postgres：Telegram 新開／升級／重複／解除／再次發生與 NULL portfolio 的 returning 判斷', dbGate, async () => {
   await assert.rejects(() => withTransaction(async (client) => {

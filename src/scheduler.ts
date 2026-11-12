@@ -1082,6 +1082,76 @@ async function checkSessionKeyDerivation(
   return null;
 }
 
+export type SessionKeyDerivationReport = {
+  /** 所有候選帳戶都讀取完成；false 時不能據此新增或解除 seed 警示。 */
+  complete: boolean;
+  checked: number;
+  mismatchedPortfolioIds: number[];
+  /** 派生失敗或單戶資料／讀鏈失敗；preflight 一律判 fail。 */
+  failedPortfolioIds: number[];
+  unavailable: number;
+};
+
+type SessionKeyCheckDeps = Pick<SchedulerDeps, 'query' | 'readPermissionConfig' | 'deriveSessionKeyAddress'>;
+
+/**
+ * 所有本鏈 active Kernel 帳戶都查，包含還沒到排程時間的帳戶。
+ * 與執行前共用 resolveSessionKey：只比對最新且鏈上已安裝的那把，避免續期後殘留的舊 key 誤報。
+ * 單戶讀取失敗計入 failed 並繼續，標示 complete=false；候選清單讀取失敗仍拋錯。
+ * 呼叫端不能把「這輪沒查成」當作問題已解除，也不能用不完整報告新增 seed 警示。
+ */
+export async function inspectSessionKeyDerivation(
+  chainId: number,
+  deps: SessionKeyCheckDeps = {},
+): Promise<SessionKeyDerivationReport> {
+  const resolved = resolveDeps({ thresholdBps: DEFAULT_THRESHOLD_BPS }, { ...deps, chainId });
+  const { rows } = await resolved.query(`
+    select sa.portfolio_id, sa.address
+      from smart_accounts sa
+      join portfolios p on p.id = sa.portfolio_id
+     where sa.chain_id = $1
+       and sa.account_type = 'KERNEL'
+       and p.schedule_state = 'active'
+       and exists (
+         select 1 from session_keys k
+          where k.portfolio_id = p.id and k.status = 'active' and k.expires_at > now()
+       )
+     order by sa.portfolio_id
+  `, [chainId]);
+  const report: SessionKeyDerivationReport = {
+    complete: true, checked: 0, mismatchedPortfolioIds: [], failedPortfolioIds: [], unavailable: 0,
+  };
+  for (const row of rows) {
+    const fields = row as { portfolio_id: unknown; address: unknown };
+    const portfolioId = Number(fields.portfolio_id);
+    if (!Number.isSafeInteger(portfolioId) || portfolioId <= 0) throw new Error('portfolio_id 不是有效整數');
+    try {
+      const account = asAddress(fields.address, 'smart_accounts.address');
+      const resolution = await resolveSessionKey({ portfolioId, account, chainId }, resolved);
+      if (!resolution.ok) {
+        report.unavailable += 1;
+        continue;
+      }
+      report.checked += 1;
+      const failure = await checkSessionKeyDerivation(resolution.key, resolved.deriveSessionKeyAddress);
+      if (failure?.code === 'SESSION_KEY_DERIVATION_MISMATCH') report.mismatchedPortfolioIds.push(portfolioId);
+      if (failure?.code === 'SESSION_KEY_DERIVATION_FAILED') report.failedPortfolioIds.push(portfolioId);
+    } catch {
+      report.complete = false;
+      report.failedPortfolioIds.push(portfolioId);
+    }
+  }
+  return report;
+}
+
+/** 僅含計數與 portfolio id；不把 seed、私鑰或派生例外帶入 preflight／Telegram。 */
+export function sessionKeyDerivationDetail(report: SessionKeyDerivationReport): string {
+  const ids = [...report.mismatchedPortfolioIds, ...report.failedPortfolioIds];
+  return `檢查 ${report.checked} 把 session key：${report.mismatchedPortfolioIds.length} 把不符、` +
+    `${report.failedPortfolioIds.length} 個帳戶派生或讀取失敗、${report.unavailable} 個帳戶無已安裝的可用 key` +
+    (ids.length === 0 ? '' : `（portfolio ${ids.slice(0, 10).join(', ')}${ids.length > 10 ? ', …' : ''}）`);
+}
+
 /**
  * 前置檢查 a + a2 + b + c：對**每一個 step** 檢查 allowance 與餘額（amountIn 是原幣單位）。
  *
@@ -1518,7 +1588,7 @@ export async function runSchedulerOnce(
 
   // ---- 一輪的尾端：告警（偵測 → 寫入 → 解除 → 一行 stdout）----
   // 只加在這裡：認領、前置檢查、間隔推進的邏輯一個字都沒動。
-  await announceAlerts({ query: resolved.query, log: resolved.log, now, dryRun, chainId: resolved.chainId });
+  await announceAlerts({ query: resolved.query, log: resolved.log, now, dryRun, chainId: resolved.chainId, sessionKeyChecks: resolved });
 
   return { claimed: claimed.length, dryRun, results };
 }
@@ -1540,15 +1610,40 @@ export async function announceAlerts(args: {
   now: Date;
   dryRun?: boolean;
   chainId?: number;
+  sessionKeyChecks?: SessionKeyCheckDeps;
+  /** 測試接縫；正式路徑沿用鏈上 gas 讀取。 */
+  gasChecks?: {
+    readNativeBalance: (address: Address) => Promise<bigint>;
+    readGasPrice: () => Promise<bigint>;
+  };
+  /** 測試接縫；正式路徑沿用 Telegram。 */
+  sendNotification?: (text: string) => Promise<void>;
 }): Promise<void> {
   try {
-    const findings = await detectAlerts(args.query, { now: args.now });
-    const notifications = { dryRun: args.dryRun ?? true, chainId: args.chainId ?? getConfig().chainId, log: args.log };
+    const chainId = args.chainId ?? getConfig().chainId;
+    const findings = await detectAlerts(args.query, { now: args.now, ...args.gasChecks });
+    let seedCheckComplete = false;
+    try {
+      const report = await inspectSessionKeyDerivation(chainId, { ...args.sessionKeyChecks, query: args.query });
+      seedCheckComplete = report.complete;
+      if (!seedCheckComplete) {
+        args.log(`[ALERT] seed 比對未完成：${sessionKeyDerivationDetail(report)}；本輪不新增或解除 seed 警示`);
+      } else if (report.mismatchedPortfolioIds.length > 0 || report.failedPortfolioIds.length > 0) {
+        findings.push({
+          kind: 'session_key_derivation_mismatch', severity: 'critical', portfolioId: null,
+          detail: `${sessionKeyDerivationDetail(report)}；確認 SESSION_KEY_MASTER_SEED，或完成 session key 續期`,
+        });
+      }
+    } catch {
+      args.log('[ALERT] seed 比對失敗：無法完成 key 讀取，本輪不新增或解除 seed 警示');
+    }
+    const notifications = { dryRun: args.dryRun ?? true, chainId, log: args.log, send: args.sendNotification };
     await recordAlerts(args.query, findings, args.now, notifications);
-    const resolved = await resolveAlerts(args.query, findings, args.now, notifications);
+    const resolved = await resolveAlerts(args.query, findings, args.now, notifications,
+      seedCheckComplete ? [] : ['session_key_derivation_mismatch']);
 
     if (findings.length === 0) {
-      args.log(`[ALERT] 沒有警示${resolved > 0 ? `（已解除 ${resolved} 筆）` : ''}`);
+      args.log(`[ALERT] ${seedCheckComplete ? '沒有警示' : '其他規則未偵測到警示'}${resolved > 0 ? `（已解除 ${resolved} 筆）` : ''}`);
       return;
     }
     for (const finding of findings) args.log(formatAlert(finding));
@@ -1765,7 +1860,7 @@ async function decideAndMaybeExecute(
   // 輸出裡仍然顯示 `ready` 的原因。`ready` 要回答「現在 `--live` 會成功嗎」，所以兩條路都驗。
   //
   // 位置選在 planRebalance 之後而不是 planPortfolio 之前，是因為 b/c 需要 `steps`；而 a/a2 擺在
-  // 這裡也剛好不多讀一次鏈——一個 `noop`（漂移未達門檻）的 portfolio 根本不需要 session key。
+  // 這裡讓 noop 不跑執行前檢查；輪尾 seed 告警仍會獨立檢查所有 active 帳戶。
   // （`executor` 在上面「重問地板」那一段就解析好了：地板要靠 `executor.oracle()` 才問得到。）
   const prechecks = await runPrechecks(
     {

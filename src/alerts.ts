@@ -5,7 +5,7 @@ import { perOperationCostWei } from './funding.js';
 import { sendTelegram } from './notify.js';
 
 /**
- * 排程器的告警。**三個種類、全部從 DB 可推導**（不靠 process 記憶體）。
+ * 排程器的告警。不靠 process 記憶體；seed 比對由 scheduler 使用同一套 key 選擇規則補入。
  *
  * 為什麼要做這件事（真實證據，詳見 `db/migrations/0013_scheduler_alerts.sql`）
  *   三次長跑（各約 2.5 小時）的實際結果：34 輪只有 1 輪成功、17 輪只有 1 輪成功、1 輪 —— **20+ 輪
@@ -38,6 +38,7 @@ export const ALERT_KINDS = [
   'session_key_expiring',
   'gas_low',
   'portfolio_stuck',
+  'session_key_derivation_mismatch',
 ] as const;
 
 export type AlertKind = (typeof ALERT_KINDS)[number];
@@ -46,7 +47,7 @@ export type AlertSeverity = 'warn' | 'critical';
 export type AlertFinding = {
   kind: AlertKind;
   severity: AlertSeverity;
-  /** `null` = 與 portfolio 無關的告警（目前三個種類都帶 portfolio，這欄保留給未來）。 */
+  /** `null` = 全域告警，例如多個 portfolio 的 seed 派生不符合併為一筆。 */
   portfolioId: number | null;
   /** 人類可讀的一句話（繁中）。排程器的 stdout 與 `--alerts` 都**原樣**印它。 */
   detail: string;
@@ -454,15 +455,17 @@ export async function recordAlerts(
  * 「沒偵測到」= 不在 `present` 裡。所以呼叫端要傳**這一輪的完整 findings**（不是差集）；傳空陣列
  * 等於「現在什麼問題都沒有」，所有未解決的都會被解除 —— 那正是 `--alerts` 之後看到空清單的條件。
  * 用 (kind, portfolio) 當鍵而不是 id：警示的 id 是 DB 給的，呼叫端不該需要先記住它。
+ * 未完成偵測的 kind 要放進 unverifiedKinds：保留既有列，不把「未知」當成「已恢復」。
  */
 export async function resolveAlerts(
   query: QueryFn,
   present: readonly AlertFinding[],
   now: Date = new Date(),
   notifications?: AlertNotificationOptions,
+  unverifiedKinds: readonly AlertKind[] = [],
 ): Promise<number> {
   const keys = present.map((finding) => alertKey(finding.kind, finding.portfolioId));
-  const { rows } = await query(SQL_RESOLVE_ALERTS, [now.toISOString(), keys]);
+  const { rows } = await query(SQL_RESOLVE_ALERTS, [now.toISOString(), keys, unverifiedKinds]);
   for (const row of rows) {
     const fields = row as Record<string, unknown>;
     if (notifications && fields.severity === 'critical') await notifyAlert(fields, true, notifications);
@@ -642,6 +645,7 @@ const SQL_RESOLVE_ALERTS = `
      set resolved_at = $1
    where resolved_at is null
      and (kind || ':' || coalesce(portfolio_id, -1)::text) <> all($2::text[])
+     and kind <> all($3::text[])
   returning id, kind, severity, portfolio_id, detail, first_seen_at, last_seen_at, resolved_at
 `;
 

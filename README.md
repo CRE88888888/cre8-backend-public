@@ -81,6 +81,19 @@ dry-run 照樣通知並標 `[dry-run]`，live 標 `[live]`。一般 warn 不推�
 因此通知是盡力送達；收件失敗請看 DB、`--alerts` 與 log，下一輪不會補送同一個 critical。
 既有未解除 critical 在啟用 Telegram 時也不補發。不新增資料表或欄位。
 
+seed 與 session key 不符會產生全域 `session_key_derivation_mismatch` critical，同輪多個帳戶合併為一筆，
+detail 列出檢查／不符把數與最多 10 個 portfolio id；`/health` 會顯示 critical 並回 `degraded`。
+需先套用 db migration 0020。每輪會檢查本鏈所有 active Kernel 帳戶未過期的 active key，
+即使帳戶尚未到 `next_run_at` 也會持續偵測；seed 換回或完成鏈上續期後，下一輪自動解除。
+與執行前檢查共用「由新到舊挑鏈上已安裝的 key」規則，舊 seed 留下的歷史 key 不會蓋過已完成續期的新 key。
+seed 未設或無法派生也會產生同種 critical。單戶 DB／RPC 讀取失敗會記入報告，並繼續檢查其他帳戶；
+seed 比對未完成時只印一行診斷，不新增或解除 seed 警示，其他警示照常記錄與解除。
+此檢查只讀鏈與 DB，不寫 `operations`、不簽名、不送交易。
+
+`bun run preflight --strict` 也做相同的 seed 比對，任何一把不符、派生失敗或單戶讀取失敗都 fail，訊息包含計數。
+沒有可檢查的 active key 時明列「檢查 0 把」；有候選 key 卻沒有一把已安裝時 warn（strict 會擋）。
+API 與 scheduler 是不同行程時，兩邊都要使用各自的環境執行 preflight，確認設定一致。
+
 設定步驟（由使用者本人操作，不把 token 貼到 issue、PR、截圖或聊天）：
 
 1. 在 Telegram 找官方 [@BotFather](https://t.me/BotFather)，輸入 `/newbot`，照提示取顯示名稱及以 `bot` 結尾的帳號。拿到的 token 就是這個 bot 的密碼，只填進本機 `.env` 的 `TELEGRAM_BOT_TOKEN=` 後方。

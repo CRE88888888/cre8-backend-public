@@ -34,6 +34,8 @@ import { REGISTRY_ABI } from '../src/chain.js';
 import { activeChain } from '../src/chain-object.js';
 import { getConfig, requireSessionKeyConfig } from '../src/config.js';
 import { query } from '../src/db.js';
+import { inspectSessionKeyDerivation, sessionKeyDerivationDetail } from '../src/scheduler.js';
+import type { SessionKeyDerivationReport } from '../src/scheduler.js';
 
 type Level = 'ok' | 'warn' | 'fail';
 
@@ -54,6 +56,15 @@ const OWNERSHIP_ABI = ['owner', 'pendingOwner'].map((name) => ({
   inputs: [],
   outputs: [{ type: 'address' as const }],
 }));
+
+export function checkSessionKeySeed(report: SessionKeyDerivationReport): Check {
+  const level: Level = report.mismatchedPortfolioIds.length > 0 || report.failedPortfolioIds.length > 0
+    ? 'fail' : report.unavailable > 0 ? 'warn' : 'ok';
+  return {
+    level, name: 'session key seed 與 DB 比對', detail: sessionKeyDerivationDetail(report),
+    ...(level === 'ok' ? {} : { fix: '確認 SESSION_KEY_MASTER_SEED 與 scheduler 一致；輪替 seed 後需完成鏈上續期' }),
+  };
+}
 
 function sameAddress(a: Address | null, b: Address | null): boolean {
   return a !== null && b !== null && a.toLowerCase() === b.toLowerCase();
@@ -488,6 +499,11 @@ async function main(): Promise<number> {
     ok('DB 連線', String(rows[0]?.version ?? 'ok').slice(0, 40));
     const { rows: applied } = await query<{ count: string }>('select count(*)::text as count from schema_migrations');
     ok('migration', `${applied[0]?.count ?? '?'} 個已套用`);
+    try {
+      record(checkSessionKeySeed(await inspectSessionKeyDerivation(config.chainId)));
+    } catch {
+      fail('session key seed 與 DB 比對', '無法完成 key 比對', '確認 DB migration、session key 資料與 RPC；未完成比對不可上線');
+    }
   } catch (cause) {
     fail('DB 連線', cause instanceof Error ? cause.message : String(cause), '確認 DATABASE_URL；Railway 上由平台注入');
   }

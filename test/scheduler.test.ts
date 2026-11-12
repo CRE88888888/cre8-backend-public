@@ -954,6 +954,47 @@ test('前置檢查 a2（缺陷 1）：seed 派生不出 DB 記的那把 → bloc
   console.log(`[缺陷 1] operations 列數=${db.operations.length}；有 INSERT operations 的 statement=${db.statements.some((e) => e.sql.includes('insert into operations'))}`);
 });
 
+for (const dryRun of [true, false]) {
+  test(`seed mismatch ${dryRun ? 'dry-run' : 'live'}：多戶 blocked 合併 critical，未到期仍保留，seed 換回才解除`, async () => {
+    const db = stubDb({
+      portfolios: [portfolio(), portfolio({ id: PORTFOLIO_ID + 1, account: OWNER })],
+      sessionKeys: [sessionKey(), sessionKey({ portfolioId: PORTFOLIO_ID + 1 })],
+    });
+    const chain = stubChain({ derivedAddress: WRONG_SEED_EOA });
+    const baseDeps = deps(db, chain);
+    const writes: unknown[][] = [];
+    let preserved: readonly unknown[] = [];
+    const query: SchedulerQueryFn = async (sql, params = []) => {
+      if (sql.includes('select sa.portfolio_id, sa.address')) {
+        return { rows: db.portfolios.map((p) => ({ portfolio_id: String(p.id), address: p.account })) };
+      }
+      if (sql.includes('insert into scheduler_alerts')) { writes.push([...params]); return { rows: [] }; }
+      if (sql.includes('update scheduler_alerts')) { preserved = params[1] as string[]; return { rows: [] }; }
+      if (sql.includes('row_number() over') || sql.includes('k.expires_at <= $1') ||
+          sql.includes('h.confirmed_count') || sql.includes('with latest as')) return { rows: [] };
+      return baseDeps.query!(sql, params);
+    };
+    const options = { ...baseDeps, query };
+    const first = await runSchedulerOnce({ now: NOW, dryRun }, options);
+    assert.deepEqual(outcomes(first), ['blocked', 'blocked']);
+    assert.equal(db.operations.length, 0);
+    assert.equal(chain.executeCalls.length, 0);
+    assert.equal(writes.length, 1);
+    assert.deepEqual(writes[0]?.slice(0, 3), ['session_key_derivation_mismatch', 'critical', null]);
+    assert.match(String(writes[0]?.[3]), /2 把不符/);
+    // 模擬下一輪還沒到期：認領 0 戶仍需維持同一筆全域警示。
+    for (const p of db.portfolios) p.nextRunAt = new Date(NOW.getTime() + ONE_DAY_SECONDS * 1000);
+    const next = await runSchedulerOnce({ now: NOW, dryRun }, options);
+    assert.equal(next.claimed, 0);
+    assert.equal(writes.length, 2);
+    assert.deepEqual(preserved, ['session_key_derivation_mismatch:-1']);
+    chain.derivedAddress = SESSION_KEY;
+    await runSchedulerOnce({ now: NOW, dryRun }, options);
+    assert.equal(writes.length, 2, '修正 seed 不再產生 mismatch finding');
+    assert.deepEqual(preserved, [], '交給既有 resolve 流程解除');
+  });
+}
+
 test('前置檢查 a2：seed 根本派生不了（沒設／格式不對）→ blocked + SESSION_KEY_DERIVATION_FAILED', async () => {
   const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
   const chain = stubChain({ deriveError: 'Session key 設定不完整：缺少 SESSION_KEY_MASTER_SEED' });

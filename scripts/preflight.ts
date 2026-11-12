@@ -166,6 +166,61 @@ export function operatorAddress(raw: string | undefined): Address | null {
   }
 }
 
+/** 只接收角色地址；不回顯未驗證的 env 值，避免誤填私鑰時洩漏。 */
+export function checkRoleSeparation(input: {
+  relayer: Address | null;
+  deployer: string | undefined;
+  bundler: string | undefined;
+  safe: Address | null;
+  strict: boolean;
+}): Check[] {
+  const checks: Check[] = [];
+  const roles = [
+    { name: 'relayer', address: input.relayer },
+    { name: 'DEPLOYER_ADDRESS', address: asAddressOrNull(input.deployer) },
+    { name: 'BUNDLER_EXECUTOR_ADDRESS', address: asAddressOrNull(input.bundler) },
+  ];
+
+  checks.push(input.relayer === null
+    ? { level: 'fail', name: 'OPERATOR_PRIVATE_KEY', detail: '未設定或不是合法的 secp256k1 私鑰', fix: '設定 relayer 私鑰；只在本機 fork 使用 anvil 公開測試金鑰' }
+    : { level: 'ok', name: 'OPERATOR_PRIVATE_KEY', detail: `relayer 地址 ${input.relayer}；用於 registry operator 與策略註冊／發版本的 provider` });
+
+  for (const [name, raw] of [
+    ['DEPLOYER_ADDRESS', input.deployer],
+    ['BUNDLER_EXECUTOR_ADDRESS', input.bundler],
+  ] as const) {
+    const address = asAddressOrNull(raw);
+    if (address === null || sameAddress(address, zeroAddress)) {
+      const missing = raw === undefined || raw.trim() === '';
+      checks.push({
+        level: missing && !input.strict ? 'warn' : 'fail', name,
+        detail: missing ? '未設定' : '不是合法的非零地址',
+        fix: '只填該角色的公開地址，不要把私鑰放進 backend',
+      });
+    } else {
+      checks.push({ level: 'ok', name, detail: address });
+    }
+  }
+
+  for (const [i, role] of roles.entries()) {
+    if (role.address === null || sameAddress(role.address, zeroAddress)) continue;
+    const peers = roles.slice(i + 1);
+    if (input.safe !== null && !sameAddress(input.safe, zeroAddress)) {
+      peers.push({ name: 'ATP_SAFE', address: input.safe });
+    }
+    for (const peer of peers) {
+      if (peer.address === null || sameAddress(peer.address, zeroAddress)) continue;
+      const duplicate = sameAddress(role.address, peer.address);
+      checks.push({
+        level: duplicate ? 'fail' : 'ok', name: `${role.name} / ${peer.name}`,
+        detail: duplicate ? `${role.address}；兩個角色使用相同地址` : '角色地址不同',
+        ...(duplicate ? { fix: 'relayer、bundler、部署者必須各用不同金鑰，且都不能是 ATP_SAFE' } : {}),
+      });
+    }
+  }
+  return checks;
+}
+
 const results: Check[] = [];
 
 function record(check: Check): void {
@@ -277,6 +332,17 @@ async function main(): Promise<number> {
     ok('EXECUTOR_ADDRESS', executor);
   }
 
+  // 地址與金鑰分離不依賴 RPC；即使鏈連不上也先回報設定問題。
+  const safe = asAddressOrNull(process.env.ATP_SAFE);
+  const expectedOperator = operatorAddress(process.env.OPERATOR_PRIVATE_KEY);
+  checkRoleSeparation({
+    relayer: expectedOperator,
+    deployer: process.env.DEPLOYER_ADDRESS,
+    bundler: process.env.BUNDLER_EXECUTOR_ADDRESS,
+    safe,
+    strict: args.strict,
+  }).forEach(record);
+
   // --- 4. RPC 與鏈一致 ---------------------------------------------------
   const rpcUrl = process.env.RPC_URL?.trim();
   if (rpcUrl === undefined || rpcUrl === '') {
@@ -328,7 +394,6 @@ async function main(): Promise<number> {
   }
 
   // --- 6. v2 Safe 交接與 registry operator（全部唯讀）-------------------
-  const safe = asAddressOrNull(process.env.ATP_SAFE);
   let safeHasCode: boolean | null = null;
   if (safe !== null && !sameAddress(safe, zeroAddress)) {
     try {
@@ -349,7 +414,6 @@ async function main(): Promise<number> {
     return { owner: await read('owner'), pendingOwner: await read('pendingOwner') };
   }
 
-  const expectedOperator = operatorAddress(process.env.OPERATOR_PRIVATE_KEY);
   if (registry !== null) {
     const ownership = await readOwnership(registry);
     checkOwnership({ label: 'registry', ...ownership, safe, safeHasCode, strict: args.strict }).forEach(record);
@@ -395,14 +459,7 @@ async function main(): Promise<number> {
     }
   }
 
-  // --- 8. 營運錢包有 gas 嗎 --------------------------------------------
-  if (expectedOperator === null) {
-    fail('OPERATOR_PRIVATE_KEY', '未設定或不是合法的 secp256k1 私鑰', '設定 relayer 私鑰；只在本機 fork 使用 anvil 公開測試金鑰');
-  } else {
-    ok('OPERATOR_PRIVATE_KEY', `relayer 地址 ${expectedOperator}`);
-  }
-
-  // --- 9. bundler -------------------------------------------------------
+  // --- 8. bundler -------------------------------------------------------
   const bundler = process.env.BUNDLER_URL?.trim() ?? '';
   if (bundler === '') {
     warn('BUNDLER_URL', '未設定（只有 dry-run 能跑）', 'live 需要一個 ERC-4337 bundler');
@@ -425,7 +482,7 @@ async function main(): Promise<number> {
     }
   }
 
-  // --- 10. DB 與 migration ---------------------------------------------
+  // --- 9. DB 與 migration ----------------------------------------------
   try {
     const { rows } = await query<{ version: string }>('select version()');
     ok('DB 連線', String(rows[0]?.version ?? 'ok').slice(0, 40));
@@ -435,7 +492,7 @@ async function main(): Promise<number> {
     fail('DB 連線', cause instanceof Error ? cause.message : String(cause), '確認 DATABASE_URL；Railway 上由平台注入');
   }
 
-  // --- 11. auth --------------------------------------------------------
+  // --- 10. auth --------------------------------------------------------
   if (process.env.AUTH_DOMAIN === undefined || process.env.AUTH_DOMAIN.trim() === '') {
     warn('AUTH_DOMAIN', '未設定', 'SIWE 需要它；用真實網域（不要 localhost）');
   } else {

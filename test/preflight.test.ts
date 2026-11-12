@@ -3,12 +3,80 @@ import { test } from 'node:test';
 import { mnemonicToAccount } from 'viem/accounts';
 import { zeroAddress } from 'viem';
 import type { Address } from 'viem';
-import { checkOwnership, checkRegistryOperator, operatorAddress } from '../scripts/preflight.js';
+import { checkOwnership, checkRegistryOperator, checkRoleSeparation, operatorAddress } from '../scripts/preflight.js';
 
 const OWNER: Address = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266';
 const SAFE: Address = '0x000000000000000000000000000000000000aBcD';
 const OTHER: Address = '0x0000000000000000000000000000000000001234';
 const OPERATOR: Address = '0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65';
+const BUNDLER: Address = '0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc';
+
+const separatedRoles = { relayer: OPERATOR, deployer: OWNER, bundler: BUNDLER, safe: SAFE, strict: true };
+
+test('three distinct anvil roles separate from the Safe pass all nine key checks', () => {
+  const checks = checkRoleSeparation(separatedRoles);
+  assert.equal(checks.length, 9);
+  assert.ok(checks.every((c) => c.level === 'ok'));
+});
+
+for (const strict of [true, false]) {
+  for (const name of ['deployer', 'bundler'] as const) {
+    const envName = name === 'deployer' ? 'DEPLOYER_ADDRESS' : 'BUNDLER_EXECUTOR_ADDRESS';
+    test(`${strict ? 'strict' : 'non-strict'}: missing ${name} is ${strict ? 'fail' : 'warn'}`, () => {
+      for (const raw of [undefined, '', '   ']) {
+        const checks = checkRoleSeparation({ ...separatedRoles, strict, [name]: raw });
+        assert.equal(checks.find((c) => c.name === envName)?.level, strict ? 'fail' : 'warn');
+      }
+    });
+    test(`${strict ? 'strict' : 'non-strict'}: malformed or zero ${name} fails without echoing input`, () => {
+      for (const raw of ['not-an-address', zeroAddress, `0x${'ff'.repeat(32)}`]) {
+        const checks = checkRoleSeparation({ ...separatedRoles, strict, [name]: raw });
+        assert.equal(checks.find((c) => c.name === envName)?.level, 'fail');
+        assert.ok(!JSON.stringify(checks).includes(raw));
+      }
+    });
+  }
+
+  for (const [name, change] of [
+    ['relayer / deployer', { deployer: OPERATOR.toLowerCase() }],
+    ['relayer / bundler', { bundler: OPERATOR.toLowerCase() }],
+    ['deployer / bundler', { bundler: OWNER.toLowerCase() }],
+  ] as const) {
+    test(`${strict ? 'strict' : 'non-strict'}: ${name} collision always fails ignoring case`, () => {
+      const checks = checkRoleSeparation({ ...separatedRoles, strict, ...change });
+      assert.equal(checks.filter((c) => c.level === 'fail').length, 1);
+      assert.match(checks.find((c) => c.level === 'fail')?.detail ?? '', /相同地址/);
+    });
+  }
+
+  for (const name of ['relayer', 'deployer', 'bundler'] as const) {
+    test(`${strict ? 'strict' : 'non-strict'}: ${name} equal to ATP_SAFE always fails`, () => {
+      const checks = checkRoleSeparation({ ...separatedRoles, strict, [name]: SAFE.toLowerCase() });
+      assert.equal(checks.filter((c) => c.level === 'fail').length, 1);
+      assert.match(checks.find((c) => c.level === 'fail')?.name ?? '', /ATP_SAFE/);
+    });
+  }
+
+  test(`${strict ? 'strict' : 'non-strict'}: missing or invalid relayer cannot pass`, () => {
+    assert.equal(checkRoleSeparation({ ...separatedRoles, strict, relayer: null })[0]?.level, 'fail');
+  });
+}
+
+test('role address parsing trims surrounding whitespace', () => {
+  assert.ok(checkRoleSeparation({
+    ...separatedRoles, deployer: `  ${OWNER} `, bundler: ` ${BUNDLER.toLowerCase()} `,
+  }).every((c) => c.level === 'ok'));
+});
+
+test('a private key pasted into a public role address never appears in the check output', () => {
+  const account = mnemonicToAccount('test test test test test test test test test test test junk', { addressIndex: 4 });
+  const key = Buffer.from(account.getHdKey().privateKey!).toString('hex');
+  const checks = checkRoleSeparation({
+    ...separatedRoles, relayer: operatorAddress(key), deployer: `0x${key}`, bundler: key,
+  });
+  assert.equal(checks.filter((c) => c.level === 'fail').length, 2);
+  assert.ok(!JSON.stringify(checks).includes(key));
+});
 
 for (const label of ['registry', 'router'] as const) {
   for (const strict of [true, false]) {

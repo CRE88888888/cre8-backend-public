@@ -21,6 +21,9 @@ BUNDLER_URL=             # alto 或第三方 bundler
 REGISTRY_ADDRESS=
 EXECUTOR_ADDRESS=
 OPERATOR_PRIVATE_KEY=    # ← secret
+ATP_SAFE=                # 預期接手 registry / router 的 Safe 公開地址
+DEPLOYER_ADDRESS=        # 唯讀 preflight：部署者公開地址，不是私鑰
+BUNDLER_EXECUTOR_ADDRESS= # 唯讀 preflight：alto executor 公開地址，不是私鑰
 SESSION_KEY_MASTER_SEED= # ← secret
 AUTH_DOMAIN=             # SIWE 的 domain
 AUTH_URI=                # SIWE 的 uri
@@ -29,6 +32,19 @@ ENABLE_OPERATOR_REBALANCE=true
 
 **Secret 放 Railway Variables（等同 secret manager），不要放進 repo**。
 `.env` 已在 `.gitignore`；`backend/.env.fork` 也是。
+
+### ATP v2 的三把金鑰
+
+| 角色 | 用途 | 私鑰放在哪裡 |
+|---|---|---|
+| relayer | registry operator：`enroll`／`setPaused`；也是策略註冊／發版本的 provider | api／scheduler 的 `OPERATOR_PRIVATE_KEY` |
+| bundler | alto 送 `handleOps` | 只在 alto 的 `EXECUTOR_PRIVATE_KEY`；`UTILITY_PRIVATE_KEY` 未設定時沿用此 key |
+| 部署者 | `forge script` 部署及交接；Safe 接受 ownership 後不再有 owner 權限 | 只在部署時使用，不進 backend 或 alto 執行期 |
+
+backend 只持有 relayer 營運私鑰與派生受限 session key 的 seed。另兩個角色只以
+`DEPLOYER_ADDRESS`、`BUNDLER_EXECUTOR_ADDRESS` 公開地址供 preflight 驗證；三者必須兩兩不同，
+也都不能等於 `ATP_SAFE`。不要把三個服務的 secrets 全部複製給彼此。
+這是 B 段由使用者本人套用的設定；A 段只在本機 fork 用 anvil #0／#4／#5 驗證，不改 Railway。
 
 ## 排程器的健康狀態從哪裡看
 
@@ -99,5 +115,8 @@ MIGRATIONS_ENABLED=0 railway run bun run scripts/preflight.ts --strict
 ```
 
 `--strict`：任何 warn 都算失敗（主網不接受「知道但先不管」）。它會檢查
-RPC 的 chainId 是否與 CHILD_ID 一致、合約位址上是否真的有 code、registry owner 是不是
-單一 EOA、executor.oracle 是否為零位址、DB migration 套了幾個。
+RPC 的 chainId 是否與 CHAIN_ID 一致、合約位址上是否真的有 code、registry／router 是否已交接給
+`ATP_SAFE`、registry operator 是否符合 relayer、executor.oracle 是否為零位址、DB migration 套了幾個。
+此外，strict 要求 `DEPLOYER_ADDRESS` 與 `BUNDLER_EXECUTOR_ADDRESS` 都是非零合法地址；
+relayer、部署者、bundler 必須兩兩不同且都不是 Safe。缺少角色地址時 strict fail（非 strict warn），
+重複、零地址或格式錯誤則一律 fail。檢查全程唯讀，只輸出公開地址。

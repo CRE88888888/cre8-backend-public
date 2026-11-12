@@ -31,6 +31,20 @@ registry `operator()` 必須非零、符合 `OPERATOR_PRIVATE_KEY` 推導的 rel
 operator 錯誤不因非 strict 降級。讀不到 `operator()`／`pendingOwner()` 一律 fail，
 提示「不是 v2 合約」（也需確認 RPC）。preflight 全程唯讀，只輸出公開地址，不輸出私鑰。
 
+ATP v2 的三個營運角色各用不同金鑰：
+
+| 角色 | 用途 | 私鑰存放 |
+|---|---|---|
+| relayer | registry operator：`enroll`／`setPaused`；策略註冊／發版本的 provider | backend api／scheduler 的 `OPERATOR_PRIVATE_KEY` |
+| bundler | alto 送 `handleOps` | 只在 alto 的 `EXECUTOR_PRIVATE_KEY`；`UTILITY_PRIVATE_KEY` 可沿用既有 fallback |
+| 部署者 | `forge script` 部署及交接；Safe 接受 ownership 後不再有 owner 權限 | 只在部署時使用，不進 backend 或 alto 執行期 |
+
+backend 另以 `SESSION_KEY_MASTER_SEED` 派生受限的 session key，不持有部署者或 bundler 私鑰。
+preflight 用 `DEPLOYER_ADDRESS`、`BUNDLER_EXECUTOR_ADDRESS` 公開地址與 relayer 推導地址比較：
+三者必須兩兩不同，且都不能等於 `ATP_SAFE`。strict 缺地址 fail，非 strict 缺地址 warn；
+重複、零地址、格式錯誤一律 fail，也不回顯誤填的私鑰。
+本機只用 anvil #0（部署者）、#4（relayer）、#5（bundler）。以下正式環境設定與操作留到 B 段由使用者本人執行。
+
 ---
 
 ## 階段 1 · 需要你：建立 Railway 專案與 Postgres
@@ -74,8 +88,10 @@ RPC_URL=<BSC 主網 RPC>          ← 要付費/有 archive 的
 BUNDLER_URL=<主網 bundler>
 REGISTRY_ADDRESS=<部署後拿到>
 ATP_SAFE=<預期接手 registry 與 router 的 Safe 公開地址>
+DEPLOYER_ADDRESS=<部署者公開地址，只供 preflight 檢查>
+BUNDLER_EXECUTOR_ADDRESS=<alto executor 公開地址，只供 preflight 檢查>
 EXECUTOR_ADDRESS=<部署後拿到>
-OPERATOR_PRIVATE_KEY=0x...      ← secret
+OPERATOR_PRIVATE_KEY=0x...      ← 只有 relayer 的 secret
 SESSION_KEY_MASTER_SEED=0x...   ← secret（32 bytes 隨機）
 AUTH_DOMAIN=<你的網域>
 AUTH_URI=https://<你的網域>
@@ -89,12 +105,12 @@ PORT=8081                       （Railway 會注入 $PORT，程式會讀）
 MIN_SESSION_GAS_WEI=...         （預設見 src/config.ts）
 ```
 
-### 我需要你提供給我的（只有這兩項是秘密）
+### 由你直接設定的兩項 backend secrets（不要貼到對話、log 或 PR）
 
 | 項目 | 用途 | 你可以怎麼做 |
 |---|---|---|
-| `SESSION_KEY_MASTER_SEED` | 派生所有 session key | **你自己產生**（見下方指令），只貼給我或直接填 Railway |
-| `OPERATOR_PRIVATE_KEY` | 部署合約、approve、初始 enroll | 建議用**新錢包**，只放少量 BNB |
+| `SESSION_KEY_MASTER_SEED` | 派生受限 session key | **你自己產生**（見下方指令），直接填 backend Railway Variables |
+| `OPERATOR_PRIVATE_KEY` | relayer：registry operator（`enroll`／`setPaused`）與策略註冊／發版本的 provider | 獨立於部署者及 bundler 的新錢包，只放少量 BNB；只填 backend Variables |
 
 產生 seed：
 
@@ -113,18 +129,18 @@ openssl rand -hex 32 | sed 's/^/0x/'
 
 ### 你需要做
 
-1. 確認營運錢包有足夠 BNB（部署 + 後續 approve，建議先放 0.5 BNB）
-2. 告訴我「可以部署了」
+1. 確認獨立的部署者錢包有足夠 BNB；它不兼任 backend relayer 或 alto bundler
+2. B 段由你本人執行部署與 Safe 交接；部署者私鑰不交給 agent
 
-### 我會做
+### 部署時的金鑰界線
 
-```bash
-cd cre8-contracts
-forge script script/DeployAtp.s.sol --rpc-url $RPC_URL --broadcast --verify
-```
+`script/DeployAtp.s.sol` 僅供本機 fork，正式部署使用合約 repo 的 `DeployAtpMainnet.s.sol`；
+實際參數與步驟依 C3 的 A8 runbook，由使用者本人執行。
 
 拿到 `REGISTRY_ADDRESS` 與 `EXECUTOR_ADDRESS` 後，填回 Railway Variables，
 然後再跑一次 `preflight --strict`。
+部署者的私鑰只在 `forge script` 使用；設定獨立 relayer 為 registry operator，並由 Safe 對 registry／router
+接受 ownership 後，部署者不再有 owner 權限。backend 只填其公開 `DEPLOYER_ADDRESS`。
 
 ### ⚠ 這一步之前，我會先跟你確認兩件事
 

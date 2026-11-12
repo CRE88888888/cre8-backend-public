@@ -33,9 +33,18 @@ railway up ../alto --path-as-root -d --service alto --no-gitignore
 | 變數 | 說明 |
 |---|---|
 | `RPC_URL` | BSC 主網 RPC |
-| `EXECUTOR_PRIVATE_KEY` | 送 bundle 的錢包（需 BNB）。**目前與部署者共用，正式前要拆開** |
+| `EXECUTOR_PRIVATE_KEY` | bundler 專用錢包（需 BNB），由 alto 送 `handleOps`；必須與 backend relayer、部署者及 Safe 分開，只放 alto 服務 |
+| `UTILITY_PRIVATE_KEY` | 選填；補 executor 餘額／部署 helper 的 utility key，未設定時沿用 `EXECUTOR_PRIVATE_KEY`（既有 fallback） |
 | `SAFE_MODE` | 預設 `true`；關掉等於不強制 ERC-4337 驗證規則 |
 | `MIN_EXECUTOR_BALANCE` | refill 門檻，預設 0.02 BNB（BSC 上 1 BNB 太高） |
+
+ATP v2 的 backend 只放 relayer 的 `OPERATOR_PRIVATE_KEY`（registry operator 的 `enroll`／`setPaused`，
+以及策略註冊／發版本的 provider）；部署者私鑰只在 `forge script` 部署時使用，Safe 接手後不再有 owner 權限。
+這兩把私鑰都不放 alto；bundler 私鑰也不放 backend。
+backend 的 preflight 只讀 `DEPLOYER_ADDRESS`、`BUNDLER_EXECUTOR_ADDRESS` 公開地址，檢查三個角色
+兩兩不同且都不是 `ATP_SAFE`。`--strict` 缺地址會 fail；任何重複都 fail。
+本機 fork 使用 anvil #0（部署者）、#4（relayer）、#5（bundler）的公開測試帳號。
+A 段只更新本機設定與文件；Railway 的實際金鑰輪替由使用者在 B 段執行。
 
 ## 已知限制
 

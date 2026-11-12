@@ -16,9 +16,10 @@ import type { KernelAccountOptions } from './kernel.js';
 import type { RebalanceSchedule } from './strategies.js';
 
 /**
- * Chain integration: the backend acts as a relayer. One operator key signs every on-chain
- * transaction (v1 trust model; user-signed meta-transactions are a later refinement), and the
- * AtpRegistry is the source of truth for on-chain enrollment state.
+ * Chain integration: the backend relayer is the registry operator for enrollment and the provider
+ * for strategy registration / version publishing. It is separate from the Safe owner, deployer,
+ * and bundler executor; their private keys never enter this process. AtpRegistry is the source of
+ * truth for on-chain enrollment state.
  *
  * Every helper fails fast with a clear error when the chain is not configured (no RPC_URL /
  * OPERATOR_PRIVATE_KEY / REGISTRY_ADDRESS), rather than silently skipping the on-chain step.

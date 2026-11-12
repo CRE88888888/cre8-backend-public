@@ -44,6 +44,9 @@ HTTP → src/index.ts（啟動：config → migrate → listen）
 | `AUTH_DOMAIN` | | `localhost` | EIP-4361 `domain`：錢包要簽的站台 authority（純 host，可帶 port，不含 scheme／path）。部署時必填自己的網域。 |
 | `AUTH_URI` | | `http://<AUTH_DOMAIN>` | EIP-4361 `uri`：這次登入指涉的資源。必須是 http/https 絕對 URI；部署時建議設 `https://app…`。 |
 | `RPC_URL` | | 空 | JSON-RPC endpoint；目前只用於 `/health` 回報是否設定。 |
+| `OPERATOR_PRIVATE_KEY` | 鏈上功能時 ✅ | 空 | backend 專用 relayer 私鑰：registry operator（`enroll`／`setPaused`），也是策略註冊／發版本的 provider；不可與部署者或 alto bundler 共用。 |
+| `DEPLOYER_ADDRESS` | preflight `--strict` 時 ✅ | 空 | 部署者的公開非零地址；私鑰只在 `forge script` 部署時使用，不進 backend 執行期。 |
+| `BUNDLER_EXECUTOR_ADDRESS` | preflight `--strict` 時 ✅ | 空 | alto 送 `handleOps` 的公開非零地址；對應私鑰只放 alto 服務的 `EXECUTOR_PRIVATE_KEY`。 |
 | `ATP_SAFE` | preflight `--strict` 時 ✅ | 空 | 唯讀檢查的預期 owner（公開 Safe 地址，不是私鑰）；registry 與 `executor.oracle()` 的 AtpMultiPoolOracle 都必須已交接給此地址，且該地址有 code。 |
 | `EXECUTOR_ADDRESS` | 續期／enroll 時 ✅ | 空 | session key CallPolicy 允許呼叫的 target（rebalance executor）。缺它時 enroll 與 `renewal-params` 會帶著變數名失敗。 |
 | `SESSION_KEY_MASTER_SEED` | 續期／enroll 時 ✅ | 空 | 派生 session key 的 HD master seed（`0x` + 64 hex）。私鑰永不落 DB，DB 只存派生路徑 `m/44'/60'/0'/0/<index>`。 |
@@ -88,7 +91,15 @@ registry 與 router（由 `executor.oracle()` 取得）的 `owner()` 必須等�
 
 registry 的 `operator()` 必須非零、等於 `OPERATOR_PRIVATE_KEY` 推導的 relayer 地址，且不能等於 owner；
 不符在兩種模式都 fail。讀不到 `operator()` 或 `pendingOwner()` 也一律 fail，提示「不是 v2 合約」並要求確認 RPC。
-輸出只列公開地址，不列私鑰。`ATP_SAFE` 僅供 preflight 使用，不改 API 或 scheduler 的設定。
+設定 `DEPLOYER_ADDRESS`、`BUNDLER_EXECUTOR_ADDRESS` 後，preflight 會檢查 relayer、部署者、bundler
+三者兩兩不同，且都不等於 `ATP_SAFE`；任何重複一律 fail。兩個角色地址缺少時，strict 下 fail，
+非 strict 下 warn；格式錯誤或零地址一律 fail。輸出只列公開地址，不回顯誤填到地址欄位的私鑰。
+這三個公開地址設定僅供 preflight 使用，不改 API 或 scheduler 的設定。
+
+backend 執行期只持有 relayer 這一把營運私鑰（另以 `SESSION_KEY_MASTER_SEED` 派生受限的 session key）。
+bundler 私鑰只放 alto 的 `EXECUTOR_PRIVATE_KEY`；`UTILITY_PRIVATE_KEY` 未設定時沿用 executor 的 fallback。
+部署者只負責 `forge script` 部署與交接，Safe 接受 ownership 後不再有 owner 權限；其私鑰不放 backend 或 alto。
+本機 fork 驗證使用 anvil #0（部署者）、#4（relayer）、#5（bundler）的公開測試帳號。
 
 ### 測試與 DB
 

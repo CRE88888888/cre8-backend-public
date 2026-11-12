@@ -2,6 +2,8 @@
 
 給 AI agent 與新工程師的工作規則。細節以 `README.md` 與 `docs/*.zh-TW.md` 為準；這份只寫查證過的事實與規則。
 
+**Claude 與 Codex 分工**：規則見 [docs/AGENT_COLLABORATION](https://github.com/CRE8Finance/docs/blob/main/docs/AGENT_COLLABORATION.zh-TW.md)。本 repo 由 Claude 規劃與 review，Codex 照 issue 實作。開工前先看本 repo 有沒有標 `agent:claude` 或 `agent:codex` 的進行中 issue，有就排隊；分支前綴 Claude 用 `claude/*`、Codex 用 `codex/*`。
+
 ## 這個 repo 是什麼
 
 CRE8 ATP 的鏈下 API ＋ 排程器。Bun + TypeScript，直接用 `pg`、**不用 ORM**，HTTP 是 `node:http`（`src/server.ts`）。預設鏈 BNB Chain mainnet（`CHAIN_ID=56`），本機 fork 用 1337。

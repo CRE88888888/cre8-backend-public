@@ -470,6 +470,8 @@ const SAMPLE_STATUS: PortfolioStatus = {
 
 const ZERO_SIGNER = '0x0000000000000000000000000000000000000000';
 const SOME_SIGNER = `0x${'2'.repeat(40)}` as const;
+// 共用固定的時間基準，避免跨毫秒建立 fixture 時改變 configured key 的到期日排序。
+const KEY_ROW_NOW_MS = Date.now();
 
 /** DB 一列（形狀照 `session_keys`：key_ref / permissions / status / expires_at）。 */
 function keyRow(keyRef: string, permissionId: string, status = 'active', expiresInMs = 86_400_000) {
@@ -477,7 +479,7 @@ function keyRow(keyRef: string, permissionId: string, status = 'active', expires
     key_ref: keyRef,
     permissions: { permissionId, sessionKeyAddress: `0x${'1'.repeat(40)}` },
     status,
-    expires_at: new Date(Date.now() + expiresInMs),
+    expires_at: new Date(KEY_ROW_NOW_MS + expiresInMs),
   };
 }
 

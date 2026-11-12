@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { getAddress, keccak256, toBytes } from 'viem';
 import type { Hex, PublicClient } from 'viem';
-import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
+import { generatePrivateKey, mnemonicToAccount, privateKeyToAccount } from 'viem/accounts';
+import type { PrivateKeyAccount } from 'viem/accounts';
 import { createSiweMessage } from 'viem/siwe';
 
 import { ForbiddenError } from '../src/errors.js';
@@ -418,8 +419,12 @@ async function getJson(baseUrl: string, path: string, token?: string): Promise<R
   return fetch(`${baseUrl}${path}`, { method: 'GET', headers });
 }
 
+async function responseErrorCode(response: Response): Promise<string> {
+  return ((await response.json()) as { error: { code: string } }).error.code;
+}
+
 /** 真的走一次 SIWE：路由要驗的是「有 token 才進得去」，那就簽一張真的 token。 */
-async function loginToken(baseUrl: string): Promise<string> {
+async function loginToken(baseUrl: string, wallet: Pick<PrivateKeyAccount, 'address' | 'signMessage'> = WALLET): Promise<string> {
   const nonceResponse = await fetch(`${baseUrl}/auth/nonce`, { method: 'POST' });
   assert.equal(nonceResponse.status, 200);
   const challenge = (await nonceResponse.json()) as {
@@ -431,7 +436,7 @@ async function loginToken(baseUrl: string): Promise<string> {
     issuedAt: string;
   };
   const message = createSiweMessage({
-    address: WALLET.address,
+    address: wallet.address,
     chainId: challenge.chainId,
     domain: challenge.domain,
     uri: challenge.uri,
@@ -442,7 +447,7 @@ async function loginToken(baseUrl: string): Promise<string> {
   });
   const login = await postJson(baseUrl, '/auth/login', {
     message,
-    signature: await WALLET.signMessage({ message }),
+    signature: await wallet.signMessage({ message }),
   });
   assert.equal(login.status, 200);
   return ((await login.json()) as { token: string }).token;
@@ -585,6 +590,124 @@ const SAMPLE_REBALANCE: OperatorRebalanceResult = {
   gasUsed: '123456',
   steps: [],
 };
+
+// anvil 公開測試帳號：#4 為營運登入者，#7 與投組無關；不需持有 relayer 私鑰。
+const ANVIL_MNEMONIC = 'test test test test test test test test test test test junk';
+const OPERATOR_WALLET = mnemonicToAccount(ANVIL_MNEMONIC, { addressIndex: 4 });
+const UNRELATED_WALLET = mnemonicToAccount(ANVIL_MNEMONIC, { addressIndex: 7 });
+const SAMPLE_PREVIEW = { portfolioId: PORTFOLIO_ID, outcome: 'ready' as const, reason: 'dry-run', steps: [] };
+const OPERATOR_ROUTES = [
+  { method: 'GET', path: '/operator/overview', body: { portfolios: [] } },
+  { method: 'GET', path: '/operator/activity?limit=7', body: { activity: [] } },
+  { method: 'GET', path: `/operator/portfolios/${PORTFOLIO_ID}/plan`, body: SAMPLE_PREVIEW },
+  { method: 'POST', path: `/operator/portfolios/${PORTFOLIO_ID}/rebalance`, body: SAMPLE_REBALANCE },
+  { method: 'POST', path: `/operator/portfolios/${PORTFOLIO_ID}/close`, body: SAMPLE_REBALANCE },
+] as const;
+
+function operatorRouteStubs(called: string[]): Partial<ServerDeps> {
+  return {
+    operatorOverview: async () => { called.push('overview'); return { portfolios: [] }; },
+    operatorActivity: async (limit) => { assert.equal(limit, 7); called.push('activity'); return []; },
+    operatorPlanPreview: async (id) => { assert.equal(id, PORTFOLIO_ID); called.push('plan'); return SAMPLE_PREVIEW; },
+    operatorForceRebalance: async (id) => { assert.equal(id, PORTFOLIO_ID); called.push('rebalance'); return SAMPLE_REBALANCE; },
+    operatorForceClose: async (id) => { assert.equal(id, PORTFOLIO_ID); called.push('close'); return SAMPLE_REBALANCE; },
+  };
+}
+
+for (const route of OPERATOR_ROUTES) {
+  test(`${route.method} ${route.path}：只放行 SIWE 白名單錢包，拒絕時不呼叫領域依賴`, async () => {
+    const called: string[] = [];
+    await withServer(async (baseUrl) => {
+      const request = (token?: string) => route.method === 'POST'
+        ? postJson(baseUrl, route.path, {}, token)
+        : getJson(baseUrl, route.path, token);
+      for (const token of [undefined, 'invalid-token']) {
+        assert.equal((await request(token)).status, 401);
+      }
+      const unrelatedToken = await loginToken(baseUrl, UNRELATED_WALLET);
+      const denied = await request(unrelatedToken);
+      assert.equal(denied.status, 403);
+      assert.equal(await responseErrorCode(denied), 'OPERATOR_FORBIDDEN');
+      assert.deepEqual(called, [], '非 operator 不可讀取資料或觸發交易');
+
+      const operatorToken = await loginToken(baseUrl, OPERATOR_WALLET);
+      const allowed = await request(operatorToken);
+      assert.equal(allowed.status, 200);
+      assert.deepEqual(await allowed.json(), route.body);
+      assert.equal(called.length, 1);
+    }, {
+      ...operatorRouteStubs(called),
+      operatorWallets: [OPERATOR_WALLET.address.toLowerCase()],
+      operatorRebalanceEnabled: () => true,
+    });
+  });
+
+  test(`${route.method} ${route.path}：空白名單拒絕所有已登入錢包`, async () => {
+    const called: string[] = [];
+    await withServer(async (baseUrl) => {
+      const token = await loginToken(baseUrl, OPERATOR_WALLET);
+      const denied = route.method === 'POST'
+        ? await postJson(baseUrl, route.path, {}, token)
+        : await getJson(baseUrl, route.path, token);
+      assert.equal(denied.status, 403);
+      assert.equal(await responseErrorCode(denied), 'OPERATOR_FORBIDDEN');
+    }, { ...operatorRouteStubs(called), operatorWallets: [], operatorRebalanceEnabled: () => true });
+    assert.deepEqual(called, []);
+  });
+
+  test(`${route.method} ${route.path}：寫入開關關閉，讀取仍可供白名單排查`, async () => {
+    const called: string[] = [];
+    await withServer(async (baseUrl) => {
+      if (route.method === 'POST') {
+        const anonymous = await postJson(baseUrl, route.path, {});
+        assert.equal(anonymous.status, 401);
+      }
+      for (const wallet of [UNRELATED_WALLET, OPERATOR_WALLET]) {
+        const token = await loginToken(baseUrl, wallet);
+        const response = route.method === 'POST'
+          ? await postJson(baseUrl, route.path, {}, token)
+          : await getJson(baseUrl, route.path, token);
+        const allowed = route.method === 'GET' && wallet === OPERATOR_WALLET;
+        assert.equal(response.status, allowed ? 200 : 403);
+        if (allowed) assert.deepEqual(await response.json(), route.body);
+        else assert.equal(await responseErrorCode(response),
+          route.method === 'POST' ? 'OPERATOR_REBALANCE_DISABLED' : 'OPERATOR_FORBIDDEN');
+      }
+    }, {
+      ...operatorRouteStubs(called),
+      operatorWallets: [OPERATOR_WALLET.address],
+      operatorRebalanceEnabled: () => false,
+    });
+    assert.equal(called.length, route.method === 'POST' ? 0 : 1);
+  });
+}
+
+test('/operator/* 預設從 OPERATOR_WALLETS 讀設定：空值拒絕、錯值不部分放行、有效地址才可用', async () => {
+  const previous = process.env.OPERATOR_WALLETS;
+  const called: string[] = [];
+  try {
+    process.env.OPERATOR_WALLETS = '';
+    await withServer(async (baseUrl) => {
+      const token = await loginToken(baseUrl, OPERATOR_WALLET);
+      const empty = await getJson(baseUrl, '/operator/overview', token);
+      assert.equal(empty.status, 403);
+      assert.equal(await responseErrorCode(empty), 'OPERATOR_FORBIDDEN');
+      process.env.OPERATOR_WALLETS = `${OPERATOR_WALLET.address},*`;
+      const invalid = await getJson(baseUrl, '/operator/overview', token);
+      assert.equal(invalid.status, 503);
+      assert.equal(await responseErrorCode(invalid), 'INVALID_OPERATOR_WALLETS');
+      assert.deepEqual(called, []);
+      process.env.OPERATOR_WALLETS = ` ${OPERATOR_WALLET.address} `;
+      const allowed = await getJson(baseUrl, '/operator/overview', token);
+      assert.equal(allowed.status, 200);
+      assert.deepEqual(await allowed.json(), { portfolios: [] });
+      assert.deepEqual(called, ['overview']);
+    }, operatorRouteStubs(called));
+  } finally {
+    if (previous === undefined) delete process.env.OPERATOR_WALLETS;
+    else process.env.OPERATOR_WALLETS = previous;
+  }
+});
 
 test('GET /portfolios/:id/status 沒有 token 是 401，有 token 才拿到狀態', async () => {
   await withServer(

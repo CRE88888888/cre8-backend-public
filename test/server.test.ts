@@ -3,7 +3,27 @@ import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { after, test } from 'node:test';
 import { closePool, query as dbQuery } from '../src/db.js';
-import { createServer } from '../src/server.js';
+import { createServer, resolveOperatorWallets } from '../src/server.js';
+
+test('OPERATOR_WALLETS：未設定或空值一律拒絕；多個地址去空白並統一大小寫', () => {
+  const operator = '0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65';
+  const other = '0x976EA74026E726554dB657fA54763abd0C3a0aa9';
+  assert.deepEqual(resolveOperatorWallets({}), []);
+  assert.deepEqual(resolveOperatorWallets({ OPERATOR_WALLETS: '  ' }), []);
+  assert.deepEqual(resolveOperatorWallets({ OPERATOR_WALLETS: ` ${operator}, ${other} ` }),
+    [operator.toLowerCase(), other.toLowerCase()]);
+});
+
+test('OPERATOR_WALLETS：萬用字元、零地址、錯誤地址或空項目拒絕整份設定', () => {
+  const operator = '0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65';
+  for (const raw of ['*', '0x1234', '0x' + '0'.repeat(40), `${operator},*`, `${operator},`, `,${operator}`]) {
+    assert.throws(() => resolveOperatorWallets({ OPERATOR_WALLETS: raw }), (error: unknown) => {
+      assert.equal((error as { status: number }).status, 503);
+      assert.equal((error as { code: string }).code, 'INVALID_OPERATOR_WALLETS');
+      return true;
+    });
+  }
+});
 
 /**
  * `GET /health` 的告警欄位。

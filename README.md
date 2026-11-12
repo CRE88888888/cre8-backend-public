@@ -52,11 +52,22 @@ HTTP → src/index.ts（啟動：config → migrate → listen）
 | `SESSION_KEY_MASTER_SEED` | 續期／enroll 時 ✅ | 空 | 派生 session key 的 HD master seed（`0x` + 64 hex）。私鑰永不落 DB，DB 只存派生路徑 `m/44'/60'/0'/0/<index>`。 |
 | `BUNDLER_URL` | | `http://127.0.0.1:3001` | `POST /bundler` 轉發的上游（alto）。`renewal-params` 也把它回給前端當**資訊**顯示。留空 = 這個預設值。 |
 | `CORS_ALLOWED_ORIGINS` | | `http://localhost:5173,http://127.0.0.1:5173` | 逗號分隔的允許 origin（完整 origin，不分大小寫）。未設定 = dev 預設；不支援 `*`。 |
+| `OPERATOR_WALLETS` | 營運 HTTP 端點時 ✅ | 空（全部拒絕） | `/operator/*` 的 SIWE 登入錢包白名單，逗號分隔的非零 EVM 公開地址；比對不分大小寫。與 backend 的 relayer 私鑰獨立，這裡不填私鑰。 |
+| `ENABLE_OPERATOR_REBALANCE` | | 關閉 | 只有字面值 `true` 才開啟 `POST /portfolios/:id/rebalance` 與 `POST /operator/portfolios/:id/{rebalance,close}`；後兩支另需營運白名單。 |
 | `TELEGRAM_BOT_TOKEN` | 與 chat id 成對 | 空 | BotFather 給的 bot 密碼；只放本機 `.env` 或服務的 secret 設定。 |
 | `TELEGRAM_CHAT_ID` | 與 token 成對 | 空 | 收件私訊或群組的 id（保留負號）；設定方式見下方。 |
 | `TELEGRAM_API_BASE` | | `https://api.telegram.org` | 測試可指向本機假 Telegram 伺服器；正式使用留空。 |
 
 複製 `.env.example` 為 `.env` 即可；`.env` 不進版控。**不要**把真的 RPC URL 或連線字串寫進 repo。
+
+`/operator/*` 先驗 SIWE（未登入／無效 token 回 401）。寫入開關未啟用時，兩支營運 POST 回
+403 `OPERATOR_REBALANCE_DISABLED`；其餘情況再驗白名單，非營運錢包回 403 `OPERATOR_FORBIDDEN`，
+不讀取投組或觸發交易。白名單留空拒絕所有錢包；任一項格式錯誤（含 `*`、零地址、逗號空項目）
+會拒絕整份設定並回 503 `INVALID_OPERATOR_WALLETS`，不會放行部分清單。
+營運 GET（overview／activity／plan）只需白名單，不受寫入開關限制。
+原本 `/portfolios/*` 的 owner 檢查與 scheduler 行為不變；設定白名單不會自動開啟寫入。
+本機 X1 測試可把 anvil #4 公開地址 `0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65` 放入白名單，
+以該錢包走 SIWE 後操作 `http://127.0.0.1:8082/operator/*`。
 
 ### Telegram 警示
 

@@ -80,6 +80,17 @@ export function resolveCorsConfig(env: NodeJS.ProcessEnv = process.env): CorsCon
   return { allowedOrigins: origins.map((origin) => origin.toLowerCase()) };
 }
 
+/** 營運 SIWE 登入錢包；空值拒絕所有人，任一項格式錯誤也不放行部分清單。 */
+export function resolveOperatorWallets(env: NodeJS.ProcessEnv = process.env): readonly string[] {
+  const raw = env.OPERATOR_WALLETS?.trim() ?? '';
+  if (raw === '') return [];
+  const wallets = raw.split(',').map((wallet) => wallet.trim().toLowerCase());
+  if (wallets.some((wallet) => !/^0x[0-9a-f]{40}$/.test(wallet) || /^0x0{40}$/.test(wallet))) {
+    throw new AppError(503, 'INVALID_OPERATOR_WALLETS', 'OPERATOR_WALLETS must be comma-separated nonzero EVM addresses');
+  }
+  return wallets;
+}
+
 /**
  * 請求的 `Origin` 在清單裡就回傳**它的原樣字串**（要放進 `Access-Control-Allow-Origin`），否則 null。
  *
@@ -176,8 +187,8 @@ export type ServerDeps = {
    *
    * `POST /portfolios/:id/rebalance` 會 `requireOwnedPortfolio`（那是給使用者的）。
    * 營運端要跑的是別人的投組，所以另開一條：傳一個 no-op 的 `requireOwnedPortfolio`。
-   * 安全性仍由**鏈上**保證 —— 送出去的是 session key 的 UserOp，executor 會驗
-   * enrollment / asset allowlist / oracle 地板；這支端點只能「觸發排程器跑一輪」。
+   * HTTP 層先驗 SIWE + `OPERATOR_WALLETS` + 寫入開關，才允許跨 owner 操作；
+   * 鏈上 executor 另外驗 enrollment / asset allowlist / oracle 地板。
    */
   operatorForceRebalance: (portfolioId: number) => Promise<OperatorRebalanceResult>;
   /** 營運端全域活動流：誰、在哪個策略上被處理（含成敗與前後漂移）。 */
@@ -199,6 +210,8 @@ export type ServerDeps = {
    * （與 CORS／bundler URL 同一個做法：env 的解析留在 server 層）。
    */
   operatorRebalanceEnabled: () => boolean;
+  /** 測試可注入白名單；未指定時每次請求從 `OPERATOR_WALLETS` 解析，預設拒絕所有人。 */
+  operatorWallets?: readonly string[];
   /** CORS 允許清單。不給 = 每次請求從 `CORS_ALLOWED_ORIGINS` 解析（見 `resolveCorsConfig`）。 */
   cors?: CorsConfig;
   /**
@@ -351,6 +364,17 @@ async function route(
   const segments = url.pathname.split('/').filter((segment) => segment.length > 0);
   const [root] = segments;
 
+  // 所有 /operator/* 共用同一道授權，不能只靠登入或鏈上的交易限制。
+  // 先驗登入（401），再驗寫入開關（403，與 /portfolios/:id/rebalance 一致），最後驗身分。
+  if (root === 'operator') {
+    const wallet = await authenticate(req.headers.authorization);
+    if (method === 'POST') requireOperatorRebalanceEnabled(deps);
+    const wallets = deps.operatorWallets ?? resolveOperatorWallets();
+    if (!wallets.some((allowed) => allowed.toLowerCase() === wallet.toLowerCase())) {
+      throw new AppError(403, 'OPERATOR_FORBIDDEN', 'wallet is not authorized to use operator endpoints');
+    }
+  }
+
   if (root === 'health' && segments.length === 1) {
     if (method !== 'GET') return methodNotAllowed(res, ['GET']);
     return health(res);
@@ -448,7 +472,6 @@ async function route(
   // `GET /operator/portfolios/:id/plan` —— 營運端 dry-run 預覽（不送交易、不檢查 owner）。
   if (root === 'operator' && segments.length === 4 && segments[1] === 'portfolios' && segments[3] === 'plan') {
     if (method !== 'GET') return methodNotAllowed(res, ['GET']);
-    await authenticate(req.headers.authorization);
     const id = Number(segments[2]);
     if (!Number.isInteger(id) || id <= 0) throw new AppError(400, 'INVALID_ID', 'portfolio id must be a positive integer');
     sendJson(res, 200, await deps.operatorPlanPreview(id));
@@ -458,7 +481,6 @@ async function route(
   // `POST /operator/portfolios/:id/close` —— 營運端代為清倉（不檢查 owner）。
   if (root === 'operator' && segments.length === 4 && segments[1] === 'portfolios' && segments[3] === 'close') {
     if (method !== 'POST') return methodNotAllowed(res, ['POST']);
-    await authenticate(req.headers.authorization);
     const id = Number(segments[2]);
     if (!Number.isInteger(id) || id <= 0) throw new AppError(400, 'INVALID_ID', 'portfolio id must be a positive integer');
     sendJson(res, 200, await deps.operatorForceClose(id));
@@ -468,7 +490,6 @@ async function route(
   // `POST /operator/portfolios/:id/rebalance` —— 營運端手動觸發一輪（不檢查 owner）。
   if (root === 'operator' && segments.length === 4 && segments[1] === 'portfolios' && segments[3] === 'rebalance') {
     if (method !== 'POST') return methodNotAllowed(res, ['POST']);
-    await authenticate(req.headers.authorization);
     const id = Number(segments[2]);
     if (!Number.isInteger(id) || id <= 0) throw new AppError(400, 'INVALID_ID', 'portfolio id must be a positive integer');
     sendJson(res, 200, await deps.operatorForceRebalance(id));
@@ -478,7 +499,6 @@ async function route(
   // `GET /operator/activity?limit=50` —— 跨所有投組的操作歷史（誰、哪個策略、成敗）。
   if (root === 'operator' && segments.length === 2 && segments[1] === 'activity') {
     if (method !== 'GET') return methodNotAllowed(res, ['GET']);
-    await authenticate(req.headers.authorization);
     const rawLimit = url.searchParams.get('limit');
     const limit = rawLimit === null ? 50 : Number(rawLimit);
     if (!Number.isFinite(limit) || limit <= 0) {
@@ -490,8 +510,6 @@ async function route(
 
   if (root === 'operator' && segments.length === 2 && segments[1] === 'overview') {
     if (method !== 'GET') return methodNotAllowed(res, ['GET']);
-    // 只要求登入，不依 owner 過濾：這是內部儀表板。之後要做 `OPERATOR_WALLETS` 白名單就加在這裡。
-    await authenticate(req.headers.authorization);
     sendJson(res, 200, await deps.operatorOverview());
     return;
   }
@@ -729,7 +747,7 @@ async function planPreviewRoute(
 /**
  * `POST /portfolios/:id/rebalance` — 對單一 portfolio 真的跑一次 live 再平衡。
  *
- * **這是唯一一支會動錢的端點，所以它預設不存在**：`ENABLE_OPERATOR_REBALANCE` 不等於字面值
+ * **這支端點預設停用**：`ENABLE_OPERATOR_REBALANCE` 不等於字面值
  * `true` 就 403。一個「用 POST 就能讓伺服器動錢」的端點不該預設可用；生產環境可能永遠不該開它
  * （那裡是排程器自己在跑）。
  *
@@ -773,6 +791,12 @@ async function operatorRebalanceRoute(
   deps: ServerDeps,
 ): Promise<void> {
   const wallet = await authenticate(req.headers.authorization);
+  requireOperatorRebalanceEnabled(deps);
+  sendJson(res, 200, await deps.operatorRebalance(id, wallet));
+}
+
+/** owner 手動再平衡與 /operator/* 寫入共用同一個部署開關。 */
+function requireOperatorRebalanceEnabled(deps: ServerDeps): void {
   const enabled = deps.operatorRebalanceEnabled ?? operatorRebalanceEnabled;
   if (!enabled()) {
     throw new AppError(
@@ -782,7 +806,6 @@ async function operatorRebalanceRoute(
         '真的動到投組裡的錢；排程器自己在跑的時候不需要它）。這是部署層的開關，未啟用時這個端點不存在',
     );
   }
-  sendJson(res, 200, await deps.operatorRebalance(id, wallet));
 }
 
 // ---------------------------------------------------------------------------

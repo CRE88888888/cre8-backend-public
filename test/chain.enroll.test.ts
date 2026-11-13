@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { decodeErrorResult, encodeErrorResult, getAddress, toFunctionSelector, zeroAddress } from 'viem';
 import type { Abi, Address, PublicClient, WalletClient } from 'viem';
 import { KERNEL_V3_3_ADDRESSES } from '../src/addresses.js';
-import { a10ErrorMessage, enrollOnchain, EXECUTOR_PAUSE_ABI, pauseSources, REGISTRY_ABI } from '../src/chain.js';
+import { a10ErrorMessage, EXECUTOR_BUY_ABI, enrollOnchain, EXECUTOR_PAUSE_ABI, pauseSources, REGISTRY_ABI } from '../src/chain.js';
 import type { ChainConfig } from '../src/chain.js';
 
 // Address-only stubs: these tests never load a private key, connect to a DB or make an RPC call.
@@ -249,4 +249,17 @@ test('a successful receipt with missing enrollment data never reports success', 
     return receipt;
   };
   await assert.rejects(() => enrollOnchain(SMART_ACCOUNT, 7, chain), /enrollment 缺漏/);
+});
+
+test('A10 buy errors decode actual ABI selectors and structured errors without RPC secrets', () => {
+  const cases = [
+    encodeErrorResult({ abi: EXECUTOR_BUY_ABI, errorName: 'BuyLimitExceeded', args: [101n, 100n] }),
+    encodeErrorResult({ abi: EXECUTOR_BUY_ABI, errorName: 'NotNumeraireRoute', args: [SMART_ACCOUNT, SIGNER] }),
+  ];
+  for (const [index, data] of cases.entries()) {
+    const message = a10ErrorMessage(new Error('sensitive-token', { cause: { data } }));
+    assert.match(message ?? '', index === 0 ? /BuyLimitExceeded.*買入額度/ : /NotNumeraireRoute.*numeraire/);
+    assert.ok(!message?.includes('sensitive-token'));
+  }
+  assert.match(a10ErrorMessage({ data: { errorName: 'BuyLimitExceeded' } }) ?? '', /BuyLimitExceeded/);
 });

@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { mnemonicToAccount } from 'viem/accounts';
 import { zeroAddress } from 'viem';
 import type { Address } from 'viem';
-import { checkGlobalPaused, checkOwnership, checkRegistryOperator, checkRoleSeparation, checkSessionKeySeed, operatorAddress } from '../scripts/preflight.js';
+import { checkBuyConfig, checkGlobalPaused, checkOwnership, checkRegistryOperator, checkRoleSeparation, checkSessionKeySeed, operatorAddress } from '../scripts/preflight.js';
 
 for (const strict of [true, false]) {
   test(`executor pause preflight (strict=${strict}) distinguishes false, true and unreadable`, () => {
@@ -214,3 +214,13 @@ test('operatorAddress rejects empty, malformed, zero and out-of-range keys witho
     assert.equal(operatorAddress(raw), null);
   }
 });
+
+for (const strict of [false, true]) {
+  test(`A10 preflight buy config strict=${strict}: zero, below, exact cap and missing data`, () => {
+    const usdt: Address = '0x55d398326f99059fF775485246999027B3197955';
+    assert.ok(checkBuyConfig(10000, usdt, strict).every((check) => check.level === 'ok'));
+    for (const bps of [0, 9999]) assert.equal(checkBuyConfig(bps, usdt, strict)[0]?.level, strict ? 'fail' : 'warn');
+    assert.equal(checkBuyConfig(10000, zeroAddress, strict)[1]?.level, strict ? 'fail' : 'warn');
+    assert.ok(checkBuyConfig(null, null, strict).every((check) => check.level === 'fail'));
+  });
+}

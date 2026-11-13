@@ -1506,6 +1506,27 @@ async 函式被**呼叫**的時候才是真正的失敗點，而那通常發生�
 
 ---
 
+### 8.44 買入的 2% 餘裕要留在總 cap，不能只乘剩餘額度
+
+`cap = 100`、`bought = 99` 時，`(cap − bought) × 98%` 還會送 0.98；上鏈前估值只跌 1%，
+cap 就變 99，這筆必然 `BuyLimitExceeded`。規劃用 `max(floor(cap × 98%) − bought, 0)`，
+並與持倉／報價釘同一塊。縮量先於報價與 payload 編碼，不能只改 step 外層的 amountIn。
+
+沒有開著的窗口時，合約回 `windowEndsAt = 0`。Safe 若關閉買入（`maxBuyBps = 0`），
+不能把這個 0 寫成 1970 年的 `next_run_at`，否則每輪立即到期。這時保持 blocked、沿用正常間隔；
+只有有效且尚未到期的窗口才改排到窗口結束。排程寫入失敗也保留正常間隔。
+
+先處理 pending／submitted 與帶 hash 的舊 failed 操作，才讀新額度。跨窗或額度耗盡都不能
+把 receipt 逾時的 UserOp 變成可重送；短 transaction 裡的第二次在途檢查仍保留。
+含買入才會做帳戶估值，預算需包含**交換前**每個已持有非 USDT 策略資產約 145k gas；
+純賣出的 redeem／close 不應因買入 cap 為 0 而停止。
+
+平行工作時，fork 驗收要從已合併 main 的固定 commit 建乾淨合約副本（例如 `git archive <commit>`），
+不要複製其他 lane 正在修改的工作目錄。#36 曾混入未合併的 A11 `SwapStep` ABI，讓正確的
+舊介面呼叫只得到裸 `0x` revert；固定到 contracts `d62d1c3` 後再部署、重建專用測試 DB 才能驗收。
+
+---
+
 ## 附錄：診斷心法
 
 這輪踩到的坑有一個共同模式：**錯誤訊息指向的位置，幾乎都不是真正的原因**。

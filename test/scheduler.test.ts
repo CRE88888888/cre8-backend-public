@@ -4,7 +4,7 @@ import { createServer as createHttpServer } from 'node:http';
 import { promisify } from 'node:util';
 import { serialize } from 'node:v8';
 import { after, test } from 'node:test';
-import { decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeErrorResult, encodeFunctionData, encodePacked, isHex, keccak256, parseAbi, toBytes } from 'viem';
+import { decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeErrorResult, encodeFunctionData, encodePacked, getAddress, isHex, keccak256, parseAbi, toBytes } from 'viem';
 import { getUserOperationHash } from 'viem/account-abstraction';
 import type { GetUserOperationReturnType, UserOperationReceipt } from 'viem/account-abstraction';
 import { EXECUTOR_PAUSE_ABI } from '../src/chain.js';
@@ -2703,4 +2703,73 @@ test('#34 預設送出前路徑每輪重讀 effectiveFeeBps：0→25→300、無
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
+});
+
+for (const dryRun of [false, true]) {
+  for (const seconds of [null, -1, 0, 1, ONE_DAY_SECONDS * 2]) {
+    test(`A10 blocked allowance reschedules only future windows; dryRun=${dryRun}, seconds=${seconds}`, async () => {
+      const db = stubDb({ portfolios: [portfolio()] });
+      const chain = stubChain();
+      const end = seconds === null ? 0n : BigInt(Math.floor(NOW.getTime() / 1000) + seconds);
+      chain.rebalance = { kind: 'blocked', reason: '買入額度用盡', buyWindowEndsAt: end };
+      const round = await runSchedulerOnce({ dryRun, now: NOW }, deps(db, chain));
+      assert.deepEqual(outcomes(round), ['blocked']);
+      const expected = !dryRun && seconds !== null && seconds > 0 ? new Date(Number(end) * 1000) : new Date(NOW.getTime() + ONE_DAY_SECONDS * 1000);
+      assert.equal(round.results[0]?.nextRunAt.toISOString(), expected.toISOString());
+      assert.equal(db.portfolios[0]?.nextRunAt?.toISOString() ?? null, dryRun ? null : expected.toISOString());
+      assert.equal(db.operations.length, 0);
+      assert.equal(chain.executeCalls.length, 0);
+    });
+  }
+}
+
+test('A10 gas adds 145k for each held valuation asset to both floor and scaled budgets', () => {
+  assert.equal(rebalanceCallGasLimit(0n, 2), 890000n);
+  assert.equal(rebalanceCallGasLimit(600000n, 3), 1335000n);
+  assert.equal(rebalanceCallGasLimit(400000n, 0), 600000n);
+  for (const count of [-1, 0.5, Number.NaN]) assert.throws(() => rebalanceCallGasLimit(0n, count), /valuation/);
+  assert.throws(() => rebalanceCallGasLimit(-1n), /valuation/);
+});
+
+test('A10 schedule write failure preserves the normal interval and never creates an operation', async () => {
+  const db = stubDb({ portfolios: [portfolio()] });
+  const chain = stubChain();
+  chain.rebalance = { kind: 'blocked', reason: '買入額度', buyWindowEndsAt: BigInt(NOW.getTime() / 1000 + 60) };
+  const original = stubQuery(db);
+  const round = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain, {
+    query: async (sql, params) => {
+      if (sql.includes('set next_run_at')) throw new Error('sensitive-token DB disconnected');
+      return original(sql, params);
+    },
+  }));
+  assert.deepEqual(outcomes(round), ['blocked']);
+  assert.equal(round.results[0]?.nextRunAt.toISOString(), new Date(NOW.getTime() + ONE_DAY_SECONDS * 1000).toISOString());
+  assert.match(round.results[0]?.reason ?? '', /排程寫回失敗/);
+  assert.ok(!JSON.stringify(round).includes('sensitive-token'));
+  assert.equal(db.operations.length, 0);
+});
+
+for (const state of ['pending', 'submitted'] as const) {
+  test(`A10 exhausted allowance never overwrites #34 ${state} protection`, async () => {
+    const db = stubDb({ portfolios: [portfolio()], operations: [{ portfolioId: PORTFOLIO_ID, idempotencyKey: 'previous', payloadHash: 'previous', state, attempts: 1, txHash: null, userOpHash: null, lastError: null }] });
+    const chain = stubChain();
+    chain.rebalance = { kind: 'blocked', reason: '買入額度用盡', buyWindowEndsAt: BigInt(NOW.getTime() / 1000 + 60) };
+    const round = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain));
+    assert.deepEqual(outcomes(round), ['blocked']);
+    assert.equal(chain.planRebalanceCalls, 0);
+    assert.equal(chain.executeCalls.length, 0);
+    assert.equal(db.operations[0]?.state, state);
+    assert.equal(round.results[0]?.nextRunAt.toISOString(), new Date(NOW.getTime() + ONE_DAY_SECONDS * 1000).toISOString());
+  });
+}
+
+test('A10 sends only held pinned-version assets for the valuation gas budget', async () => {
+  const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+  const chain = stubChain();
+  const first = chain.plan.snapshot.holdings[0];
+  assert.ok(first);
+  chain.plan.snapshot.holdings = [first, { ...first, asset: TOKEN_OUT, amountWei: 0n }, { ...first, asset: ZERO }];
+  const round = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain));
+  assert.deepEqual(outcomes(round), ['executed']);
+  assert.deepEqual(chain.executeCalls[0]?.valuationAssets, [getAddress(TOKEN_IN)]);
 });

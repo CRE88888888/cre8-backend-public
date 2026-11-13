@@ -30,12 +30,14 @@ import { createPublicClient, http, isAddress, getAddress, zeroAddress } from 'vi
 import { privateKeyToAccount } from 'viem/accounts';
 import type { Address } from 'viem';
 
-import { readGlobalPaused, REGISTRY_ABI } from '../src/chain.js';
+import { readGlobalPaused, REGISTRY_ABI, EXECUTOR_BUY_ABI } from '../src/chain.js';
 import { activeChain } from '../src/chain-object.js';
 import { getConfig, requireSessionKeyConfig } from '../src/config.js';
 import { query } from '../src/db.js';
 import { inspectSessionKeyDerivation, sessionKeyDerivationDetail } from '../src/scheduler.js';
 import type { SessionKeyDerivationReport } from '../src/scheduler.js';
+
+const USDT_ADDRESS: Address = '0x55d398326f99059fF775485246999027B3197955';
 
 type Level = 'ok' | 'warn' | 'fail';
 
@@ -67,6 +69,15 @@ export function checkGlobalPaused(paused: boolean | null, strict: boolean): Chec
     detail: paused ? 'Safe 已開啟全域暫停（所有再平衡含賣出都停止）' : 'false（未暫停）',
     ...(paused ? { fix: '由 Safe 確認事故已解除後決定是否恢復；backend 不會解除全域暫停' } : {}),
   };
+}
+
+export function checkBuyConfig(maxBuyBps: number | null, numeraire: Address | null, strict: boolean): Check[] {
+  return [
+    { name: 'executor.maxBuyBps', level: maxBuyBps === null ? 'fail' : maxBuyBps === 10000 ? 'ok' : strict ? 'fail' : 'warn',
+      detail: maxBuyBps === null ? '讀不到 maxBuyBps()' : `${maxBuyBps}（預期 10000）` },
+    { name: 'executor.numeraire', level: numeraire === null ? 'fail' : sameAddress(numeraire, USDT_ADDRESS) ? 'ok' : strict ? 'fail' : 'warn',
+      detail: numeraire === null ? '讀不到 numeraire()' : `${numeraire}（預期 USDT）` },
+  ];
 }
 
 export function checkSessionKeySeed(report: SessionKeyDerivationReport): Check {
@@ -454,6 +465,11 @@ async function main(): Promise<number> {
     let paused: boolean | null = null;
     try { paused = await readGlobalPaused(executor, client); } catch { /* unreadable is fail, never false */ }
     record(checkGlobalPaused(paused, args.strict));
+    let maxBuyBps: number | null = null;
+    let numeraire: Address | null = null;
+    try { maxBuyBps = await client.readContract({ address: executor, abi: EXECUTOR_BUY_ABI, functionName: 'maxBuyBps' }); } catch { /* unreadable fails */ }
+    try { numeraire = await client.readContract({ address: executor, abi: EXECUTOR_BUY_ABI, functionName: 'numeraire' }); } catch { /* unreadable fails */ }
+    checkBuyConfig(maxBuyBps, numeraire, args.strict).forEach(record);
     try {
       const oracle = await client.readContract({
         address: executor,

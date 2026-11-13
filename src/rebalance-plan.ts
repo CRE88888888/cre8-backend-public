@@ -93,6 +93,7 @@
  * 的 `AssetNotAllowed`），hub 不是策略資產就收不了賣出的 USDT、也付不出買的 USDT。
  */
 
+import { EXECUTOR_BUY_ABI } from './chain.js';
 import { chooseBestPath, routeImpactBps, singleHopPath } from './routing.js';
 import { V2_FACTORY_ADDRESS, V3_FACTORY_ADDRESS, WBNB_ADDRESS } from './addresses.js';
 import { decodeAbiParameters, encodeAbiParameters, encodePacked, getAddress, isAddressEqual } from 'viem';
@@ -117,7 +118,7 @@ export type PlannedStep = {
 
 export type RebalancePlan =
   | { kind: 'noop'; reason: string }
-  | { kind: 'blocked'; reason: string }
+  | { kind: 'blocked'; reason: string; buyWindowEndsAt?: bigint }
   | {
       kind: 'ready';
       steps: PlannedStep[];
@@ -1260,6 +1261,38 @@ async function capLegByImpact(params: {
   };
 }
 
+type BuyBudget = { cap: bigint; bought: bigint; windowEndsAt: bigint; remaining: bigint; note: string };
+
+/** Fail closed without copying RPC errors (which may contain credentials) into API/logs. */
+async function readBuyBudget(args: PlanRebalanceArgs): Promise<BuyBudget | Extract<RebalancePlan, { kind: 'blocked' }>> {
+  try {
+    const result: unknown = await args.publicClient.readContract({
+      address: args.executor, abi: EXECUTOR_BUY_ABI, functionName: 'buyAllowance',
+      args: [args.account], blockNumber: args.blockNumber,
+    });
+    if (!Array.isArray(result) || result.length !== 3) throw new Error('missing allowance');
+    const [cap, bought, windowEndsAt]: unknown[] = result;
+    if (typeof cap !== 'bigint' || cap < 0n || cap >= 2n ** 256n ||
+        typeof bought !== 'bigint' || bought < 0n || bought >= 2n ** 256n ||
+        typeof windowEndsAt !== 'bigint' || windowEndsAt < 0n || windowEndsAt >= 2n ** 64n) throw new Error('invalid allowance');
+    // Margin applies to the total cap: remaining * 98% is unsafe near exhaustion.
+    const safeCap = cap * 9800n / 10000n;
+    const remaining = safeCap > bought ? safeCap - bought : 0n;
+    const note = `買入額度：cap ${cap} × 98% − bought ${bought} → 可買 ${remaining}，windowEndsAt ${windowEndsAt}`;
+    if (remaining === 0n) return { kind: 'blocked', reason: `${note}；${windowEndsAt === 0n ? '沒有可等待的開啟窗口，沿用正常排程間隔' : '等待買入窗口結束'}`, buyWindowEndsAt: windowEndsAt };
+    return { cap, bought, windowEndsAt, remaining, note };
+  } catch {
+    return { kind: 'blocked', reason: '[BUY_ALLOWANCE_UNAVAILABLE] buyAllowance 讀取失敗或資料缺漏，無法確認買入額度，不送交易' };
+  }
+}
+
+async function executorNumeraire(args: PlanRebalanceArgs): Promise<Address | null> {
+  try {
+    const value = await args.publicClient.readContract({ address: args.executor, abi: EXECUTOR_BUY_ABI, functionName: 'numeraire', blockNumber: args.blockNumber });
+    return isAddressLike(value) ? getAddress(value) : null;
+  } catch { return null; }
+}
+
 /**
  * hub 模式：N 資產、以 numeraire 為中央。步驟順序是 **先所有賣、再所有買**，因為買的 USDT 只會來自
  * 前面那些賣（executor 逐 step 從帳戶拉 `tokenIn`，同一個 tx、同一個帳戶餘額）。
@@ -1308,6 +1341,8 @@ async function planHub(
     legs.push({ asset: getAddress(target.asset), row, deltaUsdE8: row.usdValueE8 - targetUsdE8 });
   }
 
+  const buyBudget = legs.some((leg) => leg.deltaUsdE8 < 0n) ? await readBuyBudget(args) : null;
+  if (buyBudget !== null && 'kind' in buyBudget) return buyBudget;
   const notes: string[] = [];
   const priced: PricedLeg[] = [];
   let head: Head | null = null;
@@ -1529,7 +1564,9 @@ async function planHub(
       continue;
     }
     const requested = amountInFor(-leg.deltaUsdE8, hubHolding.usdPriceE8, hubHolding.decimals);
-    const remaining = spendable - spent;
+    const cashRemaining = spendable - spent;
+    const allowanceRemaining = buyBudget === null ? cashRemaining : buyBudget.remaining - spent;
+    const remaining = cashRemaining < allowanceRemaining ? cashRemaining : allowanceRemaining;
     if (remaining <= 0n) {
       notes.push(
         `USDT 預算用盡（現有 ${hubHolding.amountWei} + 賣出保證 ${sellProceeds} = ${spendable}，已付 ${spent}），跳過買 ${short(leg.asset)}`,
@@ -1646,6 +1683,7 @@ async function planHub(
     `hub 模式：numeraire ${short(hub)}（${targets.length - 1} 個非 hub 資產、${steps.length} 個 step，` +
       `${priced.slice(0, sellCount).length} 賣 / ${priced.length - sellCount} 買，賣全排在買前面）`,
     ...legNotes,
+    ...(buyBudget === null ? [] : [buyBudget.note]),
     `USDT 預算：現有 ${hubHolding?.amountWei ?? 0n} + 賣出保證淨額 ${sellProceeds} = ${spendable}，實際付出 ${spent}`,
     `fee ${fee} bps（registry.effectiveFeeBps(${strategyId})）；block ${blockNumber} 時間 ${blockTimestamp}；` +
       `deadline 基準 max(塊時間, 牆鐘) = ${deadlineBaseSeconds}（取${deadlineSource === 'chain' ? '塊時間' : '牆鐘'}）` +
@@ -1872,7 +1910,12 @@ export async function planRebalance(
   // ---- 形狀判定：hub（AtpMultiPoolOracle，N 資產、以 numeraire 為中央）還是 pinned（舊的單一 pair）？
   const shape = await detectOracleShape(publicClient, oracle, blockNumber);
   if (shape.kind === 'unknown') return { kind: 'blocked', reason: shape.detail };
-  if (shape.kind === 'hub') return planHub(args, shape.numeraire, deps, deadlineSeconds, maxImpactBps);
+  const numeraire = await executorNumeraire(args);
+  if (numeraire === null) return { kind: 'blocked', reason: '[NUMERAIRE_UNAVAILABLE] executor.numeraire 讀取失敗或資料缺漏，不送交易' };
+  if (shape.kind === 'hub') {
+    if (!isAddressEqual(numeraire, shape.numeraire)) return { kind: 'blocked', reason: 'NotNumeraireRoute：oracle 與 executor 的 numeraire 不一致，不送交易' };
+    return planHub(args, shape.numeraire, deps, deadlineSeconds, maxImpactBps);
+  }
 
   // pinned：oracle 真的只釘一個 pool（D-23）。結構上做不到的事先講清楚，不要用「沒事可做」蓋過去：
   // 一個 3 資產的策略在這種 oracle 上**永遠**不能動，operator 需要知道的是這件事。
@@ -1886,7 +1929,9 @@ export async function planRebalance(
     };
   }
   const leg = preflight.leg;
-  const { tokenIn, tokenOut, amountIn, requested, clamped } = leg;
+  const { tokenIn, tokenOut, requested, clamped } = leg;
+  let amountIn = leg.amountIn;
+  let buyNote: string | null = null;
 
   // pair 必須正好是 oracle 釘住的那一對（順序不拘，方向由 tokenIn/tokenOut 決定）。
   const poolTokens = new Set([shape.token0.toLowerCase(), shape.token1.toLowerCase()]);
@@ -1898,6 +1943,14 @@ export async function planRebalance(
         `not ${short(tokenIn)} / ${short(tokenOut)}: the oracle currently pins a single pool, ` +
         'and more than two assets needs the per-call oracle (D-23)',
     };
+  }
+
+  if (!isAddressEqual(tokenOut, numeraire)) {
+    if (!isAddressEqual(tokenIn, numeraire)) return { kind: 'blocked', reason: 'NotNumeraireRoute：買入必須以 executor.numeraire 付款，不送交易' };
+    const budget = await readBuyBudget(args);
+    if ('kind' in budget) return budget;
+    if (amountIn > budget.remaining) amountIn = budget.remaining;
+    buyNote = budget.note;
   }
 
   const oraclePool = shape.pool;
@@ -2043,6 +2096,7 @@ export async function planRebalance(
   // R1 的結構保證：`steps` 的唯一來源是這個單元素陣列，所以 `ready` 不可能帶著空陣列
   // （空陣列 = «成功但什麼都沒做»，docs/pitfalls.zh-TW.md §8.1）。
   const rationale = [
+    ...(buyNote === null ? [] : [buyNote]),
     `${short(tokenIn)} 超配 +${leg.sellerRow.deltaBps} bps（現況 ${leg.sellerRow.currentBps} / 目標 ${leg.sellerRow.targetBps}）` +
       `，賣 ${formatUnits(finalAmountIn, leg.sellerDecimals)} 顆（${finalAmountIn} 個最小單位）換 ${short(tokenOut)}` +
       `，約 ${leg.valueToMoveE8} E8 USD`,

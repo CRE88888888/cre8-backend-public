@@ -76,6 +76,8 @@ type StubQuote = { minimum: bigint; quoted?: bigint };
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000' as Address;
 
 type StubChain = {
+  buyAllowance?: unknown;
+  executorNumeraire?: unknown;
   calls: ChainCall[];
   block: { number: bigint; timestamp: bigint };
   /** 被呼叫的 `getBlock` 次數（deadline 一定要讀塊時間，除非注入）。 */
@@ -141,6 +143,16 @@ function stubClient(chain: StubChain): PublicClient {
         blockNumber: args.blockNumber,
       });
       const target = args.address.toLowerCase();
+      if (target === EXECUTOR.toLowerCase() || target === EXECUTOR_MULTI.toLowerCase()) {
+        if (args.functionName === 'numeraire') {
+          if (chain.executorNumeraire instanceof Error) throw chain.executorNumeraire;
+          return chain.executorNumeraire === undefined ? chain.oracle.token0 : chain.executorNumeraire;
+        }
+        if (args.functionName === 'buyAllowance') {
+          if (chain.buyAllowance instanceof Error) throw chain.buyAllowance;
+          return chain.buyAllowance === undefined ? [2n ** 192n - 1n, 0n, 0n] : chain.buyAllowance;
+        }
+      }
       const hub = chain.oracle.numeraire !== undefined;
       const pairs = chain.oracle.pairs ?? {};
 
@@ -1991,4 +2003,151 @@ test('交叉驗證：真 fork 上跑一次規劃器，minGross ≥ previewSwap �
   );
   assert.equal(step.commands, '0x00');
   assert.equal(step.inputs.length, 1);
+});
+
+// A10: allowance is a budget for the entire batch, in numeraire units.
+function allowanceCase(chain: StubChain): PlanRebalanceArgs {
+  return hubArgs(chain, {
+    holdings: [holding(USDT, 1000n * 10n ** 18n, 18, PRICE_1_USD)],
+    targets: [{ asset: USDT, weightBps: 0 }, { asset: WBNB, weightBps: 5000 }, { asset: TOKEN3, weightBps: 5000 }],
+    thresholdBps: 100,
+  });
+}
+
+for (const [cap, bought, expected] of ([[100n, 0n, 98n], [100n, 97n, 1n], [101n, 0n, 98n], [1000n, 0n, 980n]] satisfies [bigint, bigint, bigint][])) {
+  test(`A10 batch budget cap=${cap}, bought=${bought}: floors total-cap margin before subtracting buys`, async () => {
+    const chain = hubChain();
+    chain.rate = { rateE18: 10n ** 18n, slippageBps: 100 };
+    chain.buyAllowance = [cap, bought, 1800000000n];
+    const plan = expectReady(await planRebalance(allowanceCase(chain)));
+    assert.equal(plan.steps.reduce((sum, step) => sum + step.amountIn, 0n), expected);
+    for (const step of plan.steps) {
+      const payload = decodeStepInput(step);
+      assert.equal(payload.amountIn, step.amountIn);
+      assert.equal(payload.amountOutMin, step.amountOutMin);
+      assert.equal(step.oracleFloor, (step.amountIn * 9900n + 9999n) / 10000n);
+    }
+    const reads = chain.calls.filter((call) => call.functionName === 'buyAllowance');
+    assert.equal(reads.length, 1);
+    assert.equal(reads[0]?.blockNumber, chain.block.number);
+    assert.equal(reads[0]?.args?.[0], allowanceCase(chain).account);
+    assert.match(plan.rationale, /買入額度/);
+  });
+}
+
+for (const [cap, bought, end] of ([[0n, 0n, 0n], [100n, 98n, 1800000000n], [100n, 100n, 1800000000n], [100n, 101n, 1800000000n], [1n, 0n, 0n]] satisfies [bigint, bigint, bigint][])) {
+  test(`A10 exhausted or rounded-to-zero budget ${cap}/${bought}/${end} blocks without a quote`, async () => {
+    const chain = hubChain();
+    chain.buyAllowance = [cap, bought, end];
+    const plan = await planRebalance(allowanceCase(chain));
+    assert.equal(plan.kind, 'blocked');
+    assert.ok(plan.kind === 'blocked');
+    assert.equal(plan.buyWindowEndsAt, end);
+    assert.match(plan.reason, /買入額度/);
+    assert.ok(!chain.calls.some((call) => call.functionName === 'previewSwap'));
+  });
+}
+
+for (const failure of [new Error('RPC timeout sensitive-token'), new Error('RPC failed sensitive-token')]) {
+  test(`A10 allowance RPC failure blocks without exposing credentials: ${failure.message.split(' ')[1]}`, async () => {
+    const chain = hubChain();
+    chain.buyAllowance = failure;
+    const plan = await planRebalance(allowanceCase(chain));
+    assert.equal(plan.kind, 'blocked');
+    assert.ok(!JSON.stringify(plan).includes('sensitive-token'));
+    assert.ok(!chain.calls.some((call) => call.functionName === 'previewSwap'));
+  });
+}
+
+test('A10 sales-only plans do not read buyAllowance even when its RPC fails', async () => {
+  const chain = hubChain();
+  chain.buyAllowance = new Error('unavailable');
+  chain.rate = RATE_WBNB_USDT;
+  const plan = expectReady(await planRebalance(hubArgs(chain, {
+    holdings: [holding(WBNB, 10n ** 18n, 18, PRICE_1000_USD)],
+    targets: targetsOf(WBNB, USDT, 0), thresholdBps: 100,
+  })));
+  assert.ok(plan.steps.every((step) => step.tokenOut.toLowerCase() === USDT.toLowerCase()));
+  assert.ok(!chain.calls.some((call) => call.functionName === 'buyAllowance'));
+});
+
+for (const invalid of [null, [], [100n, 0n], [100n, 0n, -1n], [-1n, 0n, 0n], [100n, -1n, 0n], [100n, 0n, 2n ** 64n], ['100', 0n, 0n]]) {
+  test(`A10 malformed allowance fails closed: ${String(invalid)}`, async () => {
+    const chain = hubChain();
+    chain.buyAllowance = invalid;
+    const plan = await planRebalance(allowanceCase(chain));
+    assert.equal(plan.kind, 'blocked');
+    assert.ok(plan.kind === 'blocked');
+    assert.match(plan.reason, /BUY_ALLOWANCE_UNAVAILABLE/);
+  });
+}
+
+test('A10 pinned buys also clamp before quoting and rebuild router amount/floor', async () => {
+  const chain = baseChain({ buyAllowance: [100n, 48n, 1800000000n], rate: { rateE18: 10n ** 18n, slippageBps: 100 } });
+  const plan = expectReady(await planRebalance(argsOf(chain, {
+    holdings: [holding(USDT, 1000n * 10n ** 18n, 18, PRICE_1_USD)],
+    targets: targetsOf(USDT, WBNB, 0), thresholdBps: 100,
+  })));
+  assert.equal(plan.steps[0]?.amountIn, 50n);
+  const first = plan.steps[0];
+  assert.ok(first);
+  assert.equal(decodeStepInput(first).amountIn, 50n);
+  assert.ok(chain.calls.filter((call) => call.functionName === 'previewSwap').every((call) => call.args?.[2] === 50n));
+});
+
+test('A10 rejects a non-numeraire route before quoting or reading allowance', async () => {
+  const chain = baseChain({ executorNumeraire: TOKEN3, rate: RATE_WBNB_USDT });
+  const plan = await planRebalance(argsOf(chain, {
+    holdings: [holding(WBNB, 10n ** 18n, 18, PRICE_1000_USD)], targets: targetsOf(WBNB, USDT), thresholdBps: 100,
+  }));
+  assert.equal(plan.kind, 'blocked');
+  assert.ok(plan.kind === 'blocked');
+  assert.match(plan.reason, /NotNumeraireRoute/);
+  assert.ok(!chain.calls.some((call) => call.functionName === 'buyAllowance' || call.functionName === 'previewSwap'));
+});
+
+for (const value of [null, ZERO_ADDRESS, new Error('RPC timeout sensitive-token')]) {
+  test(`A10 missing executor numeraire blocks without leaking RPC data: ${value instanceof Error ? 'timeout' : String(value)}`, async () => {
+    const chain = hubChain();
+    chain.executorNumeraire = value;
+    const plan = await planRebalance(allowanceCase(chain));
+    assert.equal(plan.kind, 'blocked');
+    assert.ok(!JSON.stringify(plan).includes('sensitive-token'));
+    assert.ok(!chain.calls.some((call) => call.functionName === 'buyAllowance'));
+  });
+}
+
+test('A10 allowance exactly equal to requested batch keeps all original amounts', async () => {
+  const chain = hubChain();
+  chain.rate = { rateE18: 10n ** 18n, slippageBps: 100 };
+  const args = allowanceCase(chain);
+  // Use a representable whole-unit portfolio to independently fix the requested amount.
+  chain.buyAllowance = [1000n * 10n ** 18n, 480n * 10n ** 18n, 1800000000n];
+  args.holdings = [holding(USDT, 500n * 10n ** 18n, 18, PRICE_1_USD)];
+  args.drift = computeDrift(args.holdings, args.targets, 100);
+  const plan = expectReady(await planRebalance(args));
+  assert.equal(plan.steps.length, 2);
+  assert.deepEqual(plan.steps.map((step) => step.amountIn), [250n * 10n ** 18n, 250n * 10n ** 18n]);
+});
+
+for (const allowance of [[0n, 0n, 0n], new Error('RPC timeout sensitive-token')]) {
+  test(`A10 pinned buy rejects exhausted or unavailable allowance: ${allowance instanceof Error ? 'timeout' : 'zero'}`, async () => {
+    const chain = baseChain({ buyAllowance: allowance, rate: { rateE18: 10n ** 18n, slippageBps: 100 } });
+    const plan = await planRebalance(argsOf(chain, {
+      holdings: [holding(USDT, 1000n * 10n ** 18n, 18, PRICE_1_USD)], targets: targetsOf(USDT, WBNB, 0), thresholdBps: 100,
+    }));
+    assert.equal(plan.kind, 'blocked');
+    assert.ok(plan.kind === 'blocked');
+    assert.ok(!plan.reason.includes('sensitive-token'));
+    assert.ok(!chain.calls.some((call) => call.functionName === 'previewSwap'));
+  });
+}
+
+test('A10 oracle and executor numeraire mismatch blocks before budgeting', async () => {
+  const chain = hubChain();
+  chain.executorNumeraire = WBNB;
+  const plan = await planRebalance(allowanceCase(chain));
+  assert.ok(plan.kind === 'blocked');
+  assert.match(plan.reason, /NotNumeraireRoute/);
+  assert.ok(!chain.calls.some((call) => call.functionName === 'buyAllowance'));
 });

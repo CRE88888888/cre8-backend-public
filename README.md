@@ -187,6 +187,37 @@ Safe = 1（`safe`）、operator = 2（`operator`）、帳戶本人 = 4（`accoun
 `bun test ./test/a10-pause-operator.fork.ts --timeout=120000`。它驗證真實 CLI 的暫停／恢復、
 警示、重試不送交易、三種來源與版本鏡像；恢復案例使用空的 USDT-only 帳戶，結果應為 noop。
 
+### A10 每帳戶買入額度
+
+規劃器在持倉與報價的同一區塊讀 `executor.numeraire()`、`buyAllowance(account)`。
+整批買入可用量是 `max(floor(cap × 98 / 100) − bought, 0)`，以**總 cap** 保留 2% 餘裕。
+先賣後買；每筆買入先夾到現金與剩餘買入額度，再依實際量報價並重建 router payload。
+買入額度／numeraire 讀取失敗或資料缺漏會 blocked，不用舊值推測。
+
+可用量為 0 時整輪 blocked，不寫 operations、不送買單。live 的 `next_run_at` 改為有效的未來
+`windowEndsAt`；`windowEndsAt = 0`（例如 Safe 設 `maxBuyBps = 0` 且沒有開著的窗）、已到期或
+排程寫回失敗時，沿用認領時的正常間隔。dry-run 不寫排程。未決 UserOp 仍先依 #34 對帳，
+不能因為額度歸零或跨窗而解除 pending／submitted 保護。
+
+redeem／close 只有賣成 numeraire，不消耗買入額度；Safe 的全域暫停仍阻擋賣出。
+含買入的批次用 `max(alto 估算 × 1.5, 600000) + 145000 × N` 作為 call gas 預算，
+`N` 是交換前已持有的非 numeraire 策略資產數，增加 prefund 以涵蓋鏈上估值。
+strict preflight 檢查 `maxBuyBps() = 10000` 與 `numeraire() = BSC USDT`；讀不到一律 fail。
+`BuyLimitExceeded(uint256,uint256)`、`NotNumeraireRoute(address,address)` 會轉為可讀診斷。
+
+#36 獨立 fork 驗收：依 [A3](https://github.com/CRE8Finance/docs/blob/main/docs/A3_INTEGRATION.zh-TW.md)
+用 contracts main 的 `DeployAtpMainnet` 部署並由 Safe 接手。此測試只接受 anvil **8576**、
+bundler **3036**、DB **cre8_x1d**，API 使用 **8112**；worktree 要明設
+`MIGRATIONS_DIR="$HOME/Desktop/cre8-workspace/db/migrations"`。載入這套本機環境後執行：
+
+```bash
+RUN_CHAIN_TESTS=1 bun test ./test/a10-buy-allowance.fork.ts --timeout=120000
+```
+
+測試以公開 anvil owner／operator 與只供本機的測試 session key，直接向 bundler 送 Kernel UserOp，
+不經 API／scheduler 跑來回買賣，驗證 `BuyLimitExceeded`、賣出仍可用與跨 24 小時窗口後恢復。
+另驗 100000 USDT 首次配置、Safe 降低 cap 後縮量、耗盡的窗口排程與實際 redeem／close。
+
 ### 測試與 DB
 
 完整 `bun test` 需要可拋棄的 Postgres 與 `../db/migrations`（或以 `MIGRATIONS_DIR` 指向該目錄）。

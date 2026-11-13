@@ -86,6 +86,7 @@ import {
   encodeAbiParameters,
   encodeFunctionData,
   hexToBytes,
+  getAddress,
   http,
   isAddressEqual,
   keccak256,
@@ -101,7 +102,7 @@ import { activeChain } from './chain-object.js';
 import { KERNEL_V3_3_ADDRESSES } from './addresses.js';
 import { detectAlerts, formatAlert, recordAlerts, resolveAlerts } from './alerts.js';
 import type { AlertFinding, AlertKind } from './alerts.js';
-import { a10ErrorMessage, EXECUTOR_PAUSE_ABI, readGlobalPaused } from './chain.js';
+import { a10ErrorMessage, EXECUTOR_PAUSE_ABI, EXECUTOR_BUY_ABI, readGlobalPaused } from './chain.js';
 import { getConfig, getSessionKeyConfig, requireSessionKeyConfig } from './config.js';
 import { errorMessage, query as dbQuery, withTransaction } from './db.js';
 import { buildSessionPermissions } from './permissions.js';
@@ -254,7 +255,8 @@ const CALL_GAS_HEADROOM_NUMERATOR = 3n;
 const CALL_GAS_HEADROOM_DENOMINATOR = 2n;
 
 /**
- * 真正簽進 userOp 的 `callGasLimit` = `max(alto 估計 × 1.5, 600_000)`。
+ * 真正簽進 userOp 的 `callGasLimit` = `max(alto 估計 × 1.5, 600_000) + 145_000 × 估值資產數`。
+ * 只有含買入的批次加估值預算；資產數取交換前已持有的非 numeraire 策略資產。
  *
  * 為什麼不直接寫死 600,000：steps 的數量隨資產數成長（3 資產 = 2 筆 swap ≈ 450–500k，資產再多就會
  * 超過 600k）。固定值會變成一個**靜默的能力上限** —— 有一天它不夠了，就又回到「花錢買 success=false」。
@@ -264,9 +266,11 @@ const CALL_GAS_HEADROOM_DENOMINATOR = 2n;
  * 模擬用的 gas **正是這裡算出來的值**，所以「簽名前的 gas 不夠」會在那裡變成明確的失敗，而不是
  * 一筆花了錢卻什麼都沒換的交易。
  */
-export function rebalanceCallGasLimit(estimatedCallGasLimit: bigint): bigint {
+export function rebalanceCallGasLimit(estimatedCallGasLimit: bigint, valuationAssetCount = 0): bigint {
+  if (estimatedCallGasLimit < 0n || !Number.isSafeInteger(valuationAssetCount) || valuationAssetCount < 0) throw new RangeError('invalid valuation gas input');
   const scaled = (estimatedCallGasLimit * CALL_GAS_HEADROOM_NUMERATOR) / CALL_GAS_HEADROOM_DENOMINATOR;
-  return scaled > REBALANCE_CALL_GAS_FLOOR ? scaled : REBALANCE_CALL_GAS_FLOOR;
+  // C1 measured about 128k per held non-numeraire asset; reserve the upper 145k.
+  return (scaled > REBALANCE_CALL_GAS_FLOOR ? scaled : REBALANCE_CALL_GAS_FLOOR) + BigInt(valuationAssetCount) * 145_000n;
 }
 
 /** `AtpExecutor.SwapExecuted(address,address,address,uint256,uint256,uint256,uint256,uint256)` 的 topic0。 */
@@ -495,6 +499,8 @@ export type ExecuteArgs = {
   /** AtpExecutor：`executeRebalance` 的 target，也是 allowance 的 spender。 */
   executor: Address;
   steps: readonly PlannedStep[];
+  /** Held assets of the pinned version, before any swaps (valuation precedes selling). */
+  valuationAssets: readonly Address[];
   deadline: bigint;
   /** 發出 send RPC 前通知：連線中斷且沒收到 hash 也不能推定沒有送出。 */
   onSending: () => void;
@@ -1366,7 +1372,13 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
   // alto 對「一筆 op 跑完整條 DeFi 路徑」系統性低估（§8.16 實測 367,885 vs 需要 450–500k），
   // 而 gas 不足的後果不是 revert，是「success = false 但 tx.status = 1」—— 錢扣了、幣沒換。
   const estimate = await client.estimateUserOperationGas({ calls });
-  const callGasLimit = rebalanceCallGasLimit(estimate.callGasLimit);
+  let numeraire: Address;
+  try {
+    numeraire = await publicClient.readContract({ address: args.executor, abi: EXECUTOR_BUY_ABI, functionName: 'numeraire' });
+  } catch { throw new Error('[NUMERAIRE_UNAVAILABLE] 送出前讀不到 executor.numeraire，不送交易'); }
+  const hasBuy = args.steps.some((step) => !isAddressEqual(step.tokenOut, numeraire));
+  const valuationAssetCount = hasBuy ? new Set(args.valuationAssets.filter((asset) => !isAddressEqual(asset, numeraire)).map((asset) => asset.toLowerCase())).size : 0;
+  const callGasLimit = rebalanceCallGasLimit(estimate.callGasLimit, valuationAssetCount);
 
   // ---- ② 簽名前用 eth_call 模擬整格執行 ---------------------------------------------------------
   // `executeRebalance` 的第一個檢查是 `msg.sender != account → NotAccount`，所以 `from = 帳戶` 的
@@ -1913,7 +1925,19 @@ async function decideAndMaybeExecute(
     return { ...base, outcome: 'noop', reason: `Planner returned noop: ${rebalance.reason}` };
   }
   if (rebalance.kind === 'blocked') {
-    return { ...base, outcome: 'blocked', reason: `規劃器擋下（不執行）：${rebalance.reason}` };
+    let nextRunAt = base.nextRunAt;
+    let scheduleNote = '';
+    const end = rebalance.buyWindowEndsAt;
+    if (!ctx.dryRun && end !== undefined && end > BigInt(Math.floor(ctx.now.getTime() / 1000)) && end <= 8_640_000_000_000n) {
+      const windowEnd = new Date(Number(end) * 1000);
+      try {
+        await ctx.deps.query(SQL_ADVANCE_CLAIMED, [[due.portfolioId], [windowEnd.toISOString()]]);
+        nextRunAt = windowEnd;
+      } catch {
+        scheduleNote = '；買入窗口排程寫回失敗，沿用認領時的正常間隔';
+      }
+    }
+    return { ...base, nextRunAt, outcome: 'blocked', reason: `規劃器擋下（不執行）：${rebalance.reason}${scheduleNote}` };
   }
   if (rebalance.steps.length === 0) {
     // planRebalance 的型別結構保證非空；這一條是給「未來有人改了那份保證」的防線。
@@ -2027,6 +2051,10 @@ async function decideAndMaybeExecute(
     };
   }
 
+  const valuationAssets = plan.snapshot.holdings
+    .filter((holding) => holding.amountWei > 0n && plan.targets.some((target) => target.asset.toLowerCase() === holding.asset.toLowerCase()))
+    .map((holding) => getAddress(holding.asset));
+
   // 同一 portfolio 的不同 planHash 也必須互斥；只把閘門放在短 transaction，不在鎖內讀 RPC。
   const gate = await ctx.deps.withTransaction(async (client) => {
     await client.query('select id from portfolios where id = $1 for update', [due.portfolioId]);
@@ -2053,6 +2081,7 @@ async function decideAndMaybeExecute(
     executor,
     steps,
     deadline: rebalance.deadline,
+    valuationAssets,
     idempotencyKey,
   });
 
@@ -2208,6 +2237,7 @@ async function executeAndSettle(
     sessionKey: SessionKeyRef;
     executor: Address;
     steps: readonly PlannedStep[];
+    valuationAssets: readonly Address[];
     deadline: bigint;
     idempotencyKey: string;
   },
@@ -2226,6 +2256,7 @@ async function executeAndSettle(
       sessionKey: args.sessionKey,
       executor: args.executor,
       steps: args.steps,
+      valuationAssets: args.valuationAssets,
       deadline: args.deadline,
       onSending: () => { sending = true; },
       onSubmitted: async (ids) => {

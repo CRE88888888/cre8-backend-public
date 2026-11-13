@@ -109,6 +109,16 @@ export const EXECUTOR_PAUSE_ABI = [
   { type: 'error', name: 'ExecutorPaused', inputs: [] },
 ] as const;
 
+/** A10 executor buy accounting; values are in numeraire minimal units. */
+export const EXECUTOR_BUY_ABI = [
+  { type: 'function', name: 'buyAllowance', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }],
+    outputs: [{ name: 'cap', type: 'uint256' }, { name: 'bought', type: 'uint256' }, { name: 'windowEndsAt', type: 'uint64' }] },
+  { type: 'function', name: 'maxBuyBps', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint16' }] },
+  { type: 'function', name: 'numeraire', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] },
+  { type: 'error', name: 'BuyLimitExceeded', inputs: [{ name: 'bought', type: 'uint256' }, { name: 'cap', type: 'uint256' }] },
+  { type: 'error', name: 'NotNumeraireRoute', inputs: [{ name: 'tokenIn', type: 'address' }, { name: 'tokenOut', type: 'address' }] },
+] as const;
+
 export type PauseSource = 'safe' | 'operator' | 'account';
 
 /** A10 registry bits: OWNER=1, OPERATOR=2, ACCOUNT=4. Unknown bits must not look unpaused. */
@@ -129,6 +139,8 @@ export async function readGlobalPaused(executor: Address, client: PublicClient):
 export function a10ErrorMessage(error: unknown): string | null {
   const messages = {
     ExecutorPaused: 'ExecutorPaused：Safe 已開啟全域暫停，所有再平衡（含賣出）停止；使用者可用錢包直接提領',
+    BuyLimitExceeded: 'BuyLimitExceeded：帳戶本窗口的買入額度不足，需重新讀取額度並等待窗口結束；賣出不受買入額度限制',
+    NotNumeraireRoute: 'NotNumeraireRoute：買入必須以 executor.numeraire 付款；不允許非計價資產直接互換',
     AlreadyEnrolled: 'AlreadyEnrolled：帳戶已 enroll，策略或版本只能由使用者簽署變更；operator 不會重新 enroll 或清除暫停',
   };
   const seen = new Set<unknown>();
@@ -138,9 +150,9 @@ export function a10ErrorMessage(error: unknown): string | null {
     const data = 'data' in current ? current.data : undefined;
     let name: unknown = typeof data === 'object' && data !== null && 'errorName' in data ? data.errorName : undefined;
     if (typeof data === 'string' && /^0x[0-9a-fA-F]+$/.test(data)) {
-      try { name = decodeErrorResult({ abi: [...REGISTRY_ABI, ...EXECUTOR_PAUSE_ABI], data: data as Hex }).errorName; } catch { /* not an A10 revert */ }
+      try { name = decodeErrorResult({ abi: [...REGISTRY_ABI, ...EXECUTOR_PAUSE_ABI, ...EXECUTOR_BUY_ABI], data: data as Hex }).errorName; } catch { /* not an A10 revert */ }
     }
-    if (name === 'ExecutorPaused' || name === 'AlreadyEnrolled') return messages[name];
+    if (name === 'ExecutorPaused' || name === 'AlreadyEnrolled' || name === 'BuyLimitExceeded' || name === 'NotNumeraireRoute') return messages[name];
     current = 'cause' in current ? current.cause : undefined;
   }
   return null;

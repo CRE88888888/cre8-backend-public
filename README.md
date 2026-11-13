@@ -366,12 +366,13 @@ bun run preflight --strict                                 # 0 warn · 0 fail
 
 ## API
 
-所有回應都是 `application/json; charset=utf-8`，錯誤格式固定為
-`{"error":{"code":"...","message":"..."}}`。
+所有回應都是 `application/json; charset=utf-8`，一般錯誤格式為
+`{"error":{"code":"...","message":"..."}}`；`/platform/status` 讀鏈不可用時仍回傳下述狀態物件。
 
 | Method | Path | 說明 | 成功碼 |
 | --- | --- | --- | --- |
 | `GET` | `/health` | Postgres 可連線時 200，否則 503（`db: "down"`） | 200 |
+| `GET` | `/platform/status` | 公開、免登入的平台鏈上狀態；讀鏈失敗 503，`globalPaused: null` | 200 |
 | `GET` | `/strategies` | 列表；`limit`（1–100，預設 50）、`offset`、`provider`（不分大小寫）、`public=true\|false` | 200 |
 | `GET` | `/strategies/:id` | 單一策略 + 版本歷史（新到舊） | 200 |
 | `POST` | `/auth/nonce` | 取得一次性 nonce 與 SIWE 欄位（`domain`／`chainId`／`uri`／`statement`／`issuedAt`，TTL 5 分鐘）；不需 body | 200 |
@@ -385,6 +386,25 @@ bun run preflight --strict                                 # 0 warn · 0 fail
 | `POST` | `/bundler` | bundler relay：把 JSON-RPC 原樣轉給 `BUNDLER_URL` 並原樣回傳；**需** token，方法必須在白名單內 | 上游的 status |
 
 所有需要 token 的路徑都在讀 body **之前**驗證：沒帶 token 的請求即使 body 不合法也是 401，不是 400。
+
+### 公開平台狀態（`GET /platform/status`）
+
+供所有訪客顯示全站暫停橫幅，不需要登入或 portfolio。獨立於 `/health`，因為這是鏈上狀態，
+不應依賴健康檢查的 DB／警示查詢；不查 DB，也不需要 operator 私鑰或 session key seed。
+
+```bash
+curl -s "$API/platform/status"
+# {"chainId":56,"executor":"0x…","registry":"0x…","globalPaused":false,"maxBuyBps":10000,
+#  "checkedAt":"2026-11-13T06:00:00.000Z","block":"123456789"}
+```
+
+- `executor`、`registry` 來自 `EXECUTOR_ADDRESS`、`REGISTRY_ADDRESS`；`chainId` 來自設定，並核對 RPC 的鏈。
+- `globalPaused` 與 `maxBuyBps` 在同一個 `block` 讀取；`block` 是十進位字串，`checkedAt` 是開始查詢的 ISO 時間。
+- 成功與失敗都在 process 內快取 **10 秒**，從開始查詢時計算；同時到達的請求共用一次讀鏈。
+  快取命中不更新 `checkedAt`。HTTP 使用 `Cache-Control: no-store`，不延長狀態的新鮮度。
+- RPC 每次請求逾時 **5 秒**、不重試。缺設定、RPC 失敗／逾時、鏈不符或回傳資料缺漏都回 **503**，
+  `globalPaused`、`maxBuyBps`、`block` 都是 `null`；能解析的公開地址仍會回傳，缺少／無效的地址為 `null`。
+  `null` 表示未知，前端不能當成 `false`。回應與 log 不包含 RPC URL、私鑰、seed 或內部錯誤原文。
 
 ### Auth（SIWE／EIP-4361 + session token）
 

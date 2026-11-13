@@ -10,6 +10,7 @@ import { EXECUTOR_ORACLE_ABI, ORACLE_OF_ABI, listPriceableAssets } from './asset
 import type { PriceableAsset, TradableProbe } from './assets.js';
 import { authenticate, issueNonce, login, parseLoginBody } from './auth.js';
 import { getConfig, getSessionKeyConfig } from './config.js';
+import { createPlatformStatusReader } from './chain.js';
 import { query } from './db.js';
 import { AppError, ValidationError } from './errors.js';
 import { createStrategy, getStrategy, listStrategies, publishVersion } from './strategies.js';
@@ -162,6 +163,8 @@ export const BUNDLER_TIMEOUT_MS = 30_000;
  * merged over the defaults, so a test can stub one dependency and leave the rest real.
  */
 export type ServerDeps = {
+  /** Public platform snapshot, with a process-wide TTL cache and no wallet/DB reads. */
+  platformStatus: ReturnType<typeof createPlatformStatusReader>;
   createStrategy: typeof createStrategy;
   publishVersion: typeof publishVersion;
   enrollPortfolio: typeof enrollPortfolio;
@@ -275,13 +278,14 @@ async function defaultListAssets(): Promise<PriceableAsset[]> {
 }
 
 const defaultDeps: ServerDeps = {
+  platformStatus: createPlatformStatusReader(),
   createStrategy,
   publishVersion,
   enrollPortfolio,
   listPortfolios,
   buildRenewalParams,
   recordRenewalResult,
-  // 只有這一個是在 import 時就建好的：快取要跨請求存活，不能每個請求重建一份。
+  // 快取要跨請求存活，不能每個請求重建一份。
   portfolioStatus: createPortfolioStatusReader(),
   operatorRebalance: runOperatorRebalance,
   operatorActivity: (limit) => readOperatorActivity(limit),
@@ -380,8 +384,15 @@ async function route(
     return health(res);
   }
 
+  if (root === 'platform' && segments.length === 2 && segments[1] === 'status') {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    const status = await deps.platformStatus();
+    sendJson(res, status.globalPaused === null ? 503 : 200, status);
+    return;
+  }
+
   // GET /assets — create fund 的資產選單。要認證：它是「站上可交易的東西」的內部清單，
-    // 而且這支 API 的其他資料也全部要 token（只有 /health 是公開的）。
+    // 公開的 /platform/status 不會公開這份資產清單。
   if (root === 'assets' && segments.length === 1) {
     if (method !== 'GET') return methodNotAllowed(res, ['GET']);
     await authenticate(req.headers.authorization);

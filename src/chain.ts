@@ -3,15 +3,17 @@ import {
   createWalletClient,
   decodeEventLog,
   decodeErrorResult,
+  getAddress,
   http,
   keccak256,
   toHex,
+  zeroAddress,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { activeChain } from './chain-object.js';
 import type { PublicClient, WalletClient, Address, Account, Hex } from 'viem';
 import { kernelAddressesForChain } from './addresses.js';
-import { getConfig } from './config.js';
+import { getAuthConfig, getConfig, loadSessionKeyConfig } from './config.js';
 import { assertKernelInfraDeployed, computeSalt, getKernelAccountParams } from './kernel.js';
 import type { KernelAccountOptions } from './kernel.js';
 import type { RebalanceSchedule } from './strategies.js';
@@ -133,6 +135,106 @@ export function pauseSources(flags: number): PauseSource[] {
 
 export async function readGlobalPaused(executor: Address, client: PublicClient): Promise<boolean> {
   return client.readContract({ address: executor, abi: EXECUTOR_PAUSE_ABI, functionName: 'globalPaused' });
+}
+
+export const PLATFORM_STATUS_CACHE_TTL_MS = 10_000;
+export const PLATFORM_STATUS_RPC_TIMEOUT_MS = 5_000;
+
+export type PlatformStatus = {
+  chainId: number;
+  executor: Address | null;
+  registry: Address | null;
+  globalPaused: boolean | null;
+  maxBuyBps: number | null;
+  /** ISO observation time; unchanged on cache hits. */
+  checkedAt: string;
+  /** Decimal string, so block heights never lose precision in JSON. */
+  block: string | null;
+};
+
+export type PlatformStatusConfig = {
+  chainId: number;
+  executor: Address | null;
+  registry: Address | null;
+  rpcUrl: string | null;
+};
+
+function platformStatusConfig(): PlatformStatusConfig {
+  const config = getConfig();
+  let executor: Address | null = null;
+  try {
+    // This public read needs no signing key or seed, including their parsers.
+    executor = loadSessionKeyConfig({ EXECUTOR_ADDRESS: process.env.EXECUTOR_ADDRESS }).executorAddress;
+  } catch {
+    // An invalid executor is unavailable, never an unpaused platform.
+  }
+  return {
+    chainId: config.chainId,
+    executor,
+    registry: config.registryAddress === null ? null : getAddress(config.registryAddress),
+    rpcUrl: config.rpcUrl,
+  };
+}
+
+/** Public, read-only snapshot. Cache failures too, and share concurrent RPC work across visitors. */
+export function createPlatformStatusReader(deps: {
+  config?: () => PlatformStatusConfig;
+  publicClient?: PublicClient;
+  now?: () => number;
+} = {}): () => Promise<PlatformStatus> {
+  // Monotonic epoch milliseconds keep clock corrections from extending the public cache TTL.
+  const now = deps.now ?? (() => performance.timeOrigin + performance.now());
+  let cached: { startedAt: number; value: PlatformStatus } | null = null;
+  let pending: Promise<PlatformStatus> | null = null;
+
+  const read = async (startedAt: number): Promise<PlatformStatus> => {
+    const unavailable: PlatformStatus = {
+      chainId: getAuthConfig().chainId,
+      executor: null,
+      registry: null,
+      globalPaused: null,
+      maxBuyBps: null,
+      checkedAt: new Date(startedAt).toISOString(),
+      block: null,
+    };
+    try {
+      const config = (deps.config ?? platformStatusConfig)();
+      Object.assign(unavailable, { chainId: config.chainId, executor: config.executor, registry: config.registry });
+      if (!config.rpcUrl || !config.executor || !config.registry ||
+          config.executor === zeroAddress || config.registry === zeroAddress) return unavailable;
+      const client = deps.publicClient ?? createPublicClient({
+        transport: http(config.rpcUrl, { timeout: PLATFORM_STATUS_RPC_TIMEOUT_MS, retryCount: 0 }),
+      });
+      const [chainId, block] = await Promise.all([
+        client.getChainId(),
+        client.getBlockNumber({ cacheTime: 0 }),
+      ]);
+      if (chainId !== config.chainId || typeof block !== 'bigint' || block < 0n) return unavailable;
+      const [globalPaused, maxBuyBps] = await Promise.all([
+        client.readContract({ address: config.executor, abi: EXECUTOR_PAUSE_ABI, functionName: 'globalPaused', blockNumber: block }),
+        client.readContract({ address: config.executor, abi: EXECUTOR_BUY_ABI, functionName: 'maxBuyBps', blockNumber: block }),
+      ]);
+      if (typeof globalPaused !== 'boolean' || !Number.isInteger(maxBuyBps) || maxBuyBps < 0 || maxBuyBps > 65_535) return unavailable;
+      return { ...unavailable, globalPaused, maxBuyBps, block: block.toString() };
+    } catch {
+      // No raw RPC/config error reaches the public response or logs.
+      return unavailable;
+    }
+  };
+
+  return () => {
+    const startedAt = now();
+    // Count TTL from the start of the observation, not the end of a slow RPC call.
+    if (cached !== null && startedAt >= cached.startedAt && startedAt - cached.startedAt < PLATFORM_STATUS_CACHE_TTL_MS) {
+      return Promise.resolve(cached.value);
+    }
+    if (pending !== null) return pending;
+    pending = read(startedAt).then((value) => {
+      cached = { startedAt, value };
+      return value;
+    }).finally(() => { pending = null; });
+    return pending;
+  };
 }
 
 /** Decode structured viem/RPC causes only; never echo an RPC URL, calldata or credentials. */

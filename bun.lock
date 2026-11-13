@@ -8,11 +8,11 @@
         "@scure/bip32": "1.7.0",
         "@zerodev/ecdsa-validator": "^5.4.9",
         "@zerodev/permissions": "5.5.11",
-        "@zerodev/sdk": "^5.5.11",
+        "@zerodev/sdk": "5.5.12",
         "dotenv": "^18.0.10",
         "pg": "^8.23.1",
         "tslib": "^2.9.1",
-        "viem": "^2.57.16",
+        "viem": "^2.57.17",
       },
       "devDependencies": {
         "@types/node": "^22.20.5",
@@ -57,7 +57,7 @@
 
     "@zerodev/permissions": ["@zerodev/permissions@5.5.11", "", { "dependencies": { "@simplewebauthn/browser": "^9.0.1", "merkletreejs": "^0.3.11" }, "peerDependencies": { "@zerodev/sdk": "^5.4.0", "@zerodev/webauthn-key": "^5.4.0", "viem": "^2.28.0" } }, "sha512-nheonZ588sFNrDwH72cQtXDvVJ8tiqolFBmbjuy9U0/WqR7NiqFKft4RVc8DIrQYZwvEnGqSOakX2Wl3ZJR+8g=="],
 
-    "@zerodev/sdk": ["@zerodev/sdk@5.5.11", "", { "dependencies": { "semver": "^7.6.0" }, "peerDependencies": { "viem": "^2.28.0" } }, "sha512-3FL0Oy6MXPstGVESvOs69BWekTA9uIrA9aTt6Fmyl3fVrTXRtqyUH7a3iJP3ThKKkeTg5JSBxk/zrqg6tVTefA=="],
+    "@zerodev/sdk": ["@zerodev/sdk@5.5.12", "", { "dependencies": { "semver": "^7.6.0" }, "peerDependencies": { "viem": "^2.28.0" } }, "sha512-V92CQONbnrDyxUILaBTgMXqAeStYQGIptwF9fDQn3DysjeZz+sHw+5+fDFPX9mZ0YP1BMrlgnEcsDC2c9BjzUA=="],
 
     "@zerodev/webauthn-key": ["@zerodev/webauthn-key@5.5.0", "", { "dependencies": { "@noble/curves": "^1.3.0", "@simplewebauthn/browser": "^8.3.4", "@simplewebauthn/types": "^12.0.0" }, "peerDependencies": { "viem": "^2.28.0" } }, "sha512-AbD2d/qrsX7AWxJMEfwxnLbp1TjiUjc1V4ne3Q40UJxKe+lW64Td+y8OD0qSFMqgN6rQxJZ0aOAXmat8H6xluA=="],
 
@@ -139,7 +139,7 @@
 
     "utf8": ["utf8@3.0.0", "", {}, "sha512-E8VjFIQ/TyQgp+TZfS6l8yp/xWppSAHzidGiRrqe4bK4XP9pTRyKFgGJpO3SN7zdX4DeomTrwaseCHovfpFcqQ=="],
 
-    "viem": ["viem@2.57.16", "", { "dependencies": { "@noble/curves": "1.9.1", "@noble/hashes": "1.8.0", "@scure/bip32": "1.7.0", "@scure/bip39": "1.6.0", "abitype": "1.2.3", "isows": "1.0.7", "ox": "0.14.59", "ws": "8.21.0" }, "peerDependencies": { "mppx": ">=0.17.0", "typescript": ">=5.0.4" }, "optionalPeers": ["mppx", "typescript"] }, "sha512-+4uaUw3NfkqjaqsZp8Zci94K33oc9rv7mIUgvPduJxsY/tI0ASi2YkaXoUVSBGfdIw/QPWuVnIf9LTFf35IoMg=="],
+    "viem": ["viem@2.57.17", "", { "dependencies": { "@noble/curves": "1.9.1", "@noble/hashes": "1.8.0", "@scure/bip32": "1.7.0", "@scure/bip39": "1.6.0", "abitype": "1.2.3", "isows": "1.0.7", "ox": "0.14.63", "ws": "8.21.0" }, "peerDependencies": { "mppx": ">=0.17.0", "typescript": ">=5.0.4" }, "optionalPeers": ["mppx", "typescript"] }, "sha512-yIMqNoKoVAMwX+zVbqkxfqq7qbGHmKXZidh/xfVpiPTJlAbbDDdDIMH5dDQWxhZcj56L8tPOwsIIxF618P+TOg=="],
 
     "web3-utils": ["web3-utils@1.10.4", "", { "dependencies": { "@ethereumjs/util": "^8.1.0", "bn.js": "^5.2.1", "ethereum-bloom-filters": "^1.0.6", "ethereum-cryptography": "^2.1.2", "ethjs-unit": "0.1.6", "number-to-bn": "1.7.0", "randombytes": "^2.1.0", "utf8": "3.0.0" } }, "sha512-tsu8FiKJLk2PzhDl9fXbGUWTkkVXYhtTA+SmEFkKft+9BgwLxfCRpU96sWv7ICC8zixBNd3JURVoiR3dUXgP8A=="],
 
@@ -179,7 +179,7 @@
 
     "ox/abitype": ["abitype@1.3.0", "", { "peerDependencies": { "typescript": ">=5.0.4", "zod": "^3.22.0 || ^4.0.0" }, "optionalPeers": ["typescript", "zod"] }, "sha512-fk6Te+bojIFrMvMZrnOO+SxCB+RUksTGOzq/60ZRvs1L+BVzvi2bqt9L3W/17ZLdZsyM1FuYf65P5nlmoiH1Bg=="],
 
-    "viem/ox": ["ox@0.14.59", "", { "dependencies": { "@adraffy/ens-normalize": "^1.11.0", "@noble/ciphers": "^1.3.0", "@noble/curves": "1.9.1", "@noble/hashes": "^1.8.0", "@scure/bip32": "^1.7.0", "@scure/bip39": "^1.6.0", "abitype": "^1.2.3", "eventemitter3": "5.0.1" }, "peerDependencies": { "typescript": ">=5.4.0" }, "optionalPeers": ["typescript"] }, "sha512-Y+DPEQScTEGKteQATjtytE1JRQ5cg1R2+DvYQ/lbhUCm/xS9n0Jnkkf2AqQyIntefQxs8xY6dZ+kyNZ7zf2FzA=="],
+    "viem/ox": ["ox@0.14.63", "", { "dependencies": { "@adraffy/ens-normalize": "^1.11.0", "@noble/ciphers": "^1.3.0", "@noble/curves": "1.9.1", "@noble/hashes": "^1.8.0", "@scure/bip32": "^1.7.0", "@scure/bip39": "^1.6.0", "abitype": "^1.2.3", "eventemitter3": "5.0.1" }, "peerDependencies": { "typescript": ">=5.4.0" }, "optionalPeers": ["typescript"] }, "sha512-TSKYN151boL1Aq/vsFrd8Buvd7v+oTQr8V7z4f4QQTSMB+ohD8cbNbHCtKRLI0Gs8LuYKirf5qvElTKVIFe2jw=="],
 
     "ethereum-cryptography/@scure/bip32/@scure/base": ["@scure/base@1.1.9", "", {}, "sha512-8YKhl8GHiNI/pU2VMaofa2Tor7PJRAjwQLBBuilkJ9L5+13yVbC7JO/wS7piioAvPSwR3JKM1IJ/u4xQzbcXKg=="],
 
@@ -188,5 +188,7 @@
     "ox/@scure/bip32/@scure/base": ["@scure/base@2.4.0", "", {}, "sha512-thZ1TuJwFwBblOhgsjDKvvGirBxNp+wSvY/DR6tJBJOTDhdAAcHJ8Vbr2eFnqaxeca4+t0i9KBf+uHYGWwZORg=="],
 
     "viem/ox/@noble/ciphers": ["@noble/ciphers@1.3.0", "", {}, "sha512-2I0gnIVPtfnMw9ee9h1dJG7tp81+8Ob3OJb3Mv37rx5L40/b0i7djjCVvGOVqc9AEIQyvyu1i6ypKdFw8R8gQw=="],
+
+    "viem/ox/abitype": ["abitype@1.3.0", "", { "peerDependencies": { "typescript": ">=5.0.4", "zod": "^3.22.0 || ^4.0.0" }, "optionalPeers": ["typescript", "zod"] }, "sha512-fk6Te+bojIFrMvMZrnOO+SxCB+RUksTGOzq/60ZRvs1L+BVzvi2bqt9L3W/17ZLdZsyM1FuYf65P5nlmoiH1Bg=="],
   }
 }

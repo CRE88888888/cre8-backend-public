@@ -34,6 +34,7 @@ import { closePool } from '../src/db.js';
 import { planRebalance, DEFAULT_DEADLINE_SECONDS } from '../src/rebalance-plan.js';
 import type { RebalancePlan } from '../src/rebalance-plan.js';
 import { DEFAULT_THRESHOLD_BPS, formatE8, planPortfolio } from '../src/snapshot.js';
+import { PANCAKE_DATA_ABI, PANCAKE_UR } from '../src/chain.js';
 
 const USAGE = `用法：
   bun run scripts/plan-rebalance.ts --portfolio <id> [--executor <addr>] [--oracle <addr>]
@@ -138,9 +139,14 @@ function printPlan(
     console.log(`    amountIn  ${step.amountIn}（tokenIn 最小單位）`);
     console.log(`    amountOutMin ${step.amountOutMin}（= minGross）`);
     console.log(`    oracleFloor  ${step.oracleFloor}（previewSwap 的 minimum，不是 quoted）`);
-    console.log(`    commands  ${step.commands}（V3_SWAP_EXACT_IN，一個 byte，packed）`);
-    console.log(`    inputs    ${step.inputs.length} 筆`);
-    const input = step.inputs[0];
+    console.log(`    venue     ${step.venue}`);
+    console.log(`    data      ${(step.data.length - 2) / 2} bytes`);
+    if (step.venue.toLowerCase() !== PANCAKE_UR.toLowerCase()) continue;
+    const [commands, inputs] = decodeAbiParameters(PANCAKE_DATA_ABI, step.data);
+    console.log(`    commands  ${commands}`);
+    console.log(`    inputs    ${inputs.length} 筆`);
+    if (commands !== '0x00') continue;
+    const input = inputs[0];
     if (input === undefined) {
       console.log('    ⚠ inputs 是空的：合約的 _checkCommands 會 revert BadCommands');
       continue;

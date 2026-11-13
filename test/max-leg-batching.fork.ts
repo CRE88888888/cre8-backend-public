@@ -36,13 +36,13 @@ const executorAbi = parseAbi([
 ]);
 const accountAbi = parseAbi([
   'constructor()', 'function approveToken(address,address,uint256)',
-  'function executeRebalance(address,(address tokenIn,address tokenOut,uint256 amountIn,uint256 amountOutMin,bytes commands,bytes[] inputs)[],uint256)',
+  'function executeRebalance(address,(address tokenIn,address tokenOut,uint256 amountIn,uint256 amountOutMin,address venue,bytes data)[],uint256)',
 ]);
 const erc20 = parseAbi(['function balanceOf(address) view returns(uint256)']);
 let snapshotId: unknown;
 
 async function bytecode(source: string, name: string): Promise<Hex> {
-  const value: unknown = JSON.parse(await readFile(`.bun-cache/contracts-40/out/${source}/${name}.json`, 'utf8'));
+  const value: unknown = JSON.parse(await readFile(`${process.env.CONTRACT_ARTIFACTS_DIR ?? '.bun-cache/contracts-47/out'}/${source}/${name}.json`, 'utf8'));
   assert.ok(typeof value === 'object' && value !== null);
   const code: unknown = Reflect.get(value, 'bytecode');
   assert.ok(typeof code === 'object' && code !== null);

@@ -846,3 +846,91 @@ UserOp；黑名單永遠會漏一個方法，白名單漏掉的代價只是一�
 6. 錯誤回應加上 `details`（哪個 asset 出錯），方便 web app 顯示。
 7. 用 OpenAPI 描述 API；現在 README 是唯一契約。
 8. `portfolios.version` 的複合 FK（見 `db/README.md` 的已知缺口）。
+
+### A11 executor ABI 與聚合器
+
+`SwapStep` 為 `{ tokenIn, tokenOut, amountIn, amountOutMin, venue, data }`；
+`executeRebalance` selector 是 `0xc52fc5da`。Pancake 的 `venue` 是 Universal Router，
+`data = abi.encode(bytes commands, bytes[] inputs)`；KyberSwap 的 data 是 opaque calldata。
+舊 session key 的 CallPolicy 不接受新 selector；新 executor 上線前必須重新安裝／續期權限。
+
+規劃器在既有買入額度、單筆限額之內，向 Kyber APIv1 GET routes、POST route/build；sender 與
+recipient 固定 executor，不附 native value。只使用鏈上白名單的 ERC20_APPROVE／PERMIT2 venue，
+並驗證 build target 與 route router 一致。依相同平台費率比較整數淨得量，平手保留 Pancake；
+API／白名單 RPC 失敗或整段超過 5 秒時退回 Pancake。OpenOcean 未接入。
+送出前重新讀 oracle 地板並重建 payload；聚合器刷新失敗或 venue 改變時，本輪阻擋，不送舊 calldata。
+API 的 steps 與 scheduler log 帶 venue，DB schema 不變。
+
+preflight 需要 `EXECUTOR_DEPLOYMENT_BLOCK`（executor 部署 receipt 的 blockNumber），用來從部署開始
+讀 `VenueSet`，再讀各 venue 的當前狀態，已移除的 venue 不列出。UR 必須為 PANCAKE_UR 且 spender=UR。
+讀取不完整直接 fail；RPC 必須支援部署至今的事件範圍。
+
+fork 驗收必須從乾淨 fork 開始。先唯讀取得已合併合約 main 的固定 commit，解到 backend
+快取再編譯，避免混入 C1 正在修改的工作目錄：
+
+```bash
+CONTRACTS_MAIN=$(git -C ../cre8-contracts rev-parse origin/main)
+mkdir -p .bun-cache/contracts-47-main
+git -C ../cre8-contracts archive "$CONTRACTS_MAIN" | tar -x -C .bun-cache/contracts-47-main
+forge build --root .bun-cache/contracts-47-main
+```
+
+#47 僅使用 anvil 8616、alto 3076、DB `cre8_x1h`，backend 若啟動僅用 8152。
+mixed mining 同時保留即時交易與定時產塊；測試在一般部署交易後明確挖一塊，
+再查 receipt，避免尚未入塊的本機 hash 被轉送上游而收到 archive 403。
+每次重跑先停止這兩個專用測試服務，再以最新 BSC 主網區塊建立 fork；不要重用已成交過的池子狀態。
+`BSC_FORK_RPC` 是唯讀上游，`--silent` 避免印出 anvil 測試金鑰：
+
+```bash
+anvil --host 127.0.0.1 --port 8616 --chain-id 56 \
+  --fork-url "$BSC_FORK_RPC" --block-time 0.1 --mixed-mining --timeout 120000 --silent
+```
+
+alto 使用與 A3 相同的 `@pimlico/alto@0.0.18`（`ALTO_CLI` 指向其 `esm/cli/alto.js`）。
+下列啟動僅由公開 anvil 助記詞派生 index 5 帳號；safe-mode 保持開啟，估算採預設，僅 fork RPC 逾時放寬到 120 秒：
+
+```bash
+bun -e '
+import { spawn } from "node:child_process";
+import { mnemonicToAccount } from "viem/accounts";
+import { toHex } from "viem";
+if (!process.env.ALTO_CLI) throw new Error("set ALTO_CLI to the pinned alto CLI");
+const key = mnemonicToAccount("test test test test test test test test test test test junk", { addressIndex: 5 }).getHdKey().privateKey;
+if (!key) throw new Error("missing public anvil key");
+const proc = spawn("node", [process.env.ALTO_CLI,
+  "--rpc-url", "http://127.0.0.1:8616", "--port", "3076",
+  "--entrypoints", "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
+  "--executor-private-keys", toHex(key), "--utility-private-key", toHex(key),
+  "--deploy-simulations-contract", "--safe-mode", "--timeout", "120000", "--max-block-range", "100",
+  "--min-entity-stake", "1", "--min-entity-unstake-delay", "1",
+  "--min-executor-balance", "50000000000000000"], { stdio: "inherit" });
+proc.on("exit", code => { process.exitCode = code ?? 1; });
+'
+```
+
+先把 `DATABASE_URL` 指向本機專用的 `cre8_x1h`，不使用其他服務的 `.env`，套用 migration 後執行：
+
+```bash
+export MIGRATIONS_DIR=../db/migrations
+bun run migrate
+RUN_CHAIN_TESTS=1 CHAIN_ID=56 PORT=8152 \
+  RPC_URL=http://127.0.0.1:8616 ANVIL_RPC_URL=http://127.0.0.1:8616 \
+  BUNDLER_URL=http://127.0.0.1:3076 CONTRACT_ARTIFACTS_DIR=.bun-cache/contracts-47-main/out \
+  bun test ./test/a11-venue.fork.ts --timeout=480000
+```
+
+測試部署固定 main artifact、建立 Safe 與 Kyber 白名單、送出 DOGE 1,000 USDT 買入，
+再由 Safe 撤除 Kyber，預熱 Pancake 候選池並讀 ETH/USDT 雙向實際報價，
+驗證規劃器因白名單移除自然退回 Pancake、真的成交並過地板；之後 Safe 恢復 Kyber。
+測試先預熱 scheduler 同批持倉的 Multicall3；測試 client／anvil 上游／alto 的 RPC 逾時為 120 秒，
+CLI 驗收等待上限 240 秒，整個 fork 測試上限 480 秒；產品預設不變。
+Kyber calldata 在交給 alto 前以 `from=Kernel` 的 `eth_call` 預熱；UserOp 仍由 alto 估 gas，
+加上既有 1.5 倍餘裕。之後執行原版 scheduler `--once --live`，核對 confirmed operation、
+原 session UserOp／permission nonce、新 selector 與完整 venue/data planHash、canonical receipt。
+一般 `bun test` 不會選取 `.fork.ts`，必須顯式執行。
+
+
+完整 suite 要使用同一組本機 RPC／DB，並把 fork 測試最後印出的 registry／executor 地址
+設為 `REGISTRY_ADDRESS`／`EXECUTOR_ADDRESS`（測試子程序內的 env 不會傳回 shell）。
+router 已同時設定 WBNB oracle，讓 pricing crosscheck 有實際部署可比；然後執行
+`RUN_CHAIN_TESTS= bun test --timeout=120000`，一般 suite 的送交易測試維持原有 opt-in 條件。

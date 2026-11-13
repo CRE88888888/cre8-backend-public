@@ -21,7 +21,7 @@ import {
   listPortfolioActivity,
   buildRedeemPlan,
 } from '../src/operator.js';
-import { sellFixture } from './fixtures/max-leg.js';
+import { sellFixture, DOGE, CASH } from './fixtures/max-leg.js';
 import { computeDrift } from '../src/drift.js';
 import { listPriceableAssets } from '../src/assets.js';
 import type { OperatorRebalanceResult, PortfolioStatus } from '../src/operator.js';
@@ -1052,8 +1052,8 @@ function runResult(overrides: Partial<PortfolioRunResult> = {}): PortfolioRunRes
     nextRunAt: new Date('2026-11-08T06:00:00.000Z'),
     plan: {
       steps: [
-        { tokenIn: WBNB, tokenOut: USDT, amountIn: '1000', amountOutMin: '500' },
-        { tokenIn: USDT, tokenOut: WBNB, amountIn: '2000', amountOutMin: '800' },
+        { tokenIn: WBNB, tokenOut: USDT, amountIn: '1000', amountOutMin: '500', venue: '0x1a0a18ac4becddbd6389559687d1a73d8927e416' },
+        { tokenIn: USDT, tokenOut: WBNB, amountIn: '2000', amountOutMin: '800', venue: '0x1a0a18ac4becddbd6389559687d1a73d8927e416' },
       ],
       deadline: '1700000000',
       planHash: '0xdead' as Hex,
@@ -1391,4 +1391,22 @@ test('listPriceableAssets：probe.oracleOf 拋錯 → tradable 是 null（未知
   assert.equal(assets[0]?.tradable, true, 'numeraire 不需要 oracle，永遠可交易');
   assert.equal(assets[1]?.tradable, null, '查不到就是未知 —— 不是 false（那會讓它變成不可選）');
   assert.equal(assets[2]?.tradable, null);
+});
+
+test('#47 redeem and close planning share aggregator routing after applying the asset leg cap', async () => {
+  const f = sellFixture();
+  const seen: bigint[] = [];
+  const result = await buildRedeemPlan({ portfolioId: PORTFOLIO_ID, account: ACCOUNT, plan: f.plan(samplePlan()) },
+    { sellUsdE8: 200n * 100000000n }, { ...f.deps, quoteAggregator: async (request) => {
+      seen.push(request.amountIn);
+      assert.equal(request.tokenIn, DOGE);
+      assert.equal(request.tokenOut, CASH);
+      assert.equal(request.executor, f.deps.executor);
+      return { venue: ACCOUNT, data: '0x12345678', amountOut: request.minimum + 1n };
+    } });
+  assert.equal(result.plan.kind, 'ready');
+  if (result.plan.kind !== 'ready') return;
+  assert.deepEqual(seen, [150n * 10n ** 8n]);
+  assert.equal(result.plan.steps[0]?.venue, ACCOUNT);
+  assert.equal(result.plan.steps[0]?.data, '0x12345678');
 });

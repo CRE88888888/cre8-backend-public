@@ -1,3 +1,4 @@
+import { PANCAKE_UR } from '../src/chain.js';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createServer as createHttpServer } from 'node:http';
@@ -97,8 +98,8 @@ function step(overrides: Partial<PlannedStep> = {}): PlannedStep {
     amountIn: 250_000_000_000_000_000n,
     amountOutMin: 500_000_000_000_000_000n,
     oracleFloor: 499_000_000_000_000_000n,
-    commands: '0x00',
-    inputs: ['0x'],
+    venue: PANCAKE_UR,
+    data: '0x',
     ...overrides,
   };
 }
@@ -741,6 +742,14 @@ test('planHashFor：同樣的參數得到同一個 hash；改 amountIn 或 deadl
   assert.notEqual(planHashFor([step({ amountOutMin: 1n })], 1_800_000_300n), hash, 'amountOutMin 變了也要不同');
 
   assert.equal(idempotencyKeyFor(PORTFOLIO_ID, hash), `rebalance:${PORTFOLIO_ID}:${hash}`);
+});
+
+test('#47 planHash commits to venue and opaque calldata, not only token amounts', () => {
+  const original = { ...step(), venue: EXECUTOR, data: '0x12345678' as Hex };
+  const deadline = 1_800_000_300n;
+  const hash = planHashFor([original], deadline);
+  assert.notEqual(planHashFor([{ ...original, venue: TOKEN_IN }], deadline), hash);
+  assert.notEqual(planHashFor([{ ...original, data: '0x12345679' }], deadline), hash);
 });
 
 // ---------------------------------------------------------------------------
@@ -2064,7 +2073,7 @@ function receiptFixture(steps = [step()], mode: Hex = `0x${'00'.repeat(32)}`) {
   const blockHash = keccak256(toBytes('canonical block'));
   const txHash = keccak256(toBytes('transaction'));
   const data = encodeFunctionData({ abi: parseAbi([
-    'function executeRebalance(address account, (address tokenIn, address tokenOut, uint256 amountIn, uint256 amountOutMin, bytes commands, bytes[] inputs)[] steps, uint256 deadline)',
+    'function executeRebalance(address account, (address tokenIn, address tokenOut, uint256 amountIn, uint256 amountOutMin, address venue, bytes data)[] steps, uint256 deadline)',
   ]), functionName: 'executeRebalance', args: [ACCOUNT, steps, readyPlan().deadline] });
   const callData = encodeFunctionData({ abi: parseAbi(['function execute(bytes32 mode, bytes data) payable']),
     functionName: 'execute', args: [mode, encodePacked(['address', 'uint256', 'bytes'], [EXECUTOR, 0n, data])] });
@@ -2718,8 +2727,8 @@ function encodableStep(overrides: Partial<PlannedStep> = {}): PlannedStep {
     amountIn,
     amountOutMin,
     oracleFloor: amountOutMin,
-    commands: '0x00',
-    inputs: [encodeAbiParameters(V3_INPUT_ABI, [EXECUTOR, amountIn, amountOutMin, path, true])],
+    venue: PANCAKE_UR,
+    data: encodeAbiParameters([{ type: 'bytes' }, { type: 'bytes[]' }], ['0x00', [encodeAbiParameters(V3_INPUT_ABI, [EXECUTOR, amountIn, amountOutMin, path, true])]]),
     ...overrides,
   };
 }
@@ -2828,8 +2837,8 @@ test('重問地板：排程器送出的 amountOutMin 是**新鮮值**，planHash
     '上鏈的是新鮮的地板，不是規劃時凍結的那一個',
   );
   assert.deepEqual(
-    chain.executeCalls[0]?.steps[0]?.inputs,
-    fresh.inputs,
+    chain.executeCalls[0]?.steps[0]?.data,
+    fresh.data,
     'inputs 裡的 amountOutMin 也要是新的：那是 router 的滑價檢查（合約今天不會替我們覆寫它）',
   );
   assert.equal(
@@ -2891,7 +2900,7 @@ test('refreshFloors：用**新鮮值**（不是 max(規劃, 新鮮)），並重�
   assert.equal(refreshed.steps[0]?.oracleFloor, freshFloor, 'oracleFloor 也換成新鮮值（它是稽核欄位）');
   const [, inputAmountIn, inputAmountOutMin, inputPath, payerIsUser] = decodeAbiParameters(
     V3_INPUT_ABI,
-    refreshed.steps[0]!.inputs[0]!,
+    pancakeInput(refreshed.steps[0]!),
   );
   assert.equal(inputAmountOutMin, amountOutMinWithBuffer(freshFloor), 'inputs 裡的 amountOutMin 必須一起換：那是 router 的地板');
   assert.equal(inputAmountIn, planned.amountIn, 'amountIn 不該被動到');
@@ -2955,7 +2964,8 @@ test('refreshFloors：previewSwap 失敗／minimum 是 0／inputs 解不開 → 
   assert.equal(rpcDown.ok, false);
   if (rpcDown.ok) return;
   assert.equal(rpcDown.kind, 'quote-failed');
-  assert.match(rpcDown.reason, /403 Forbidden/);
+  assert.match(rpcDown.reason, /RPC 無法取得地板/);
+  assert.ok(!rpcDown.reason.includes('403 Forbidden'));
 
   const noFloor = await refreshFloors({ publicClient: floorClient({ minimum: 0n }), oracle: EXECUTOR, steps: [planned], feeBps: 0 });
   assert.equal(noFloor.ok, false);
@@ -3249,4 +3259,26 @@ test('#40 DB failure after confirmed sale keeps tx/progress visible and gives a 
   assert.ok(result.txHash);
   assert.match(result.reason, /DB 延後排程失敗/);
   assert.ok(!JSON.stringify(result).includes('secret-token'));
+});
+
+function pancakeInput(step: PlannedStep): Hex {
+  const [commands, inputs] = decodeAbiParameters([{ type: 'bytes' }, { type: 'bytes[]' }], step.data);
+  assert.equal(commands, '0x00');
+  assert.equal(inputs.length, 1);
+  const input = inputs[0]; assert.ok(input); return input;
+}
+
+test('#47 scheduler send guard uses the new executor selector', async () => {
+  const { EXECUTE_REBALANCE_SELECTOR } = await import('../src/scheduler.js');
+  assert.equal(EXECUTE_REBALANCE_SELECTOR, '0xc52fc5da');
+});
+
+test('#47 receipt reconciliation restores mixed venue/data steps and rejects either field changing', async () => {
+  const original = step({ venue: OWNER, data: '0x12345678' });
+  const f = receiptFixture([step(), original]);
+  assert.equal((await readRebalanceReceipt(f.input, f.reader)).kind, 'found');
+  for (const changed of [{ ...original, venue: TOKEN_IN }, { ...original, data: '0x87654321' as const }]) {
+    const altered = { ...f.input, payloadHash: planHashFor([step(), changed], readyPlan().deadline) };
+    await assert.rejects(readRebalanceReceipt(altered, f.reader), /planHash/);
+  }
 });

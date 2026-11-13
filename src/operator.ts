@@ -1,3 +1,4 @@
+import type { AggregatorQuoter } from './aggregator.js';
 /**
  * 操作員的兩支端點實作：`GET /portfolios/:id/status` 與 `POST /portfolios/:id/rebalance`。
  *
@@ -25,7 +26,7 @@ import { getGasConfig } from './config.js';
 import { countSwapExecuted, PARTIAL_FOLLOW_UP_SECONDS, runSchedulerOnce } from './scheduler.js';
 import type { ExecutionOutcome, PortfolioRunResult, WithTransactionFn } from './scheduler.js';
 import { planPortfolio } from './snapshot.js';
-import { buildStep, capAssetLeg, DEFAULT_DEADLINE_SECONDS, minGrossFor, nominalSellQuote, numeraireDecimals, readMaxLegUsdE8 } from './rebalance-plan.js';
+import { buildRoutedStep, capAssetLeg, DEFAULT_DEADLINE_SECONDS, minGrossFor, nominalSellQuote, numeraireDecimals, readMaxLegUsdE8 } from './rebalance-plan.js';
 import type { PlannedStep, RebalancePlan } from './rebalance-plan.js';
 import type { RebalancePlanningInput } from './scheduler.js';
 import type { PortfolioPlan, QueryFn } from './snapshot.js';
@@ -646,7 +647,7 @@ export type OperatorRebalanceResult = {
   /** 規劃器的完整 rationale（含「為什麼某一檔沒被買」）。null = 這一輪沒有規劃。 */
   rationale?: string | null;
   /** 真的被規劃出來（且送出）的參數；blocked/noop 時是空的。 */
-  steps: { tokenIn: string; tokenOut: string; amountIn: string; amountOutMin: string }[];
+  steps: { tokenIn: string; tokenOut: string; amountIn: string; amountOutMin: string; venue: string }[];
 };
 
 /** `GET /portfolios/:id/plan` 的回應：這一輪**會做什麼、不會做什麼，以及為什麼**。 */
@@ -657,7 +658,7 @@ export type OperatorPlanPreview = {
   /** 排程器寫的那一句話，**原文照回**。這是這支端點存在的全部理由。 */
   reason: string;
   /** 這一輪會送的 step（`ready` 才有）。前端不該自己猜，規劃在後端。 */
-  steps: { tokenIn: string; tokenOut: string; amountIn: string; amountOutMin: string }[];
+  steps: { tokenIn: string; tokenOut: string; amountIn: string; amountOutMin: string; venue: string }[];
   /**
    * 規劃器的完整 rationale（含「為什麼某一檔沒被買」）。
    *
@@ -669,6 +670,7 @@ export type OperatorPlanPreview = {
 };
 
 export type RebalanceDeps = {
+  quoteAggregator?: AggregatorQuoter;
   query?: QueryFn;
   requireOwnedPortfolio?: typeof requireOwnedPortfolio;
   runSchedulerOnce?: typeof runSchedulerOnce;
@@ -870,6 +872,7 @@ export async function runOperatorRebalance(
       tokenOut: step.tokenOut,
       amountIn: step.amountIn,
       amountOutMin: step.amountOutMin,
+      venue: step.venue,
     })),
     rationale: result.plan?.rationale ?? null,
   };
@@ -938,6 +941,7 @@ export async function previewOperatorRebalance(
       tokenOut: step.tokenOut,
       amountIn: step.amountIn,
       amountOutMin: step.amountOutMin,
+      venue: step.venue,
     })),
     rationale: result.plan?.rationale ?? null,
   };
@@ -1226,7 +1230,7 @@ export type RedeemResult = {
   outcome: OperatorRebalanceOutcome;
   reason: string;
   txHash: string | null;
-  steps: { tokenIn: string; tokenOut: string; amountIn: string; amountOutMin: string }[];
+  steps: { tokenIn: string; tokenOut: string; amountIn: string; amountOutMin: string; venue: string }[];
   /** 保留既有欄位：首批仍為請求的 usd，close 為投組總值；續作為請求的 sellUsdE8。 */
   redeemedUsdE8: string;
   /** 非現金待賣名義額，可直接帶回 sellUsdE8；規劃前被擋住的首批為 null（未知），不是 0。 */
@@ -1285,7 +1289,7 @@ async function runOperatorSell(portfolioId: number, wallet: string, request: Sel
   return {
     portfolioId, outcome, reason,
     txHash: result?.execution?.txHash ?? null,
-    steps: (result?.plan?.steps ?? []).map((step) => ({ tokenIn: step.tokenIn, tokenOut: step.tokenOut, amountIn: step.amountIn, amountOutMin: step.amountOutMin })),
+    steps: (result?.plan?.steps ?? []).map((step) => ({ tokenIn: step.tokenIn, tokenOut: step.tokenOut, amountIn: step.amountIn, amountOutMin: step.amountOutMin, venue: step.venue })),
     redeemedUsdE8: requested.toString(), remainingUsdE8: remaining?.toString() ?? null,
     batched: details !== null && details.requestedSellUsdE8 !== null && details.plannedSellUsdE8 < details.requestedSellUsdE8,
   };
@@ -1397,6 +1401,9 @@ export async function buildRedeemPlan(input: RebalancePlanningInput, request: Se
     if (wanted === 0n) return reply({ kind: 'noop', reason: '提領比例換算後待賣代幣量為 0' });
     const budget = wanted < allUsdE8 ? wanted : allUsdE8;
     const feeBps = await readExecutorFeeBps(client, BigInt(pinnedVersion.onchainStrategyId), blockNumber, deps.registry);
+    const { timestamp } = await client.getBlock({ blockNumber });
+    const wall = BigInt(Math.floor(Date.now() / 1000));
+    const deadline = (timestamp > wall ? timestamp : wall) + BigInt(DEFAULT_DEADLINE_SECONDS);
     const steps: PlannedStep[] = [];
     const notes: string[] = [];
     let soldRaw = 0n;
@@ -1418,15 +1425,15 @@ export async function buildRedeemPlan(input: RebalancePlanningInput, request: Se
       if (nextRaw * 100_000_000n > wanted * scale) { notes.push(`${holding.asset}: oracle 名義額超過剩餘待賣量`); continue; }
       if (limit !== null && quotedOut * 100_000_000n > limit * scale) { notes.push(`${holding.asset}: oracle 名義額超過單筆上限`); continue; }
       const poolFee = await readPoolFee(client, router, holding.asset as Address, blockNumber);
-      steps.push(buildStep({ executor, tokenIn: holding.asset as Address, tokenOut: numeraire, amountIn, oracleFloor: floor, minGross: minGrossFor(floor, feeBps), poolFee }));
+      const step = await buildRoutedStep({ publicClient: client, executor, tokenIn: holding.asset as Address, tokenOut: numeraire, amountIn, oracleFloor: floor, minGross: minGrossFor(floor, feeBps), poolFee, feeBps, deadline, blockNumber }, deps);
+      if (step === null) { notes.push(`${holding.asset}: 沒有符合地板的白名單路徑`); continue; }
+      steps.push(step);
       soldRaw = nextRaw;
     }
     if (steps.length === 0) return reply({ kind: 'blocked', reason: `沒有可執行的賣出步驟：${notes.join('；') || '待賣量換算後為 0'}` });
-    const { timestamp } = await client.getBlock({ blockNumber });
-    const wall = BigInt(Math.floor(Date.now() / 1000));
     // Subtract the ceiling of aggregate nominal sold, so repeated E8 continuation never oversells by truncation.
     const soldE8 = (soldRaw * 100_000_000n + scale - 1n) / scale;
-    return reply({ kind: 'ready', steps, deadline: (timestamp > wall ? timestamp : wall) + BigInt(DEFAULT_DEADLINE_SECONDS),
+    return reply({ kind: 'ready', steps, deadline,
       rationale: `賣出 ${steps.length} 檔，非現金待賣 ${wanted} E8，本批名義額 ${soldE8} E8；剩餘由 API 呼叫者以 sellUsdE8 續作（依當下非現金價值重新分配）${notes.length === 0 ? '' : `；blocked：${notes.join('；')}`}` }, soldE8);
   } catch {
     return reply({ kind: 'blocked', reason: '[REDEEM_PLAN_UNAVAILABLE] 持倉、限額、oracle 或 DB 資料不可用，不送交易' });

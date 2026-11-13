@@ -252,7 +252,7 @@ test('buildSessionPermissions: policySnapshot 含三層 policy 與 executor targ
   assert.equal(policySnapshot.call.permissions.length, 1);
   assert.equal(lower(policySnapshot.call.permissions[0]!.target), lower(EXECUTOR));
   assert.equal(policySnapshot.call.permissions[0]!.selector, EXECUTOR_SELECTOR);
-  assert.equal(EXECUTOR_SELECTOR, '0x1b977850');
+  assert.equal(EXECUTOR_SELECTOR, '0xc52fc5da');
   assert.equal(policySnapshot.call.policyVersion, SESSION_CALL_POLICY_VERSION);
   assert.equal(policySnapshot.call.policyVersion, '0.0.4');
 

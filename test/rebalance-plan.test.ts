@@ -1,6 +1,8 @@
+import { PANCAKE_UR, EXECUTOR_ABI } from '../src/chain.js';
+import { quoteKyberSwap, aggregatorWins } from '../src/aggregator.js';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createPublicClient, decodeAbiParameters, encodePacked, getAddress, http } from 'viem';
+import { createPublicClient, custom, decodeAbiParameters, decodeFunctionData, encodeFunctionResult, encodePacked, getAddress, http, isHex, parseAbi, zeroAddress } from 'viem';
 import type { Address, Hex, PublicClient } from 'viem';
 import { bsc } from 'viem/chains';
 import { computeDrift } from '../src/drift.js';
@@ -14,6 +16,9 @@ import {
   moveValueE8,
   planRebalance,
   capAssetLeg,
+  buildStep,
+  buildRoutedStep,
+  refreshFloors,
   readMaxLegUsdE8,
   amountOutMinWithBuffer,} from '../src/rebalance-plan.js';
 import type { PlanRebalanceArgs, PlannedStep, RebalancePlan } from '../src/rebalance-plan.js';
@@ -145,6 +150,7 @@ function stubClient(chain: StubChain): PublicClient {
         blockNumber: args.blockNumber,
       });
       const target = args.address.toLowerCase();
+      if (args.functionName === 'venues') return [1, PANCAKE_UR];
       if (target === EXECUTOR.toLowerCase() || target === EXECUTOR_MULTI.toLowerCase()) {
         if (args.functionName === 'numeraire') {
           if (chain.executorNumeraire instanceof Error) throw chain.executorNumeraire;
@@ -387,7 +393,7 @@ function decodeStepInput(step: PlannedStep): {
   path: Hex;
   payerIsUser: boolean;
 } {
-  const input = step.inputs[0];
+  const input = pancakePayload(step).inputs[0];
   assert.ok(input !== undefined, 'inputs[0] 必須存在');
   const decoded = decodeAbiParameters(V3_INPUT_ABI, input);
   return {
@@ -906,11 +912,11 @@ test('R6 commands 是單一 byte 0x00、inputs 只有一筆、recipient 是 exec
 
   const step = plan.steps[0];
   assert.ok(step !== undefined);
-  assert.equal(step.commands, V3_SWAP_EXACT_IN);
-  assert.equal(step.commands, '0x00');
+  assert.equal(pancakePayload(step).commands, V3_SWAP_EXACT_IN);
+  assert.equal(pancakePayload(step).commands, '0x00');
   // packed bytes：0x + 2 個 hex 字元 = 一個 byte。帶 flag bit（例如 0x80）會被 CommandNotAllowed。
-  assert.equal(step.commands.length, 4);
-  assert.equal(step.inputs.length, 1);
+  assert.equal(pancakePayload(step).commands.length, 4);
+  assert.equal(pancakePayload(step).inputs.length, 1);
   const decoded = decodeStepInput(step);
   // _checkRecipient 讀第 0 個 head word 的低 20 bytes，必須等於 executor。
   assert.equal(decoded.recipient, getAddress(EXECUTOR));
@@ -1156,7 +1162,7 @@ test('H1 3 資產手算：40/30/30 vs 實際 60/20/20 → 賣 0.2 WBNB、買 100
     assert.equal(decoded.recipient, getAddress(EXECUTOR_MULTI));
     assert.equal(decoded.payerIsUser, true);
     assert.equal(decoded.amountIn, step.amountIn);
-    assert.equal(step.commands, V3_SWAP_EXACT_IN);
+    assert.equal(pancakePayload(step).commands, V3_SWAP_EXACT_IN);
   }
   assert.equal(plan.deadline, chain.block.timestamp + BigInt(DEFAULT_DEADLINE_SECONDS));
 
@@ -2004,8 +2010,8 @@ test('交叉驗證：真 fork 上跑一次規劃器，minGross ≥ previewSwap �
     `[交叉驗證] 塊時間 ${block.timestamp}、牆鐘 ${wallBefore}、deadline ${ready.deadline}` +
       `（相對塊時間 +${ready.deadline - block.timestamp}s，設定 ${DEFAULT_DEADLINE_SECONDS}s）`,
   );
-  assert.equal(step.commands, '0x00');
-  assert.equal(step.inputs.length, 1);
+  assert.equal(pancakePayload(step).commands, '0x00');
+  assert.equal(pancakePayload(step).inputs.length, 1);
 });
 
 // A10: allowance is a budget for the entire batch, in numeraire units.
@@ -2274,4 +2280,204 @@ test('#40 direct planner callers load DB limits by default, and DB failure block
   assert.ok(blocked.kind === 'blocked');
   assert.ok(!blocked.reason.includes('secret-token'));
   assert.ok(!chain.calls.some((call) => call.functionName === 'previewSwap'));
+});
+
+function pancakePayload(step: PlannedStep): { commands: Hex; inputs: readonly Hex[] } {
+  assert.equal(step.venue, PANCAKE_UR);
+  const [commands, inputs] = decodeAbiParameters([{ type: 'bytes' }, { type: 'bytes[]' }], step.data);
+  return { commands, inputs };
+}
+
+// #47: opaque aggregator payloads must be rebuilt against the fresh floor, never reused.
+test('#47 aggregator refresh converts thrown upstream failures to a blocked result without leaking details', async () => {
+  const chain = baseChain();
+  const planned = { ...buildStep({ executor: EXECUTOR, tokenIn: WBNB, tokenOut: USDT,
+    amountIn: 1n, oracleFloor: chain.oracle.minimum, minGross: chain.oracle.minimum, poolFee: 500 }),
+    venue: REGISTRY, data: '0x12345678' as const };
+  const result = await refreshFloors({ publicClient: stubClient(chain), oracle: ORACLE, steps: [planned],
+    feeBps: 0, executor: EXECUTOR, deadline: 2000000000n,
+    quoteAggregator: async () => { throw new Error('upstream secret-token'); } });
+  assert.equal(result.ok, false);
+  assert.ok(!JSON.stringify(result).includes('secret-token'));
+});
+
+function kyberFixture() {
+  const state = { chainId: 56, kind: 2, spender: REGISTRY, rpcFailure: false,
+    requests: [] as { url: string; init: RequestInit }[], reads: [] as unknown[] };
+  const summary = { tokenIn: WBNB, tokenOut: USDT, amountIn: '100', amountOut: '120' };
+  const route = { code: 0, data: { routerAddress: REGISTRY, routeSummary: summary } };
+  const built = { code: 0, data: { routerAddress: REGISTRY, to: REGISTRY, amountIn: '100', amountOut: '120',
+    transactionValue: '0', data: '0x12345678' } };
+  const client = createPublicClient({ transport: custom({ request: async ({ method, params }) => {
+    if (state.rpcFailure) throw new Error('RPC secret-token');
+    if (method === 'eth_chainId') return `0x${state.chainId.toString(16)}`;
+    assert.equal(method, 'eth_call');
+    assert.ok(Array.isArray(params));
+    state.reads.push(params[1]);
+    return encodeFunctionResult({ abi: EXECUTOR_ABI, functionName: 'venues', result: [state.kind, state.spender] });
+  } }, { retryCount: 0 }) });
+  const request = { publicClient: client, executor: EXECUTOR, tokenIn: WBNB, tokenOut: USDT,
+    amountIn: 100n, minimum: 110n, deadline: 2000000000n, blockNumber: 42n };
+  const fetcher = async (url: string, init: RequestInit) => {
+    state.requests.push({ url, init });
+    return Response.json(url.includes('/route/build') ? built : route);
+  };
+  return { state, summary, route, built, request, fetcher };
+}
+
+test('#47 Kyber pins sender/recipient and deadline, verifies whitelist at observed block and builds zero-value calldata', async () => {
+  const f = kyberFixture();
+  assert.deepEqual(await quoteKyberSwap(f.request, { fetch: f.fetcher }), { venue: getAddress(REGISTRY), data: '0x12345678', amountOut: 120n });
+  assert.deepEqual(f.state.reads, ['0x2a']);
+  assert.equal(f.state.requests.length, 2);
+  const built = f.state.requests[1]; assert.ok(built && typeof built.init.body === 'string');
+  const body: unknown = JSON.parse(built.init.body);
+  assert.ok(typeof body === 'object' && body !== null);
+  assert.equal(Reflect.get(body, 'sender'), EXECUTOR);
+  assert.equal(Reflect.get(body, 'recipient'), EXECUTOR);
+  assert.equal(Reflect.get(body, 'deadline'), Number(f.request.deadline));
+  assert.ok(Number(Reflect.get(body, 'slippageTolerance')) <= 833);
+});
+
+for (const scenario of ['unlisted', 'pancake-kind', 'bad-spender', 'wrong-chain', 'RPC', 'wrong-token-in', 'wrong-token-out',
+  'wrong-input', 'route-below-floor', 'build-below-floor', 'build-target', 'explicit-to', 'value', 'malformed-data', 'empty-data',
+  'missing-value', 'overflow', 'API-code'] as const) {
+  test(`#47 Kyber rejects ${scenario} and returns no upstream text`, async () => {
+    const f = kyberFixture();
+    switch (scenario) {
+      case 'unlisted': f.state.kind = 0; break;
+      case 'pancake-kind': f.state.kind = 1; break;
+      case 'bad-spender': f.state.spender = zeroAddress; break;
+      case 'wrong-chain': f.state.chainId = 1337; break;
+      case 'RPC': f.state.rpcFailure = true; break;
+      case 'wrong-token-in': f.summary.tokenIn = TOKEN3; break;
+      case 'wrong-token-out': f.summary.tokenOut = TOKEN3; break;
+      case 'wrong-input': f.built.data.amountIn = '99'; break;
+      case 'route-below-floor': f.summary.amountOut = '109'; break;
+      case 'build-below-floor': f.built.data.amountOut = '109'; break;
+      case 'build-target': f.built.data.routerAddress = TOKEN3; break;
+      case 'explicit-to': f.built.data.to = TOKEN3; break;
+      case 'value': f.built.data.transactionValue = '1'; break;
+      case 'malformed-data': f.built.data.data = '0x1234567'; break;
+      case 'empty-data': f.built.data.data = '0x'; break;
+      case 'missing-value': f.built.data.transactionValue = ''; break;
+      case 'overflow': f.summary.amountOut = (2n ** 256n).toString(); break;
+      case 'API-code': f.built.code = 4002; break;
+    }
+    assert.equal(await quoteKyberSwap(f.request, { fetch: f.fetcher }), null);
+  });
+}
+
+test('#47 Kyber boundaries: zero/uint256 overflow rejected, exact floor accepted, Permit2 uint160 enforced', async () => {
+  const f = kyberFixture();
+  for (const amountIn of [0n, -1n, 2n ** 256n]) assert.equal(await quoteKyberSwap({ ...f.request, amountIn }, { fetch: f.fetcher }), null);
+  f.summary.amountOut = f.built.data.amountOut = '110';
+  assert.ok(await quoteKyberSwap(f.request, { fetch: f.fetcher }));
+  f.state.kind = 3;
+  const max = 2n ** 160n - 1n;
+  f.summary.amountIn = f.built.data.amountIn = max.toString();
+  assert.ok(await quoteKyberSwap({ ...f.request, amountIn: max }, { fetch: f.fetcher }));
+  f.summary.amountIn = f.built.data.amountIn = (max + 1n).toString();
+  assert.equal(await quoteKyberSwap({ ...f.request, amountIn: max + 1n }, { fetch: f.fetcher }), null);
+});
+
+test('#47 API HTTP/JSON failures and a non-cooperative timeout all fall back', async () => {
+  const f = kyberFixture();
+  for (const fetcher of [async () => new Response('upstream secret-token', { status: 503 }),
+    async () => new Response('not json'), async () => { throw new Error('upstream secret-token'); }]) {
+    assert.equal(await quoteKyberSwap(f.request, { fetch: fetcher }), null);
+  }
+  const started = performance.now();
+  assert.equal(await quoteKyberSwap(f.request, { fetch: async () => new Promise<Response>(() => {}), timeoutMs: 10 }), null);
+  assert.ok(performance.now() - started < 1000);
+});
+
+test('#47 route comparison uses integer net receipts, keeps ties on Pancake, requires floor', () => {
+  const quote = { venue: REGISTRY, data: '0x12345678' as const, amountOut: 120n };
+  assert.equal(aggregatorWins(quote, 119n, 110n, 100), true);
+  assert.equal(aggregatorWins(quote, 121n, 110n, 100), false);
+  assert.equal(aggregatorWins(quote, 120n, 110n, 100), false);
+  assert.equal(aggregatorWins(quote, null, 120n, 0), true);
+  assert.equal(aggregatorWins(quote, null, 121n, 0), false);
+  assert.equal(aggregatorWins(quote, null, 0n, 0), false);
+  for (const fee of [-1, 10000, NaN, 0.5]) assert.equal(aggregatorWins(quote, null, 110n, fee), false);
+  // 10000 and 9999 both leave exactly 1 after a 9999bps fee: gross advantage is not a net advantage.
+  assert.equal(aggregatorWins({ ...quote, amountOut: 10000n }, 9999n, 1n, 9999), false);
+});
+
+test('#47 shared routing selects aggregator, falls back on failure, and blocks an unreadable Pancake whitelist', async () => {
+  const chain = baseChain();
+  const client = stubClient(chain);
+  const params = { publicClient: client, executor: EXECUTOR, tokenIn: WBNB, tokenOut: USDT, amountIn: 1n,
+    oracleFloor: 100n, minGross: 100n, poolFee: 500, deadline: 2000000000n, feeBps: 0, blockNumber: 42n };
+  const best = await buildRoutedStep(params, { quoteAggregator: async () => ({ venue: REGISTRY, data: '0x12345678', amountOut: 110n }) });
+  assert.equal(best?.venue, REGISTRY);
+  for (const quoteAggregator of [async () => null, async () => { throw new Error('API unavailable'); }]) {
+    const fallback = await buildRoutedStep(params, { quoteAggregator });
+    assert.equal(fallback?.venue, PANCAKE_UR);
+  }
+  const f = kyberFixture(); f.state.rpcFailure = true;
+  assert.equal(await buildRoutedStep({ ...params, publicClient: f.request.publicClient }, { quoteAggregator: async () => null }), null);
+});
+
+test('#47 refresh replaces opaque data using the fresh buffered floor, and rejects missing, changed or insufficient quotes', async () => {
+  const chain = baseChain();
+  const planned = { ...buildStep({ executor: EXECUTOR, tokenIn: WBNB, tokenOut: USDT, amountIn: 1n,
+    oracleFloor: chain.oracle.minimum, minGross: chain.oracle.minimum, poolFee: 500 }), venue: REGISTRY, data: '0x12345678' as const };
+  const params = { publicClient: stubClient(chain), oracle: ORACLE, steps: [planned], feeBps: 100,
+    executor: EXECUTOR, deadline: 2000000000n };
+  const refreshed = await refreshFloors({ ...params, quoteAggregator: async (request) => {
+    assert.equal(request.blockNumber, undefined);
+    assert.equal(request.minimum, amountOutMinWithBuffer(minGrossFor(chain.oracle.minimum, 100)));
+    return { venue: REGISTRY, data: '0x87654321', amountOut: request.minimum };
+  } });
+  assert.ok(refreshed.ok);
+  assert.equal(refreshed.steps[0]?.data, '0x87654321');
+  for (const candidate of [null, { venue: TOKEN3, data: '0x87654321' as const, amountOut: 2n ** 255n },
+    { venue: REGISTRY, data: '0x87654321' as const, amountOut: 0n }]) {
+    assert.equal((await refreshFloors({ ...params, quoteAggregator: async () => candidate })).ok, false);
+  }
+  assert.equal((await refreshFloors({ ...params, executor: undefined })).ok, false);
+});
+
+test('#47 a stalled Pancake RPC cannot hold a valid aggregator route indefinitely', { timeout: 10000 }, async () => {
+  const client = createPublicClient({ transport: custom({ request: async ({ method, params }) => {
+    assert.equal(method, 'eth_call'); assert.ok(Array.isArray(params));
+    const call: unknown = params[0]; assert.ok(typeof call === 'object' && call !== null);
+    const data: unknown = Reflect.get(call, 'data'); assert.ok(typeof data === 'string');
+    if (data.startsWith('0xb15ff644')) return encodeFunctionResult({ abi: EXECUTOR_ABI, functionName: 'venues', result: [1, PANCAKE_UR] });
+    return new Promise<string>(() => {});
+  } }, { retryCount: 0 }) });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([buildRoutedStep({ publicClient: client, executor: EXECUTOR,
+      tokenIn: WBNB, tokenOut: USDT, amountIn: 1n, oracleFloor: 100n, minGross: 100n, poolFee: 500,
+      deadline: 2000000000n, feeBps: 0, blockNumber: 42n },
+      { quoteAggregator: async () => ({ venue: REGISTRY, data: '0x12345678', amountOut: 120n }) }),
+      new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('Pancake quote did not terminate')), 7000); })]);
+    assert.equal(result?.venue, REGISTRY);
+  } finally { clearTimeout(timer); }
+});
+
+test('#47 Pancake comparison caps eth_call gas so a cold thin pool cannot consume the RPC indefinitely', async () => {
+  const observedGas: unknown[] = [];
+  const quoteAbi = parseAbi(['function getPool(address,address,uint24) view returns(address)',
+    'function quoteExactInput(bytes,uint256) returns(uint256,uint160[])']);
+  const client = createPublicClient({ transport: custom({ request: async ({ params }) => {
+    assert.ok(Array.isArray(params)); const call: unknown = params[0];
+    assert.ok(typeof call === 'object' && call !== null);
+    const data: unknown = Reflect.get(call, 'data'); assert.ok(typeof data === 'string' && isHex(data));
+    if (data.startsWith('0xb15ff644')) return encodeFunctionResult({ abi: EXECUTOR_ABI, functionName: 'venues', result: [1, PANCAKE_UR] });
+    observedGas.push(Reflect.get(call, 'gas'));
+    const callData = decodeFunctionData({ abi: quoteAbi, data });
+    if (callData.functionName === 'getPool') return encodeFunctionResult({ abi: quoteAbi, functionName: 'getPool',
+      result: callData.args[2] === 500 && callData.args[0].toLowerCase() !== callData.args[1].toLowerCase() ? WBNB_USDT_POOL : zeroAddress });
+    return encodeFunctionResult({ abi: quoteAbi, functionName: 'quoteExactInput', result: [130n, []] });
+  } }, { retryCount: 0 }) });
+  const step = await buildRoutedStep({ publicClient: client, executor: EXECUTOR, tokenIn: WBNB, tokenOut: USDT, amountIn: 1n,
+    oracleFloor: 100n, minGross: 100n, poolFee: 500, deadline: 2000000000n, feeBps: 0, blockNumber: 42n },
+    { quoteAggregator: async () => ({ venue: REGISTRY, data: '0x12345678', amountOut: 120n }) });
+  assert.equal(step?.venue, PANCAKE_UR, 'the valid Pancake quote beats the aggregator 130 to 120');
+  assert.ok(observedGas.length > 0);
+  assert.ok(observedGas.every((gas) => gas === '0x7a120'), 'each comparison eth_call must have a 500000 gas budget');
 });

@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { mnemonicToAccount } from 'viem/accounts';
-import { zeroAddress } from 'viem';
+import { createPublicClient, custom, getAddress, encodeAbiParameters, encodeEventTopics, encodeFunctionResult, zeroAddress } from 'viem';
+import { EXECUTOR_ABI, PANCAKE_UR } from '../src/chain.js';
 import type { Address } from 'viem';
-import { checkBuyConfig, checkGlobalPaused, checkOwnership, checkRegistryOperator, checkRoleSeparation, checkSessionKeySeed, operatorAddress } from '../scripts/preflight.js';
+import { checkVenues, checkBuyConfig, checkGlobalPaused, checkOwnership, checkRegistryOperator, checkRoleSeparation, checkSessionKeySeed, operatorAddress } from '../scripts/preflight.js';
 
 for (const strict of [true, false]) {
   test(`executor pause preflight (strict=${strict}) distinguishes false, true and unreadable`, () => {
@@ -224,3 +225,71 @@ for (const strict of [false, true]) {
     assert.ok(checkBuyConfig(null, null, strict).every((check) => check.level === 'fail'));
   });
 }
+
+function venuePreflightFixture() {
+  const state = { urKind: 1, urSpender: PANCAKE_UR, otherKind: 2, wrongDeployment: false, fail: '', blocks: [] as unknown[] };
+  const client = createPublicClient({ transport: custom({ request: async ({ method, params }) => {
+    if (state.fail === method) throw new Error('RPC secret-token');
+    if (method === 'eth_blockNumber') return '0x2a';
+    if (method === 'eth_getCode') {
+      assert.ok(Array.isArray(params));
+      return params[1] === '0x27' && !state.wrongDeployment ? '0x' : '0x1234';
+    }
+    if (method === 'eth_getLogs') return [PANCAKE_UR, OTHER, OTHER].map((target, index) => ({
+      address: SAFE, blockNumber: '0x29', blockHash: `0x${'a'.repeat(64)}`, transactionHash: `0x${'b'.repeat(64)}`,
+      transactionIndex: '0x0', logIndex: `0x${index}`, removed: false,
+      topics: encodeEventTopics({ abi: EXECUTOR_ABI, eventName: 'VenueSet', args: { target } }),
+      data: encodeAbiParameters([{ type: 'uint8' }, { type: 'address' }], [2, OTHER]),
+    }));
+    assert.equal(method, 'eth_call'); assert.ok(Array.isArray(params));
+    const call: unknown = params[0]; assert.ok(typeof call === 'object' && call !== null);
+    const data: unknown = Reflect.get(call, 'data');
+    assert.ok(typeof data === 'string' && /^0x[0-9a-f]+$/i.test(data));
+    // ABI selector + padded address: all calls here are venues(target).
+    state.blocks.push(params[1]);
+    const ur = data.slice(-40).toLowerCase() === PANCAKE_UR.slice(2).toLowerCase();
+    return encodeFunctionResult({ abi: EXECUTOR_ABI, functionName: 'venues',
+      result: ur ? [state.urKind, state.urSpender] : [state.otherKind, OTHER] });
+  } }, { retryCount: 0 }) });
+  return { state, client };
+}
+
+test('#47 preflight lists current venues once at one block and requires canonical PANCAKE_UR', async () => {
+  const f = venuePreflightFixture();
+  const checks = await checkVenues(f.client, getAddress(SAFE.toLowerCase()), 40n);
+  assert.equal(checks.length, 2);
+  assert.ok(checks.every((check) => check.level === 'ok'));
+  assert.match(checks[1]?.detail ?? '', /ERC20_APPROVE/);
+  assert.deepEqual(f.state.blocks, ['0x2a', '0x2a']);
+  f.state.otherKind = 0;
+  assert.equal((await checkVenues(f.client, getAddress(SAFE.toLowerCase()), 40n)).length, 1, 'removed venue is omitted');
+  for (const kind of [0, 2, 3, 255]) {
+    f.state.urKind = kind;
+    assert.equal((await checkVenues(f.client, getAddress(SAFE.toLowerCase()), 40n))[0]?.level, 'fail');
+  }
+  f.state.urKind = 1; f.state.urSpender = zeroAddress;
+  assert.equal((await checkVenues(f.client, getAddress(SAFE.toLowerCase()), 40n))[0]?.level, 'fail');
+});
+
+for (const method of ['eth_blockNumber', 'eth_getCode', 'eth_getLogs', 'eth_call']) {
+  test(`#47 preflight ${method} failure is not an empty successful venue list`, async () => {
+    const f = venuePreflightFixture(); f.state.fail = method;
+    const checks = await checkVenues(f.client, getAddress(SAFE.toLowerCase()), 40n);
+    assert.equal(checks.length, 1);
+    assert.equal(checks[0]?.level, 'fail');
+    assert.ok(!JSON.stringify(checks).includes('secret-token'));
+  });
+}
+
+test('#47 preflight deployment block accepts zero and rejects negative or future heights', async () => {
+  const f = venuePreflightFixture();
+  assert.ok((await checkVenues(f.client, getAddress(SAFE.toLowerCase()), 0n)).every((check) => check.level === 'ok'));
+  for (const block of [-1n, 43n]) {
+    assert.equal((await checkVenues(f.client, getAddress(SAFE.toLowerCase()), block))[0]?.level, 'fail');
+  }
+});
+
+test('#47 preflight rejects a scan starting after deployment to avoid omitting old venues', async () => {
+  const f = venuePreflightFixture(); f.state.wrongDeployment = true;
+  assert.equal((await checkVenues(f.client, getAddress(SAFE.toLowerCase()), 40n))[0]?.level, 'fail');
+});

@@ -31,7 +31,7 @@ const usdt = getAddress('0x55d398326f99059fF775485246999027B3197955');
 const wbnb = getAddress('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c');
 const entryPoint = { address: KERNEL_V3_3_ADDRESSES.entryPointV07, version: '0.7' } as const;
 const abi = parseAbi([
-  'function executeRebalance(address account, (address tokenIn,address tokenOut,uint256 amountIn,uint256 amountOutMin,bytes commands,bytes[] inputs)[] steps,uint256 deadline)',
+  'function executeRebalance(address account, (address tokenIn,address tokenOut,uint256 amountIn,uint256 amountOutMin,address venue,bytes data)[] steps,uint256 deadline)',
   'function setMaxBuyBps(uint16 bps)', 'function owner() view returns(address)',
   'function oracle() view returns(address)',
   'function previewSwap(address tokenIn,address tokenOut,uint256 amountIn) view returns(uint256 quoted,uint256 minimum)',

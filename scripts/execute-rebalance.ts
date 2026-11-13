@@ -1,3 +1,4 @@
+import { EXECUTOR_ABI as REBALANCE_ABI, EXECUTOR_SELECTOR as EXECUTE_REBALANCE_SELECTOR } from '../src/chain.js';
 // 用 **session key**（Kernel permission validator）真的把投組調回目標，並證明「代幣真的移動了」。
 //
 // ⚠ DEV / FORK ONLY。它會送鏈上交易、也會用 anvil 內建帳號入金。私鑰只從 process.env 讀，
@@ -95,37 +96,6 @@ const NVDAB: Address = '0x02fca66c1d1afb4e2a7884261eb00f63598a7436';
 /** anvil #0：唯一的資金來源。那 9995 BNB 是 anvil 自己灌的，不是上游真錢。 */
 const ANVIL0: Address = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266';
 const ANVIL0_KEY: Hex = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
-
-/** CallPolicy 白名單裡唯一的 selector：`executeRebalance(address,(...)[],uint256)`。 */
-const EXECUTE_REBALANCE_SELECTOR: Hex = '0x1b977850';
-
-/**
- * `SwapStep` 的欄位名照合約寫（AtpExecutor.sol:46-59）。名字不影響 ABI 編碼，但解碼/稽核時要對得上。
- */
-const REBALANCE_ABI = [
-  {
-    type: 'function',
-    name: 'executeRebalance',
-    stateMutability: 'nonpayable',
-    inputs: [
-      { name: 'account', type: 'address' },
-      {
-        name: 'steps',
-        type: 'tuple[]',
-        components: [
-          { name: 'tokenIn', type: 'address' },
-          { name: 'tokenOut', type: 'address' },
-          { name: 'amountIn', type: 'uint256' },
-          { name: 'amountOutMin', type: 'uint256' },
-          { name: 'commands', type: 'bytes' },
-          { name: 'inputs', type: 'bytes[]' },
-        ],
-      },
-      { name: 'deadline', type: 'uint256' },
-    ],
-    outputs: [],
-  },
-] as const;
 
 /** 唯一能證明「幣真的換了」的事件（AtpExecutor.sol:62-71）。 */
 const SWAP_EXECUTED_ABI = [
@@ -664,7 +634,7 @@ async function modePlan(args: Args, publicClient: PublicClient): Promise<void> {
     log('plan', `step ${index} tokenIn ${step.tokenIn} → tokenOut ${step.tokenOut}`);
     log('plan', `  amountIn ${step.amountIn}`);
     log('plan', `  amountOutMin ${step.amountOutMin}（= minGross）oracleFloor ${step.oracleFloor}`);
-    log('plan', `  commands ${step.commands} inputs ${step.inputs.length}`);
+    log('plan', `  venue ${step.venue} data ${(step.data.length - 2) / 2} bytes`);
   }
 }
 
@@ -730,7 +700,7 @@ async function modeExecute(args: Args, publicClient: PublicClient, chain: Chain)
       functionName: 'effectiveFeeBps',
       args: [BigInt(plan.pinnedVersion.onchainStrategyId)],
     });
-    const refresh = await refreshFloors({ publicClient, oracle, steps: rebalance.steps, feeBps: Number(feeBpsRaw) });
+    const refresh = await refreshFloors({ publicClient, oracle, steps: rebalance.steps, feeBps: Number(feeBpsRaw), executor: args.executor, deadline: rebalance.deadline });
     if (!refresh.ok) {
       // 放棄這一輪：問不到地板（或地板崩掉）就不簽名、不送 —— 用舊值硬送等於賭一個過期的下限。
       throw new Error(`送出前重問地板失敗（${refresh.kind}）：${refresh.reason}｜這一輪不送`);
@@ -761,8 +731,8 @@ async function modeExecute(args: Args, publicClient: PublicClient, chain: Chain)
         tokenOut: step.tokenOut,
         amountIn: step.amountIn,
         amountOutMin: step.amountOutMin,
-        commands: step.commands,
-        inputs: step.inputs,
+        venue: step.venue,
+        data: step.data,
       })),
       rebalance.deadline,
     ],

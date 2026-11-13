@@ -1,3 +1,4 @@
+import { PANCAKE_UR } from '../../src/chain.js';
 import assert from 'node:assert/strict';
 import { createPublicClient, custom, decodeFunctionData, encodeFunctionResult, getAddress, isHex, parseAbi } from 'viem';
 import { computeDrift } from '../../src/drift.js';
@@ -15,7 +16,8 @@ const ABI = parseAbi([
   'function pool() view returns(address)', 'function fee() view returns(uint24)',
   'function effectiveFeeBps(uint256) view returns(uint16)',
   'function previewSwap(address,address,uint256) view returns(uint256,uint256)',
-  'function decimals() view returns(uint8)',
+  'function decimals() view returns(uint8)', 'function venues(address) view returns(uint8,address)',
+  'function getPool(address,address,uint24) view returns(address)', 'function quoteExactInput(bytes,uint256) returns(uint256,uint160[])',
 ]);
 
 /** Real viem ABI encoding/decoding over an in-memory RPC; no PublicClient type assertions. */
@@ -41,6 +43,9 @@ export function sellFixture() {
     if (state.fail === decoded.functionName) throw new Error('RPC timeout secret-token');
     switch (decoded.functionName) {
       case 'oracle': case 'oracleOf': case 'pool': return encodeFunctionResult({ abi: ABI, functionName: decoded.functionName, result: ORACLE });
+      case 'venues': return encodeFunctionResult({ abi: ABI, functionName: 'venues', result: [1, PANCAKE_UR] });
+      case 'getPool': return encodeFunctionResult({ abi: ABI, functionName: 'getPool', result: '0x0000000000000000000000000000000000000000' });
+      case 'quoteExactInput': throw new Error('quoter unavailable in fixture');
       case 'fee': return encodeFunctionResult({ abi: ABI, functionName: 'fee', result: 10000 });
       case 'effectiveFeeBps': return encodeFunctionResult({ abi: ABI, functionName: 'effectiveFeeBps', result: 0 });
       case 'decimals': return encodeFunctionResult({ abi: ABI, functionName: 'decimals', result: 18 });

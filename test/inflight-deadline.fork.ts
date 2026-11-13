@@ -43,8 +43,8 @@ async function rpcCall(url: string, method: string, params: readonly unknown[] =
   return Reflect.get(result, 'result');
 }
 async function bytecode(source: string, name: string): Promise<Hex> {
-  // d62d1c3 matches this backend's SwapStep ABI, before the separately tracked A11 venue change.
-  const artifact: unknown = JSON.parse(await readFile(`.bun-cache/contracts-39-v1/out/${source}/${name}.json`, 'utf8'));
+  // Use current main artifacts: the backend now encodes the A11 venue/data SwapStep.
+  const artifact: unknown = JSON.parse(await readFile(`${process.env.CONTRACT_ARTIFACTS_DIR ?? '.bun-cache/contracts-47/out'}/${source}/${name}.json`, 'utf8'));
   assert.ok(typeof artifact === 'object' && artifact !== null);
   const code: unknown = Reflect.get(artifact, 'bytecode');
   assert.ok(typeof code === 'object' && code !== null);

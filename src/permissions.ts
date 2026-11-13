@@ -12,6 +12,8 @@ import type { Address, Hex, PublicClient } from 'viem';
 import { hdKeyToAccount } from 'viem/accounts';
 import { KERNEL_VERSION_STRING, KERNEL_V3_3_ADDRESSES } from './addresses.js';
 import { requireSessionKeyConfig } from './config.js';
+import { EXECUTOR_SELECTOR } from './chain.js';
+export { EXECUTOR_SELECTOR } from './chain.js';
 
 /**
  * Kernel session key 的權限機制（第一段：只做機制，不接 enroll 流程）。
@@ -30,9 +32,6 @@ import { requireSessionKeyConfig } from './config.js';
 
 /** EntryPoint v0.7（`toPermissionValidator` 只接受 0.7，其他版本會直接 throw）。 */
 const ENTRY_POINT = { address: KERNEL_V3_3_ADDRESSES.entryPointV07, version: '0.7' } as const;
-
-/** 允許 session key 呼叫的函式：executor 的 `executeRebalance`。 */
-export const EXECUTOR_SELECTOR: Hex = '0x1b977850';
 
 /** GasPolicy 的一次性 wei 預算（1e18 wei）。用完不重置，權限永久失效。 */
 export const SESSION_GAS_ALLOWED_WEI = 10n ** 18n;

@@ -28,9 +28,9 @@
 import { pathToFileURL } from 'node:url';
 import { createPublicClient, http, isAddress, getAddress, zeroAddress } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import type { Address } from 'viem';
+import type { Address, PublicClient } from 'viem';
 
-import { readGlobalPaused, REGISTRY_ABI, EXECUTOR_BUY_ABI } from '../src/chain.js';
+import { readGlobalPaused, REGISTRY_ABI, EXECUTOR_BUY_ABI, EXECUTOR_ABI, PANCAKE_UR } from '../src/chain.js';
 import { activeChain } from '../src/chain-object.js';
 import { getConfig, requireSessionKeyConfig } from '../src/config.js';
 import { query } from '../src/db.js';
@@ -78,6 +78,38 @@ export function checkBuyConfig(maxBuyBps: number | null, numeraire: Address | nu
     { name: 'executor.numeraire', level: numeraire === null ? 'fail' : sameAddress(numeraire, USDT_ADDRESS) ? 'ok' : strict ? 'fail' : 'warn',
       detail: numeraire === null ? '讀不到 numeraire()' : `${numeraire}（預期 USDT）` },
   ];
+}
+
+/** Enumerate targets from events, then read current state (including removals) at one block. */
+export async function checkVenues(client: PublicClient, executor: Address, deploymentBlock: bigint): Promise<Check[]> {
+  try {
+    const blockNumber = await client.getBlockNumber({ cacheTime: 0 });
+    if (deploymentBlock < 0n || deploymentBlock > blockNumber) throw new Error('invalid deployment block');
+    const deployedCode = await client.getCode({ address: executor, blockNumber: deploymentBlock });
+    const priorCode = deploymentBlock === 0n ? undefined
+      : await client.getCode({ address: executor, blockNumber: deploymentBlock - 1n });
+    if (deployedCode === undefined || deployedCode === '0x' || (priorCode !== undefined && priorCode !== '0x')) {
+      throw new Error('deployment block does not match code creation');
+    }
+    const events = await client.getContractEvents({ address: executor, abi: EXECUTOR_ABI,
+      eventName: 'VenueSet', fromBlock: deploymentBlock, toBlock: blockNumber, strict: true });
+    const targets = new Map<string, Address>([[PANCAKE_UR.toLowerCase(), PANCAKE_UR]]);
+    for (const event of events) targets.set(event.args.target.toLowerCase(), event.args.target);
+    const checks: Check[] = [];
+    for (const target of targets.values()) {
+      const [kind, spender] = await client.readContract({ address: executor, abi: EXECUTOR_ABI,
+        functionName: 'venues', args: [target], blockNumber });
+      const pancake = sameAddress(target, PANCAKE_UR);
+      if (!pancake && kind === 0) continue;
+      const valid = pancake ? kind === 1 && sameAddress(spender, PANCAKE_UR)
+        : (kind === 2 || kind === 3) && !sameAddress(spender, zeroAddress);
+      checks.push({ name: `executor venue ${target}`, level: valid ? 'ok' : 'fail',
+        detail: `kind=${['NONE', 'PANCAKE_UR', 'ERC20_APPROVE', 'PERMIT2'][kind] ?? 'UNKNOWN'} spender=${spender}` });
+    }
+    return checks;
+  } catch {
+    return [{ name: 'executor venues', level: 'fail', detail: '無法完整讀取 venue 事件與白名單；確認 A11 executor 與 RPC' }];
+  }
 }
 
 export function checkSessionKeySeed(report: SessionKeyDerivationReport): Check {
@@ -470,6 +502,12 @@ async function main(): Promise<number> {
     try { maxBuyBps = await client.readContract({ address: executor, abi: EXECUTOR_BUY_ABI, functionName: 'maxBuyBps' }); } catch { /* unreadable fails */ }
     try { numeraire = await client.readContract({ address: executor, abi: EXECUTOR_BUY_ABI, functionName: 'numeraire' }); } catch { /* unreadable fails */ }
     checkBuyConfig(maxBuyBps, numeraire, args.strict).forEach(record);
+    const deploymentBlock = process.env.EXECUTOR_DEPLOYMENT_BLOCK?.trim();
+    if (deploymentBlock === undefined || !/^\d+$/.test(deploymentBlock)) {
+      fail('executor venues', '缺少合法的 EXECUTOR_DEPLOYMENT_BLOCK', '填 executor 部署 receipt 的 blockNumber，才能完整列出 venue 並避免從 genesis 掃描');
+    } else {
+      (await checkVenues(client, executor, BigInt(deploymentBlock))).forEach(record);
+    }
     try {
       const oracle = await client.readContract({
         address: executor,

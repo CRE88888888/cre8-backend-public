@@ -1,3 +1,4 @@
+import { EXECUTOR_ABI, EXECUTOR_SELECTOR, PLAN_HASH_ABI } from './chain.js';
 /**
  * 排程器迴圈（S3）：讓前幾刀做好的零件自己動起來。
  *
@@ -52,7 +53,7 @@
  *    **不寫 `operations`、不推進 `next_run_at`、不送交易**（①-bis 與②不變）。
  *
  * ④ **`operations` 是防重複的第二道鎖**：`idempotency_key = rebalance:{portfolioId}:{planHash}`，
- *    `planHash` 涵蓋 `tokenIn/tokenOut/amountIn/amountOutMin/deadline`。`confirmed` 永不再送、
+ *    `planHash` 涵蓋 `tokenIn/tokenOut/amountIn/amountOutMin/venue/data/deadline`。`confirmed` 永不再送、
  *    portfolio 只要有 `pending`/`submitted` 就先對帳、不送新 plan；舊版帶 hash 的 `failed` 亦同。
  *    明確未送出的 `failed`／已確認 `reverted` 才允許同一個 key 重試（attempts +1）。
  *    `expired` 只由雙 null 與原 deadline／nonce 證據安全釋放，不算在途、不能重試舊 key。
@@ -103,7 +104,7 @@ import { activeChain } from './chain-object.js';
 import { KERNEL_V3_3_ADDRESSES } from './addresses.js';
 import { detectAlerts, formatAlert, recordAlerts, resolveAlerts } from './alerts.js';
 import type { AlertFinding, AlertKind } from './alerts.js';
-import { a10ErrorMessage, EXECUTOR_PAUSE_ABI, EXECUTOR_BUY_ABI, readGlobalPaused } from './chain.js';
+import { a10ErrorMessage, EXECUTOR_BUY_ABI, readGlobalPaused } from './chain.js';
 import { getConfig, getSessionKeyConfig, requireSessionKeyConfig } from './config.js';
 import { errorMessage, query as dbQuery, withTransaction } from './db.js';
 import { buildSessionPermissions } from './permissions.js';
@@ -144,7 +145,7 @@ export const UNSUPPORTED_SCHEDULE_BACKOFF_SECONDS = 3_600;
 export const DEFAULT_DEADLINE_SECONDS = PLAN_DEFAULT_DEADLINE_SECONDS;
 
 /** CallPolicy 白名單裡唯一的 selector（= session key 唯一被允許呼叫的函式）。 */
-export const EXECUTE_REBALANCE_SELECTOR: Hex = '0x1b977850';
+export const EXECUTE_REBALANCE_SELECTOR = EXECUTOR_SELECTOR;
 
 /** EntryPoint v0.7：`toPermissionValidator` 只接受 0.7，其他版本會直接 throw。 */
 const ENTRY_POINT = { address: KERNEL_V3_3_ADDRESSES.entryPointV07, version: '0.7' } as const;
@@ -201,39 +202,6 @@ const ERC20_ABI = [
     stateMutability: 'view',
     inputs: [{ name: 'owner', type: 'address' }],
     outputs: [{ name: '', type: 'uint256' }],
-  },
-] as const;
-
-const EXECUTOR_ABI = [
-  ...EXECUTOR_PAUSE_ABI,
-  {
-    type: 'function',
-    name: 'oracle',
-    stateMutability: 'view',
-    inputs: [],
-    outputs: [{ name: '', type: 'address' }],
-  },
-  {
-    type: 'function',
-    name: 'executeRebalance',
-    stateMutability: 'nonpayable',
-    inputs: [
-      { name: 'account', type: 'address' },
-      {
-        name: 'steps',
-        type: 'tuple[]',
-        components: [
-          { name: 'tokenIn', type: 'address' },
-          { name: 'tokenOut', type: 'address' },
-          { name: 'amountIn', type: 'uint256' },
-          { name: 'amountOutMin', type: 'uint256' },
-          { name: 'commands', type: 'bytes' },
-          { name: 'inputs', type: 'bytes[]' },
-        ],
-      },
-      { name: 'deadline', type: 'uint256' },
-    ],
-    outputs: [],
   },
 ] as const;
 
@@ -357,20 +325,6 @@ const REGISTRY_ABI = [
   },
 ] as const;
 
-/** `planHash` 的編碼：只涵蓋會改變鏈上結果的四個數字 + deadline。 */
-const PLAN_HASH_ABI = [
-  {
-    type: 'tuple[]',
-    components: [
-      { name: 'tokenIn', type: 'address' },
-      { name: 'tokenOut', type: 'address' },
-      { name: 'amountIn', type: 'uint256' },
-      { name: 'amountOutMin', type: 'uint256' },
-    ],
-  },
-  { name: 'deadline', type: 'uint256' },
-] as const;
-
 // ---------------------------------------------------------------------------
 // 型別
 // ---------------------------------------------------------------------------
@@ -450,9 +404,10 @@ export type PlannedSummary = {
     tokenOut: Address;
     amountIn: string;
     amountOutMin: string;
+    venue: string;
   }[];
   deadline: string;
-  /** 涵蓋 steps 四個數字 + deadline 的 hash（hex）。 */
+  /** 涵蓋 完整 steps（含 venue/data）+ deadline 的 hash（hex）。 */
   planHash: Hex;
   /** `rebalance:{portfolioId}:{planHash}`：live 時 operations 的防重複鍵（dry-run 只印不寫）。 */
   idempotencyKey: string;
@@ -539,6 +494,7 @@ export type RebalancePlanningInput = { portfolioId: number; account: Address; pl
 
 /** 送出前重問地板的輸入。`executor` 是 chain 上 `oracle()` 的讀取點，`strategyId` 是 `effectiveFeeBps` 的 key。 */
 export type FloorRefreshInput = {
+  deadline: bigint;
   steps: readonly PlannedStep[];
   /** **鏈上** strategy id（`enrollment.strategyId`），不是 DB 的 `strategies.id`。 */
   strategyId: bigint;
@@ -661,7 +617,7 @@ export function parseSchedule(raw: unknown): ParsedSchedule {
 }
 
 /**
- * `planHash`：涵蓋 `tokenIn/tokenOut/amountIn/amountOutMin/deadline`。
+ * `planHash`：涵蓋 `tokenIn/tokenOut/amountIn/amountOutMin/venue/data/deadline`。
  *
  * 它同時是 operations 的 `payload_hash` 與 `idempotency_key` 的一部分，所以「同樣的參數」必須
  * 得到同一個 hash（keccak256 對 abi.encode 的結果，欄位順序由 `PLAN_HASH_ABI` 固定）。
@@ -674,6 +630,7 @@ export function planHashFor(steps: readonly PlannedStep[], deadline: bigint): He
         tokenOut: step.tokenOut,
         amountIn: step.amountIn,
         amountOutMin: step.amountOutMin,
+        venue: step.venue, data: step.data,
       })),
       deadline,
     ]),
@@ -1373,8 +1330,8 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
         tokenOut: step.tokenOut,
         amountIn: step.amountIn,
         amountOutMin: step.amountOutMin,
-        commands: step.commands,
-        inputs: step.inputs,
+        venue: step.venue,
+        data: step.data,
       })),
       args.deadline,
     ],
@@ -1598,7 +1555,7 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
      */
     refreshFloors:
       provided.refreshFloors ??
-      (async ({ steps, strategyId, executor }: FloorRefreshInput) => {
+      (async ({ steps, strategyId, executor, deadline }: FloorRefreshInput) => {
         try {
           const publicClient = defaultPublicClient();
           const [oracle, feeBpsRaw] = await Promise.all([
@@ -1610,7 +1567,7 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
               args: [strategyId],
             }),
           ]);
-          return await refreshFloors({ publicClient, oracle, steps, feeBps: Number(feeBpsRaw) });
+          return await refreshFloors({ publicClient, oracle, steps, feeBps: Number(feeBpsRaw), executor, deadline });
         } catch (error) {
           return {
             ok: false,
@@ -2092,6 +2049,7 @@ async function decideAndMaybeExecute(
   const executor = ctx.deps.executor ?? executorAddress();
   const refresh = await ctx.deps.refreshFloors({
     steps: rebalance.steps,
+    deadline: rebalance.deadline,
     strategyId: BigInt(plan.pinnedVersion.onchainStrategyId),
     executor,
   });
@@ -2106,6 +2064,7 @@ async function decideAndMaybeExecute(
     };
   }
   const steps = refresh.steps;
+  ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} venues: ${steps.map((step, index) => `${index}:${step.venue}`).join(', ')}`);
   ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} 送出前重問地板：${refresh.note}`);
 
   const planHash = planHashFor(steps, rebalance.deadline);
@@ -2116,6 +2075,7 @@ async function decideAndMaybeExecute(
       tokenOut: step.tokenOut,
       amountIn: step.amountIn.toString(),
       amountOutMin: step.amountOutMin.toString(),
+      venue: step.venue,
     })),
     deadline: rebalance.deadline.toString(),
     planHash,

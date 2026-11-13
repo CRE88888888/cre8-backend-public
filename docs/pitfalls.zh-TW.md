@@ -1628,3 +1628,49 @@ alto manual mode 接受真實 session UserOp 後，以「submitted 已 commit �
 4. `plugins.regular` **不影響**地址，只有 `initConfig` 影響 → §3.3
 
 **所以：涉及鏈上行為的結論，讀碼只能產生假設，必須實測才能定案。** 這不是要你不讀碼 —— 而是讀完之後要設計一個能在 5 分鐘內證偽的實驗。
+
+### A11 venue ABI：selector、payload、對帳與 preflight 要一起換
+
+新版 executor 的 selector 是 `0xc52fc5da`，SwapStep 最後兩欄為 `address venue, bytes data`。
+Pancake 的 commands/inputs 包在 data 裡；聚合器 data 不可當 V3 path 解碼。
+排程器送出 guard、CallPolicy、CLI 與對帳 decoder 都必須使用共用 ABI。
+planHash 必須包含 venue/data；否則換 venue 或 calldata 仍會命中同一 idempotency key。
+舊 CallPolicy 需要使用者重新授權，新 selector 無法沿用舊權限。
+
+preflight 不可從 genesis 查 VenueSet：本機 fork 會把 fork 以前的區間轉給上游，可能遭 429 或範圍限制。
+使用部署 receipt 的 `EXECUTOR_DEPLOYMENT_BLOCK`，讀事件後逐個查當前 venues；讀取失敗不得當成空白名單。
+
+
+### A11 fork：先預熱同一筆 calldata，再交給 alto 估 gas
+
+#47 的 DOGE 1,000 USDT 路徑會讀許多池子。冷 fork 上，alto 的外層 `handleOps`
+`eth_estimateGas` 曾超過 RPC 預設逾時，最後拒絕 UserOp 為 `INTERNAL FAILURE`；
+單獨填高 UserOp 的 callGasLimit 不會消除這次外層估算。
+
+依 C3 指定順序，先對**刷新後的同一筆** executor calldata 做
+`eth_call({ from: Kernel帳戶, to: executor, data })`，讓 anvil 快取路徑狀態。
+#47 已以這一步讓 Kyber 成交；繼續驗收時，scheduler 又在冷 Multicall3 的持倉讀取逾時。
+因此也預熱同批 balanceOf／decimals，並依 C3 第二步將 fork client／anvil 上游／alto 的
+RPC 逾時放寬到 120 秒。alto 保持 safe-mode 與正常估算，UserOp 用估算值乘既有
+1.5 倍餘裕，沒有採固定 gas；產品 RPC／gas 預設不變。
+只有預熱仍失敗才依序放寬本機 fork／alto 逾時，最後才考慮 fork 測試專用固定上限；
+不要把這些測試環境措施放進產品預設。
+
+每次驗收從乾淨 fork 開始；主網 API 的即時報價與 fork 池子可能不同，
+深池不保證 Pancake 一定勝出。#47 曾測得 WBNB/USDT 雙向都是 Kyber 較好，
+不能把測試改成強迫 Pancake。Pancake 候選池也先預熱，再開始產品的 5 秒比價預算，
+避免測到冷快取逾時而誤以為直接池報價較差。應使用真實競爭報價找到 Pancake 勝出的方向，
+保留 venue 斷言，並用真實 UserOp、SwapExecuted、receipt 與地板證明成交。
+#47 曾實測 ETH 賣出由 Pancake 勝出並成交，但後續即時報價又變成 Kyber 較好。
+固定 fork 驗收另以 Safe 真正移除 Kyber、檢查 kind=NONE，讓規劃器自然退回 Pancake並成交；
+之後恢復 Kyber 才跑 scheduler。這驗證白名單移除的退路；不得宣稱每次市場比價都是 Pancake 較好。
+
+完整 suite 的 pricing crosscheck 需要 `EXECUTOR_ADDRESS` 指向這次部署的 executor，
+router 也要註冊 WBNB/USDT（fee 500、TWAP 1800 秒）的 oracle。
+只設本機 RPC 而沒有 executor 時，舊測試會對零地址解碼出 `0x`；這是驗收環境缺漏，
+應補齊部署與 env，不能以 skip 或改斷言掩蓋。
+
+
+測試 client 關閉 RPC 重試後，部署交易首次查 receipt 可能早於 interval mining，
+anvil 會把未知 hash 轉給上游，PublicNode 回 archive 403。mixed mining 仍可能有這個查詢競態；
+fork fixture 的 `landed()` 應先 `evm_mine`，再確認真正 receipt.status，不能把 403 當成功。

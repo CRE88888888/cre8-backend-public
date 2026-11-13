@@ -657,7 +657,7 @@ test('enrollPortfolio writes exactly one session_keys row: active, path-shaped k
   assert.equal(snapshot.sessionKeyAddress, EXPECTED_SESSION_KEY.address, 'the row names the key it was built for');
   assert.equal(snapshot.permissionId, FAKE_PERMISSION_ID);
   assert.equal(snapshot.call.permissions.length, 1, 'call layer: one target + selector');
-  assert.equal(snapshot.call.permissions[0]?.selector, '0x1b977850');
+  assert.equal(snapshot.call.permissions[0]?.selector, '0xc52fc5da');
   assert.equal(BigInt(snapshot.gas.allowed), 10n ** 18n, 'gas layer: the one-shot 1e18 wei budget');
   assert.equal(snapshot.timestamp.validAfter, 0);
 

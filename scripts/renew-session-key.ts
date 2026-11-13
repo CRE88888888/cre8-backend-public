@@ -1,3 +1,4 @@
+import { EXECUTOR_ABI as REBALANCE_ABI, EXECUTOR_SELECTOR as EXECUTE_REBALANCE_SELECTOR } from '../src/chain.js';
 // Renew (re-issue) a deployed Kernel v3.3 account's session-key permission, with the UserOp signed
 // by the account's **sudo owner** (the user's own EOA) instead of by a session key.
 //
@@ -61,28 +62,7 @@ const RPC_URL = process.env.RPC_URL ?? 'http://127.0.0.1:8546';
 const BUNDLER_URL = process.env.BUNDLER_URL ?? 'http://127.0.0.1:3001';
 const CHAIN_ID = Number(process.env.CHAIN_ID ?? 56);
 
-/** AtpExecutor.executeRebalance(address,(...)[],uint256) —— CallPolicy 白名單裡唯一的 selector。 */
-const EXECUTE_REBALANCE_SELECTOR: Hex = '0x1b977850';
-const REBALANCE_ABI = [
-  {
-    type: 'function',
-    name: 'executeRebalance',
-    stateMutability: 'nonpayable',
-    inputs: [
-      { name: 'account', type: 'address' },
-      { name: 'steps', type: 'tuple[]', components: [
-        { name: 'tokenIn', type: 'address' },
-        { name: 'tokenOut', type: 'address' },
-        { name: 'amountIn', type: 'uint256' },
-        { name: 'minAmountOut', type: 'uint256' },
-        { name: 'routerData', type: 'bytes' },
-        { name: 'extraData', type: 'bytes[]' },
-      ] },
-      { name: 'deadline', type: 'uint256' },
-    ],
-    outputs: [],
-  },
-] as const;
+
 
 type Args = {
   strategyId: bigint;

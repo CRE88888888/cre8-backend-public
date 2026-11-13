@@ -264,7 +264,7 @@ UserOp 的唯一真優勢是 initCode 部署＋執行可原子化，代價是要
 | 拍板 | 使用者（依工程建議） |
 
 **理由**：這三層各自封住一個風險維度：
-- **Call** → 只能呼叫 `AtpExecutor.executeRebalance`（selector `0x1b977850`），這是「合約側唯一搬錢點」不變式在執行層的對應
+- **Call** → 只能呼叫 `AtpExecutor.executeRebalance`（A11 selector `0xc52fc5da`；舊 ABI 為 `0x1b977850`，既有 CallPolicy 需重新授權），這是「合約側唯一搬錢點」不變式在執行層的對應
 - **Gas** → 封住「鑰匙洩漏後帳戶餘額被吸光」—— gas 是**從使用者帳戶扣的**（Spike 實測：帳戶要先注資才發得出 op）
 - **Timestamp** → 讓鑰匙自動失效，不需主動撤銷
 

@@ -7,6 +7,7 @@ import {
   http,
   keccak256,
   toHex,
+  toFunctionSelector,
   zeroAddress,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
@@ -109,6 +110,32 @@ export const REGISTRY_ABI = [
 export const EXECUTOR_PAUSE_ABI = [
   { type: 'function', name: 'globalPaused', stateMutability: 'view', inputs: [], outputs: [{ type: 'bool' }] },
   { type: 'error', name: 'ExecutorPaused', inputs: [] },
+] as const;
+
+export const PANCAKE_UR = getAddress('0x1a0a18ac4becddbd6389559687d1a73d8927e416');
+export const PANCAKE_DATA_ABI = [{ type: 'bytes' }, { type: 'bytes[]' }] as const;
+export const SWAP_STEP_COMPONENTS = [
+  { name: 'tokenIn', type: 'address' }, { name: 'tokenOut', type: 'address' },
+  { name: 'amountIn', type: 'uint256' }, { name: 'amountOutMin', type: 'uint256' },
+  { name: 'venue', type: 'address' }, { name: 'data', type: 'bytes' },
+] as const;
+export const EXECUTOR_ABI = [
+  ...EXECUTOR_PAUSE_ABI,
+  { type: 'function', name: 'oracle', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] },
+  { type: 'function', name: 'executeRebalance', stateMutability: 'nonpayable', inputs: [
+    { name: 'account', type: 'address' }, { name: 'steps', type: 'tuple[]', components: SWAP_STEP_COMPONENTS },
+    { name: 'deadline', type: 'uint256' },
+  ], outputs: [] },
+  { type: 'function', name: 'venues', stateMutability: 'view', inputs: [{ name: 'target', type: 'address' }],
+    outputs: [{ name: 'kind', type: 'uint8' }, { name: 'spender', type: 'address' }] },
+  { type: 'event', name: 'VenueSet', inputs: [
+    { name: 'target', type: 'address', indexed: true }, { name: 'kind', type: 'uint8', indexed: false },
+    { name: 'spender', type: 'address', indexed: false },
+  ] },
+] as const;
+export const EXECUTOR_SELECTOR = toFunctionSelector(EXECUTOR_ABI[3]);
+export const PLAN_HASH_ABI = [
+  { name: 'steps', type: 'tuple[]', components: SWAP_STEP_COMPONENTS }, { name: 'deadline', type: 'uint256' },
 ] as const;
 
 /** A10 executor buy accounting; values are in numeraire minimal units. */

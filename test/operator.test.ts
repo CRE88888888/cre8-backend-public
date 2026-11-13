@@ -19,7 +19,10 @@ import {
   runOperatorRebalance,
   singlePortfolioClaim,
   listPortfolioActivity,
+  buildRedeemPlan,
 } from '../src/operator.js';
+import { sellFixture } from './fixtures/max-leg.js';
+import { computeDrift } from '../src/drift.js';
 import { listPriceableAssets } from '../src/assets.js';
 import type { OperatorRebalanceResult, PortfolioStatus } from '../src/operator.js';
 import { NUMERAIRE_PRICE_SOURCE, TWAP_PRICE_SOURCE } from '../src/positions.js';
@@ -427,6 +430,126 @@ test('縮減後的認領只綁一個 portfolio id，而且只有認領查詢多�
   assert.deepEqual(seen[0]?.params, [new Date(0), 56, 20, PORTFOLIO_ID]);
   assert.match(seen[0]?.text ?? '', /p\.id = \$4/);
   assert.deepEqual(seen[1]?.params, [PORTFOLIO_ID], '非認領查詢不能多一個參數');
+});
+
+test('#42 close 的單投組認領允許 DB paused，其他狀態與鎖仍保留', () => {
+  const sql = narrowClaimToPortfolio(CLAIM_SQL, PORTFOLIO_ID, true);
+  assert.match(sql, /p\.schedule_state in \('active', 'paused'\)/);
+  assert.match(sql, /p\.id = \$4/);
+  assert.match(sql, /for update of p skip locked/);
+  assert.throws(() => narrowClaimToPortfolio(CLAIM_SQL.replace('schedule_state', 'state'), PORTFOLIO_ID, true), /換了形狀/);
+});
+
+test('#40 redeem 路由接受 E8 續作字串、忽略 usd，拒絕錯誤格式', async () => {
+  const received: unknown[] = [];
+  await withServer(async (base) => {
+    const token = await loginToken(base);
+    const route = `/portfolios/${PORTFOLIO_ID}/redeem`;
+    const good = await postJson(base, route, { sellUsdE8: '5000000000', usd: 'ignored' }, token);
+    assert.equal(good.status, 200);
+    assert.deepEqual(received, [{ sellUsdE8: 5000000000n }]);
+    for (const body of [{}, { sellUsdE8: 1 }, { sellUsdE8: '-1' }, { sellUsdE8: '1.0' }, { sellUsdE8: '' }, { sellUsdE8: null }, { sellUsdE8: '0' }, { usd: 1e-12 }, { usd: 1e308 }]) {
+      assert.equal((await postJson(base, route, body, token)).status, 400, JSON.stringify(body));
+    }
+    assert.equal(received.length, 1);
+  }, { operatorRedeem: async (_id, _wallet, amount) => { received.push(amount); return { remainingUsdE8: '0', batched: false }; } });
+});
+
+test('#40 1800 USDT + 200 DOGE：首批賣 150，remaining 50 續作恰好賣完', async () => {
+  const f = sellFixture();
+  const first = await buildRedeemPlan({ portfolioId: PORTFOLIO_ID, account: ACCOUNT, plan: f.plan(samplePlan()) }, 2000n * 100000000n, f.deps);
+  assert.ok(first.plan.kind === 'ready');
+  assert.equal(first.plan.steps[0]?.amountIn, 150n * 10n ** 8n);
+  assert.equal(first.requestedSellUsdE8, 200n * 100000000n);
+  assert.equal(first.plannedSellUsdE8, 150n * 100000000n);
+  const remaining = first.requestedSellUsdE8 - first.plannedSellUsdE8;
+  const next = await buildRedeemPlan({ portfolioId: PORTFOLIO_ID, account: ACCOUNT, plan: f.plan(samplePlan(), 50n, 1950n) }, { sellUsdE8: remaining }, f.deps);
+  assert.ok(next.plan.kind === 'ready');
+  assert.equal(next.plan.steps[0]?.amountIn, 50n * 10n ** 8n);
+  assert.equal(next.requestedSellUsdE8, next.plannedSellUsdE8);
+  assert.ok(f.state.reads.every((read) => read.block === '0x7e'), 'oracle / fee / pool 全部使用持倉區塊');
+  const legacy = await buildRedeemPlan({ portfolioId: PORTFOLIO_ID, account: ACCOUNT, plan: f.plan(samplePlan()) }, 100n * 100000000n, f.deps);
+  assert.ok(legacy.plan.kind === 'ready');
+  assert.equal(legacy.plan.steps[0]?.amountIn, 10n * 10n ** 8n, 'usd 的既有比例語意不變');
+});
+
+for (const failure of ['DB', 'oracle', 'previewSwap', 'effectiveFeeBps', 'pool', 'fee', 'getBlock']) {
+  test(`#40 redeem ${failure} failure/timeout blocks without leaking upstream data`, async () => {
+    const f = sellFixture(); f.state.fail = failure;
+    const result = await buildRedeemPlan({ portfolioId: PORTFOLIO_ID, account: ACCOUNT, plan: f.plan(samplePlan()) }, { sellUsdE8: 20000000000n }, f.deps);
+    assert.ok(result.plan.kind === 'blocked');
+    assert.equal(result.plannedSellUsdE8, 0n);
+    assert.ok(!JSON.stringify(result, (_key, value: unknown) => typeof value === 'bigint' ? value.toString() : value).includes('secret-token'));
+  });
+}
+
+test('#40 redeem 0/NULL/exact cap and no-floor preserve a truthful remaining amount', async () => {
+  const f = sellFixture();
+  for (const limit of ['0', null, '200']) {
+    f.state.limit = limit;
+    const result = await buildRedeemPlan({ portfolioId: PORTFOLIO_ID, account: ACCOUNT, plan: f.plan(samplePlan()) }, { sellUsdE8: 20000000000n }, f.deps);
+    if (limit === '0') { assert.ok(result.plan.kind === 'blocked'); assert.equal(result.plannedSellUsdE8, 0n); }
+    else { assert.ok(result.plan.kind === 'ready'); assert.equal(result.plannedSellUsdE8, 20000000000n); }
+  }
+  f.state.noFloor = true;
+  const blocked = await buildRedeemPlan({ portfolioId: PORTFOLIO_ID, account: ACCOUNT, plan: f.plan(samplePlan()) }, { sellUsdE8: 20000000000n }, f.deps);
+  assert.ok(blocked.plan.kind === 'blocked');
+  assert.equal(blocked.requestedSellUsdE8, 20000000000n);
+  assert.equal(blocked.plannedSellUsdE8, 0n);
+});
+
+test('#42 owner close routes a completed exit to HTTP 200 noop; authentication still precedes it', async () => {
+  let calls = 0;
+  await withServer(async (base) => {
+    const route = `/portfolios/${PORTFOLIO_ID}/close`;
+    assert.equal((await postJson(base, route, {})).status, 401);
+    assert.equal(calls, 0);
+    const token = await loginToken(base);
+    const response = await postJson(base, route, {}, token);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { outcome: 'noop', reason: 'nothing to sell', remainingUsdE8: '0', batched: false });
+  }, { operatorClose: async () => { calls += 1; return { outcome: 'noop', reason: 'nothing to sell', remainingUsdE8: '0', batched: false }; } });
+});
+
+test('#40 continuation with no remaining holdings is blocked, never falsely complete', async () => {
+  const f = sellFixture();
+  const result = await buildRedeemPlan({ portfolioId: PORTFOLIO_ID, account: ACCOUNT, plan: f.plan(samplePlan(), 0n) }, { sellUsdE8: 1n }, f.deps);
+  assert.ok(result.plan.kind === 'blocked');
+  assert.equal(result.requestedSellUsdE8, 1n);
+  assert.equal(result.plannedSellUsdE8, 0n);
+});
+
+test('#40 E8 ceiling of available value never makes continuation sell more tokens than held', async () => {
+  const f = sellFixture(); f.state.limit = null; f.state.quoteOffset = 1n;
+  const result = await buildRedeemPlan({ portfolioId: PORTFOLIO_ID, account: ACCOUNT, plan: f.plan(samplePlan(), 1n) }, { sellUsdE8: 100000001n }, f.deps);
+  assert.ok(result.plan.kind === 'ready');
+  assert.equal(result.plan.steps[0]?.amountIn, 10n ** 8n);
+  assert.equal(result.plannedSellUsdE8, 100000001n);
+});
+
+test('#40 continuation reallocates across current non-cash holdings and its aggregate never exceeds the request', async () => {
+  const f = sellFixture();
+  f.state.extraLimits = [{ address: WBNB, max_leg_usdt: '200' }];
+  const plan = f.plan(samplePlan(), 50n, 1350n);
+  plan.snapshot.holdings.push({ asset: WBNB, amountWei: 600n * 10n ** 18n, decimals: 18, usdPriceE8: 100000000n, priceSource: TWAP_PRICE_SOURCE });
+  plan.targets.push({ asset: WBNB, weightBps: 3000, symbol: 'WBNB' });
+  plan.targets[1] = { asset: USDT, weightBps: 6000, symbol: 'USDT' };
+  plan.report = computeDrift(plan.snapshot.holdings, plan.targets, 100);
+  const result = await buildRedeemPlan({ portfolioId: PORTFOLIO_ID, account: ACCOUNT, plan }, { sellUsdE8: 5000000000n }, f.deps);
+  assert.ok(result.plan.kind === 'ready');
+  assert.equal(result.plan.steps.length, 2);
+  assert.equal(result.plan.steps[0]?.amountIn, 384615384n);
+  assert.equal(result.plan.steps[1]?.amountIn, 46153846153846153846n);
+  assert.ok(result.plannedSellUsdE8 <= 5000000000n);
+  assert.equal(new Set(result.plan.steps.map((step) => step.tokenIn.toLowerCase())).size, 2);
+});
+
+test('#40 a price change on continuation uses current oracle nominal rather than stale holding price', async () => {
+  const f = sellFixture(); f.state.price = 2n;
+  const result = await buildRedeemPlan({ portfolioId: PORTFOLIO_ID, account: ACCOUNT, plan: f.plan(samplePlan(), 50n) }, { sellUsdE8: 5000000000n }, f.deps);
+  assert.ok(result.plan.kind === 'ready');
+  assert.equal(result.plan.steps[0]?.amountIn, 25n * 10n ** 8n);
+  assert.equal(result.plannedSellUsdE8, 5000000000n);
 });
 
 // ---------------------------------------------------------------------------

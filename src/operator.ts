@@ -22,10 +22,10 @@ import type { GasStatus } from './funding.js';
 import { getAccountGasBalance, getGasPriceWei, pauseSources, REGISTRY_ABI } from './chain.js';
 import type { PauseSource } from './chain.js';
 import { getGasConfig } from './config.js';
-import { countSwapExecuted, runSchedulerOnce } from './scheduler.js';
+import { countSwapExecuted, PARTIAL_FOLLOW_UP_SECONDS, runSchedulerOnce } from './scheduler.js';
 import type { ExecutionOutcome, PortfolioRunResult, WithTransactionFn } from './scheduler.js';
 import { planPortfolio } from './snapshot.js';
-import { buildStep, minGrossFor } from './rebalance-plan.js';
+import { buildStep, capAssetLeg, DEFAULT_DEADLINE_SECONDS, minGrossFor, nominalSellQuote, numeraireDecimals, readMaxLegUsdE8 } from './rebalance-plan.js';
 import type { PlannedStep, RebalancePlan } from './rebalance-plan.js';
 import type { RebalancePlanningInput } from './scheduler.js';
 import type { PortfolioPlan, QueryFn } from './snapshot.js';
@@ -669,6 +669,7 @@ export type OperatorPlanPreview = {
 };
 
 export type RebalanceDeps = {
+  query?: QueryFn;
   requireOwnedPortfolio?: typeof requireOwnedPortfolio;
   runSchedulerOnce?: typeof runSchedulerOnce;
   /** 排程器認領用的 transaction runner（測試注入記憶體 stub）。 */
@@ -676,6 +677,7 @@ export type RebalanceDeps = {
   publicClient?: PublicClient;
   /** 讀 `SwapExecuted` 時要認的 emitter；省略 = `EXECUTOR_ADDRESS`。 */
   executor?: Address | null;
+  registry?: Address;
   log?: (line: string) => void;
 };
 
@@ -690,7 +692,7 @@ const DUE_PREDICATE = 'and (p.next_run_at is null or p.next_run_at <= $1)';
  * 為什麼要改寫：`runSchedulerOnce` 只認領**到期**的（`schedule_state = 'active'` 且
  * `next_run_at <= now`）。操作員按鈕的語意是「現在就跑」，與排程時鐘無關，所以：
  *   * **拿掉** `next_run_at` 的到期條件 —— 不然按了也可能什麼都不做（該投組明天才到期）。
- *   * **留著** `schedule_state = 'active'` —— 暫停的投組不該被手動觸發。
+ *   * 一般操作留著 `schedule_state = 'active'`；只有 close 允許 DB paused 繼續退出。
  *   * 加上 `p.id = $4`（portfolio id 當第四個參數）—— 這是「只動這一個」的唯一保證。
  *
  * 為什麼是改寫 SQL 而不是自己重寫一次決策流程：排程器的 live 路徑（前置檢查 a/a2/b/c → operations
@@ -700,7 +702,7 @@ const DUE_PREDICATE = 'and (p.next_run_at is null or p.next_run_at <= $1)';
  * 認不出這段 SQL（上游改了形狀）→ **拋錯中止**。最壞的失敗是「安靜地認領了全部到期的投組」，
  * 那會一次動到所有人的錢，所以寧可整輪什麼都不做。
  */
-export function narrowClaimToPortfolio(text: string, portfolioId: number): string {
+export function narrowClaimToPortfolio(text: string, portfolioId: number, allowPaused = false): string {
   if (!text.includes(CLAIM_LOCK_MARKER)) return text;
   if (!text.includes(ACTIVE_PREDICATE) || !text.includes(DUE_PREDICATE)) {
     throw new Error(
@@ -711,7 +713,8 @@ export function narrowClaimToPortfolio(text: string, portfolioId: number): strin
   // `$1`（now）在縮減後已經沒有語意，但**不能讓它變成孤兒參數**：pg 的 extended protocol 要從 SQL
   // 推斷每個 $n 的型別，陣列裡有、SQL 裡沒有的參數會直接 `could not determine data type of parameter $1`。
   // `$1::timestamptz is not null` 恆為真（呼叫端一定傳 Date），效果就是「忽略到期時間」。
-  return text.replace(DUE_PREDICATE, 'and ($1::timestamptz is not null) and p.id = $4');
+  const narrowed = text.replace(DUE_PREDICATE, 'and ($1::timestamptz is not null) and p.id = $4');
+  return allowPaused ? narrowed.replace(ACTIVE_PREDICATE, "where p.schedule_state in ('active', 'paused')") : narrowed;
 }
 
 const defaultTransaction: WithTransactionFn = (fn) =>
@@ -726,14 +729,16 @@ const defaultTransaction: WithTransactionFn = (fn) =>
 export function singlePortfolioClaim(
   portfolioId: number,
   inner?: WithTransactionFn,
+  options: { allowPaused?: boolean; preserveNextRunAt?: boolean } = {},
 ): WithTransactionFn {
   const run = inner ?? defaultTransaction;
   return (fn) =>
     run((client) =>
       fn({
         query: (text, params) => {
-          const narrowed = narrowClaimToPortfolio(text, portfolioId);
-          return client.query(narrowed, narrowed === text ? params : [...(params ?? []), portfolioId]);
+          const narrowed = narrowClaimToPortfolio(text, portfolioId, options.allowPaused);
+          const sql = options.preserveNextRunAt ? narrowed.replace('set next_run_at = claimed.next_run_at', 'set next_run_at = greatest(p.next_run_at, claimed.next_run_at)') : narrowed;
+          return client.query(sql, narrowed === text ? params : [...(params ?? []), portfolioId]);
         },
       }),
     );
@@ -1212,83 +1217,79 @@ export async function readOperatorOverview(deps: OperatorOverviewDeps = {}): Pro
 // Redeem：把部位賣成 numeraire（提領成 USDT 的前半段）
 // ---------------------------------------------------------------------------
 
-/**
- * 為什麼需要「先賣再提」而不是直接提領資產。
- *
- * 使用者要的是「存 USDT、提 USDT」。但錢在部位裡（TSLAB/SPCXB/…），要變成 USDT 只能在鏈上賣掉。
- * 賣這一步是 executor 的工作、由 **session key** 簽（owner 的 CallPolicy 不允許，反過來也一樣），
- * 所以它是「一輪再平衡」而不是「一筆轉帳」。
- *
- * 關鍵是**按比例賣**：每一檔非 numeraire 的部位都賣掉 `A / T` 的比例（A=要提領的美元、T=總價值）。
- * 這樣賣完之後每個資產的**權重不變**，因此：
- *   * 合規上仍然貼著 mandate（不會變成 100% 現金）
- *   * 排程器不會立刻把它買回來（漂移沒有變大）
- *   * 使用者拿到的是「按比例縮小後的基金 + 一筆 USDT」
- *
- * 走的是排程器同一條路（`runSchedulerOnce` 只認領這一個 portfolio），只是把
- * `planRebalance` 換成「按比例賣出」—— 送出、地板重問、operations 記錄、快照全部沿用，
- * 不另寫一份執行路徑（兩份實作一定會分岔）。
- */
+/** 首批 bigint 保留 usd 比例語意；續作只表示待賣的非現金名義額（E8）。 */
+export type RedeemAmount = bigint | { sellUsdE8: bigint };
+type SellRequest = RedeemAmount | { close: true };
+
 export type RedeemResult = {
   portfolioId: number;
   outcome: OperatorRebalanceOutcome;
   reason: string;
   txHash: string | null;
-  /** 賣出的步驟（每一檔一筆）。 */
   steps: { tokenIn: string; tokenOut: string; amountIn: string; amountOutMin: string }[];
-  /** 這一輪賣出的估算美元（= 使用者要提領的金額）。 */
+  /** 保留既有欄位：首批仍為請求的 usd，close 為投組總值；續作為請求的 sellUsdE8。 */
   redeemedUsdE8: string;
+  /** 非現金待賣名義額，可直接帶回 sellUsdE8；規劃前被擋住的首批為 null（未知），不是 0。 */
+  remainingUsdE8: string | null;
+  batched: boolean;
 };
 
-export async function runOperatorRedeem(
-  portfolioId: number,
-  wallet: string,
-  usdE8: bigint,
-  deps: RebalanceDeps = {},
-): Promise<RedeemResult> {
-  if (usdE8 <= 0n) throw new AppError(400, 'INVALID_AMOUNT', 'redeem amount must be greater than zero');
-  const find = deps.requireOwnedPortfolio ?? requireOwnedPortfolio;
-  await find(portfolioId, wallet);
+export async function runOperatorRedeem(portfolioId: number, wallet: string, amount: RedeemAmount, deps: RebalanceDeps = {}): Promise<RedeemResult> {
+  const value = typeof amount === 'bigint' ? amount : amount.sellUsdE8;
+  if (value <= 0n) throw new AppError(400, 'INVALID_AMOUNT', 'redeem amount must be greater than zero');
+  return runOperatorSell(portfolioId, wallet, amount, deps);
+}
 
-  const run = deps.runSchedulerOnce ?? runSchedulerOnce;
-  const round = await run(
+async function runOperatorSell(portfolioId: number, wallet: string, request: SellRequest, deps: RebalanceDeps): Promise<RedeemResult> {
+  await (deps.requireOwnedPortfolio ?? requireOwnedPortfolio)(portfolioId, wallet);
+  const closing = typeof request === 'object' && 'close' in request;
+  const planning: { result: RedeemPlanningResult | null } = { result: null };
+  const round = await (deps.runSchedulerOnce ?? runSchedulerOnce)(
     { dryRun: false, limit: 1 },
     {
-      withTransaction: singlePortfolioClaim(portfolioId, deps.withTransaction),
-      planRebalance: (input) => buildRedeemPlan(input, usdE8),
-      // 按比例賣不會讓漂移變大，所以「不需要再平衡」不代表「不用做」——不 force 就永遠 noop。
+      withTransaction: singlePortfolioClaim(portfolioId, deps.withTransaction, { allowPaused: closing, preserveNextRunAt: true }),
+      ...(deps.query === undefined ? {} : { query: deps.query }),
+      planRebalance: async (input) => {
+        const built = await buildRedeemPlan(input, request, deps);
+        planning.result = built;
+        return built.plan;
+      },
       forcePlan: true,
       ...(deps.log === undefined ? {} : { log: deps.log }),
     },
   );
-
-  const result = round.results[0];
-  if (result === undefined || result.portfolioId !== portfolioId) {
-    return {
-      portfolioId,
-      outcome: 'blocked',
-      reason: `排程器沒有認領 portfolio ${portfolioId}（schedule_state 不是 active，或鏈上沒有它的 smart account）`,
-      txHash: null,
-      steps: [],
-      redeemedUsdE8: usdE8.toString(),
-    };
+  const candidate = round.results[0];
+  const result = candidate?.portfolioId === portfolioId ? candidate : undefined;
+  const details = planning.result;
+  const requested = typeof request === 'bigint' ? request : 'sellUsdE8' in request ? request.sellUsdE8 : details?.portfolioTotalUsdE8 ?? 0n;
+  const outcome = result === undefined || result.portfolioId !== portfolioId ? 'blocked' : operatorOutcome(result);
+  const wanted = details?.requestedSellUsdE8 ?? (typeof request === 'object' && 'sellUsdE8' in request ? request.sellUsdE8 : null);
+  const remaining = wanted === null ? null : wanted - (outcome === 'executed' ? details?.plannedSellUsdE8 ?? 0n : 0n);
+  let reason = result?.reason ?? `排程器沒有認領 portfolio ${portfolioId}（排程狀態或 smart account 不允許）`;
+  const nothingToSell = details?.plan.kind === 'noop' && details.plan.reason === 'nothing to sell';
+  if (nothingToSell) reason = 'nothing to sell';
+  const query = deps.query ?? dbQuery;
+  if (outcome === 'executed' || (outcome === 'noop' && nothingToSell && closing)) {
+    try {
+      if (closing) {
+        await query("update portfolios set schedule_state = 'paused' where id = $1", [portfolioId]);
+        await query('update scheduler_alerts set resolved_at = now() where portfolio_id = $1 and resolved_at is null', [portfolioId]);
+      } else {
+        await query("update portfolios set next_run_at = greatest(next_run_at, now() + $2::int * interval '1 second') where id = $1", [portfolioId, PARTIAL_FOLLOW_UP_SECONDS]);
+      }
+    } catch {
+      // A successful transaction must stay visible even if the subsequent scheduling write fails.
+      reason += closing ? '；清倉結果已確認，但 DB 暫停／警示更新失敗，請檢查排程狀態' : '；賣出已確認，但 DB 延後排程失敗，請暫停排程後再續作';
+    }
   }
-
   return {
-    portfolioId,
-    outcome: operatorOutcome(result),
-    reason: result.reason,
-    txHash: result.execution?.txHash ?? null,
-    steps: (result.plan?.steps ?? []).map((step) => ({
-      tokenIn: step.tokenIn,
-      tokenOut: step.tokenOut,
-      amountIn: step.amountIn,
-      amountOutMin: step.amountOutMin,
-    })),
-    redeemedUsdE8: usdE8.toString(),
+    portfolioId, outcome, reason,
+    txHash: result?.execution?.txHash ?? null,
+    steps: (result?.plan?.steps ?? []).map((step) => ({ tokenIn: step.tokenIn, tokenOut: step.tokenOut, amountIn: step.amountIn, amountOutMin: step.amountOutMin })),
+    redeemedUsdE8: requested.toString(), remainingUsdE8: remaining?.toString() ?? null,
+    batched: details !== null && details.requestedSellUsdE8 !== null && details.plannedSellUsdE8 < details.requestedSellUsdE8,
   };
 }
-
 
 const ORACLE_ABI = [
   {
@@ -1313,209 +1314,128 @@ const POOL_FEE_ABI = [
  * 的值，前者是**鏈上實際生效**的值（中間可能有下限或治理調整）。用錯的那個會讓 `minGross` 偏低，
  * 合約以 `BelowFloor` revert，而錯誤訊息完全看不出是這個原因。
  */
-async function readExecutorFeeBps(strategyOnchainId: bigint): Promise<number> {
-  const registry = getConfig().registryAddress;
+async function readExecutorFeeBps(client: PublicClient, strategyOnchainId: bigint, blockNumber: bigint, provided?: Address): Promise<number> {
+  const registry = provided ?? getConfig().registryAddress;
   if (registry === null) throw new Error('沒有設定 REGISTRY_ADDRESS，讀不到 effectiveFeeBps');
-  const value = await defaultPublicClient().readContract({
+  const value = await client.readContract({
     address: registry as Address,
-    abi: [{ type: 'function', name: 'effectiveFeeBps', stateMutability: 'view', inputs: [{ name: '', type: 'uint256' }], outputs: [{ type: 'uint16' }] }] as const,
-    functionName: 'effectiveFeeBps',
-    args: [strategyOnchainId],
+    abi: [{ type: 'function', name: 'effectiveFeeBps', stateMutability: 'view', inputs: [{ type: 'uint256' }], outputs: [{ type: 'uint16' }] }],
+    functionName: 'effectiveFeeBps', args: [strategyOnchainId], blockNumber,
   });
   return Number(value);
 }
 
-/** path 的 fee 層：從該資產的 per-pair oracle 反查它綁的池子。 */
-async function readPoolFee(router: Address, asset: Address): Promise<number> {
-  const client = defaultPublicClient();
-  const pairOracle = (await client.readContract({
-    address: router,
-    abi: ORACLE_ABI,
-    functionName: 'oracleOf',
-    args: [asset],
-  })) as Address;
-  const pool = (await client.readContract({ address: pairOracle, abi: POOL_FEE_ABI, functionName: 'pool' })) as Address;
-  const fee = (await client.readContract({ address: pool, abi: POOL_FEE_ABI, functionName: 'fee' })) as number;
-  return Number(fee);
+async function readPoolFee(client: PublicClient, router: Address, asset: Address, blockNumber: bigint): Promise<number> {
+  const pairOracle = await client.readContract({ address: router, abi: ORACLE_ABI, functionName: 'oracleOf', args: [asset], blockNumber });
+  const pool = await client.readContract({ address: pairOracle, abi: POOL_FEE_ABI, functionName: 'pool', blockNumber });
+  return Number(await client.readContract({ address: pool, abi: POOL_FEE_ABI, functionName: 'fee', blockNumber }));
 }
 
-async function readStrategyOnchainId(portfolioId: number): Promise<bigint> {
-  const { rows } = await dbQuery<{ onchain_id: string | number }>(
-    `select s.onchain_id from portfolios p join strategies s on s.id = p.strategy_id where p.id = $1`,
-    [portfolioId],
-  );
-  const value = rows[0]?.onchain_id;
-  if (value === undefined || value === null) throw new Error(`portfolio ${portfolioId} 的 strategy 沒有 onchain_id`);
-  return BigInt(value);
-}
-
-/** `priceable_assets.is_numeraire` 的那一個地址（會計資產）。 */
-async function readNumeraireAddress(): Promise<Address> {
-  const { rows } = await dbQuery<{ address: string }>(
-    'select address from priceable_assets where is_numeraire order by symbol limit 1',
-  );
-  const address = rows[0]?.address;
-  if (typeof address !== 'string') throw new Error('priceable_assets 沒有 is_numeraire 的列，redeem 不知道要換成什麼');
+async function readNumeraireAddress(query: QueryFn): Promise<Address> {
+  const { rows } = await query('select address from priceable_assets where is_numeraire order by symbol limit 1');
+  const row: unknown = rows[0];
+  const address: unknown = typeof row === 'object' && row !== null ? Reflect.get(row, 'address') : null;
+  if (typeof address !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(address)) throw new Error('missing numeraire');
   return address as Address;
 }
 
-/** viem 錯誤裡的 revert 名稱（`UnsupportedPair` / `ZeroQuote` …），拿不到就回 null。 */
-function revertNameOfForLog(error: unknown): string | null {
-  const message = error instanceof Error ? error.message : String(error);
-  const match = /reverted with the following reason:\s*([A-Za-z0-9_]+)/.exec(message);
-  if (match?.[1] !== undefined) return match[1];
-  const custom = /reverted with custom error '([A-Za-z0-9_]+)/.exec(message);
-  return custom?.[1] ?? null;
-}
-
-/** 把 `wantUsdE8` 換成「每一檔按同一個比例賣」的 steps。 */
-async function buildRedeemPlan(
-  input: RebalancePlanningInput,
-  wantUsdE8: bigint,
-): Promise<RebalancePlan> {
-  const { account, snapshot, report, portfolioId } = input.plan;
-  const totalE8 = report?.totalUsdE8 ?? 0n;
-  if (totalE8 === 0n) return { kind: 'noop', reason: '投組價值是 0，沒有東西可以賣' };
-  if (wantUsdE8 > totalE8) {
-    return {
-      kind: 'blocked',
-      reason: `要提領 ${Number(wantUsdE8) / 1e8} 美元，但投組只有 ${Number(totalE8) / 1e8} 美元`,
-    };
-  }
-
-  const client = defaultPublicClient();
-  const executor = getSessionKeyConfig().executorAddress;
-  if (executor === null) return { kind: 'blocked', reason: '這個部署沒有設定 EXECUTOR_ADDRESS' };
-  const router = (await client.readContract({
-    address: executor,
-    abi: [{ type: 'function', name: 'oracle', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] }] as const,
-    functionName: 'oracle',
-  })) as Address;
-  const numeraire = await readNumeraireAddress();
-
-  const strategyOnchainId = await readStrategyOnchainId(portfolioId);
-  const block = await client.getBlockNumber();
-  const steps: PlannedStep[] = [];
-  const notes: string[] = [];
-
-  for (const holding of snapshot.holdings) {
-    if (holding.asset.toLowerCase() === numeraire.toLowerCase()) continue;
-    // 按比例：amountIn = balance × want / total（向下取整，絕不多賣）
-    const amountIn = (holding.amountWei * wantUsdE8) / totalE8;
-    if (amountIn <= 0n) continue;
-
-    const quoted = await client
-      .readContract({
-        address: router,
-        abi: ORACLE_ABI,
-        functionName: 'previewSwap',
-        args: [holding.asset as Address, numeraire, amountIn],
-      })
-      .catch((error: unknown) => {
-        notes.push(`${holding.asset} 報不出價（${revertNameOfForLog(error) ?? 'unknown'}）`);
-        return null;
-      });
-    if (quoted === null) continue;
-    const [quotedOut, floor] = quoted as readonly [bigint, bigint];
-    if (quotedOut === 0n || floor === 0n) {
-      notes.push(`${holding.asset} 的報價是 0`);
-      continue;
-    }
-    const feeBps = await readExecutorFeeBps(strategyOnchainId);
-    steps.push(
-      buildStep({
-        executor,
-        tokenIn: holding.asset as Address,
-        tokenOut: numeraire,
-        amountIn,
-        oracleFloor: floor,
-        minGross: minGrossFor(floor, feeBps),
-        poolFee: await readPoolFee(router, holding.asset as Address),
-      }),
-    );
-  }
-
-  if (steps.length === 0) {
-    return { kind: 'noop', reason: `沒有可賣的部位${notes.length === 0 ? '' : `：${notes.join('; ')}`}` };
-  }
-
-  const { timestamp } = await client.getBlock({ blockNumber: block });
-  return {
-    kind: 'ready',
-    steps,
-    deadline: timestamp + 1200n,
-    rationale:
-      `按比例賣出 ${steps.length} 檔以換成 numeraire（每檔賣掉 ${(Number(wantUsdE8) / Number(totalE8) * 100).toFixed(2)}%），` +
-      `權重不變所以排程器不會把它買回來` +
-      (notes.length === 0 ? '' : `；略過：${notes.join('; ')}`),
-  };
-}
+export type RedeemPlanningResult = {
+  plan: RebalancePlan;
+  requestedSellUsdE8: bigint | null;
+  plannedSellUsdE8: bigint;
+  portfolioTotalUsdE8: bigint | null;
+};
 
 /**
- * `POST /portfolios/:id/close` —— 清倉：把**全部**部位賣成 numeraire。
- *
- * 與 redeem 的差別只在比例：redeem 賣 `A / T`（保留投組形狀），close 賣 **100%**。
- * 所以它直接沿用同一條管線（`runOperatorRedeem` + `forcePlan`），只是把「要提領的美元」
- * 換成「目前的總價值」——`amountIn = balance × T / T = balance`，也就是整筆。
- *
- * 為什麼不是另寫一份「全部賣出」：賣出涉及 oracle 地板、impact 上限、地板重問、operations 記錄，
- * 那些全都已經在 redeem/planRebalance 裡；另寫一份一定會分岔（這個 repo 已經吃過兩次同樣的虧）。
- *
- * 賣不掉的部分（流動性不足、報不出價）**留在帳戶裡**並回報，由前端接著把它們直接轉回錢包 ——
- * 清倉的語意是「錢包裡什麼都不剩」，不是「帳戶裡什麼都不剩」。
+ * 首批 usd：各持倉乘 usd / total（既有比例）。續作 sellUsdE8：按當下非現金 oracle
+ * 名義額分配，總和不超過請求；不保留首批各資產原始待賣比例。close 每批以全部非現金為目標。
+ * 持倉、oracle、fee、pool fee 全部釘在 snapshot.block；不使用折價 minimum 計算賣出名義額。
  */
-export async function runOperatorClose(
-  portfolioId: number,
-  wallet: string,
-  deps: RebalanceDeps = {},
-): Promise<RedeemResult> {
-  const find = deps.requireOwnedPortfolio ?? requireOwnedPortfolio;
-  await find(portfolioId, wallet);
-
-  // 先讀一次現值：清倉要賣的就是「全部」，而金額必須先知道才能交給同一條管線。
-  const status = await statusOf(portfolioId, {});
-  const totalE8 = status.totalUsdE8 === null ? 0n : BigInt(status.totalUsdE8);
-  if (totalE8 <= 0n) {
-    // 已經是空的：仍然要「歸位」（pause），否則一個已清空但仍 active 的投組會永遠留在
-    // operator 的預設清單裡，掛著 drift 9999 bps 與 gas low。這也是 Close 的冪等語意。
-    await dbQuery(`update portfolios set schedule_state = 'paused' where id = $1`, [portfolioId]);
-    return {
-      portfolioId,
-      outcome: 'noop',
-      reason: '投組價值是 0，沒有東西可以清倉（排程已暫停）',
-      txHash: null,
-      steps: [],
-      redeemedUsdE8: '0',
-    };
+export async function buildRedeemPlan(input: RebalancePlanningInput, request: SellRequest, deps: RebalanceDeps = {}): Promise<RedeemPlanningResult> {
+  let requestedSellUsdE8: bigint | null = typeof request === 'object' && 'sellUsdE8' in request ? request.sellUsdE8 : null;
+  const reply = (plan: RebalancePlan, plannedSellUsdE8 = 0n): RedeemPlanningResult => ({
+    plan, requestedSellUsdE8, plannedSellUsdE8, portfolioTotalUsdE8: input.plan.report?.totalUsdE8 ?? null,
+  });
+  try {
+    const { snapshot, report, pinnedVersion } = input.plan;
+    const query = deps.query ?? dbQuery;
+    const numeraire = await readNumeraireAddress(query);
+    const totalE8 = report?.totalUsdE8;
+    if (typeof request === 'bigint' && totalE8 !== undefined && request > totalE8) return reply({ kind: 'blocked', reason: '要提領的 usd 超過投組總值' });
+    const holdings = snapshot.holdings.filter((holding) => holding.asset.toLowerCase() !== numeraire.toLowerCase() && holding.amountWei > 0n);
+    if (holdings.length === 0) {
+      if (typeof request === 'object' && 'sellUsdE8' in request) return reply({ kind: 'blocked', reason: '沒有非現金部位可滿足待賣名義額' });
+      requestedSellUsdE8 = 0n;
+      return reply({ kind: 'noop', reason: 'nothing to sell' });
+    }
+    if (new Set(holdings.map((holding) => holding.asset.toLowerCase())).size !== holdings.length) return reply({ kind: 'blocked', reason: '重複的持倉資產，不送交易' });
+    if (totalE8 === undefined || totalE8 <= 0n) return reply({ kind: 'blocked', reason: '沒有有效投組總值，不能規劃提領' });
+    const client = deps.publicClient ?? defaultPublicClient();
+    const executor = deps.executor ?? getSessionKeyConfig().executorAddress;
+    if (executor === null) return reply({ kind: 'blocked', reason: '沒有設定 EXECUTOR_ADDRESS' });
+    const blockNumber = snapshot.block;
+    const router = await client.readContract({ address: executor, abi: [{ type: 'function', name: 'oracle', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] }], functionName: 'oracle', blockNumber });
+    const decimals = await numeraireDecimals(client, numeraire, snapshot.holdings, blockNumber);
+    const scale = 10n ** BigInt(decimals);
+    const limits = await readMaxLegUsdE8(holdings.map((holding) => holding.asset), query);
+    const nominal = await Promise.all(holdings.map((holding) => nominalSellQuote(client, router, holding.asset as Address, numeraire, holding.amountWei, blockNumber)));
+    const nonCashRaw = nominal.reduce((sum, value) => sum + value, 0n);
+    // Carry E8 at aggregate precision; per-token rounding residue remains in the requested total.
+    const allUsdE8 = (nonCashRaw * 100_000_000n + scale - 1n) / scale;
+    const first = typeof request === 'bigint';
+    if (first) {
+      // Price the exact original token quantities after token rounding; otherwise sub-token
+      // dust would become a phantom continuation amount that cannot ever be sold.
+      const desired = await Promise.all(holdings.map((holding) => {
+        const amount = holding.amountWei * request / totalE8;
+        return amount === 0n ? 0n : nominalSellQuote(client, router, holding.asset as Address, numeraire, amount, blockNumber);
+      }));
+      const desiredRaw = desired.reduce((sum, value) => sum + value, 0n);
+      requestedSellUsdE8 = (desiredRaw * 100_000_000n + scale - 1n) / scale;
+    } else if ('close' in request) requestedSellUsdE8 = allUsdE8;
+    const wanted = requestedSellUsdE8 ?? 0n;
+    if (wanted === 0n) return reply({ kind: 'noop', reason: '提領比例換算後待賣代幣量為 0' });
+    const budget = wanted < allUsdE8 ? wanted : allUsdE8;
+    const feeBps = await readExecutorFeeBps(client, BigInt(pinnedVersion.onchainStrategyId), blockNumber, deps.registry);
+    const steps: PlannedStep[] = [];
+    const notes: string[] = [];
+    let soldRaw = 0n;
+    for (const holding of holdings) {
+      let amountIn = first ? holding.amountWei * request / totalE8 : holding.amountWei * budget * scale / (nonCashRaw * 100_000_000n);
+      if (typeof request === 'object' && 'close' in request) amountIn = holding.amountWei;
+      if (amountIn > holding.amountWei) amountIn = holding.amountWei;
+      if (amountIn === 0n) continue;
+      const limit = limits.get(holding.asset.toLowerCase());
+      if (limit === undefined) return reply({ kind: 'blocked', reason: '[MAX_LEG_UNAVAILABLE] 缺少單筆限額' });
+      const capped = await capAssetLeg({ publicClient: client, oracle: router, numeraire, tokenIn: holding.asset as Address, tokenOut: numeraire, amountIn, limitUsdE8: limit, decimals, blockNumber });
+      if ('blocked' in capped) { notes.push(`${holding.asset}: ${capped.blocked}`); continue; }
+      amountIn = capped.amountIn;
+      const quoted = await client.readContract({ address: router, abi: ORACLE_ABI, functionName: 'previewSwap', args: [holding.asset as Address, numeraire, amountIn], blockNumber });
+      const [quotedOut, floor] = quoted;
+      if (quotedOut <= 0n || floor <= 0n) { notes.push(`${holding.asset}: oracle 沒有有效地板`); continue; }
+      // Independent final check: integer rounding or a malformed oracle must never exceed the total request.
+      const nextRaw = soldRaw + quotedOut;
+      if (nextRaw * 100_000_000n > wanted * scale) { notes.push(`${holding.asset}: oracle 名義額超過剩餘待賣量`); continue; }
+      if (limit !== null && quotedOut * 100_000_000n > limit * scale) { notes.push(`${holding.asset}: oracle 名義額超過單筆上限`); continue; }
+      const poolFee = await readPoolFee(client, router, holding.asset as Address, blockNumber);
+      steps.push(buildStep({ executor, tokenIn: holding.asset as Address, tokenOut: numeraire, amountIn, oracleFloor: floor, minGross: minGrossFor(floor, feeBps), poolFee }));
+      soldRaw = nextRaw;
+    }
+    if (steps.length === 0) return reply({ kind: 'blocked', reason: `沒有可執行的賣出步驟：${notes.join('；') || '待賣量換算後為 0'}` });
+    const { timestamp } = await client.getBlock({ blockNumber });
+    const wall = BigInt(Math.floor(Date.now() / 1000));
+    // Subtract the ceiling of aggregate nominal sold, so repeated E8 continuation never oversells by truncation.
+    const soldE8 = (soldRaw * 100_000_000n + scale - 1n) / scale;
+    return reply({ kind: 'ready', steps, deadline: (timestamp > wall ? timestamp : wall) + BigInt(DEFAULT_DEADLINE_SECONDS),
+      rationale: `賣出 ${steps.length} 檔，非現金待賣 ${wanted} E8，本批名義額 ${soldE8} E8；剩餘由 API 呼叫者以 sellUsdE8 續作（依當下非現金價值重新分配）${notes.length === 0 ? '' : `；blocked：${notes.join('；')}`}` }, soldE8);
+  } catch {
+    return reply({ kind: 'blocked', reason: '[REDEEM_PLAN_UNAVAILABLE] 持倉、限額、oracle 或 DB 資料不可用，不送交易' });
   }
-  const result = await runOperatorRedeem(portfolioId, wallet, totalE8, deps);
+}
 
-  // 清倉成功了就把排程暫停：帳戶被搬到空，繼續讓排程器每 24 小時「再平衡一個 $0 的投組」
-  // 只會製造噪音（operator 頁面上會掛著 drift 9999 bps 與 gas low）。
-  //
-  // 這裡**不刪**投組：它是使用者的部位紀錄，而且 counterfactual 地址由 (owner, strategy) 決定，
-  // 下次入金會回到**同一個**帳戶 —— 刪掉反而會讓「重新入金」看起來像換了一個帳戶。
-  //
-  // 判準用「**現在**價值是不是 0」，而不是 outcome：已經空了的投組再按一次 Close 會回 noop，
-  // 那也該被歸位（否則舊的、已清空但仍 active 的投組永遠留在 operator 的預設清單裡）。
-  const after = await statusOf(portfolioId, {}).catch(() => null);
-  // `executed` 也算：清倉的後半段（把錢掃回錢包）是前端另一筆 owner UserOp，
-  // 可能在這一輪結束**之後**才上鏈。那時 `statusOf` 還看得到現金，但使用者按的是 Close ——
-  // 意圖明確，就該歸位。若真的只清了一半，下次入金/rebalance 會把 active 接回來。
-  const nowEmpty = result.outcome === 'executed' || after === null || String(after.totalUsdE8 ?? '0') === '0';
-  if (nowEmpty) {
-    await dbQuery(`update portfolios set schedule_state = 'paused' where id = $1`, [portfolioId]);
-    // 一併關掉這個投組的未解決警示。
-    //
-    // 為什麼：`resolveAlerts` 是「這一輪沒偵測到的警示 → 標成已解決」，而排程器只認領 active
-    // 的投組。所以一個被暫停的投組，它的 gas-low / 其它警示會**永遠**停在 open
-    // （實測：清倉並暫停後，operator 仍顯示 2 critical）。
-    await dbQuery(
-      `update scheduler_alerts set resolved_at = now() where portfolio_id = $1 and resolved_at is null`,
-      [portfolioId],
-    ).catch(() => undefined);
-  }
-  return result;
+/** DB paused 僅放寬本次單投組認領；全域／鏈上 pause 與 #38 對帳仍由 scheduler 檢查。 */
+export async function runOperatorClose(portfolioId: number, wallet: string, deps: RebalanceDeps = {}): Promise<RedeemResult> {
+  return runOperatorSell(portfolioId, wallet, { close: true }, deps);
 }
 
 /**

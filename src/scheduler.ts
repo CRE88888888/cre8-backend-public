@@ -106,7 +106,7 @@ import { a10ErrorMessage, EXECUTOR_PAUSE_ABI, EXECUTOR_BUY_ABI, readGlobalPaused
 import { getConfig, getSessionKeyConfig, requireSessionKeyConfig } from './config.js';
 import { errorMessage, query as dbQuery, withTransaction } from './db.js';
 import { buildSessionPermissions } from './permissions.js';
-import { DEFAULT_DEADLINE_SECONDS as PLAN_DEFAULT_DEADLINE_SECONDS, planRebalance, refreshFloors } from './rebalance-plan.js';
+import { DEFAULT_DEADLINE_SECONDS as PLAN_DEFAULT_DEADLINE_SECONDS, planRebalance, readMaxLegUsdE8, refreshFloors } from './rebalance-plan.js';
 import { writeSnapshot as writeSnapshotImpl } from './snapshot.js';
 import type { PlanPartial, PlannedStep, RebalancePlan, RefreshFloorsResult } from './rebalance-plan.js';
 import { DEFAULT_THRESHOLD_BPS, planPortfolio } from './snapshot.js';
@@ -1519,6 +1519,7 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
           throw new Error('planPortfolio 沒有漂移報告（blocked）：不該進到規劃器');
         }
         return planRebalance({
+          maxLegUsdE8: await readMaxLegUsdE8(plan.targets.map((target) => target.asset), query),
           publicClient,
           account,
           executor,
@@ -1783,11 +1784,11 @@ async function runOne(
   // 認領時已經在**同一個 transaction 內**寫入完整間隔（那個語意不動，crash 時留在完整間隔＝
   // 不會變成熱迴圈）。這裡是在結果已知之後把它**提前**，屬於同一條推進路上的第二段。
   //
-  // ⚠ 只有**算得出**執行後漂移時才提前。`remainingDriftBps === null` 代表「算不出來」（這一輪買進
+  // 沒有已知限額餘量時，只有**算得出**執行後漂移才提前。`remainingDriftBps === null` 代表「算不出來」（這一輪買進
   // 帳戶沒持有的資產，到手量沒有價格可估）—— 拿一個算不出來的缺口去排一輪 1800s 後的執行，
   // 等於用猜的調度。實際發生過：6600 → 6 bps 收斂的一輪，卻被排成「還在 6600，30 分鐘後再來」。
   if (!ctx.dryRun && result.outcome === 'executed' && result.partial !== null) {
-    if (result.partial.remainingDriftBps === null) {
+    if (result.partial.remainingDriftBps === null && result.partial.maxLegBatched !== true) {
       result = {
         ...result,
         reason:
@@ -1800,7 +1801,7 @@ async function runOne(
     const followUpAt = new Date(ctx.now.getTime() + followUpSeconds * 1_000);
     if (followUpAt.getTime() < result.nextRunAt.getTime()) {
       const note =
-        `Partial execution: estimated drift is still ${result.partial.remainingDriftBps} bps after this round` +
+        (result.partial.maxLegBatched === true ? 'Partial execution: asset max_leg_usdt left a known batch for the next round' : `Partial execution: estimated drift is still ${result.partial.remainingDriftBps} bps after this round`) +
         ` (${result.partial.shrunk.length === 0 ? 'the gap was skipped rather than shrunk' : `${result.partial.shrunk.length} step(s) were shrunk by the impact budget`});` +
         ` next_run_at moved up to ${followUpAt.toISOString()} (${followUpSeconds}s, full interval is ${due.intervalSeconds}s)`;
       try {

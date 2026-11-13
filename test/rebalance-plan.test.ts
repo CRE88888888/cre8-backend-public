@@ -13,6 +13,8 @@ import {
   minGrossFor,
   moveValueE8,
   planRebalance,
+  capAssetLeg,
+  readMaxLegUsdE8,
   amountOutMinWithBuffer,} from '../src/rebalance-plan.js';
 import type { PlanRebalanceArgs, PlannedStep, RebalancePlan } from '../src/rebalance-plan.js';
 import { DEFAULT_MAX_IMPACT_BPS, resolveMaxImpactBps } from '../src/rebalance-plan.js';
@@ -330,6 +332,7 @@ function argsOf(
   const { holdings, targets, thresholdBps, drift: driftOverride, ...rest } = overrides;
   return {
     publicClient: stubClient(chain),
+    maxLegUsdE8: new Map(targets.map((target) => [target.asset.toLowerCase(), null])),
     account: '0x2b082fadf8f3d620eaa242a9e36817af8640d042' as Address,
     executor: EXECUTOR,
     oracle: ORACLE,
@@ -2150,4 +2153,125 @@ test('A10 oracle and executor numeraire mismatch blocks before budgeting', async
   assert.ok(plan.kind === 'blocked');
   assert.match(plan.reason, /NotNumeraireRoute/);
   assert.ok(!chain.calls.some((call) => call.functionName === 'buyAllowance'));
+});
+
+for (const mode of ['hub', 'pinned'] as const) {
+  for (const limit of [null, 150n, 200n, 0n]) {
+    test(`#40 ${mode}: buy limit ${limit} applies before quotes and calldata`, async () => {
+      const chain = mode === 'hub' ? hubChain() : baseChain();
+      chain.rate = { rateE18: 10n ** 18n, slippageBps: 100 };
+      const args = argsOf(chain, {
+        ...(mode === 'hub' ? { oracle: ROUTER, executor: EXECUTOR_MULTI } : {}),
+        holdings: [holding(USDT, 2000n * 10n ** 18n, 18, PRICE_1_USD)],
+        targets: targetsOf(USDT, WBNB, 9000), thresholdBps: 100,
+      });
+      const plan = await planRebalance({ ...args, maxLegUsdE8: new Map([[WBNB, limit === null ? null : limit * PRICE_1_USD]]) });
+      if (limit === 0n) {
+        assert.ok(plan.kind === 'blocked');
+        assert.match(plan.reason, /MAX_LEG/);
+        assert.ok(!chain.calls.some((call) => call.functionName === 'previewSwap'));
+      } else {
+        const ready = expectReady(plan);
+        const expected = (limit === null ? 200n : limit) * 10n ** 18n;
+        assert.equal(ready.steps.length, 1);
+        const step = ready.steps[0]; assert.ok(step);
+        assert.equal(step.amountIn, expected);
+        assert.equal(decodeStepInput(step).amountIn, expected);
+        assert.ok(chain.calls.filter((call) => call.functionName === 'previewSwap').every((call) => call.args?.[2] === expected));
+        if (limit === 150n) assert.equal(ready.partial?.maxLegBatched, true);
+      }
+    });
+  }
+}
+
+test('#40 buy allowance and asset limit use the stricter budget', async () => {
+  for (const available of [100n, 180n]) {
+    const chain = hubChain();
+    chain.rate = { rateE18: 10n ** 18n, slippageBps: 100 };
+    chain.buyAllowance = [1000n * 10n ** 18n, (980n - available) * 10n ** 18n, 0n];
+    const args = allowanceCase(chain);
+    const ready = expectReady(await planRebalance({ ...args, maxLegUsdE8: new Map([[WBNB, 150n * PRICE_1_USD], [TOKEN3, null]]) }));
+    assert.equal(ready.steps[0]?.amountIn, (available < 150n ? available : 150n) * 10n ** 18n);
+    assert.ok(ready.steps.reduce((sum, step) => sum + step.amountIn, 0n) <= available * 10n ** 18n);
+    assert.equal(ready.partial?.maxLegBatched, true, 'a tighter buy budget must not hide the known capped remainder');
+  }
+});
+
+test('#40 pinned buy budget stricter than asset cap still records the known next batch', async () => {
+  const chain = baseChain({ rate: { rateE18: 10n ** 18n, slippageBps: 100 }, buyAllowance: [1000n * 10n ** 18n, 880n * 10n ** 18n, 0n] });
+  const args = argsOf(chain, { holdings: [holding(USDT, 2000n * 10n ** 18n, 18, PRICE_1_USD)], targets: targetsOf(USDT, WBNB, 9000), thresholdBps: 100 });
+  const result = expectReady(await planRebalance({ ...args, maxLegUsdE8: new Map([[WBNB, 150n * PRICE_1_USD]]) }));
+  assert.equal(result.steps[0]?.amountIn, 100n * 10n ** 18n);
+  assert.equal(result.partial?.maxLegBatched, true);
+});
+
+test('#40 DB numeric limits retain precision, NULL, zero and round down beyond E8', async () => {
+  const limits = await readMaxLegUsdE8([WBNB, USDT, TOKEN3, TOKEN6], async () => ({ rows: [
+    { address: WBNB, max_leg_usdt: '9007199254740993.123456789' },
+    { address: USDT, max_leg_usdt: null }, { address: TOKEN3, max_leg_usdt: '0' }, { address: TOKEN6, max_leg_usdt: '0.000000009' },
+  ] }));
+  assert.equal(limits.get(WBNB), 900719925474099312345678n);
+  assert.equal(limits.get(USDT), null);
+  assert.equal(limits.get(TOKEN3), 0n);
+  assert.equal(limits.get(TOKEN6), 0n);
+});
+
+for (const value of [undefined, '-1', 'NaN', 'Infinity', 150, '1e2', '']) {
+  test(`#40 DB invalid numeric ${value} fails closed`, async () => {
+    await assert.rejects(readMaxLegUsdE8([WBNB], async () => ({ rows: [{ address: WBNB, max_leg_usdt: value }] })), /MAX_LEG_UNAVAILABLE/);
+  });
+}
+test('#40 missing asset and DB timeout never become an unlimited leg or leak errors', async () => {
+  await assert.rejects(readMaxLegUsdE8([WBNB], async () => ({ rows: [] })), /MAX_LEG_UNAVAILABLE/);
+  await assert.rejects(readMaxLegUsdE8([WBNB], async () => { throw new Error('DB timeout secret-token'); }), (error: unknown) => error instanceof Error && !error.message.includes('secret-token'));
+});
+
+for (const mode of ['hub', 'pinned'] as const) {
+  test(`#40 ${mode}: sales use oracle nominal, not holding price or discounted floor`, async () => {
+    const chain = mode === 'hub' ? hubChain() : baseChain();
+    chain.rate = { rateE18: 2n * 10n ** 18n, slippageBps: 100 };
+    const args = argsOf(chain, {
+      ...(mode === 'hub' ? { oracle: ROUTER, executor: EXECUTOR_MULTI } : {}),
+      holdings: [holding(WBNB, 200n * 10n ** 18n, 18, PRICE_1_USD), holding(USDT, 0n, 18, PRICE_1_USD)],
+      targets: targetsOf(WBNB, USDT, 0), thresholdBps: 100,
+    });
+    const plan = expectReady(await planRebalance({ ...args, maxLegUsdE8: new Map([[WBNB, 150n * PRICE_1_USD]]) }));
+    assert.equal(plan.steps.length, 1);
+    assert.equal(plan.steps[0]?.amountIn, 75n * 10n ** 18n);
+    assert.equal(plan.partial?.maxLegBatched, true);
+    assert.ok(chain.calls.filter((call) => call.functionName === 'previewSwap').every((call) => call.blockNumber === chain.block.number));
+  });
+}
+
+test('#40 sell quote failure/timeout fails closed without copying RPC data', async () => {
+  const chain = baseChain();
+  chain.oracle.revert = 'RPC timeout secret-token';
+  const result = await capAssetLeg({ publicClient: stubClient(chain), oracle: ORACLE, numeraire: USDT, tokenIn: WBNB, tokenOut: USDT,
+    amountIn: 1000n, limitUsdE8: PRICE_1_USD, decimals: 18, blockNumber: chain.block.number });
+  assert.ok('blocked' in result);
+  assert.ok(!JSON.stringify(result).includes('secret-token'));
+});
+
+test('#40 numeraire decimals 6 and dust limit never overstate the raw cap', async () => {
+  const chain = baseChain();
+  const base = { publicClient: stubClient(chain), oracle: ORACLE, numeraire: USDT, tokenIn: USDT, tokenOut: WBNB, amountIn: 200000000n, decimals: 6, blockNumber: chain.block.number };
+  assert.deepEqual(await capAssetLeg({ ...base, limitUsdE8: 15012345678n }), { amountIn: 150123456n, batched: true });
+  assert.ok('blocked' in await capAssetLeg({ ...base, limitUsdE8: 1n }));
+});
+
+test('#40 direct planner callers load DB limits by default, and DB failure blocks before a quote', async () => {
+  const chain = hubChain(); chain.rate = { rateE18: 10n ** 18n, slippageBps: 100 };
+  const { maxLegUsdE8: _limits, ...args } = allowanceCase(chain);
+  let reads = 0;
+  const result = expectReady(await planRebalance(args, { query: async () => {
+    reads += 1;
+    return { rows: [{ address: USDT, max_leg_usdt: null }, { address: WBNB, max_leg_usdt: '150' }, { address: TOKEN3, max_leg_usdt: null }] };
+  } }));
+  assert.equal(reads, 1);
+  assert.equal(result.steps[0]?.amountIn, 150n * 10n ** 18n);
+  chain.calls.length = 0;
+  const blocked = await planRebalance(args, { query: async () => { throw new Error('DB timeout secret-token'); } });
+  assert.ok(blocked.kind === 'blocked');
+  assert.ok(!blocked.reason.includes('secret-token'));
+  assert.ok(!chain.calls.some((call) => call.functionName === 'previewSwap'));
 });

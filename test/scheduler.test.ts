@@ -42,6 +42,8 @@ import type {
   ReconcileInput,
 } from '../src/scheduler.js';
 import type { PortfolioPlan } from '../src/snapshot.js';
+import { runOperatorClose, runOperatorRedeem } from '../src/operator.js';
+import { sellFixture } from './fixtures/max-leg.js';
 
 /**
  * 排程器的測試。
@@ -213,7 +215,8 @@ function stubQuery(db: StubDb): SchedulerQueryFn {
       const now = params[0] as Date;
       const limit = Number(params[2]);
       const due = db.portfolios
-        .filter((row) => row.state === 'active' && (row.nextRunAt === null || row.nextRunAt.getTime() <= now.getTime()))
+        .filter((row) => (row.state === 'active' || (text.includes("in ('active', 'paused')") && row.state === 'paused')) &&
+          (text.includes('p.id = $4') ? row.id === Number(params[3]) : row.nextRunAt === null || row.nextRunAt.getTime() <= now.getTime()))
         .sort((left, right) => {
           const lt = left.nextRunAt?.getTime() ?? Number.NEGATIVE_INFINITY;
           const rt = right.nextRunAt?.getTime() ?? Number.NEGATIVE_INFINITY;
@@ -232,11 +235,13 @@ function stubQuery(db: StubDb): SchedulerQueryFn {
       };
     }
 
-    if (text.includes('set next_run_at = claimed.next_run_at')) {
+    if (text.includes('set next_run_at = claimed.next_run_at') || text.includes('set next_run_at = greatest(p.next_run_at, claimed.next_run_at)')) {
       const ids = params[0] as number[];
       const stamps = params[1] as string[];
       ids.forEach((id, index) => {
-        const value = new Date(String(stamps[index]));
+        const original = db.portfolios.find((entry) => entry.id === id)?.nextRunAt;
+        const candidate = new Date(String(stamps[index]));
+        const value = text.includes('greatest(p.next_run_at') && original !== null && original !== undefined && original > candidate ? original : candidate;
         if (db.inTransaction) {
           db.pendingNextRunAt.set(id, value);
         } else {
@@ -2034,6 +2039,22 @@ test('認領（真的 Postgres）：paused／idle／未到期不被認領，NULL
   const second = await claimDuePortfolios(50, new Date(), { chainId: REAL_CHAIN_ID });
   assert.deepEqual(second, [], '同一輪再跑一次，一個都不該被重複認領');
 
+  // #40/#42: execute the actual rewritten SQL against Postgres, including the preserved future time.
+  const later = new Date(now.getTime() + 3 * ONE_DAY_SECONDS * 1000);
+  await query('update portfolios set next_run_at = $2 where id = $1', [paused.id, later]);
+  const closeClaim = await claimDuePortfolios(50, now, {
+    chainId: REAL_CHAIN_ID,
+    withTransaction: singlePortfolioClaim(paused.id, undefined, { allowPaused: true, preserveNextRunAt: true }),
+  });
+  assert.deepEqual(closeClaim.map((entry) => entry.portfolioId), [paused.id]);
+  const pausedRow = (await query<{ schedule_state: string; next_run_at: Date }>('select schedule_state, next_run_at from portfolios where id = $1', [paused.id])).rows[0];
+  assert.equal(pausedRow?.schedule_state, 'paused');
+  assert.equal(pausedRow?.next_run_at.getTime(), later.getTime());
+  assert.equal((await claimDuePortfolios(50, now, {
+    chainId: REAL_CHAIN_ID,
+    withTransaction: singlePortfolioClaim(idle.id, undefined, { allowPaused: true }),
+  })).length, 0, 'close only widens active to paused, never idle');
+
   // #34 兩個手動輪次先後完成認領，但同時規劃不同 deadline：真正的 Postgres 鎖必須串行閘門。
   let firstPlanning: () => void = () => {};
   const entered = new Promise<void>((resolve) => { firstPlanning = resolve; });
@@ -2211,6 +2232,16 @@ test('排程：執行後漂移算不出來（remainingDriftBps 是 null）→ �
 
   const advance = db.statements.filter((entry) => entry.sql.includes('set next_run_at = claimed.next_run_at'));
   assert.equal(advance.length, 1, '只有認領那一條，沒有第二條修正');
+});
+
+test('#40 已知單筆限額留下批次，即使新建倉無法估漂移也在 30 分鐘跟進', async () => {
+  const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+  const rebalance: RebalancePlan = { ...readyPlan(), partial: { remainingDriftBps: null, shrunk: [], maxLegBatched: true } };
+  const chain = stubChain({ rebalance });
+  const round = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain));
+  assert.deepEqual(outcomes(round), ['executed']);
+  assert.equal(round.results[0]?.nextRunAt.getTime(), NOW.getTime() + PARTIAL_FOLLOW_UP_SECONDS * 1000);
+  assert.match(round.results[0]?.reason ?? '', /known batch/);
 });
 
 test('排程：完全收斂（執行後預估漂移已回到門檻下）→ 完整間隔，寫入的還是認領算好的那個值', async () => {
@@ -2772,4 +2803,113 @@ test('A10 sends only held pinned-version assets for the valuation gas budget', a
   const round = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain));
   assert.deepEqual(outcomes(round), ['executed']);
   assert.deepEqual(chain.executeCalls[0]?.valuationAssets, [getAddress(TOKEN_IN)]);
+});
+
+function exitCase(state: StubPortfolio['state'] = 'paused', extra: SchedulerDeps = {}) {
+  const f = sellFixture();
+  const db = stubDb({ portfolios: [portfolio({ state })], sessionKeys: [sessionKey()] });
+  const chain = stubChain({ balance: 10n ** 30n, allowance: 10n ** 30n });
+  chain.plan = f.plan(stubPlan());
+  const query = f.deps.query;
+  assert.ok(query);
+  const owned = async () => ({ id: PORTFOLIO_ID, userId: OWNER, strategyId: STRATEGY_ID, version: 1, scheduleState: state,
+    createdAt: NOW.toISOString(), chainId: TEST_CHAIN_ID, accountAddress: ACCOUNT, ownerAddress: OWNER, existingKeyRefs: [] });
+  const options = { ...f.deps, requireOwnedPortfolio: owned, withTransaction: stubWithTransaction(db),
+    query: async (sql: string, params?: readonly unknown[]) => {
+      if (sql.includes("set schedule_state = 'paused'")) { const row = db.portfolios[0]; assert.ok(row); row.state = 'paused'; }
+      return query(sql, params);
+    },
+    runSchedulerOnce: async (args: Parameters<typeof runSchedulerOnce>[0], provided: SchedulerDeps = {}) => {
+      const base = deps(db, chain, extra);
+      return runSchedulerOnce({ ...args, now: NOW }, { ...base, ...provided, query: base.query });
+    },
+  };
+  return { f, db, chain, options };
+}
+
+test('#42 paused close executes one capped batch, stays paused, and an empty retry is noop', async () => {
+  const c = exitCase();
+  const first = await runOperatorClose(PORTFOLIO_ID, OWNER, c.options);
+  assert.equal(first.outcome, 'executed', first.reason);
+  assert.equal(first.remainingUsdE8, '5000000000');
+  assert.equal(first.redeemedUsdE8, '200000000000', 'close preserves the legacy total-portfolio estimate');
+  assert.equal(first.batched, true);
+  assert.equal(c.db.portfolios[0]?.state, 'paused');
+  c.chain.plan = c.f.plan(stubPlan(), 50n, 1950n);
+  const second = await runOperatorClose(PORTFOLIO_ID, OWNER, c.options);
+  assert.equal(second.outcome, 'executed', second.reason);
+  assert.equal(second.remainingUsdE8, '0');
+  c.chain.plan = c.f.plan(stubPlan(), 0n, 2000n);
+  const third = await runOperatorClose(PORTFOLIO_ID, OWNER, c.options);
+  assert.equal(third.outcome, 'noop');
+  assert.equal(third.reason, 'nothing to sell');
+  assert.equal(third.remainingUsdE8, '0');
+  assert.equal(c.chain.executeCalls.length, 2, 'two batches, empty retry sends nothing');
+  assert.ok(c.db.statements.filter((s) => s.sql.includes('for update of p skip locked')).every((s) => s.sql.includes("in ('active', 'paused')") && s.sql.includes('p.id = $4')));
+});
+
+for (const gate of ['global', 'chain', 'inflight'] as const) {
+  test(`#42 paused close preserves ${gate} blocking without new planning or sending`, async () => {
+    const c = exitCase('paused', { readGlobalPaused: async () => gate === 'global', reconcileRebalance: async () => null });
+    if (gate === 'chain') c.chain.plan.pinnedVersion.paused = true;
+    if (gate === 'inflight') c.db.operations.push(unresolvedOperation());
+    const result = await runOperatorClose(PORTFOLIO_ID, OWNER, c.options);
+    assert.equal(result.outcome, 'blocked');
+    assert.equal(result.remainingUsdE8, null, 'unknown is never completion');
+    assert.equal(c.f.state.reads.length, 0);
+    assert.equal(c.chain.executeCalls.length, 0);
+    assert.equal(c.f.state.writes.length, 0);
+  });
+}
+
+test('#42 receipt timeout then another close is blocked and sends only once', async () => {
+  const c = exitCase('active', { reconcileRebalance: async () => null });
+  c.chain.executeResult = { ...c.chain.executeResult, status: 'unknown', error: 'receipt timeout' };
+  const first = await runOperatorClose(PORTFOLIO_ID, OWNER, c.options);
+  assert.equal(first.outcome, 'blocked');
+  assert.equal(first.remainingUsdE8, '20000000000', 'unconfirmed batch is not subtracted');
+  const reads = c.f.state.reads.length;
+  const second = await runOperatorClose(PORTFOLIO_ID, OWNER, c.options);
+  assert.equal(second.outcome, 'blocked');
+  assert.equal(c.f.state.reads.length, reads, 'in-flight guard precedes the sell planner');
+  assert.equal(c.chain.executeCalls.length, 1);
+});
+
+test('#42 confirmed close then immediate empty close sends exactly once', async () => {
+  const c = exitCase('active'); c.f.state.limit = null;
+  assert.equal((await runOperatorClose(PORTFOLIO_ID, OWNER, c.options)).outcome, 'executed');
+  c.chain.plan = c.f.plan(stubPlan(), 0n, 2000n);
+  const again = await runOperatorClose(PORTFOLIO_ID, OWNER, c.options);
+  assert.equal(again.outcome, 'noop');
+  assert.equal(again.reason, 'nothing to sell');
+  assert.equal(c.chain.executeCalls.length, 1);
+});
+
+test('#40 redeem delays scheduling, preserves an already later time, and reports confirmed progress', async () => {
+  const c = exitCase('active');
+  const row = c.db.portfolios[0]; assert.ok(row);
+  row.nextRunAt = new Date(NOW.getTime() + 3 * ONE_DAY_SECONDS * 1000);
+  const later = row.nextRunAt.getTime();
+  const result = await runOperatorRedeem(PORTFOLIO_ID, OWNER, 200000000000n, c.options);
+  assert.equal(result.outcome, 'executed', result.reason);
+  assert.equal(result.remainingUsdE8, '5000000000');
+  assert.equal(row.nextRunAt?.getTime(), later);
+  const delayed = c.f.state.writes.find((write) => write.sql.includes('greatest(next_run_at'));
+  assert.ok(delayed);
+  assert.deepEqual(delayed.params, [PORTFOLIO_ID, PARTIAL_FOLLOW_UP_SECONDS]);
+});
+
+test('#40 DB failure after confirmed sale keeps tx/progress visible and gives a sanitized scheduling warning', async () => {
+  const c = exitCase('active');
+  const baseQuery = c.options.query;
+  const options = { ...c.options, query: async (sql: string, params?: readonly unknown[]) => {
+    if (sql.includes('update portfolios')) throw new Error('DB failed secret-token');
+    return baseQuery(sql, params);
+  } };
+  const result = await runOperatorRedeem(PORTFOLIO_ID, OWNER, { sellUsdE8: 20000000000n }, options);
+  assert.equal(result.outcome, 'executed', result.reason);
+  assert.equal(result.remainingUsdE8, '5000000000');
+  assert.ok(result.txHash);
+  assert.match(result.reason, /DB 延後排程失敗/);
+  assert.ok(!JSON.stringify(result).includes('secret-token'));
 });

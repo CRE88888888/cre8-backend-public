@@ -6,6 +6,7 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { alertCounts, healthStatusFor, listOpenAlerts } from './alerts.js';
 import type { AlertCounts } from './alerts.js';
 import { listPortfolioActivity, readOperatorActivity, readOperatorOverview, runOperatorClose, runOperatorRedeem } from './operator.js';
+import type { RedeemAmount } from './operator.js';
 import { EXECUTOR_ORACLE_ABI, ORACLE_OF_ABI, listPriceableAssets } from './assets.js';
 import type { PriceableAsset, TradableProbe } from './assets.js';
 import { authenticate, issueNonce, login, parseLoginBody } from './auth.js';
@@ -179,7 +180,7 @@ export type ServerDeps = {
   /** operator 總覽（rebalance dashboard）。 */
   operatorOverview: () => Promise<unknown>;
   /** 把部位按比例賣成 numeraire（提領成 USDT 的前半段）。 */
-  operatorRedeem: (portfolioId: number, wallet: string, usdE8: bigint) => Promise<unknown>;
+  operatorRedeem: (portfolioId: number, wallet: string, amount: RedeemAmount) => Promise<unknown>;
   /** 清倉：把全部部位賣成 numeraire。 */
   operatorClose: (portfolioId: number, wallet: string) => Promise<unknown>;
   portfolioStatus: PortfolioStatusReader;
@@ -774,9 +775,9 @@ async function planPreviewRoute(
 /**
  * `POST /portfolios/:id/redeem` —— 把部位**按比例**賣成 numeraire。
  *
- * 為什麼是「按比例」而不是「賣到剛好夠」：按比例賣完每個資產的權重不變，所以投組仍然貼著 mandate，
- * 排程器也不會立刻把它買回來。使用者要提領 USDT，前端接著再送一筆 owner-signed 的 transfer
- * （兩段分開是刻意的：賣出是 session key、轉出是 owner，權限本來就不同）。
+ * 首批 usd 保留 balance × usd / total；續作 sellUsdE8 是正整數字串（E8），忽略 usd，
+ * 依當下非現金 oracle 名義額重新分配，不保留首批各資產原始待賣量。
+ * remainingUsdE8 可直接帶回 sellUsdE8；0 代表完成，null 代表尚未能規劃。
  */
 async function redeemRoute(
   req: IncomingMessage,
@@ -786,12 +787,23 @@ async function redeemRoute(
 ): Promise<void> {
   const wallet = await authenticate(req.headers.authorization);
   const body = await readJsonBody(req);
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) throw new AppError(400, 'INVALID_AMOUNT', 'body must contain usd or sellUsdE8');
+  if ('sellUsdE8' in body) {
+    const sell: unknown = body.sellUsdE8;
+    if (typeof sell !== 'string' || !/^[0-9]+$/.test(sell) || sell.length > 78 || BigInt(sell) <= 0n || BigInt(sell) >= 2n ** 256n) {
+      throw new AppError(400, 'INVALID_AMOUNT', 'body.sellUsdE8 must be a positive E8 integer string');
+    }
+    sendJson(res, 200, await deps.operatorRedeem(id, wallet, { sellUsdE8: BigInt(sell) }));
+    return;
+  }
   const usd = (body as { usd?: unknown }).usd;
   if (typeof usd !== 'number' || !Number.isFinite(usd) || usd <= 0) {
     throw new AppError(400, 'INVALID_AMOUNT', 'body.usd must be a positive number');
   }
   // 8 位小數的整數（與 totalUsdE8 同一個刻度）。
-  const usdE8 = BigInt(Math.round(usd * 1e8));
+  const scaled = Math.round(usd * 1e8);
+  if (!Number.isSafeInteger(scaled) || scaled <= 0) throw new AppError(400, 'INVALID_AMOUNT', 'body.usd must fit a positive safe E8 integer');
+  const usdE8 = BigInt(scaled);
   sendJson(res, 200, await deps.operatorRedeem(id, wallet, usdE8));
 }
 

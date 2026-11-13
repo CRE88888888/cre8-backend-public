@@ -102,6 +102,8 @@ import type { AssetDrift, DriftReport, Holding, TargetWeight } from './drift.js'
 import { computeDrift } from './drift.js';
 import { capAmountInForImpact, estimateImpact, impactStateProblem } from './impact.js';
 import type { PoolImpactState } from './impact.js';
+import { query as dbQuery } from './db.js';
+import type { QueryFn } from './snapshot.js';
 
 export type PlannedStep = {
   tokenIn: Address;
@@ -152,6 +154,8 @@ export type ShrunkStep = {
 };
 
 export type PlanPartial = {
+  /** 已知有量因 max_leg_usdt 留到下一輪；即使新建倉的漂移不可估也可安排跟進。 */
+  maxLegBatched?: boolean;
   /**
    * 執行後的預估漂移（bps）。
    *
@@ -167,6 +171,8 @@ export type PlanPartial = {
 
 
 export type PlanRebalanceArgs = {
+  /** DB max_leg_usdt 轉成 E8；NULL 不限、0 阻擋。省略時規劃器讀 DB，CLI 也不能繞過限額。 */
+  maxLegUsdE8?: ReadonlyMap<string, bigint | null>;
   publicClient: PublicClient;
   /** 被再平衡的 smart account（合約要求 `msg.sender == account`）。 */
   account: Address;
@@ -220,6 +226,7 @@ export type PlanRebalanceArgs = {
 
 
 export type PlanRebalanceDeps = {
+  query?: QueryFn;
   /**
    * 注入「塊時間」（unix 秒）。省略就讀 `publicClient` 上 `blockNumber` 那一塊的 timestamp。
    * 存在的理由是測試要能證明 deadline 跟著塊時間走：換一個塊時間（而且它在牆鐘之後），deadline 必須
@@ -231,6 +238,76 @@ export type PlanRebalanceDeps = {
 
 const BPS_DENOMINATOR = 10_000;
 const BPS_BIG = 10_000n;
+const USD_E8 = 100_000_000n;
+
+/** PostgreSQL numeric 全程以字串解析；超出 E8 的小數向下取整，絕不放大限額。 */
+export async function readMaxLegUsdE8(assets: readonly string[], query: QueryFn = dbQuery): Promise<Map<string, bigint | null>> {
+  try {
+    const { rows } = await query('select address, max_leg_usdt::text as max_leg_usdt from priceable_assets where lower(address) = any($1::text[])', [assets.map((asset) => asset.toLowerCase())]);
+    const limits = new Map<string, bigint | null>();
+    for (const raw of rows) {
+      if (typeof raw !== 'object' || raw === null) throw new Error('invalid row');
+      const address: unknown = Reflect.get(raw, 'address');
+      const value: unknown = Reflect.get(raw, 'max_leg_usdt');
+      if (typeof address !== 'string' || !isAddressLike(address)) throw new Error('invalid address');
+      if (value === null) { limits.set(address.toLowerCase(), null); continue; }
+      if (typeof value !== 'string' || !/^\d+(?:\.\d+)?$/.test(value)) throw new Error('invalid numeric');
+      const [whole = '0', fraction = ''] = value.split('.');
+      limits.set(address.toLowerCase(), BigInt(whole) * USD_E8 + BigInt(fraction.slice(0, 8).padEnd(8, '0')));
+    }
+    if (assets.some((asset) => !limits.has(asset.toLowerCase()))) throw new Error('missing asset');
+    return limits;
+  } catch {
+    throw new Error('[MAX_LEG_UNAVAILABLE] 資產單筆限額讀取失敗或資料缺漏，不送交易');
+  }
+}
+
+function limitOf(limits: ReadonlyMap<string, bigint | null> | undefined, asset: string): bigint | null {
+  if (limits === undefined) return null;
+  for (const [key, value] of limits) if (sameAsset(key, asset)) return value;
+  throw new Error('[MAX_LEG_UNAVAILABLE] 缺少資產單筆限額，不送交易');
+}
+
+export async function numeraireDecimals(client: PublicClient, numeraire: Address, holdings: readonly Holding[], blockNumber: bigint): Promise<number> {
+  try {
+    const known = holdings.find((holding) => sameAsset(holding.asset, numeraire));
+    const value = known?.decimals ?? await client.readContract({ address: numeraire, abi: [{ type: 'function', name: 'decimals', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint8' }] }], functionName: 'decimals', blockNumber });
+    if (!Number.isInteger(value) || value < 0 || value > 36) throw new Error('invalid decimals');
+    return value;
+  } catch { throw new Error('[MAX_LEG_UNAVAILABLE] numeraire decimals 讀取失敗，不送交易'); }
+}
+
+/** USDT raw 名義額，不使用 minimum（折價地板會低估賣出額）。所有呼叫釘在持倉同一塊。 */
+export async function nominalSellQuote(client: PublicClient, oracle: Address, token: Address, numeraire: Address, amountIn: bigint, blockNumber: bigint): Promise<bigint> {
+  try {
+    const [quoted] = await client.readContract({ address: oracle, abi: ORACLE_ABI, functionName: 'previewSwap', args: [token, numeraire, amountIn], blockNumber });
+    if (typeof quoted !== 'bigint' || quoted <= 0n) throw new Error('no quote');
+    return quoted;
+  } catch { throw new Error('[MAX_LEG_QUOTE_UNAVAILABLE] oracle 名義額報價失敗或為 0，不送交易'); }
+}
+
+/** 每資產每輪只有一步；買入先限 USDT input，賣出按 oracle quoted 限量後再核對。 */
+export async function capAssetLeg(params: {
+  publicClient: PublicClient; oracle: Address; numeraire: Address; tokenIn: Address; tokenOut: Address;
+  amountIn: bigint; limitUsdE8: bigint | null; decimals: number; blockNumber: bigint;
+}): Promise<{ amountIn: bigint; batched: boolean } | { blocked: string }> {
+  const { amountIn, limitUsdE8 } = params;
+  if (limitUsdE8 === null) return { amountIn, batched: false };
+  if (limitUsdE8 <= 0n) return { blocked: '[MAX_LEG_ZERO] 資產單筆上限為 0，不交易' };
+  const rawCap = limitUsdE8 * 10n ** BigInt(params.decimals) / USD_E8;
+  if (rawCap === 0n) return { blocked: '[MAX_LEG_ZERO] 單筆上限低於 numeraire 最小單位，不交易' };
+  if (sameAsset(params.tokenIn, params.numeraire)) return { amountIn: amountIn > rawCap ? rawCap : amountIn, batched: amountIn > rawCap };
+  if (!sameAsset(params.tokenOut, params.numeraire)) return { blocked: '[MAX_LEG_ROUTE] 賣出限額需要 numeraire 路徑' };
+  try {
+    const quoted = await nominalSellQuote(params.publicClient, params.oracle, params.tokenIn, params.numeraire, amountIn, params.blockNumber);
+    if (quoted <= rawCap) return { amountIn, batched: false };
+    const capped = amountIn * rawCap / quoted;
+    if (capped === 0n) return { blocked: '[MAX_LEG_ZERO] 單筆限額換算後賣出量為 0，不交易' };
+    const finalQuote = await nominalSellQuote(params.publicClient, params.oracle, params.tokenIn, params.numeraire, capped, params.blockNumber);
+    if (finalQuote > rawCap) return { blocked: '[MAX_LEG_QUOTE_INVALID] 縮量後 oracle 名義額仍超限，不交易' };
+    return { amountIn: capped, batched: true };
+  } catch { return { blocked: '[MAX_LEG_QUOTE_UNAVAILABLE] oracle 名義額報價失敗或為 0，不送交易' }; }
+}
 /** Permit2 的 allowance 是 uint160；合約對超過它的 amountIn 是 revert AmountTooLarge（不是截斷）。 */
 const UINT160_MAX = 2n ** 160n - 1n;
 /** Permit2 的 allowance 到期時間上限：30 天。超過就不是「這一筆的期限」而是一個長期授權。 */
@@ -1344,6 +1421,10 @@ async function planHub(
   const buyBudget = legs.some((leg) => leg.deltaUsdE8 < 0n) ? await readBuyBudget(args) : null;
   if (buyBudget !== null && 'kind' in buyBudget) return buyBudget;
   const notes: string[] = [];
+  let maxLegBatched = false;
+  let maxLegBlocked = false;
+  const needsDecimals = targets.some((target) => !sameAsset(target.asset, hub) && limitOf(args.maxLegUsdE8, target.asset) !== null);
+  const cashDecimals = needsDecimals ? await numeraireDecimals(publicClient, hub, holdings, blockNumber) : 18;
   const priced: PricedLeg[] = [];
   let head: Head | null = null;
   const ensureHead = async (): Promise<{ blocked: string } | Head> => {
@@ -1367,6 +1448,14 @@ async function planHub(
     tokenOut: Address;
     amountIn: bigint;
   }): Promise<(ImpactCappedLeg & { poolFee: number; path: Hex; v2Tokens: Address[] | null }) | { skip: string }> => {
+    const limited = await capAssetLeg({ publicClient, oracle, numeraire: hub, tokenIn: params.tokenIn, tokenOut: params.tokenOut,
+      amountIn: params.amountIn, limitUsdE8: limitOf(args.maxLegUsdE8, params.asset), decimals: cashDecimals, blockNumber });
+    if ('blocked' in limited) { maxLegBlocked = true; return { skip: limited.blocked }; }
+    if (limited.batched) {
+      maxLegBatched = true;
+      notes.push(`[MAX_LEG_BATCHED] ${short(params.asset)} 單筆限額縮量 ${params.amountIn} → ${limited.amountIn}，餘量留待下一輪`);
+    }
+    params = { ...params, amountIn: limited.amountIn };
     const pair = await resolveHubPair(publicClient, { router: oracle, asset: params.asset, blockNumber });
     if ('skip' in pair) return pair;
     const first = await quoteHub(publicClient, {
@@ -1564,6 +1653,12 @@ async function planHub(
       continue;
     }
     const requested = amountInFor(-leg.deltaUsdE8, hubHolding.usdPriceE8, hubHolding.decimals);
+    // Compare the asset cap with the original target gap: a tighter cash/buy budget
+    // must not hide the known cap remainder when the new asset has no post-trade price yet.
+    const assetLimit = limitOf(args.maxLegUsdE8, leg.asset);
+    if (assetLimit !== null && assetLimit > 0n && requested * USD_E8 > assetLimit * pow10(cashDecimals)) {
+      maxLegBatched = true;
+    }
     const cashRemaining = spendable - spent;
     const allowanceRemaining = buyBudget === null ? cashRemaining : buyBudget.remaining - spent;
     const remaining = cashRemaining < allowanceRemaining ? cashRemaining : allowanceRemaining;
@@ -1610,7 +1705,7 @@ async function planHub(
   // 全部都被跳過 → noop（絕對不回空的 steps：pitfalls §8.1）。
   if (priced.length === 0) {
     return {
-      kind: 'noop',
+      kind: maxLegBlocked ? 'blocked' : 'noop',
       reason:
         `Hub mode (numeraire ${short(hub)}) produced no executable step: ` +
         `${notes.length === 0 ? 'no non-numeraire target assets, or every deltaUsd is 0' : notes.join('; ')}. Not sending empty steps.`,
@@ -1675,6 +1770,7 @@ async function planHub(
       : postDrift.needsRebalance
         ? { remainingDriftBps: postDrift.grossDriftBps, shrunk: shrunkStepsOf(priced) }
         : null;
+  const batchPartial = maxLegBatched ? { ...(partial ?? { remainingDriftBps: postDrift?.grossDriftBps ?? null, shrunk: [] }), maxLegBatched: true } : partial;
   const impactNotes = priced
     .map((leg) => leg.impactNote)
     .filter((note): note is string => note !== null);
@@ -1693,7 +1789,7 @@ async function planHub(
     describePostDrift(drift, postDrift, partial),
   ].join('；');
 
-  return { kind: 'ready', steps, deadline, rationale, ...(partial === null ? {} : { partial }) };
+  return { kind: 'ready', steps, deadline, rationale, ...(batchPartial === null ? {} : { partial: batchPartial }) };
 }
 
 /** pinned 路徑裡「已算好、只差問鏈」的那一筆：全部是純算術的結果，不含任何鏈上讀取。 */
@@ -1907,11 +2003,26 @@ export async function planRebalance(
   const preflight = targets.length === 2 ? preflightPinned({ holdings, targets, drift }) : null;
   if (preflight !== null && preflight.kind === 'reply') return preflight.plan;
 
+  if (new Set(targets.map((target) => target.asset.toLowerCase())).size !== targets.length) {
+    return { kind: 'blocked', reason: '目標資產包含同一個地址，不能在同一輪產生多步交易' };
+  }
+  if (args.maxLegUsdE8 === undefined) {
+    try { args = { ...args, maxLegUsdE8: await readMaxLegUsdE8(targets.map((target) => target.asset), deps.query) }; }
+    catch { return { kind: 'blocked', reason: '[MAX_LEG_UNAVAILABLE] 資產單筆限額讀取失敗或資料缺漏，不送交易' }; }
+  }
+
   // ---- 形狀判定：hub（AtpMultiPoolOracle，N 資產、以 numeraire 為中央）還是 pinned（舊的單一 pair）？
   const shape = await detectOracleShape(publicClient, oracle, blockNumber);
   if (shape.kind === 'unknown') return { kind: 'blocked', reason: shape.detail };
   const numeraire = await executorNumeraire(args);
   if (numeraire === null) return { kind: 'blocked', reason: '[NUMERAIRE_UNAVAILABLE] executor.numeraire 讀取失敗或資料缺漏，不送交易' };
+  try {
+    for (const target of targets) {
+      if (sameAsset(target.asset, numeraire)) continue;
+      const limit = limitOf(args.maxLegUsdE8, target.asset);
+      if (limit !== null && limit < 0n) throw new Error('invalid limit');
+    }
+  } catch { return { kind: 'blocked', reason: '[MAX_LEG_UNAVAILABLE] 資產單筆限額缺漏或無效，不送交易' }; }
   if (shape.kind === 'hub') {
     if (!isAddressEqual(numeraire, shape.numeraire)) return { kind: 'blocked', reason: 'NotNumeraireRoute：oracle 與 executor 的 numeraire 不一致，不送交易' };
     return planHub(args, shape.numeraire, deps, deadlineSeconds, maxImpactBps);
@@ -1952,6 +2063,16 @@ export async function planRebalance(
     if (amountIn > budget.remaining) amountIn = budget.remaining;
     buyNote = budget.note;
   }
+
+  const asset = sameAsset(tokenIn, numeraire) ? tokenOut : tokenIn;
+  const limit = limitOf(args.maxLegUsdE8, asset);
+  const limited = await capAssetLeg({ publicClient, oracle, numeraire, tokenIn, tokenOut, amountIn, limitUsdE8: limit,
+    decimals: limit === null ? 18 : await numeraireDecimals(publicClient, numeraire, holdings, blockNumber), blockNumber });
+  if ('blocked' in limited) return { kind: 'blocked', reason: limited.blocked };
+  amountIn = limited.amountIn;
+  const maxLegBatched = limited.batched ||
+    (limit !== null && limit > 0n && sameAsset(tokenIn, numeraire) &&
+      leg.amountIn * USD_E8 > limit * pow10(leg.sellerDecimals));
 
   const oraclePool = shape.pool;
   const head = await readHead(publicClient, registry, strategyId, blockNumber, deps.blockTimestampSeconds);
@@ -2096,6 +2217,7 @@ export async function planRebalance(
   // R1 的結構保證：`steps` 的唯一來源是這個單元素陣列，所以 `ready` 不可能帶著空陣列
   // （空陣列 = «成功但什麼都沒做»，docs/pitfalls.zh-TW.md §8.1）。
   const rationale = [
+    ...(maxLegBatched ? [`[MAX_LEG_BATCHED] 單筆限額 ${limit} E8，餘量留待下一輪`] : []),
     ...(buyNote === null ? [] : [buyNote]),
     `${short(tokenIn)} 超配 +${leg.sellerRow.deltaBps} bps（現況 ${leg.sellerRow.currentBps} / 目標 ${leg.sellerRow.targetBps}）` +
       `，賣 ${formatUnits(finalAmountIn, leg.sellerDecimals)} 顆（${finalAmountIn} 個最小單位）換 ${short(tokenOut)}` +
@@ -2116,6 +2238,7 @@ export async function planRebalance(
     .filter((segment) => segment !== '')
     .join('；');
 
-  return { kind: 'ready', steps: [step], deadline, rationale, ...(partial === null ? {} : { partial }) };
+  const batchPartial = maxLegBatched ? { ...(partial ?? { remainingDriftBps: postDrift?.grossDriftBps ?? null, shrunk: [] }), maxLegBatched: true } : partial;
+  return { kind: 'ready', steps: [step], deadline, rationale, ...(batchPartial === null ? {} : { partial: batchPartial }) };
 }
 

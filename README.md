@@ -218,6 +218,53 @@ RUN_CHAIN_TESTS=1 bun test ./test/a10-buy-allowance.fork.ts --timeout=120000
 不經 API／scheduler 跑來回買賣，驗證 `BuyLimitExceeded`、賣出仍可用與跨 24 小時窗口後恢復。
 另驗 100000 USDT 首次配置、Safe 降低 cap 後縮量、耗盡的窗口排程與實際 redeem／close。
 
+### 每個資產的單筆上限與提領續作（#40／#42）
+
+先套用 db migration `0022_priceable_assets_max_leg.sql`。`priceable_assets.max_leg_usdt`
+以 USDT 為單位，`NULL` 不限、`0` 阻擋該資產並記錄原因；DOGE 的直接池上限是 **150 USDT**。
+DB numeric 以字串轉為 E8，超出八位的小數向下取整。資料缺漏／DB 失敗會 blocked。
+規劃器本身預設讀 DB，因此 scheduler 與直接呼叫規劃器的 CLI 都套用上限。
+
+買入先取資產上限、現金與買入額度中較嚴者，再報價及編碼。賣出用持倉同區塊 oracle
+`quoted` 換算 USDT 名義額（不使用折價的 `minimum`），縮量後重新核對；同資產每輪最多一步。
+大單的餘量留到下一輪，成功後沿用 `min(intervalSeconds, PARTIAL_FOLLOW_UP_SECONDS)` 跟進。
+若已知限額留下批次，即使新建倉無法估算剩餘漂移，也會跟進；其他無法估漂移的計畫保持完整間隔。
+限額不保證可成交，每批仍須通過原有 oracle 地板及送出前檢查。
+
+`POST /portfolios/:id/redeem`（需登入）：
+
+- 首批 `{ "usd": 2000 }` 保留原行為：每個非現金部位賣 `balance × usd / total`，分母含現金。
+- 續作 `{ "sellUsdE8": "5000000000" }` 表示還要賣 **50 USDT 的非現金名義額**。
+  `sellUsdE8` 是正整數字串、1e8 定點；提供時忽略 `usd`。兩者都沒給或有效欄位格式錯誤回 400。
+  續作依當下非現金 oracle 名義額重新按比例分配，不承諾維持首批各資產原始待賣量。
+- 回應保留原有欄位，新增 `remainingUsdE8` 與 `batched`。已確認的本批名義額才從剩餘量扣除；
+  `remainingUsdE8` 可直接帶回下一次的 `sellUsdE8`，`"0"` 表示完成。未能規劃的首批為 `null`
+  （未知），blocked／交易未確認不代表完成。金額取整以 E8 為精度、已賣名義額向上取整。
+- 例：1,800 USDT ＋ 200 USDT 的 DOGE，首批 `usd: 2000` 賣 150、剩餘 50；續批使用
+  `sellUsdE8: "5000000000"`。每批成功後，以 DB 時鐘將 `next_run_at` 延後到至少現在＋30 分鐘，
+  已更晚的時間保留。由 API 呼叫者續作，scheduler 不自動接續提領意圖。
+
+`POST /portfolios/:id/close` 每次最多清一批，第一批成功後暫停 DB 排程。DB paused 仍可繼續 close，
+但不會解除全域／鏈上暫停，也不改 #38 在途對帳。已無非現金部位回 HTTP 200，
+`outcome: "noop"`、`reason: "nothing to sell"`、`remainingUsdE8: "0"`，不送交易。
+DB 延後／暫停失敗時仍回報已確認交易與進度，並在 `reason` 提示排程更新失敗，避免把成交當作未成交重做。
+
+獨立 DOGE fork 驗收只接受 anvil **8586**、DB **cre8_x1e**（此 lane 的 API 埠 **8122**）：
+在本 worktree 的 `.bun-cache/contracts-40` 解出 contracts 已合併的 `d62d1c3` 並執行 `forge build`，
+用 `https://bsc-mainnet.public.blastapi.io` 起 BSC fork（chain 56、cancun），再執行：
+
+```bash
+RUN_CHAIN_TESTS=1 RPC_URL=http://127.0.0.1:8586 \
+  DATABASE_URL=postgres:///cre8_x1e \
+  MIGRATIONS_DIR=../db/migrations \
+  bun test ./test/max-leg-batching.fork.ts --timeout=120000
+```
+
+測試自行部署該固定版本的 registry／oracle／executor 與測試帳戶，僅用 anvil 公開測試助記詞；
+真實交換走 DOGE 直接池，2,000 USDT、DOGE 10% 目標，每輪至多 150，逐批驗 `SwapExecuted` 與地板。
+為獨立驗證直接池限額／合約地板，測試關閉可選的 80bps impact 估算（該池費用本身為 100bps）；
+不改生產規劃器預設，也不宣稱此測試涵蓋 Kernel／bundler 權限整合。
+
 ### 測試與 DB
 
 完整 `bun test` 需要可拋棄的 Postgres 與 `../db/migrations`（或以 `MIGRATIONS_DIR` 指向該目錄）。

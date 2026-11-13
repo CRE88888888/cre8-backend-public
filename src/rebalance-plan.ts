@@ -95,7 +95,7 @@
 
 import { EXECUTOR_BUY_ABI, EXECUTOR_ABI, PANCAKE_UR, PANCAKE_DATA_ABI, describePriceSourceError, decodePriceSourceError, PriceSourceError } from './chain.js';
 import { quoteKyberSwap, aggregatorWins } from './aggregator.js';
-import type { AggregatorQuoter } from './aggregator.js';
+import type { AggregatorFailure, AggregatorQuoter } from './aggregator.js';
 import { chooseBestPath, routeImpactBps, singleHopPath } from './routing.js';
 import type { RouteCandidate } from './routing.js';
 import { V2_FACTORY_ADDRESS, V3_FACTORY_ADDRESS, WBNB_ADDRESS } from './addresses.js';
@@ -678,34 +678,39 @@ export function buildStep(params: {
 export const PANCAKE_QUOTE_TIMEOUT_MS = 5_000;
 export const PANCAKE_QUOTE_GAS_LIMIT = 500_000n;
 
+/** Bounds even non-cooperative RPCs; a refresh requires an actual executable quote. */
+async function quotePancake(params: {
+  publicClient: PublicClient; tokenIn: Address; tokenOut: Address; amountIn: bigint;
+  poolFee: number | null; blockNumber?: bigint;
+}): Promise<RouteCandidate | null> {
+  const { publicClient, tokenIn, tokenOut, amountIn, blockNumber } = params;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let active = true;
+  const quoteClient: PublicClient = { ...publicClient,
+    call: (request) => {
+      if (!active) return Promise.reject(new Error('Pancake quote window expired'));
+      return publicClient.call({ ...request, gas: PANCAKE_QUOTE_GAS_LIMIT });
+    },
+    readContract: (request) => readContract(quoteClient, request),
+  };
+  try {
+    return await Promise.race([
+      chooseBestPath(quoteClient, { tokenIn, tokenOut, amountIn, via: WBNB_ADDRESS, factory: V3_FACTORY_ADDRESS,
+        pinnedFee: params.poolFee, blockNumber,
+        v2Factory: process.env.ROUTE_V2_ENABLED === '1' ? V2_FACTORY_ADDRESS : null }).catch(() => null),
+      new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), PANCAKE_QUOTE_TIMEOUT_MS); }),
+    ]);
+  } finally { active = false; clearTimeout(timer); }
+}
+
 /** Exact amount is already capped by the caller. Never resize calldata after quoting. */
 export async function buildRoutedStep(params: Parameters<typeof buildStep>[0] & {
   publicClient: PublicClient; deadline: bigint; feeBps: number; blockNumber: bigint;
 }, deps: { quoteAggregator?: AggregatorQuoter } = {}): Promise<PlannedStep | null> {
   const { publicClient, tokenIn, tokenOut, amountIn, executor, blockNumber } = params;
   const minimum = amountOutMinWithBuffer(params.minGross);
-  // A cold/failed pool RPC must not prevent an independently validated aggregator quote being used.
-  const pancakeQuote = async (): Promise<RouteCandidate | null> => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let active = true;
-    const quoteClient: PublicClient = { ...publicClient,
-      call: (request) => {
-        if (!active) return Promise.reject(new Error('Pancake quote window expired'));
-        return publicClient.call({ ...request, gas: PANCAKE_QUOTE_GAS_LIMIT });
-      },
-      readContract: (request) => readContract(quoteClient, request),
-    };
-    try {
-      return await Promise.race([
-        chooseBestPath(quoteClient, { tokenIn, tokenOut, amountIn, via: WBNB_ADDRESS, factory: V3_FACTORY_ADDRESS,
-          pinnedFee: params.poolFee, blockNumber,
-          v2Factory: process.env.ROUTE_V2_ENABLED === '1' ? V2_FACTORY_ADDRESS : null }).catch(() => null),
-        new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), PANCAKE_QUOTE_TIMEOUT_MS); }),
-      ]);
-    } finally { active = false; clearTimeout(timer); }
-  };
   const [pancake, aggregator, allowed] = await Promise.all([
-    pancakeQuote(),
+    quotePancake(params),
     (deps.quoteAggregator ?? quoteKyberSwap)({ publicClient, executor, tokenIn, tokenOut, amountIn, minimum,
       deadline: params.deadline, blockNumber }).catch(() => null),
     publicClient.readContract({ address: executor, abi: EXECUTOR_ABI, functionName: 'venues', args: [PANCAKE_UR], blockNumber })
@@ -898,11 +903,15 @@ export async function refreshFloors(params: {
   executor?: Address;
   deadline?: bigint;
   quoteAggregator?: AggregatorQuoter;
+  account?: Address;
+  query?: QueryFn;
+  log?: (line: string) => void;
 }): Promise<RefreshFloorsResult> {
   const { publicClient, oracle, steps, feeBps } = params;
   const maxWorseningBps = params.maxWorseningBps ?? MAX_FLOOR_WORSENING_BPS;
   const refreshes: FloorRefresh[] = [];
   const rebuilt: PlannedStep[] = [];
+  let usedFallback = false;
 
   for (const [index, step] of steps.entries()) {
     const identity = isAddressEqual(step.venue, PANCAKE_UR) ? decodeStepIdentity(step) : null;
@@ -958,12 +967,25 @@ export async function refreshFloors(params: {
     });
     if (identity === null) {
       if (params.executor === undefined || params.deadline === undefined) return { ok: false, kind: 'quote-failed', reason: '聚合器刷新缺少 executor/deadline，不送交易' };
+      let failure: AggregatorFailure = 'api-failed';
+      const buffered = amountOutMinWithBuffer(freshAmountOutMin);
       const candidate = await (params.quoteAggregator ?? quoteKyberSwap)({ publicClient, executor: params.executor,
         tokenIn: step.tokenIn, tokenOut: step.tokenOut, amountIn: step.amountIn,
-        minimum: amountOutMinWithBuffer(freshAmountOutMin), deadline: params.deadline,
+        minimum: buffered, deadline: params.deadline,
+        onFailure: (reason) => { failure = reason; },
         ...(params.blockNumber === undefined ? {} : { blockNumber: params.blockNumber }) }).catch(() => null);
-      if (candidate === null || candidate.amountOut < amountOutMinWithBuffer(freshAmountOutMin) || !isAddressEqual(candidate.venue, step.venue)) return { ok: false, kind: 'quote-failed', reason: '聚合器刷新失敗或 venue 改變，不送交易' };
-      rebuilt.push({ ...step, venue: candidate.venue, data: candidate.data, oracleFloor: minimum, amountOutMin: amountOutMinWithBuffer(freshAmountOutMin) });
+      if (candidate !== null && candidate.amountOut >= buffered && isAddressEqual(candidate.venue, step.venue)) {
+        rebuilt.push({ ...step, venue: candidate.venue, data: candidate.data, oracleFloor: minimum, amountOutMin: buffered });
+      } else {
+        if (candidate !== null) failure = !isAddressEqual(candidate.venue, step.venue) ? 'venue-changed' : 'below-floor';
+        const label = { 'api-failed': 'API 失敗／逾時', 'below-floor': '低於地板', 'venue-changed': 'venue 改變' }[failure];
+        const diagnostic = `step#${index} 聚合器刷新 ${failure}（${label}），退回 Pancake`;
+        (params.log ?? console.log)(`[routing] ${diagnostic}`);
+        const fallback = await pancakeFallback({ ...params, executor: params.executor, step, minimum, minGross: freshAmountOutMin });
+        if (fallback === null) return { ok: false, kind: 'quote-failed', reason: `${diagnostic}；Pancake 沒有符合新鮮地板的白名單報價，不送交易` };
+        rebuilt.push(fallback);
+        usedFallback = true;
+      }
       continue;
     }
     rebuilt.push(
@@ -994,7 +1016,79 @@ export async function refreshFloors(params: {
     };
   }
 
+  if (usedFallback) {
+    const problem = await validateFallbackPlan({ ...params, steps: rebuilt });
+    if (problem !== null) return { ok: false, kind: 'quote-failed', reason: problem };
+  }
   return { ok: true, steps: rebuilt, refreshes, note: describeRefreshes(refreshes) };
+}
+
+/** Opaque aggregator data contains no reusable Pancake path. Search without guessing a fee. */
+async function pancakeFallback(params: {
+  publicClient: PublicClient; executor: Address; step: PlannedStep; minimum: bigint; minGross: bigint; blockNumber?: bigint;
+}): Promise<PlannedStep | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([(async () => {
+      const [route, venue] = await Promise.all([
+        quotePancake({ publicClient: params.publicClient, ...params.step, poolFee: null,
+          ...(params.blockNumber === undefined ? {} : { blockNumber: params.blockNumber }) }),
+        params.publicClient.readContract({ address: params.executor, abi: EXECUTOR_ABI, functionName: 'venues',
+          args: [PANCAKE_UR], ...(params.blockNumber === undefined ? {} : { blockNumber: params.blockNumber }) }),
+      ]);
+      if (venue[0] !== 1 || !isAddressEqual(venue[1], PANCAKE_UR) || route === null ||
+          route.amountOut < amountOutMinWithBuffer(params.minGross)) return null;
+      return buildStep({ ...params.step, executor: params.executor, oracleFloor: params.minimum,
+        minGross: params.minGross, poolFee: 0,
+        ...(route.kind === 'v3' ? { path: route.path } : { v2Tokens: route.tokens }) });
+    })().catch(() => null), new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), PANCAKE_QUOTE_TIMEOUT_MS);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+
+/** Revalidate every leg after fallback; never resize another leg's already quoted calldata. */
+async function validateFallbackPlan(params: {
+  publicClient: PublicClient; oracle: Address; steps: readonly PlannedStep[]; feeBps: number;
+  executor?: Address; account?: Address; blockNumber?: bigint; query?: QueryFn;
+}): Promise<string | null> {
+  try {
+    if (params.executor === undefined || params.account === undefined) return '[FALLBACK_LIMITS_UNAVAILABLE] 缺少 executor/account，不送交易';
+    const blockNumber = params.blockNumber ?? await params.publicClient.getBlockNumber({ cacheTime: 0 });
+    const numeraire = await params.publicClient.readContract({ address: params.executor, abi: EXECUTOR_BUY_ABI,
+      functionName: 'numeraire', blockNumber });
+    const decimals = await numeraireDecimals(params.publicClient, numeraire, [], blockNumber);
+    const scale = 10n ** BigInt(decimals);
+    const assets = params.steps.map((step) => sameAsset(step.tokenIn, numeraire) ? step.tokenOut : step.tokenIn);
+    const limits = await readMaxLegUsdE8(assets, params.query);
+    const hasBuy = params.steps.some((step) => sameAsset(step.tokenIn, numeraire));
+    let cash = hasBuy ? await params.publicClient.readContract({ address: numeraire, abi: [{ type: 'function', name: 'balanceOf',
+      stateMutability: 'view', inputs: [{ type: 'address' }], outputs: [{ type: 'uint256' }] }],
+      functionName: 'balanceOf', args: [params.account], blockNumber }) : 0n;
+    let totalBuy = 0n;
+    for (const step of params.steps) {
+      if (step.amountIn <= 0n || step.amountIn > UINT160_MAX) return '[MAX_LEG_INVALID] 無效的單筆數量，不送交易';
+      const buying = sameAsset(step.tokenIn, numeraire);
+      if (!buying && !sameAsset(step.tokenOut, numeraire)) return '[MAX_LEG_ROUTE] 非 numeraire 路徑，不送交易';
+      const nominal = buying ? step.amountIn : await nominalSellQuote(params.publicClient, params.oracle, step.tokenIn, numeraire, step.amountIn, blockNumber);
+      const limit = limitOf(limits, buying ? step.tokenOut : step.tokenIn);
+      if (limit !== null && (limit <= 0n || nominal * USD_E8 > limit * scale)) return '[MAX_LEG_EXCEEDED] 重建後整筆的單筆上限不符，不送交易';
+      if (buying) {
+        totalBuy += nominal;
+        if (step.amountIn > cash) return '[BUY_CASH_EXCEEDED] 重建後現金與先前賣出保證淨額不足，不送交易';
+        cash -= step.amountIn;
+      } else {
+        cash += step.amountOutMin - step.amountOutMin * BigInt(params.feeBps) / BPS_BIG;
+      }
+    }
+    if (totalBuy > 0n) {
+      const budget = await readBuyBudget({ publicClient: params.publicClient, executor: params.executor,
+        account: params.account, oracle: params.oracle, blockNumber });
+      if ('kind' in budget) return budget.reason;
+      if (totalBuy > budget.remaining) return '[BUY_ALLOWANCE_EXCEEDED] 重建後整筆買入額度不足，不送交易';
+    }
+    return null;
+  } catch { return '[FALLBACK_LIMITS_UNAVAILABLE] 重建後整筆限額、RPC 或 DB 資料不可用，不送交易'; }
 }
 
 /** 「部分執行」在理由字串裡的那一段。被縮小**不是錯誤**，所以用「⚠ 部分執行」而不是「失敗」。 */
@@ -1416,7 +1510,7 @@ async function capLegByImpact(params: {
 type BuyBudget = { cap: bigint; bought: bigint; windowEndsAt: bigint; remaining: bigint; note: string };
 
 /** Fail closed without copying RPC errors (which may contain credentials) into API/logs. */
-async function readBuyBudget(args: PlanRebalanceArgs): Promise<BuyBudget | Extract<RebalancePlan, { kind: 'blocked' }>> {
+async function readBuyBudget(args: Pick<PlanRebalanceArgs, 'publicClient' | 'executor' | 'account' | 'oracle' | 'blockNumber'>): Promise<BuyBudget | Extract<RebalancePlan, { kind: 'blocked' }>> {
   try {
     const result: unknown = await args.publicClient.readContract({
       address: args.executor, abi: EXECUTOR_BUY_ABI, functionName: 'buyAllowance',

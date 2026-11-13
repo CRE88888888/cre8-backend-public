@@ -496,7 +496,7 @@ type StubChain = {
   planPortfolioCalls: number[];
   planRebalanceCalls: number;
   /** 送出前重問地板被呼叫的次數與輸入（釘住「真的在送出前問了」）。 */
-  refreshCalls: { steps: readonly PlannedStep[]; strategyId: bigint; executor: Address }[];
+  refreshCalls: { account: Address; steps: readonly PlannedStep[]; strategyId: bigint; executor: Address }[];
   /** 重問地板的結果；預設「地板沒變」＝既有測試的行為完全不動。 */
   refresh: (input: { steps: readonly PlannedStep[] }) => Promise<RefreshFloorsResult>;
   /** 每一把 key 被讀 `permissionConfig` 的對象地址（必須是 smart account，不是 owner）。 */
@@ -565,7 +565,7 @@ function deps(db: StubDb, chain: StubChain, extra: SchedulerDeps = {}): Schedule
      * 送出前重問地板（預設實作會讀真鏈：`executor.oracle()` / `effectiveFeeBps` / `previewSwap`，
      * 測試一律不碰鏈，所以這裡注入 stub）。預設 stub 回「地板沒變」，既有測試的斷言因此完全不受影響。
      */
-    refreshFloors: async (input: { steps: readonly PlannedStep[]; strategyId: bigint; executor: Address }) => {
+    refreshFloors: async (input: { account: Address; steps: readonly PlannedStep[]; strategyId: bigint; executor: Address }) => {
       chain.refreshCalls.push(input);
       return chain.refresh(input);
     },
@@ -3327,4 +3327,18 @@ test('#52 a secondary failure after submission retains the original in-flight op
   assert.equal(db.operations[0]?.state, 'submitted');
   assert.equal(db.operations[0]?.attempts, 1);
   assert.equal(chain.executeCalls.length, 0);
+});
+
+test('#54 fallback Pancake venue/data are executed and hashed, and account reaches refresh', async () => {
+  const fallback = encodableStep();
+  const planned = { ...fallback, venue: TOKEN_OUT, data: '0x12345678' as const };
+  const chain = stubChain({ rebalance: readyPlan([planned]), refresh: async () => ({ ok: true, steps: [fallback], refreshes: [], note: 'api-failed → Pancake' }) });
+  const { db, round } = dueRound(chain);
+  const result = (await round).results[0]; assert.ok(result);
+  assert.equal(result.outcome, 'executed');
+  assert.equal(chain.refreshCalls[0]?.account, ACCOUNT);
+  assert.deepEqual(chain.executeCalls[0]?.steps, [fallback]);
+  assert.equal(result.plan?.planHash, planHashFor([fallback], 1_800_000_300n));
+  assert.notEqual(result.plan?.planHash, planHashFor([planned], 1_800_000_300n));
+  assert.equal(db.operations[0]?.payloadHash, result.plan?.planHash);
 });

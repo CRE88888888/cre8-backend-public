@@ -1641,6 +1641,21 @@ preflight 不可從 genesis 查 VenueSet：本機 fork 會把 fork 以前的區�
 使用部署 receipt 的 `EXECUTOR_DEPLOYMENT_BLOCK`，讀事件後逐個查當前 venues；讀取失敗不得當成空白名單。
 
 
+### 送出前 Kyber 重問失敗：只重建失敗步驟，不沿用 opaque data
+
+`quoteKyberSwap` 的 null 曾把 API／RPC 失敗或逾時、低於地板、venue 改變合成整筆 blocked，
+導致第一次配置與提領重試才偶爾成功。#54 在送出前針對失敗步驟重新搜尋 Pancake 路徑，
+以原本 amountIn、新鮮 oracle floor、平台費及 buffer 重建 struct 與 router inputs。
+搜尋受 5 秒／每次 eth_call 500000 gas 約束；沒有真實 Pancake 報價或白名單驗證就 blocked，
+不會猜一個 fee tier，也不會拿舊 Kyber calldata 當 Pancake data。
+
+log 僅記分類 `api-failed`（API／RPC／逾時）、`below-floor`、`venue-changed`（含白名單移除），
+不印 API 原文。任一步 fallback 後，**整筆**重新讀最新買入額度、現金及單筆限額，買入也不能超過現金加先前賣出的保證淨額；賣出用 oracle
+名義報價，不用折價 floor。超限、DB／RPC 失敗或資料缺漏一律不送；地板惡化門檻仍保留。
+既有 operations 在途保護與 planHash 流程沿用，hash 描述刷新後真正送出的 venue/data。
+#54 fork 驗收先取送出前最新塊，再於同一塊預熱／刷新；實測候選搜尋未釘塊時曾花 11.5 秒，
+釘住新鮮塊後約 76 ms。五秒內拿不到報價仍應 blocked，不為驗收放寬產品逾時。
+
 ### A11 fork：先預熱同一筆 calldata，再交給 alto 估 gas
 
 #47 的 DOGE 1,000 USDT 路徑會讀許多池子。冷 fork 上，alto 的外層 `handleOps`

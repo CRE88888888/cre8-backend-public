@@ -499,6 +499,7 @@ export type RebalancePlanningInput = { portfolioId: number; account: Address; pl
 
 /** 送出前重問地板的輸入。`executor` 是 chain 上 `oracle()` 的讀取點，`strategyId` 是 `effectiveFeeBps` 的 key。 */
 export type FloorRefreshInput = {
+  account: Address;
   deadline: bigint;
   steps: readonly PlannedStep[];
   /** **鏈上** strategy id（`enrollment.strategyId`），不是 DB 的 `strategies.id`。 */
@@ -1597,7 +1598,7 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
      */
     refreshFloors:
       provided.refreshFloors ??
-      (async ({ steps, strategyId, executor, deadline }: FloorRefreshInput) => {
+      (async ({ steps, strategyId, executor, deadline, account }: FloorRefreshInput) => {
         try {
           const publicClient = defaultPublicClient();
           const [oracle, feeBpsRaw] = await Promise.all([
@@ -1609,7 +1610,8 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
               args: [strategyId],
             }),
           ]);
-          return await refreshFloors({ publicClient, oracle, steps, feeBps: Number(feeBpsRaw), executor, deadline });
+          return await refreshFloors({ publicClient, oracle, steps, feeBps: Number(feeBpsRaw), executor, deadline,
+            account, query, log: provided.log ?? console.log });
         } catch (error) {
           return {
             ok: false,
@@ -2114,6 +2116,7 @@ async function decideAndMaybeExecute(
   // 也是 `idempotency_key` 的一部分）涵蓋 `amountOutMin`，所以它必須描述**真的會上鏈**的那組參數。
   const executor = ctx.deps.executor ?? executorAddress();
   const refresh = await ctx.deps.refreshFloors({
+    account: due.account,
     steps: rebalance.steps,
     deadline: rebalance.deadline,
     strategyId: BigInt(plan.pinnedVersion.onchainStrategyId),

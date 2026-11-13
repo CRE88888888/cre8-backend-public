@@ -2292,7 +2292,7 @@ function pancakePayload(step: PlannedStep): { commands: Hex; inputs: readonly He
 }
 
 // #47: opaque aggregator payloads must be rebuilt against the fresh floor, never reused.
-test('#47 aggregator refresh converts thrown upstream failures to a blocked result without leaking details', async () => {
+test('#47 aggregator refresh with no executable Pancake quote blocks without leaking upstream details', async () => {
   const chain = baseChain();
   const planned = { ...buildStep({ executor: EXECUTOR, tokenIn: WBNB, tokenOut: USDT,
     amountIn: 1n, oracleFloor: chain.oracle.minimum, minGross: chain.oracle.minimum, poolFee: 500 }),
@@ -2423,7 +2423,7 @@ test('#47 shared routing selects aggregator, falls back on failure, and blocks a
   assert.equal(await buildRoutedStep({ ...params, publicClient: f.request.publicClient }, { quoteAggregator: async () => null }), null);
 });
 
-test('#47 refresh replaces opaque data using the fresh buffered floor, and rejects missing, changed or insufficient quotes', async () => {
+test('#47 refresh replaces opaque data using the fresh buffered floor; failed fallback and missing context block', async () => {
   const chain = baseChain();
   const planned = { ...buildStep({ executor: EXECUTOR, tokenIn: WBNB, tokenOut: USDT, amountIn: 1n,
     oracleFloor: chain.oracle.minimum, minGross: chain.oracle.minimum, poolFee: 500 }), venue: REGISTRY, data: '0x12345678' as const };
@@ -2511,4 +2511,191 @@ test('#52 a faulty held feed in buyAllowance preserves independent healthy sells
   const plan = expectReady(await planRebalance(hubArgs(chain, { holdings, targets, thresholdBps: 100 })));
   assert.equal(plan.steps.length, 1); assert.equal(plan.steps[0]?.tokenIn, getAddress(WBNB));
   assert.match(plan.rationale, /StaleFeed/);
+});
+
+// #54: keep these RPCs real ABI round trips; fallback calldata must describe exactly the fresh quote.
+function refreshFallbackFixture() {
+  const abi = parseAbi([
+    'function previewSwap(address,address,uint256) view returns(uint256,uint256)',
+    'function venues(address) view returns(uint8,address)',
+    'function getPool(address,address,uint24) view returns(address)',
+    'function quoteExactInput(bytes,uint256) returns(uint256,uint160[])',
+    'function numeraire() view returns(address)', 'function decimals() view returns(uint8)',
+    'function balanceOf(address) view returns(uint256)', 'function buyAllowance(address) view returns(uint256,uint256,uint64)',
+  ]);
+  const state: { floor: bigint; nominal: bigint; pancakeOut: bigint; cash: bigint; allowed: boolean; cap: bigint; bought: bigint;
+    limit: string | null; failure: string; calls: string[]; logs: string[] } = {
+    floor: 100n, nominal: 105n, pancakeOut: 110n, cash: 2n ** 255n, allowed: true, cap: 1000n, bought: 0n,
+    limit: '0.00000001', failure: '', calls: [], logs: [] };
+  const client = createPublicClient({ transport: custom({ request: async ({ method, params }) => {
+    if (method === 'eth_blockNumber') return '0x2a';
+    assert.equal(method, 'eth_call'); assert.ok(Array.isArray(params));
+    const raw: unknown = params[0]; assert.ok(typeof raw === 'object' && raw !== null);
+    const data: unknown = Reflect.get(raw, 'data'); assert.ok(typeof data === 'string' && isHex(data));
+    const call = decodeFunctionData({ abi, data }); state.calls.push(call.functionName);
+    if (state.failure === call.functionName) throw new Error('RPC private-token');
+    if (call.functionName === 'previewSwap') return encodeFunctionResult({ abi, functionName: call.functionName, result: [state.nominal, state.floor] });
+    if (call.functionName === 'venues') return encodeFunctionResult({ abi, functionName: call.functionName, result: [state.allowed ? 1 : 0, PANCAKE_UR] });
+    if (call.functionName === 'getPool') return encodeFunctionResult({ abi, functionName: call.functionName, result: call.args[2] === 500 ? WBNB_USDT_POOL : zeroAddress });
+    if (call.functionName === 'quoteExactInput') return encodeFunctionResult({ abi, functionName: call.functionName, result: [state.pancakeOut, []] });
+    if (call.functionName === 'balanceOf') return encodeFunctionResult({ abi, functionName: call.functionName, result: state.cash });
+    if (call.functionName === 'numeraire') return encodeFunctionResult({ abi, functionName: call.functionName, result: USDT });
+    if (call.functionName === 'decimals') return encodeFunctionResult({ abi, functionName: call.functionName, result: 18 });
+    return encodeFunctionResult({ abi, functionName: 'buyAllowance', result: [state.cap, state.bought, 0n] });
+  } }, { retryCount: 0 }) });
+  const planned: PlannedStep = { tokenIn: USDT, tokenOut: WBNB, amountIn: 100n, oracleFloor: 100n,
+    amountOutMin: 101n, venue: REGISTRY, data: '0x12345678' };
+  const params = { publicClient: client, oracle: ORACLE, executor: EXECUTOR, account: TOKEN3,
+    deadline: 2000000000n, feeBps: 0, steps: [planned], blockNumber: 42n,
+    query: async () => {
+      if (state.failure === 'DB') throw new Error('DB private-token');
+      return { rows: state.failure === 'missing-limit' ? [] : [WBNB, TOKEN3].map((address) => ({ address, max_leg_usdt: state.limit })) };
+    }, log: (line: string) => state.logs.push(line),
+  };
+  return { state, planned, params };
+}
+
+for (const failure of ['api-failed', 'below-floor', 'venue-changed'] as const) {
+  test(`#54 ${failure} rebuilds only the failed leg on Pancake at the fresh buffered floor`, async () => {
+    const f = refreshFallbackFixture();
+    const healthy = { ...f.planned, tokenOut: TOKEN3, data: '0x87654321' as const };
+    const result = await refreshFloors({ ...f.params, steps: [f.planned, healthy], quoteAggregator: async (request) => {
+      if (request.tokenOut === TOKEN3) return { venue: REGISTRY, data: healthy.data, amountOut: request.minimum };
+      if (failure === 'api-failed') return null;
+      return { venue: failure === 'venue-changed' ? TOKEN3 : REGISTRY, data: '0xaabbccdd', amountOut: failure === 'below-floor' ? request.minimum - 1n : request.minimum };
+    } });
+    assert.ok(result.ok);
+    const fallback = result.steps[0]; assert.ok(fallback);
+    assert.equal(fallback.venue, PANCAKE_UR);
+    const input = decodeStepInput(fallback);
+    assert.equal(input.recipient, getAddress(EXECUTOR)); assert.equal(input.amountIn, f.planned.amountIn);
+    assert.equal(input.amountOutMin, amountOutMinWithBuffer(f.state.floor));
+    assert.equal(fallback.amountOutMin, input.amountOutMin);
+    assert.equal(fallback.oracleFloor, f.state.floor);
+    assert.equal(result.steps[1]?.venue, REGISTRY); assert.equal(result.steps[1]?.data, healthy.data);
+    assert.ok(f.state.logs.some((line) => line.includes(failure)));
+    assert.doesNotMatch(JSON.stringify(result, (_key, value: unknown) => typeof value === 'bigint' ? value.toString() : value) + f.state.logs.join(), /private-token/);
+  });
+}
+
+for (const failure of ['quoteExactInput', 'venues', 'numeraire', 'decimals', 'buyAllowance', 'balanceOf', 'DB', 'missing-limit']) {
+  test(`#54 fallback fails closed on ${failure} without exposing errors`, async () => {
+    const f = refreshFallbackFixture(); f.state.failure = failure;
+    const result = await refreshFloors({ ...f.params, quoteAggregator: async () => null });
+    assert.equal(result.ok, false);
+    assert.doesNotMatch(JSON.stringify(result, (_key, value: unknown) => typeof value === 'bigint' ? value.toString() : value) + f.state.logs.join(), /private-token/);
+  });
+}
+
+test('#54 Pancake exact buffered floor passes; zero/below floor and removed venue block', async () => {
+  for (const output of [0n, 100n, 101n]) {
+    const f = refreshFallbackFixture(); f.state.pancakeOut = output;
+    assert.equal((await refreshFloors({ ...f.params, quoteAggregator: async () => null })).ok, output === 101n);
+  }
+  const f = refreshFallbackFixture(); f.state.allowed = false;
+  assert.equal((await refreshFloors({ ...f.params, quoteAggregator: async () => null })).ok, false);
+});
+
+test('#54 rebuilt whole plan rechecks total buy allowance with 98% cap and exact boundary', async () => {
+  for (const bought of [779n, 780n, 781n, 980n]) {
+    const f = refreshFallbackFixture(); f.state.bought = bought;
+    const result = await refreshFloors({ ...f.params, steps: [f.planned, { ...f.planned, tokenOut: TOKEN3 }], quoteAggregator: async () => null });
+    assert.equal(result.ok, bought <= 780n);
+  }
+});
+
+test('#54 per-leg cap checks original input for buys and fresh nominal quote for sells', async () => {
+  for (const sell of [false, true]) for (const cap of ['0', '0.00000000', '0.00000001', null]) {
+    const f = refreshFallbackFixture(); f.state.limit = cap;
+    const step = sell ? { ...f.planned, tokenIn: WBNB, tokenOut: USDT } : f.planned;
+    const result = await refreshFloors({ ...f.params, steps: [step], quoteAggregator: async () => null });
+    assert.equal(result.ok, cap === null || cap === '0.00000001');
+  }
+});
+
+test('#54 fallback rechecks nominal sell cap at equality and one raw unit over it', async () => {
+  for (const nominal of [100n * 10n ** 8n, 100n * 10n ** 8n + 1n]) {
+    const f = refreshFallbackFixture(); f.state.nominal = nominal;
+    const result = await refreshFloors({ ...f.params, steps: [{ ...f.planned, tokenIn: WBNB, tokenOut: USDT }], quoteAggregator: async () => null });
+    assert.equal(result.ok, nominal === 100n * 10n ** 8n);
+  }
+});
+
+for (const scenario of ['API', 'RPC', 'timeout', 'route-floor', 'build-floor', 'removed', 'target'] as const) {
+  test(`#54 real Kyber ${scenario} reports only its diagnostic category`, async () => {
+    const f = kyberFixture(); const reasons: string[] = [];
+    if (scenario === 'RPC') f.state.rpcFailure = true;
+    if (scenario === 'route-floor') f.summary.amountOut = '109';
+    if (scenario === 'build-floor') f.built.data.amountOut = '109';
+    if (scenario === 'removed') f.state.kind = 0;
+    if (scenario === 'target') f.built.data.routerAddress = TOKEN3;
+    const result = await quoteKyberSwap({ ...f.request, onFailure: (reason) => reasons.push(reason) }, {
+      fetch: scenario === 'timeout' ? async () => new Promise<Response>(() => {}) :
+        scenario === 'API' ? async () => new Response('private-token', { status: 503 }) : f.fetcher,
+      timeoutMs: 20,
+    });
+    assert.equal(result, null);
+    assert.deepEqual(reasons, [scenario === 'route-floor' || scenario === 'build-floor' ? 'below-floor' :
+      scenario === 'removed' || scenario === 'target' ? 'venue-changed' : 'api-failed']);
+  });
+}
+
+test('#54 real null Kyber diagnostic reaches fallback log for floor and removed venue', async () => {
+  for (const removed of [false, true]) {
+    const f = refreshFallbackFixture(); const kyber = kyberFixture();
+    kyber.request.minimum = 101n;
+    if (removed) kyber.state.kind = 0; else kyber.summary.amountOut = '100';
+    const result = await refreshFloors({ ...f.params,
+      quoteAggregator: (request) => quoteKyberSwap({ ...kyber.request, onFailure: request.onFailure }, { fetch: kyber.fetcher }) });
+    assert.ok(result.ok);
+    assert.match(f.state.logs.join(), new RegExp(removed ? 'venue-changed' : 'below-floor'));
+  }
+});
+
+test('#54 fallback preserves the floor collapse guard and blocks missing account', async () => {
+  const f = refreshFallbackFixture(); f.state.floor = 99n;
+  const collapsed = await refreshFloors({ ...f.params, quoteAggregator: async () => null });
+  assert.ok(!collapsed.ok); assert.equal(collapsed.kind, 'floor-collapsed');
+  f.state.floor = 100n;
+  assert.equal((await refreshFloors({ ...f.params, account: undefined, quoteAggregator: async () => null })).ok, false);
+});
+
+test('#54 thrown quote falls back and a non-cooperative Pancake RPC terminates safely', { timeout: 10000 }, async () => {
+  const f = refreshFallbackFixture();
+  const result = await refreshFloors({ ...f.params, quoteAggregator: async () => { throw new Error('API private-token'); } });
+  assert.ok(result.ok); assert.match(f.state.logs.join(), /api-failed/); assert.doesNotMatch(f.state.logs.join(), /private-token/);
+  const client: PublicClient = { ...f.params.publicClient, call: async () => new Promise<never>(() => {}) };
+  const stalled = await refreshFloors({ ...f.params, publicClient: client, quoteAggregator: async () => null });
+  assert.equal(stalled.ok, false);
+});
+
+test('#54 fallback checks untouched legs against their own cap and buys at the raw cap boundary', async () => {
+  const rawCap = 10n ** 10n;
+  for (const amountIn of [rawCap, rawCap + 1n]) {
+    const f = refreshFallbackFixture(); f.state.cap = 10n ** 20n;
+    const healthy = { ...f.planned, tokenOut: TOKEN3, amountIn };
+    const result = await refreshFloors({ ...f.params, steps: [f.planned, healthy], quoteAggregator: async (request) =>
+      request.tokenOut === TOKEN3 ? { venue: REGISTRY, data: '0x87654321', amountOut: request.minimum } : null });
+    assert.equal(result.ok, amountIn === rawCap);
+    if (!result.ok) assert.match(result.reason, /MAX_LEG_EXCEEDED/);
+  }
+});
+
+test('#54 fallback amountIn rejects zero and uint160 overflow and accepts uint160 max', async () => {
+  const max = 2n ** 160n - 1n;
+  for (const amountIn of [0n, max, max + 1n]) {
+    const f = refreshFallbackFixture(); f.state.limit = null; f.state.cap = 2n ** 255n;
+    const result = await refreshFloors({ ...f.params, steps: [{ ...f.planned, amountIn }], quoteAggregator: async () => null });
+    assert.equal(result.ok, amountIn === max);
+  }
+});
+
+test('#54 rebuilt buys must also fit fresh cash plus prior net sell floors', async () => {
+  for (const cash of [97n, 98n, 99n]) {
+    const f = refreshFallbackFixture(); f.state.cash = cash;
+    const result = await refreshFloors({ ...f.params, feeBps: 100,
+      steps: [{ ...f.planned, tokenIn: WBNB, tokenOut: USDT }, { ...f.planned, amountIn: 200n }], quoteAggregator: async () => null });
+    // Net guarantee: minGross(100, 100bps)=102, buffered=103, fee=floor(103/100)=1 -> 102.
+    assert.equal(result.ok, cash + 102n >= 200n);
+  }
 });

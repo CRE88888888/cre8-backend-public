@@ -858,8 +858,28 @@ UserOp；黑名單永遠會漏一個方法，白名單漏掉的代價只是一�
 recipient 固定 executor，不附 native value。只使用鏈上白名單的 ERC20_APPROVE／PERMIT2 venue，
 並驗證 build target 與 route router 一致。依相同平台費率比較整數淨得量，平手保留 Pancake；
 API／白名單 RPC 失敗或整段超過 5 秒時退回 Pancake。OpenOcean 未接入。
-送出前重新讀 oracle 地板並重建 payload；聚合器刷新失敗或 venue 改變時，本輪阻擋，不送舊 calldata。
+送出前重新讀 oracle 地板並重建 payload。聚合器 API／RPC 失敗或逾時、報價低於新鮮地板、venue
+改變（含 Safe 移除白名單）時，只把失敗那一步改由 Pancake 重新搜尋、報價與重建，保留原數量，
+其他步驟照原計畫刷新。Pancake 必須仍在白名單，且實際報價達到含平台費與緩衝的新鮮地板；
+沒有可驗證報價、超過 5 秒或低於地板就 blocked。整筆再檢查最新買入額度（cap × 98% − bought）、
+現金加先前賣出的保證淨額，與 DB 各資產單筆上限；超限／RPC／DB 資料缺漏時不送交易，也不改動其他步驟來湊額度。
+既有地板惡化門檻仍會放棄本輪。log 分開記 `api-failed`、`below-floor`、`venue-changed`，
+不含 API 回應原文；舊聚合器 calldata 不會被重用。
 API 的 steps 與 scheduler log 帶 venue，DB schema 不變。
+
+#54 fork 驗收只使用 anvil **8646**、Postgres **cre8_x1k**（API 若啟動只用 **8182**）。
+以合約 `origin/main` 封存至 `.bun-cache/issue54/contracts` 並 `forge build --root` 編譯；
+以本節相同的 anvil 參數起乾淨 fork（埠改為 8646）。測試使用合約測試帳戶與公開 anvil 助記詞，
+規劃階段注入 Pancake quoter 不可用以選到**真實** Kyber 報價，送出前則只對 Kyber 注入 null；
+送出前取最新區塊，Pancake 候選預熱與刷新釘在同一塊；第一次配置、提領均實際經 Pancake
+成交並驗 receipt／SwapExecuted／地板。此驗收不經 bundler／HTTP。
+
+```bash
+DATABASE_URL='postgres:///cre8_x1k' \
+MIGRATIONS_DIR="$PWD/../db/migrations" \
+RPC_URL='http://127.0.0.1:8646' RUN_CHAIN_TESTS=1 \
+bun test ./test/kyber-requote-fallback.fork.ts --timeout=120000
+```
 
 preflight 需要 `EXECUTOR_DEPLOYMENT_BLOCK`（executor 部署 receipt 的 blockNumber），用來從部署開始
 讀 `VenueSet`，再讀各 venue 的當前狀態，已移除的 venue 不列出。UR 必須為 PANCAKE_UR 且 spender=UR。

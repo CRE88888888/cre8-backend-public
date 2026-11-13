@@ -6,6 +6,7 @@ const API = 'https://aggregator-api.kyberswap.com/bsc/api/v1';
 export const AGGREGATOR_TIMEOUT_MS = 5_000;
 const UINT256_MAX = (1n << 256n) - 1n;
 export type AggregatorQuote = { venue: Address; data: Hex; amountOut: bigint };
+export type AggregatorFailure = 'api-failed' | 'below-floor' | 'venue-changed';
 export type AggregatorRequest = {
   publicClient: PublicClient;
   executor: Address;
@@ -15,6 +16,8 @@ export type AggregatorRequest = {
   minimum: bigint;
   deadline: bigint;
   blockNumber?: bigint;
+  /** Local diagnostics only; never receives upstream text or response data. */
+  onFailure?: (reason: AggregatorFailure) => void;
 };
 export type AggregatorQuoter = (request: AggregatorRequest) => Promise<AggregatorQuote | null>;
 
@@ -40,8 +43,12 @@ export async function quoteKyberSwap(request: AggregatorRequest, deps: {
   timeoutMs?: number;
 } = {}): Promise<AggregatorQuote | null> {
   const { publicClient, executor, tokenIn, tokenOut, amountIn, minimum, deadline } = request;
+  let failure: AggregatorFailure = 'api-failed';
+  const rejected = (reason: AggregatorFailure): null => { failure = reason; return null; };
   if (amountIn <= 0n || amountIn > UINT256_MAX || minimum <= 0n || minimum > UINT256_MAX || same(tokenIn, tokenOut) ||
-      deadline <= 0n || deadline > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+      deadline <= 0n || deadline > BigInt(Number.MAX_SAFE_INTEGER)) {
+    request.onFailure?.(failure); return null;
+  }
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   // Promise.race bounds RPC, response body parsing and non-cooperative fetch implementations too.
@@ -64,12 +71,13 @@ export async function quoteKyberSwap(request: AggregatorRequest, deps: {
     const route = await json(`${API}/routes?${query}`, { method: 'GET' });
     const summary = record(route.routeSummary);
     if (!same(address(summary.tokenIn), tokenIn) || !same(address(summary.tokenOut), tokenOut) ||
-        amount(summary.amountIn) !== amountIn || amount(summary.amountOut) < minimum) return null;
+        amount(summary.amountIn) !== amountIn) return null;
+    if (amount(summary.amountOut) < minimum) return rejected('below-floor');
     const venue = address(route.routerAddress);
     if ([zeroAddress, tokenIn, tokenOut, executor].some((item) => same(venue, item))) return null;
     const [kind, spender] = await publicClient.readContract({ address: executor, abi: EXECUTOR_ABI,
       functionName: 'venues', args: [venue], ...(request.blockNumber === undefined ? {} : { blockNumber: request.blockNumber }) });
-    if ((kind !== 2 && kind !== 3) || [zeroAddress, tokenIn, tokenOut, executor].some((item) => same(spender, item))) return null;
+    if ((kind !== 2 && kind !== 3) || [zeroAddress, tokenIn, tokenOut, executor].some((item) => same(spender, item))) return rejected('venue-changed');
     if (kind === 3 && amountIn > (1n << 160n) - 1n) return null;
     const quoted = amount(summary.amountOut);
     const slippage = (quoted - minimum) * 10_000n / quoted;
@@ -79,13 +87,18 @@ export async function quoteKyberSwap(request: AggregatorRequest, deps: {
     }) });
     // APIv1 routerAddress is the transaction target (tx.to). Reject a differing explicit to too.
     const to = address(built.routerAddress);
-    if (!same(to, venue) || (built.to !== undefined && !same(address(built.to), venue)) ||
-        amount(built.transactionValue) !== 0n || amount(built.amountIn) !== amountIn || amount(built.amountOut) < minimum ||
+    if (!same(to, venue) || (built.to !== undefined && !same(address(built.to), venue))) return rejected('venue-changed');
+    if (amount(built.amountOut) < minimum) return rejected('below-floor');
+    if (amount(built.transactionValue) !== 0n || amount(built.amountIn) !== amountIn ||
         typeof built.data !== 'string' || !isHex(built.data, { strict: true }) ||
         !/^0x(?:[0-9a-fA-F]{2}){4,}$/.test(built.data)) return null;
     return { venue: to, data: built.data, amountOut: amount(built.amountOut) };
   };
-  try { return await Promise.race([work().catch(() => null), timeout]); }
+  try {
+    const quote = await Promise.race([work().catch(() => null), timeout]);
+    if (quote === null) request.onFailure?.(failure);
+    return quote;
+  }
   finally { clearTimeout(timer); controller.abort(); }
 }
 

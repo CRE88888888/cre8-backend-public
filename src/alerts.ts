@@ -150,8 +150,17 @@ export async function detectAlerts(
   const env = args.env ?? process.env;
   const thresholds = loadAlertThresholds(env);
 
+  const failures = await detectPortfolioFailures(query, thresholds.failingOps);
+  const releases = await detectOperationReleases(query, now);
+  for (const release of releases) {
+    const failure = failures.find((finding) => finding.portfolioId === release.portfolioId);
+    // Same (kind, portfolio) key: preserve a real critical rather than upserting a later warn.
+    if (failure) failure.detail += `；${release.detail}`;
+    else failures.push(release);
+  }
+
   return [
-    ...(await detectPortfolioFailures(query, thresholds.failingOps)),
+    ...failures,
     ...(await detectSessionKeyExpiry(query, { now, expiryDays: thresholds.keyExpiryDays })),
     ...(await detectLowGas(query, {
       chainId: chainIdFromEnv(env),
@@ -163,6 +172,26 @@ export async function detectAlerts(
     // （前三個看 operations / session_keys / 鏈上餘額，這個看快照）。
     ...(await detectPortfolioStuck(query, thresholds.stuckHours)),
   ];
+}
+
+/** Safety releases are not failed attempts. Repeated drops still need an operator's attention. */
+export async function detectOperationReleases(query: QueryFn, now: Date): Promise<AlertFinding[]> {
+  const { rows } = await query(`
+    select portfolio_id, count(*)::int as release_count
+      from operations
+     where type = 'rebalance' and state = 'expired'
+       and updated_at >= $1::timestamptz - interval '24 hours'
+       and updated_at <= $1::timestamptz
+     group by portfolio_id
+    having count(*) >= 3
+  `, [now.toISOString()]).catch(() => { throw new Error('expired 釋放計數讀取失敗，本輪保留既有警示'); });
+  return rows.map((row) => {
+    const fields = row as Record<string, unknown>;
+    const portfolioId = toInteger(fields.portfolio_id, 'portfolio_id');
+    const count = toInteger(fields.release_count, 'release_count');
+    return { kind: 'portfolio_repeatedly_failing', severity: 'warn', portfolioId,
+      detail: `portfolio ${portfolioId}：24 小時內 ${count} 次安全釋放（expired），請檢查 bundler 丟棄或送出失聯` };
+  });
 }
 
 /**
@@ -562,6 +591,7 @@ const SQL_FAILING_TAIL = `
            o.last_error   as last_error,
            row_number() over (partition by o.portfolio_id order by o.id desc) as rn
       from operations o
+     where o.state <> 'expired'
   )
   select portfolio_id,
          count(*)::int                       as failed_count,

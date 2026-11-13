@@ -7,6 +7,7 @@ import {
   detectAlerts,
   detectLowGas,
   detectPortfolioFailures,
+  detectOperationReleases,
   detectSessionKeyExpiry,
   formatAlert,
   healthStatusFor,
@@ -81,6 +82,39 @@ function findSeen(seen: readonly Seen[], fragment: string): Seen {
   assert.ok(hit !== undefined, `沒有發出包含「${fragment}」的 SQL（收到 ${seen.length} 條）`);
   return hit;
 }
+
+test('#39 24 小時內重複安全釋放沿用失敗 kind 的 warn，不覆蓋真正的 critical', async () => {
+  for (const hasFailure of [false, true]) {
+    const { query, seen } = stubQuery((sql) => {
+      if (sql.includes("state = 'expired'")) return [{ portfolio_id: PORTFOLIO_ID, release_count: 3 }];
+      if (hasFailure && sql.includes('with ranked')) return [{ portfolio_id: PORTFOLIO_ID,
+        failed_count: 3, last_state: 'failed', last_error: 'real failure' }];
+      return [];
+    });
+    const findings = await detectAlerts(query, { now: NOW, env: {}, readGasPrice: async () => GAS_PRICE_WEI });
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0]?.kind, 'portfolio_repeatedly_failing');
+    assert.equal(findings[0]?.severity, hasFailure ? 'critical' : 'warn');
+    assert.match(findings[0]?.detail ?? '', /24.*3.*安全釋放/);
+    const statement = findSeen(seen, "state = 'expired'");
+    assert.match(statement.sql, /updated_at >=/);
+    assert.match(statement.sql, /updated_at <=/);
+    assert.match(statement.sql, /count\(\*\) >= 3/);
+    assert.deepEqual(statement.params, [NOW.toISOString()]);
+  }
+});
+
+test('#39 釋放計數 DB 失敗不能解除警示或洩漏連線資料', async () => {
+  const { query, seen } = stubQuery((sql) => {
+    if (sql.includes('as release_count')) throw new Error('sensitive DB token');
+    return [];
+  });
+  const logs: string[] = [];
+  await announceAlerts({ query, now: NOW, chainId: 1337, log: (line) => logs.push(line) });
+  assert.equal(seen.some((entry) => entry.sql.includes('update scheduler_alerts')), false);
+  assert.match(logs.join('\n'), /偵測失敗/);
+  assert.doesNotMatch(logs.join('\n'), /sensitive/);
+});
 
 const TEST_SEED: Hex = `0x${'11'.repeat(32)}`;
 const OTHER_TEST_SEED: Hex = `0x${'22'.repeat(32)}`;
@@ -1087,6 +1121,29 @@ test('真 Postgres：同一個 (kind, portfolio) 連跑兩次 = 一列 occurrenc
         );
         const portfolioId = Number((seeded.rows[0] as { id?: unknown } | undefined)?.id);
         assert.ok(Number.isInteger(portfolioId), 'DB 裡沒有任何 strategy，造不出測試用的 portfolio');
+
+        // #39: real SQL boundaries, including exactly 24h, future rows, and warn lifecycle.
+        for (let index = 0; index < 2; index += 1) {
+          await q(`insert into operations (portfolio_id, type, state, idempotency_key, updated_at)
+            values ($1, 'rebalance', 'expired', $2, $3)`, [portfolioId, `release-${portfolioId}-${index}`, NOW]);
+        }
+        const releases = async () => (await detectOperationReleases(q, NOW)).filter((entry) => entry.portfolioId === portfolioId);
+        assert.equal((await releases()).length, 0, '2 次不告警');
+        const edge = `release-${portfolioId}-edge`;
+        await q(`insert into operations (portfolio_id, type, state, idempotency_key, updated_at)
+          values ($1, 'rebalance', 'expired', $2, $3)`, [portfolioId, edge, new Date(NOW.getTime() - DAY_MS)]);
+        assert.equal((await releases())[0]?.severity, 'warn', '剛好 24h 的第 3 次列入');
+        assert.equal((await detectPortfolioFailures(q, 3)).some((entry) => entry.portfolioId === portfolioId), false,
+          'expired 不應被連續失敗規則升成 critical');
+        await recordAlerts(q, await releases(), NOW);
+        await recordAlerts(q, await releases(), NOW);
+        assert.equal((await listOpenAlerts(q)).find((entry) => entry.portfolioId === portfolioId)?.occurrences, 2);
+        await q('update operations set updated_at = $2 where idempotency_key = $1', [edge, new Date(NOW.getTime() - DAY_MS - 1)]);
+        assert.equal((await releases()).length, 0, '超出 24h 一毫秒不列入');
+        await q('update operations set updated_at = $2 where idempotency_key = $1', [edge, new Date(NOW.getTime() + 1)]);
+        assert.equal((await releases()).length, 0, '未來列不列入');
+        await resolveAlerts(q, [], NOW);
+        assert.equal((await listOpenAlerts(q)).some((entry) => entry.portfolioId === portfolioId), false);
 
         // ---- 規則 1 對真的 Postgres：三筆 operation 都不是 confirmed ----
         for (const [index, state] of ['failed', 'reverted', 'failed'].entries()) {

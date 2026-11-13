@@ -55,6 +55,7 @@
  *    `planHash` 涵蓋 `tokenIn/tokenOut/amountIn/amountOutMin/deadline`。`confirmed` 永不再送、
  *    portfolio 只要有 `pending`/`submitted` 就先對帳、不送新 plan；舊版帶 hash 的 `failed` 亦同。
  *    明確未送出的 `failed`／已確認 `reverted` 才允許同一個 key 重試（attempts +1）。
+ *    `expired` 只由雙 null 與原 deadline／nonce 證據安全釋放，不算在途、不能重試舊 key。
  *
  * ⑤ **地板的規劃值不是送出值：簽名前一定重問一次**（`deps.refreshFloors`）。
  *    `planRebalance` 的 `minimum` 是 `plan.snapshot.block` 那一塊問到的，而 `AtpExecutor._checkStep`
@@ -96,7 +97,7 @@ import {
 } from 'viem';
 import type { Address, Hex, PublicClient } from 'viem';
 import { hdKeyToAccount } from 'viem/accounts';
-import { createBundlerClient, getUserOperationHash } from 'viem/account-abstraction';
+import { createBundlerClient, entryPoint07Abi, formatUserOperation, formatUserOperationReceipt, getUserOperationHash } from 'viem/account-abstraction';
 import type { GetUserOperationReturnType, UserOperationReceipt } from 'viem/account-abstraction';
 import { activeChain } from './chain-object.js';
 import { KERNEL_V3_3_ADDRESSES } from './addresses.js';
@@ -150,6 +151,9 @@ const ENTRY_POINT = { address: KERNEL_V3_3_ADDRESSES.entryPointV07, version: '0.
 
 /** 交易送出後等 receipt 的上限（毫秒）。超過仍在途，下一輪先對帳，不能重送。 */
 const USER_OP_RECEIPT_TIMEOUT_MS = 180_000;
+
+const RELEASE_MARGIN_SECONDS = 300n;
+const MAX_USER_OP_NONCE = (1n << 256n) - 1n;
 
 /** 三層 policy 都裝好的證據：`policyData` 的長度（call + gas + timestamp）。 */
 const EXPECTED_POLICY_COUNT = 3;
@@ -502,6 +506,8 @@ export type ExecuteArgs = {
   /** Held assets of the pinned version, before any swaps (valuation precedes selling). */
   valuationAssets: readonly Address[];
   deadline: bigint;
+  /** pending 已保存的實際 EntryPoint nonce；估 gas 與送出均不得重新取值。 */
+  nonce: bigint;
   /** 發出 send RPC 前通知：連線中斷且沒收到 hash 也不能推定沒有送出。 */
   onSending: () => void;
   /** 送出（拿到 userOpHash）後立刻回呼，讓排程器把 operations 標成 submitted。 */
@@ -581,8 +587,12 @@ export type SchedulerDeps = {
   readBalance?: (args: Erc20Args) => Promise<bigint>;
   /** 真正送出的路徑。dry-run 時**一次都不會被呼叫**（測試釘住）。 */
   executeRebalance?: (args: ExecuteArgs) => Promise<ExecutionOutcome>;
-  /** 恢復只讀證據，不簽名、不重送；receipt 缺漏回 null，RPC 失敗可拋錯，均保持在途。 */
-  reconcileRebalance?: (input: ReconcileInput) => Promise<ExecutionOutcome | null>;
+  /** 送出前取得所選 Kernel permission 的實際 nonce，pending 落庫後固定使用。 */
+  readRebalanceNonce?: (args: Pick<ExecuteArgs, 'account' | 'sessionKey' | 'executor'>) => Promise<bigint>;
+  readLatestBlockTimestamp?: () => Promise<bigint>;
+  readEntryPointNonce?: (args: { account: Address; key: bigint }) => Promise<bigint>;
+  /** 只讀對帳；只有兩個 bundler 查詢明確回 null 才是 not_found。 */
+  reconcileRebalance?: (input: ReconcileInput) => Promise<ReconcileResult>;
   /**
    * **送出前重問地板**。省略 = `rebalance-plan.ts` 的 `refreshFloors`（讀 `executor.oracle()` 與
    * `registry.effectiveFeeBps(strategyId)`，再對每個 step 重問 `previewSwap`）。
@@ -849,8 +859,8 @@ const SQL_MARK_CHECKED = `
 // ---------------------------------------------------------------------------
 
 const SQL_INSERT_OPERATION = `
-  insert into operations (portfolio_id, type, state, idempotency_key, payload_hash, attempts, updated_at)
-  values ($1, 'rebalance', 'pending', $2, $3, 1, now())
+  insert into operations (portfolio_id, type, state, idempotency_key, payload_hash, attempts, updated_at, deadline, user_op_nonce)
+  values ($1, 'rebalance', 'pending', $2, $3, 1, now(), $4, $5)
   on conflict (idempotency_key) do nothing
   returning attempts
 `;
@@ -859,7 +869,7 @@ const SQL_GET_OPERATION = 'select state, attempts from operations where idempote
 
 // 不依賴 planHash（deadline／價格變了仍擋）。也保護舊版將已送出操作誤寫成 failed 的列。
 const SQL_UNRESOLVED_OPERATIONS = `
-  select idempotency_key, payload_hash, state, user_op_hash, tx_hash
+  select idempotency_key, payload_hash, state, user_op_hash, tx_hash, deadline, user_op_nonce
     from operations
    where portfolio_id = $1 and type = 'rebalance'
      and (state in ('pending', 'submitted')
@@ -873,7 +883,14 @@ type UnresolvedOperation = {
   state: string;
   user_op_hash: Hex | null;
   tx_hash: Hex | null;
+  deadline: Date | null;
+  user_op_nonce: string | null;
 };
+
+export type ReconcileResult =
+  | { kind: 'found'; outcome: ExecutionOutcome }
+  | { kind: 'not_found' }
+  | { kind: 'incomplete'; reason: string };
 
 export type ReconcileInput = {
   account: Address;
@@ -895,6 +912,8 @@ async function unresolvedOperations(query: SchedulerQueryFn, portfolioId: number
 const SQL_RETRY_OPERATION = `
   update operations
      set state = 'pending',
+         deadline = $2,
+         user_op_nonce = $3,
          attempts = attempts + 1,
          last_error = null,
          tx_hash = null,
@@ -923,6 +942,8 @@ const SQL_SETTLE_OPERATION = `
          last_error = $5,
          updated_at = now()
    where idempotency_key = $1
+     and state <> 'expired'
+  returning idempotency_key
 `;
 
 /**
@@ -944,16 +965,17 @@ type OperationGate =
  *   * `confirmed` → 同一個 plan 已經上鏈成功，**永不再送**。
  *   * `pending`/`submitted` → 在途或結果未知，**不重送**：結果未知時重送的代價是重複動錢。
  *   * `failed`/`reverted` → 上一次沒有成交，允許重試（CAS +1 attempts）。
+ *   * `expired` → 舊 plan 已安全釋放，必須使用新計畫的 key，不能重試。
  */
 async function beginOperation(
   query: SchedulerQueryFn,
-  args: { portfolioId: number; idempotencyKey: string; payloadHash: Hex },
+  args: { portfolioId: number; idempotencyKey: string; payloadHash: Hex; deadline: string; nonce: bigint },
 ): Promise<OperationGate> {
   const unresolved = await unresolvedOperations(query, args.portfolioId);
   if (unresolved.length > 0) {
     return { proceed: false, outcome: 'blocked', reason: `portfolio 還在 ${unresolved[0]!.state}，先對帳，不重送` };
   }
-  const inserted = await query(SQL_INSERT_OPERATION, [args.portfolioId, args.idempotencyKey, args.payloadHash]);
+  const inserted = await query(SQL_INSERT_OPERATION, [args.portfolioId, args.idempotencyKey, args.payloadHash, args.deadline, args.nonce.toString()]);
   if (inserted.rows.length > 0) {
     return { proceed: true, attempts: toInteger((inserted.rows[0] as { attempts?: unknown }).attempts, 'operations.attempts') };
   }
@@ -984,7 +1006,11 @@ async function beginOperation(
     };
   }
 
-  const retried = (await query(SQL_RETRY_OPERATION, [args.idempotencyKey])).rows[0] as { attempts?: unknown } | undefined;
+  if (state === 'expired') {
+    return { proceed: false, outcome: 'blocked', reason: '這組參數已安全釋放為 expired，須重新規劃新的 idempotency_key，不能重試舊 key' };
+  }
+
+  const retried = (await query(SQL_RETRY_OPERATION, [args.idempotencyKey, args.deadline, args.nonce.toString()])).rows[0] as { attempts?: unknown } | undefined;
   if (retried === undefined) {
     return {
       proceed: false,
@@ -1285,11 +1311,9 @@ async function runPrechecks(
  *     以 `gas = 那個值` 模擬一次執行。不通過就不簽名 —— 不花錢買 `success = false`。
  *   * **送出後**：`judgeRebalanceOutcome` 三層判定。`tx.status == 1` 單獨不足以叫成功。
  */
-async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<ExecutionOutcome> {
+async function rebalanceKernelAccount(args: Pick<ExecuteArgs, 'account' | 'sessionKey' | 'executor'>) {
   const { masterSeed } = requireSessionKeyConfig();
   const publicClient = defaultPublicClient();
-  // 簽 UserOp 用的鏈物件必須與 RPC 的 chainId 一致（userOpHash 含 chainId）。
-  const network = activeChain();
 
   const keyAccount = hdKeyToAccount(HDKey.fromMasterSeed(hexToBytes(masterSeed)), { path: args.sessionKey.keyRef });
   if (!isAddressEqual(keyAccount.address, args.sessionKey.sessionKeyAddress)) {
@@ -1332,6 +1356,13 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
     throw new Error(`帳戶地址不符：算出 ${account.address} != 已部署 ${args.account}`);
   }
 
+  return account;
+}
+
+async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<ExecutionOutcome> {
+  const publicClient = defaultPublicClient();
+  const network = activeChain();
+  const account = await rebalanceKernelAccount(args);
   const data = encodeFunctionData({
     abi: EXECUTOR_ABI,
     functionName: 'executeRebalance',
@@ -1371,7 +1402,7 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
   // ---- ① gas：`callGasLimit` 明確覆寫，不讓 alto 的估算單獨決定 ---------------------------------
   // alto 對「一筆 op 跑完整條 DeFi 路徑」系統性低估（§8.16 實測 367,885 vs 需要 450–500k），
   // 而 gas 不足的後果不是 revert，是「success = false 但 tx.status = 1」—— 錢扣了、幣沒換。
-  const estimate = await client.estimateUserOperationGas({ calls });
+  const estimate = await client.estimateUserOperationGas({ calls, nonce: args.nonce });
   let numeraire: Address;
   try {
     numeraire = await publicClient.readContract({ address: args.executor, abi: EXECUTOR_BUY_ABI, functionName: 'numeraire' });
@@ -1402,7 +1433,7 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
   // 只覆寫 `callGasLimit`：其餘欄位（verificationGasLimit / preVerificationGas）仍由 alto 估算，
   // 它們與「執行路徑有多長」無關。
   args.onSending();
-  const userOpHash = await client.sendUserOperation({ calls, callGasLimit });
+  const userOpHash = await client.sendUserOperation({ calls, callGasLimit, nonce: args.nonce });
   // alto 有 simulation：被拒的 op **不會**回 userOpHash。所以拿到 hash = 這一筆被接受了。
   await args.onSubmitted({ userOpHash });
 
@@ -1605,12 +1636,31 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
       provided.readBalance ??
       (({ token, owner }: Erc20Args) =>
         defaultPublicClient().readContract({ address: token, abi: ERC20_ABI, functionName: 'balanceOf', args: [owner] })),
+    readRebalanceNonce: provided.readRebalanceNonce ?? (async (input: Pick<ExecuteArgs, 'account' | 'sessionKey' | 'executor'>) =>
+      (await rebalanceKernelAccount(input)).getNonce()),
+    readLatestBlockTimestamp: provided.readLatestBlockTimestamp ?? (async () => (await defaultPublicClient().getBlock({ blockTag: 'latest' })).timestamp),
+    readEntryPointNonce: provided.readEntryPointNonce ?? (async ({ account, key }: { account: Address; key: bigint }) =>
+      defaultPublicClient().readContract({ address: ENTRY_POINT.address, abi: entryPoint07Abi,
+        functionName: 'getNonce', args: [account, key] })),
     executeRebalance: provided.executeRebalance ?? sendRebalanceWithSessionKey,
     reconcileRebalance: provided.reconcileRebalance ?? (async (input: ReconcileInput) => {
       const bundler = createBundlerClient({ transport: http(bundlerUrl()) });
       return readRebalanceReceipt(input, {
-        getReceipt: (hash) => bundler.getUserOperationReceipt({ hash }),
-        getOperation: (hash) => bundler.getUserOperation({ hash }),
+        // viem's convenience actions throw on every falsy value. Only an explicit RPC null
+        // means absent; malformed/undefined/error responses must never authorize release.
+        getReceipt: async (hash) => {
+          const raw = await bundler.request({ method: 'eth_getUserOperationReceipt', params: [hash] });
+          if (raw === null) return null;
+          if (!raw || typeof raw !== 'object') throw new Error('receipt RPC 資料不完整');
+          return formatUserOperationReceipt(raw);
+        },
+        getOperation: async (hash) => {
+          const raw = await bundler.request({ method: 'eth_getUserOperationByHash', params: [hash] });
+          if (raw === null) return null;
+          if (!raw || typeof raw !== 'object') throw new Error('UserOp RPC 資料不完整');
+          return { ...raw, userOperation: formatUserOperation(raw.userOperation),
+            blockNumber: raw.blockNumber === null ? null : BigInt(raw.blockNumber) };
+        },
         getBlockHash: async (number) => (await defaultPublicClient().getBlock({ blockNumber: number })).hash,
       });
     }),
@@ -1675,7 +1725,8 @@ export async function runSchedulerOnce(
 
   // ---- 一輪的尾端：告警（偵測 → 寫入 → 解除 → 一行 stdout）----
   // 只加在這裡：認領、前置檢查、間隔推進的邏輯一個字都沒動。
-  await announceAlerts({ query: resolved.query, log: resolved.log, now, dryRun, chainId: resolved.chainId, sessionKeyChecks: resolved, executorPaused });
+  // Live clock must include releases committed during this round; preserve an explicitly injected test clock.
+  await announceAlerts({ query: resolved.query, log: resolved.log, now: args.now ?? new Date(), dryRun, chainId: resolved.chainId, sessionKeyChecks: resolved, executorPaused });
 
   return { claimed: claimed.length, dryRun, results };
 }
@@ -1754,6 +1805,72 @@ export async function announceAlerts(args: {
 }
 
 type ResolvedDeps = ReturnType<typeof resolveDeps>;
+
+function validNonce(nonce: bigint): boolean {
+  return typeof nonce === 'bigint' && nonce >= 0n && nonce <= MAX_USER_OP_NONCE;
+}
+
+const SQL_EXPIRE_OPERATION = `
+  update operations
+     set state = 'expired', last_error = $2, updated_at = now()
+   where idempotency_key = $1 and state = $3
+     and user_op_hash is not distinct from $4
+     and tx_hash is not distinct from $5
+     and user_op_nonce = $6 and deadline = $7 and payload_hash = $8
+  returning idempotency_key
+`;
+
+/** Only called after BOTH bundler lookups returned explicit null. Never sends in this round. */
+async function releaseUnresolvedOperation(
+  due: DuePortfolio,
+  deps: ResolvedDeps,
+  op: UnresolvedOperation,
+  base: Omit<PortfolioRunResult, 'outcome' | 'reason'>,
+): Promise<PortfolioRunResult> {
+  const blocked = (reason: string): PortfolioRunResult => ({ ...base, outcome: 'blocked', reason });
+  const milliseconds = op.deadline instanceof Date ? op.deadline.getTime() : Number.NaN;
+  if (!Number.isSafeInteger(milliseconds) || milliseconds < 0 || milliseconds % 1000 !== 0 ||
+      typeof op.user_op_nonce !== 'string' || !/^\d+$/.test(op.user_op_nonce)) {
+    return blocked('先對帳：缺少有效的原 deadline／user_op_nonce，保留在途，交人工確認');
+  }
+  const savedNonce = BigInt(op.user_op_nonce);
+  if (!validNonce(savedNonce)) return blocked('先對帳：保存的 user_op_nonce 超出 uint256，保留在途');
+  const deadline = BigInt(milliseconds / 1000);
+  let timestamp: bigint;
+  let nonce: bigint;
+  try {
+    [timestamp, nonce] = await Promise.all([
+      deps.readLatestBlockTimestamp(),
+      deps.readEntryPointNonce({ account: due.account, key: savedNonce >> 64n }),
+    ]);
+    if (!validNonce(timestamp) || !validNonce(nonce) || nonce >> 64n !== savedNonce >> 64n) {
+      return blocked('先對帳：鏈上時間／EntryPoint nonce 證據不完整，保留在途');
+    }
+  } catch {
+    return blocked('先對帳：讀取鏈上時間／EntryPoint nonce 失敗，保留在途');
+  }
+  const reasons: string[] = [];
+  if (timestamp > deadline + RELEASE_MARGIN_SECONDS) reasons.push(`deadline 已過（鏈上時間 ${timestamp} > ${deadline} + 300 秒）`);
+  if (nonce > savedNonce) reasons.push(`nonce 已前進（${nonce} > ${savedNonce}，key ${savedNonce >> 64n}）`);
+  if (reasons.length === 0) return blocked('先對帳：deadline 安全邊際未過且 nonce 未前進，保留在途');
+  const reason = `安全釋放：receipt 與原 UserOp 均查無；${reasons.join('；')}；舊操作不可能再成功，標記 expired，下一輪重新規劃`;
+  try {
+    const released = await deps.withTransaction(async (client) => {
+      // Same portfolio lock as beginOperation; no RPC inside this short transaction.
+      await client.query('select id from portfolios where id = $1 for update', [due.portfolioId]);
+      const unresolved = await unresolvedOperations(client.query, due.portfolioId);
+      if (unresolved.length !== 1 || unresolved[0]?.idempotency_key !== op.idempotency_key) return false;
+      const result = await client.query(SQL_EXPIRE_OPERATION, [op.idempotency_key, reason, op.state,
+        op.user_op_hash, op.tx_hash, op.user_op_nonce, op.deadline?.toISOString(), op.payload_hash]);
+      return result.rows.length === 1;
+    });
+    if (!released) return blocked('先對帳：釋放時未決操作或證據已改變，這一輪不送交易');
+  } catch {
+    return blocked('先對帳：expired 落庫失敗，這一輪不送交易');
+  }
+  deps.log(`[scheduler] portfolio ${due.portfolioId} operation ${op.idempotency_key} ${reason}`);
+  return { ...base, outcome: 'noop', reason };
+}
 
 async function runOne(
   due: DuePortfolio,
@@ -1853,15 +1970,28 @@ async function decideAndMaybeExecute(
     if (ctx.dryRun || unresolved.length > 1 || op.user_op_hash === null) {
       return { ...base, outcome: 'blocked', reason: `portfolio 還在 ${op.state}（${unresolved.length} 筆未決操作），結果未知，先對帳，不重送` };
     }
-    const execution = await ctx.deps.reconcileRebalance({
-      account: due.account, executor: ctx.deps.executor ?? executorAddress(), chainId: ctx.deps.chainId,
-      userOpHash: op.user_op_hash, txHash: op.tx_hash, payloadHash: op.payload_hash,
-    });
-    if (execution === null || (execution.status !== 'success' && execution.status !== 'reverted')) {
+    let reconciliation: ReconcileResult;
+    try {
+      reconciliation = await ctx.deps.reconcileRebalance({
+        account: due.account, executor: ctx.deps.executor ?? executorAddress(), chainId: ctx.deps.chainId,
+        userOpHash: op.user_op_hash, txHash: op.tx_hash, payloadHash: op.payload_hash,
+      });
+    } catch {
+      return { ...base, outcome: 'blocked', reason: '先對帳：RPC 失敗或證據不符，保留在途，不重送' };
+    }
+    if (reconciliation.kind === 'not_found') {
+      return releaseUnresolvedOperation(due, ctx.deps, op, base);
+    }
+    if (reconciliation.kind !== 'found' ||
+        (reconciliation.outcome.status !== 'success' && reconciliation.outcome.status !== 'reverted')) {
       return { ...base, outcome: 'blocked', reason: '先對帳：receipt 尚未取得或證據不完整，保留在途，不重送' };
     }
-    await ctx.deps.query(SQL_SETTLE_OPERATION, [op.idempotency_key,
+    const execution = reconciliation.outcome;
+    const settled = await ctx.deps.query(SQL_SETTLE_OPERATION, [op.idempotency_key,
       execution.status === 'success' ? 'confirmed' : 'reverted', execution.txHash, execution.userOpHash, execution.error]);
+    if (settled.rows.length !== 1) {
+      return { ...base, outcome: 'blocked', reason: '先對帳：操作已安全釋放或不存在，不覆寫 expired，這一輪不送交易' };
+    }
     // 這輪只恢復，不拿舊計畫再送。重新讀鏈記 after；持倉從未用預估成交量更新。
     try {
       const afterPlan = await ctx.deps.planPortfolio(due.portfolioId);
@@ -2057,10 +2187,25 @@ async function decideAndMaybeExecute(
     .map((holding) => getAddress(holding.asset));
 
   // 同一 portfolio 的不同 planHash 也必須互斥；只把閘門放在短 transaction，不在鎖內讀 RPC。
-  const gate = await ctx.deps.withTransaction(async (client) => {
-    await client.query('select id from portfolios where id = $1 for update', [due.portfolioId]);
-    return beginOperation(client.query, { portfolioId: due.portfolioId, idempotencyKey, payloadHash: planHash });
-  });
+  let nonce: bigint;
+  let deadline: string;
+  try {
+    nonce = await ctx.deps.readRebalanceNonce({ account: due.account, sessionKey, executor });
+    if (!validNonce(nonce)) throw new Error('invalid nonce');
+    if (rebalance.deadline < 0n || rebalance.deadline > 8_640_000_000_000n) throw new Error('invalid deadline');
+    deadline = new Date(Number(rebalance.deadline) * 1000).toISOString();
+  } catch {
+    return { ...withPlan, outcome: 'blocked', reason: '[USER_OP_EVIDENCE_UNAVAILABLE] 無法取得有效的原 nonce／deadline，不寫 pending、不送交易' };
+  }
+  let gate: OperationGate;
+  try {
+    gate = await ctx.deps.withTransaction(async (client) => {
+      await client.query('select id from portfolios where id = $1 for update', [due.portfolioId]);
+      return beginOperation(client.query, { portfolioId: due.portfolioId, idempotencyKey, payloadHash: planHash, deadline, nonce });
+    });
+  } catch {
+    return { ...withPlan, outcome: 'blocked', reason: 'operations 閘門落庫失敗，無法確認 pending 已保存，不送交易' };
+  }
   if (!gate.proceed) {
     return { ...withPlan, outcome: gate.outcome, reason: `operations 閘門擋下：${gate.reason}` };
   }
@@ -2082,6 +2227,7 @@ async function decideAndMaybeExecute(
     executor,
     steps,
     deadline: rebalance.deadline,
+    nonce,
     valuationAssets,
     idempotencyKey,
   });
@@ -2183,11 +2329,11 @@ export async function readRebalanceReceipt(input: ReconcileInput, reader: {
   getReceipt: (hash: Hex) => Promise<UserOperationReceipt | null>;
   getOperation: (hash: Hex) => Promise<GetUserOperationReturnType | null>;
   getBlockHash: (number: bigint) => Promise<Hex | null>;
-}): Promise<ExecutionOutcome | null> {
+}): Promise<ReconcileResult> {
   const receipt = await reader.getReceipt(input.userOpHash);
-  if (receipt === null) return null;
   const operation = await reader.getOperation(input.userOpHash);
-  if (operation === null) return null;
+  if (receipt === null && operation === null) return { kind: 'not_found' };
+  if (receipt === null || operation === null) return { kind: 'incomplete', reason: 'receipt 或原 UserOp 缺漏' };
   const same = (left: string, right: string) => left.toLowerCase() === right.toLowerCase();
   const hash = getUserOperationHash({ userOperation: operation.userOperation,
     chainId: input.chainId, entryPointAddress: ENTRY_POINT.address, entryPointVersion: '0.7' });
@@ -2219,14 +2365,20 @@ export async function readRebalanceReceipt(input: ReconcileInput, reader: {
       !same(keccak256(encodeAbiParameters(PLAN_HASH_ABI, [steps, deadline])), input.payloadHash)) {
     throw new Error('對帳 planHash／帳戶／步數不符，保留在途');
   }
-  if (typeof receipt.success !== 'boolean') return null;
-  if (receipt.success && countSwapExecuted(receipt.logs, input.executor) !== steps.length) return null;
-  return judgeRebalanceOutcome({ txStatus: receipt.receipt.status,
+  if (typeof receipt.success !== 'boolean') return { kind: 'incomplete', reason: 'receipt 缺 success' };
+  if (receipt.receipt.status !== 'success' && receipt.receipt.status !== 'reverted') {
+    return { kind: 'incomplete', reason: 'receipt 缺 transaction status' };
+  }
+  const swaps = countSwapExecuted(receipt.logs, input.executor);
+  if (swaps !== (receipt.success ? steps.length : 0)) {
+    return { kind: 'incomplete', reason: 'SwapExecuted 數量與原計畫不符' };
+  }
+  return { kind: 'found', outcome: judgeRebalanceOutcome({ txStatus: receipt.receipt.status,
     userOpSuccess: typeof receipt.success === 'boolean' ? receipt.success : null,
     // getUserOperationReceipt.logs 僅限該 UserOp；receipt.logs 可能含同 tx 的其他 UserOp。
-    swapExecuted: countSwapExecuted(receipt.logs, input.executor), expectedSwaps: steps.length,
+    swapExecuted: swaps, expectedSwaps: steps.length,
     txHash: receipt.receipt.transactionHash, userOpHash: input.userOpHash,
-    gasUsed: receipt.actualGasUsed.toString() });
+    gasUsed: receipt.actualGasUsed.toString() }) };
 }
 
 /** 送出 → 標 submitted → 等 receipt；任何送出後例外都保留在途，不降成可重試的 failed。 */
@@ -2240,11 +2392,14 @@ async function executeAndSettle(
     steps: readonly PlannedStep[];
     valuationAssets: readonly Address[];
     deadline: bigint;
+    nonce: bigint;
     idempotencyKey: string;
   },
 ): Promise<ExecutionOutcome> {
-  const settle = (state: 'confirmed' | 'reverted' | 'failed', outcome: ExecutionOutcome, error: string | null) =>
-    deps.query(SQL_SETTLE_OPERATION, [args.idempotencyKey, state, outcome.txHash, outcome.userOpHash, error]);
+  const settle = async (state: 'confirmed' | 'reverted' | 'failed', outcome: ExecutionOutcome, error: string | null) => {
+    const result = await deps.query(SQL_SETTLE_OPERATION, [args.idempotencyKey, state, outcome.txHash, outcome.userOpHash, error]);
+    if (result.rows.length !== 1) throw new Error('操作已安全釋放或不存在，不覆寫 expired');
+  };
 
   let sending = false;
   let submitted: { userOpHash?: Hex; txHash?: Hex } = {};
@@ -2259,6 +2414,7 @@ async function executeAndSettle(
       steps: args.steps,
       valuationAssets: args.valuationAssets,
       deadline: args.deadline,
+      nonce: args.nonce,
       onSending: () => { sending = true; },
       onSubmitted: async (ids) => {
         sending = true;

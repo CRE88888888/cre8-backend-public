@@ -135,7 +135,9 @@ type StubOperation = {
   portfolioId: number;
   idempotencyKey: string;
   payloadHash: string;
-  state: 'pending' | 'submitted' | 'confirmed' | 'failed' | 'reverted';
+  state: 'pending' | 'submitted' | 'confirmed' | 'failed' | 'reverted' | 'expired';
+  deadline?: Date | null;
+  userOpNonce?: string | null;
   attempts: number;
   txHash: string | null;
   userOpHash: string | null;
@@ -291,6 +293,8 @@ function stubQuery(db: StubDb): SchedulerQueryFn {
         txHash: null,
         userOpHash: null,
         lastError: null,
+        deadline: new Date(String(params[3])),
+        userOpNonce: String(params[4]),
       });
       return { rows: [{ attempts: 1 }] };
     }
@@ -307,7 +311,8 @@ function stubQuery(db: StubDb): SchedulerQueryFn {
         (op.state === 'pending' || op.state === 'submitted' ||
           (op.state === 'failed' && (op.userOpHash !== null || op.txHash !== null))))
         .map((op) => ({ idempotency_key: op.idempotencyKey, payload_hash: op.payloadHash,
-          state: op.state, user_op_hash: op.userOpHash, tx_hash: op.txHash })) };
+          state: op.state, user_op_hash: op.userOpHash, tx_hash: op.txHash,
+          deadline: op.deadline ?? null, user_op_nonce: op.userOpNonce ?? null })) };
     }
 
     if (text.includes('select state, attempts from operations')) {
@@ -315,9 +320,19 @@ function stubQuery(db: StubDb): SchedulerQueryFn {
       return { rows: existing === undefined ? [] : [{ state: existing.state, attempts: existing.attempts }] };
     }
 
+    if (text.includes("set state = 'expired'")) {
+      const existing = db.operations.find((entry) => entry.idempotencyKey === String(params[0]));
+      if (existing === undefined || existing.state !== params[2] || existing.userOpHash !== params[3] ||
+          existing.txHash !== params[4] || existing.userOpNonce !== params[5] ||
+          existing.deadline?.toISOString() !== params[6] || existing.payloadHash !== params[7]) return { rows: [] };
+      existing.state = 'expired';
+      existing.lastError = String(params[1]);
+      return { rows: [{ idempotency_key: existing.idempotencyKey }] };
+    }
+
     if (text.includes("set state = 'submitted'")) {
       const existing = db.operations.find((entry) => entry.idempotencyKey === String(params[0]));
-      if (existing === undefined) return { rows: [] };
+      if (existing === undefined || (existing.state !== 'pending' && existing.state !== 'submitted')) return { rows: [] };
       existing.state = 'submitted';
       if (params[1] !== null && params[1] !== undefined) existing.userOpHash = String(params[1]);
       if (params[2] !== null && params[2] !== undefined) existing.txHash = String(params[2]);
@@ -328,6 +343,8 @@ function stubQuery(db: StubDb): SchedulerQueryFn {
       const existing = db.operations.find((entry) => entry.idempotencyKey === String(params[0]));
       if (existing === undefined || (existing.state !== 'failed' && existing.state !== 'reverted')) return { rows: [] };
       existing.state = 'pending';
+      existing.deadline = new Date(String(params[1]));
+      existing.userOpNonce = String(params[2]);
       existing.attempts += 1;
       existing.lastError = null;
       existing.txHash = null;
@@ -338,11 +355,12 @@ function stubQuery(db: StubDb): SchedulerQueryFn {
     if (text.includes('set state = $2')) {
       const existing = db.operations.find((entry) => entry.idempotencyKey === String(params[0]));
       if (existing === undefined) return { rows: [] };
+      if (text.includes("state <> 'expired'") && existing.state === 'expired') return { rows: [] };
       existing.state = String(params[1]) as StubOperation['state'];
       if (params[2] !== null && params[2] !== undefined) existing.txHash = String(params[2]);
       if (params[3] !== null && params[3] !== undefined) existing.userOpHash = String(params[3]);
       existing.lastError = params[4] === null || params[4] === undefined ? null : String(params[4]);
-      return { rows: [] };
+      return { rows: [{ idempotency_key: existing.idempotencyKey }] };
     }
 
     throw new Error(`stub DB 沒預期這條 SQL：${text.replace(/\s+/g, ' ').slice(0, 120)}`);
@@ -530,6 +548,9 @@ function deps(db: StubDb, chain: StubChain, extra: SchedulerDeps = {}): Schedule
     chainId: TEST_CHAIN_ID,
     executor: EXECUTOR,
     readGlobalPaused: async () => false,
+    readRebalanceNonce: async () => 0n,
+    readLatestBlockTimestamp: async () => 0n,
+    readEntryPointNonce: async () => 0n,
     log: () => {},
     planPortfolio: async (portfolioId: number) => {
       chain.planPortfolioCalls.push(portfolioId);
@@ -565,6 +586,7 @@ function deps(db: StubDb, chain: StubChain, extra: SchedulerDeps = {}): Schedule
       if (chain.executeResult.userOpHash !== null) await args.onSubmitted({ userOpHash: chain.executeResult.userOpHash });
       return chain.executeResult;
     },
+    reconcileRebalance: async () => ({ kind: 'incomplete', reason: 'stub: receipt unavailable' }),
     ...extra,
   };
 }
@@ -665,7 +687,7 @@ test('global pause preserves #34 in-flight protection; resume returns to reconci
   let reconciliations = 0;
   const options = deps(db, chain, {
     readGlobalPaused: async () => paused,
-    reconcileRebalance: async () => { reconciliations += 1; return null; },
+    reconcileRebalance: async () => { reconciliations += 1; return { kind: 'incomplete', reason: 'missing receipt' }; },
   });
   assert.deepEqual(outcomes(await runSchedulerOnce({ now: NOW, dryRun: false }, options)), ['blocked']);
   assert.equal(reconciliations, 0);
@@ -1107,7 +1129,7 @@ for (const dryRun of [true, false]) {
       if (sql.includes('insert into scheduler_alerts')) { writes.push([...params]); return { rows: [] }; }
       if (sql.includes('update scheduler_alerts')) { preserved = params[1] as string[]; return { rows: [] }; }
       if (sql.includes('row_number() over') || sql.includes('k.expires_at <= $1') ||
-          sql.includes('h.confirmed_count') || sql.includes('with latest as')) return { rows: [] };
+          sql.includes('h.confirmed_count') || sql.includes('with latest as') || sql.includes('as release_count')) return { rows: [] };
       return baseDeps.query!(sql, params);
     };
     const options = { ...baseDeps, query };
@@ -1648,6 +1670,263 @@ function unresolvedOperation(overrides: Partial<StubOperation> = {}): StubOperat
     payloadHash, state: 'submitted', attempts: 1, txHash: null, userOpHash: '0xabc123', lastError: null, ...overrides };
 }
 
+function releasableOperation(overrides: Partial<StubOperation> = {}): StubOperation {
+  return unresolvedOperation({ deadline: new Date(Number(readyPlan().deadline) * 1000), userOpNonce: '0', ...overrides });
+}
+
+test('#39 receipt 與原 UserOp 只有雙 null 才是 not_found，RPC 失敗不能冒充不存在', async () => {
+  const f = receiptFixture();
+  let operationReads = 0;
+  const notFound = { ...f.reader, getReceipt: async () => null,
+    getOperation: async () => { operationReads += 1; return null; } };
+  assert.deepEqual(await readRebalanceReceipt(f.input, notFound), { kind: 'not_found' });
+  assert.equal(operationReads, 1, 'receipt null 仍必須查原 UserOp');
+  await assert.rejects(readRebalanceReceipt(f.input, { ...notFound,
+    getOperation: async () => { throw new Error('timeout'); } }), /timeout/);
+});
+
+test('#39 deadline 已過但有 receipt 仍先對帳，不讀釋放證據、不送新 plan', async () => {
+  for (const status of ['success', 'reverted'] as const) {
+    const op = releasableOperation({ deadline: new Date(0) });
+    const db = stubDb({ portfolios: [portfolio()], operations: [op] });
+    const chain = stubChain();
+    const round = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain, {
+      reconcileRebalance: async () => ({ kind: 'found', outcome: { ...chain.executeResult, status } }),
+      readLatestBlockTimestamp: async () => { assert.fail('found 不走釋放'); },
+    }));
+    assert.deepEqual(outcomes(round), [status === 'success' ? 'executed' : 'failed']);
+    assert.equal(op.state, status === 'success' ? 'confirmed' : 'reverted');
+    assert.equal(chain.executeCalls.length, 0);
+  }
+});
+
+test('#39 deadline 0 合法；損壞的鏈上時間不允許釋放', async () => {
+  for (const timestamp of [-1n, 300n, 301n]) {
+    const op = releasableOperation({ deadline: new Date(0) });
+    const db = stubDb({ portfolios: [portfolio()], operations: [op] });
+    const round = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, stubChain(), {
+      reconcileRebalance: async () => ({ kind: 'not_found' }), readLatestBlockTimestamp: async () => timestamp,
+    }));
+    assert.deepEqual(outcomes(round), [timestamp > 300n ? 'noop' : 'blocked']);
+  }
+});
+
+test('#39 expired 是終態，延遲的 sender 結果不能重新寫成 confirmed／failed', async () => {
+  for (const status of ['success', 'error'] as const) {
+    const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+    const chain = stubChain();
+    const round = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain, {
+      executeRebalance: async (args) => {
+        args.onSending();
+        const operation = db.operations[0];
+        assert.ok(operation);
+        operation.state = 'expired'; // another reconciler committed the release while this sender stalled
+        operation.lastError = '安全釋放';
+        return { ...chain.executeResult, status };
+      },
+    }));
+    assert.deepEqual(outcomes(round), ['blocked']);
+    assert.equal(db.operations[0]?.state, 'expired');
+    assert.equal(db.operations[0]?.lastError, '安全釋放');
+    assert.equal(db.portfolios[0]?.lastRebalanceAt, null);
+  }
+});
+
+test('#39 當輪第 3 次釋放立即告警，告警時間必須包含釋放 commit', async () => {
+  const op = releasableOperation();
+  const db = stubDb({ portfolios: [portfolio()], operations: [op] });
+  const transaction = stubWithTransaction(db);
+  const q = stubQuery(db);
+  const recorded: unknown[][] = [];
+  let committedAt: Date | null = null;
+  const round = await runSchedulerOnce({ dryRun: false }, deps(db, stubChain(), {
+    reconcileRebalance: async () => ({ kind: 'not_found' }),
+    readLatestBlockTimestamp: async () => readyPlan().deadline + 301n,
+    withTransaction: (fn) => transaction((client) => fn({ query: async (sql, params) => {
+      const result = await client.query(sql, params);
+      if (sql.includes("set state = 'expired'")) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5)); // delayed commit must still count this round
+        committedAt = new Date();
+      }
+      return result;
+    } })),
+    query: async (sql, params = []) => {
+      if (sql.includes('as release_count')) {
+        assert.ok(committedAt);
+        assert.ok(new Date(String(params[0])) >= committedAt);
+        return { rows: [{ portfolio_id: PORTFOLIO_ID, release_count: 3 }] };
+      }
+      if (sql.includes('insert into scheduler_alerts')) { recorded.push([...params]); return { rows: [] }; }
+      if (sql.includes('with ranked') || sql.includes('k.expires_at <= $1') || sql.includes('h.confirmed_count') ||
+          sql.includes('with latest as') || sql.includes('select sa.portfolio_id') || sql.includes('update scheduler_alerts')) return { rows: [] };
+      return q(sql, params);
+    },
+  }));
+  assert.deepEqual(outcomes(round), ['noop']);
+  assert.deepEqual(recorded.map((params) => params.slice(0, 3)), [['portfolio_repeatedly_failing', 'warn', PORTFOLIO_ID]]);
+});
+
+test('#39 pending 保存原 deadline 與完整 uint256 nonce，執行只能使用保存的 nonce', async () => {
+  for (const nonce of [0n, (1n << 256n) - 1n]) {
+    const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+    const chain = stubChain();
+    const original = deps(db, chain);
+    const round = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain, {
+      readRebalanceNonce: async () => nonce,
+      executeRebalance: async (args) => {
+        assert.equal(db.operations[0]?.state, 'pending');
+        assert.equal(db.operations[0]?.deadline?.getTime(), Number(args.deadline) * 1000);
+        assert.equal(db.operations[0]?.userOpNonce, nonce.toString());
+        assert.equal(args.nonce, nonce);
+        assert.equal(db.inTransaction, false, '先 commit pending，才發送 RPC');
+        return original.executeRebalance!(args);
+      },
+    }));
+    assert.deepEqual(outcomes(round), ['executed']);
+  }
+});
+
+test('#39 只有最新鏈上時間嚴格超過 deadline + 300 才釋放，牆鐘不作證據；下一輪用新 key', async () => {
+  for (const delta of [-1n, 0n, 1n]) {
+    const op = releasableOperation();
+    const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()], operations: [op] });
+    const chain = stubChain({ rebalance: { ...readyPlan(), deadline: readyPlan().deadline + 9999n } });
+    const logs: string[] = [];
+    const options = deps(db, chain, {
+      reconcileRebalance: async () => ({ kind: 'not_found' }),
+      readLatestBlockTimestamp: async () => readyPlan().deadline + 300n + delta,
+      log: (line) => logs.push(line),
+    });
+    const round = await runSchedulerOnce({ dryRun: false, now: new Date('2099-01-01') }, options);
+    assert.deepEqual(outcomes(round), [delta > 0n ? 'noop' : 'blocked']);
+    assert.equal(op.state, delta > 0n ? 'expired' : 'submitted');
+    assert.equal(op.userOpHash, '0xabc123', 'hash 永不清除');
+    assert.equal(op.attempts, 1);
+    assert.equal(chain.executeCalls.length, 0, '釋放當輪不送新 plan');
+    assert.equal(chain.planPortfolioCalls.length, 0);
+    if (delta > 0n) {
+      assert.match(op.lastError ?? '', /deadline/);
+      assert.ok(logs.some((line) => line.includes('安全釋放')));
+      const next = await runSchedulerOnce({ dryRun: false, now: new Date('2099-01-02') }, options);
+      assert.deepEqual(outcomes(next), ['executed']);
+      assert.equal(db.operations.length, 2);
+      assert.notEqual(db.operations[1]?.idempotencyKey, op.idempotencyKey);
+      assert.equal(op.state, 'expired');
+      assert.equal(chain.executeCalls.length, 1);
+    }
+  }
+});
+
+test('#39 nonce 取保存值高 192 位作 key；只有同 key 且嚴格前進才能釋放', async () => {
+  const saved = (0x123456789abcdef123456789abcdef123456789abcdef123n << 64n) + 5n;
+  for (const current of [saved - 1n, saved, saved + 1n, saved + (1n << 64n), 1n << 256n]) {
+    const op = releasableOperation({ userOpNonce: saved.toString() });
+    const db = stubDb({ portfolios: [portfolio()], operations: [op] });
+    const chain = stubChain();
+    const round = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain, {
+      reconcileRebalance: async () => ({ kind: 'not_found' }),
+      readLatestBlockTimestamp: async () => 0n,
+      readEntryPointNonce: async ({ account, key }) => {
+        assert.equal(account, ACCOUNT);
+        assert.equal(key, saved >> 64n);
+        return current;
+      },
+    }));
+    assert.deepEqual(outcomes(round), [current === saved + 1n ? 'noop' : 'blocked']);
+    assert.equal(op.state, current === saved + 1n ? 'expired' : 'submitted');
+    if (op.state === 'expired') assert.match(op.lastError ?? '', /nonce/);
+    assert.equal(chain.executeCalls.length, 0);
+  }
+});
+
+test('#39 缺證據、無 hash、不完整對帳、RPC 與 DB 失敗皆保留在途', async () => {
+  for (const scenario of ['deadline-null', 'nonce-null', 'bad-date', 'fractional-date', 'negative-nonce',
+    'fractional-nonce', 'oversize-nonce', 'hash-missing', 'incomplete', 'receipt-rpc', 'time-rpc',
+    'nonce-rpc', 'db', 'dry-run', 'multiple'] as const) {
+    const op = releasableOperation();
+    if (scenario === 'deadline-null') op.deadline = null;
+    if (scenario === 'nonce-null') op.userOpNonce = null;
+    if (scenario === 'bad-date') op.deadline = new Date('invalid');
+    if (scenario === 'fractional-date') op.deadline = new Date(1234);
+    if (scenario === 'negative-nonce') op.userOpNonce = '-1';
+    if (scenario === 'fractional-nonce') op.userOpNonce = '1.5';
+    if (scenario === 'oversize-nonce') op.userOpNonce = (1n << 256n).toString();
+    if (scenario === 'hash-missing') op.userOpHash = null;
+    const db = stubDb({ portfolios: [portfolio()], operations: [op,
+      ...(scenario === 'multiple' ? [releasableOperation({ idempotencyKey: 'other' })] : [])] });
+    const chain = stubChain();
+    const original = stubQuery(db);
+    const before = structuredClone(db.operations);
+    const options = deps(db, chain, {
+      reconcileRebalance: async () => {
+        if (scenario === 'receipt-rpc') throw new Error('sensitive RPC token');
+        return scenario === 'incomplete' ? { kind: 'incomplete', reason: 'missing logs' } : { kind: 'not_found' };
+      },
+      readLatestBlockTimestamp: async () => {
+        if (scenario === 'time-rpc') throw new Error('sensitive RPC token');
+        return readyPlan().deadline + 301n;
+      },
+      readEntryPointNonce: async () => {
+        if (scenario === 'nonce-rpc') throw new Error('sensitive RPC token');
+        return 0n;
+      },
+      withTransaction: async (fn) => fn({ query: async (sql, params) => {
+        if (scenario === 'db' && sql.includes("set state = 'expired'")) throw new Error('sensitive DB token');
+        return original(sql, params);
+      } }),
+    });
+    const round = await runSchedulerOnce({ dryRun: scenario === 'dry-run', now: NOW }, options);
+    assert.deepEqual(outcomes(round), ['blocked'], scenario);
+    assert.deepEqual(db.operations, before, scenario);
+    assert.equal(chain.executeCalls.length, 0, scenario);
+    assert.doesNotMatch(JSON.stringify(round), /sensitive/, scenario);
+  }
+});
+
+test('#39 CAS 過程中狀態或 hash 改變不可覆寫為 expired', async () => {
+  for (const field of ['state', 'userOpHash', 'txHash', 'deadline', 'userOpNonce'] as const) {
+    const op = releasableOperation();
+    const db = stubDb({ portfolios: [portfolio()], operations: [op] });
+    const original = stubQuery(db);
+    const round = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, stubChain(), {
+      reconcileRebalance: async () => ({ kind: 'not_found' }),
+      readLatestBlockTimestamp: async () => readyPlan().deadline + 301n,
+      withTransaction: async (fn) => fn({ query: async (sql, params) => {
+        if (sql.includes("set state = 'expired'")) {
+          if (field === 'state') op.state = 'confirmed';
+          if (field === 'userOpHash') op.userOpHash = '0x9876';
+          if (field === 'txHash') op.txHash = '0x9876';
+          if (field === 'deadline') op.deadline = new Date(0);
+          if (field === 'userOpNonce') op.userOpNonce = '9';
+        }
+        return original(sql, params);
+      } }),
+    }));
+    assert.deepEqual(outcomes(round), ['blocked'], field);
+    assert.notEqual(op.state, 'expired', field);
+  }
+});
+
+test('#39 expired 的同一 idempotency key 不可重試；nonce RPC 或 pending 寫入失敗不得送出', async () => {
+  for (const scenario of ['expired', 'nonce-rpc', 'pending-db'] as const) {
+    const op = releasableOperation({ state: 'expired' });
+    const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()], operations: scenario === 'expired' ? [op] : [] });
+    const chain = stubChain();
+    const original = stubQuery(db);
+    const round = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain, {
+      readRebalanceNonce: async () => { if (scenario === 'nonce-rpc') throw new Error('sensitive RPC token'); return 0n; },
+      withTransaction: async (fn) => fn({ query: async (sql, params) => {
+        if (scenario === 'pending-db' && sql.includes('insert into operations')) throw new Error('sensitive DB token');
+        return original(sql, params);
+      } }),
+    }));
+    assert.deepEqual(outcomes(round), ['blocked'], scenario);
+    assert.equal(chain.executeCalls.length, 0);
+    assert.equal(op.attempts, 1);
+    assert.doesNotMatch(JSON.stringify(round), /sensitive/);
+  }
+});
+
 test('#34 恢復成功／revert 只對帳一次，先重讀鏈才寫 after；當輪不送新計畫', async () => {
   for (const status of ['success', 'reverted'] as const) {
     const db = stubDb({ portfolios: [portfolio()], operations: [unresolvedOperation()] });
@@ -1659,8 +1938,8 @@ test('#34 恢復成功／revert 只對帳一次，先重讀鏈才寫 after；當
         order.push('receipt');
         assert.equal(input.payloadHash, db.operations[0]?.payloadHash);
         assert.equal(input.userOpHash, '0xabc123');
-        return { status, userOpHash: input.userOpHash, txHash: '0xdef456', gasUsed: '123',
-          error: status === 'reverted' ? 'execution reverted' : null };
+        return { kind: 'found', outcome: { status, userOpHash: input.userOpHash, txHash: '0xdef456', gasUsed: '123',
+          error: status === 'reverted' ? 'execution reverted' : null } };
       },
       planPortfolio: async (id) => { order.push('read-chain'); return base.planPortfolio!(id); },
       writeSnapshot: async (_snapshot, _report, options) => {
@@ -1691,7 +1970,7 @@ test('#34 receipt 缺漏／RPC 失敗／無 hash／多筆未決／dry-run 均不
     const chain = stubChain();
     let reads = 0;
     const round = await runSchedulerOnce({ dryRun: scenario === 'dry-run', now: NOW }, deps(db, chain, {
-      reconcileRebalance: async () => { reads += 1; if (scenario === 'rpc') throw new Error('RPC timeout'); return null; },
+      reconcileRebalance: async () => { reads += 1; if (scenario === 'rpc') throw new Error('RPC timeout'); return { kind: 'incomplete', reason: 'receipt unavailable' }; },
     }));
     assert.deepEqual(outcomes(round), ['blocked'], scenario);
     assert.equal(reads, ['multiple', 'hash-missing', 'dry-run'].includes(scenario) ? 0 : 1, scenario);
@@ -1709,7 +1988,7 @@ test('#34 對帳落庫失敗保持 submitted；DB 恢復後再對帳，不重送
   const query = stubQuery(db);
   let fail = true;
   const options = deps(db, chain, {
-    reconcileRebalance: async () => chain.executeResult,
+    reconcileRebalance: async () => ({ kind: 'found', outcome: chain.executeResult }),
     query: async (sql, params) => {
       if (fail && sql.includes('set state = $2')) throw new Error('DB unavailable');
       return query(sql, params);
@@ -1819,25 +2098,38 @@ test('#34 對帳驗證原 UserOp 的多步計畫與 canonical receipt（塊號 0
   // 同 tx 別的 op 的 receipt.logs 不能湊數；採用限定本 UserOp 的 logs。
   assert.equal(f.receipt.receipt.logs.length, 0);
   const result = await readRebalanceReceipt(f.input, f.reader);
-  assert.equal(result?.status, 'success');
-  assert.equal(result?.userOpHash, f.input.userOpHash);
-  assert.equal(result?.txHash, f.receipt.receipt.transactionHash);
+  assert.equal(result.kind, 'found');
+  assert.ok(result.kind === 'found');
+  assert.equal(result.outcome.status, 'success');
+  assert.equal(result.outcome.userOpHash, f.input.userOpHash);
+  assert.equal(result.outcome.txHash, f.receipt.receipt.transactionHash);
   f.receipt.success = false;
   f.receipt.logs = [];
-  assert.equal((await readRebalanceReceipt(f.input, f.reader))?.status, 'reverted');
+  const reverted = await readRebalanceReceipt(f.input, f.reader);
+  assert.ok(reverted.kind === 'found');
+  assert.equal(reverted.outcome.status, 'reverted');
 });
 
 test('#34 缺 receipt／原 UserOp／成交事件不能被當作已完成', async () => {
   const f = receiptFixture();
   const missingSuccess = receiptFixture();
   Reflect.deleteProperty(missingSuccess.receipt, 'success');
-  assert.equal(await readRebalanceReceipt(missingSuccess.input, missingSuccess.reader), null);
-  assert.equal(await readRebalanceReceipt(f.input, { ...f.reader, getReceipt: async () => null }), null);
-  assert.equal(await readRebalanceReceipt(f.input, { ...f.reader, getOperation: async () => null }), null);
+  assert.equal((await readRebalanceReceipt(missingSuccess.input, missingSuccess.reader)).kind, 'incomplete');
+  assert.equal((await readRebalanceReceipt(f.input, { ...f.reader, getReceipt: async () => null })).kind, 'incomplete');
+  assert.equal((await readRebalanceReceipt(f.input, { ...f.reader, getOperation: async () => null })).kind, 'incomplete');
   f.receipt.logs = [];
-  assert.equal(await readRebalanceReceipt(f.input, f.reader), null, 'success=true 但缺 SwapExecuted 不能解鎖');
+  assert.equal((await readRebalanceReceipt(f.input, f.reader)).kind, 'incomplete', 'success=true 但缺 SwapExecuted 不能解鎖');
   f.receipt.receipt.logs = receiptFixture().receipt.logs;
-  assert.equal(await readRebalanceReceipt(f.input, f.reader), null, '不能借同 tx 其他 op 的 log');
+  assert.equal((await readRebalanceReceipt(f.input, f.reader)).kind, 'incomplete', '不能借同 tx 其他 op 的 log');
+});
+
+test('#39 缺 transaction status 或 reverted UserOp 帶成交 logs 仍是不完整證據', async () => {
+  const missingStatus = receiptFixture();
+  Reflect.deleteProperty(missingStatus.receipt.receipt, 'status');
+  assert.equal((await readRebalanceReceipt(missingStatus.input, missingStatus.reader)).kind, 'incomplete');
+  const contradictoryLogs = receiptFixture();
+  contradictoryLogs.receipt.success = false;
+  assert.equal((await readRebalanceReceipt(contradictoryLogs.input, contradictoryLogs.reader)).kind, 'incomplete');
 });
 
 test('#34 來源／hash／plan／canonical 身分不符一律拒絕對帳', async () => {
@@ -2065,6 +2357,7 @@ test('認領（真的 Postgres）：paused／idle／未到期不被認領，NULL
   const keys = stubQuery(stubDb({ sessionKeys: [sessionKey({ portfolioId: due.id })] }));
   const options: SchedulerDeps = {
     withTransaction: singlePortfolioClaim(due.id),
+    readRebalanceNonce: async () => (1n << 256n) - 1n,
     readGlobalPaused: async () => false,
     query: (sql, params) => sql.includes('from session_keys k') ? keys(sql, params) : query(sql, params),
     chainId: REAL_CHAIN_ID, executor: EXECUTOR, log: () => {},
@@ -2095,6 +2388,50 @@ test('認領（真的 Postgres）：paused／idle／未到期不被認領，NULL
   const pending = (await query<{ state: string; attempts: number }>(
     "select state, attempts from operations where portfolio_id = $1 and type = 'rebalance'", [due.id])).rows;
   assert.deepEqual(pending.map((op) => [op.state, op.attempts]), [['submitted', 1]]);
+
+  const evidence = (await query<{ deadline: Date; user_op_nonce: string }>(
+    'select deadline, user_op_nonce from operations where portfolio_id = $1', [due.id])).rows[0];
+  assert.ok(evidence);
+  assert.equal(evidence.user_op_nonce, ((1n << 256n) - 1n).toString(), 'numeric 精確保存 uint256 上限');
+  assert.ok(evidence.deadline instanceof Date);
+  let reconciliationCount = 0;
+  let enterRelease: () => void = () => {};
+  const firstReleaseEntered = new Promise<void>((resolve) => { enterRelease = resolve; });
+  let releaseBoth: () => void = () => {};
+  const bothRead = new Promise<void>((resolve) => { releaseBoth = resolve; });
+  const releaseLogs: string[] = [];
+  const releaseOptions: SchedulerDeps = { ...options,
+    reconcileRebalance: async () => {
+      reconciliationCount += 1;
+      enterRelease();
+      if (reconciliationCount === 2) releaseBoth();
+      await bothRead;
+      return { kind: 'not_found' };
+    },
+    readLatestBlockTimestamp: async () => BigInt(evidence.deadline.getTime() / 1000) + 301n,
+    readEntryPointNonce: async () => (1n << 256n) - 1n,
+    log: (line) => { releaseLogs.push(line); },
+  };
+  const firstRelease = runSchedulerOnce({ dryRun: false, now }, releaseOptions);
+  await firstReleaseEntered;
+  const released = await Promise.all([firstRelease, runSchedulerOnce({ dryRun: false, now }, releaseOptions)]);
+  assert.deepEqual(released.flatMap(outcomes).sort(), ['blocked', 'noop'], '同時釋放只能有一個 CAS 成功');
+  assert.equal(releaseLogs.filter((line) => line.startsWith('[scheduler] portfolio') && line.includes('operation ') && line.includes('安全釋放')).length, 1);
+  assert.equal(sends, 1, '釋放當輪不送');
+  assert.equal((await query<{ state: string }>('select state from operations where portfolio_id = $1', [due.id])).rows[0]?.state, 'expired');
+  const fresh = await runSchedulerOnce({ dryRun: false, now }, { ...options,
+    planRebalance: async () => ({ ...readyPlan(), deadline: BigInt(evidence.deadline.getTime() / 1000) + 9999n }),
+    executeRebalance: async (args) => {
+      sends += 1;
+      assert.equal(args.nonce, (1n << 256n) - 1n);
+      return { status: 'success', userOpHash: '0xnew', txHash: '0xnewtx', gasUsed: '123', error: null };
+    },
+  });
+  assert.deepEqual(outcomes(fresh), ['executed']);
+  const states = (await query<{ state: string; attempts: number }>(
+    'select state, attempts from operations where portfolio_id = $1 order by id', [due.id])).rows;
+  assert.deepEqual(states.map((op) => [op.state, op.attempts]), [['expired', 1], ['confirmed', 1]]);
+  assert.equal(sends, 2, '新 key 僅送一次，舊列不重試');
 
   console.log(
     `[claim/真 DB] 認領 ${claimed.map((entry) => `${entry.portfolioId}(${entry.intervalSeconds}s)`).join(', ')}；` +
@@ -2850,7 +3187,7 @@ test('#42 paused close executes one capped batch, stays paused, and an empty ret
 
 for (const gate of ['global', 'chain', 'inflight'] as const) {
   test(`#42 paused close preserves ${gate} blocking without new planning or sending`, async () => {
-    const c = exitCase('paused', { readGlobalPaused: async () => gate === 'global', reconcileRebalance: async () => null });
+    const c = exitCase('paused', { readGlobalPaused: async () => gate === 'global', reconcileRebalance: async () => ({ kind: 'incomplete', reason: 'missing receipt' }) });
     if (gate === 'chain') c.chain.plan.pinnedVersion.paused = true;
     if (gate === 'inflight') c.db.operations.push(unresolvedOperation());
     const result = await runOperatorClose(PORTFOLIO_ID, OWNER, c.options);
@@ -2863,7 +3200,7 @@ for (const gate of ['global', 'chain', 'inflight'] as const) {
 }
 
 test('#42 receipt timeout then another close is blocked and sends only once', async () => {
-  const c = exitCase('active', { reconcileRebalance: async () => null });
+  const c = exitCase('active', { reconcileRebalance: async () => ({ kind: 'incomplete', reason: 'missing receipt' }) });
   c.chain.executeResult = { ...c.chain.executeResult, status: 'unknown', error: 'receipt timeout' };
   const first = await runOperatorClose(PORTFOLIO_ID, OWNER, c.options);
   assert.equal(first.outcome, 'blocked');

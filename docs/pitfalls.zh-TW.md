@@ -1541,6 +1541,45 @@ close 第一批成功就暫停 DB 排程，因此後續 close 的單投組認領
 
 ---
 
+### 8.46 查不到 receipt 不等於未上鏈：安全釋放必須保存原執行證據（#39）
+
+**症狀**：bundler 丟棄 UserOp 後，操作一直維持 pending／submitted，投組每輪 blocked。
+只按逾時改成 failed 會允許重送；只看 receipt null 又可能把仍在 mempool 或已上鏈但缺證據的操作解鎖。
+
+先套用 db migration **0023**。scheduler 在 pending 的短 transaction 裡保存原 plan 的
+`deadline` 與完整十進位 `user_op_nonce`，commit 後才發送；估 gas 與送出都固定使用保存的 nonce。
+原 nonce 由所選 Kernel permission 的 `getNonce()` 取得，不能以 owner 的 nonce 代替。
+
+`readRebalanceReceipt` 區分 `found`、`not_found`、`incomplete`。只有 bundler 的
+`eth_getUserOperationReceipt` 與 `eth_getUserOperationByHash` **都明確回 null** 才是 not_found。
+viem 的便利方法會把 null 包成例外，因此這裡直接讀 RPC 回應；不能把一般 RPC 例外轉成「不存在」。
+receipt 存在時仍依原 UserOp、planHash、canonical block 與成交事件對帳，不以本輪新 plan 補證據。
+
+依 #39 總管定義，not_found 且兩欄均有效時，讀最新鏈上區塊時間及
+`EntryPoint.getNonce(account, savedNonce >> 64)`。只有**鏈上時間嚴格大於原 deadline + 300 秒**，
+**或同一 key 的 nonce 嚴格前進**，才以 portfolio 鎖與原證據 CAS 標記 `expired`。
+牆鐘、等於門檻、缺欄位、無 hash、多筆未決、RPC／DB 失敗及 dry-run 都不允許釋放。
+
+釋放保留 hash、attempts、deadline、nonce，`last_error` 與每次 log 記錄依據。
+當輪不送交易，下一輪重讀持倉並產生新 plan／idempotency key；expired 不算在途，也不能重試舊 key。
+expired 是終態，延遲的 sender／對帳結果不能覆寫它並重新開啟重試。
+24 小時內同投組至少 3 次 expired，沿用 `portfolio_repeatedly_failing` 產生 warn；真正的失敗仍保留 critical。
+這個 24 小時窗按釋放的 `updated_at` 計算，包含剛好 24 小時，不包含未來列。
+
+獨立 fork 驗收：僅使用 anvil **8606**、alto **3066**（開啟 debug endpoints）、DB **cre8_x1g**；
+backend 若啟動只使用 **8142**。將 contracts **d62d1c3** 解出到本 worktree 的
+`.bun-cache/contracts-39-v1` 並 `forge build --root .bun-cache/contracts-39-v1`。
+該版本與此 backend 的 SwapStep ABI 一致；後續 A11 venue 介面另案整合。
+設定上述本機環境與 `MIGRATIONS_DIR` 後執行：
+
+```bash
+RUN_CHAIN_TESTS=1 bun test ./test/inflight-deadline.fork.ts --timeout=120000
+```
+
+測試自行部署 registry／oracle／executor、建立 Kernel 與三層 permission，只用公開 anvil 測試助記詞。
+alto manual mode 接受真實 session UserOp 後，以「submitted 已 commit 後發生例外」模擬執行程序中斷，
+避免等待 receipt；清空 mempool、推進鏈上時間後驗證安全釋放與重做，並核對 executor 只有一次真實交換。
+
 ## 附錄：診斷心法
 
 這輪踩到的坑有一個共同模式：**錯誤訊息指向的位置，幾乎都不是真正的原因**。

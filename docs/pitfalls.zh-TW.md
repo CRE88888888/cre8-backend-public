@@ -1055,7 +1055,10 @@ DB 最新那把是 0x7db20115（第三次續期）
 
 **實務影響**：帳戶的續期應該走**前端那條路**（`POST /portfolios/:id/renewal-params` → 簽名 → 上鏈），它不需要重算部署地址，因為它拿的是鏈上的 `enrollment` 與現有的 `permissionConfig`，不是 DB 的推測。
 
-⚠ 這也解釋了為什麼 `scripts/renew-session-key.ts` 只適合「全新帳戶的第一次續期」。
+**#29 修正後**：腳本用 DB 的完整公開快照（含 `sessionKeyAddress`、policy 地址、flag 與參數）重建所有歷史
+key 的 initConfig，要求恰好一把重現部署地址；包括 revoked key，且完全不依賴目前 seed。換 seed、多次續期、
+初始 key 已撤銷時仍可核對地址。續期時目前 seed 只用來派生**新 key**；準備舊簽章樣本時，
+仍須使用該舊 key 對應的 seed。
 
 ### 8.22 換 executor 之後，舊 portfolio 需要**重裝權限**，不是重新 approve
 
@@ -1075,7 +1078,21 @@ permissionId 不符：重建 0x839a6ba5 != DB 0xf67556bf
 
 只做 2 或只做 3 都會卡住，而錯誤訊息不同（`permissionId 不符` vs `ALLOWANCE_TOO_LOW`）。
 
-⚠ 這也代表 `renew-session-key.ts` 的那個地址守衛在「換 executor 後」還多一個障礙（§8.21）—— 所以遷移應該走前端那條續期路徑。
+`renew-session-key.ts` 現在以歷史快照核對部署身分（§8.21），新權限才使用目前的 `EXECUTOR_ADDRESS`；
+舊權限撤銷仍使用原快照的 executor，不能套用新 executor 重建舊 deinitData。
+
+#### 撤銷失敗不能全部當「舊 key 已不能用」
+
+舊版將任意 exception 印成「✅ 撤銷後該 key 送不出 op」，連 SDK 空 signer 的 `Method not supported`
+也被當成證明。它根本沒到 EntryPoint，不能證明 Kernel 拒絕了舊 key。
+
+#29 的 fork 流程先用舊 seed 簽好一份 UserOp，保存 EntryPoint `handleOps` calldata；撤銷時只需新 seed
+（或不帶 seed）。同一份 calldata 必須在撤銷前通過 validation、撤銷後收到可解碼的 EntryPoint
+`AA23 reverted`（inner revertData 為空，或 Kernel `InvalidNonce`）。RPC 不支援、連線失敗、壞簽章等一律不是成功。
+舊 seed 遺失又沒簽章樣本時照樣可撤銷，但不能宣稱驗證過舊簽章被拒絕。
+
+DB 的 `revoked`／`revoked_at` 必須等 receipt 執行成功且鏈上 signer 與 policies 都清空才寫入；
+已在鏈上撤銷但 DB 尚未同步時可安全重跑。完整指令見 README「本機 seed 輪替／撤銷演練」。
 
 ---
 
@@ -1200,7 +1217,8 @@ DB 那一列描述的仍是**換 executor 之前**的 CallPolicy target
 
 **症狀**：葉面上「續期成功」，排程器卻永遠說 `permissionId 不符`。鏈上與 DB 各說各話。
 
-**修法**：從 `baseIndex + 1` 往上找**第一個沒被 `session_keys` 用過**的 index（`firstFreeIndex()`），
+**修法**：先用 `nextRenewalKeyIndex()` 取「基準 index 與此投組歷史最大 index 的較大值 + 1」，
+再往上找**第一個沒被 `session_keys` 用過**的 index（`firstFreeIndex()`），
 並在安裝成功後把 `policySnapshot` 寫進 DB（腳本現在有 `[8b]` 這一步）。
 
 ⚠ 這也說明：**「寫 DB 失敗」被設計成 `duplicate: true` 是善意的（重送不該報錯），但它讓「key_ref 撞到

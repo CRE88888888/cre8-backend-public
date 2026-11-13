@@ -14,21 +14,24 @@
 //   `grantAccess(...)`); this script replays exactly those bytes as two self-calls in ONE UserOp.
 //
 // Run (one line):
-//   DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/cre8_atp \
-//   RPC_URL=http://127.0.0.1:8545 BUNDLER_URL=http://127.0.0.1:3001 \
+//   DATABASE_URL=<local cre8_x1 database> \
+//   RPC_URL=http://127.0.0.1:8546 BUNDLER_URL=http://127.0.0.1:3001 \
 //   SESSION_KEY_MASTER_SEED=0x<64 hex> SUDO_PRIVATE_KEY=0x<64 hex> \
-//   bun run backend/scripts/renew-session-key.ts --strategy-id 11
+//   bun run scripts/renew-session-key.ts --strategy-id 11
 //
 // Flags: --strategy-id <n> --owner <addr> --account <addr> --valid-until <unix> --key-index <n>
 //        --no-prove (skip the new-key executeRebalance proof) --revoke-old (also uninstall the old id)
+//        --revoke-only <pid> (no seed needed) --prepare-revoke-proof <pid> --proof-file <path>
+// See README「本機 seed 輪替／撤銷演練」for the signed proof captured BEFORE losing the old seed.
 
-import { mkdir, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { readFile, writeFile } from 'node:fs/promises';
 
 import { HDKey } from '@scure/bip32';
 import { signerToEcdsaValidator } from '@zerodev/ecdsa-validator';
-import { toECDSASigner } from '@zerodev/permissions/signers';
+import { PolicyFlags, toInitConfig, toPermissionValidator } from '@zerodev/permissions';
+import type { ModularSigner } from '@zerodev/permissions';
+import { toCallPolicy, toGasPolicy, toTimestampPolicy } from '@zerodev/permissions/policies';
+import { toECDSASigner, toEmptyECDSASigner } from '@zerodev/permissions/signers';
 import {
   KernelV3_3AccountAbi,
   addressToEmptyAccount,
@@ -37,23 +40,26 @@ import {
 } from '@zerodev/sdk';
 import { KERNEL_V3_3, VALIDATOR_TYPE } from '@zerodev/sdk/constants';
 import type { GetKernelVersion } from '@zerodev/sdk/types';
-import { recordRenewalResult } from '../src/renewal.js';
-import { concat, isAddressEqual, pad } from 'viem';
+import { nextRenewalKeyIndex, recordRenewalResult } from '../src/renewal.js';
+import { concat, decodeErrorResult, isAddressEqual, pad, toHex, zeroAddress } from 'viem';
 import type { Address, Chain, Hex, PublicClient } from 'viem';
 import { createPublicClient, decodeFunctionData, defineChain, encodeFunctionData, http } from 'viem';
 import { hdKeyToAccount, privateKeyToAccount } from 'viem/accounts';
+import { entryPoint07Abi, toPackedUserOperation } from 'viem/account-abstraction';
+import type { UserOperation } from 'viem/account-abstraction';
 
 import { KERNEL_V3_3_ADDRESSES } from '../src/addresses.js';
 import { closePool, query } from '../src/db.js';
 import { computeSalt } from '../src/kernel.js';
-import { buildSessionPermissions, deriveSessionKey, sessionKeyIndexFor, sessionValidUntil } from '../src/permissions.js';
+import { buildSessionPermissions, deriveSessionKey, sessionValidUntil } from '../src/permissions.js';
+import type { SessionPermission, SessionPolicySnapshot } from '../src/permissions.js';
 
 /** EntryPoint v0.7（`toPermissionValidator` 只接受 0.7）。 */
 const ENTRY_POINT = { address: KERNEL_V3_3_ADDRESSES.entryPointV07, version: '0.7' } as const;
 
-const RPC_URL = process.env.RPC_URL ?? 'http://127.0.0.1:8545';
+const RPC_URL = process.env.RPC_URL ?? 'http://127.0.0.1:8546';
 const BUNDLER_URL = process.env.BUNDLER_URL ?? 'http://127.0.0.1:3001';
-const CHAIN_ID = 56;
+const CHAIN_ID = Number(process.env.CHAIN_ID ?? 56);
 
 /** AtpExecutor.executeRebalance(address,(...)[],uint256) —— CallPolicy 白名單裡唯一的 selector。 */
 const EXECUTE_REBALANCE_SELECTOR: Hex = '0x1b977850';
@@ -88,13 +94,20 @@ type Args = {
   revokeOld: boolean;
   /** `--revoke-only <pid>`：只撤銷這個 permissionId，不續期（生命週期驗證用）。 */
   revokeOnlyPid: Hex | null;
-  revokeValidUntil: number | null;
-  revokeKeyIndex: bigint | null;
+  prepareProofPid: Hex | null;
+  proofFile: string | null;
 };
 
 function parseArgs(argv: readonly string[]): Args {
+  const known = new Set(['strategy-id', 'owner', 'account', 'valid-until', 'key-index', 'no-prove',
+    'revoke-old', 'revoke-only', 'prepare-revoke-proof', 'proof-file', 'revoke-valid-until', 'revoke-key-index']);
+  for (const arg of argv.filter((value) => value.startsWith('--'))) {
+    if (!known.has(arg.slice(2))) throw new Error(`未知參數 ${arg}；不送 op`);
+    if (argv.indexOf(arg) !== argv.lastIndexOf(arg)) throw new Error(`重複參數 ${arg}；不送 op`);
+  }
   const flag = (name: string): string | undefined => {
     const i = argv.indexOf(`--${name}`);
+    if (i >= 0 && (!argv[i + 1] || argv[i + 1]!.startsWith('--'))) throw new Error(`--${name} 缺少值`);
     return i >= 0 ? argv[i + 1] : undefined;
   };
   const has = (name: string): boolean => argv.includes(`--${name}`);
@@ -102,11 +115,23 @@ function parseArgs(argv: readonly string[]): Args {
     const raw = flag(name);
     if (raw === undefined) return undefined;
     const n = Number(raw);
-    if (!Number.isInteger(n)) throw new Error(`--${name} 必須是整數，收到 "${raw}"`);
+    if (!Number.isSafeInteger(n)) throw new Error(`--${name} 必須是安全整數，收到 "${raw}"`);
     return n;
   };
   const validUntilFlag = num('valid-until');
   const keyIndexFlag = flag('key-index');
+  if (has('revoke-valid-until') || has('revoke-key-index')) {
+    throw new Error('撤銷參數改由 DB 的完整 permissions 快照讀取；請移除 --revoke-valid-until / --revoke-key-index');
+  }
+  const revokeOnlyPid = flag('revoke-only') ?? null;
+  const prepareProofPid = flag('prepare-revoke-proof') ?? null;
+  for (const pid of [revokeOnlyPid, prepareProofPid]) {
+    if (pid !== null && !/^0x[0-9a-fA-F]{8}$/.test(pid)) throw new Error('permissionId 必須是 bytes4');
+  }
+  if ([has('revoke-old'), has('revoke-only'), has('prepare-revoke-proof')].filter(Boolean).length > 1) {
+    throw new Error('--revoke-old / --revoke-only / --prepare-revoke-proof 不可並用');
+  }
+  if (prepareProofPid && !flag('proof-file')) throw new Error('--prepare-revoke-proof 需要 --proof-file');
   return {
     strategyId: BigInt(num('strategy-id') ?? process.env.STRATEGY_ID ?? 11),
     owner: (flag('owner') as Address | undefined) ?? null,
@@ -115,9 +140,9 @@ function parseArgs(argv: readonly string[]): Args {
     keyIndex: keyIndexFlag === undefined ? null : BigInt(keyIndexFlag),
     prove: !has('no-prove'),
     revokeOld: has('revoke-old'),
-    revokeOnlyPid: (flag('revoke-only') as Hex | undefined) ?? null,
-    revokeValidUntil: num('revoke-valid-until') ?? null,
-    revokeKeyIndex: flag('revoke-key-index') === undefined ? null : BigInt(flag('revoke-key-index')!),
+    revokeOnlyPid: revokeOnlyPid as Hex | null,
+    prepareProofPid: prepareProofPid as Hex | null,
+    proofFile: flag('proof-file') ?? null,
   };
 }
 
@@ -129,6 +154,24 @@ const addr = (value: string): Address => value.toLowerCase() as Address;
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
+  // 私鑰工具只允許 loopback anvil；chain 56 也可能是本機 BSC fork，不能只用 chain id 判斷。
+  if (!['127.0.0.1', 'localhost', '[::1]'].includes(new URL(RPC_URL).hostname)) {
+    throw new Error('DEV / FORK ONLY：RPC_URL 必須是本機 anvil');
+  }
+  if (!['127.0.0.1', 'localhost', '[::1]'].includes(new URL(BUNDLER_URL).hostname)) {
+    throw new Error('DEV / FORK ONLY：BUNDLER_URL 必須是本機測試 bundler');
+  }
+  const chain = defineChain({
+    id: CHAIN_ID,
+    name: 'anvil-fork-bsc',
+    nativeCurrency: { name: 'BNB', symbol: 'BNB', decimals: 18 },
+    rpcUrls: { default: { http: [RPC_URL] } },
+  });
+  const publicClient: PublicClient = createPublicClient({ chain, transport: http(RPC_URL) });
+  const version = await publicClient.request({ method: 'web3_clientVersion' });
+  if (!version.toLowerCase().includes('anvil') || await publicClient.getChainId() !== CHAIN_ID) {
+    throw new Error('DEV / FORK ONLY：節點必須是 anvil，且 CHAIN_ID 必須相符');
+  }
 
   // ---- [1] sudo key: derive the address and prove it is the account's owner ------------------
   // The derivation IS the check: a wrong key must fail here rather than after a signed UserOp.
@@ -144,18 +187,10 @@ async function main(): Promise<void> {
   log('1', `sudo owner ${owner}（由 SUDO_PRIVATE_KEY 推導，已驗證相符）`);
 
   const masterSeed = process.env.SESSION_KEY_MASTER_SEED;
-  if (!masterSeed || !/^0x[0-9a-fA-F]{64}$/.test(masterSeed)) {
+  if (!args.revokeOnlyPid && (!masterSeed || !/^0x[0-9a-fA-F]{64}$/.test(masterSeed))) {
     throw new Error('[1] SESSION_KEY_MASTER_SEED 未設定或格式不對：需要 0x + 64 hex');
   }
   const material = { masterSeed: masterSeed as Hex };
-
-  const chain = defineChain({
-    id: CHAIN_ID,
-    name: 'anvil-fork-bsc',
-    nativeCurrency: { name: 'BNB', symbol: 'BNB', decimals: 18 },
-    rpcUrls: { default: { http: [RPC_URL] } },
-  });
-  const publicClient: PublicClient = createPublicClient({ chain, transport: http(RPC_URL) });
 
   // ---- [2] resolve the already-deployed account ---------------------------------------------
   // `createKernelAccount` derives the address from the init code, and initConfig is part of that init
@@ -167,14 +202,14 @@ async function main(): Promise<void> {
        from smart_accounts sa
        join portfolios p on p.id = sa.portfolio_id
       where lower(sa.owner) = $1 and p.strategy_id = $2 and sa.chain_id = $3
-      limit 1`,
-    [owner.toLowerCase(), args.strategyId.toString(), CHAIN_ID],
+        and ($4::text is null or lower(sa.address) = $4)`,
+    [owner.toLowerCase(), args.strategyId.toString(), CHAIN_ID, args.account?.toLowerCase() ?? null],
   );
-  if (portfolio.rowCount === 0 && !args.account) {
-    throw new Error(`[2] DB 找不到 owner=${owner} strategyId=${args.strategyId} 的 smart account：請用 --account 指定`);
+  if (portfolio.rows.length !== 1) {
+    throw new Error(`[2] DB 必須恰好有一個符合 owner / strategy / chain / account 的帳戶，找到 ${portfolio.rows.length} 個；不送 op`);
   }
   const deployed = args.account ? args.account : addr(portfolio.rows[0]!.address);
-  const portfolioId = portfolio.rowCount === 0 ? null : BigInt(portfolio.rows[0]!.portfolio_id);
+  const portfolioId = BigInt(portfolio.rows[0]!.portfolio_id);
   const code = await publicClient.getCode({ address: deployed });
   if (!code || code === '0x') {
     throw new Error(`[2] ${deployed} 沒有 code：這不是已部署的帳戶，續期腳本不負責部署`);
@@ -182,24 +217,22 @@ async function main(): Promise<void> {
   log('2', `帳戶 ${deployed}（已部署，code ${code.length} chars，portfolio ${portfolioId?.toString() ?? 'n/a'}）`);
 
   // ---- [3] the existing permissions (baseline + the account-identity guards) -----------------
-  // **全部** active 的 key 都讀回來，不是只讀最新那把：帳戶是用**第一把**的 initConfig 部署的
+  // **全部歷史** key 都讀回來（包括 revoked），帳戶是用**第一把**的 initConfig 部署的
   // （docs/pitfalls §8.21），續期過一次的帳戶，最新那把的 initConfig 推不出已部署地址。只讀最新那把
-  // 等於讓「續期過的帳戶」全部停在守衛上 —— 而那正是最需要續期的帳戶。舊權限基線（oldKey）仍然是
+  // 等於讓「續期過的帳戶」全部停在守衛上。公開快照不依賴 seed；舊權限基線（oldKey）仍然是
   // 最新那把（＝這一輪要被換掉的那把），兩件事分開。
-  const keyRows = portfolioId === null
-    ? []
-    : (await query<{ key_ref: string; pid: string; valid_until: string; executor: string }>(
-        `select key_ref,
+  const keyRows = (await query<SessionKeyRow>(
+        `select key_ref, status, permissions,
                 permissions->>'permissionId' as pid,
                 permissions->'timestamp'->>'validUntil' as valid_until,
                 permissions->'call'->'permissions'->0->>'target' as executor
            from session_keys
-          where portfolio_id = $1 and status = 'active'
-          order by expires_at asc`,
-        [portfolioId!.toString()],
+          where portfolio_id = $1
+          order by substring(key_ref from '[0-9]+$')::bigint asc`,
+        [portfolioId.toString()],
       )).rows;
-  const oldKey = keyRows.length === 0 ? null : keyRows[keyRows.length - 1]!;
-  const executor = addr(process.env.EXECUTOR_ADDRESS ?? oldKey?.executor ?? '0x60691760815C69d32c1f68146FA11669F62A4b38');
+  const oldKey = keyRows.filter((row) => row.status === 'active').at(-1) ?? null;
+  const executor = addr(process.env.EXECUTOR_ADDRESS ?? oldKey?.executor ?? '');
   let oldPid: Hex | null = null;
   if (oldKey) {
     oldPid = oldKey.pid as Hex;
@@ -213,74 +246,34 @@ async function main(): Promise<void> {
   }
   // 守衛一：帳戶身分（直接讀鏈，不靠重算地址）。梯子壞掉時 `enrollments` 會是 (0,0,false)。
   await assertOnChainIdentity(publicClient, deployed, args.strategyId);
-  // 守衛二：帳戶地址必須由「DB 裡某一把 key 的 initConfig」重現。候選是全部 active key，不是只有最新那把。
-  if (keyRows.length > 0) {
-    await resolveDeployKey(publicClient, sudoSigner.address, args.strategyId, deployed, keyRows, material);
+  // 守衛二：帳戶地址必須由 DB 的歷史公開快照重現，不從目前 seed 派生。
+  await resolveDeployKey(publicClient, sudoSigner.address, args.strategyId, deployed, keyRows);
+
+  const targetPid = args.revokeOnlyPid ?? args.prepareProofPid;
+  const target = targetPid ? keyRows.filter((row) => row.pid.toLowerCase() === targetPid.toLowerCase()) : [];
+  if (targetPid && target.length !== 1) {
+    throw new Error(`[3] permissionId ${targetPid} 在此 portfolio 必須恰好對到一筆 DB 紀錄；不送 op`);
   }
-
-  // ---- [3b] revoke-only mode: uninstall one permissionId, then prove its key is dead ----------
+  if (args.prepareProofPid) {
+    const row = target[0]!;
+    const keyAccount = hdKeyToAccount(HDKey.fromMasterSeed(hexToBytesSafe(masterSeed as Hex)), {
+      path: row.key_ref as `m/44'/60'/${string}`,
+    });
+    assertAddress(keyAccount.address, row.permissions.sessionKeyAddress, 'proof signer');
+    const perms = await storedPermission(publicClient, row, await toECDSASigner({ signer: keyAccount }));
+    const data = await prepareRevokeProof(publicClient, deployed, perms, owner, row.executor as Address);
+    await simulateProof(publicClient, data);
+    await writeFile(args.proofFile!, JSON.stringify({ chainId: chain.id, account: deployed, permissionId: row.pid, data }, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+    log('proof', '已保存舊 key 簽署的 UserOp；EntryPoint 撤銷前 validation 通過（eth_call，未送交易）');
+    return;
+  }
   if (args.revokeOnlyPid) {
-    const pid = args.revokeOnlyPid;
-    if (args.revokeValidUntil === null) {
-      throw new Error('--revoke-only 需要 --revoke-valid-until：撤銷要重建該權限拿 deinitData');
-    }
-    const beforeRevoke = await readPermission(publicClient, deployed, pid);
-    log('10', `撤銷前 permissionConfig(${pid}) signer=${beforeRevoke.signer} policies=${beforeRevoke.policyData.length}`);
-    if (beforeRevoke.signer === '0x0000000000000000000000000000000000000000') {
-      log('10', `${pid} 在鏈上本來就不存在，沒東西可撤銷`);
-      return;
-    }
-    // 重建該權限：deinitData 就是安裝時用的 enableData（SDK uninstallPlugin 也是這樣取）。
-    const revokeIndex = args.revokeKeyIndex ?? sessionKeyIndexFor(sudoSigner.address, args.strategyId) + 1n;
-    const revokeKeyRef = `m/44'/60'/0'/0/${revokeIndex.toString()}`;
-    const revokeKeyAccount = hdKeyToAccount(HDKey.fromMasterSeed(hexToBytesSafe(masterSeed as Hex)), {
-      path: revokeKeyRef as `m/44'/60'/${string}`,
-    });
-    const revokedPerms = await buildSessionPermissions({
-      publicClient,
-      sessionKeyAddress: revokeKeyAccount.address,
-      executorAddress: executor,
-      validUntil: args.revokeValidUntil,
-      signer: await toECDSASigner({ signer: revokeKeyAccount }),
-    });
-    if (revokedPerms.permissionId !== pid) {
-      log('10', `⚠ 重建的 permissionId ${revokedPerms.permissionId} != 被撤銷的 ${pid}：下面「送不出 op」不能歸因於撤銷`);
-    }
-    const revoke = await revokeOldPermission(
-      publicClient, chain, deployed, sudoSigner, pid,
-      await revokedPerms.permissionValidator.getEnableData(deployed),
-    );
-    log('10', `uninstallValidation(${pid}) txHash ${revoke.txHash} status=${revoke.success ? 'success' : 'REVERT'}`);
-    const gone = await readPermission(publicClient, deployed, pid);
-    log('10', `撤銷後 permissionConfig(${pid}) signer=${gone.signer} policies=${gone.policyData.length}`);
-
-    const outcome: Record<string, unknown> = {
-      account: deployed,
-      revoked: pid,
-      txHash: revoke.txHash,
-      success: revoke.success,
-      signerAfter: gone.signer,
-      policiesAfter: gone.policyData.length,
-    };
-
-    outcome['rebuilt'] = { permissionId: revokedPerms.permissionId, keyRef: revokeKeyRef, sessionKeyAddress: revokeKeyAccount.address };
-    try {
-      const stillWorks = await proveNewKey(publicClient, chain, deployed, revokedPerms, sudoSigner.address, revokeKeyAccount.address, executor);
-      log('10', `❌ 撤銷後該 key 仍然送得出 op —— 撤銷沒有生效`);
-      outcome['keyAfterRevoke'] = { stillWorks };
-    } catch (error) {
-      const reason = firstLine(error);
-      log('10', `✅ 撤銷後該 key 送不出 op：${reason}`);
-      outcome['keyAfterRevoke'] = { rejected: reason };
-    }
-    console.log(JSON.stringify(outcome, null, 2));
+    console.log(JSON.stringify(await revokeStoredKey(publicClient, chain, deployed, sudoSigner, portfolioId, target[0]!, args.proofFile), null, 2));
     return;
   }
 
   // ---- [4] derive the NEW session key ---------------------------------------------------------
-  // Deterministic and distinct from the old one: base index + 1 unless --key-index says otherwise.
-  const baseIndex = sessionKeyIndexFor(sudoSigner.address, args.strategyId);
-  const newIndex = args.keyIndex ?? (await firstFreeIndex(baseIndex + 1n));
+  const newIndex = args.keyIndex ?? (await firstFreeIndex(nextRenewalKeyIndex(owner, args.strategyId, keyRows.map((row) => row.key_ref))));
   const newKeyRef = `m/44'/60'/0'/0/${newIndex.toString()}` as const satisfies string as `m/44'/60'/${string}`;
   const newKeyAccount = hdKeyToAccount(HDKey.fromMasterSeed(hexToBytesSafe(masterSeed as Hex)), { path: newKeyRef });
   // Cross-check against the production deriver so this script cannot drift from src/permissions.ts.
@@ -300,6 +293,17 @@ async function main(): Promise<void> {
     signer: await toECDSASigner({ signer: newKeyAccount }),
   });
   log('5', `新 permissionId ${perms.permissionId} validUntil=${args.validUntil}（${perms.initConfig.length} 筆 install calldata）`);
+  const replacing = keyRows.filter((row) => row.status === 'active' && row.pid !== perms.permissionId).at(-1);
+  const used = keyRows.find((row) => row.key_ref === newKeyRef);
+  if (used && (used.pid !== perms.permissionId || used.status !== 'active')) {
+    throw new Error('[5] --key-index 已被不同權限使用或已停用；不送 op');
+  }
+  if (args.keyIndex !== null && !used && (await query('select 1 from session_keys where key_ref = $1', [newKeyRef])).rowCount) {
+    throw new Error('[5] --key-index 已屬於其他 portfolio；不送 op');
+  }
+  if (args.revokeOld && replacing && args.proofFile) {
+    await loadProof(publicClient, args.proofFile, deployed, replacing.pid as Hex);
+  }
 
   const already = await readPermission(publicClient, deployed, perms.permissionId);
   if (already.signer !== '0x0000000000000000000000000000000000000000') {
@@ -310,6 +314,9 @@ async function main(): Promise<void> {
       validUntil: Number(args.validUntil),
     }, perms.policySnapshot);
     if (args.prove) await proveNewKey(publicClient, chain, deployed, perms, sudoSigner.address, newKeyAccount.address, executor);
+    if (args.revokeOld && replacing) {
+      await revokeStoredKey(publicClient, chain, deployed, sudoSigner, portfolioId, replacing, args.proofFile);
+    }
     return;
   }
 
@@ -382,29 +389,10 @@ async function main(): Promise<void> {
   }
 
   // ---- [10] optional: revoke the OLD permission ----------------------------------------------
-  if (args.revokeOld && oldPid && oldKey) {
-    const oldPerms = await buildSessionPermissions({
-      publicClient,
-      sessionKeyAddress: hdKeyToAccount(HDKey.fromMasterSeed(hexToBytesSafe(masterSeed as Hex)), {
-        path: oldKey.key_ref as `m/44'/60'/${string}`,
-      }).address,
-      executorAddress: executor,
-      validUntil: Number(oldKey.valid_until),
-    });
-    const revoke = await revokeOldPermission(
-      publicClient, chain, deployed, sudoSigner, oldPid,
-      await oldPerms.permissionValidator.getEnableData(deployed),
-    );
-    log('10', `uninstallValidation(${oldPid}) txHash ${revoke.txHash} status=${revoke.success ? 'success' : 'REVERT'}`);
-    const gone = await readPermission(publicClient, deployed, oldPid);
-    log('10', `撤銷後 permissionConfig(${oldPid}) signer=${gone.signer} policies=${gone.policyData.length}`);
-    evidence['oldRevoked'] = { ...revoke, signerAfter: gone.signer, policiesAfter: gone.policyData.length };
+  if (args.revokeOld && replacing) {
+    evidence['oldRevoked'] = await revokeStoredKey(publicClient, chain, deployed, sudoSigner, portfolioId, replacing, args.proofFile);
   }
-
-  const stateFile = fileURLToPath(new URL('../../spike/renewal/state.json', import.meta.url));
-  await mkdir(dirname(stateFile), { recursive: true });
-  await writeFile(stateFile, `${JSON.stringify(evidence, null, 2)}\n`);
-  log('i', '結果寫入 spike/renewal/state.json（不含任何私鑰）');
+  console.log(JSON.stringify(evidence, null, 2));
 }
 
 /**
@@ -600,14 +588,145 @@ const REGISTRY_ABI = [
 ] as const;
 
 /** 一筆 session_keys 列（只取推導/守衛需要的那幾個欄位）。 */
-type SessionKeyRow = { key_ref: string; pid: string; valid_until: string; executor: string };
+type SessionKeyRow = {
+  key_ref: string; status: string; pid: string; valid_until: string; executor: string;
+  permissions: SessionPolicySnapshot;
+};
+
+/** 完整重建安裝時的公開資料；不使用目前 seed 或目前 policy 預設值。 */
+async function storedPermission(publicClient: PublicClient, row: SessionKeyRow, signer?: ModularSigner): Promise<SessionPermission> {
+  const s = row.permissions;
+  if (s.version !== 1 || s.kernelVersion !== '0.3.3' || !isAddressEqual(s.entryPoint, ENTRY_POINT.address)) {
+    throw new Error('[3] 不支援的 DB permission 快照；不送 op');
+  }
+  const permissionValidator = await toPermissionValidator(publicClient, {
+    signer: signer ?? toEmptyECDSASigner(s.sessionKeyAddress),
+    policies: [
+      toCallPolicy({ ...s.call, permissions: s.call.permissions.map((p) => ({ ...p, valueLimit: BigInt(p.valueLimit) })) } as Parameters<typeof toCallPolicy>[0]),
+      toGasPolicy({ ...s.gas, policyFlag: s.gas.policyFlag as PolicyFlags, allowed: BigInt(s.gas.allowed) }),
+      toTimestampPolicy({ ...s.timestamp, policyFlag: s.timestamp.policyFlag as PolicyFlags }),
+    ],
+    entryPoint: ENTRY_POINT, kernelVersion: kernelVersion33(), flag: s.flag as PolicyFlags,
+  });
+  const permissionId = permissionValidator.getIdentifier();
+  if (permissionId.toLowerCase() !== row.pid.toLowerCase()) {
+    throw new Error(`[3] DB 快照重建 permissionId ${permissionId} != ${row.pid}；不送 op`);
+  }
+  return { permissionValidator, permissionId, policySnapshot: s,
+    initConfig: await toInitConfig(permissionValidator), expiresAt: new Date(s.expiresAt) };
+}
+
+/** 在舊 seed 還可用時簽署一次；驗證用 eth_call，不消耗 nonce、gas 或 policy 預算。 */
+async function prepareRevokeProof(publicClient: PublicClient, deployed: Address, perms: SessionPermission, owner: Address, executor: Address): Promise<Hex> {
+  if ((await readPermission(publicClient, deployed, perms.permissionId)).signer === zeroAddress) {
+    throw new Error('proof 必須在撤銷前產生');
+  }
+  const account = await createKernelAccount(publicClient, {
+    address: deployed,
+    plugins: {
+      sudo: await signerToEcdsaValidator(publicClient, { signer: addressToEmptyAccount(owner), entryPoint: ENTRY_POINT, kernelVersion: kernelVersion33() }),
+      regular: perms.permissionValidator,
+    },
+    entryPoint: ENTRY_POINT, kernelVersion: kernelVersion33(), useMetaFactory: true,
+  });
+  const data = encodeFunctionData({ abi: REBALANCE_ABI, functionName: 'executeRebalance', args: [deployed, [], 2n ** 48n - 1n] });
+  const gasPrice = await publicClient.getGasPrice();
+  const op: UserOperation<'0.7'> = {
+    sender: deployed, nonce: await account.getNonce(),
+    callData: await account.encodeCalls([{ to: executor, data, value: 0n }]),
+    callGasLimit: 500_000n, verificationGasLimit: 1_500_000n, preVerificationGas: 100_000n,
+    maxFeePerGas: gasPrice, maxPriorityFeePerGas: gasPrice, signature: '0x',
+  };
+  op.signature = await account.signUserOperation(op);
+  return encodeFunctionData({ abi: entryPoint07Abi, functionName: 'handleOps', args: [[toPackedUserOperation(op)], owner] });
+}
+
+async function simulateProof(publicClient: PublicClient, data: Hex): Promise<void> {
+  await publicClient.call({ to: ENTRY_POINT.address, data, gas: 10_000_000n });
+}
+
+async function loadProof(publicClient: PublicClient, file: string, account: Address, pid: Hex): Promise<Hex> {
+  const proof = JSON.parse(await readFile(file, 'utf8')) as { chainId: number; account: Address; permissionId: Hex; data: Hex };
+  if (proof.chainId !== CHAIN_ID || !isAddressEqual(proof.account, account) || proof.permissionId.toLowerCase() !== pid.toLowerCase()) {
+    throw new Error('proof 的 chain / account / permissionId 不符；不送 op');
+  }
+  const decoded = decodeFunctionData({ abi: entryPoint07Abi, data: proof.data });
+  if (decoded.functionName !== 'handleOps') throw new Error('proof 必須是 EntryPoint.handleOps');
+  const [ops] = decoded.args;
+  const op = ops[0];
+  // Kernel nonce: default mode(1) + permission type(1) + pid(4) + padding(18) + sequence(8)。
+  const nonce = op ? toHex(op.nonce, { size: 32 }) : '0x';
+  if (ops.length !== 1 || !op || !isAddressEqual(op.sender, account) ||
+      nonce.slice(2, 6) !== '0002' || nonce.slice(6, 14).toLowerCase() !== pid.slice(2).toLowerCase()) {
+    throw new Error('proof 必須由指定的舊 permission 簽署（非 sudo / enable mode）；不送 op');
+  }
+  // 每次撤銷前重新驗證：過期、壞簽章、舊 nonce、RPC 失敗，都不能當撤銷證明。
+  await simulateProof(publicClient, proof.data);
+  log('proof', 'EntryPoint 撤銷前 validation 通過');
+  return proof.data;
+}
+
+async function revokeStoredKey(publicClient: PublicClient, chain: Chain, account: Address,
+  owner: ReturnType<typeof privateKeyToAccount>, portfolioId: bigint, row: SessionKeyRow, proofFile: string | null,
+): Promise<Record<string, unknown>> {
+  const perms = await storedPermission(publicClient, row);
+  const pid = perms.permissionId;
+  const before = await readPermission(publicClient, account, pid);
+  const proof = before.signer !== zeroAddress && proofFile ? await loadProof(publicClient, proofFile, account, pid) : null;
+  let txHash: Hex | null = null;
+  if (before.signer !== zeroAddress) {
+    const result = await revokeOldPermission(publicClient, chain, account, owner, pid, await perms.permissionValidator.getEnableData(account));
+    txHash = result.txHash;
+    if (!result.success) throw new Error('[10] 撤銷 UserOp revert；DB 不更新');
+  }
+  const after = await readPermission(publicClient, account, pid);
+  if (after.signer !== zeroAddress || after.policyData.length !== 0) {
+    throw new Error('[10] 鏈上 permission 仍存在；DB 不更新');
+  }
+  const updated = await query(`update session_keys set status = 'revoked', revoked_at = coalesce(revoked_at, now())
+    where key_ref = $1 and portfolio_id = $2 and permissions->>'permissionId' = $3`,
+    [row.key_ref, portfolioId.toString(), row.pid]);
+  if (updated.rowCount !== 1) throw new Error('[10] 鏈上已撤銷，但 DB 對應列已變更；請核對後重跑');
+  log('10', `permissionConfig(${pid}) signer=0 policies=0；DB status=revoked`);
+  let rejection: string | null = null;
+  if (proof) {
+    try {
+      await simulateProof(publicClient, proof);
+    } catch (error) {
+      // 只接受 EntryPoint 解碼成功的 validation 錯誤；連線、方法不支援等錯誤一律往外拋。
+      const data = findRevertData(error);
+      if (!data) throw error;
+      const decoded = decodeErrorResult({ abi: entryPoint07Abi, data });
+      if (decoded.errorName !== 'FailedOpWithRevert' || decoded.args[1] !== 'AA23 reverted') throw error;
+      // Kernel v3.3 清空 signer 後也可能 bare-revert（零地址 signer 的回傳值無法解碼）。
+      // 仍須是 EntryPoint 解碼成功的 AA23，且完全相同的簽署 payload 剛在撤銷前通過 validation。
+      const inner = decoded.args[2];
+      const reason = inner === '0x' ? 'account validation reverted (inner revertData=0x)' :
+        decodeErrorResult({ abi: KernelV3_3AccountAbi, data: inner }).errorName;
+      if (inner !== '0x' && reason !== 'InvalidNonce') throw error;
+      rejection = `EntryPoint ${decoded.args[1]} / ${reason}`;
+      log('proof', `舊 key 簽署的同一份 UserOp 被拒絕：${rejection}`);
+    }
+    if (!rejection) throw new Error('[proof] 撤銷後舊 UserOp 仍通過 validation');
+  } else {
+    log('proof', '未驗證舊 key 的 UserOp 拒絕：未提供撤銷前有效的 --proof-file（鏈上撤銷已確認）');
+  }
+  return { account, permissionId: pid, txHash, signerAfter: after.signer, status: 'revoked', rejection };
+}
+
+function findRevertData(error: unknown): Hex | null {
+  if (!error || typeof error !== 'object') return null;
+  const e = error as { data?: unknown; cause?: unknown };
+  if (typeof e.data === 'string' && /^0x[0-9a-fA-F]+$/.test(e.data)) return e.data as Hex;
+  return findRevertData(e.cause);
+}
 
 /**
  * 守衛一：帳戶身分**直接讀鏈**，不靠重算地址。
  *
  * 判的是「這個地址在 AtpRegistry 上是我們這條策略的帳戶」，也就是「要送 op 的對象是 DB 說的那個帳戶」
  * 這件事本身；重算地址判的是「部署參數可重現」，兩者防的不是同一個錯。梯子上沒有 enroll 紀錄
- * （全 0）、策略不同、或被 pause 都是停下來的理由。
+ * （全 0）、策略不同是停下來的理由；paused 只阻擋再平衡，不阻擋維運。
  */
 async function assertOnChainIdentity(
   publicClient: PublicClient,
@@ -646,20 +765,18 @@ async function assertOnChainIdentity(
         '帳戶與策略對不起來，停下不送 op',
     );
   }
-  if (paused) {
-    throw new Error(`[3] 策略 ${chainStrategyId} 在 registry 上是 paused：續期裝上去也不會生效，停下不送 op`);
-  }
+  // 暫停中的帳戶仍可續期／撤銷；解除暫停另由 owner / Safe 決定。
 }
 
 /**
- * 守衛二：已部署地址必須由「DB 裡某一把 active key 的 initConfig」重現。
+ * 守衛二：已部署地址必須由 DB 的某一把歷史 key 的公開快照重現，不依賴 seed。
  *
  * 帳戶是用**第一把** session key 的 initConfig 部署的（`docs/pitfalls` §8.21），而續期每次都往 DB
  * 加一把新的、expires_at 更晚的 key。所以「重算地址」這條守衛的輸入必須是**候選集合**而不是
  * 「最新那把」：拿最新那把去算，續期過一次的帳戶必然算不出自己的地址 —— 守衛本身沒錯，餵錯參數。
  *
  * 這裡**沒有放寬**判準：仍然要求「initConfig 進 initcode 後逐位重現已部署地址」，只是把候選從 1 把
- * 換成全部 active key，並要求**恰好一把**命中（0 把 = 參數對不上，多把 = DB 有重複紀錄，兩者都停）。
+ * 換成全部歷史 key（含 revoked），並要求**恰好一把**命中（0 把 = 參數對不上，多把 = DB 有重複紀錄，兩者都停）。
  * 同時把「不帶 initConfig」的反向對照留下來當證據。
  */
 async function resolveDeployKey(
@@ -668,19 +785,10 @@ async function resolveDeployKey(
   strategyId: bigint,
   deployed: Address,
   candidates: readonly SessionKeyRow[],
-  material: { masterSeed: Hex },
 ): Promise<SessionKeyRow> {
   const matches: SessionKeyRow[] = [];
   for (const candidate of candidates) {
-    const keyAccount = hdKeyToAccount(HDKey.fromMasterSeed(hexToBytesSafe(material.masterSeed)), {
-      path: candidate.key_ref as `m/44'/60'/${string}`,
-    });
-    const perms = await buildSessionPermissions({
-      publicClient,
-      sessionKeyAddress: keyAccount.address,
-      executorAddress: candidate.executor.toLowerCase() as Address,
-      validUntil: Number(candidate.valid_until),
-    });
+    const perms = await storedPermission(publicClient, candidate);
     const account = await createKernelAccount(publicClient, {
       plugins: { sudo: await signerToEcdsaValidator(publicClient, { signer: addressToEmptyAccount(owner), entryPoint: ENTRY_POINT, kernelVersion: kernelVersion33() }) },
       entryPoint: ENTRY_POINT,
@@ -695,14 +803,14 @@ async function resolveDeployKey(
     const onChain = await readPermission(publicClient, deployed, candidate.pid as Hex);
     log(
       '3',
-      `候選 ${candidate.key_ref}（${keyAccount.address}，pid ${candidate.pid}，validUntil ${candidate.valid_until}，` +
+      `候選 ${candidate.key_ref}（${candidate.permissions.sessionKeyAddress}，pid ${candidate.pid}，validUntil ${candidate.valid_until}，` +
         `鏈上 signer ${onChain.signer}）→ 帶 initConfig 推導 ${account.address}${hit ? ' = 已部署 ✓' : ' ✗'}`,
     );
   }
 
   if (matches.length === 0) {
     throw new Error(
-      `[3] DB 現有 ${candidates.length} 把 active session key 都推不出已部署地址 ${deployed}（逐一結果見上）：` +
+      `[3] DB 現有 ${candidates.length} 把歷史 session key 都推不出已部署地址 ${deployed}（逐一結果見上）：` +
         'DB 的 key_ref/validUntil 與部署當時不一致，停下不送 op',
     );
   }
@@ -752,5 +860,11 @@ function describeCalls(calls: readonly { to: Address; data: Hex }[]): void {
   });
 }
 
-await main();
-await closePool().catch(() => undefined);
+try {
+  await main();
+} catch (error) {
+  console.error(firstLine(error));
+  process.exitCode = 1;
+} finally {
+  await closePool();
+}

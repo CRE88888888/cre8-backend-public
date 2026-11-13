@@ -559,6 +559,44 @@ curl -s -X POST "$API/portfolios/3/renewal-result" \
 - 錯誤：401 `UNAUTHORIZED`；404 `NOT_FOUND`；403 `FORBIDDEN`；400 `INVALID_RENEWAL`（缺 `keyRef`／
   `permissionId`、`validUntil` 不在 uint48 內、`policySnapshot` 不是物件）、`INVALID_ID`、`INVALID_JSON`。
 
+### 本機 seed 輪替／撤銷演練（維運工具）
+
+`scripts/renew-session-key.ts` **只供本機 anvil fork 使用**，由 owner 的公開測試金鑰簽 sudo UserOp。
+RPC 與 bundler 必須是 loopback，節點必須回報 anvil；不可帶真實 owner 私鑰執行。
+X1 使用 anvil 8546、backend 8082、資料庫 `cre8_x1`；帳戶須已部署並有完整 DB permission 快照。
+
+先設定本機 `DATABASE_URL`、`RPC_URL=http://127.0.0.1:8546`、`BUNDLER_URL`、`CHAIN_ID`、
+`REGISTRY_ADDRESS`、`EXECUTOR_ADDRESS` 與 `SUDO_PRIVATE_KEY`（anvil 公開測試金鑰）。
+`SID` 是 **DB strategy id**，`OLD_PID` 是該帳戶舊 key 的 bytes4 permissionId。
+
+```bash
+# seed A 建好帳戶後，先保存舊 key 簽好的 UserOp（僅 eth_call，不送交易）。
+# TEST_SEED_A / TEST_SEED_B 只用測試值；proof-file 放在 repo 內的忽略目錄，不能進版控。
+mkdir -p .deploy/seed-rotation
+SESSION_KEY_MASTER_SEED="$TEST_SEED_A" bun run scripts/renew-session-key.ts \
+  --strategy-id "$SID" --prepare-revoke-proof "$OLD_PID" --proof-file .deploy/seed-rotation/old-op.json
+
+# 換 seed B：續期仍能核對原部署地址；--no-prove 只跳過新 key 的實際再平衡交易。
+SESSION_KEY_MASTER_SEED="$TEST_SEED_B" bun run scripts/renew-session-key.ts --strategy-id "$SID" --no-prove
+
+# 只帶 seed B 即可撤銷 seed A 的 key；撤銷本身也可以完全不帶 seed。
+SESSION_KEY_MASTER_SEED="$TEST_SEED_B" bun run scripts/renew-session-key.ts \
+  --strategy-id "$SID" --revoke-only "$OLD_PID" --proof-file .deploy/seed-rotation/old-op.json
+```
+
+撤銷從 **DB 的完整公開快照**重建 deinitData，核對 permissionId；不讀舊 seed，也不接受手填舊 index／到期日。
+成功須同時有 UserOp 執行成功、鏈上 `permissionConfig(pid).signer = 0`、policy 清空，之後才把唯一對應的
+`session_keys` 列更新為 `revoked` 並填 `revoked_at`。若鏈上早已撤銷，重跑只同步 DB，不重送交易。
+`--revoke-old` 可在續期後撤銷上一把 active key；`--account` 可進一步限縮 DB 帳戶，不能繞過 owner／strategy／chain 核對。
+帳戶暫停時也能做維運，腳本不解除暫停；續期請加 `--no-prove`，因為執行再平衡仍會被 paused 擋下。
+
+`--proof-file` 在撤銷前重驗一次有效性，再用**同一份舊簽章**跑 EntryPoint `handleOps` 的 `eth_call`。
+只接受解碼後的 `FailedOpWithRevert(AA23 reverted)`（inner revertData 為空，或 Kernel `InvalidNonce`）為拒絕證明；
+RPC、SDK、壞簽章、nonce 過期、權限到期等錯誤會失敗退出。撤銷成功後若 proof 驗證失敗，DB 仍如實記錄已撤銷。
+沒有 proof-file 仍能撤銷，但明確回報「未驗證舊 UserOp 拒絕」。
+舊 seed 已遺失且沒有事先簽好的 UserOp 時，無法補造舊 key 簽章；只能驗證鏈上撤銷狀態。
+proof-file 含可提交的簽署資料，雖無私鑰，仍須保護並在演練後刪除；不要在準備 proof 後再用舊 key 送交易消耗 nonce。
+
 ### 前端拿到 `renewal-params` 之後還缺什麼
 
 缺兩樣，而且**全部刻意放在前端**：`ownerAddress` 的 **sudo 簽章者**（後端沒有使用者的 owner 私鑰，

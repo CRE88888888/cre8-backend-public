@@ -23,10 +23,11 @@ const ABI = parseAbi([
 /** Real viem ABI encoding/decoding over an in-memory RPC; no PublicClient type assertions. */
 export function sellFixture() {
   const state: { limit: string | null; fail: string; noFloor: boolean; price: bigint; quoteOffset: bigint;
+    quoteErrors: Map<string, Error>;
     extraLimits: { address: string; max_leg_usdt: string | null }[];
     reads: { functionName: string; block: unknown }[]; writes: { sql: string; params: readonly unknown[] }[] } = {
     limit: '150', fail: '', noFloor: false, price: 1n, quoteOffset: 0n,
-    extraLimits: [], reads: [], writes: [] };
+    quoteErrors: new Map(), extraLimits: [], reads: [], writes: [] };
   const publicClient = createPublicClient({ transport: custom({ request: async ({ method, params }) => {
     if (method === 'eth_getBlockByNumber') {
       if (state.fail === 'getBlock') throw new Error('RPC timeout secret-token');
@@ -50,6 +51,8 @@ export function sellFixture() {
       case 'effectiveFeeBps': return encodeFunctionResult({ abi: ABI, functionName: 'effectiveFeeBps', result: 0 });
       case 'decimals': return encodeFunctionResult({ abi: ABI, functionName: 'decimals', result: 18 });
       case 'previewSwap': {
+        const error = state.quoteErrors.get(decoded.args[0].toLowerCase());
+        if (error !== undefined) throw error;
         const factor = decoded.args[0].toLowerCase() === DOGE.toLowerCase() ? 10n ** 10n : 1n;
         const quoted = decoded.args[2] * factor * state.price + state.quoteOffset;
         return encodeFunctionResult({ abi: ABI, functionName: 'previewSwap', result: [quoted, state.noFloor ? 0n : quoted * 99n / 100n] });

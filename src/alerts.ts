@@ -1,4 +1,5 @@
 import type { Address } from 'viem';
+import type { PriceSourceObservation } from './chain.js';
 import { getAccountGasBalance, getGasPriceWei } from './chain.js';
 import { DEFAULT_CHAIN_ID } from './config.js';
 import { perOperationCostWei } from './funding.js';
@@ -40,6 +41,7 @@ export const ALERT_KINDS = [
   'portfolio_stuck',
   'session_key_derivation_mismatch',
   'executor_paused',
+  'price_source_unavailable',
 ] as const;
 
 export type AlertKind = (typeof ALERT_KINDS)[number];
@@ -743,4 +745,46 @@ function chainIdFromEnv(env: NodeJS.ProcessEnv): number {
 
 function truncate(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}…`;
+}
+
+export const PRICE_SOURCE_FAILURE_ROUNDS = 3;
+export type PriceSourceTracker = ReturnType<typeof createPriceSourceTracker>;
+
+/** Pre-alert counters reset on process restart; an existing DB critical stays latched until verified recovery. */
+export function createPriceSourceTracker() {
+  const counts = new Map<string, number>();
+  return (observations: readonly PriceSourceObservation[], previous: AlertFinding | null): { finding: AlertFinding | null; complete: boolean } => {
+    const unique = new Map(observations.map((observation) => [observation.asset.toLowerCase(), observation]));
+    let complete = true;
+    for (const [asset, observation] of unique) {
+      if (!observation.verified) { complete = false; counts.delete(asset); }
+      else if (observation.failure === null) counts.delete(asset);
+      else counts.set(asset, Math.min(PRICE_SOURCE_FAILURE_ROUNDS, (counts.get(asset) ?? 0) + 1));
+    }
+    if (previous !== null && priceSourceAlertAssets(previous.detail).length === 0) complete = false;
+    // Missing observations are unknown too, including assets disabled since the alert opened.
+    for (const asset of priceSourceAlertAssets(previous?.detail ?? '')) {
+      if (!unique.has(asset.toLowerCase())) complete = false;
+    }
+    for (const asset of counts.keys()) if (!unique.has(asset)) counts.delete(asset);
+    const failures = [...unique.values()].filter((observation) => observation.verified && observation.failure !== null);
+    const critical = previous !== null || failures.some((observation) => (counts.get(observation.asset.toLowerCase()) ?? 0) >= PRICE_SOURCE_FAILURE_ROUNDS);
+    const lines = failures
+      .sort((left, right) => left.asset.toLowerCase().localeCompare(right.asset.toLowerCase()))
+      .map((observation) => `asset ${observation.asset.toLowerCase()}: ${observation.failure?.detail}（連續 ${counts.get(observation.asset.toLowerCase()) ?? 0}/${PRICE_SOURCE_FAILURE_ROUNDS} 輪）`);
+    // Preserve previous affected assets whose current read is unknown, but remove verified healthy ones.
+    for (const line of previous?.detail.split('\n') ?? []) {
+      const [asset] = priceSourceAlertAssets(line);
+      if (asset !== undefined && unique.get(asset.toLowerCase())?.verified !== true) lines.push(line);
+    }
+    const finding: AlertFinding | null = critical && lines.length > 0 ? {
+      kind: 'price_source_unavailable', severity: 'critical', portfolioId: null,
+      detail: '價格來源不可用；全部受影響資產確認恢復後才解除：\n' + lines.join('\n'),
+    } : null;
+    return { finding: previous !== null && priceSourceAlertAssets(previous.detail).length === 0 ? previous : finding, complete };
+  };
+}
+
+export function priceSourceAlertAssets(detail: string): Address[] {
+  return [...detail.matchAll(/^asset (0x[0-9a-fA-F]{40}):/gm)].map((match) => match[1] as Address);
 }

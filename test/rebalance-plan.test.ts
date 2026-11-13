@@ -90,6 +90,7 @@ type StubChain = {
   /** 被呼叫的 `getBlock` 次數（deadline 一定要讀塊時間，除非注入）。 */
   blockReads: number;
   oracle: {
+    errors?: Record<string, Error>;
     pool: Address;
     token0: Address;
     token1: Address;
@@ -177,6 +178,8 @@ function stubClient(chain: StubChain): PublicClient {
             const byRate = quoteByRate(amountIn);
             if (byRate !== null) return byRate;
             const key = `${String(args.args?.[0]).toLowerCase()}:${String(args.args?.[1]).toLowerCase()}`;
+            const failure = chain.oracle.errors?.[key];
+            if (failure !== undefined) throw failure;
             const quote = chain.oracle.quotes?.[key];
             if (quote === undefined) throw new Error('execution reverted: UnsupportedRoute()');
             return [quote.quoted ?? quote.minimum, quote.minimum];
@@ -2480,4 +2483,32 @@ test('#47 Pancake comparison caps eth_call gas so a cold thin pool cannot consum
   assert.equal(step?.venue, PANCAKE_UR, 'the valid Pancake quote beats the aggregator 130 to 120');
   assert.ok(observedGas.length > 0);
   assert.ok(observedGas.every((gas) => gas === '0x7a120'), 'each comparison eth_call must have a 500000 gas budget');
+});
+
+
+import { secondaryRevert } from './fixtures/secondary-price.js';
+for (const code of ['StaleFeed', 'InvalidAnswer', 'SourcesDisagree'] as const) {
+  test(`#52 hub skips only ${code} asset and preserves a healthy buy`, async () => {
+    const holdings = [holding(USDT, 200n * 10n ** 18n, 18, PRICE_1_USD)];
+    const targets = [{ asset: WBNB, weightBps: 5000 }, { asset: TOKEN3, weightBps: 5000 }, { asset: USDT, weightBps: 0 }];
+    const chain = hubChain({ quotes: { [`${USDT}:${TOKEN3}`]: { minimum: 99n * 10n ** 18n } } });
+    chain.oracle.errors = { [`${USDT}:${WBNB}`]: secondaryRevert(code, code === 'InvalidAnswer' ? 0n : 100n) };
+    const plan = expectReady(await planRebalance(hubArgs(chain, { holdings, targets, thresholdBps: 100 })));
+    assert.equal(plan.steps.length, 1); assert.equal(plan.steps[0]?.tokenOut, getAddress(TOKEN3));
+    assert.match(plan.rationale, new RegExp(code)); assert.doesNotMatch(plan.rationale, /private-token/);
+    chain.oracle.errors[`${USDT}:${TOKEN3}`] = secondaryRevert(code, code === 'InvalidAnswer' ? -1n : 100n);
+    const allBlocked = await planRebalance(hubArgs(chain, { holdings, targets, thresholdBps: 100 }));
+    assert.equal(allBlocked.kind, 'blocked');
+    assert.match(allBlocked.reason, new RegExp(code));
+  });
+}
+
+
+test('#52 a faulty held feed in buyAllowance preserves independent healthy sells', async () => {
+  const { holdings, targets } = threeAssetCase();
+  const chain = hubChain({ quotes: { [`${WBNB}:${USDT}`]: { minimum: 198n * 10n ** 18n } } });
+  chain.buyAllowance = secondaryRevert('StaleFeed');
+  const plan = expectReady(await planRebalance(hubArgs(chain, { holdings, targets, thresholdBps: 100 })));
+  assert.equal(plan.steps.length, 1); assert.equal(plan.steps[0]?.tokenIn, getAddress(WBNB));
+  assert.match(plan.rationale, /StaleFeed/);
 });

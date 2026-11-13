@@ -934,3 +934,40 @@ Kyber calldata 在交給 alto 前以 `from=Kernel` 的 `eth_call` 預熱；UserO
 設為 `REGISTRY_ADDRESS`／`EXECUTOR_ADDRESS`（測試子程序內的 env 不會傳回 shell）。
 router 已同時設定 WBNB oracle，讓 pricing crosscheck 有實際部署可比；然後執行
 `RUN_CHAIN_TESTS= bun test --timeout=120000`，一般 suite 的送交易測試維持原有 opt-in 條件。
+
+### 第二價格來源：錯誤、警示與起飛前檢查（#52）
+
+router 掛上 secondary 後，`StaleFeed`、`InvalidAnswer`、`SourcesDisagree` 都會阻擋該資產。
+後端從 ABI revert data 解碼，列出資產、secondary feed、updatedAt／鏈上年齡，或 TWAP 與
+secondary 報價及差距；拿不到診斷用鏈上時間時會明說未知，不用牆鐘猜，也不回顯 RPC 原文。
+hub 規劃會跳過故障資產，在 rationale 記原因，其他可用資產照常規劃。送出前刷新若失敗，
+保留整批不送，下一輪重新規劃，避免移除一步後破壞原來的現金預算。已送出的 UserOp 仍先對帳，
+不能因來源故障把結果未知的操作當成未送出。
+
+每輪（含 dry-run、沒有到期投組的輪次）檢查 enabled 資產與既有警示中的資產。
+同一資產連續 **3 輪**出現以上任一錯誤，建立一筆 `price_source_unavailable` critical，
+`portfolio_id = null`，detail 合併受影響資產及原因。DB 需先套用 **0025**。
+單一資產恢復不解除全域警示；全部確認恢復才解除。RPC／DB 失敗或缺少觀測不算恢復，
+也不累計為一次價格來源故障。三輪門檻前的計數存在 scheduler 程序中，重啟後重新累積；
+已建立的 critical 保存在 DB，重啟後仍保留到全部確認恢復。
+
+`bun run preflight --strict` 逐資產列出有無 secondary、maxAge、maxDeviation，並列出
+asset/USD 與 numeraire/USD 兩個 feed 的 updatedAt 和鏈上年齡。年齡剛好等於 maxAge 可用；
+超過、updatedAt 為 0／未來時間、answer ≤ 0 都 fail；讀取失敗也 fail。
+未設定 secondary 會明列「只有 Pancake TWAP」，不自行要求所有資產都必須配置 secondary。
+
+提領續作與 close 可保留其他有價資產的賣出；close 有資產無價時，剩餘名義額維持 null。
+首批按 usd 比例提領若不能確認完整待賣名義額，會 blocked，避免把未知剩餘量報成已完成。
+
+獨立 fork 驗收使用 anvil **8636**、DB **cre8_x1j**，backend 若啟動只用 **8172**。
+從 contracts main `08ed3453316b9665623a3d39fab49444cd0df1e8` 建立唯讀副本到
+`.bun-cache/contracts-52`，使用該版本依賴並 `forge build --root .bun-cache/contracts-52`。
+設定上述本機環境及 `MIGRATIONS_DIR` 後執行：
+
+```bash
+RUN_CHAIN_TESTS=1 bun test ./test/secondary-price.fork.ts --timeout=120000
+```
+
+測試部署真正的 router／PushFeedPriceSource 與可更新的測試 feeds，以 `evm_increaseTime`
+製造過期，檢查第三輪全域 critical、健康 ETH 的真實 SwapExecuted 與地板，最後用 snapshot
+恢復鏈上時間，驗證警示解除與兩資產重新可規劃。只用 anvil 公開測試助記詞。

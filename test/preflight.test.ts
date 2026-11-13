@@ -4,7 +4,7 @@ import { mnemonicToAccount } from 'viem/accounts';
 import { createPublicClient, custom, getAddress, encodeAbiParameters, encodeEventTopics, encodeFunctionResult, zeroAddress } from 'viem';
 import { EXECUTOR_ABI, PANCAKE_UR } from '../src/chain.js';
 import type { Address } from 'viem';
-import { checkVenues, checkBuyConfig, checkGlobalPaused, checkOwnership, checkRegistryOperator, checkRoleSeparation, checkSessionKeySeed, operatorAddress } from '../scripts/preflight.js';
+import { checkSecondarySources, checkVenues, checkBuyConfig, checkGlobalPaused, checkOwnership, checkRegistryOperator, checkRoleSeparation, checkSessionKeySeed, operatorAddress } from '../scripts/preflight.js';
 
 for (const strict of [true, false]) {
   test(`executor pause preflight (strict=${strict}) distinguishes false, true and unreadable`, () => {
@@ -292,4 +292,139 @@ test('#47 preflight deployment block accepts zero and rejects negative or future
 test('#47 preflight rejects a scan starting after deployment to avoid omitting old venues', async () => {
   const f = venuePreflightFixture(); f.state.wrongDeployment = true;
   assert.equal((await checkVenues(f.client, getAddress(SAFE.toLowerCase()), 40n))[0]?.level, 'fail');
+});
+
+// #52 regression: a structured secondary revert must survive the pre-send quote boundary.
+test('#52 stale feed refresh returns the feed and reason without RPC credentials', async () => {
+  const { refreshFloors } = await import('../src/rebalance-plan.js');
+  const { ContractFunctionRevertedError, encodeErrorResult, parseAbi } = await import('viem');
+  const abi = parseAbi(['error StaleFeed(address feed,uint256 updatedAt)']);
+  const error = new ContractFunctionRevertedError({ abi, functionName: 'previewSwap', data: encodeErrorResult({ abi,
+    errorName: 'StaleFeed', args: [OTHER, 100n] }) });
+  const client = createPublicClient({ transport: custom({ request: async ({ method }) => {
+    if (method === 'eth_getBlockByNumber') return { number: '0x2a', timestamp: '0xc8', transactions: [] };
+    throw new Error('https://rpc.invalid/private-token', { cause: error });
+  } }, { retryCount: 0 }) });
+  const result = await refreshFloors({ publicClient: client, oracle: getAddress(SAFE.toLowerCase()), feeBps: 0,
+    steps: [{ tokenIn: OWNER, tokenOut: OTHER, amountIn: 10n, amountOutMin: 9n,
+      oracleFloor: 9n, venue: OTHER, data: '0x' }] });
+  assert.equal(result.ok, false);
+  if (result.ok) throw new Error('stale feed was accepted');
+  assert.match(result.reason, /StaleFeed/);
+  assert.match(result.reason, new RegExp(OTHER, 'i'));
+  assert.match(result.reason, /100.*秒/);
+  assert.doesNotMatch(result.reason, /private-token|rpc.invalid/);
+});
+
+
+import { decodePriceSourceError, inspectPriceSources, readSecondaryHealth } from '../src/chain.js';
+import { ASSET, ASSET_FEED, CASH, ORACLE, secondaryFixture, secondaryRevert } from './fixtures/secondary-price.js';
+
+for (const [code, value, pattern] of [
+  ['StaleFeed', 900n, /年齡 100 秒/], ['InvalidAnswer', 0n, /回傳 0/],
+  ['InvalidAnswer', -1n, /回傳 -1/], ['SourcesDisagree', 10101n, /101 bps/],
+] as const) {
+  test(`#52 ${code} ABI and nested RPC decode retains safe facts`, () => {
+    const failure = decodePriceSourceError(new Error('private-token', { cause: secondaryRevert(code, value) }), { asset: ASSET, timestamp: 1000n });
+    assert.equal(failure?.code, code); assert.match(failure?.detail ?? '', pattern);
+    assert.doesNotMatch(failure?.detail ?? '', /private-token/);
+    assert.match(failure?.detail ?? '', new RegExp(ASSET, 'i'));
+  });
+}
+
+test('#52 malformed, cyclic, forged message and unknown reverts cannot disclose RPC text', () => {
+  const cyclic: { cause?: unknown } = {}; cyclic.cause = cyclic;
+  for (const error of [cyclic, new Error('StaleFeed private-token'), { data: '0x12345678' },
+    { data: { errorName: 'StaleFeed', args: ['private-token', 1n] } }, { errorName: 'InvalidAnswer', args: [ASSET_FEED, 1n] }]) {
+    assert.equal(decodePriceSourceError(error), null);
+  }
+  assert.match(decodePriceSourceError(secondaryRevert('SourcesDisagree', 0n))?.detail ?? '', /10000 bps/);
+});
+
+for (const strict of [true, false]) {
+  for (const at of [0n, 939n, 940n, 941n, 1001n]) {
+    test(`#52 preflight strict=${strict}, feed updatedAt=${at} (zero/exact age/future)`, async () => {
+      const f = secondaryFixture(); f.state.cashAt = at;
+      const checks = await checkSecondarySources(f.client, ORACLE, [ASSET], strict);
+      assert.equal(checks.length, 3);
+      const good = at >= 940n && at <= 1000n;
+      assert.equal(checks[2]?.level, good ? 'ok' : strict ? 'fail' : 'warn');
+      assert.match(checks[1]?.detail ?? '', /年齡 60 秒/);
+      assert.ok(f.state.calls.every((call) => call.block === '0x2a'));
+    });
+  }
+}
+
+for (const method of ['eth_getBlockByNumber', 'secondaryOf', 'assetFeed', 'numeraireFeed', 'maxAge', 'latestRoundData']) {
+  test(`#52 preflight ${method} missing/RPC failure fails closed and hides credentials`, async () => {
+    const f = secondaryFixture(); f.state.fail = method;
+    const checks = await checkSecondarySources(f.client, ORACLE, [ASSET], true);
+    assert.ok(checks.some((check) => check.level === 'fail'));
+    assert.doesNotMatch(JSON.stringify(checks), /private-token/);
+  });
+}
+
+test('#52 absent secondary is explicit; both invalid answers and maxAge limits are checked', async () => {
+  const f = secondaryFixture(); f.state.source = zeroAddress;
+  assert.match((await checkSecondarySources(f.client, ORACLE, [ASSET], true))[0]?.detail ?? '', /未設定 secondary/);
+  f.state.source = (await import('./fixtures/secondary-price.js')).SOURCE;
+  for (const answer of [0n, -1n]) {
+    f.state.assetAnswer = answer;
+    assert.equal((await checkSecondarySources(f.client, ORACLE, [ASSET], true))[1]?.level, 'fail');
+  }
+  f.state.assetAnswer = 1n;
+  for (const maxAge of [60, 86400]) {
+    f.state.maxAge = maxAge;
+    assert.equal((await readSecondaryHealth(f.client, ORACLE, ASSET, { number: 42n, timestamp: 1000n })).maxAge, maxAge);
+  }
+  for (const maxAge of [0, 59, 86401]) {
+    f.state.maxAge = maxAge;
+    await assert.rejects(readSecondaryHealth(f.client, ORACLE, ASSET, { number: 42n, timestamp: 1000n }));
+  }
+});
+
+test('#52 monitor identifies stale/disagree/invalid and preserves unknown RPC state', async () => {
+  const f = secondaryFixture();
+  let observations = await inspectPriceSources(f.client, ORACLE, [ASSET, ASSET, CASH]);
+  assert.equal(observations.length, 1); assert.equal(observations[0]?.failure, null);
+  f.state.assetAt = 939n;
+  assert.equal((await inspectPriceSources(f.client, ORACLE, [ASSET]))[0]?.failure?.code, 'StaleFeed');
+  f.state.assetAt = 940n; f.state.assetAnswer = 0n;
+  assert.equal((await inspectPriceSources(f.client, ORACLE, [ASSET]))[0]?.failure?.code, 'InvalidAnswer');
+  f.state.assetAnswer = 1n; f.state.quoteError = secondaryRevert('SourcesDisagree', 12000n);
+  assert.equal((await inspectPriceSources(f.client, ORACLE, [ASSET]))[0]?.failure?.code, 'SourcesDisagree');
+  f.state.quoteError = new Error('private-token timeout');
+  observations = await inspectPriceSources(f.client, ORACLE, [ASSET]);
+  assert.equal(observations[0]?.verified, false); assert.equal(observations[0]?.failure, null);
+});
+
+
+test('#52 EntryPoint wrapper and deep viem causes decode only the inner ABI error', async () => {
+  const { encodeErrorResult } = await import('viem');
+  const { PRICE_SOURCE_ABI, describePriceSourceError } = await import('../src/chain.js');
+  const raw = secondaryRevert('StaleFeed', 900n).raw; assert.ok(raw);
+  let error: unknown = { data: encodeErrorResult({ abi: PRICE_SOURCE_ABI, errorName: 'FailedOpWithRevert', args: [0n, 'RPC private-token', raw] }) };
+  for (let index = 0; index < 12; index += 1) error = new Error('RPC private-token', { cause: error });
+  assert.equal(decodePriceSourceError(error)?.code, 'StaleFeed');
+  const f = secondaryFixture();
+  const detailed = await describePriceSourceError(error, f.client, { oracle: ORACLE, assets: [CASH, ASSET] });
+  assert.equal(detailed?.asset, ASSET); assert.match(detailed?.detail ?? '', /年齡 100 秒.*上限 60 秒.*超時 40 秒/);
+  assert.doesNotMatch(detailed?.detail ?? '', /private-token/);
+  f.state.fail = 'eth_getBlockByNumber';
+  assert.match((await describePriceSourceError(error, f.client, { oracle: ORACLE }))?.detail ?? '', /鏈上時間未知/);
+});
+
+test('#52 malformed structured integer args cannot masquerade as valid oracle evidence', () => {
+  for (const error of [{ errorName: 'StaleFeed', args: [ASSET_FEED, -1n] },
+    { errorName: 'StaleFeed', args: [ASSET_FEED, 1n << 256n] },
+    { errorName: 'InvalidAnswer', args: [ASSET_FEED, -(1n << 255n) - 1n] },
+    { errorName: 'SourcesDisagree', args: [ASSET, 1n, 1n << 256n] }]) assert.equal(decodePriceSourceError(error), null);
+  assert.equal(decodePriceSourceError(secondaryRevert('InvalidAnswer', -(1n << 255n)))?.code, 'InvalidAnswer');
+});
+
+test('#52 disagreement zero denominator, exact 100 bps and uint256 upper bound stay integer-safe', () => {
+  const zero = decodePriceSourceError({ data: { errorName: 'SourcesDisagree', args: [ASSET, 1n, 0n] } });
+  assert.match(zero?.detail ?? '', /無法計算（secondary=0）/);
+  assert.match(decodePriceSourceError({ data: { errorName: 'SourcesDisagree', args: [ASSET, 10100n, 10000n] } })?.detail ?? '', /差距 100 bps/);
+  assert.equal(decodePriceSourceError({ data: { errorName: 'SourcesDisagree', args: [ASSET, (1n << 256n) - 1n, 1n] } })?.code, 'SourcesDisagree');
 });

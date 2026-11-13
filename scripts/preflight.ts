@@ -30,7 +30,7 @@ import { createPublicClient, http, isAddress, getAddress, zeroAddress } from 'vi
 import { privateKeyToAccount } from 'viem/accounts';
 import type { Address, PublicClient } from 'viem';
 
-import { readGlobalPaused, REGISTRY_ABI, EXECUTOR_BUY_ABI, EXECUTOR_ABI, PANCAKE_UR } from '../src/chain.js';
+import { readGlobalPaused, REGISTRY_ABI, EXECUTOR_BUY_ABI, EXECUTOR_ABI, PANCAKE_UR, readSecondaryHealth } from '../src/chain.js';
 import { activeChain } from '../src/chain-object.js';
 import { getConfig, requireSessionKeyConfig } from '../src/config.js';
 import { query } from '../src/db.js';
@@ -110,6 +110,29 @@ export async function checkVenues(client: PublicClient, executor: Address, deplo
   } catch {
     return [{ name: 'executor venues', level: 'fail', detail: '無法完整讀取 venue 事件與白名單；確認 A11 executor 與 RPC' }];
   }
+}
+
+/** Report every asset and both push feeds at the same chain block, including invalid/future updates. */
+export async function checkSecondarySources(client: PublicClient, oracle: Address, assets: readonly Address[], strict: boolean): Promise<Check[]> {
+  const checks: Check[] = [];
+  try {
+    const block = await client.getBlock({ blockTag: 'latest' });
+    if (block.number === null) throw new Error('missing block');
+    for (const asset of new Map(assets.map((value) => [value.toLowerCase(), value])).values()) {
+      try {
+        const health = await readSecondaryHealth(client, oracle, asset, { number: block.number, timestamp: block.timestamp });
+        checks.push({ name: `secondary ${asset}`, level: 'ok', detail: health.source === zeroAddress
+          ? '未設定 secondary（只有 Pancake TWAP）' : `${health.source}；maxAge=${health.maxAge} 秒，maxDeviation=${health.maxDeviationBps} bps` });
+        for (const feed of health.feeds) checks.push({ name: `${asset} ${feed.role}`, level: feed.failure === null ? 'ok' : strict ? 'fail' : 'warn',
+          detail: feed.failure?.detail ?? `feed ${feed.feed}；updatedAt=${feed.updatedAt}，年齡 ${feed.age} 秒` });
+      } catch {
+        checks.push({ name: `secondary ${asset}`, level: 'fail', detail: '無法完整讀取 secondary／兩個 feed；不可當成未設定或已恢復' });
+      }
+    }
+  } catch {
+    checks.push({ name: 'secondary block', level: 'fail', detail: '無法取得鏈上時間，不能確認 feed 年齡' });
+  }
+  return checks;
 }
 
 export function checkSessionKeySeed(report: SessionKeyDerivationReport): Check {
@@ -530,6 +553,17 @@ async function main(): Promise<number> {
           fail('executor.oracle', `${oracle} 上沒有合約`, '重新部署 oracle 並呼叫 setOracle');
         } else {
           ok('executor.oracle', oracle);
+          try {
+            const { rows } = await query<{ address: string }>('select address from priceable_assets where enabled order by address');
+            const assets = rows.map((row) => {
+              const asset = asAddressOrNull(row.address);
+              if (asset === null) throw new Error('invalid asset address');
+              return asset;
+            });
+            (await checkSecondarySources(client, oracle, assets, args.strict)).forEach(record);
+          } catch {
+            fail('secondary assets', '資產清單讀取失敗，無法完整檢查 secondary', '確認 DB migration 與資產資料');
+          }
           const ownership = await readOwnership(oracle);
           checkOwnership({ label: 'router', ...ownership, safe, safeHasCode, strict: args.strict }).forEach(record);
         }

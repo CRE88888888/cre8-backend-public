@@ -1674,3 +1674,19 @@ router 也要註冊 WBNB/USDT（fee 500、TWAP 1800 秒）的 oracle。
 測試 client 關閉 RPC 重試後，部署交易首次查 receipt 可能早於 interval mining，
 anvil 會把未知 hash 轉給上游，PublicNode 回 archive 403。mixed mining 仍可能有這個查詢競態；
 fork fixture 的 `landed()` 應先 `evm_mine`，再確認真正 receipt.status，不能把 403 當成功。
+
+### Secondary 錯誤不能只解 executor ABI，也不能把未知當恢復（#52）
+
+`StaleFeed`／`InvalidAnswer` 是 PushFeedPriceSource 的錯誤，`SourcesDisagree` 是 router 的錯誤；
+它們會穿過 executor、Kernel、EntryPoint 的錯誤包裝。只看最外層訊息或舊 ABI，會把 feed 位址、
+updatedAt 和報價差距丟掉。共用 decoder 只接受已驗證的 ABI 參數，並可解 EntryPoint
+`FailedOpWithRevert` 的 inner bytes，不能用 RPC 原文拼接 blocked 原因。
+
+feed 年齡用觀測區塊時間；updatedAt=0／未來時間同樣不可用，剛好等於 maxAge 則可用。
+`SourcesDisagree` 的分母是 secondaryQuote，secondaryQuote=0 時不能除以零。
+全域價格警示保留舊受影響資產，包含其後被停用的資產；必須讀到恢復證據才解除，
+單一 RPC 失敗不能被空 findings 解除。無關資產讀不到，也不能遮掉其他資產已確認的三輪故障。
+門檻前計數在記憶體，重啟會重算；DB 中已開啟的 critical 不依賴這份計數。
+
+fork 上健康資產實際成交應核對「原餘額 − 計畫 amountIn」及 SwapExecuted／floor。
+規劃器兩次向下取整會保留最小單位粉塵，不能把整個餘額必定歸零當成通過條件。

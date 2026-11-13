@@ -1410,3 +1410,31 @@ test('#47 redeem and close planning share aggregator routing after applying the 
   assert.equal(result.plan.steps[0]?.venue, ACCOUNT);
   assert.equal(result.plan.steps[0]?.data, '0x12345678');
 });
+
+
+import { secondaryRevert } from './fixtures/secondary-price.js';
+for (const request of ['first', 'continue', 'close'] as const) {
+  test(`#52 ${request} redeem preserves secondary reason and never treats unpriced exit as complete`, async () => {
+    const f = sellFixture();
+    const plan = f.plan(samplePlan());
+    const healthy = '0x0000000000000000000000000000000000001234';
+    const broken = plan.snapshot.holdings[0]; assert.ok(broken);
+    plan.snapshot.holdings.push({ ...broken, asset: healthy, decimals: 18, amountWei: 100n * 10n ** 18n });
+    plan.targets.push({ asset: healthy, weightBps: 0, symbol: 'HEALTHY' });
+    plan.report = computeDrift(plan.snapshot.holdings, plan.targets, plan.thresholdBps);
+    f.state.extraLimits.push({ address: healthy, max_leg_usdt: null });
+    f.state.quoteErrors.set(broken.asset.toLowerCase(), secondaryRevert('StaleFeed'));
+    const input = { portfolioId: PORTFOLIO_ID, account: ACCOUNT, plan };
+    const result = await buildRedeemPlan(input, request === 'first' ? 10000000000n : request === 'continue' ? { sellUsdE8: 20000000000n } : { close: true }, f.deps);
+    if (request === 'first') {
+      assert.equal(result.plan.kind, 'blocked'); assert.equal(result.requestedSellUsdE8, null);
+      assert.match(result.plan.reason, /StaleFeed/);
+    } else {
+      assert.ok(result.plan.kind === 'ready'); assert.equal(result.plan.steps.length, 1);
+      assert.equal(result.plan.steps[0]?.tokenIn.toLowerCase(), healthy);
+      assert.match(result.plan.rationale, /StaleFeed/);
+      assert.equal(result.requestedSellUsdE8, request === 'close' ? null : 20000000000n);
+      assert.ok(result.plannedSellUsdE8 > 0n && result.plannedSellUsdE8 <= 10000000000n);
+    }
+  });
+}

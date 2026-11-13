@@ -3282,3 +3282,49 @@ test('#47 receipt reconciliation restores mixed venue/data steps and rejects eit
     await assert.rejects(readRebalanceReceipt(altered, f.reader), /planHash/);
   }
 });
+
+
+import { secondaryRevert } from './fixtures/secondary-price.js';
+for (const phase of ['planning', 'send', 'reconcile'] as const) {
+  test(`#52 ${phase} preserves structured secondary failure without RPC text or resending`, async () => {
+    const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+    const chain = stubChain();
+    const failure = new Error('RPC private-token', { cause: secondaryRevert('StaleFeed') });
+    if (phase === 'reconcile') db.operations.push({ portfolioId: PORTFOLIO_ID, idempotencyKey: 'old',
+      payloadHash: planHashFor([step()], readyPlan().deadline), state: 'submitted', attempts: 1,
+      txHash: null, userOpHash: `0x${'ab'.repeat(32)}`, lastError: null });
+    const extra: SchedulerDeps = phase === 'planning' ? { planRebalance: async () => { throw failure; } }
+      : phase === 'send' ? { executeRebalance: async () => { throw failure; } }
+      : { reconcileRebalance: async () => { throw failure; } };
+    const round = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain, extra));
+    assert.equal(round.results[0]?.outcome, 'blocked'); assert.match(round.results[0]?.reason ?? '', /StaleFeed/);
+    assert.doesNotMatch(round.results[0]?.reason ?? '', /private-token/);
+    assert.equal(chain.executeCalls.length, 0);
+    if (phase === 'reconcile') assert.equal(db.operations[0]?.state, 'submitted');
+  });
+}
+
+test('#52 failed on-chain UserOp retains decoded secondary reason through receipt reconciliation', async () => {
+  const f = receiptFixture(); f.receipt.success = false; f.receipt.logs = [];
+  const failure = secondaryRevert('SourcesDisagree', 12000n); assert.ok(failure.raw);
+  f.receipt.reason = failure.raw;
+  const result = await readRebalanceReceipt(f.input, f.reader);
+  assert.ok(result.kind === 'found'); assert.equal(result.outcome.status, 'reverted');
+  assert.match(result.outcome.error ?? '', /SourcesDisagree.*2000 bps/);
+});
+
+test('#52 a secondary failure after submission retains the original in-flight operation', async () => {
+  const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+  const chain = stubChain();
+  const extra: SchedulerDeps = { executeRebalance: async (args) => {
+    args.onSending(); await args.onSubmitted({ userOpHash: `0x${'52'.repeat(32)}` });
+    throw secondaryRevert('InvalidAnswer', 0n);
+  } };
+  const round = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain, extra));
+  assert.equal(round.results[0]?.outcome, 'blocked');
+  assert.equal(round.results[0]?.execution?.status, 'unknown');
+  assert.match(round.results[0]?.reason ?? '', /InvalidAnswer/);
+  assert.equal(db.operations[0]?.state, 'submitted');
+  assert.equal(db.operations[0]?.attempts, 1);
+  assert.equal(chain.executeCalls.length, 0);
+});

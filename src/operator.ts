@@ -20,7 +20,7 @@ import { listOpenAlerts } from './alerts.js';
 import { readSchedulerStatus } from './scheduler-status.js';
 import type { SchedulerStatus } from './scheduler-status.js';
 import type { GasStatus } from './funding.js';
-import { getAccountGasBalance, getGasPriceWei, pauseSources, REGISTRY_ABI } from './chain.js';
+import { getAccountGasBalance, getGasPriceWei, pauseSources, REGISTRY_ABI, decodePriceSourceError, describePriceSourceError } from './chain.js';
 import type { PauseSource } from './chain.js';
 import { getGasConfig } from './config.js';
 import { countSwapExecuted, PARTIAL_FOLLOW_UP_SECONDS, runSchedulerOnce } from './scheduler.js';
@@ -170,7 +170,7 @@ function assetKey(asset: string): string {
 
 /** 一行、有限長度、保留原文的錯誤訊息（多行 stack 進 JSON body 沒有幫助，反而蓋掉真正的原因）。 */
 function oneLine(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
+  const message = decodePriceSourceError(error)?.detail ?? (error instanceof Error ? error.message : String(error));
   return message.split('\n')[0]!.slice(0, 500);
 }
 
@@ -1382,32 +1382,42 @@ export async function buildRedeemPlan(input: RebalancePlanningInput, request: Se
     const decimals = await numeraireDecimals(client, numeraire, snapshot.holdings, blockNumber);
     const scale = 10n ** BigInt(decimals);
     const limits = await readMaxLegUsdE8(holdings.map((holding) => holding.asset), query);
-    const nominal = await Promise.all(holdings.map((holding) => nominalSellQuote(client, router, holding.asset as Address, numeraire, holding.amountWei, blockNumber)));
+    const notes: string[] = [];
+    const nominal = await Promise.all(holdings.map(async (holding) => {
+      try { return await nominalSellQuote(client, router, holding.asset as Address, numeraire, holding.amountWei, blockNumber); }
+      catch (error) {
+        const failure = decodePriceSourceError(error);
+        if (failure === null) throw error;
+        notes.push(failure.detail); return 0n;
+      }
+    }));
+    const unavailable = notes.length > 0;
+    const availableHoldings = holdings.filter((_, index) => (nominal[index] ?? 0n) > 0n);
     const nonCashRaw = nominal.reduce((sum, value) => sum + value, 0n);
     // Carry E8 at aggregate precision; per-token rounding residue remains in the requested total.
     const allUsdE8 = (nonCashRaw * 100_000_000n + scale - 1n) / scale;
+    if (unavailable && typeof request === 'bigint') return reply({ kind: 'blocked', reason: `無法確認首批提領的完整待賣名義額：${notes.join('；')}` });
     const first = typeof request === 'bigint';
     if (first) {
       // Price the exact original token quantities after token rounding; otherwise sub-token
       // dust would become a phantom continuation amount that cannot ever be sold.
-      const desired = await Promise.all(holdings.map((holding) => {
+      const desired = await Promise.all(availableHoldings.map((holding) => {
         const amount = holding.amountWei * request / totalE8;
         return amount === 0n ? 0n : nominalSellQuote(client, router, holding.asset as Address, numeraire, amount, blockNumber);
       }));
       const desiredRaw = desired.reduce((sum, value) => sum + value, 0n);
       requestedSellUsdE8 = (desiredRaw * 100_000_000n + scale - 1n) / scale;
-    } else if ('close' in request) requestedSellUsdE8 = allUsdE8;
-    const wanted = requestedSellUsdE8 ?? 0n;
-    if (wanted === 0n) return reply({ kind: 'noop', reason: '提領比例換算後待賣代幣量為 0' });
+    } else if ('close' in request) requestedSellUsdE8 = unavailable ? null : allUsdE8;
+    const wanted = requestedSellUsdE8 ?? allUsdE8;
+    if (wanted === 0n) return reply(unavailable ? { kind: 'blocked', reason: notes.join('；') } : { kind: 'noop', reason: '提領比例換算後待賣代幣量為 0' });
     const budget = wanted < allUsdE8 ? wanted : allUsdE8;
     const feeBps = await readExecutorFeeBps(client, BigInt(pinnedVersion.onchainStrategyId), blockNumber, deps.registry);
     const { timestamp } = await client.getBlock({ blockNumber });
     const wall = BigInt(Math.floor(Date.now() / 1000));
     const deadline = (timestamp > wall ? timestamp : wall) + BigInt(DEFAULT_DEADLINE_SECONDS);
     const steps: PlannedStep[] = [];
-    const notes: string[] = [];
     let soldRaw = 0n;
-    for (const holding of holdings) {
+    for (const holding of availableHoldings) {
       let amountIn = first ? holding.amountWei * request / totalE8 : holding.amountWei * budget * scale / (nonCashRaw * 100_000_000n);
       if (typeof request === 'object' && 'close' in request) amountIn = holding.amountWei;
       if (amountIn > holding.amountWei) amountIn = holding.amountWei;
@@ -1417,7 +1427,12 @@ export async function buildRedeemPlan(input: RebalancePlanningInput, request: Se
       const capped = await capAssetLeg({ publicClient: client, oracle: router, numeraire, tokenIn: holding.asset as Address, tokenOut: numeraire, amountIn, limitUsdE8: limit, decimals, blockNumber });
       if ('blocked' in capped) { notes.push(`${holding.asset}: ${capped.blocked}`); continue; }
       amountIn = capped.amountIn;
-      const quoted = await client.readContract({ address: router, abi: ORACLE_ABI, functionName: 'previewSwap', args: [holding.asset as Address, numeraire, amountIn], blockNumber });
+      const quoted = await client.readContract({ address: router, abi: ORACLE_ABI, functionName: 'previewSwap', args: [holding.asset as Address, numeraire, amountIn], blockNumber }).catch(async (error: unknown) => {
+        const failure = await describePriceSourceError(error, client, { oracle: router, asset: holding.asset as Address, blockNumber });
+        if (failure === null) throw error;
+        notes.push(failure.detail); return null;
+      });
+      if (quoted === null) continue;
       const [quotedOut, floor] = quoted;
       if (quotedOut <= 0n || floor <= 0n) { notes.push(`${holding.asset}: oracle 沒有有效地板`); continue; }
       // Independent final check: integer rounding or a malformed oracle must never exceed the total request.
@@ -1435,8 +1450,8 @@ export async function buildRedeemPlan(input: RebalancePlanningInput, request: Se
     const soldE8 = (soldRaw * 100_000_000n + scale - 1n) / scale;
     return reply({ kind: 'ready', steps, deadline,
       rationale: `賣出 ${steps.length} 檔，非現金待賣 ${wanted} E8，本批名義額 ${soldE8} E8；剩餘由 API 呼叫者以 sellUsdE8 續作（依當下非現金價值重新分配）${notes.length === 0 ? '' : `；blocked：${notes.join('；')}`}` }, soldE8);
-  } catch {
-    return reply({ kind: 'blocked', reason: '[REDEEM_PLAN_UNAVAILABLE] 持倉、限額、oracle 或 DB 資料不可用，不送交易' });
+  } catch (error) {
+    return reply({ kind: 'blocked', reason: decodePriceSourceError(error)?.detail ?? '[REDEEM_PLAN_UNAVAILABLE] 持倉、限額、oracle 或 DB 資料不可用，不送交易' });
   }
 }
 

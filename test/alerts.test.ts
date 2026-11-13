@@ -245,7 +245,7 @@ test('announceAlerts：seed 比對拋錯仍記錄 gas_low，resolve 排除 seed 
   const inserts = seen.filter(({ sql }) => sql.includes('insert into scheduler_alerts'));
   assert.equal(inserts.length, 1);
   assert.equal(inserts[0]?.params[0], 'gas_low');
-  assert.deepEqual(findSeen(seen, 'update scheduler_alerts').params[2], ['session_key_derivation_mismatch', 'executor_paused']);
+  assert.deepEqual(findSeen(seen, 'update scheduler_alerts').params[2], ['session_key_derivation_mismatch', 'price_source_unavailable', 'executor_paused']);
   assert.equal(lines.filter((line) => line.includes('seed 比對失敗')).length, 1);
   assert.ok(lines.some((line) => line.includes('[ALERT][warn]')));
   assert.ok(!JSON.stringify(lines).includes(TEST_SEED), '失敗 log 不帶原始例外中的敏感內容');
@@ -265,7 +265,7 @@ for (const executorPaused of [true, false, null, undefined]) {
     }
     const resolution = findSeen(seen, 'update scheduler_alerts');
     assert.deepEqual(resolution.params[1], executorPaused === true ? ['executor_paused:-1'] : []);
-    assert.deepEqual(resolution.params[2], executorPaused === null || executorPaused === undefined ? ['executor_paused'] : []);
+    assert.deepEqual(resolution.params[2], executorPaused === null || executorPaused === undefined ? ['price_source_unavailable', 'executor_paused'] : ['price_source_unavailable']);
   });
 }
 
@@ -1275,4 +1275,88 @@ test('ALERT_STUCK_HOURS 可覆寫；格式錯誤要拋錯（不要靜默用預�
   assert.equal(loadAlertThresholds({}).stuckHours, 6);
   assert.equal(loadAlertThresholds({ ALERT_STUCK_HOURS: '12' }).stuckHours, 12);
   assert.throws(() => loadAlertThresholds({ ALERT_STUCK_HOURS: '12h' }), /ALERT_STUCK_HOURS/);
+});
+
+
+import { createPriceSourceTracker } from '../src/alerts.js';
+import type { PriceSourceObservation } from '../src/chain.js';
+import { ASSET, CASH, secondaryRevert } from './fixtures/secondary-price.js';
+import { decodePriceSourceError } from '../src/chain.js';
+function sourceObservation(asset = ASSET, code: 'StaleFeed' | 'InvalidAnswer' | 'SourcesDisagree' | null = 'StaleFeed'): PriceSourceObservation {
+  return { asset, verified: true, failure: code === null ? null : decodePriceSourceError(secondaryRevert(code, code === 'InvalidAnswer' ? 0n : 100n), { asset, timestamp: 1000n }) };
+}
+
+test('#52 consecutive rounds are per asset, deduplicated, reset on recovery/unknown and critical exactly at 3', () => {
+  const track = createPriceSourceTracker();
+  assert.equal(track([], null).finding, null);
+  assert.equal(track([sourceObservation(), sourceObservation()], null).finding, null);
+  assert.equal(track([sourceObservation(), sourceObservation(CASH)], null).finding, null);
+  let result = track([sourceObservation(), sourceObservation(CASH)], null);
+  assert.equal(result.finding?.severity, 'critical'); assert.equal(result.finding?.portfolioId, null);
+  assert.match(result.finding?.detail ?? '', /連續 3\/3 輪/);
+  assert.match(result.finding?.detail ?? '', new RegExp(CASH, 'i'));
+  const fresh = createPriceSourceTracker();
+  assert.equal(fresh([sourceObservation(ASSET, null)], null).finding, null);
+  assert.equal(fresh([sourceObservation()], null).finding, null);
+  assert.equal(fresh([{ ...sourceObservation(), failure: null, verified: false }], null).complete, false);
+  assert.equal(fresh([sourceObservation()], null).finding, null);
+  assert.equal(fresh([sourceObservation()], null).finding, null);
+  assert.equal(fresh([sourceObservation()], null).finding?.kind, 'price_source_unavailable');
+  // A process restart cannot clear a persisted global critical while a different asset remains broken.
+  const previous = result.finding; assert.ok(previous);
+  result = createPriceSourceTracker()([sourceObservation(ASSET, null), sourceObservation(CASH, 'InvalidAnswer')], previous);
+  assert.ok(result.finding); assert.match(result.finding.detail, /InvalidAnswer/);
+  const remaining = result.finding;
+  assert.equal(track([sourceObservation(ASSET, null)], remaining).complete, false, 'missing previous asset is unknown');
+  assert.equal(track([sourceObservation(ASSET, null), sourceObservation(CASH, null)], remaining).finding, null);
+});
+
+test('#52 DB global lifecycle: alert only at round 3, one row, partial recovery/restart/unknown retain, all healthy resolves', dbGate, async () => {
+  await assert.rejects(() => withTransaction(async (client) => {
+    const q: QueryFn = (sql, params = []) => client.query(sql, [...params]);
+    await q('delete from scheduler_alerts');
+    let observations = [sourceObservation(), sourceObservation(CASH, 'SourcesDisagree')];
+    let tracker = createPriceSourceTracker();
+    const sent: string[] = [];
+    const run = (checks = async () => observations, query = q) => announceAlerts({ query, now: NOW, chainId: 999152,
+      executorPaused: false, log: () => {}, priceSourceChecks: checks, priceSourceTracker: tracker,
+      sendNotification: async (message) => { sent.push(message); }, gasChecks: { readGasPrice: async () => 0n, readNativeBalance: async () => 0n } });
+    const open = async () => (await listOpenAlerts(q)).filter((alert) => alert.kind === 'price_source_unavailable');
+    for (let round = 1; round <= 3; round += 1) {
+      await run(); assert.equal((await open()).length, round < 3 ? 0 : 1);
+    }
+    assert.equal((await open())[0]?.portfolioId, null); assert.equal((await open())[0]?.occurrences, 1);
+    assert.equal(sent.length, 1);
+    observations = [sourceObservation(ASSET, null), sourceObservation(CASH, 'InvalidAnswer')];
+    tracker = createPriceSourceTracker(); await run();
+    assert.equal((await open())[0]?.occurrences, 2); assert.match((await open())[0]?.detail ?? '', /InvalidAnswer/);
+    await run(async () => { throw new Error('RPC private-token timeout'); });
+    assert.equal((await open())[0]?.occurrences, 2);
+    await run(async () => observations, async (sql, params) => {
+      if (sql.startsWith('select detail')) throw new Error('DB private-token');
+      return q(sql, params);
+    });
+    assert.equal((await open()).length, 1);
+    observations = [sourceObservation(ASSET, null), { asset: CASH, verified: false, failure: null }];
+    await run(); assert.equal((await open()).length, 1);
+    observations = [sourceObservation(ASSET, null), sourceObservation(CASH, null)];
+    await run(); assert.equal((await open()).length, 0); assert.equal(sent.length, 2);
+    assert.match(sent[1] ?? '', /已解除/); assert.doesNotMatch(sent.join(''), /private-token/);
+    throw new Error('rollback #52');
+  }), /rollback #52/);
+});
+
+
+test('#52 an unrelated unknown asset cannot hide three verified failures or erase previous affected detail', () => {
+  const tracker = createPriceSourceTracker();
+  const observations = [sourceObservation(), { asset: CASH, verified: false, failure: null }];
+  assert.equal(tracker(observations, null).finding, null);
+  assert.equal(tracker(observations, null).finding, null);
+  const third = tracker(observations, null);
+  assert.equal(third.complete, false); assert.equal(third.finding?.kind, 'price_source_unavailable');
+  const previous = tracker([sourceObservation(), sourceObservation(CASH)], third.finding).finding;
+  assert.ok(previous);
+  const unknown = tracker([sourceObservation(), { asset: CASH, verified: false, failure: null }], previous);
+  assert.match(unknown.finding?.detail ?? '', new RegExp(`asset ${CASH}:`, 'i'));
+  assert.equal(unknown.complete, false);
 });

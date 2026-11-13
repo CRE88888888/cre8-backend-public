@@ -96,15 +96,16 @@ import {
   slice,
   toBytes,
 } from 'viem';
+import type { PriceSourceObservation, PriceSourceFailure } from './chain.js';
 import type { Address, Hex, PublicClient } from 'viem';
 import { hdKeyToAccount } from 'viem/accounts';
 import { createBundlerClient, entryPoint07Abi, formatUserOperation, formatUserOperationReceipt, getUserOperationHash } from 'viem/account-abstraction';
 import type { GetUserOperationReturnType, UserOperationReceipt } from 'viem/account-abstraction';
 import { activeChain } from './chain-object.js';
 import { KERNEL_V3_3_ADDRESSES } from './addresses.js';
-import { detectAlerts, formatAlert, recordAlerts, resolveAlerts } from './alerts.js';
-import type { AlertFinding, AlertKind } from './alerts.js';
-import { a10ErrorMessage, EXECUTOR_BUY_ABI, readGlobalPaused } from './chain.js';
+import { detectAlerts, formatAlert, recordAlerts, resolveAlerts, createPriceSourceTracker, priceSourceAlertAssets } from './alerts.js';
+import type { AlertFinding, AlertKind, PriceSourceTracker } from './alerts.js';
+import { a10ErrorMessage, EXECUTOR_BUY_ABI, readGlobalPaused, decodePriceSourceError, describePriceSourceError, PriceSourceError, inspectPriceSources } from './chain.js';
 import { getConfig, getSessionKeyConfig, requireSessionKeyConfig } from './config.js';
 import { errorMessage, query as dbQuery, withTransaction } from './db.js';
 import { buildSessionPermissions } from './permissions.js';
@@ -280,6 +281,7 @@ export type RebalanceEvidence = {
   txHash: Hex | null;
   userOpHash: Hex | null;
   gasUsed: string | null;
+  revertReason?: string;
 };
 
 /**
@@ -310,6 +312,8 @@ export function judgeRebalanceOutcome(evidence: RebalanceEvidence): ExecutionOut
   if (failures.length === 0) return { status: 'success', ...base, error: null };
 
   // 可診斷的 last_error：說清楚「上鏈了、錢花了、哪一層沒過」。下一輪照這個訊息決定要不要重試。
+  const secondary = decodePriceSourceError({ data: evidence.revertReason });
+  if (secondary !== null) failures.push(secondary.detail);
   const spent = evidence.gasUsed === null ? '' : `，gas ${evidence.gasUsed} 已經花掉`;
   return { status: 'reverted', ...base, error: `上鏈但 op 沒有成功（${failures.join('；')}）${spent}` };
 }
@@ -481,6 +485,7 @@ export type ExecuteArgs = {
  *             **沒有證據說它上鏈了**，所以要記成 failed 而不是 reverted —— 後者會讓人以為鏈上那一筆失敗了。
  */
 export type ExecutionOutcome = {
+  priceSourceFailure?: PriceSourceFailure;
   status: 'success' | 'reverted' | 'error' | 'unknown';
   userOpHash: Hex | null;
   txHash: Hex | null;
@@ -502,6 +507,8 @@ export type FloorRefreshInput = {
 };
 
 export type SchedulerDeps = {
+  priceSourceChecks?: () => Promise<PriceSourceObservation[]>;
+  priceSourceTracker?: PriceSourceTracker;
   /** Checked once before each round. An unavailable RPC blocks every claimed portfolio. */
   readGlobalPaused?: () => Promise<boolean>;
   /**
@@ -1318,94 +1325,108 @@ async function rebalanceKernelAccount(args: Pick<ExecuteArgs, 'account' | 'sessi
 
 async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<ExecutionOutcome> {
   const publicClient = defaultPublicClient();
-  const network = activeChain();
-  const account = await rebalanceKernelAccount(args);
-  const data = encodeFunctionData({
-    abi: EXECUTOR_ABI,
-    functionName: 'executeRebalance',
-    args: [
-      args.account,
-      args.steps.map((step) => ({
-        tokenIn: step.tokenIn,
-        tokenOut: step.tokenOut,
-        amountIn: step.amountIn,
-        amountOutMin: step.amountOutMin,
-        venue: step.venue,
-        data: step.data,
-      })),
-      args.deadline,
-    ],
-  });
-  if (data.slice(0, 10) !== EXECUTE_REBALANCE_SELECTOR) {
-    throw new Error(`selector 不符：${data.slice(0, 10)} != ${EXECUTE_REBALANCE_SELECTOR}（CallPolicy 會擋下）`);
-  }
+  try {
+    const network = activeChain();
+    const account = await rebalanceKernelAccount(args);
+    const data = encodeFunctionData({
+      abi: EXECUTOR_ABI,
+      functionName: 'executeRebalance',
+      args: [
+        args.account,
+        args.steps.map((step) => ({
+          tokenIn: step.tokenIn,
+          tokenOut: step.tokenOut,
+          amountIn: step.amountIn,
+          amountOutMin: step.amountOutMin,
+          venue: step.venue,
+          data: step.data,
+        })),
+        args.deadline,
+      ],
+    });
+    if (data.slice(0, 10) !== EXECUTE_REBALANCE_SELECTOR) {
+      throw new Error(`selector 不符：${data.slice(0, 10)} != ${EXECUTE_REBALANCE_SELECTOR}（CallPolicy 會擋下）`);
+    }
 
-  const client = createKernelAccountClient({
-    account,
-    chain: network,
-    client: publicClient,
-    bundlerTransport: http(bundlerUrl()),
-    // alto 不提供 ZeroDev 的 zd_getUserOperationGasPrice，用節點 gas price。
-    userOperation: {
-      estimateFeesPerGas: async () => {
-        const gasPrice = await publicClient.getGasPrice();
-        return { maxFeePerGas: gasPrice, maxPriorityFeePerGas: gasPrice };
+    const client = createKernelAccountClient({
+      account,
+      chain: network,
+      client: publicClient,
+      bundlerTransport: http(bundlerUrl()),
+      // alto 不提供 ZeroDev 的 zd_getUserOperationGasPrice，用節點 gas price。
+      userOperation: {
+        estimateFeesPerGas: async () => {
+          const gasPrice = await publicClient.getGasPrice();
+          return { maxFeePerGas: gasPrice, maxPriorityFeePerGas: gasPrice };
+        },
       },
-    },
-  });
+    });
 
-  const calls = [{ to: args.executor, data, value: 0n }] as const;
+    const calls = [{ to: args.executor, data, value: 0n }] as const;
 
-  // ---- ① gas：`callGasLimit` 明確覆寫，不讓 alto 的估算單獨決定 ---------------------------------
-  // alto 對「一筆 op 跑完整條 DeFi 路徑」系統性低估（§8.16 實測 367,885 vs 需要 450–500k），
-  // 而 gas 不足的後果不是 revert，是「success = false 但 tx.status = 1」—— 錢扣了、幣沒換。
-  const estimate = await client.estimateUserOperationGas({ calls, nonce: args.nonce });
-  let numeraire: Address;
-  try {
-    numeraire = await publicClient.readContract({ address: args.executor, abi: EXECUTOR_BUY_ABI, functionName: 'numeraire' });
-  } catch { throw new Error('[NUMERAIRE_UNAVAILABLE] 送出前讀不到 executor.numeraire，不送交易'); }
-  const hasBuy = args.steps.some((step) => !isAddressEqual(step.tokenOut, numeraire));
-  const valuationAssetCount = hasBuy ? new Set(args.valuationAssets.filter((asset) => !isAddressEqual(asset, numeraire)).map((asset) => asset.toLowerCase())).size : 0;
-  const callGasLimit = rebalanceCallGasLimit(estimate.callGasLimit, valuationAssetCount);
+    // ---- ① gas：`callGasLimit` 明確覆寫，不讓 alto 的估算單獨決定 ---------------------------------
+    // alto 對「一筆 op 跑完整條 DeFi 路徑」系統性低估（§8.16 實測 367,885 vs 需要 450–500k），
+    // 而 gas 不足的後果不是 revert，是「success = false 但 tx.status = 1」—— 錢扣了、幣沒換。
+    const estimate = await client.estimateUserOperationGas({ calls, nonce: args.nonce });
+    let numeraire: Address;
+    try {
+      numeraire = await publicClient.readContract({ address: args.executor, abi: EXECUTOR_BUY_ABI, functionName: 'numeraire' });
+    } catch { throw new Error('[NUMERAIRE_UNAVAILABLE] 送出前讀不到 executor.numeraire，不送交易'); }
+    const hasBuy = args.steps.some((step) => !isAddressEqual(step.tokenOut, numeraire));
+    const valuationAssetCount = hasBuy ? new Set(args.valuationAssets.filter((asset) => !isAddressEqual(asset, numeraire)).map((asset) => asset.toLowerCase())).size : 0;
+    const callGasLimit = rebalanceCallGasLimit(estimate.callGasLimit, valuationAssetCount);
 
-  // ---- ② 簽名前用 eth_call 模擬整格執行 ---------------------------------------------------------
-  // `executeRebalance` 的第一個檢查是 `msg.sender != account → NotAccount`，所以 `from = 帳戶` 的
-  // `eth_call` 走的是**真正的那條路**（帳戶本身就是 UserOp 執行時的呼叫者），不需要 state override，
-  // 也不需要先 simulateValidation。gas 給的**正是等一下要簽的 callGasLimit**，所以它能抓到的就是
-  // 「這個值不夠」本身，而不是一個寬鬆的「有沒有 revert」。
-  //
-  // 抓到什麼：執行必定失敗的原因（地板、註冊狀態、allowance、UniversalRouter 的命令/參數）＋ 粗的
-  // gas 不足（需求 > callGasLimit）。抓不到什麼：比 63/64 內層保留額更小的邊緣 gas 不足，以及
-  // **驗證階段**的問題（session key 的權限、nonce、prefund）—— 那些發生在 EntryPoint 那一層，
-  // 這裡的 `eth_call` 沒有經過 EntryPoint，alto 的 simulation 才會擋。兩者是互補的檢查。
-  try {
-    await publicClient.call({ account: args.account, to: args.executor, data, gas: callGasLimit });
+    // ---- ② 簽名前用 eth_call 模擬整格執行 ---------------------------------------------------------
+    // `executeRebalance` 的第一個檢查是 `msg.sender != account → NotAccount`，所以 `from = 帳戶` 的
+    // `eth_call` 走的是**真正的那條路**（帳戶本身就是 UserOp 執行時的呼叫者），不需要 state override，
+    // 也不需要先 simulateValidation。gas 給的**正是等一下要簽的 callGasLimit**，所以它能抓到的就是
+    // 「這個值不夠」本身，而不是一個寬鬆的「有沒有 revert」。
+    //
+    // 抓到什麼：執行必定失敗的原因（地板、註冊狀態、allowance、UniversalRouter 的命令/參數）＋ 粗的
+    // gas 不足（需求 > callGasLimit）。抓不到什麼：比 63/64 內層保留額更小的邊緣 gas 不足，以及
+    // **驗證階段**的問題（session key 的權限、nonce、prefund）—— 那些發生在 EntryPoint 那一層，
+    // 這裡的 `eth_call` 沒有經過 EntryPoint，alto 的 simulation 才會擋。兩者是互補的檢查。
+    try {
+      await publicClient.call({ account: args.account, to: args.executor, data, gas: callGasLimit });
+    } catch (error) {
+      const secondary = decodePriceSourceError(error);
+      if (secondary !== null) throw error;
+      throw new Error(
+        `送出前的 eth_call 模擬失敗（from ${args.account}、gas ${callGasLimit}）：這一筆不送，` +
+          `不花錢買一個 success=false 的 op。原因：${a10ErrorMessage(error) ?? errorMessage(error)}`,
+      );
+    }
+
+    // 只覆寫 `callGasLimit`：其餘欄位（verificationGasLimit / preVerificationGas）仍由 alto 估算，
+    // 它們與「執行路徑有多長」無關。
+    args.onSending();
+    const userOpHash = await client.sendUserOperation({ calls, callGasLimit, nonce: args.nonce });
+    // alto 有 simulation：被拒的 op **不會**回 userOpHash。所以拿到 hash = 這一筆被接受了。
+    await args.onSubmitted({ userOpHash });
+
+    const receipt = await client.waitForUserOperationReceipt({ hash: userOpHash, timeout: USER_OP_RECEIPT_TIMEOUT_MS });
+
+    // ---- ③ 三層判定（§8.16）：只驗 receipt.status 就是把「上鏈但什麼都沒換」記成成功 -----------------
+    return judgeRebalanceOutcome({
+      txStatus: receipt.receipt.status,
+      userOpSuccess: typeof receipt.success === 'boolean' ? receipt.success : null,
+      swapExecuted: countSwapExecuted(receipt.receipt.logs, args.executor),
+      expectedSwaps: args.steps.length,
+      txHash: receipt.receipt.transactionHash,
+      userOpHash,
+      gasUsed: (receipt.actualGasUsed ?? receipt.receipt.gasUsed).toString(),
+      ...(receipt.reason === undefined ? {} : { revertReason: receipt.reason }),
+    });
   } catch (error) {
-    throw new Error(
-      `送出前的 eth_call 模擬失敗（from ${args.account}、gas ${callGasLimit}）：這一筆不送，` +
-        `不花錢買一個 success=false 的 op。原因：${a10ErrorMessage(error) ?? errorMessage(error)}`,
-    );
+    const decoded = decodePriceSourceError(error);
+    if (decoded === null) throw error;
+    let detailed = decoded;
+    try {
+      const oracle = await publicClient.readContract({ address: args.executor, abi: EXECUTOR_ABI, functionName: 'oracle' });
+      detailed = await describePriceSourceError(error, publicClient, { oracle, assets: args.steps.flatMap((step) => [step.tokenIn, step.tokenOut]) }) ?? decoded;
+    } catch { /* Preserve the ABI failure even if diagnostic metadata cannot be read. */ }
+    throw new PriceSourceError(detailed);
   }
-
-  // 只覆寫 `callGasLimit`：其餘欄位（verificationGasLimit / preVerificationGas）仍由 alto 估算，
-  // 它們與「執行路徑有多長」無關。
-  args.onSending();
-  const userOpHash = await client.sendUserOperation({ calls, callGasLimit, nonce: args.nonce });
-  // alto 有 simulation：被拒的 op **不會**回 userOpHash。所以拿到 hash = 這一筆被接受了。
-  await args.onSubmitted({ userOpHash });
-
-  const receipt = await client.waitForUserOperationReceipt({ hash: userOpHash, timeout: USER_OP_RECEIPT_TIMEOUT_MS });
-
-  // ---- ③ 三層判定（§8.16）：只驗 receipt.status 就是把「上鏈但什麼都沒換」記成成功 -----------------
-  return judgeRebalanceOutcome({
-    txStatus: receipt.receipt.status,
-    userOpSuccess: typeof receipt.success === 'boolean' ? receipt.success : null,
-    swapExecuted: countSwapExecuted(receipt.receipt.logs, args.executor),
-    expectedSwaps: args.steps.length,
-    txHash: receipt.receipt.transactionHash,
-    userOpHash,
-    gasUsed: (receipt.actualGasUsed ?? receipt.receipt.gasUsed).toString(),
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1462,10 +1483,12 @@ function defaultQuery(): SchedulerQueryFn {
 }
 
 function oneLine(error: unknown): string {
-  return (a10ErrorMessage(error) ?? errorMessage(error)).split('\n')[0]!.slice(0, 400);
+  return (decodePriceSourceError(error)?.detail ?? a10ErrorMessage(error) ?? errorMessage(error)).split('\n')[0]!.slice(0, 400);
 }
 
 /** 把 run 的參數與外部注入的 deps 合成一組完整可用的依賴（缺的就補預設實作）。 */
+const priceSourceTrackers = new Map<string, PriceSourceTracker>();
+
 function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
   const query = provided.query ?? defaultQuery();
   const chainId = provided.chainId ?? getConfig().chainId;
@@ -1474,6 +1497,25 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
   return {
     query,
     chainId,
+    priceSourceTracker: provided.priceSourceTracker ?? (() => {
+      const key = `${chainId}:${provided.executor?.toLowerCase() ?? process.env.EXECUTOR_ADDRESS?.trim().toLowerCase() ?? 'unconfigured'}`;
+      let tracker = priceSourceTrackers.get(key);
+      if (tracker === undefined) { tracker = createPriceSourceTracker(); priceSourceTrackers.set(key, tracker); }
+      return tracker;
+    })(),
+    priceSourceChecks: provided.priceSourceChecks ?? (async () => {
+      const { rows } = await query("select address from priceable_assets where enabled");
+      const assets = rows.map((row) => asAddress(typeof row === 'object' && row !== null ? Reflect.get(row, 'address') : null, 'priceable_assets.address'));
+      const previous = await query("select detail from scheduler_alerts where kind = 'price_source_unavailable' and portfolio_id is null and resolved_at is null");
+      for (const row of previous.rows) {
+        if (typeof row !== 'object' || row === null || typeof Reflect.get(row, 'detail') !== 'string') throw new Error('price source alert data unavailable');
+        assets.push(...priceSourceAlertAssets(Reflect.get(row, 'detail')));
+      }
+      if (assets.length === 0) return [];
+      const client = defaultPublicClient();
+      const oracle = await client.readContract({ address: provided.executor ?? executorAddress(), abi: EXECUTOR_ABI, functionName: 'oracle' });
+      return inspectPriceSources(client, oracle, assets);
+    }),
     readGlobalPaused: provided.readGlobalPaused ?? (() => readGlobalPaused(provided.executor ?? executorAddress(), defaultPublicClient())),
     /**
      * null = 還沒解析；`decideAndMaybeExecute` 在**兩條路**上都會 `?? executorAddress()`
@@ -1683,7 +1725,7 @@ export async function runSchedulerOnce(
   // ---- 一輪的尾端：告警（偵測 → 寫入 → 解除 → 一行 stdout）----
   // 只加在這裡：認領、前置檢查、間隔推進的邏輯一個字都沒動。
   // Live clock must include releases committed during this round; preserve an explicitly injected test clock.
-  await announceAlerts({ query: resolved.query, log: resolved.log, now: args.now ?? new Date(), dryRun, chainId: resolved.chainId, sessionKeyChecks: resolved, executorPaused });
+  await announceAlerts({ query: resolved.query, log: resolved.log, now: args.now ?? new Date(), dryRun, chainId: resolved.chainId, sessionKeyChecks: resolved, executorPaused, priceSourceChecks: resolved.priceSourceChecks, priceSourceTracker: resolved.priceSourceTracker });
 
   return { claimed: claimed.length, dryRun, results };
 }
@@ -1700,6 +1742,8 @@ export async function runSchedulerOnce(
  * 累積，而「無人值守」正是靠這個累積被看見。
  */
 export async function announceAlerts(args: {
+  priceSourceChecks?: () => Promise<PriceSourceObservation[]>;
+  priceSourceTracker?: PriceSourceTracker;
   /** null/omitted = not verified; keep an existing global pause alert open. */
   executorPaused?: boolean | null;
   query: SchedulerQueryFn;
@@ -1729,6 +1773,26 @@ export async function announceAlerts(args: {
       try { await recordAlerts(args.query, [pauseFinding], args.now, notifications); }
       catch { args.log('[ALERT] executor_paused 寫入失敗：全域暫停仍阻擋送單'); }
     }
+    let priceComplete = false;
+    let priceFinding: AlertFinding | null = null;
+    if (args.priceSourceChecks !== undefined && args.priceSourceTracker !== undefined) {
+      try {
+        const { rows } = await args.query("select detail from scheduler_alerts where kind = 'price_source_unavailable' and portfolio_id is null and resolved_at is null");
+        const row = rows[0];
+        const detail: unknown = typeof row === 'object' && row !== null ? Reflect.get(row, 'detail') : undefined;
+        if (row !== undefined && typeof detail !== 'string') throw new Error('invalid price source alert');
+        const previous: AlertFinding | null = typeof detail === 'string' ? { kind: 'price_source_unavailable', severity: 'critical', portfolioId: null, detail } : null;
+        const observations = await args.priceSourceChecks();
+        const tracked = args.priceSourceTracker(observations, previous);
+        priceComplete = tracked.complete;
+        priceFinding = tracked.finding;
+        if (priceFinding !== null && (priceComplete || observations.some((observation) => observation.verified && observation.failure !== null))) await recordAlerts(args.query, [priceFinding], args.now, notifications);
+      } catch {
+        priceComplete = false;
+        args.priceSourceTracker([], null); // An unknown whole round breaks pre-alert consecutive failure counts.
+        args.log('[ALERT] 價格來源檢查失敗；本輪保留既有 price_source_unavailable 警示');
+      }
+    }
     const findings = await detectAlerts(args.query, { now: args.now, ...args.gasChecks });
     let seedCheckComplete = false;
     try {
@@ -1747,6 +1811,8 @@ export async function announceAlerts(args: {
     }
     await recordAlerts(args.query, findings, args.now, notifications);
     const unverified: AlertKind[] = seedCheckComplete ? [] : ['session_key_derivation_mismatch'];
+    if (!priceComplete) unverified.push('price_source_unavailable');
+    if (priceFinding !== null) findings.push(priceFinding);
     if (args.executorPaused !== true && args.executorPaused !== false) unverified.push('executor_paused');
     const resolved = await resolveAlerts(args.query, pauseFinding === null ? findings : [...findings, pauseFinding], args.now, notifications, unverified);
 
@@ -1933,8 +1999,8 @@ async function decideAndMaybeExecute(
         account: due.account, executor: ctx.deps.executor ?? executorAddress(), chainId: ctx.deps.chainId,
         userOpHash: op.user_op_hash, txHash: op.tx_hash, payloadHash: op.payload_hash,
       });
-    } catch {
-      return { ...base, outcome: 'blocked', reason: '先對帳：RPC 失敗或證據不符，保留在途，不重送' };
+    } catch (error) {
+      return { ...base, outcome: 'blocked', reason: decodePriceSourceError(error)?.detail ?? '先對帳：RPC 失敗或證據不符，保留在途，不重送' };
     }
     if (reconciliation.kind === 'not_found') {
       return releaseUnresolvedOperation(due, ctx.deps, op, base);
@@ -2233,7 +2299,7 @@ async function decideAndMaybeExecute(
   }
   return {
     ...withPlan,
-    outcome: 'failed',
+    outcome: execution.priceSourceFailure === undefined ? 'failed' : 'blocked',
     reason:
       `Send failed (nothing landed): ${execution.error ?? '(no error message)'}` +
       `（第 ${gate.attempts} 次嘗試，operations 記為 failed）`,
@@ -2338,7 +2404,7 @@ export async function readRebalanceReceipt(input: ReconcileInput, reader: {
     // getUserOperationReceipt.logs 僅限該 UserOp；receipt.logs 可能含同 tx 的其他 UserOp。
     swapExecuted: swaps, expectedSwaps: steps.length,
     txHash: receipt.receipt.transactionHash, userOpHash: input.userOpHash,
-    gasUsed: receipt.actualGasUsed.toString() }) };
+    gasUsed: receipt.actualGasUsed.toString(), ...(receipt.reason === undefined ? {} : { revertReason: receipt.reason }) }) };
 }
 
 /** 送出 → 標 submitted → 等 receipt；任何送出後例外都保留在途，不降成可重試的 failed。 */
@@ -2403,11 +2469,13 @@ async function executeAndSettle(
     await settle('reverted', outcome, diagnosis);
     return outcome;
   } catch (error) {
+    const failure = decodePriceSourceError(error);
     const message = oneLine(error);
     const unknown = sending || (received !== null && received.status !== 'error');
     const outcome: ExecutionOutcome = { status: unknown ? 'unknown' : 'error',
       userOpHash: received?.userOpHash ?? submitted.userOpHash ?? null,
-      txHash: received?.txHash ?? submitted.txHash ?? null, gasUsed: received?.gasUsed ?? null, error: message };
+      txHash: received?.txHash ?? submitted.txHash ?? null, gasUsed: received?.gasUsed ?? null, error: message,
+      ...(failure === null ? {} : { priceSourceFailure: failure }) };
     try {
       if (unknown) {
         // pending 已在發 RPC 前持久化；有 hash 就盡力補記 submitted，寫不進去仍由 pending 阻擋。

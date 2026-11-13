@@ -577,3 +577,157 @@ function decodeReturnedId(
   }
   throw new Error(`${eventName} event not found in receipt logs`);
 }
+
+/** #52: shared router/push-feed ABI, including errors that bubble through executor/EntryPoint. */
+export const PRICE_SOURCE_ABI = [
+  { type: 'error', name: 'FailedOpWithRevert', inputs: [{ name: 'opIndex', type: 'uint256' }, { name: 'reason', type: 'string' }, { name: 'inner', type: 'bytes' }] },
+  { type: 'error', name: 'StaleFeed', inputs: [{ name: 'feed', type: 'address' }, { name: 'updatedAt', type: 'uint256' }] },
+  { type: 'error', name: 'InvalidAnswer', inputs: [{ name: 'feed', type: 'address' }, { name: 'answer', type: 'int256' }] },
+  { type: 'error', name: 'SourcesDisagree', inputs: [{ name: 'asset', type: 'address' }, { name: 'poolQuote', type: 'uint256' }, { name: 'secondaryQuote', type: 'uint256' }] },
+  { type: 'function', name: 'secondaryOf', stateMutability: 'view', inputs: [{ name: 'asset', type: 'address' }], outputs: [{ name: 'source', type: 'address' }, { name: 'maxDeviationBps', type: 'uint16' }] },
+  ...(['assetFeed', 'numeraireFeed'] as const).map((name) => ({ type: 'function', name, stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] } as const)),
+  { type: 'function', name: 'maxAge', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint32' }] },
+  { type: 'function', name: 'latestRoundData', stateMutability: 'view', inputs: [], outputs: [
+    { type: 'uint80' }, { type: 'int256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint80' },
+  ] },
+  { type: 'function', name: 'numeraire', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] },
+  { type: 'function', name: 'decimals', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint8' }] },
+  { type: 'function', name: 'previewSwap', stateMutability: 'view', inputs: [{ type: 'address' }, { type: 'address' }, { type: 'uint256' }], outputs: [{ type: 'uint256' }, { type: 'uint256' }] },
+] as const;
+
+export type PriceSourceFailure = { code: 'StaleFeed' | 'InvalidAnswer' | 'SourcesDisagree'; detail: string; asset?: Address; feed?: Address };
+
+/** Only ABI data is trusted. Message text, URLs and arbitrary errorName strings never reach users. */
+export function decodePriceSourceError(error: unknown, context: { asset?: Address; timestamp?: bigint; maxAge?: number } = {}): PriceSourceFailure | null {
+  const seen = new Set<unknown>();
+  const pending: unknown[] = [error];
+  for (let depth = 0; depth < 128 && pending.length > 0; depth += 1) {
+    const current = pending.shift();
+    if (typeof current !== 'object' || current === null || seen.has(current)) continue;
+    seen.add(current);
+    if (current instanceof PriceSourceError) return current.failure;
+    const data: unknown = Reflect.get(current, 'data');
+    let name: unknown = Reflect.get(current, 'errorName');
+    let args: unknown = Reflect.get(current, 'args');
+    if (typeof data === 'string' && /^0x[0-9a-fA-F]+$/.test(data)) {
+      try {
+        const decoded = decodeErrorResult({ abi: PRICE_SOURCE_ABI, data: data as Hex });
+        name = decoded.errorName; args = decoded.args;
+      } catch { /* an unrelated revert */ }
+    }
+    if (name === 'FailedOpWithRevert' && Array.isArray(args) && typeof args[2] === 'string') pending.push({ data: args[2] });
+    const uint = (value: unknown): value is bigint => typeof value === 'bigint' && value >= 0n && value < (1n << 256n);
+    const address = (value: unknown): value is Address => typeof value === 'string' && /^0x[0-9a-fA-F]{40}$/.test(value);
+    if (Array.isArray(args) && address(args[0])) {
+      const label = context.asset === undefined ? '' : `資產 ${context.asset}：`;
+      if (name === 'StaleFeed' && uint(args[1])) {
+        const at = args[1];
+        const age = context.timestamp === undefined ? '鏈上時間未知，年齡無法確認'
+          : at === 0n ? 'updatedAt=0（缺少更新）'
+          : at > context.timestamp ? `updatedAt 在未來 ${at - context.timestamp} 秒`
+          : `年齡 ${context.timestamp - at} 秒${context.maxAge === undefined ? '' : `，上限 ${context.maxAge} 秒，超時 ${context.timestamp - at > BigInt(context.maxAge) ? context.timestamp - at - BigInt(context.maxAge) : 0n} 秒`}`;
+        return { code: name, feed: args[0], ...(context.asset === undefined ? {} : { asset: context.asset }), detail: `${label}StaleFeed：secondary push feed ${args[0]}，updatedAt=${at}；${age}，本輪不交易此資產` };
+      }
+      if (name === 'InvalidAnswer' && typeof args[1] === 'bigint' && args[1] <= 0n && args[1] >= -(1n << 255n)) {
+        return { code: name, feed: args[0], ...(context.asset === undefined ? {} : { asset: context.asset }), detail: `${label}InvalidAnswer：secondary push feed ${args[0]} 回傳 ${args[1]}（必須 > 0），本輪不交易此資產` };
+      }
+      if (name === 'SourcesDisagree' && uint(args[1]) && uint(args[2])) {
+        const gap = args[1] > args[2] ? args[1] - args[2] : args[2] - args[1];
+        return { code: name, asset: args[0], detail: `資產 ${args[0]}：SourcesDisagree：Pancake TWAP=${args[1]}，secondary=${args[2]}，差距 ${args[2] === 0n ? '無法計算（secondary=0）' : `${gap * 10000n / args[2]} bps`}，本輪不交易此資產` };
+      }
+    }
+    pending.push(data, Reflect.get(current, 'cause'), Reflect.get(current, 'error'), Reflect.get(current, 'originalError'));
+  }
+  return null;
+}
+
+export class PriceSourceError extends Error {
+  constructor(readonly failure: PriceSourceFailure) { super(failure.detail); this.name = 'PriceSourceError'; }
+}
+
+/** Enrich only a recognized revert, with the chain clock at the same observation block. */
+export async function describePriceSourceError(error: unknown, client: PublicClient, context: {
+  oracle: Address; blockNumber?: bigint; asset?: Address; tokenIn?: Address; tokenOut?: Address; assets?: readonly Address[];
+}): Promise<PriceSourceFailure | null> {
+  const decoded = decodePriceSourceError(error);
+  if (decoded === null) return null;
+  let asset = context.asset ?? decoded.asset;
+  let timestamp: bigint | undefined;
+  let maxAge: number | undefined;
+  try {
+    const block = await client.getBlock(context.blockNumber === undefined ? { blockTag: 'latest' } : { blockNumber: context.blockNumber });
+    timestamp = block.timestamp;
+    const blockNumber = block.number ?? context.blockNumber;
+    if (asset === undefined && context.tokenIn !== undefined && context.tokenOut !== undefined) {
+      const numeraire = await client.readContract({ address: context.oracle, abi: PRICE_SOURCE_ABI, functionName: 'numeraire', blockNumber });
+      asset = context.tokenIn.toLowerCase() === numeraire.toLowerCase() ? context.tokenOut : context.tokenIn;
+    }
+    if (asset === undefined && context.assets !== undefined && blockNumber !== undefined) {
+      for (const candidate of new Map(context.assets.map((value) => [value.toLowerCase(), value])).values()) {
+        try {
+          const health = await readSecondaryHealth(client, context.oracle, candidate, { number: blockNumber, timestamp: block.timestamp });
+          if (health.feeds.some((feed) => feed.feed.toLowerCase() === decoded.feed?.toLowerCase())) { asset = candidate; break; }
+        } catch { /* another route asset is not this feed */ }
+      }
+    }
+    if (asset !== undefined) {
+      const [source] = await client.readContract({ address: context.oracle, abi: PRICE_SOURCE_ABI, functionName: 'secondaryOf', args: [asset], blockNumber });
+      if (source !== zeroAddress) maxAge = await client.readContract({ address: source, abi: PRICE_SOURCE_ABI, functionName: 'maxAge', blockNumber });
+    }
+  } catch { /* keep the decoded cause; unavailable metadata is never invented */ }
+  return decodePriceSourceError(error, { ...(asset === undefined ? {} : { asset }),
+    ...(timestamp === undefined ? {} : { timestamp }), ...(maxAge === undefined ? {} : { maxAge }) });
+}
+
+export type SecondaryFeedHealth = { role: 'asset/USD' | 'numeraire/USD'; feed: Address; updatedAt: bigint; age: bigint; failure: PriceSourceFailure | null };
+export type SecondaryHealth = { asset: Address; source: Address; maxAge: number | null; maxDeviationBps: number; feeds: SecondaryFeedHealth[] };
+
+/** Two feeds at one pinned block. Missing RPC/ABI data throws; it is never a healthy/absent source. */
+export async function readSecondaryHealth(client: PublicClient, oracle: Address, asset: Address, block: { number: bigint; timestamp: bigint }): Promise<SecondaryHealth> {
+  const [source, maxDeviationBps] = await client.readContract({ address: oracle, abi: PRICE_SOURCE_ABI, functionName: 'secondaryOf', args: [asset], blockNumber: block.number });
+  if (source === zeroAddress) return { asset, source, maxAge: null, maxDeviationBps, feeds: [] };
+  const [assetFeed, numeraireFeed, maxAge] = await Promise.all([
+    client.readContract({ address: source, abi: PRICE_SOURCE_ABI, functionName: 'assetFeed', blockNumber: block.number }),
+    client.readContract({ address: source, abi: PRICE_SOURCE_ABI, functionName: 'numeraireFeed', blockNumber: block.number }),
+    client.readContract({ address: source, abi: PRICE_SOURCE_ABI, functionName: 'maxAge', blockNumber: block.number }),
+  ]);
+  if (maxAge < 60 || maxAge > 86400 || assetFeed === zeroAddress || numeraireFeed === zeroAddress) throw new Error('secondary metadata invalid');
+  const feeds: SecondaryFeedHealth[] = [];
+  for (const [role, feed] of [['asset/USD', assetFeed], ['numeraire/USD', numeraireFeed]] as const) {
+    const [, answer, , updatedAt] = await client.readContract({ address: feed, abi: PRICE_SOURCE_ABI, functionName: 'latestRoundData', blockNumber: block.number });
+    const code = answer <= 0n ? 'InvalidAnswer' : updatedAt === 0n || updatedAt > block.timestamp || block.timestamp - updatedAt > BigInt(maxAge) ? 'StaleFeed' : null;
+    const failure = code === null ? null : decodePriceSourceError({ errorName: code, args: [feed, code === 'InvalidAnswer' ? answer : updatedAt] }, { asset, timestamp: block.timestamp, maxAge });
+    feeds.push({ role, feed, updatedAt, age: block.timestamp - updatedAt, failure });
+  }
+  return { asset, source, maxAge, maxDeviationBps, feeds };
+}
+
+export type PriceSourceObservation = { asset: Address; verified: boolean; failure: PriceSourceFailure | null };
+
+export async function inspectPriceSources(client: PublicClient, oracle: Address, assets: readonly Address[]): Promise<PriceSourceObservation[]> {
+  const block = await client.getBlock({ blockTag: 'latest' });
+  if (block.number === null) throw new Error('price source block unavailable');
+  const blockNumber = block.number;
+  const numeraire = await client.readContract({ address: oracle, abi: PRICE_SOURCE_ABI, functionName: 'numeraire', blockNumber });
+  const observations: PriceSourceObservation[] = [];
+  for (const asset of new Map(assets.map((value) => [value.toLowerCase(), value])).values()) {
+    if (asset.toLowerCase() === numeraire.toLowerCase()) continue;
+    try {
+      const health = await readSecondaryHealth(client, oracle, asset, { number: blockNumber, timestamp: block.timestamp });
+      const failure = health.feeds.find((feed) => feed.failure !== null)?.failure;
+      if (failure) { observations.push({ asset, verified: true, failure }); continue; }
+      // No secondary is a valid configuration and must be visible in preflight.
+      if (health.source !== zeroAddress) {
+        const decimals = await client.readContract({ address: asset, abi: PRICE_SOURCE_ABI, functionName: 'decimals', blockNumber });
+        if (decimals > 36) throw new Error('invalid asset decimals');
+        const [quoted, minimum] = await client.readContract({ address: oracle, abi: PRICE_SOURCE_ABI, functionName: 'previewSwap', args: [asset, numeraire, 10n ** BigInt(decimals)], blockNumber });
+        if (quoted <= 0n || minimum <= 0n) throw new Error('price source quote incomplete');
+      }
+      observations.push({ asset, verified: true, failure: null });
+    } catch (error) {
+      const failure = decodePriceSourceError(error, { asset, timestamp: block.timestamp });
+      observations.push({ asset, verified: failure !== null, failure });
+    }
+  }
+  return observations;
+}

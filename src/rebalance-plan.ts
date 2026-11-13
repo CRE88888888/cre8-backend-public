@@ -93,7 +93,7 @@
  * 的 `AssetNotAllowed`），hub 不是策略資產就收不了賣出的 USDT、也付不出買的 USDT。
  */
 
-import { EXECUTOR_BUY_ABI, EXECUTOR_ABI, PANCAKE_UR, PANCAKE_DATA_ABI } from './chain.js';
+import { EXECUTOR_BUY_ABI, EXECUTOR_ABI, PANCAKE_UR, PANCAKE_DATA_ABI, describePriceSourceError, decodePriceSourceError, PriceSourceError } from './chain.js';
 import { quoteKyberSwap, aggregatorWins } from './aggregator.js';
 import type { AggregatorQuoter } from './aggregator.js';
 import { chooseBestPath, routeImpactBps, singleHopPath } from './routing.js';
@@ -288,7 +288,11 @@ export async function nominalSellQuote(client: PublicClient, oracle: Address, to
     const [quoted] = await client.readContract({ address: oracle, abi: ORACLE_ABI, functionName: 'previewSwap', args: [token, numeraire, amountIn], blockNumber });
     if (typeof quoted !== 'bigint' || quoted <= 0n) throw new Error('no quote');
     return quoted;
-  } catch { throw new Error('[MAX_LEG_QUOTE_UNAVAILABLE] oracle 名義額報價失敗或為 0，不送交易'); }
+  } catch (error) {
+    const failure = await describePriceSourceError(error, client, { oracle, asset: token, blockNumber });
+    if (failure !== null) throw new PriceSourceError(failure);
+    throw new Error('[MAX_LEG_QUOTE_UNAVAILABLE] oracle 名義額報價失敗或為 0，不送交易');
+  }
 }
 
 /** 每資產每輪只有一步；買入先限 USDT input，賣出按 oracle quoted 限量後再核對。 */
@@ -311,7 +315,7 @@ export async function capAssetLeg(params: {
     const finalQuote = await nominalSellQuote(params.publicClient, params.oracle, params.tokenIn, params.numeraire, capped, params.blockNumber);
     if (finalQuote > rawCap) return { blocked: '[MAX_LEG_QUOTE_INVALID] 縮量後 oracle 名義額仍超限，不交易' };
     return { amountIn: capped, batched: true };
-  } catch { return { blocked: '[MAX_LEG_QUOTE_UNAVAILABLE] oracle 名義額報價失敗或為 0，不送交易' }; }
+  } catch (error) { return { blocked: decodePriceSourceError(error)?.detail ?? '[MAX_LEG_QUOTE_UNAVAILABLE] oracle 名義額報價失敗或為 0，不送交易' }; }
 }
 /** Permit2 的 allowance 是 uint160；合約對超過它的 amountIn 是 revert AmountTooLarge（不是截斷）。 */
 const UINT160_MAX = 2n ** 160n - 1n;
@@ -512,7 +516,7 @@ function revertNameOf(error: unknown): string | null {
   while (cursor !== null && typeof cursor === 'object' && !seen.has(cursor)) {
     seen.add(cursor);
     const record = cursor as { data?: { errorName?: unknown }; cause?: unknown };
-    if (typeof record.data?.errorName === 'string') return record.data.errorName;
+    if (typeof record.data?.errorName === 'string' && /^(UnsupportedPair|UnsupportedRoute|OracleNotSet|SameToken|ZeroQuote|ZeroAmount|TwapUnavailable|InvalidPoolPrice|DeadlineExpired)$/.test(record.data.errorName)) return record.data.errorName;
     cursor = record.cause;
   }
   const message = error instanceof Error ? error.message : String(error);
@@ -919,7 +923,8 @@ export async function refreshFloors(params: {
     if (!quote.ok) {
       // 用舊值硬送才是錯的：問不到地板就不知道「現在的下限」是什麼，合約會在 `_checkStep` 裡 revert
       // （oracle 的 revert 或 `NoFloor`）—— 那是把「這一輪不做」變成一次花 gas 的失敗。
-      const name = revertNameOf(quote.error);
+      const secondary = await describePriceSourceError(quote.error, publicClient, { oracle, tokenIn: step.tokenIn, tokenOut: step.tokenOut, ...(params.blockNumber === undefined ? {} : { blockNumber: params.blockNumber }) });
+      const name = secondary?.detail ?? revertNameOf(quote.error);
       return {
         ok: false,
         kind: 'quote-failed',
@@ -1228,11 +1233,12 @@ async function quoteHub(
     .then((result) => ({ ok: true as const, result }))
     .catch((error: unknown) => ({ ok: false as const, error }));
   if (!quote.ok) {
-    const name = revertNameOf(quote.error);
+    const secondary = await describePriceSourceError(quote.error, client, { oracle: router, tokenIn, tokenOut, blockNumber });
+    const name = secondary?.detail ?? revertNameOf(quote.error);
     return {
       skip:
         `previewSwap(${short(tokenIn)} → ${short(tokenOut)}, ${amountIn}) cannot quote right now` +
-        `（${name ?? (quote.error instanceof Error ? quote.error.message : String(quote.error))}）`,
+        `（${name ?? 'RPC 無法取得地板'}）`,
     };
   }
   const [quoted, minimum] = quote.result;
@@ -1427,7 +1433,9 @@ async function readBuyBudget(args: PlanRebalanceArgs): Promise<BuyBudget | Extra
     const note = `買入額度：cap ${cap} × 98% − bought ${bought} → 可買 ${remaining}，windowEndsAt ${windowEndsAt}`;
     if (remaining === 0n) return { kind: 'blocked', reason: `${note}；${windowEndsAt === 0n ? '沒有可等待的開啟窗口，沿用正常排程間隔' : '等待買入窗口結束'}`, buyWindowEndsAt: windowEndsAt };
     return { cap, bought, windowEndsAt, remaining, note };
-  } catch {
+  } catch (error) {
+    const secondary = await describePriceSourceError(error, args.publicClient, { oracle: args.oracle, blockNumber: args.blockNumber });
+    if (secondary !== null) return { kind: 'blocked', reason: secondary.detail };
     return { kind: 'blocked', reason: '[BUY_ALLOWANCE_UNAVAILABLE] buyAllowance 讀取失敗或資料缺漏，無法確認買入額度，不送交易' };
   }
 }
@@ -1487,9 +1495,11 @@ async function planHub(
     legs.push({ asset: getAddress(target.asset), row, deltaUsdE8: row.usdValueE8 - targetUsdE8 });
   }
 
-  const buyBudget = legs.some((leg) => leg.deltaUsdE8 < 0n) ? await readBuyBudget(args) : null;
-  if (buyBudget !== null && 'kind' in buyBudget) return buyBudget;
-  const notes: string[] = [];
+  const budgetResult = legs.some((leg) => leg.deltaUsdE8 < 0n) ? await readBuyBudget(args) : null;
+  const buySourceBlock = budgetResult !== null && 'kind' in budgetResult && /StaleFeed|SourcesDisagree|InvalidAnswer/.test(budgetResult.reason) ? budgetResult.reason : null;
+  if (budgetResult !== null && 'kind' in budgetResult && buySourceBlock === null) return budgetResult;
+  const buyBudget = budgetResult !== null && !('kind' in budgetResult) ? budgetResult : null;
+  const notes: string[] = buySourceBlock === null ? [] : [buySourceBlock];
   let maxLegBatched = false;
   let maxLegBlocked = false;
   const needsDecimals = targets.some((target) => !sameAsset(target.asset, hub) && limitOf(args.maxLegUsdE8, target.asset) !== null);
@@ -1699,6 +1709,9 @@ async function planHub(
 
   for (const leg of legs) {
     if (leg.deltaUsdE8 >= 0n) continue;
+    // An unavailable buyAllowance cannot authorize a buy. A sales-only batch needs no buy
+    // valuation, so keep independent healthy sells without inventing a buy allowance.
+    if (buySourceBlock !== null) continue;
     if (hubHolding === undefined) {
       notes.push(`holdings 裡沒有 numeraire ${short(hub)}（沒有 decimals／價格），算不出要付多少 USDT，跳過買 ${short(leg.asset)}`);
       continue;
@@ -1761,7 +1774,7 @@ async function planHub(
   // 全部都被跳過 → noop（絕對不回空的 steps：pitfalls §8.1）。
   if (priced.length === 0) {
     return {
-      kind: maxLegBlocked ? 'blocked' : 'noop',
+      kind: maxLegBlocked || notes.some((note) => /StaleFeed|SourcesDisagree|InvalidAnswer/.test(note)) ? 'blocked' : 'noop',
       reason:
         `Hub mode (numeraire ${short(hub)}) produced no executable step: ` +
         `${notes.length === 0 ? 'no non-numeraire target assets, or every deltaUsd is 0' : notes.join('; ')}. Not sending empty steps.`,
@@ -2136,13 +2149,15 @@ export async function planRebalance(
       .catch((error: unknown) => ({ ok: false as const, error })),
   ]);
   if (!quote.ok) {
+    const secondary = await describePriceSourceError(quote.error, publicClient, { oracle, asset, blockNumber });
+    if (secondary !== null) return { kind: 'blocked', reason: secondary.detail };
     const name = revertNameOf(quote.error);
     if (name === 'UnsupportedPair' || name === null) {
       return {
         kind: 'blocked',
         reason:
           `oracle.previewSwap(${short(tokenIn)} → ${short(tokenOut)}, ${amountIn}) 失敗` +
-          `（${name ?? (quote.error instanceof Error ? quote.error.message : String(quote.error))}）：` +
+          `（${name ?? 'RPC 無法取得地板'}）：` +
           '這個 pair 不在 oracle 綁定的那個 pool 上，>2 資產要等 per-call oracle（D-23）',
       };
     }
@@ -2193,7 +2208,7 @@ export async function planRebalance(
         return {
           skip:
             '重問 previewSwap 失敗' +
-            `（${revertNameOf(again) ?? (again instanceof Error ? again.message : String(again))}）`,
+            `（${(await describePriceSourceError(again, publicClient, { oracle, asset, blockNumber }))?.detail ?? revertNameOf(again) ?? 'RPC 無法取得地板'}）`,
         };
       }
       const [reQuoted, reMinimum] = again as unknown as readonly [bigint, bigint];
@@ -2203,7 +2218,7 @@ export async function planRebalance(
   });
   if ('skip' in capped) {
     // 縮小救不回來 → 這一輪不送。**不是 blocked**：市場狀態，下一輪 TWAP 吸收衝擊後可能就好了。
-    return { kind: 'noop', reason: `${capped.skip}. Not sending empty steps.` };
+    return { kind: /StaleFeed|SourcesDisagree|InvalidAnswer/.test(capped.skip) ? 'blocked' : 'noop', reason: `${capped.skip}. Not sending empty steps.` };
   }
 
   const finalAmountIn = capped.amountIn;

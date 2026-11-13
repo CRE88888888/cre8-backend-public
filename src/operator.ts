@@ -19,7 +19,8 @@ import { listOpenAlerts } from './alerts.js';
 import { readSchedulerStatus } from './scheduler-status.js';
 import type { SchedulerStatus } from './scheduler-status.js';
 import type { GasStatus } from './funding.js';
-import { getAccountGasBalance, getGasPriceWei } from './chain.js';
+import { getAccountGasBalance, getGasPriceWei, pauseSources, REGISTRY_ABI } from './chain.js';
+import type { PauseSource } from './chain.js';
 import { getGasConfig } from './config.js';
 import { countSwapExecuted, runSchedulerOnce } from './scheduler.js';
 import type { ExecutionOutcome, PortfolioRunResult, WithTransactionFn } from './scheduler.js';
@@ -91,6 +92,9 @@ export type StatusDrift = {
 
 export type PortfolioStatus = {
   portfolioId: number;
+  /** Registry pause sources at `block`: Safe=1, operator=2, account=4. null means unreadable. */
+  pauseFlags: number | null;
+  pauseSources: PauseSource[] | null;
   /**
    * executor 位址 —— app 要靠它組 `approve(spender = executor)`。
    *
@@ -135,6 +139,7 @@ export type PortfolioStatus = {
 };
 
 export type StatusDeps = {
+  readPauseFlags?: (account: Address, blockNumber: bigint) => Promise<number>;
   planPortfolio?: (portfolioId: number) => Promise<PortfolioPlan>;
   requireOwnedPortfolio?: typeof requireOwnedPortfolio;
   query?: QueryFn;
@@ -498,6 +503,22 @@ async function statusOf(portfolioId: number, deps: StatusDeps): Promise<Portfoli
 
   // 唯讀的附加資訊：讀不到也只記進 `sessionKey.error`，不讓一份算得出來的狀態變成 503。
   const sessionKey = await resolveStatusSessionKey(plan.portfolioId, plan.account, deps);
+  let flags: number | null = null;
+  let sources: PauseSource[] | null = null;
+  try {
+    const readFlags = deps.readPauseFlags ?? (async (account: Address, blockNumber: bigint) => {
+      const registry = getConfig().registryAddress;
+      if (registry === null) throw new Error('REGISTRY_ADDRESS 未設定');
+      return (deps.publicClient ?? defaultPublicClient()).readContract({
+        address: registry as Address, abi: REGISTRY_ABI, functionName: 'pauseFlags', args: [account], blockNumber,
+      });
+    });
+    const observed = await readFlags(plan.account, plan.snapshot.block);
+    sources = pauseSources(observed);
+    flags = observed;
+  } catch {
+    // Do not report zero when a missing ABI, RPC timeout or unknown flag makes the sources unknown.
+  }
   const executor = deps.executor ?? getSessionKeyConfig().executorAddress ?? null;
   // gas 讀不到（RPC 掛）不該讓整份狀態變 503：留 null，前端顯示「未知」。
   const gas = await (async () => {
@@ -514,6 +535,8 @@ async function statusOf(portfolioId: number, deps: StatusDeps): Promise<Portfoli
 
   return {
     portfolioId: plan.portfolioId,
+    pauseFlags: flags,
+    pauseSources: sources,
     executorAddress: executor,
     block: plan.snapshot.block.toString(),
     account: plan.account,

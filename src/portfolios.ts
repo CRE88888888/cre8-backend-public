@@ -300,14 +300,15 @@ export async function enrollPortfolio(
 
   // On-chain first: enroll the smart account (not the EOA), and fail here on a revert before any
   // DB row exists.
-  await enroll(smartAccount.address, onchainId);
+  // A retry may find an older pinned version on-chain. Publishing a version never upgrades it.
+  const enrolledVersion = await enroll(smartAccount.address, onchainId);
 
   const written = await runInTransaction(async (client) => {
     const inserted = await client.query<PortfolioRow>(
       `insert into portfolios (user_id, strategy_id, version, schedule_state)
        values ($1, $2, $3, 'active')
        returning id, user_id, strategy_id, version, schedule_state, created_at`,
-      [account, strategyId, version],
+      [account, strategyId, enrolledVersion],
     );
     const portfolioRow = inserted.rows[0];
     if (!portfolioRow) throw new Error('insert into portfolios returned no row');

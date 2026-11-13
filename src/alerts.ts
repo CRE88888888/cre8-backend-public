@@ -39,6 +39,7 @@ export const ALERT_KINDS = [
   'gas_low',
   'portfolio_stuck',
   'session_key_derivation_mismatch',
+  'executor_paused',
 ] as const;
 
 export type AlertKind = (typeof ALERT_KINDS)[number];

@@ -96,6 +96,45 @@ const SYMBOL_ROWS = [
   { address: USDT, symbol: 'USDT' },
 ];
 
+for (const flags of [0, 1, 2, 3, 4, 5, 6, 7]) {
+  test(`status exposes pauseFlags=${flags} and exact Safe/operator/account sources without a write`, async () => {
+    const reads: unknown[] = [];
+    const ownedReader = createPortfolioStatusReader({
+      planPortfolio: async () => samplePlan({ pinnedVersion: { version: 1, onchainStrategyId: 3, paused: flags !== 0 } }),
+      requireOwnedPortfolio: async () => ({
+        id: PORTFOLIO_ID, userId: WALLET.address, strategyId: 447, version: 1, scheduleState: 'active',
+        createdAt: new Date(0).toISOString(), chainId: 56, accountAddress: ACCOUNT,
+        ownerAddress: WALLET.address, existingKeyRefs: [],
+      }),
+      query: symbolQuery(),
+      readPauseFlags: async (account, blockNumber) => { reads.push([account, blockNumber]); return flags; },
+    });
+    const status = await ownedReader(PORTFOLIO_ID, WALLET.address);
+    assert.equal(status.pauseFlags, flags);
+    assert.deepEqual(status.pauseSources, [
+      ...(flags & 1 ? ['safe'] : []), ...(flags & 2 ? ['operator'] : []), ...(flags & 4 ? ['account'] : []),
+    ]);
+    assert.deepEqual(reads, [[ACCOUNT, 132_164_357n]]);
+  });
+}
+
+test('status pause lookup failure is unknown, never an unpaused zero', async () => {
+  const reader = createPortfolioStatusReader({
+    planPortfolio: async () => samplePlan(),
+    requireOwnedPortfolio: async () => ({
+      id: PORTFOLIO_ID, userId: WALLET.address, strategyId: 447, version: 1, scheduleState: 'active',
+      createdAt: new Date(0).toISOString(), chainId: 56, accountAddress: ACCOUNT,
+      ownerAddress: WALLET.address, existingKeyRefs: [],
+    }),
+    query: symbolQuery(),
+    readPauseFlags: async () => { throw new Error('sensitive RPC token'); },
+  });
+  const status = await reader(PORTFOLIO_ID, WALLET.address);
+  assert.equal(status.pauseFlags, null);
+  assert.equal(status.pauseSources, null);
+  assert.ok(!JSON.stringify(status).includes('sensitive RPC token'));
+});
+
 /** 一個「DB 只有 priceable_assets 一張表」的 query 替身。 */
 function symbolQuery(rows: unknown[] = SYMBOL_ROWS) {
   return async (text: string) => {
@@ -455,6 +494,8 @@ async function loginToken(baseUrl: string, wallet: Pick<PrivateKeyAccount, 'addr
 
 const SAMPLE_STATUS: PortfolioStatus = {
   portfolioId: PORTFOLIO_ID,
+  pauseFlags: 0,
+  pauseSources: [],
   executorAddress: '0x9C41696ea7FaA5470eAfb77415D063beEef83f4a',
   block: '1',
   account: ACCOUNT,

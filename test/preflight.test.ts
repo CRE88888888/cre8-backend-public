@@ -3,7 +3,17 @@ import { test } from 'node:test';
 import { mnemonicToAccount } from 'viem/accounts';
 import { zeroAddress } from 'viem';
 import type { Address } from 'viem';
-import { checkOwnership, checkRegistryOperator, checkRoleSeparation, checkSessionKeySeed, operatorAddress } from '../scripts/preflight.js';
+import { checkGlobalPaused, checkOwnership, checkRegistryOperator, checkRoleSeparation, checkSessionKeySeed, operatorAddress } from '../scripts/preflight.js';
+
+for (const strict of [true, false]) {
+  test(`executor pause preflight (strict=${strict}) distinguishes false, true and unreadable`, () => {
+    assert.equal(checkGlobalPaused(false, strict).level, 'ok');
+    assert.equal(checkGlobalPaused(true, strict).level, strict ? 'fail' : 'warn');
+    assert.match(checkGlobalPaused(true, strict).detail, /Safe.*全域暫停/);
+    assert.equal(checkGlobalPaused(null, strict).level, 'fail');
+    assert.match(checkGlobalPaused(null, strict).detail, /讀不到.*globalPaused/);
+  });
+}
 
 const OWNER: Address = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266';
 const SAFE: Address = '0x000000000000000000000000000000000000aBcD';

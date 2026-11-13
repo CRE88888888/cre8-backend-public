@@ -2,6 +2,7 @@ import {
   createPublicClient,
   createWalletClient,
   decodeEventLog,
+  decodeErrorResult,
   http,
   keccak256,
   toHex,
@@ -14,6 +15,7 @@ import { getConfig } from './config.js';
 import { assertKernelInfraDeployed, computeSalt, getKernelAccountParams } from './kernel.js';
 import type { KernelAccountOptions } from './kernel.js';
 import type { RebalanceSchedule } from './strategies.js';
+import { AppError } from './errors.js';
 
 /**
  * Chain integration: the backend relayer is the registry operator for enrollment and the provider
@@ -70,6 +72,18 @@ export const REGISTRY_ABI = [
     stateMutability: 'nonpayable',
   },
   { type: 'error', name: 'Unauthorized', inputs: [] },
+  { type: 'error', name: 'AlreadyEnrolled', inputs: [{ name: 'account', type: 'address' }] },
+  { type: 'function', name: 'isEnrolled', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }], outputs: [{ type: 'bool' }] },
+  {
+    type: 'function', name: 'enrollments', stateMutability: 'view',
+    inputs: [{ name: 'account', type: 'address' }],
+    outputs: [{ name: 'strategyId', type: 'uint256' }, { name: 'version', type: 'uint16' }, { name: 'paused', type: 'bool' }],
+  },
+  { type: 'function', name: 'pauseFlags', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }], outputs: [{ type: 'uint8' }] },
+  {
+    type: 'event', name: 'PauseFlagsSet',
+    inputs: [{ name: 'account', type: 'address', indexed: true }, { name: 'flags', type: 'uint8', indexed: false }],
+  },
   {
     type: 'event',
     name: 'StrategyRegistered',
@@ -89,6 +103,48 @@ export const REGISTRY_ABI = [
     ],
   },
 ] as const;
+
+export const EXECUTOR_PAUSE_ABI = [
+  { type: 'function', name: 'globalPaused', stateMutability: 'view', inputs: [], outputs: [{ type: 'bool' }] },
+  { type: 'error', name: 'ExecutorPaused', inputs: [] },
+] as const;
+
+export type PauseSource = 'safe' | 'operator' | 'account';
+
+/** A10 registry bits: OWNER=1, OPERATOR=2, ACCOUNT=4. Unknown bits must not look unpaused. */
+export function pauseSources(flags: number): PauseSource[] {
+  if (!Number.isInteger(flags) || flags < 0 || flags > 7) throw new Error('pauseFlags 不是有效的 A10 暫停來源');
+  const sources: PauseSource[] = [];
+  if (flags & 1) sources.push('safe');
+  if (flags & 2) sources.push('operator');
+  if (flags & 4) sources.push('account');
+  return sources;
+}
+
+export async function readGlobalPaused(executor: Address, client: PublicClient): Promise<boolean> {
+  return client.readContract({ address: executor, abi: EXECUTOR_PAUSE_ABI, functionName: 'globalPaused' });
+}
+
+/** Decode structured viem/RPC causes only; never echo an RPC URL, calldata or credentials. */
+export function a10ErrorMessage(error: unknown): string | null {
+  const messages = {
+    ExecutorPaused: 'ExecutorPaused：Safe 已開啟全域暫停，所有再平衡（含賣出）停止；使用者可用錢包直接提領',
+    AlreadyEnrolled: 'AlreadyEnrolled：帳戶已 enroll，策略或版本只能由使用者簽署變更；operator 不會重新 enroll 或清除暫停',
+  };
+  const seen = new Set<unknown>();
+  let current = error;
+  for (let depth = 0; depth < 12 && typeof current === 'object' && current !== null && !seen.has(current); depth += 1) {
+    seen.add(current);
+    const data = 'data' in current ? current.data : undefined;
+    let name: unknown = typeof data === 'object' && data !== null && 'errorName' in data ? data.errorName : undefined;
+    if (typeof data === 'string' && /^0x[0-9a-fA-F]+$/.test(data)) {
+      try { name = decodeErrorResult({ abi: [...REGISTRY_ABI, ...EXECUTOR_PAUSE_ABI], data: data as Hex }).errorName; } catch { /* not an A10 revert */ }
+    }
+    if (name === 'ExecutorPaused' || name === 'AlreadyEnrolled') return messages[name];
+    current = 'cause' in current ? current.cause : undefined;
+  }
+  return null;
+}
 
 export type ChainConfig = {
   chainId: number;
@@ -204,33 +260,62 @@ export async function publishVersionOnchain(
   return decodeReturnedId(receipt.logs, 'VersionPublished', 'version');
 }
 
-/** Enroll using the registry's operator. `chain` is an injection seam for unit tests. */
-export async function enrollOnchain(account: Address, onchainId: number, chain?: ChainConfig): Promise<void> {
+/** First enrollment only. Same-strategy retries preserve the chain's version and pause sources. */
+export async function enrollOnchain(account: Address, onchainId: number, chain?: ChainConfig): Promise<number> {
   const { wallet, publicClient, registryAddress, account: operator } = chain ?? getChain();
 
-  // ATP v2 does not grant the owner enrollment rights. Read on every attempt so a revoked or
-  // rotated operator fails before a transaction is submitted, even with a cached ChainConfig.
-  const registryOperator = await publicClient.readContract({
-    address: registryAddress,
-    abi: REGISTRY_ABI,
-    functionName: 'operator',
-  });
-  if (registryOperator.toLowerCase() !== operator.address.toLowerCase()) {
-    throw new Error(
-      `enroll operator mismatch: signer ${operator.address}, registry.operator() ${registryOperator}; ` +
-        '需由 owner 呼叫 setOperator 將 registry operator 設為 signer 地址',
-    );
-  }
+  try {
+    const readEnrollment = async (blockNumber: bigint): Promise<number | null> => {
+      const [enrolled, enrollment] = await Promise.all([
+        publicClient.readContract({ address: registryAddress, abi: REGISTRY_ABI, functionName: 'isEnrolled', args: [account], blockNumber }),
+        publicClient.readContract({ address: registryAddress, abi: REGISTRY_ABI, functionName: 'enrollments', args: [account], blockNumber }),
+      ]);
+      const [strategyId, version, paused] = enrollment;
+      if (!enrolled && strategyId === 0n && version === 0 && paused === false) return null;
+      if (!enrolled || strategyId <= 0n || !Number.isInteger(version) || version < 1 || version > 65535) {
+        throw new AppError(503, 'ENROLLMENT_INCONSISTENT', 'enrollment 與 isEnrolled 不一致：拒絕送出 enroll');
+      }
+      if (strategyId !== BigInt(onchainId)) {
+        throw new AppError(409, 'ALREADY_ENROLLED', `AlreadyEnrolled：帳戶已加入策略 ${strategyId}，策略或版本只能由使用者簽署變更；operator 不送交易`);
+      }
+      return version;
+    };
+    const version = await readEnrollment(await publicClient.getBlockNumber({ cacheTime: 0 }));
+    if (version !== null) return version;
 
-  const hash = await wallet.writeContract({
-    account: operator,
-    chain: activeChain(),
-    address: registryAddress,
-    abi: REGISTRY_ABI,
-    functionName: 'enroll',
-    args: [account, BigInt(onchainId)],
-  });
-  await publicClient.waitForTransactionReceipt({ hash });
+    // ATP v2 does not grant the owner enrollment rights. Read on every attempt so a revoked or
+    // rotated operator fails before a transaction is submitted, even with a cached ChainConfig.
+    const registryOperator = await publicClient.readContract({
+      address: registryAddress,
+      abi: REGISTRY_ABI,
+      functionName: 'operator',
+    });
+    if (registryOperator.toLowerCase() !== operator.address.toLowerCase()) {
+      throw new AppError(503, 'OPERATOR_MISMATCH',
+        `enroll operator mismatch: signer ${operator.address}, registry.operator() ${registryOperator}; ` +
+          '需由 owner 呼叫 setOperator 將 registry operator 設為 signer 地址',
+      );
+    }
+
+    const hash = await wallet.writeContract({
+      account: operator,
+      chain: activeChain(),
+      address: registryAddress,
+      abi: REGISTRY_ABI,
+      functionName: 'enroll',
+      args: [account, BigInt(onchainId)],
+    });
+    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+    if (receipt.status !== 'success') throw new AppError(502, 'ENROLL_REVERTED', 'enroll transaction reverted：未完成 enrollment');
+    const enrolledVersion = await readEnrollment(receipt.blockNumber);
+    if (enrolledVersion === null) throw new AppError(503, 'ENROLLMENT_MISSING', 'enroll receipt 成功但 enrollment 缺漏：拒絕回報成功');
+    return enrolledVersion;
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    const message = a10ErrorMessage(error);
+    if (message !== null) throw new AppError(409, 'ALREADY_ENROLLED', message);
+    throw new AppError(503, 'ENROLL_UNAVAILABLE', 'enroll 無法完成確認：鏈上狀態、RPC 或交易回執不可用，請稍後重試');
+  }
 }
 
 /**

@@ -30,7 +30,7 @@ import { createPublicClient, http, isAddress, getAddress, zeroAddress } from 'vi
 import { privateKeyToAccount } from 'viem/accounts';
 import type { Address } from 'viem';
 
-import { REGISTRY_ABI } from '../src/chain.js';
+import { readGlobalPaused, REGISTRY_ABI } from '../src/chain.js';
 import { activeChain } from '../src/chain-object.js';
 import { getConfig, requireSessionKeyConfig } from '../src/config.js';
 import { query } from '../src/db.js';
@@ -56,6 +56,18 @@ const OWNERSHIP_ABI = ['owner', 'pendingOwner'].map((name) => ({
   inputs: [],
   outputs: [{ type: 'address' as const }],
 }));
+
+export function checkGlobalPaused(paused: boolean | null, strict: boolean): Check {
+  if (paused === null) return {
+    level: 'fail', name: 'executor.globalPaused', detail: '讀不到 globalPaused()：無法確認是否可交易',
+    fix: '確認 RPC 與 A10 executor 位址；未知狀態不可送交易',
+  };
+  return {
+    level: paused ? (strict ? 'fail' : 'warn') : 'ok', name: 'executor.globalPaused',
+    detail: paused ? 'Safe 已開啟全域暫停（所有再平衡含賣出都停止）' : 'false（未暫停）',
+    ...(paused ? { fix: '由 Safe 確認事故已解除後決定是否恢復；backend 不會解除全域暫停' } : {}),
+  };
+}
 
 export function checkSessionKeySeed(report: SessionKeyDerivationReport): Check {
   const level: Level = report.mismatchedPortfolioIds.length > 0 || report.failedPortfolioIds.length > 0
@@ -439,6 +451,9 @@ async function main(): Promise<number> {
 
   // --- 7. executor 的 oracle / router 接上了嗎 --------------------------
   if (executor !== null) {
+    let paused: boolean | null = null;
+    try { paused = await readGlobalPaused(executor, client); } catch { /* unreadable is fail, never false */ }
+    record(checkGlobalPaused(paused, args.strict));
     try {
       const oracle = await client.readContract({
         address: executor,

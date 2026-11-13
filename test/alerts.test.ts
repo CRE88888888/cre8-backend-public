@@ -211,10 +211,56 @@ test('announceAlerts：seed 比對拋錯仍記錄 gas_low，resolve 排除 seed 
   const inserts = seen.filter(({ sql }) => sql.includes('insert into scheduler_alerts'));
   assert.equal(inserts.length, 1);
   assert.equal(inserts[0]?.params[0], 'gas_low');
-  assert.deepEqual(findSeen(seen, 'update scheduler_alerts').params[2], ['session_key_derivation_mismatch']);
+  assert.deepEqual(findSeen(seen, 'update scheduler_alerts').params[2], ['session_key_derivation_mismatch', 'executor_paused']);
   assert.equal(lines.filter((line) => line.includes('seed 比對失敗')).length, 1);
   assert.ok(lines.some((line) => line.includes('[ALERT][warn]')));
   assert.ok(!JSON.stringify(lines).includes(TEST_SEED), '失敗 log 不帶原始例外中的敏感內容');
+});
+
+for (const executorPaused of [true, false, null, undefined]) {
+  test(`pause alerts: observed ${executorPaused} records or preserves exactly the verified state`, async () => {
+    const { query, seen } = stubQuery(() => []);
+    const lines: string[] = [];
+    await announceAlerts({ query, now: NOW, chainId: 1337, log: (line) => lines.push(line), executorPaused });
+    const inserts = seen.filter(({ sql }) => sql.includes('insert into scheduler_alerts'));
+    assert.equal(inserts.length, executorPaused === true ? 1 : 0);
+    if (executorPaused === true) {
+      assert.deepEqual(inserts[0]?.params.slice(0, 3), ['executor_paused', 'critical', null]);
+      assert.ok(lines.some((line) => /critical.*ExecutorPaused/.test(line)));
+      assert.ok(!lines.some((line) => /沒有警示/.test(line)));
+    }
+    const resolution = findSeen(seen, 'update scheduler_alerts');
+    assert.deepEqual(resolution.params[1], executorPaused === true ? ['executor_paused:-1'] : []);
+    assert.deepEqual(resolution.params[2], executorPaused === null || executorPaused === undefined ? ['executor_paused'] : []);
+  });
+}
+
+test('pause alert is persisted even when another detector fails', async () => {
+  const saved: unknown[][] = [];
+  const lines: string[] = [];
+  await announceAlerts({
+    now: NOW, chainId: 1337, executorPaused: true, log: (line) => lines.push(line),
+    query: async (sql, params = []) => {
+      if (sql.includes('insert into scheduler_alerts')) { saved.push([...params]); return { rows: [] }; }
+      throw new Error('unrelated detector unavailable');
+    },
+  });
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0]?.[0], 'executor_paused');
+  assert.ok(lines.some((line) => line.includes('ExecutorPaused')));
+});
+
+test('pause alert DB failure never leaks raw credentials or prevents the round from completing', async () => {
+  const lines: string[] = [];
+  await announceAlerts({
+    now: NOW, chainId: 1337, executorPaused: true, log: (line) => lines.push(line),
+    query: async (sql) => {
+      if (sql.includes('insert into scheduler_alerts')) throw new Error('sensitive connection credentials');
+      return { rows: [] };
+    },
+  });
+  assert.ok(lines.some((line) => line.includes('executor_paused 寫入失敗')));
+  assert.ok(!JSON.stringify(lines).includes('sensitive connection credentials'));
 });
 
 // ---------------------------------------------------------------------------
@@ -994,6 +1040,33 @@ test('每一種 AlertKind 都能寫進 DB 再讀回來（型別與執行期白�
       const found = open.filter((alert) => alert.portfolioId === portfolioId && alert.kind === kind);
       assert.equal(found.length, 1, `kind ${kind} 應該寫得進去也讀得回來（讀回來失敗＝白名單漏了它）`);
     }
+    // NULL portfolio is the real global-pause key. Exercise the complete lifecycle against 0021.
+    await assert.rejects(() => withTransaction(async (client) => {
+      const q: QueryFn = (sql, params = []) => client.query(sql, [...params]);
+      await q("delete from scheduler_alerts where kind = 'executor_paused' and portfolio_id is null");
+      const messages: string[] = [];
+      const round = (executorPaused: boolean | null) => announceAlerts({
+        query: q, now: NOW, chainId: 999135, executorPaused, log: () => {},
+        sendNotification: async (message) => { if (message.includes('kind: executor_paused')) messages.push(message); },
+      });
+      const open = async () => (await listOpenAlerts(q)).filter((alert) => alert.kind === 'executor_paused' && alert.portfolioId === null);
+      await round(true);
+      await round(true);
+      assert.equal((await open()).length, 1);
+      assert.equal((await open())[0]?.occurrences, 2);
+      assert.equal((await open())[0]?.severity, 'critical');
+      assert.equal(messages.length, 1);
+      await round(null);
+      assert.equal((await open())[0]?.occurrences, 2, 'unknown RPC state neither clears nor invents an observation');
+      await round(false);
+      assert.equal((await open()).length, 0);
+      assert.equal(messages.length, 2);
+      assert.match(messages[1] ?? '', /已解除/);
+      await round(true);
+      assert.equal((await open())[0]?.occurrences, 1);
+      assert.equal(messages.length, 3);
+      throw new Error('rollback global pause lifecycle');
+    }), /rollback global pause lifecycle/);
   } finally {
     await dbQuery('delete from scheduler_alerts where portfolio_id = $1', [portfolioId]);
   }

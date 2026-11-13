@@ -161,6 +161,32 @@ bundler 私鑰只放 alto 的 `EXECUTOR_PRIVATE_KEY`；`UTILITY_PRIVATE_KEY` 未
 部署者只負責 `forge script` 部署與交接，Safe 接受 ownership 後不再有 owner 權限；其私鑰不放 backend 或 alto。
 本機 fork 驗證使用 anvil #0（部署者）、#4（relayer）、#5（bundler）的公開測試帳號。
 
+### A10 全域暫停、首次 enroll 與來源
+
+scheduler 每輪認領前讀 `executor.globalPaused()`。Safe 開啟時，該輪所有認領項目都記 `blocked`，
+不規劃、不寫 `operations`、不送交易（包含 redeem／close 的賣出）。RPC 讀不到也一律阻擋，
+不把未知當成已恢復。live blocked 仍依原有認領規則推進 `next_run_at`；恢復後等下次到期再跑。
+`preflight --strict` 在全域暫停時 fail，非 strict 則 warn；讀不到時兩種模式都 fail。
+
+先套用 db migration `0021_alert_executor_paused.sql`。全域暫停用 `executor_paused` critical 警示，
+`portfolio_id = NULL`；同一暫停期間去重，持續累加 occurrences，只有成功讀到 `false` 才解除。
+空輪次與 dry-run 也會偵測；RPC 失敗保留既有警示。Telegram 沿用既有的新開／解除通知規則。
+
+operator 只會送第一次 enroll。送前在同一塊讀 `isEnrolled` 與 `enrollments`：同策略重試直接成功，
+保留鏈上原版本與暫停；不同策略回 409 `ALREADY_ENROLLED`，不送交易。新投組 DB 版本採鏈上實際值，
+provider 發布新版不替既有帳戶升版；換策略／換版本須由使用者在 app 簽署，scheduler 只同步版本鏡像。
+`ExecutorPaused()`、`AlreadyEnrolled(address)` 會轉為可讀訊息，RPC 原始錯誤不進 enrollment 回應。
+
+`GET /portfolios/:id/status` 增加 `pauseFlags` 與 `pauseSources`，在回應的 `block` 讀鏈：
+Safe = 1（`safe`）、operator = 2（`operator`）、帳戶本人 = 4（`account`），可以同時存在。
+0 對應空陣列；讀不到時兩欄都是 `null`。backend 沒有鏈上解除暫停端點，也不會用重新 enroll 清除暫停。
+營運端重新啟用 DB 排程不會解除 Safe 或使用者設的鏈上暫停。
+
+獨立 fork 驗收（只接受本機 8566、`cre8_x1c`，API 使用 8102）：依 docs 的 A3 步驟用合約最新 main
+`DeployAtpMainnet` 部署並讓 Safe 接手，設定本機環境與 `MIGRATIONS_DIR` 後執行
+`bun test ./test/a10-pause-operator.fork.ts --timeout=120000`。它驗證真實 CLI 的暫停／恢復、
+警示、重試不送交易、三種來源與版本鏡像；恢復案例使用空的 USDT-only 帳戶，結果應為 noop。
+
 ### 測試與 DB
 
 完整 `bun test` 需要可拋棄的 Postgres 與 `../db/migrations`（或以 `MIGRATIONS_DIR` 指向該目錄）。

@@ -369,7 +369,7 @@ function createIntentStore(seed: Record<string, bigint> = {}): IntentStore {
 }
 
 /** Fakes every seam enrollPortfolio touches and records every call for assertions. */
-function fakeEnrollDeps(existingRows: unknown[] = [], insertedPortfolioId = '11', intents: IntentStore = createIntentStore()) {
+function fakeEnrollDeps(existingRows: unknown[] = [], insertedPortfolioId = '11', intents: IntentStore = createIntentStore(), activeVersion = 1) {
   const calls = {
     reads: [] as FakeDbCall[],
     writes: [] as FakeDbCall[],
@@ -384,7 +384,7 @@ function fakeEnrollDeps(existingRows: unknown[] = [], insertedPortfolioId = '11'
     params: readonly unknown[] = [],
   ): Promise<QueryResult<T>> => {
     calls.reads.push({ text, params });
-    if (text.includes('from strategies')) return { rows: [STRATEGY_ON_CHAIN] } as unknown as QueryResult<T>;
+    if (text.includes('from strategies')) return { rows: [{ ...STRATEGY_ON_CHAIN, active_version: activeVersion }] } as unknown as QueryResult<T>;
     if (text.includes('from portfolios p')) {
       return { rows: dbWouldReturn(existingRows, text) } as unknown as QueryResult<T>;
     }
@@ -402,7 +402,7 @@ function fakeEnrollDeps(existingRows: unknown[] = [], insertedPortfolioId = '11'
               id: insertedPortfolioId,
               user_id: OWNER,
               strategy_id: '3',
-              version: 1,
+              version: Number(params[2]),
               schedule_state: 'active',
               created_at: new Date('2026-02-03T04:05:06.000Z'),
             },
@@ -469,6 +469,7 @@ function fakeEnrollDeps(existingRows: unknown[] = [], insertedPortfolioId = '11'
 
   const fakeEnroll: EnrollDeps['enrollOnchain'] = async (account, onchainId) => {
     calls.enroll.push({ account, onchainId });
+    return 1;
   };
 
   // 0.05 BNB @ 1.22 gwei：遠高於 0.01 BNB 門檻，所以預設情況下 gas 狀態是 ready。
@@ -511,6 +512,23 @@ test('enrollPortfolio returns the existing KERNEL portfolio without deploying or
   assert.equal(calls.deploy.length, 0, 'an idempotent re-enroll must not deploy');
   assert.equal(calls.enroll.length, 0, 'an idempotent re-enroll must not send an enroll tx');
   assert.equal(calls.writes.length, 0, 'an idempotent re-enroll must not write a DB row');
+});
+
+test('a chain retry pinned to an older version writes that version, never the latest DB version', async () => {
+  const { deps, calls } = fakeEnrollDeps([], '11', createIntentStore(), 2);
+  const pinnedVersion = 1;
+  deps.enrollOnchain = async () => pinnedVersion;
+  const result = await enrollPortfolio(3, ROUTE_WALLET.address, deps);
+  const inserted = calls.writes.find((call) => call.text.includes('insert into portfolios'));
+  assert.equal(inserted?.params[2], pinnedVersion);
+  assert.equal(result.version, pinnedVersion);
+});
+
+test('an enrollment RPC failure leaves no portfolio, smart account or session key rows', async () => {
+  const { deps, calls } = fakeEnrollDeps();
+  deps.enrollOnchain = async () => { throw new Error('enrollment RPC timeout'); };
+  await assert.rejects(() => enrollPortfolio(3, ROUTE_WALLET.address, deps), /enrollment RPC timeout/);
+  assert.equal(calls.writes.length, 0);
 });
 
 test('enrollPortfolio returns the KERNEL row when a lower-id legacy EOA row sits beside it', async () => {

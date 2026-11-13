@@ -4,9 +4,10 @@ import { createServer as createHttpServer } from 'node:http';
 import { promisify } from 'node:util';
 import { serialize } from 'node:v8';
 import { after, test } from 'node:test';
-import { decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, encodePacked, isHex, keccak256, parseAbi, toBytes } from 'viem';
+import { decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeErrorResult, encodeFunctionData, encodePacked, isHex, keccak256, parseAbi, toBytes } from 'viem';
 import { getUserOperationHash } from 'viem/account-abstraction';
 import type { GetUserOperationReturnType, UserOperationReceipt } from 'viem/account-abstraction';
+import { EXECUTOR_PAUSE_ABI } from '../src/chain.js';
 import type { Address, Hex, PublicClient } from 'viem';
 import { closePool, query } from '../src/db.js';
 import { singlePortfolioClaim } from '../src/operator.js';
@@ -523,6 +524,7 @@ function deps(db: StubDb, chain: StubChain, extra: SchedulerDeps = {}): Schedule
     query: stubQuery(db),
     chainId: TEST_CHAIN_ID,
     executor: EXECUTOR,
+    readGlobalPaused: async () => false,
     log: () => {},
     planPortfolio: async (portfolioId: number) => {
       chain.planPortfolioCalls.push(portfolioId);
@@ -567,6 +569,111 @@ type Outcome = PortfolioRunResult['outcome'];
 function outcomes(round: { results: PortfolioRunResult[] }): Outcome[] {
   return round.results.map((result) => result.outcome);
 }
+
+for (const dryRun of [true, false]) {
+  for (const mode of ['paused', 'RPC error', 'timeout'] as const) {
+    test(`global pause gate: ${mode}, dryRun=${dryRun} blocks all accounts before planning`, async () => {
+      const db = stubDb({ portfolios: [portfolio(), portfolio({ id: PORTFOLIO_ID + 1 })] });
+      const chain = stubChain();
+      let reads = 0;
+      const lines: string[] = [];
+      const round = await runSchedulerOnce({ dryRun, now: NOW }, deps(db, chain, {
+        readGlobalPaused: async () => {
+          reads += 1;
+          assert.equal(db.statements.length, 0, 'global pause is checked before claiming');
+          if (mode !== 'paused') throw new Error(`sensitive RPC token: ${mode}`);
+          return true;
+        },
+        log: (line) => lines.push(line),
+      }));
+      assert.equal(reads, 1);
+      assert.deepEqual(outcomes(round), ['blocked', 'blocked']);
+      assert.equal(chain.planPortfolioCalls.length, 0);
+      assert.equal(chain.planRebalanceCalls, 0);
+      assert.equal(chain.executeCalls.length, 0);
+      assert.equal(db.operations.length, 0);
+      assert.ok(round.results.every((result) => /ExecutorPaused|EXECUTOR_PAUSE_UNAVAILABLE/.test(result.reason)));
+      assert.ok(!JSON.stringify({ round, lines }).includes('sensitive RPC token'));
+      assert.ok(db.portfolios.every((p) => p.lastCheckedAt?.getTime() === NOW.getTime()));
+    });
+  }
+}
+
+test('global pause is re-read each round and releasing it restores the normal execution path', async () => {
+  const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+  const chain = stubChain();
+  let paused = true;
+  const dependencies = deps(db, chain, { readGlobalPaused: async () => paused });
+  assert.deepEqual(outcomes(await runSchedulerOnce({ now: NOW }, dependencies)), ['blocked']);
+  paused = false;
+  assert.deepEqual(outcomes(await runSchedulerOnce({ now: NOW }, dependencies)), ['ready-dry-run']);
+  assert.equal(db.operations.length, 0);
+});
+
+test('global pause cannot turn a failed claim transaction into an executable round', async () => {
+  const db = stubDb({ portfolios: [portfolio()], failTransaction: true });
+  const chain = stubChain();
+  await assert.rejects(() => runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain, {
+    readGlobalPaused: async () => true,
+  })), /transaction.*失敗/);
+  assert.equal(chain.executeCalls.length, 0);
+  assert.equal(db.operations.length, 0);
+  assert.equal(db.portfolios[0]?.nextRunAt, null);
+});
+
+test('on-chain user version changes only synchronize the DB mirror', async () => {
+  const db = stubDb({ portfolios: [portfolio()] });
+  const chain = stubChain({ plan: stubPlan({ needsRebalance: false }) });
+  chain.plan.pinnedVersion.version = 65535;
+  const saved: unknown[][] = [];
+  const query = stubQuery(db);
+  const round = await runSchedulerOnce({ now: NOW }, deps(db, chain, {
+    query: async (sql, params) => {
+      if (sql.includes('update portfolios set version')) { saved.push([...(params ?? [])]); return { rows: [] }; }
+      return query(sql, params);
+    },
+  }));
+  assert.deepEqual(saved, [[65535, PORTFOLIO_ID]]);
+  assert.deepEqual(outcomes(round), ['noop']);
+  assert.equal(chain.executeCalls.length, 0);
+});
+
+test('a global pause racing with the round check still produces a readable execution error', async () => {
+  const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+  const chain = stubChain();
+  const round = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain, {
+    executeRebalance: async () => { throw new Error('sensitive RPC token', { cause: {
+      data: encodeErrorResult({ abi: EXECUTOR_PAUSE_ABI, errorName: 'ExecutorPaused' }),
+    } }); },
+  }));
+  assert.deepEqual(outcomes(round), ['failed']);
+  assert.match(round.results[0]?.reason ?? '', /ExecutorPaused.*Safe.*含賣出/);
+  assert.equal(db.operations[0]?.state, 'failed');
+  assert.ok(!JSON.stringify(round).includes('sensitive RPC token'));
+});
+
+test('global pause preserves #34 in-flight protection; resume returns to reconciliation without resending', async () => {
+  const operation = unresolvedOperation();
+  const db = stubDb({ portfolios: [portfolio()], operations: [operation] });
+  const chain = stubChain();
+  let paused = true;
+  let reconciliations = 0;
+  const options = deps(db, chain, {
+    readGlobalPaused: async () => paused,
+    reconcileRebalance: async () => { reconciliations += 1; return null; },
+  });
+  assert.deepEqual(outcomes(await runSchedulerOnce({ now: NOW, dryRun: false }, options)), ['blocked']);
+  assert.equal(reconciliations, 0);
+  paused = false;
+  const due = db.portfolios[0];
+  assert.ok(due);
+  due.nextRunAt = null;
+  assert.deepEqual(outcomes(await runSchedulerOnce({ now: NOW, dryRun: false }, options)), ['blocked']);
+  assert.equal(reconciliations, 1);
+  assert.equal(db.operations.length, 1);
+  assert.equal(db.operations[0]?.state, 'submitted');
+  assert.equal(chain.executeCalls.length, 0);
+});
 
 // ---------------------------------------------------------------------------
 // 1. 純函式：排程解析 / planHash
@@ -1937,6 +2044,7 @@ test('認領（真的 Postgres）：paused／idle／未到期不被認領，NULL
   const keys = stubQuery(stubDb({ sessionKeys: [sessionKey({ portfolioId: due.id })] }));
   const options: SchedulerDeps = {
     withTransaction: singlePortfolioClaim(due.id),
+    readGlobalPaused: async () => false,
     query: (sql, params) => sql.includes('from session_keys k') ? keys(sql, params) : query(sql, params),
     chainId: REAL_CHAIN_ID, executor: EXECUTOR, log: () => {},
     planPortfolio: async () => stubPlan({ portfolioId: due.id }),
@@ -2537,11 +2645,13 @@ test('#34 預設送出前路徑每輪重讀 effectiveFeeBps：0→25→300、無
     assert.ok(call !== null && typeof call === 'object' && 'data' in call && typeof call.data === 'string');
     assert.ok(isHex(call.data));
     const decoded = decodeFunctionData({ abi: parseAbi([
+      'function globalPaused() view returns (bool)',
       'function oracle() view returns (address)',
       'function effectiveFeeBps(uint256 id) view returns (uint16)',
       'function previewSwap(address tokenIn, address tokenOut, uint256 amountIn) view returns (uint256 quoted, uint256 minimum)',
     ]), data: call.data });
     let result: Hex | undefined;
+    if (decoded.functionName === 'globalPaused') result = encodeAbiParameters([{ type: 'bool' }], [false]);
     if (decoded.functionName === 'oracle') result = encodeAbiParameters([{ type: 'address' }], [EXECUTOR]);
     if (decoded.functionName === 'effectiveFeeBps') {
       strategyIds.push(decoded.args[0]);

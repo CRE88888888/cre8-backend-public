@@ -100,6 +100,8 @@ import type { GetUserOperationReturnType, UserOperationReceipt } from 'viem/acco
 import { activeChain } from './chain-object.js';
 import { KERNEL_V3_3_ADDRESSES } from './addresses.js';
 import { detectAlerts, formatAlert, recordAlerts, resolveAlerts } from './alerts.js';
+import type { AlertFinding, AlertKind } from './alerts.js';
+import { a10ErrorMessage, EXECUTOR_PAUSE_ABI, readGlobalPaused } from './chain.js';
 import { getConfig, getSessionKeyConfig, requireSessionKeyConfig } from './config.js';
 import { errorMessage, query as dbQuery, withTransaction } from './db.js';
 import { buildSessionPermissions } from './permissions.js';
@@ -198,6 +200,7 @@ const ERC20_ABI = [
 ] as const;
 
 const EXECUTOR_ABI = [
+  ...EXECUTOR_PAUSE_ABI,
   {
     type: 'function',
     name: 'oracle',
@@ -531,6 +534,8 @@ export type FloorRefreshInput = {
 };
 
 export type SchedulerDeps = {
+  /** Checked once before each round. An unavailable RPC blocks every claimed portfolio. */
+  readGlobalPaused?: () => Promise<boolean>;
   /**
    * 即使漂移低於門檻也照樣呼叫 `planRebalance`。
    *
@@ -1378,7 +1383,7 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
   } catch (error) {
     throw new Error(
       `送出前的 eth_call 模擬失敗（from ${args.account}、gas ${callGasLimit}）：這一筆不送，` +
-        `不花錢買一個 success=false 的 op。原因：${errorMessage(error)}`,
+        `不花錢買一個 success=false 的 op。原因：${a10ErrorMessage(error) ?? errorMessage(error)}`,
     );
   }
 
@@ -1457,7 +1462,7 @@ function defaultQuery(): SchedulerQueryFn {
 }
 
 function oneLine(error: unknown): string {
-  return errorMessage(error).split('\n')[0]!.slice(0, 400);
+  return (a10ErrorMessage(error) ?? errorMessage(error)).split('\n')[0]!.slice(0, 400);
 }
 
 /** 把 run 的參數與外部注入的 deps 合成一組完整可用的依賴（缺的就補預設實作）。 */
@@ -1469,6 +1474,7 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
   return {
     query,
     chainId,
+    readGlobalPaused: provided.readGlobalPaused ?? (() => readGlobalPaused(provided.executor ?? executorAddress(), defaultPublicClient())),
     /**
      * null = 還沒解析；`decideAndMaybeExecute` 在**兩條路**上都會 `?? executorAddress()`
      * （dry-run 的前置檢查 b 也要 spender，見檔頭 ③-bis）。
@@ -1627,6 +1633,18 @@ export async function runSchedulerOnce(
   const thresholdBps = args.thresholdBps ?? DEFAULT_THRESHOLD_BPS;
   const resolved = resolveDeps({ thresholdBps }, deps);
 
+  let executorPaused: boolean | null = null;
+  try {
+    const paused = await resolved.readGlobalPaused();
+    if (typeof paused === 'boolean') executorPaused = paused;
+  } catch {
+    // Unknown is never permission to trade. Do not log raw RPC errors (URLs may carry tokens).
+  }
+  const roundBlockReason = executorPaused === false ? null : executorPaused === true
+    ? 'ExecutorPaused：Safe 已開啟全域暫停，這一輪全部 blocked，不送交易'
+    : '[EXECUTOR_PAUSE_UNAVAILABLE] 讀不到 executor.globalPaused()，這一輪全部 blocked，不送交易';
+  if (roundBlockReason !== null) resolved.log(`[scheduler] ${roundBlockReason}`);
+
   const claimed = await claimDuePortfolios(limit, now, {
     withTransaction: resolved.withTransaction,
     chainId: resolved.chainId,
@@ -1637,14 +1655,14 @@ export async function runSchedulerOnce(
   const results: PortfolioRunResult[] = [];
   for (const due of claimed) {
     // `forcePlan` 要一路傳到 runOne：它決定「漂移低於門檻時要不要照樣規劃」（redeem 用）。
-    const result = await runOne(due, { dryRun, now, thresholdBps, deps: resolved, forcePlan: deps.forcePlan === true });
+    const result = await runOne(due, { dryRun, now, thresholdBps, deps: resolved, forcePlan: deps.forcePlan === true, roundBlockReason });
     results.push(result);
     resolved.log(formatResult(result, dryRun));
   }
 
   // ---- 一輪的尾端：告警（偵測 → 寫入 → 解除 → 一行 stdout）----
   // 只加在這裡：認領、前置檢查、間隔推進的邏輯一個字都沒動。
-  await announceAlerts({ query: resolved.query, log: resolved.log, now, dryRun, chainId: resolved.chainId, sessionKeyChecks: resolved });
+  await announceAlerts({ query: resolved.query, log: resolved.log, now, dryRun, chainId: resolved.chainId, sessionKeyChecks: resolved, executorPaused });
 
   return { claimed: claimed.length, dryRun, results };
 }
@@ -1661,6 +1679,8 @@ export async function runSchedulerOnce(
  * 累積，而「無人值守」正是靠這個累積被看見。
  */
 export async function announceAlerts(args: {
+  /** null/omitted = not verified; keep an existing global pause alert open. */
+  executorPaused?: boolean | null;
   query: SchedulerQueryFn;
   log: (line: string) => void;
   now: Date;
@@ -1677,6 +1697,17 @@ export async function announceAlerts(args: {
 }): Promise<void> {
   try {
     const chainId = args.chainId ?? getConfig().chainId;
+    const notifications = { dryRun: args.dryRun ?? true, chainId, log: args.log, send: args.sendNotification };
+    const pauseFinding: AlertFinding | null = args.executorPaused === true ? {
+      kind: 'executor_paused', severity: 'critical', portfolioId: null,
+      detail: 'ExecutorPaused：Safe 已開啟 executor 全域暫停，所有再平衡（含賣出）停止；使用者可用錢包直接提領',
+    } : null;
+    // Persist this independent check even if another alert detector fails later.
+    if (pauseFinding !== null) {
+      args.log(formatAlert(pauseFinding));
+      try { await recordAlerts(args.query, [pauseFinding], args.now, notifications); }
+      catch { args.log('[ALERT] executor_paused 寫入失敗：全域暫停仍阻擋送單'); }
+    }
     const findings = await detectAlerts(args.query, { now: args.now, ...args.gasChecks });
     let seedCheckComplete = false;
     try {
@@ -1693,12 +1724,12 @@ export async function announceAlerts(args: {
     } catch {
       args.log('[ALERT] seed 比對失敗：無法完成 key 讀取，本輪不新增或解除 seed 警示');
     }
-    const notifications = { dryRun: args.dryRun ?? true, chainId, log: args.log, send: args.sendNotification };
     await recordAlerts(args.query, findings, args.now, notifications);
-    const resolved = await resolveAlerts(args.query, findings, args.now, notifications,
-      seedCheckComplete ? [] : ['session_key_derivation_mismatch']);
+    const unverified: AlertKind[] = seedCheckComplete ? [] : ['session_key_derivation_mismatch'];
+    if (args.executorPaused !== true && args.executorPaused !== false) unverified.push('executor_paused');
+    const resolved = await resolveAlerts(args.query, pauseFinding === null ? findings : [...findings, pauseFinding], args.now, notifications, unverified);
 
-    if (findings.length === 0) {
+    if (findings.length === 0 && pauseFinding === null) {
       args.log(`[ALERT] ${seedCheckComplete ? '沒有警示' : '其他規則未偵測到警示'}${resolved > 0 ? `（已解除 ${resolved} 筆）` : ''}`);
       return;
     }
@@ -1713,7 +1744,7 @@ type ResolvedDeps = ReturnType<typeof resolveDeps>;
 
 async function runOne(
   due: DuePortfolio,
-  ctx: { dryRun: boolean; now: Date; thresholdBps: number; deps: ResolvedDeps; forcePlan?: boolean },
+  ctx: { dryRun: boolean; now: Date; thresholdBps: number; deps: ResolvedDeps; forcePlan?: boolean; roundBlockReason: string | null },
 ): Promise<PortfolioRunResult> {
   const base = {
     portfolioId: due.portfolioId,
@@ -1727,7 +1758,9 @@ async function runOne(
 
   let result: PortfolioRunResult;
   try {
-    result = await decideAndMaybeExecute(due, ctx, base);
+    result = ctx.roundBlockReason === null
+      ? await decideAndMaybeExecute(due, ctx, base)
+      : { ...base, outcome: 'blocked', reason: ctx.roundBlockReason };
   } catch (error) {
     // 一個 portfolio 的例外不該讓整輪停擺（RPC 抖動、某個帳戶的資料不一致）。它會被記成 blocked
     // 並在下一輪重試；next_run_at 已經推進過了，所以不會變成熱迴圈。

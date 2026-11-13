@@ -5,6 +5,7 @@ import type { Address, Hex, PublicClient } from 'viem';
 import { planPortfolio, writeSnapshot } from '../src/snapshot.js';
 import type { QueryFn } from '../src/snapshot.js';
 import type { PriceTokenFn } from '../src/positions.js';
+import { PricingError } from '../src/pricing.js';
 
 /**
  * `snapshot.ts` × `holdings-scan.ts` 的接線：鏈與 DB 都是 stub。
@@ -366,6 +367,38 @@ test('掃描的 head 與 readPositions 的 block 是同一個值：兩邊都用�
       `eth_call 用到的塊=${[...new Set(chain.contractBlocks)].join(',')} ` +
       `getLogs=${chain.logCalls.map((call) => `[${call.fromBlock}, ${call.toBlock}]`).join(' ')}`,
   );
+});
+
+test('#34 價格與餘額釘同塊；歷史 TWAP 失敗不可退回不同 head 的價格', async () => {
+  const pool: Address = '0x00000000000000000000000000000000000000ab';
+  for (const unavailable of [false, true]) {
+    const chain = stubChain({ balances: new Map([[`${WBNB}:${ACCOUNT}`, 10n ** 18n]]) });
+    const db = stubDb({ priceTable: [
+      { address: USDT, symbol: 'USDT', usdt_pool: null, is_numeraire: true },
+      { address: WBNB, symbol: 'WBNB', usdt_pool: pool, is_numeraire: false },
+    ] });
+    const priceBlocks: bigint[] = [];
+    const result = await plan({ chain, db, priceToken: async (_client, args) => {
+      priceBlocks.push(args.blockNumber);
+      assert.equal(args.blockNumber, BLOCK);
+      chain.head += 1n; // 讀價期間 head 前進，不得因此換用較新的價格。
+      if (unavailable) throw new PricingError('TWAP_UNAVAILABLE', 'observe 歷史不足');
+      return { priceE8: 200_000_000n, decimals: 18 };
+    } });
+    assert.deepEqual(priceBlocks, [BLOCK], '失敗也不能改讀 latest 重試');
+    assert.deepEqual([...new Set(chain.contractBlocks)], [BLOCK]);
+    assert.ok(chain.batches.every((batch) => batch.blockNumber === BLOCK));
+    assert.equal(chain.headReads, 0);
+    if (unavailable) {
+      assert.equal(result.report, null);
+      assert.equal(result.blocked[0]?.code, 'UNPRICED_HOLDINGS');
+      assert.match(result.blocked[0]?.detail ?? '', /TWAP_UNAVAILABLE/);
+      assert.equal(result.snapshot.holdings.length, 0);
+    } else {
+      assert.equal(result.blocked.length, 0);
+      assert.equal(result.report?.totalUsdE8, 200_000_000n);
+    }
+  }
 });
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { validateAllocation } from '../src/strategies.js';
 import {
   computeDrift,
   parseHoldingsJson,
@@ -7,6 +8,58 @@ import {
   parseSnapshotRows,
 } from '../src/drift.js';
 import type { AssetDrift, DriftReport, Holding, TargetWeight } from '../src/drift.js';
+
+test('#34 上游整數 bps 案例守恆；自動零權重 USDT、1..16 資產與錯誤總和', () => {
+  // 上游 strategy-v3-risk.ts cappedWeights 的 bps 輸出；ATP 只驗證既有整數介面，不新增市值轉權重。
+  // 20% cap 後剩 4000 bps，按 10:7:6:4 分配；largest remainder 補給餘數最大的第 7、6 成分。
+  const vectors = [[3334, 3333, 3333], [2000, 2000, 2000, 1481, 1037, 889, 593], [1, 9999], [10000]];
+  const address = (i: number) => `0x${(i + 1).toString(16).padStart(40, '0')}`;
+  for (let count = 1; count <= 15; count += 1) {
+    const base = Math.floor(10000 / count);
+    vectors.push(Array.from({ length: count }, (_, i) => base + (i < 10000 % count ? 1 : 0)));
+  }
+  for (const weights of vectors) {
+    const assets = weights.map((weightBps, i) => ({ address: address(i), weightBps }));
+    const allocation = validateAllocation({ assets });
+    assert.equal(allocation.assets.reduce((sum, a) => sum + a.weightBps, 0), 10000);
+    assert.deepEqual(allocation.assets.slice(0, -1), assets, '有效 bps 逐位保留，不偷偷再取整');
+    assert.equal(allocation.assets.at(-1)?.weightBps, 0);
+    assert.deepEqual(validateAllocation(allocation), allocation);
+    for (const delta of [-1, 1]) {
+      const perturbed = assets.map((a, i) => ({ ...a, weightBps: a.weightBps + (i === 0 ? delta : 0) }));
+      assert.throws(() => validateAllocation({ assets: perturbed }));
+    }
+  }
+  const sixteen = Array.from({ length: 16 }, (_, i) => ({ address: address(i), weightBps: 625 }));
+  assert.throws(() => validateAllocation({ assets: sixteen }), /including USDT/);
+  sixteen[15] = { address: '0x55d398326f99059ff775485246999027b3197955', weightBps: 625 };
+  const max = validateAllocation({ assets: sixteen });
+  assert.equal(max.assets.length, 16);
+  assert.equal(max.assets.reduce((sum, a) => sum + a.weightBps, 0), 10000);
+  assert.throws(() => validateAllocation({ assets: [...sixteen, { address: address(17), weightBps: 1 }] }), /at most 16/);
+  for (const weightBps of [0, 0.5, -1, 10001, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(() => validateAllocation({ assets: [{ address: address(0), weightBps }] }));
+  }
+});
+
+test('#34 ATP gross drift 用 >=；上游任一成分 > 的規則不可移植', () => {
+  // 上游：任一成分偏離 > 門檻才觸發，等於不動。ATP：sum(abs(delta))/2 >= 門檻。
+  // 四成分 +3、+3、−3、−3pp：單成分最大 300，但 ATP gross=600，在 500 bps 門檻會動。
+  const holdings = [2800, 2800, 2200, 2200].map((amount, i) => ({
+    asset: String(i), amountWei: BigInt(amount), decimals: 0, usdPriceE8: 100_000_000n,
+  }));
+  const targets = holdings.map((h) => ({ asset: h.asset, weightBps: 2500 }));
+  for (const threshold of [0, 500, 599, 600, 601, 10000]) {
+    const report = computeDrift(holdings, targets, threshold);
+    assert.equal(report.maxAbsDeltaBps, 300);
+    assert.equal(report.grossDriftBps, 600);
+    assert.equal(report.needsRebalance, threshold <= 600);
+  }
+  const balanced = computeDrift(targets.map((t) => ({ asset: t.asset, amountWei: 2500n,
+    decimals: 0, usdPriceE8: 100_000_000n })), targets, 0);
+  assert.equal(balanced.grossDriftBps, 0);
+  assert.equal(balanced.needsRebalance, true, '門檻 0 時仍然是 >=，不偷偷換成 >');
+});
 
 /**
  * `backend/src/drift.ts` 的單元測試：純函式，不碰鏈也不碰 DB。

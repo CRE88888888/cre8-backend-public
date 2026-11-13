@@ -1,8 +1,15 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
+import { createServer as createHttpServer } from 'node:http';
+import { promisify } from 'node:util';
+import { serialize } from 'node:v8';
 import { after, test } from 'node:test';
-import { decodeAbiParameters, encodeAbiParameters, encodePacked, keccak256, toBytes } from 'viem';
+import { decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, encodePacked, isHex, keccak256, parseAbi, toBytes } from 'viem';
+import { getUserOperationHash } from 'viem/account-abstraction';
+import type { GetUserOperationReturnType, UserOperationReceipt } from 'viem/account-abstraction';
 import type { Address, Hex, PublicClient } from 'viem';
 import { closePool, query } from '../src/db.js';
+import { singlePortfolioClaim } from '../src/operator.js';
 import { TWAP_PRICE_SOURCE } from '../src/positions.js';
 import { DEFAULT_DEADLINE_SECONDS as PLANNER_DEFAULT_DEADLINE_SECONDS, MAX_FLOOR_WORSENING_BPS, refreshFloors, amountOutMinWithBuffer,
 } from '../src/rebalance-plan.js';
@@ -18,6 +25,7 @@ import {
   parseSchedule,
   planHashFor,
   rebalanceCallGasLimit,
+  readRebalanceReceipt,
   runSchedulerOnce,
 } from '../src/scheduler.js';
 import type {
@@ -30,6 +38,7 @@ import type {
   SchedulerDeps,
   SchedulerQueryFn,
   WithTransactionFn,
+  ReconcileInput,
 } from '../src/scheduler.js';
 import type { PortfolioPlan } from '../src/snapshot.js';
 
@@ -280,6 +289,21 @@ function stubQuery(db: StubDb): SchedulerQueryFn {
       return { rows: [{ attempts: 1 }] };
     }
 
+    if (text.includes('select id from portfolios where id = $1 for update')) return { rows: [{ id: params[0] }] };
+
+    if (text.includes('select id::text as id from operations')) {
+      const index = db.operations.findIndex((op) => op.idempotencyKey === params[0]);
+      return { rows: index < 0 ? [] : [{ id: String(index + 1) }] };
+    }
+
+    if (text.includes('select idempotency_key, payload_hash, state, user_op_hash, tx_hash')) {
+      return { rows: db.operations.filter((op) => op.portfolioId === Number(params[0]) &&
+        (op.state === 'pending' || op.state === 'submitted' ||
+          (op.state === 'failed' && (op.userOpHash !== null || op.txHash !== null))))
+        .map((op) => ({ idempotency_key: op.idempotencyKey, payload_hash: op.payloadHash,
+          state: op.state, user_op_hash: op.userOpHash, tx_hash: op.txHash })) };
+    }
+
     if (text.includes('select state, attempts from operations')) {
       const existing = db.operations.find((entry) => entry.idempotencyKey === String(params[0]));
       return { rows: existing === undefined ? [] : [{ state: existing.state, attempts: existing.attempts }] };
@@ -410,7 +434,7 @@ function stubPlan(
   };
 }
 
-function readyPlan(steps: PlannedStep[] = [step()]): RebalancePlan {
+function readyPlan(steps: PlannedStep[] = [step()]): Extract<RebalancePlan, { kind: 'ready' }> {
   return { kind: 'ready', steps, deadline: 1_800_000_300n, rationale: 'stub：WBNB 超配 3000bps' };
 }
 
@@ -530,8 +554,8 @@ function deps(db: StubDb, chain: StubChain, extra: SchedulerDeps = {}): Schedule
     readBalance: async (_args: Erc20Args) => chain.balance,
     executeRebalance: async (args: ExecuteArgs) => {
       chain.executeCalls.push(args);
-      if (args.onSubmitted !== undefined) await args.onSubmitted({ userOpHash: chain.executeResult.userOpHash ?? undefined });
       if (chain.executeError !== null) throw new Error(chain.executeError);
+      if (chain.executeResult.userOpHash !== null) await args.onSubmitted({ userOpHash: chain.executeResult.userOpHash });
       return chain.executeResult;
     },
     ...extra,
@@ -1456,6 +1480,294 @@ test('送出拋錯 → failed + last_error（不是 reverted：沒有證據說�
   console.log(`[failed] ${round.results[0]?.reason}`);
 });
 
+// 上游 worker.test.mjs：未知結果不投影、不重送；ATP 以鏈上重新讀值取代本地 inventory projection。
+test('#34 receipt 逾時保留 submitted；新 deadline 的下一輪仍 blocked、不重送、不寫 after', async () => {
+  const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+  const chain = stubChain();
+  const phases: string[] = [];
+  const options = deps(db, chain, {
+    executeRebalance: async (args) => {
+      chain.executeCalls.push(args);
+      await args.onSubmitted({ userOpHash: '0xabc123' });
+      throw new Error('receipt timeout');
+    },
+    writeSnapshot: async (_snapshot, _report, options) => {
+      phases.push(options?.phase ?? 'manual');
+      return { headerInserted: true, inserted: 0, updated: 0 };
+    },
+  });
+  const first = await runSchedulerOnce({ dryRun: false, now: NOW }, options);
+  assert.deepEqual(outcomes(first), ['blocked']);
+  assert.equal(db.operations[0]?.state, 'submitted');
+  assert.equal(db.operations[0]?.userOpHash, '0xabc123');
+  assert.equal(db.portfolios[0]?.lastRebalanceAt, null);
+  assert.deepEqual(phases, ['before']);
+  chain.rebalance = { ...readyPlan(), deadline: 1_800_000_301n };
+  const second = await runSchedulerOnce({ dryRun: false, now: new Date(NOW.getTime() + ONE_DAY_SECONDS * 1000) }, options);
+  assert.deepEqual(outcomes(second), ['blocked']);
+  assert.equal(chain.executeCalls.length, 1);
+  assert.equal(db.operations.length, 1);
+  assert.equal(db.operations[0]?.attempts, 1);
+  assert.deepEqual(phases, ['before']);
+});
+
+test('#34 confirmed 落庫失敗不能降成 failed 或在下一輪重送', async () => {
+  const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+  const chain = stubChain();
+  const originalQuery = stubQuery(db);
+  const options = deps(db, chain, { query: async (sql, params) => {
+    if (sql.includes('set state = $2') && params?.[1] === 'confirmed') throw new Error('DB disconnected');
+    return originalQuery(sql, params);
+  } });
+  const first = await runSchedulerOnce({ dryRun: false, now: NOW }, options);
+  assert.deepEqual(outcomes(first), ['blocked']);
+  assert.equal(db.operations[0]?.state, 'submitted');
+  assert.equal(db.operations[0]?.attempts, 1);
+  chain.rebalance = { ...readyPlan(), deadline: 1_800_000_301n };
+  const second = await runSchedulerOnce({ dryRun: false, now: new Date(NOW.getTime() + ONE_DAY_SECONDS * 1000) }, options);
+  assert.deepEqual(outcomes(second), ['blocked']);
+  assert.equal(chain.executeCalls.length, 1);
+  assert.equal(db.operations.length, 1);
+});
+
+function unresolvedOperation(overrides: Partial<StubOperation> = {}): StubOperation {
+  const payloadHash = planHashFor([step()], readyPlan().deadline);
+  return { portfolioId: PORTFOLIO_ID, idempotencyKey: idempotencyKeyFor(PORTFOLIO_ID, payloadHash),
+    payloadHash, state: 'submitted', attempts: 1, txHash: null, userOpHash: '0xabc123', lastError: null, ...overrides };
+}
+
+test('#34 恢復成功／revert 只對帳一次，先重讀鏈才寫 after；當輪不送新計畫', async () => {
+  for (const status of ['success', 'reverted'] as const) {
+    const db = stubDb({ portfolios: [portfolio()], operations: [unresolvedOperation()] });
+    const chain = stubChain({ plan: stubPlan({ needsRebalance: false }) });
+    const order: string[] = [];
+    const base = deps(db, chain);
+    const options = deps(db, chain, {
+      reconcileRebalance: async (input) => {
+        order.push('receipt');
+        assert.equal(input.payloadHash, db.operations[0]?.payloadHash);
+        assert.equal(input.userOpHash, '0xabc123');
+        return { status, userOpHash: input.userOpHash, txHash: '0xdef456', gasUsed: '123',
+          error: status === 'reverted' ? 'execution reverted' : null };
+      },
+      planPortfolio: async (id) => { order.push('read-chain'); return base.planPortfolio!(id); },
+      writeSnapshot: async (_snapshot, _report, options) => {
+        order.push(options?.phase ?? 'manual');
+        return { headerInserted: true, inserted: 0, updated: 0 };
+      },
+    });
+    const first = await runSchedulerOnce({ dryRun: false, now: NOW }, options);
+    assert.deepEqual(outcomes(first), [status === 'success' ? 'executed' : 'failed']);
+    assert.equal(db.operations[0]?.state, status === 'success' ? 'confirmed' : 'reverted');
+    assert.deepEqual(order, ['receipt', 'read-chain', 'after']);
+    assert.equal(db.portfolios[0]?.lastRebalanceAt?.getTime() ?? null, status === 'success' ? NOW.getTime() : null);
+    assert.equal(chain.executeCalls.length, 0);
+    assert.equal(chain.planRebalanceCalls, 0);
+    const next = await runSchedulerOnce({ dryRun: false, now: new Date(NOW.getTime() + ONE_DAY_SECONDS * 1000) }, options);
+    assert.deepEqual(outcomes(next), ['noop']);
+    assert.equal(order.filter((x) => x === 'receipt').length, 1);
+  }
+});
+
+test('#34 receipt 缺漏／RPC 失敗／無 hash／多筆未決／dry-run 均不重送或投影', async () => {
+  for (const scenario of ['missing', 'rpc', 'hash-missing', 'multiple', 'dry-run', 'legacy-failed'] as const) {
+    const op = unresolvedOperation(scenario === 'hash-missing' ? { state: 'pending', userOpHash: null } :
+      scenario === 'legacy-failed' ? { state: 'failed' } : {});
+    const db = stubDb({ portfolios: [portfolio()], operations: [op,
+      ...(scenario === 'multiple' ? [unresolvedOperation({ idempotencyKey: 'older' })] : [])] });
+    const before = structuredClone(db.operations);
+    const chain = stubChain();
+    let reads = 0;
+    const round = await runSchedulerOnce({ dryRun: scenario === 'dry-run', now: NOW }, deps(db, chain, {
+      reconcileRebalance: async () => { reads += 1; if (scenario === 'rpc') throw new Error('RPC timeout'); return null; },
+    }));
+    assert.deepEqual(outcomes(round), ['blocked'], scenario);
+    assert.equal(reads, ['multiple', 'hash-missing', 'dry-run'].includes(scenario) ? 0 : 1, scenario);
+    assert.deepEqual(db.operations, before);
+    assert.equal(chain.executeCalls.length, 0);
+    assert.equal(chain.planPortfolioCalls.length, 0, '未確認之前不能把新觀測或預估當成成交後持倉');
+    assert.equal(db.portfolios[0]?.lastRebalanceAt, null);
+    if (scenario === 'dry-run') assert.equal(db.portfolios[0]?.nextRunAt, null);
+  }
+});
+
+test('#34 對帳落庫失敗保持 submitted；DB 恢復後再對帳，不重送', async () => {
+  const db = stubDb({ portfolios: [portfolio()], operations: [unresolvedOperation()] });
+  const chain = stubChain();
+  const query = stubQuery(db);
+  let fail = true;
+  const options = deps(db, chain, {
+    reconcileRebalance: async () => chain.executeResult,
+    query: async (sql, params) => {
+      if (fail && sql.includes('set state = $2')) throw new Error('DB unavailable');
+      return query(sql, params);
+    },
+  });
+  assert.deepEqual(outcomes(await runSchedulerOnce({ dryRun: false, now: NOW }, options)), ['blocked']);
+  assert.equal(db.operations[0]?.state, 'submitted');
+  fail = false;
+  assert.deepEqual(outcomes(await runSchedulerOnce({ dryRun: false, now: new Date(NOW.getTime() + ONE_DAY_SECONDS * 1000) }, options)), ['executed']);
+  assert.equal(db.operations[0]?.state, 'confirmed');
+  assert.equal(chain.executeCalls.length, 0);
+});
+
+test('#34 send RPC 失聯無 hash 或 submitted 寫 DB 失敗，均保留可阻擋重送的列', async () => {
+  for (const lostHash of [true, false]) {
+    const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+    const chain = stubChain();
+    const query = stubQuery(db);
+    const round = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain, {
+      executeRebalance: async (args) => {
+        chain.executeCalls.push(args);
+        args.onSending();
+        if (!lostHash) await args.onSubmitted({ userOpHash: '0xabc123' });
+        throw new Error('connection lost after send');
+      },
+      query: async (sql, params) => {
+        if (sql.includes("set state = 'submitted'")) throw new Error('DB unavailable');
+        return query(sql, params);
+      },
+    }));
+    assert.deepEqual(outcomes(round), ['blocked']);
+    assert.equal(db.operations[0]?.state, 'pending');
+    assert.equal(round.results[0]?.execution?.userOpHash, lostHash ? null : '0xabc123');
+    assert.equal(db.portfolios[0]?.lastRebalanceAt, null);
+  }
+});
+
+test('#34 sender 回 error 但帶 hash 或回 unknown，仍視為在途', async () => {
+  for (const result of [
+    { status: 'error', userOpHash: '0xabc123', txHash: null, gasUsed: null, error: 'receipt missing' },
+    { status: 'unknown', userOpHash: null, txHash: null, gasUsed: null, error: 'send result unknown' },
+  ] satisfies ExecutionOutcome[]) {
+    const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+    const chain = stubChain();
+    const round = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain, {
+      executeRebalance: async () => result,
+    }));
+    assert.deepEqual(outcomes(round), ['blocked']);
+    assert.equal(db.operations[0]?.state, result.userOpHash === null ? 'pending' : 'submitted');
+    assert.equal(db.portfolios[0]?.lastRebalanceAt, null);
+  }
+});
+
+test('#34 讀 operations 失敗必須 fail closed，不規劃也不送出', async () => {
+  const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+  const chain = stubChain();
+  const query = stubQuery(db);
+  const round = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain, {
+    query: async (sql, params) => {
+      if (sql.includes('select idempotency_key, payload_hash')) throw new Error('DB timeout');
+      return query(sql, params);
+    },
+  }));
+  assert.deepEqual(outcomes(round), ['blocked']);
+  assert.equal(chain.planPortfolioCalls.length, 0);
+  assert.equal(chain.executeCalls.length, 0);
+  assert.equal(db.operations.length, 0);
+});
+
+/** 真實 ABI 編碼與 viem UserOp hash；不以任意 hash 假裝原交易。 */
+function receiptFixture(steps = [step()], mode: Hex = `0x${'00'.repeat(32)}`) {
+  const entryPoint: Address = '0x0000000071727de22e5e9d8baf0edac6f37da032';
+  const blockHash = keccak256(toBytes('canonical block'));
+  const txHash = keccak256(toBytes('transaction'));
+  const data = encodeFunctionData({ abi: parseAbi([
+    'function executeRebalance(address account, (address tokenIn, address tokenOut, uint256 amountIn, uint256 amountOutMin, bytes commands, bytes[] inputs)[] steps, uint256 deadline)',
+  ]), functionName: 'executeRebalance', args: [ACCOUNT, steps, readyPlan().deadline] });
+  const callData = encodeFunctionData({ abi: parseAbi(['function execute(bytes32 mode, bytes data) payable']),
+    functionName: 'execute', args: [mode, encodePacked(['address', 'uint256', 'bytes'], [EXECUTOR, 0n, data])] });
+  const operation: GetUserOperationReturnType = {
+    blockHash, blockNumber: 0n, entryPoint, transactionHash: txHash,
+    userOperation: { sender: ACCOUNT, nonce: 0n, callData, callGasLimit: 600_000n,
+      verificationGasLimit: 100_000n, preVerificationGas: 50_000n, maxFeePerGas: 1n,
+      maxPriorityFeePerGas: 1n, signature: '0x' },
+  };
+  const userOpHash = getUserOperationHash({ userOperation: operation.userOperation,
+    chainId: TEST_CHAIN_ID, entryPointAddress: entryPoint, entryPointVersion: '0.7' });
+  const receipt: UserOperationReceipt = {
+    actualGasCost: 123n, actualGasUsed: 123n, entryPoint, nonce: 0n, sender: ACCOUNT,
+    success: true, userOpHash,
+    logs: steps.map((_, logIndex) => ({ address: EXECUTOR,
+      topics: [keccak256(toBytes('SwapExecuted(address,address,address,uint256,uint256,uint256,uint256,uint256)'))],
+      data: '0x', blockHash, blockNumber: 0n, transactionHash: txHash, transactionIndex: 0, logIndex, removed: false })),
+    receipt: { blockHash, blockNumber: 0n, contractAddress: null, cumulativeGasUsed: 123n, effectiveGasPrice: 1n,
+      from: OWNER, gasUsed: 123n, logs: [], logsBloom: '0x', status: 'success', to: entryPoint,
+      transactionHash: txHash, transactionIndex: 0, type: 'eip1559' },
+  };
+  const input: ReconcileInput = { account: ACCOUNT, executor: EXECUTOR, chainId: TEST_CHAIN_ID,
+    userOpHash, txHash: null, payloadHash: planHashFor(steps, readyPlan().deadline) };
+  const reader = { getReceipt: async () => receipt, getOperation: async () => operation,
+    getBlockHash: async () => blockHash };
+  return { input, reader, receipt, operation };
+}
+
+test('#34 對帳驗證原 UserOp 的多步計畫與 canonical receipt（塊號 0 也合法）', async () => {
+  const f = receiptFixture([step(), step({ amountIn: 1n })]);
+  // 同 tx 別的 op 的 receipt.logs 不能湊數；採用限定本 UserOp 的 logs。
+  assert.equal(f.receipt.receipt.logs.length, 0);
+  const result = await readRebalanceReceipt(f.input, f.reader);
+  assert.equal(result?.status, 'success');
+  assert.equal(result?.userOpHash, f.input.userOpHash);
+  assert.equal(result?.txHash, f.receipt.receipt.transactionHash);
+  f.receipt.success = false;
+  f.receipt.logs = [];
+  assert.equal((await readRebalanceReceipt(f.input, f.reader))?.status, 'reverted');
+});
+
+test('#34 缺 receipt／原 UserOp／成交事件不能被當作已完成', async () => {
+  const f = receiptFixture();
+  const missingSuccess = receiptFixture();
+  Reflect.deleteProperty(missingSuccess.receipt, 'success');
+  assert.equal(await readRebalanceReceipt(missingSuccess.input, missingSuccess.reader), null);
+  assert.equal(await readRebalanceReceipt(f.input, { ...f.reader, getReceipt: async () => null }), null);
+  assert.equal(await readRebalanceReceipt(f.input, { ...f.reader, getOperation: async () => null }), null);
+  f.receipt.logs = [];
+  assert.equal(await readRebalanceReceipt(f.input, f.reader), null, 'success=true 但缺 SwapExecuted 不能解鎖');
+  f.receipt.receipt.logs = receiptFixture().receipt.logs;
+  assert.equal(await readRebalanceReceipt(f.input, f.reader), null, '不能借同 tx 其他 op 的 log');
+});
+
+test('#34 來源／hash／plan／canonical 身分不符一律拒絕對帳', async () => {
+  for (const mutation of ['hash', 'sender', 'entryPoint', 'tx', 'block', 'plan', 'chain', 'calldata', 'nonce', 'receipt-nonce'] as const) {
+    const f = receiptFixture();
+    if (mutation === 'hash') f.receipt.userOpHash = keccak256(toBytes('foreign op'));
+    if (mutation === 'sender') f.receipt.sender = OWNER;
+    if (mutation === 'entryPoint') f.receipt.entryPoint = EXECUTOR;
+    if (mutation === 'tx') f.input.txHash = keccak256(toBytes('foreign tx'));
+    if (mutation === 'block') f.operation.blockNumber = 1n;
+    if (mutation === 'plan') f.input.payloadHash = planHashFor([step({ amountIn: 1n })], readyPlan().deadline);
+    if (mutation === 'chain') f.input.chainId += 1;
+    if (mutation === 'calldata') f.operation.userOperation.callData = '0x';
+    if (mutation === 'nonce') f.operation.userOperation.nonce += 1n;
+    if (mutation === 'receipt-nonce') f.receipt.nonce += 1n;
+    await assert.rejects(readRebalanceReceipt(f.input, f.reader), Error, mutation);
+  }
+  const f = receiptFixture();
+  await assert.rejects(readRebalanceReceipt(f.input, { ...f.reader,
+    getBlockHash: async () => keccak256(toBytes('reorg')) }), /canonical/);
+  await assert.rejects(readRebalanceReceipt(f.input, { ...f.reader, getBlockHash: async () => null }), /canonical/);
+  await assert.rejects(readRebalanceReceipt(f.input, { ...f.reader, getReceipt: async () => { throw new Error('RPC timeout'); } }), /RPC timeout/);
+  await assert.rejects(readRebalanceReceipt(f.input, { ...f.reader, getOperation: async () => { throw new Error('RPC unavailable'); } }), /RPC unavailable/);
+  await assert.rejects(readRebalanceReceipt(f.input, { ...f.reader, getBlockHash: async () => { throw new Error('RPC offline'); } }), /RPC offline/);
+});
+
+test('#34 空步數與非原子 Kernel mode 不能解除在途保護', async () => {
+  const empty = receiptFixture([]);
+  await assert.rejects(readRebalanceReceipt(empty.input, empty.reader), /步數/);
+  const tryMode = receiptFixture([step()], `0x0001${'00'.repeat(30)}`);
+  await assert.rejects(readRebalanceReceipt(tryMode.input, tryMode.reader), /原子呼叫/);
+  const foreignExecutor = receiptFixture();
+  foreignExecutor.input.executor = OWNER;
+  await assert.rejects(readRebalanceReceipt(foreignExecutor.input, foreignExecutor.reader), /原子呼叫/);
+  const malformed = receiptFixture();
+  malformed.operation.userOperation.callData = '0x';
+  malformed.input.userOpHash = getUserOperationHash({ userOperation: malformed.operation.userOperation,
+    chainId: TEST_CHAIN_ID, entryPointAddress: malformed.operation.entryPoint, entryPointVersion: '0.7' });
+  malformed.receipt.userOpHash = malformed.input.userOpHash;
+  await assert.rejects(readRebalanceReceipt(malformed.input, malformed.reader), /decode|signature/i);
+});
+
 test('一個 portfolio 拋錯不會讓整輪停擺：它自己變 blocked，其他的照跑', async () => {
   const db = stubDb({
     portfolios: [portfolio({ id: 1 }), portfolio({ id: 2 })],
@@ -1614,6 +1926,46 @@ test('認領（真的 Postgres）：paused／idle／未到期不被認領，NULL
   // 再跑一次同一輪：已經推進過，所以一個都撿不到（這正是「不會重複認領」）。
   const second = await claimDuePortfolios(50, new Date(), { chainId: REAL_CHAIN_ID });
   assert.deepEqual(second, [], '同一輪再跑一次，一個都不該被重複認領');
+
+  // #34 兩個手動輪次先後完成認領，但同時規劃不同 deadline：真正的 Postgres 鎖必須串行閘門。
+  let firstPlanning: () => void = () => {};
+  const entered = new Promise<void>((resolve) => { firstPlanning = resolve; });
+  let finishPlanning: () => void = () => {};
+  const barrier = new Promise<void>((resolve) => { finishPlanning = resolve; });
+  let planners = 0;
+  let sends = 0;
+  const keys = stubQuery(stubDb({ sessionKeys: [sessionKey({ portfolioId: due.id })] }));
+  const options: SchedulerDeps = {
+    withTransaction: singlePortfolioClaim(due.id),
+    query: (sql, params) => sql.includes('from session_keys k') ? keys(sql, params) : query(sql, params),
+    chainId: REAL_CHAIN_ID, executor: EXECUTOR, log: () => {},
+    planPortfolio: async () => stubPlan({ portfolioId: due.id }),
+    planRebalance: async () => {
+      const sequence = ++planners;
+      firstPlanning();
+      if (planners === 2) finishPlanning();
+      await barrier;
+      return { ...readyPlan(), deadline: readyPlan().deadline + BigInt(sequence) };
+    },
+    refreshFloors: async ({ steps }) => ({ ok: true, steps: [...steps], refreshes: [], note: 'unchanged' }),
+    readPermissionConfig: async () => ({ signer: SIGNER_CONTRACT, policyCount: 3 }),
+    deriveSessionKeyAddress: async () => SESSION_KEY,
+    readAllowance: async () => 10n ** 20n, readBalance: async () => 10n ** 20n,
+    writeSnapshot: async () => ({ headerInserted: true, inserted: 0, updated: 0 }),
+    executeRebalance: async (args) => {
+      sends += 1;
+      await args.onSubmitted({ userOpHash: '0xabc123' });
+      throw new Error('receipt timeout');
+    },
+  };
+  const firstRound = runSchedulerOnce({ dryRun: false, now }, options);
+  await entered;
+  const rounds = await Promise.all([firstRound, runSchedulerOnce({ dryRun: false, now }, options)]);
+  assert.deepEqual(rounds.map((r) => outcomes(r)), [['blocked'], ['blocked']]);
+  assert.equal(sends, 1, '不同 planHash 仍只能送一筆');
+  const pending = (await query<{ state: string; attempts: number }>(
+    "select state, attempts from operations where portfolio_id = $1 and type = 'rebalance'", [due.id])).rows;
+  assert.deepEqual(pending.map((op) => [op.state, op.attempts]), [['submitted', 1]]);
 
   console.log(
     `[claim/真 DB] 認領 ${claimed.map((entry) => `${entry.portfolioId}(${entry.intervalSeconds}s)`).join(', ')}；` +
@@ -1789,6 +2141,7 @@ test('排程：部分執行但送出失敗（failed）→ 完整間隔（別把 
   const round = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain));
 
   assert.deepEqual(outcomes(round), ['failed']);
+  assert.equal(db.operations[0]?.state, 'failed', '明確未送出的 error 不能被寫成鏈上 reverted');
   assert.equal(
     db.portfolios[0]?.nextRunAt?.toISOString(),
     new Date(NOW.getTime() + ONE_DAY_SECONDS * 1_000).toISOString(),
@@ -2167,4 +2520,77 @@ test('refreshFloors：feeBps 走 minGrossFor（fee 0 ≠ fee 2500），而且每
     amountOutMinWithBuffer(666_666_666_666_666_667n),
     'minGross = ceil(floor * 10000/(10000−feeBps))，再加 buildStep 的 10 bps 緩衝',
   );
+});
+
+test('#34 預設送出前路徑每輪重讀 effectiveFeeBps：0→25→300、無效 fee、RPC 失敗', async () => {
+  const fees = [0, 25, 300, 10000];
+  let feeReads = 0;
+  const strategyIds: bigint[] = [];
+  const server = createHttpServer(async (request, response) => {
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    const payload: unknown = JSON.parse(body);
+    assert.ok(payload !== null && typeof payload === 'object' && 'id' in payload && 'params' in payload);
+    const params = payload.params;
+    assert.ok(Array.isArray(params));
+    const call: unknown = params[0];
+    assert.ok(call !== null && typeof call === 'object' && 'data' in call && typeof call.data === 'string');
+    assert.ok(isHex(call.data));
+    const decoded = decodeFunctionData({ abi: parseAbi([
+      'function oracle() view returns (address)',
+      'function effectiveFeeBps(uint256 id) view returns (uint16)',
+      'function previewSwap(address tokenIn, address tokenOut, uint256 amountIn) view returns (uint256 quoted, uint256 minimum)',
+    ]), data: call.data });
+    let result: Hex | undefined;
+    if (decoded.functionName === 'oracle') result = encodeAbiParameters([{ type: 'address' }], [EXECUTOR]);
+    if (decoded.functionName === 'effectiveFeeBps') {
+      strategyIds.push(decoded.args[0]);
+      const fee = fees[feeReads++];
+      if (fee !== undefined) result = encodeAbiParameters([{ type: 'uint16' }], [fee]);
+    }
+    if (decoded.functionName === 'previewSwap') {
+      result = encodeAbiParameters([{ type: 'uint256' }, { type: 'uint256' }], [500_000_000_000_000_000n, 500_000_000_000_000_000n]);
+    }
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify(result === undefined
+      ? { jsonrpc: '2.0', id: payload.id, error: { code: -32000, message: 'fee RPC unavailable' } }
+      : { jsonrpc: '2.0', id: payload.id, result }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address();
+    assert.ok(address !== null && typeof address !== 'string');
+    // 子行程隔離 config／RPC cache，走正式的預設 refreshFloors；只換鏈 RPC 與 DB，不注入 refresh。
+    const fixture = serialize({ plan: stubPlan(), rebalance: readyPlan([encodableStep()]),
+      portfolio: portfolio(), key: sessionKey() }).toString('base64');
+    const script = `
+      import { deserialize } from 'node:v8';
+      import { runSchedulerOnce } from ${JSON.stringify(new URL('../src/scheduler.ts', import.meta.url).href)};
+      const {plan,rebalance,portfolio:p,key:k}=deserialize(Buffer.from(${JSON.stringify(fixture)},'base64'));
+      const query=async(sql)=>({rows:sql.includes('for update of p') ? [{portfolio_id:String(p.id),strategy_id:String(p.strategyId),address:p.account,account_type:p.accountType,schedule:p.schedule}]
+        : sql.includes('from session_keys k') ? [{key_ref:k.keyRef,owner:k.owner,permissions:{permissionId:k.permissionId,sessionKeyAddress:k.sessionKeyAddress,timestamp:{validUntil:k.validUntil}}}] : []});
+      for(let i=0;i<5;i++){
+        const r=await runSchedulerOnce({}, {query,withTransaction:async fn=>fn({query}),chainId:${TEST_CHAIN_ID},executor:${JSON.stringify(EXECUTOR)},
+          planPortfolio:async()=>plan,planRebalance:async()=>rebalance,readPermissionConfig:async()=>({signer:${JSON.stringify(SIGNER_CONTRACT)},policyCount:3}),
+          deriveSessionKeyAddress:async()=>k.sessionKeyAddress,readAllowance:async()=>10n**20n,readBalance:async()=>10n**20n,log:()=>{}});
+        console.log('FLOOR_RESULT '+r.results[0].outcome+' '+(r.results[0].plan?.steps[0]?.amountOutMin ?? 'none'));
+      }`;
+    const { stdout } = await promisify(execFile)(process.execPath, ['--eval', script], {
+      timeout: 20000,
+      env: { PATH: process.env.PATH, DATABASE_URL: 'postgres://ci:ci@127.0.0.1:1/unused',
+        RPC_URL: `http://127.0.0.1:${address.port}`, REGISTRY_ADDRESS: EXECUTOR, CHAIN_ID: String(TEST_CHAIN_ID),
+        OPERATOR_PRIVATE_KEY: '', SESSION_KEY_MASTER_SEED: '', EXECUTOR_ADDRESS: EXECUTOR },
+    });
+    const results = stdout.split('\n').filter((line) => line.startsWith('FLOOR_RESULT '));
+    const expected = fees.slice(0, 3).map((fee) => {
+      const denominator = 10000n - BigInt(fee);
+      const gross = (500_000_000_000_000_000n * 10000n + denominator - 1n) / denominator;
+      return `FLOOR_RESULT ready-dry-run ${(gross * 10010n + 9999n) / 10000n}`;
+    });
+    assert.deepEqual(results, [...expected, 'FLOOR_RESULT blocked none', 'FLOOR_RESULT blocked none']);
+    assert.ok(feeReads >= 5);
+    assert.ok(strategyIds.every((id) => id === 1n), '使用鏈上 strategy id，不用 DB 的 11');
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
 });

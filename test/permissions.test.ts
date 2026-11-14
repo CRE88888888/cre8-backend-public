@@ -21,7 +21,8 @@ import type { Address, Hex, PublicClient } from 'viem';
 import { entryPoint07Abi } from 'viem/account-abstraction';
 import { bsc } from 'viem/chains';
 import { KERNEL_V3_3_ADDRESSES, SALT_DOMAIN_TAG } from '../src/addresses.js';
-import { loadConfig, loadSessionKeyConfig, requireSessionKeyConfig } from '../src/config.js';
+import { loadConfig, loadGasConfig, loadSessionKeyConfig, requireSessionKeyConfig } from '../src/config.js';
+import { assertNoSecretSlices } from './fixtures/secret-output.js';
 import { computeSalt, getKernelAccountParams } from '../src/kernel.js';
 import {
   EXECUTOR_SELECTOR,
@@ -410,6 +411,44 @@ test('loadSessionKeyConfig: 兩個 env 都未設時是 null，不影響既有 co
   const config = loadConfig({ DATABASE_URL: 'postgres://localhost/cre8' });
   assert.equal('executorAddress' in config, false);
   assert.equal('sessionKeyMasterSeed' in config, false);
+});
+
+test('#56 config errors report names and shapes without echoing any input', () => {
+  const secret = '0123456789abcdef'.repeat(4);
+  const loaders = [
+    (raw: string) => loadSessionKeyConfig({ SESSION_KEY_MASTER_SEED: raw }),
+    (raw: string) => loadSessionKeyConfig({ EXECUTOR_ADDRESS: raw }),
+    (raw: string) => loadConfig({ DATABASE_URL: 'postgres://localhost/test', REGISTRY_ADDRESS: raw }),
+    (raw: string) => loadConfig({ DATABASE_URL: 'postgres://localhost/test', PORT: raw }),
+    (raw: string) => loadConfig({ DATABASE_URL: 'postgres://localhost/test', CHAIN_ID: `${raw}-invalid` }),
+    (raw: string) => loadConfig({ DATABASE_URL: 'postgres://localhost/test', AUTH_DOMAIN: `https://${raw}` }),
+    (raw: string) => loadConfig({ DATABASE_URL: 'postgres://localhost/test', AUTH_URI: raw }),
+    (raw: string) => loadConfig({ DATABASE_URL: 'postgres://localhost/test', AUTH_URI: `ftp://${raw}` }),
+    (raw: string) => loadGasConfig({ MIN_SESSION_GAS_WEI: raw }),
+  ];
+  for (const raw of [secret, `0x${secret.slice(1)}`, `0x${secret}0`, `"0x${secret}"`]) {
+    for (const load of loaders) {
+      assert.throws(() => load(raw), (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assertNoSecretSlices(error.message, secret);
+        assert.doesNotMatch(error.message, /got "/);
+        return true;
+      });
+    }
+  }
+  assert.throws(() => loadSessionKeyConfig({ SESSION_KEY_MASTER_SEED: secret }), /length=64, has0x=false/);
+});
+
+test('#56 config numeric and seed boundaries retain their original validation', () => {
+  for (const port of ['1', '65535']) {
+    assert.equal(loadConfig({ DATABASE_URL: 'postgres://localhost/test', PORT: port }).port, Number(port));
+  }
+  for (const port of ['0', '65536']) {
+    assert.throws(() => loadConfig({ DATABASE_URL: 'postgres://localhost/test', PORT: port }), /PORT.*1\.\.65535/);
+  }
+  assert.equal(loadGasConfig({ MIN_SESSION_GAS_WEI: '0' }).minSessionGasWei, 0n);
+  assert.equal(loadSessionKeyConfig({ SESSION_KEY_MASTER_SEED: `0x${'00'.repeat(32)}` }).sessionKeyMasterSeed, `0x${'00'.repeat(32)}`);
+  assert.throws(() => loadSessionKeyConfig({ SESSION_KEY_MASTER_SEED: '0x' }), /length=2, has0x=true/);
 });
 
 test('requireSessionKeyConfig: 缺 env 時拋出可診斷的錯誤，設好後回正規化值', () => {

@@ -34,8 +34,7 @@ else
   set -- "$@" --no-safe-mode
 fi
 
-echo "[alto] starting: rpc=${RPC_URL} port=${PORT:-3001} safeMode=${SAFE_MODE} entrypoints=${ENTRYPOINTS:-default}"
+echo "[alto] starting: rpc=(configured) port=${PORT:-3001} safeMode=${SAFE_MODE} entrypoints=${ENTRYPOINTS:-default}"
 # 不要把整串參數印出來 —— 裡面有私鑰。
-echo "[alto] executor=$(printf '%s' "$EXECUTOR_PRIVATE_KEY" | head -c 6)…"
 
 exec node src/lib/cli/alto.js "$@"

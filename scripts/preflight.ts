@@ -26,7 +26,7 @@
  */
 
 import { pathToFileURL } from 'node:url';
-import { createPublicClient, http, isAddress, getAddress, zeroAddress } from 'viem';
+import { BaseError, createPublicClient, http, isAddress, getAddress, zeroAddress } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import type { Address, PublicClient } from 'viem';
 
@@ -328,6 +328,22 @@ function fail(name: string, detail: string, fix: string): void {
   record({ level: 'fail', name, detail, fix });
 }
 
+/** viem 的完整 message 含 URL／request body；只取摘要並在輸出前移除憑證。 */
+function oneLine(cause: unknown): string {
+  let message = cause instanceof BaseError ? cause.shortMessage
+    : cause instanceof Error ? cause.message : '檢查失敗（未知錯誤）';
+  for (const name of [
+    'RPC_URL', 'ANVIL_RPC_URL', 'BUNDLER_URL', 'DATABASE_URL',
+    'OPERATOR_PRIVATE_KEY', 'SESSION_KEY_MASTER_SEED', 'TELEGRAM_BOT_TOKEN',
+  ]) {
+    const value = process.env[name]?.trim();
+    if (value) message = message.split(value).join('[redacted]');
+  }
+  return message.replace(/\b[a-z][a-z\d+.-]*:\/\/[^\s]+/gi, '[redacted URL]')
+    .replace(/\b(?:0x)?[0-9a-f]{64}\b/gi, '[redacted]')
+    .split(/[\r\n]/)[0]?.slice(0, 400) ?? '';
+}
+
 // ---------------------------------------------------------------------------
 // 參數
 // ---------------------------------------------------------------------------
@@ -379,7 +395,7 @@ async function main(): Promise<number> {
     config = getConfig();
     ok('config 載入', `CHAIN_ID=${config.chainId} PORT=${config.port}`);
   } catch (cause) {
-    fail('config 載入', cause instanceof Error ? cause.message : String(cause), '補齊 backend/.env（對照 .env.example）');
+    fail('config 載入', oneLine(cause), '補齊 backend/.env（對照 .env.example）');
     print();
     return 1;
   }
@@ -404,7 +420,7 @@ async function main(): Promise<number> {
       ok('SESSION_KEY_MASTER_SEED', '已設定且不是全零');
     }
   } catch (cause) {
-    fail('session key 設定', cause instanceof Error ? cause.message : String(cause), '設定 EXECUTOR_ADDRESS 與 SESSION_KEY_MASTER_SEED');
+    fail('session key 設定', oneLine(cause), '設定 EXECUTOR_ADDRESS 與 SESSION_KEY_MASTER_SEED');
   }
 
   // --- 3. 合約位址格式 ---------------------------------------------------
@@ -459,7 +475,7 @@ async function main(): Promise<number> {
     const blockNumber = await client.getBlockNumber();
     ok('RPC 連線', `head = ${blockNumber}`);
   } catch (cause) {
-    fail('RPC 連線', cause instanceof Error ? cause.message : String(cause), '確認 RPC_URL 可達');
+    fail('RPC 連線', oneLine(cause), '確認 RPC_URL 可達');
     print();
     return 1;
   }
@@ -478,7 +494,7 @@ async function main(): Promise<number> {
         ok(`${label} 的 code`, `${(code.length - 2) / 2} bytes`);
       }
     } catch (cause) {
-      warn(`${label} 的 code`, `讀不到：${cause instanceof Error ? cause.message : String(cause)}`, 'RPC 可能不支援 eth_getCode');
+      warn(`${label} 的 code`, `讀不到：${oneLine(cause)}`, 'RPC 可能不支援 eth_getCode');
     }
   }
 
@@ -569,7 +585,7 @@ async function main(): Promise<number> {
         }
       }
     } catch (cause) {
-      warn('executor.oracle', `讀不到：${cause instanceof Error ? cause.message : String(cause)}`, '確認 executor ABI');
+      warn('executor.oracle', `讀不到：${oneLine(cause)}`, '確認 executor ABI');
     }
   }
 
@@ -585,14 +601,15 @@ async function main(): Promise<number> {
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_supportedEntryPoints', params: [] }),
         signal: AbortSignal.timeout(5_000),
       });
-      const body = (await response.json()) as { result?: string[]; error?: { message?: string } };
-      if (Array.isArray(body.result) && body.result.length > 0) {
-        ok('bundler', `entryPoints: ${body.result.join(', ')}`);
+      const body: unknown = await response.json();
+      const result = typeof body === 'object' && body !== null && 'result' in body ? body.result : undefined;
+      if (Array.isArray(result) && result.length > 0 && result.every((value: unknown) => typeof value === 'string' && isAddress(value))) {
+        ok('bundler', `entryPoints: ${result.join(', ')}`);
       } else {
-        warn('bundler', body.error?.message ?? '沒有回 entryPoints', '確認 alto / 第三方 bundler 的版本與設定');
+        warn('bundler', '沒有回 entryPoints（上游錯誤內容不輸出）', '確認 alto / 第三方 bundler 的版本與設定');
       }
     } catch (cause) {
-      warn('bundler', `連不上：${cause instanceof Error ? cause.message : String(cause)}`, 'live 模式需要它');
+      warn('bundler', `連不上：${oneLine(cause)}`, 'live 模式需要它');
     }
   }
 
@@ -608,7 +625,7 @@ async function main(): Promise<number> {
       fail('session key seed 與 DB 比對', '無法完成 key 比對', '確認 DB migration、session key 資料與 RPC；未完成比對不可上線');
     }
   } catch (cause) {
-    fail('DB 連線', cause instanceof Error ? cause.message : String(cause), '確認 DATABASE_URL；Railway 上由平台注入');
+    fail('DB 連線', oneLine(cause), '確認 DATABASE_URL；Railway 上由平台注入');
   }
 
   // --- 10. auth --------------------------------------------------------
@@ -657,7 +674,7 @@ if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.a
       process.exit(code);
     })
     .catch((cause: unknown) => {
-      console.error(`\n  preflight 自己壞了：${cause instanceof Error ? cause.message : String(cause)}\n`);
+      console.error(`\n  preflight 自己壞了：${oneLine(cause)}\n`);
       process.exit(1);
     });
 }

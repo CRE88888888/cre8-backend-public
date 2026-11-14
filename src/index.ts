@@ -1,4 +1,4 @@
-import { getConfig } from './config.js';
+import { getConfig, getSessionKeyConfig } from './config.js';
 import { closePool, migrate } from './db.js';
 import { createServer } from './server.js';
 
@@ -18,6 +18,8 @@ import { createServer } from './server.js';
  */
 async function main(): Promise<void> {
   const config = getConfig();
+  // 驗證已填的值，但不要求 seed／executor 必填；未啟用 session key 的本機與 CI 照常啟動。
+  getSessionKeyConfig();
 
   if (process.env.MIGRATIONS_ENABLED === '0') {
     console.log(JSON.stringify({ level: 'warn', msg: 'migrations skipped (MIGRATIONS_ENABLED=0)' }));

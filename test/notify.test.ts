@@ -36,6 +36,14 @@ test('Telegram 設定：兩個留空停用、只填一個在啟動時報錯且�
   }
 });
 
+test('#56 production Telegram requires HTTPS; local development still accepts HTTP', () => {
+  assert.throws(() => loadTelegramConfig({ ...env, NODE_ENV: 'production' }), /TELEGRAM_API_BASE.*https/);
+  assert.equal(loadTelegramConfig({ ...env, NODE_ENV: 'test' }).apiBase, env.TELEGRAM_API_BASE);
+  assert.equal(loadTelegramConfig({ ...env, NODE_ENV: 'development' }).apiBase, env.TELEGRAM_API_BASE);
+  assert.equal(loadTelegramConfig({ NODE_ENV: 'production' }).apiBase, 'https://api.telegram.org');
+  assert.equal(loadTelegramConfig({ ...env, NODE_ENV: 'production', TELEGRAM_API_BASE: 'https://api.telegram.org///' }).apiBase, 'https://api.telegram.org');
+});
+
 test('未設定：不呼叫 fetch，每個行程只 log 一次', async () => {
   const lines: string[] = [];
   const args = { env: {}, fetch: async () => { throw new Error('不應打網路'); }, log: (line: string) => lines.push(line) };

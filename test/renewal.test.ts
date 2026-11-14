@@ -32,6 +32,7 @@ import {
   resolveCorsConfig,
 } from '../src/server.js';
 import type { ServerDeps } from '../src/server.js';
+import { assertNoSecretSlices } from './fixtures/secret-output.js';
 
 /**
  * `GET /portfolios`、`GET /portfolios/:id/renewal-params`、`POST /portfolios/:id/renewal-result`
@@ -757,7 +758,7 @@ test('renewal-params answers 404 for an unknown portfolio and 403 for someone el
   }
 });
 
-test('renewal-params answers 500 naming the missing session key env vars', async () => {
+test('renewal-params answers a fixed 500 for missing session key configuration', async () => {
   // 真的 requireSessionKeyConfig()，只是餵它一個空 env：錯誤訊息因此是 production 那一份。
   const { buildRenewalParams: build } = realRenewalParams(ownedPortfolio(), {
     sessionKeyConfig: () => requireSessionKeyConfig({}),
@@ -773,8 +774,7 @@ test('renewal-params answers 500 naming the missing session key env vars', async
       assert.equal(missingBoth.status, 500);
       const bothBody = (await missingBoth.json()) as { error: { code: string; message: string } };
       assert.equal(bothBody.error.code, 'SESSION_KEY_CONFIG');
-      assert.match(bothBody.error.message, /EXECUTOR_ADDRESS/);
-      assert.match(bothBody.error.message, /SESSION_KEY_MASTER_SEED/, 'the message must name what is missing');
+      assert.equal(bothBody.error.message, '續期需要有效的 session key 設定，請聯絡管理員');
     },
     { buildRenewalParams: build },
   );
@@ -786,11 +786,61 @@ test('renewal-params answers 500 naming the missing session key env vars', async
       assert.equal(onlyOne.status, 500);
       const oneBody = (await onlyOne.json()) as { error: { code: string; message: string } };
       assert.equal(oneBody.error.code, 'SESSION_KEY_CONFIG');
-      assert.match(oneBody.error.message, /SESSION_KEY_MASTER_SEED/);
-      assert.doesNotMatch(oneBody.error.message, /EXECUTOR_ADDRESS 與/, 'only the missing one is reported');
+      assert.equal(oneBody.error.message, '續期需要有效的 session key 設定，請聯絡管理員');
     },
     { buildRenewalParams: onlyExecutor.buildRenewalParams },
   );
+});
+
+test('#56 H-2 PoC regression: malformed seeds never reach HTTP or console', async () => {
+  const seed = '0123456789abcdef'.repeat(4);
+  const lines: string[] = [];
+  const savedError = console.error;
+  const savedWarn = console.warn;
+  const capture = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  console.error = capture;
+  console.warn = capture;
+  try {
+    for (const raw of [seed, `0x${seed.slice(1)}`, `0x${seed}0`, `"0x${seed}"`]) {
+      const { buildRenewalParams: build } = realRenewalParams(ownedPortfolio(), {
+        sessionKeyConfig: () => requireSessionKeyConfig({ EXECUTOR_ADDRESS: EXECUTOR, SESSION_KEY_MASTER_SEED: raw }),
+      });
+      await withServer(async (baseUrl) => {
+        const token = await loginToken(baseUrl);
+        const response = await getJson(baseUrl, `/portfolios/${PORTFOLIO_ID}/renewal-params`, token);
+        assert.equal(response.status, 500);
+        const body = await response.text();
+        assertNoSecretSlices(body + lines.join('\n'), seed);
+        assert.deepEqual(JSON.parse(body), { error: { code: 'SESSION_KEY_CONFIG', message: '續期需要有效的 session key 設定，請聯絡管理員' } });
+      }, { buildRenewalParams: build });
+    }
+    assert.equal(lines.length, 4);
+    assert.ok(lines.every((line) => line.includes('SESSION_KEY_MASTER_SEED')));
+  } finally {
+    console.error = savedError;
+    console.warn = savedWarn;
+  }
+});
+
+test('#56 unexpected session config exceptions also stay out of HTTP and logs', async () => {
+  const secret = 'untrusted-secret-value';
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  try {
+    for (const cause of [new Error(secret), secret, { message: secret }]) {
+      const { buildRenewalParams: build } = realRenewalParams(ownedPortfolio(), {
+        sessionKeyConfig: () => { throw cause; },
+      });
+      await withServer(async (baseUrl) => {
+        const token = await loginToken(baseUrl);
+        const response = await getJson(baseUrl, `/portfolios/${PORTFOLIO_ID}/renewal-params`, token);
+        assert.equal(response.status, 500);
+        assertNoSecretSlices(await response.text() + lines.join('\n'), secret);
+      }, { buildRenewalParams: build });
+    }
+    assert.equal(lines.length, 3);
+  } finally { console.error = original; }
 });
 
 // ---------------------------------------------------------------------------

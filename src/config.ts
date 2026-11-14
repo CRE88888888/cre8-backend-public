@@ -1,6 +1,9 @@
 import { config as loadDotenv } from 'dotenv';
 import type { Address, Hex } from 'viem';
 
+/** 僅含變數名與格式診斷，不含 env 原值；可安全寫入 server log。 */
+export class ConfigurationError extends Error {}
+
 /**
  * Settings the auth layer needs to build and check an EIP-4361 (SIWE) challenge. Kept separate
  * from the rest of the config so `src/auth.ts` can resolve it without `DATABASE_URL`: auth is the
@@ -20,7 +23,8 @@ export type AuthConfig = {
  *
  * 與 `AuthConfig` 分開、**不進 `Config`** 的理由有二：`src/permissions.ts` 不該為了算一個派生地址
  * 去要 `DATABASE_URL`；而且這兩個值在「沒有開啟 session key 功能」的行程裡完全用不到，設成必填會讓
- * 啟動與既有測試一起掛掉。取用請走 `requireSessionKeyConfig()`：真的需要時才失敗，訊息帶著缺哪一個。
+ * 啟動與既有測試一起掛掉。啟動只驗證已填值的格式；取用走 `requireSessionKeyConfig()`，
+ * 真的需要時才要求兩個值必填，訊息帶著缺哪一個。
  */
 export type SessionKeyConfig = {
   /** Session key CallPolicy 的 target（rebalance executor）；null = 未設定。 */
@@ -55,7 +59,7 @@ export function loadTelegramConfig(env: NodeJS.ProcessEnv = process.env): Telegr
   const botToken = env.TELEGRAM_BOT_TOKEN?.trim() || null;
   const chatId = env.TELEGRAM_CHAT_ID?.trim() || null;
   if ((botToken === null) !== (chatId === null)) {
-    throw new Error('TELEGRAM_BOT_TOKEN 與 TELEGRAM_CHAT_ID 必須一起設定或一起留空');
+    throw new ConfigurationError('TELEGRAM_BOT_TOKEN 與 TELEGRAM_CHAT_ID 必須一起設定或一起留空');
   }
   const apiBase = env.TELEGRAM_API_BASE?.trim() || 'https://api.telegram.org';
   try {
@@ -63,8 +67,11 @@ export function loadTelegramConfig(env: NodeJS.ProcessEnv = process.env): Telegr
     if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
       throw new Error('invalid URL');
     }
+    if (env.NODE_ENV === 'production' && url.protocol !== 'https:') {
+      throw new Error('HTTPS required');
+    }
   } catch {
-    throw new Error('TELEGRAM_API_BASE 必須是 http/https URL，且不能含帳密、query 或 fragment');
+    throw new ConfigurationError('TELEGRAM_API_BASE 必須是 http/https URL（production 僅允許 https），且不能含帳密、query 或 fragment');
   }
   return { botToken, chatId, apiBase: apiBase.replace(/\/+$/, '') };
 }
@@ -108,7 +115,7 @@ let cachedGasConfig: GasConfig | null = null;
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const databaseUrl = env.DATABASE_URL?.trim();
   if (!databaseUrl) {
-    throw new Error('DATABASE_URL is required (see backend/.env.example)');
+    throw new ConfigurationError('DATABASE_URL is required (see backend/.env.example)');
   }
 
   const port = parseInteger(env, 'PORT', DEFAULT_PORT, { min: 1, max: 65_535 });
@@ -206,7 +213,7 @@ export function requireSessionKeyConfig(env: NodeJS.ProcessEnv = process.env): {
   if (executorAddress === null) missing.push('EXECUTOR_ADDRESS');
   if (sessionKeyMasterSeed === null) missing.push('SESSION_KEY_MASTER_SEED');
   if (executorAddress === null || sessionKeyMasterSeed === null) {
-    throw new Error(
+    throw new ConfigurationError(
       `Session key 設定不完整：缺少 ${missing.join(' 與 ')}（見 backend/.env.example）。` +
         `EXECUTOR_ADDRESS 是 session key CallPolicy 允許呼叫的 target；` +
         `SESSION_KEY_MASTER_SEED 是派生 session key 的 HD master seed（0x + 64 hex）`,
@@ -230,7 +237,7 @@ function parseInteger(
     Number.isInteger(value) && value >= bounds.min && (bounds.max === undefined || value <= bounds.max);
   if (!withinBounds) {
     const range = bounds.max === undefined ? `>= ${bounds.min}` : `in ${bounds.min}..${bounds.max}`;
-    throw new Error(`${name} must be an integer ${range}, got "${raw}"`);
+    throw new ConfigurationError(`${name} must be an integer ${range}`);
   }
   return value;
 }
@@ -246,7 +253,7 @@ function parseBigInt(env: NodeJS.ProcessEnv, name: string, fallback: bigint): bi
   const raw = env[name]?.trim();
   if (raw === undefined || raw === '') return fallback;
   if (!/^\d+$/.test(raw)) {
-    throw new Error(`${name} must be a decimal integer amount of wei (digits only), got "${raw}"`);
+    throw new ConfigurationError(`${name} must be a decimal integer amount of wei (digits only)`);
   }
   return BigInt(raw);
 }
@@ -259,7 +266,7 @@ function parseOptionalAddress(env: NodeJS.ProcessEnv, name: string): Address | n
   const raw = env[name]?.trim();
   if (raw === undefined || raw === '') return null;
   if (!/^0x[0-9a-fA-F]{40}$/.test(raw)) {
-    throw new Error(`${name} must be a 0x-prefixed 20-byte hex address, got "${raw}"`);
+    throw new ConfigurationError(`${name} must be a 0x-prefixed 20-byte hex address`);
   }
   // 上面那條 regex 已保證形狀與長度，這裡只是把驗證過的結果收窄成 viem 的 Address。
   return raw.toLowerCase() as Address;
@@ -275,7 +282,7 @@ function parseOptionalSeed(env: NodeJS.ProcessEnv, name: string): Hex | null {
   const raw = env[name]?.trim();
   if (raw === undefined || raw === '') return null;
   if (!/^0x[0-9a-fA-F]{64}$/.test(raw)) {
-    throw new Error(`${name} must be a 0x-prefixed 32-byte hex seed (64 hex chars), got "${raw}"`);
+    throw new ConfigurationError(`${name} must be a 0x-prefixed 32-byte hex seed (64 hex chars); length=${raw.length}, has0x=${raw.startsWith('0x')}`);
   }
   return raw.toLowerCase() as Hex;
 }
@@ -288,7 +295,7 @@ function parseAuthDomain(env: NodeJS.ProcessEnv): string {
   const raw = env.AUTH_DOMAIN?.trim();
   if (raw === undefined || raw === '') return DEFAULT_AUTH_DOMAIN;
   if (/[/?#@\s]/.test(raw) || raw.includes('://')) {
-    throw new Error(`AUTH_DOMAIN must be a bare authority such as app.cre8.xyz (no scheme or path), got "${raw}"`);
+    throw new ConfigurationError('AUTH_DOMAIN must be a bare authority such as app.cre8.xyz (no scheme or path)');
   }
   return raw;
 }
@@ -305,10 +312,10 @@ function parseAuthUri(env: NodeJS.ProcessEnv, authDomain: string): string {
   try {
     protocol = new URL(value).protocol;
   } catch {
-    throw new Error(`AUTH_URI must be an absolute URI such as https://app.cre8.xyz, got "${value}"`);
+    throw new ConfigurationError('AUTH_URI must be an absolute URI such as https://app.cre8.xyz');
   }
   if (protocol !== 'http:' && protocol !== 'https:') {
-    throw new Error(`AUTH_URI must use http or https, got "${value}"`);
+    throw new ConfigurationError('AUTH_URI must use http or https');
   }
   return value;
 }

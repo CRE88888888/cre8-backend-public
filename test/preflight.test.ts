@@ -1,10 +1,135 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
+import { mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
 import { test } from 'node:test';
 import { mnemonicToAccount } from 'viem/accounts';
 import { createPublicClient, custom, getAddress, encodeAbiParameters, encodeEventTopics, encodeFunctionResult, zeroAddress } from 'viem';
 import { EXECUTOR_ABI, PANCAKE_UR } from '../src/chain.js';
 import type { Address } from 'viem';
 import { checkSecondarySources, checkVenues, checkBuyConfig, checkGlobalPaused, checkOwnership, checkRegistryOperator, checkRoleSeparation, checkSessionKeySeed, operatorAddress } from '../scripts/preflight.js';
+import { assertNoSecretSlices, runScript } from './fixtures/secret-output.js';
+
+test('#56 scheduler startup describes configured endpoints without credentials', async () => {
+  for (const rpc of ['https://bsc.example/v1/SECRETKEY', 'https://SECRETKEY.example/v1', 'malformed-SECRETKEY']) {
+    const result = await runScript('scripts/scheduler.ts', { RPC_URL: rpc, BUNDLER_URL: 'https://user:password@bundler.example/SECRETKEY?token=SECRETKEY' }, `
+      const { mock } = await import('bun:test');
+      mock.module(${JSON.stringify(new URL('../src/scheduler.ts', import.meta.url).pathname)}, () => ({
+        DEFAULT_ROUND_LIMIT: 25,
+        runSchedulerOnce: async () => ({ claimed: 0, dryRun: true, results: [] }),
+      }));
+    `);
+    assert.equal(result.code, 0);
+    assert.match(result.output, /RPC\s+\(configured\)/);
+    assert.match(result.output, /BUNDLER\s+\(configured\)/);
+    assert.doesNotMatch(result.output, /SECRETKEY|password|https:\/\//);
+  }
+});
+
+test('#56 alto startup logs no URL or key characters while forwarding the same CLI flags', async () => {
+  await mkdir('.bun-cache', { recursive: true });
+  const directory = await mkdtemp(join(process.cwd(), '.bun-cache/alto-log-'));
+  try {
+    await writeFile(join(directory, 'node'), `#!${process.execPath}
+      const value = flag => process.argv[process.argv.indexOf(flag) + 1];
+      console.log(JSON.stringify({
+        rpc: value('--rpc-url') === process.env.RPC_URL,
+        executor: value('--executor-private-keys') === process.env.EXECUTOR_PRIVATE_KEY,
+        utility: value('--utility-private-key') === (process.env.UTILITY_PRIVATE_KEY || process.env.EXECUTOR_PRIVATE_KEY),
+        safeMode: process.argv.includes('--safe-mode'),
+      }));
+    `, { mode: 0o755 });
+    for (const safeMode of ['true', 'false']) {
+      const key = `0x${'0123456789abcdef'.repeat(4)}`;
+      const { stdout, stderr } = await promisify(execFile)('/bin/sh', ['alto/entrypoint.sh'], {
+        cwd: process.cwd(), timeout: 5_000,
+        env: { PATH: `${directory}:${process.env.PATH}`, RPC_URL: 'https://bsc.example/v1/SECRETKEY',
+          EXECUTOR_PRIVATE_KEY: key, UTILITY_PRIVATE_KEY: safeMode === 'true' ? '' : `0x${'ab'.repeat(32)}`,
+          SAFE_MODE: safeMode, PORT: '3001' },
+      });
+      assert.doesNotMatch(stdout + stderr, /SECRETKEY|bsc\.example|0x0123/);
+      assertNoSecretSlices(stdout + stderr, key);
+      assert.deepEqual(JSON.parse(stdout.trim().split('\n').at(-1) ?? ''), {
+        rpc: true, executor: true, utility: true, safeMode: safeMode === 'true',
+      });
+    }
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('#56 scheduler config failure cannot log malformed seed fragments', async () => {
+  const seed = '0123456789abcdef'.repeat(4);
+  for (const raw of [seed, `0x${seed.slice(1)}`, `"0x${seed}"`]) {
+    const result = await runScript('scripts/scheduler.ts', { SESSION_KEY_MASTER_SEED: raw });
+    assert.equal(result.code, 1);
+    assert.match(result.output, /SESSION_KEY_MASTER_SEED/);
+    assertNoSecretSlices(result.output, seed);
+  }
+});
+
+test('#56 preflight RPC network, timeout and missing data errors never log endpoint keys', async () => {
+  for (const mode of ['network', 'timeout', 'missing']) {
+    const result = await runScript('scripts/preflight.ts', { RPC_URL: 'https://bsc.example/v1/SECRETKEY' }, `
+      globalThis.fetch = async () => {
+        if (${JSON.stringify(mode)} === 'timeout') throw new DOMException('https://bsc.example/v1/SECRETKEY', 'TimeoutError');
+        if (${JSON.stringify(mode)} === 'missing') return Response.json({ error: { code: -32000, message: 'https://bsc.example/v1/SECRETKEY' } });
+        throw new Error('https://bsc.example/v1/SECRETKEY');
+      };
+    `);
+    assert.equal(result.code, 1);
+    assert.match(result.output, /RPC 連線/);
+    assert.doesNotMatch(result.output, /SECRETKEY|bsc\.example/);
+  }
+});
+
+test('#56 preflight later RPC, bundler and DB failures hide URLs and upstream error text', async () => {
+  for (const bundlerFailure of ['network', 'timeout', 'json', 'api']) {
+    const result = await runScript('scripts/preflight.ts', {
+      RPC_URL: 'https://bsc.example/v1/SECRETKEY', BUNDLER_URL: 'https://bundler.example/SECRETKEY',
+      REGISTRY_ADDRESS: OWNER, EXECUTOR_ADDRESS: OTHER,
+    }, `
+      globalThis.fetch = async (url, init) => {
+        if (String(url).includes('bundler.example')) {
+          if (${JSON.stringify(bundlerFailure)} === 'timeout') throw new DOMException('https://bundler.example/SECRETKEY', 'TimeoutError');
+          if (${JSON.stringify(bundlerFailure)} === 'json') return new Response('https://bundler.example/SECRETKEY');
+          if (${JSON.stringify(bundlerFailure)} === 'api') return Response.json({ error: { message: 'SECRETKEY' } });
+          throw new Error('https://bundler.example/SECRETKEY');
+        }
+        const body = JSON.parse(init.body);
+        if (body.method === 'eth_chainId') return Response.json({ jsonrpc: '2.0', id: body.id, result: '0x539' });
+        if (body.method === 'eth_blockNumber') return Response.json({ jsonrpc: '2.0', id: body.id, result: '0x2a' });
+        return Response.json({ jsonrpc: '2.0', id: body.id, error: { code: -32601, message: 'https://bsc.example/v1/SECRETKEY' } });
+      };
+    `);
+    assert.equal(result.code, 1);
+    for (const label of ['RPC 連線', 'registry 的 code', 'executor 的 code', 'executor.oracle', 'bundler', 'DB 連線']) {
+      assert.ok(result.output.includes(label), `missing check: ${label}`);
+    }
+    assert.doesNotMatch(result.output, /SECRETKEY|bsc\.example|bundler\.example|postgres:\/\//);
+  }
+});
+
+test('#56 preflight logs only validated bundler entrypoint addresses', async () => {
+  const entrypoint = '0x0000000071727De22E5E9d8BAf0edAc6f37da032';
+  for (const result of [[entrypoint], ['https://bundler.example/SECRETKEY'], [entrypoint, 'SECRETKEY'], [null], [], null]) {
+    const run = await runScript('scripts/preflight.ts', {
+      RPC_URL: 'https://bsc.example/v1/SECRETKEY', BUNDLER_URL: 'https://bundler.example/SECRETKEY',
+    }, `
+      globalThis.fetch = async (url, init) => {
+        if (String(url).includes('bundler.example')) return Response.json({ result: ${JSON.stringify(result)} });
+        const body = JSON.parse(init.body);
+        return Response.json({ jsonrpc: '2.0', id: body.id, result: body.method === 'eth_chainId' ? '0x539' : '0x2a' });
+      };
+    `);
+    assert.equal(run.code, 1, 'unconfigured contracts and DB still fail the overall preflight');
+    assert.doesNotMatch(run.output, /SECRETKEY|bsc\.example|bundler\.example/);
+    if (result?.length === 1 && result[0] === entrypoint) {
+      assert.match(run.output, /entryPoints: 0x0000000071727De22E5E9d8BAf0edAc6f37da032/);
+    } else {
+      assert.match(run.output, /沒有回 entryPoints/);
+    }
+  }
+});
 
 for (const strict of [true, false]) {
   test(`executor pause preflight (strict=${strict}) distinguishes false, true and unreadable`, () => {

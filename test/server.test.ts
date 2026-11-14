@@ -10,6 +10,45 @@ import { createPlatformStatusReader, EXECUTOR_BUY_ABI, EXECUTOR_PAUSE_ABI, PLATF
 import type { PlatformStatusConfig } from '../src/chain.js';
 import { closePool, query as dbQuery } from '../src/db.js';
 import { createServer, resolveOperatorWallets } from '../src/server.js';
+import { assertNoSecretSlices, runScript } from './fixtures/secret-output.js';
+
+test('#56 API validates malformed session config before migration or listening', async () => {
+  const seed = '0123456789abcdef'.repeat(4);
+  for (const raw of [seed, `0x${seed.slice(1)}`, `0x${seed}0`, `"0x${seed}"`]) {
+    const result = await runScript('src/index.ts', { SESSION_KEY_MASTER_SEED: raw, MIGRATIONS_ENABLED: '1' });
+    assert.equal(result.code, 1);
+    assert.match(result.output, /startup failed/);
+    assert.match(result.output, /SESSION_KEY_MASTER_SEED/);
+    assert.doesNotMatch(result.output, /migrations|listening|ENOENT|ECONNREFUSED/);
+    assertNoSecretSlices(result.output, seed);
+  }
+});
+
+test('#56 API starts with missing/blank seed and accepts a valid 32-byte seed', async () => {
+  for (const seed of [undefined, '', '   ', `0x${'01'.repeat(32)}`]) {
+    const result = await runScript('src/index.ts', { SESSION_KEY_MASTER_SEED: seed }, `
+      const originalLog = console.log;
+      console.log = (...args) => {
+        originalLog(...args);
+        if (args.some(arg => String(arg).includes('cre8-atp-backend listening'))) {
+          process.kill(process.pid, 'SIGTERM');
+        }
+      };
+    `);
+    assert.equal(result.code, 0);
+    assert.match(result.output, /cre8-atp-backend listening/);
+    assert.match(result.output, /shutting down/);
+  }
+});
+
+test('#56 API rejects an invalid executor before migration without echoing its value', async () => {
+  const secret = 'misplaced-secret-key-value';
+  const result = await runScript('src/index.ts', { EXECUTOR_ADDRESS: secret, MIGRATIONS_ENABLED: '1' });
+  assert.equal(result.code, 1);
+  assert.match(result.output, /EXECUTOR_ADDRESS/);
+  assert.doesNotMatch(result.output, /migrations|listening|ENOENT|ECONNREFUSED/);
+  assertNoSecretSlices(result.output, secret);
+});
 
 test('POST /platform/status returns 405 with Allow: GET before reading any dependencies', async () => {
   const server = createServer({ platformStatus: async () => { throw new Error('must not read'); } });

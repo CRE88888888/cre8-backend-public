@@ -119,10 +119,10 @@ function describeEnvironment(args: Args): void {
   const bundler = firstNonEmpty(process.env.BUNDLER_URL);
 
   console.log('[scheduler] 設定');
-  console.log(`  RPC            ${rpc ?? '(未設定 → 讀鏈會失敗，見 docs/pitfalls §8.12)'}`);
+  console.log(`  RPC            ${rpc === undefined ? '(未設定 → 讀鏈會失敗，見 docs/pitfalls §8.12)' : '(configured)'}`);
   console.log(`  REGISTRY       ${registry ?? '(未設定)'}`);
   console.log(`  EXECUTOR       ${String(executor as Address | null)}`);
-  console.log(`  BUNDLER        ${bundler ?? '(未設定 → 預設 http://127.0.0.1:3001，只有 live 會用到)'}`);
+  console.log(`  BUNDLER        ${bundler === undefined ? '(未設定 → 預設 http://127.0.0.1:3001，只有 live 會用到)' : '(configured)'}`);
   console.log(`  模式           ${args.mode === 'once' ? '--once（跑一輪）' : `--loop（每 ${args.intervalSeconds} 秒一輪）`}`);
   console.log(`  送出交易       ${args.live ? '是（--live）' : '否（沒有 --live：dry-run）'}`);
   console.log(`  limit          ${args.limit}`);

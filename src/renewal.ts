@@ -1,7 +1,7 @@
 import type { Address, Hex, PublicClient } from 'viem';
 import { KERNEL_V3_3_ADDRESSES, KERNEL_VERSION_STRING } from './addresses.js';
 import { getChain } from './chain.js';
-import { getConfig, requireSessionKeyConfig } from './config.js';
+import { ConfigurationError, getConfig, requireSessionKeyConfig } from './config.js';
 import { query } from './db.js';
 import { AppError, ValidationError } from './errors.js';
 import {
@@ -206,8 +206,7 @@ export async function buildRenewalParams(
   const find = deps.requireOwnedPortfolio ?? requireOwnedPortfolio;
   const portfolio = await find(portfolioId, wallet);
 
-  // 缺 env 的訊息本身就是診斷（指出缺哪一個、那一個在做什麼），所以整段搬進 500 的 body：
-  // 讓它變成 `INTERNAL: internal server error` 等於把唯一有用的資訊丟掉。
+  // 設定診斷只留在 server log；HTTP 使用固定訊息，避免 env 或底層例外外洩。
   const sessionKeyConfig = resolveSessionKeyConfigOrFail(deps.sessionKeyConfig);
   const publicClient = deps.publicClient ?? getChain().publicClient;
   const validUntil = (deps.validUntil ?? sessionValidUntil)();
@@ -261,20 +260,22 @@ export function resolveBundlerUrl(env: NodeJS.ProcessEnv = process.env): string 
   return raw === undefined || raw === '' ? DEFAULT_BUNDLER_URL : raw;
 }
 
-/**
- * 缺 session key env 的錯誤要帶上原文（它指出缺哪一個變數），不然前端只會看到一個沒有資訊的 500。
- */
+/** 只記錄 config parser 產生的安全診斷；未知例外的原文與 cause 都不輸出。 */
 function resolveSessionKeyConfigOrFail(
   fromDeps: RenewalParamsDeps['sessionKeyConfig'] | undefined,
 ): { executorAddress: Address; masterSeed: Hex } {
   try {
     return (fromDeps ?? requireSessionKeyConfig)();
   } catch (err) {
+    console.error(JSON.stringify({
+      level: 'error',
+      msg: 'session key configuration failed',
+      error: err instanceof ConfigurationError ? err.message : '無法載入 session key 設定',
+    }));
     throw new AppError(
       500,
       'SESSION_KEY_CONFIG',
-      `續期需要 session key 設定：${err instanceof Error ? err.message : String(err)}`,
-      { cause: err },
+      '續期需要有效的 session key 設定，請聯絡管理員',
     );
   }
 }

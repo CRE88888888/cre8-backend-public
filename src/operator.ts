@@ -670,6 +670,8 @@ export type OperatorPlanPreview = {
 };
 
 export type RebalanceDeps = {
+  /** Only the owner route opts into restoring a portfolio paused by an exit. */
+  resumeIfPaused?: boolean;
   quoteAggregator?: AggregatorQuoter;
   query?: QueryFn;
   requireOwnedPortfolio?: typeof requireOwnedPortfolio;
@@ -822,9 +824,11 @@ export async function runOperatorRebalance(
   // 使用者主動要求跑一輪 = 「請幫我管理這個投組」→ 若之前因為清倉被暫停，這裡接回來。
   // 排程器只認領 `schedule_state = 'active'`，不接回來的話「入金後再也不會自動再平衡」。
   // 只在使用者端（owner）做：營運端的 Run round 不該改變使用者設定的排程狀態。
-  await dbQuery(`update portfolios set schedule_state = 'active' where id = $1 and schedule_state = 'paused'`, [
-    portfolioId,
-  ]);
+  if (deps.resumeIfPaused === true) {
+    await (deps.query ?? dbQuery)(`update portfolios set schedule_state = 'active' where id = $1 and schedule_state = 'paused'`, [
+      portfolioId,
+    ]);
+  }
 
   const run = deps.runSchedulerOnce ?? runSchedulerOnce;
   const round = await run(
@@ -1233,7 +1237,7 @@ export type RedeemResult = {
   steps: { tokenIn: string; tokenOut: string; amountIn: string; amountOutMin: string; venue: string }[];
   /** 保留既有欄位：首批仍為請求的 usd，close 為投組總值；續作為請求的 sellUsdE8。 */
   redeemedUsdE8: string;
-  /** 非現金待賣名義額，可直接帶回 sellUsdE8；規劃前被擋住的首批為 null（未知），不是 0。 */
+  /** 非現金待賣名義額；尚未規劃、只對帳或送出結果未知時為 null，不能當成可重送量。 */
   remainingUsdE8: string | null;
   batched: boolean;
 };
@@ -1267,8 +1271,9 @@ async function runOperatorSell(portfolioId: number, wallet: string, request: Sel
   const details = planning.result;
   const requested = typeof request === 'bigint' ? request : 'sellUsdE8' in request ? request.sellUsdE8 : details?.portfolioTotalUsdE8 ?? 0n;
   const outcome = result === undefined || result.portfolioId !== portfolioId ? 'blocked' : operatorOutcome(result);
-  const wanted = details?.requestedSellUsdE8 ?? (typeof request === 'object' && 'sellUsdE8' in request ? request.sellUsdE8 : null);
-  const remaining = wanted === null ? null : wanted - (outcome === 'executed' ? details?.plannedSellUsdE8 ?? 0n : 0n);
+  const wanted = details?.requestedSellUsdE8 ?? null;
+  const remaining = wanted === null || details === null || result?.execution?.status === 'unknown'
+    ? null : wanted - (outcome === 'executed' ? details.plannedSellUsdE8 : 0n);
   let reason = result?.reason ?? `排程器沒有認領 portfolio ${portfolioId}（排程狀態或 smart account 不允許）`;
   const nothingToSell = details?.plan.kind === 'noop' && details.plan.reason === 'nothing to sell';
   if (nothingToSell) reason = 'nothing to sell';

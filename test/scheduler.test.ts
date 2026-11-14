@@ -43,7 +43,7 @@ import type {
   ReconcileInput,
 } from '../src/scheduler.js';
 import type { PortfolioPlan } from '../src/snapshot.js';
-import { runOperatorClose, runOperatorRedeem } from '../src/operator.js';
+import { runOperatorClose, runOperatorRedeem, runOperatorRebalance } from '../src/operator.js';
 import { sellFixture } from './fixtures/max-leg.js';
 
 /**
@@ -544,6 +544,7 @@ function stubChain(overrides: Partial<StubChain> = {}): StubChain {
 
 function deps(db: StubDb, chain: StubChain, extra: SchedulerDeps = {}): SchedulerDeps {
   return {
+    ...stubPortfolioLock(db),
     withTransaction: stubWithTransaction(db),
     query: stubQuery(db),
     chainId: TEST_CHAIN_ID,
@@ -591,6 +592,114 @@ function deps(db: StubDb, chain: StubChain, extra: SchedulerDeps = {}): Schedule
     ...extra,
   };
 }
+
+const portfolioLocks = new WeakMap<StubDb, Set<number>>();
+function stubPortfolioLock(db: StubDb) {
+  let held = portfolioLocks.get(db);
+  if (held === undefined) { held = new Set(); portfolioLocks.set(db, held); }
+  const locks = held;
+  return { withPortfolioLock: async <T>(id: number, fn: () => Promise<T>): Promise<T | null> => {
+    if (locks.has(id)) return null;
+    locks.add(id);
+    try { return await fn(); } finally { locks.delete(id); }
+  } };
+}
+
+test('#57 concurrent rounds cannot send a second plan from stale holdings after A settles', async () => {
+  const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+  const chain = stubChain();
+  let enterA = () => {};
+  const entered = new Promise<void>((resolve) => { enterA = resolve; });
+  let continueA = () => {};
+  const continuePlanning = new Promise<void>((resolve) => { continueA = resolve; });
+  let settleA = () => {};
+  const settled = new Promise<void>((resolve) => { settleA = resolve; });
+  const base = deps(db, chain);
+  const options = { ...base, withTransaction: singlePortfolioClaim(PORTFOLIO_ID, base.withTransaction) };
+  const first = runSchedulerOnce({ dryRun: false, now: NOW }, { ...options,
+    planRebalance: async () => { enterA(); await continuePlanning; return readyPlan(); },
+  }).finally(settleA);
+  await entered;
+  const second = runSchedulerOnce({ dryRun: false, now: NOW }, { ...options,
+    planRebalance: async () => {
+      const stale = readyPlan();
+      await settled;
+      return { ...stale, deadline: stale.deadline + 1n };
+    },
+  });
+  // Let B finish claiming while A still owns the planning window.
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  continueA();
+  const rounds = await Promise.all([first, second]);
+  assert.equal(chain.executeCalls.length, 1);
+  assert.deepEqual(rounds.flatMap(outcomes).sort(), ['blocked', 'executed']);
+  assert.match(rounds[1]?.results[0]?.reason ?? '', /lock|鎖/);
+});
+
+test('#57 hashless pending needs both expired deadline margin and advanced same-key nonce', async () => {
+  const saved = (42n << 64n) + 5n;
+  for (const delta of [-1n, 0n, 1n]) for (const nonce of [saved - 1n, saved, saved + 1n, saved + (1n << 64n)]) {
+    const op = releasableOperation({ state: 'pending', userOpHash: null, userOpNonce: saved.toString() });
+    const db = stubDb({ portfolios: [portfolio()], operations: [op] });
+    const chain = stubChain();
+    const round = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain, {
+      reconcileRebalance: async () => { assert.fail('no hash to look up'); },
+      readLatestBlockTimestamp: async () => readyPlan().deadline + 300n + delta,
+      readEntryPointNonce: async ({ key }) => { assert.equal(key, 42n); return nonce; },
+    }));
+    const released = delta > 0n && nonce === saved + 1n;
+    assert.deepEqual(outcomes(round), [released ? 'noop' : 'blocked']);
+    assert.equal(op.state, released ? 'expired' : 'pending');
+    assert.equal(op.userOpHash, null);
+    assert.equal(op.attempts, 1);
+    assert.equal(chain.executeCalls.length, 0);
+    assert.equal(chain.planPortfolioCalls.length, 0);
+  }
+});
+
+test('#57 hashless pending fails closed for missing data, RPC/DB failures, stale evidence and dry-run', async () => {
+  for (const failure of ['deadline', 'nonce', 'submitted', 'multiple', 'time-rpc', 'nonce-rpc', 'db', 'changed', 'dry-run'] as const) {
+    const op = releasableOperation({ state: 'pending', userOpHash: null });
+    if (failure === 'deadline') op.deadline = null;
+    if (failure === 'nonce') op.userOpNonce = null;
+    if (failure === 'submitted') op.state = 'submitted';
+    const db = stubDb({ portfolios: [portfolio()], operations: [op,
+      ...(failure === 'multiple' ? [releasableOperation({ idempotencyKey: 'other' })] : [])] });
+    const original = stubQuery(db);
+    const chain = stubChain();
+    const round = await runSchedulerOnce({ dryRun: failure === 'dry-run', now: NOW }, deps(db, chain, {
+      readLatestBlockTimestamp: async () => { if (failure === 'time-rpc') throw new Error('private-token'); return readyPlan().deadline + 301n; },
+      readEntryPointNonce: async () => { if (failure === 'nonce-rpc') throw new Error('private-token'); return 1n; },
+      withTransaction: async (fn) => fn({ query: async (sql, params) => {
+        if (sql.includes("set state = 'expired'")) {
+          if (failure === 'db') throw new Error('private-token');
+          if (failure === 'changed') op.userOpHash = '0x1234';
+        }
+        return original(sql, params);
+      } }),
+    }));
+    assert.deepEqual(outcomes(round), ['blocked'], failure);
+    assert.equal(op.state, failure === 'submitted' ? 'submitted' : 'pending');
+    assert.equal(chain.planPortfolioCalls.length, 0);
+    assert.equal(chain.executeCalls.length, 0);
+    assert.doesNotMatch(JSON.stringify(round), /private-token/);
+  }
+});
+
+test('#57 live lock failures block sending, and dry-run never acquires an execution lock', async () => {
+  for (const dryRun of [true, false]) {
+    const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+    const chain = stubChain();
+    let lockCalls = 0;
+    const round = await runSchedulerOnce({ dryRun, now: NOW }, deps(db, chain, {
+      withPortfolioLock: async () => { lockCalls += 1; throw new Error('lock unavailable'); },
+    }));
+    assert.deepEqual(outcomes(round), [dryRun ? 'ready-dry-run' : 'blocked']);
+    assert.equal(lockCalls, dryRun ? 0 : 1);
+    assert.equal(chain.executeCalls.length, 0);
+    assert.equal(db.operations.length, 0);
+  }
+});
 
 type Outcome = PortfolioRunResult['outcome'];
 
@@ -2303,6 +2412,20 @@ test('認領（真的 Postgres）：paused／idle／未到期不被認領，NULL
   const idle = await seedPortfolio({ state: 'idle', nextRunAt: null, serial: 4 });
   const future = await seedPortfolio({ state: 'active', nextRunAt: new Date(Date.now() + 3_600_000), serial: 5 });
 
+  // #57 operator Run round must preserve the user's exit; only the owner opts into resuming.
+  const owned = async () => ({ id: paused.id, userId: OWNER, strategyId: STRATEGY_ID, version: 1,
+    scheduleState: 'paused', createdAt: NOW.toISOString(), chainId: REAL_CHAIN_ID,
+    accountAddress: paused.account, ownerAddress: OWNER, existingKeyRefs: [] });
+  const rebalanceDeps = { requireOwnedPortfolio: owned,
+    runSchedulerOnce: async () => ({ claimed: 0, dryRun: false, results: [] }),
+  };
+  await runOperatorRebalance(paused.id, 'operator', rebalanceDeps);
+  const state = async () => (await query<{ schedule_state: string }>('select schedule_state from portfolios where id = $1', [paused.id])).rows[0]?.schedule_state;
+  assert.equal(await state(), 'paused');
+  await runOperatorRebalance(paused.id, OWNER, { ...rebalanceDeps, ...{ resumeIfPaused: true } });
+  assert.equal(await state(), 'active');
+  await query("update portfolios set schedule_state = 'paused' where id = $1", [paused.id]);
+
   const now = new Date();
   const claimed = await claimDuePortfolios(50, now, { chainId: REAL_CHAIN_ID });
   const ids = claimed.map((entry) => entry.portfolioId).sort((left, right) => left - right);
@@ -2374,7 +2497,6 @@ test('認領（真的 Postgres）：paused／idle／未到期不被認領，NULL
     planRebalance: async () => {
       const sequence = ++planners;
       firstPlanning();
-      if (planners === 2) finishPlanning();
       await barrier;
       return { ...readyPlan(), deadline: readyPlan().deadline + BigInt(sequence) };
     },
@@ -2391,7 +2513,10 @@ test('認領（真的 Postgres）：paused／idle／未到期不被認領，NULL
   };
   const firstRound = runSchedulerOnce({ dryRun: false, now }, options);
   await entered;
-  const rounds = await Promise.all([firstRound, runSchedulerOnce({ dryRun: false, now }, options)]);
+  const blockedRound = await runSchedulerOnce({ dryRun: false, now }, options);
+  assert.match(blockedRound.results[0]?.reason ?? '', /PORTFOLIO_LOCK_BUSY/);
+  finishPlanning();
+  const rounds = await Promise.all([firstRound, blockedRound]);
   assert.deepEqual(rounds.map((r) => outcomes(r)), [['blocked'], ['blocked']]);
   assert.equal(sends, 1, '不同 planHash 仍只能送一筆');
   const pending = (await query<{ state: string; attempts: number }>(
@@ -2413,7 +2538,6 @@ test('認領（真的 Postgres）：paused／idle／未到期不被認領，NULL
     reconcileRebalance: async () => {
       reconciliationCount += 1;
       enterRelease();
-      if (reconciliationCount === 2) releaseBoth();
       await bothRead;
       return { kind: 'not_found' };
     },
@@ -2423,7 +2547,11 @@ test('認領（真的 Postgres）：paused／idle／未到期不被認領，NULL
   };
   const firstRelease = runSchedulerOnce({ dryRun: false, now }, releaseOptions);
   await firstReleaseEntered;
-  const released = await Promise.all([firstRelease, runSchedulerOnce({ dryRun: false, now }, releaseOptions)]);
+  const blockedRelease = await runSchedulerOnce({ dryRun: false, now }, releaseOptions);
+  assert.match(blockedRelease.results[0]?.reason ?? '', /PORTFOLIO_LOCK_BUSY/);
+  releaseBoth();
+  const released = await Promise.all([firstRelease, blockedRelease]);
+  assert.equal(reconciliationCount, 1, 'only the lock owner reads reconciliation evidence');
   assert.deepEqual(released.flatMap(outcomes).sort(), ['blocked', 'noop'], '同時釋放只能有一個 CAS 成功');
   assert.equal(releaseLogs.filter((line) => line.startsWith('[scheduler] portfolio') && line.includes('operation ') && line.includes('安全釋放')).length, 1);
   assert.equal(sends, 1, '釋放當輪不送');
@@ -2441,6 +2569,26 @@ test('認領（真的 Postgres）：paused／idle／未到期不被認領，NULL
     'select state, attempts from operations where portfolio_id = $1 order by id', [due.id])).rows;
   assert.deepEqual(states.map((op) => [op.state, op.attempts]), [['expired', 1], ['confirmed', 1]]);
   assert.equal(sends, 2, '新 key 僅送一次，舊列不重試');
+
+  // #57: A confirms before B's old snapshot would reach the short gate. The session lock
+  // must reject B before it can capture that snapshot, even though A leaves no pending row.
+  let enterSuccess = () => {};
+  const successEntered = new Promise<void>((resolve) => { enterSuccess = resolve; });
+  let allowSuccess = () => {};
+  const canSucceed = new Promise<void>((resolve) => { allowSuccess = resolve; });
+  const successfulOptions: SchedulerDeps = { ...options,
+    planRebalance: async () => { enterSuccess(); await canSucceed; return { ...readyPlan(), deadline: readyPlan().deadline + 20000n }; },
+    executeRebalance: async () => { sends += 1; return { status: 'success', userOpHash: '0xaaa', txHash: '0xbbb', gasUsed: '123', error: null }; },
+  };
+  const successA = runSchedulerOnce({ dryRun: false, now }, successfulOptions);
+  await successEntered;
+  const staleB = await runSchedulerOnce({ dryRun: false, now }, { ...successfulOptions,
+    planPortfolio: async () => { assert.fail('B cannot capture a stale snapshot while A plans'); },
+  });
+  allowSuccess();
+  assert.deepEqual(outcomes(await successA), ['executed']);
+  assert.deepEqual(outcomes(staleB), ['blocked']);
+  assert.equal(sends, 3, 'A confirmed, B still sends nothing');
 
   console.log(
     `[claim/真 DB] 認領 ${claimed.map((entry) => `${entry.portfolioId}(${entry.intervalSeconds}s)`).join(', ')}；` +
@@ -3214,7 +3362,7 @@ test('#42 receipt timeout then another close is blocked and sends only once', as
   c.chain.executeResult = { ...c.chain.executeResult, status: 'unknown', error: 'receipt timeout' };
   const first = await runOperatorClose(PORTFOLIO_ID, OWNER, c.options);
   assert.equal(first.outcome, 'blocked');
-  assert.equal(first.remainingUsdE8, '20000000000', 'unconfirmed batch is not subtracted');
+  assert.equal(first.remainingUsdE8, null, 'unknown execution must not advertise a retry amount');
   const reads = c.f.state.reads.length;
   const second = await runOperatorClose(PORTFOLIO_ID, OWNER, c.options);
   assert.equal(second.outcome, 'blocked');
@@ -3244,6 +3392,24 @@ test('#40 redeem delays scheduling, preserves an already later time, and reports
   const delayed = c.f.state.writes.find((write) => write.sql.includes('greatest(next_run_at'));
   assert.ok(delayed);
   assert.deepEqual(delayed.params, [PORTFOLIO_ID, PARTIAL_FOLLOW_UP_SECONDS]);
+});
+
+test('#57 continuation after receipt timeout and reconciliation never repeats the requested sale amount', async () => {
+  const c = exitCase('active', { reconcileRebalance: async () => ({ kind: 'found', outcome: {
+    status: 'success', userOpHash: '0xabc123', txHash: '0xdef456', gasUsed: '250000', error: null,
+  } }) });
+  c.chain.executeResult = { ...c.chain.executeResult, status: 'unknown', error: 'receipt timeout' };
+  const amount = { sellUsdE8: 20000000000n };
+  const first = await runOperatorRedeem(PORTFOLIO_ID, OWNER, amount, c.options);
+  assert.equal(first.outcome, 'blocked');
+  assert.equal(first.remainingUsdE8, null);
+  const reads = c.f.state.reads.length;
+  const second = await runOperatorRedeem(PORTFOLIO_ID, OWNER, amount, c.options);
+  assert.equal(second.outcome, 'executed');
+  assert.equal(second.remainingUsdE8, null);
+  assert.notEqual(second.remainingUsdE8, amount.sellUsdE8.toString());
+  assert.equal(c.f.state.reads.length, reads, 'reconciliation never invokes the sell planner');
+  assert.equal(c.chain.executeCalls.length, 1);
 });
 
 test('#40 DB failure after confirmed sale keeps tx/progress visible and gives a sanitized scheduling warning', async () => {

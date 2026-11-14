@@ -7,6 +7,7 @@ import type { PrivateKeyAccount } from 'viem/accounts';
 import { createSiweMessage } from 'viem/siwe';
 
 import { ForbiddenError } from '../src/errors.js';
+import { query } from '../src/db.js';
 import type { HoldingScanResult } from '../src/holdings-scan.js';
 import {
   OPERATOR_REBALANCE_ENV,
@@ -760,6 +761,31 @@ const ANVIL_MNEMONIC = 'test test test test test test test test test test test j
 const OPERATOR_WALLET = mnemonicToAccount(ANVIL_MNEMONIC, { addressIndex: 4 });
 const UNRELATED_WALLET = mnemonicToAccount(ANVIL_MNEMONIC, { addressIndex: 7 });
 const SAMPLE_PREVIEW = { portfolioId: PORTFOLIO_ID, outcome: 'ready' as const, reason: 'dry-run', steps: [] };
+
+test('#57 default HTTP handlers preserve operator-paused state and resume only for the authenticated owner', async () => {
+  const strategy = (await query<{ id: string }>("insert into strategies (provider, name) values ($1, '#57 route fixture') returning id", [WALLET.address.toLowerCase()])).rows[0];
+  assert.ok(strategy);
+  const row = (await query<{ id: string }>("insert into portfolios (user_id, strategy_id, version, schedule_state) values ($1, $2, 1, 'paused') returning id", [WALLET.address.toLowerCase(), strategy.id])).rows[0];
+  assert.ok(row);
+  try {
+    await query("insert into smart_accounts (portfolio_id, chain_id, address, owner, account_type) values ($1, 56, $2, $3, 'KERNEL')", [row.id, ACCOUNT.toLowerCase(), WALLET.address.toLowerCase()]);
+    const state = async () => (await query<{ schedule_state: string }>('select schedule_state from portfolios where id = $1', [row.id])).rows[0]?.schedule_state;
+    await withServer(async (base) => {
+      const operator = await loginToken(base, OPERATOR_WALLET);
+      const owner = await loginToken(base, WALLET);
+      const unrelated = await loginToken(base, UNRELATED_WALLET);
+      assert.equal((await postJson(base, `/operator/portfolios/${row.id}/rebalance`, {}, operator)).status, 200);
+      assert.equal(await state(), 'paused');
+      assert.equal((await postJson(base, `/portfolios/${row.id}/rebalance`, {}, unrelated)).status, 403);
+      assert.equal(await state(), 'paused');
+      assert.equal((await postJson(base, `/portfolios/${row.id}/rebalance`, {}, owner)).status, 200);
+      assert.equal(await state(), 'active');
+    }, { operatorWallets: [OPERATOR_WALLET.address], operatorRebalanceEnabled: () => true });
+  } finally {
+    await query('delete from portfolios where id = $1', [row.id]);
+    await query('delete from strategies where id = $1', [strategy.id]);
+  }
+});
 const OPERATOR_ROUTES = [
   { method: 'GET', path: '/operator/overview', body: { portfolios: [] } },
   { method: 'GET', path: '/operator/activity?limit=7', body: { activity: [] } },

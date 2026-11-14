@@ -107,7 +107,7 @@ import { detectAlerts, formatAlert, recordAlerts, resolveAlerts, createPriceSour
 import type { AlertFinding, AlertKind, PriceSourceTracker } from './alerts.js';
 import { a10ErrorMessage, EXECUTOR_BUY_ABI, readGlobalPaused, decodePriceSourceError, describePriceSourceError, PriceSourceError, inspectPriceSources } from './chain.js';
 import { getConfig, getSessionKeyConfig, requireSessionKeyConfig } from './config.js';
-import { errorMessage, query as dbQuery, withTransaction } from './db.js';
+import { errorMessage, query as dbQuery, withTransaction, withPortfolioLock } from './db.js';
 import { buildSessionPermissions } from './permissions.js';
 import { DEFAULT_DEADLINE_SECONDS as PLAN_DEFAULT_DEADLINE_SECONDS, planRebalance, readMaxLegUsdE8, refreshFloors } from './rebalance-plan.js';
 import { writeSnapshot as writeSnapshotImpl } from './snapshot.js';
@@ -508,6 +508,8 @@ export type FloorRefreshInput = {
 };
 
 export type SchedulerDeps = {
+  /** Must hold exclusion from the first snapshot through settlement. null means busy. */
+  withPortfolioLock?: typeof withPortfolioLock;
   priceSourceChecks?: () => Promise<PriceSourceObservation[]>;
   priceSourceTracker?: PriceSourceTracker;
   /** Checked once before each round. An unavailable RPC blocks every claimed portfolio. */
@@ -1497,6 +1499,7 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
 
   return {
     query,
+    withPortfolioLock: provided.withPortfolioLock ?? withPortfolioLock,
     chainId,
     priceSourceTracker: provided.priceSourceTracker ?? (() => {
       const key = `${chainId}:${provided.executor?.toLowerCase() ?? process.env.EXECUTOR_ADDRESS?.trim().toLowerCase() ?? 'unconfigured'}`;
@@ -1845,7 +1848,7 @@ const SQL_EXPIRE_OPERATION = `
   returning idempotency_key
 `;
 
-/** Only called after BOTH bundler lookups returned explicit null. Never sends in this round. */
+/** Hash present: both bundler lookups must return null. Hashless pending: require both proofs. */
 async function releaseUnresolvedOperation(
   due: DuePortfolio,
   deps: ResolvedDeps,
@@ -1875,10 +1878,14 @@ async function releaseUnresolvedOperation(
     return blocked('先對帳：讀取鏈上時間／EntryPoint nonce 失敗，保留在途');
   }
   const reasons: string[] = [];
+  const hashless = op.user_op_hash === null;
+  if (hashless && (op.state !== 'pending' || timestamp <= deadline + RELEASE_MARGIN_SECONDS || nonce <= savedNonce)) {
+    return blocked('先對帳：無 hash 的 pending 必須 deadline 安全邊際已過且同 key nonce 已前進，保留在途');
+  }
   if (timestamp > deadline + RELEASE_MARGIN_SECONDS) reasons.push(`deadline 已過（鏈上時間 ${timestamp} > ${deadline} + 300 秒）`);
   if (nonce > savedNonce) reasons.push(`nonce 已前進（${nonce} > ${savedNonce}，key ${savedNonce >> 64n}）`);
   if (reasons.length === 0) return blocked('先對帳：deadline 安全邊際未過且 nonce 未前進，保留在途');
-  const reason = `安全釋放：receipt 與原 UserOp 均查無；${reasons.join('；')}；舊操作不可能再成功，標記 expired，下一輪重新規劃`;
+  const reason = `安全釋放：${hashless ? 'pending 未保存 UserOp hash' : 'receipt 與原 UserOp 均查無'}；${reasons.join('；')}；舊操作不可能再成功，標記 expired，下一輪重新規劃`;
   try {
     const released = await deps.withTransaction(async (client) => {
       // Same portfolio lock as beginOperation; no RPC inside this short transaction.
@@ -1913,9 +1920,14 @@ async function runOne(
 
   let result: PortfolioRunResult;
   try {
-    result = ctx.roundBlockReason === null
-      ? await decideAndMaybeExecute(due, ctx, base)
-      : { ...base, outcome: 'blocked', reason: ctx.roundBlockReason };
+    if (ctx.roundBlockReason !== null) {
+      result = { ...base, outcome: 'blocked', reason: ctx.roundBlockReason };
+    } else if (ctx.dryRun) {
+      result = await decideAndMaybeExecute(due, ctx, base);
+    } else {
+      result = await ctx.deps.withPortfolioLock(due.portfolioId, () => decideAndMaybeExecute(due, ctx, base))
+        ?? { ...base, outcome: 'blocked', reason: '[PORTFOLIO_LOCK_BUSY] 投組已被另一輪鎖定，這一輪不規劃、不送交易' };
+    }
   } catch (error) {
     // 一個 portfolio 的例外不該讓整輪停擺（RPC 抖動、某個帳戶的資料不一致）。它會被記成 blocked
     // 並在下一輪重試；next_run_at 已經推進過了，所以不會變成熱迴圈。
@@ -1992,8 +2004,16 @@ async function decideAndMaybeExecute(
   if (unresolved.length > 0) {
     // dry-run 只能報在途，不能因預演而改 operations 或假稱 ready。
     const op = unresolved[0]!;
-    if (ctx.dryRun || unresolved.length > 1 || op.user_op_hash === null) {
+    if (ctx.dryRun || unresolved.length > 1) {
       return { ...base, outcome: 'blocked', reason: `portfolio 還在 ${op.state}（${unresolved.length} 筆未決操作），結果未知，先對帳，不重送` };
+    }
+    if (op.user_op_hash === null) {
+      if (op.state === 'pending') {
+        const released = await releaseUnresolvedOperation(due, ctx.deps, op, base);
+        return released.outcome === 'blocked'
+          ? { ...released, reason: `portfolio 還在 pending（結果未知）；${released.reason}` } : released;
+      }
+      return { ...base, outcome: 'blocked', reason: '先對帳：未決操作缺少 UserOp hash，保留在途，不重送' };
     }
     let reconciliation: ReconcileResult;
     try {

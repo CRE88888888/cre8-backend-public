@@ -288,7 +288,7 @@ const defaultDeps: ServerDeps = {
   recordRenewalResult,
   // 快取要跨請求存活，不能每個請求重建一份。
   portfolioStatus: createPortfolioStatusReader(),
-  operatorRebalance: runOperatorRebalance,
+  operatorRebalance: (portfolioId, wallet) => runOperatorRebalance(portfolioId, wallet, { resumeIfPaused: true }),
   operatorActivity: (limit) => readOperatorActivity(limit),
   // 與 force rebalance 用同一個「不檢查 owner」的注入；差別是這支只讀不送。
   operatorPlanPreview: (portfolioId) =>
@@ -777,7 +777,7 @@ async function planPreviewRoute(
  *
  * 首批 usd 保留 balance × usd / total；續作 sellUsdE8 是正整數字串（E8），忽略 usd，
  * 依當下非現金 oracle 名義額重新分配，不保留首批各資產原始待賣量。
- * remainingUsdE8 可直接帶回 sellUsdE8；0 代表完成，null 代表尚未能規劃。
+ * remainingUsdE8 有值時可直接帶回 sellUsdE8；0 代表完成，null 代表尚未能規劃、只做對帳或送出結果未知。
  */
 async function redeemRoute(
   req: IncomingMessage,

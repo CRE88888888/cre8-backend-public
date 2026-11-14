@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -30,6 +31,19 @@ export const MIGRATIONS_DIR =
 const MIGRATION_LOCK_ID = 8_121_956_001;
 
 let pool: PgPool | null = null;
+// All DB work inside a portfolio lock reuses its client, including short transactions.
+// Reserving a lock client while borrowing other pool clients can exhaust the pool.
+const portfolioClient = new AsyncLocalStorage<PoolClient>();
+
+function timeoutMillis(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (raw === undefined || raw === '') return fallback;
+  const value = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isInteger(value) || value < 1 || value > 2_147_483_647) {
+    throw new Error(`${name} must be an integer between 1 and 2147483647 milliseconds`);
+  }
+  return value;
+}
 
 export function getPool(): PgPool {
   if (pool) return pool;
@@ -41,6 +55,8 @@ export function getPool(): PgPool {
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 5_000,
     application_name: 'cre8-atp-backend',
+    statement_timeout: timeoutMillis('DB_STATEMENT_TIMEOUT_MS', 15_000),
+    idle_in_transaction_session_timeout: timeoutMillis('DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS', 30_000),
   });
   pool.on('error', (err: Error) => {
     // An idle client died (network blip, server restart). The pool discards it; log and move on.
@@ -54,12 +70,13 @@ export function query<T extends QueryResultRow = QueryResultRow>(
   text: string,
   params: readonly unknown[] = [],
 ): Promise<QueryResult<T>> {
-  return getPool().query<T>(text, [...params]);
+  return (portfolioClient.getStore() ?? getPool()).query<T>(text, [...params]);
 }
 
 /** Run `fn` inside BEGIN/COMMIT; rolls back on any throw. */
 export async function withTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
-  const client = await getPool().connect();
+  const scoped = portfolioClient.getStore();
+  const client = scoped ?? await getPool().connect();
   try {
     await client.query('begin');
     const result = await fn(client);
@@ -71,7 +88,40 @@ export async function withTransaction<T>(fn: (client: PoolClient) => Promise<T>)
     });
     throw err;
   } finally {
-    client.release();
+    if (scoped === undefined) client.release();
+  }
+}
+
+/** Nonblocking, cross-process exclusion from planning through settlement. null = already owned. */
+export async function withPortfolioLock<T>(portfolioId: number, fn: () => Promise<T>): Promise<T | null> {
+  if (!Number.isSafeInteger(portfolioId) || portfolioId <= 0) throw new RangeError('invalid portfolio id');
+  // Negative bigint keys keep portfolio locks separate from the positive migration lock.
+  const key = (-BigInt(portfolioId)).toString();
+  const client = await getPool().connect().catch(() => { throw new Error('portfolio lock connection unavailable'); });
+  let acquired = false;
+  let reusable = false;
+  const disconnected = () => { reusable = false; };
+  client.on('error', disconnected);
+  try {
+    acquired = (await client.query<{ acquired: boolean }>(
+      'select pg_try_advisory_lock($1::bigint) as acquired', [key],
+    ).catch(() => { throw new Error('portfolio lock acquisition failed'); })).rows[0]?.acquired === true;
+    reusable = true;
+    if (!acquired) return null;
+    return await portfolioClient.run(client, fn);
+  } finally {
+    if (acquired) {
+      try {
+        reusable = (await client.query<{ unlocked: boolean }>(
+          'select pg_advisory_unlock($1::bigint) as unlocked', [key],
+        )).rows[0]?.unlocked === true;
+      } catch {
+        reusable = false;
+      }
+    }
+    // Acquisition/cleanup errors may leave a session lock behind. Never recycle that session.
+    client.release(!reusable);
+    client.removeListener('error', disconnected);
   }
 }
 

@@ -1,6 +1,7 @@
 import { getAddress, isAddress, isHex, zeroAddress } from 'viem';
 import type { Address, Hex, PublicClient } from 'viem';
 import { EXECUTOR_ABI } from './chain.js';
+import { quoteBoundMinimum } from './swap-slippage.js';
 
 const API = 'https://aggregator-api.kyberswap.com/bsc/api/v1';
 export const AGGREGATOR_TIMEOUT_MS = 5_000;
@@ -14,6 +15,8 @@ export type AggregatorRequest = {
   tokenOut: Address;
   amountIn: bigint;
   minimum: bigint;
+  /** Independent Pancake quote for this exact input and observed block; null when unavailable. */
+  pancakeOut?: bigint | null;
   deadline: bigint;
   blockNumber?: bigint;
   /** Local diagnostics only; never receives upstream text or response data. */
@@ -80,7 +83,9 @@ export async function quoteKyberSwap(request: AggregatorRequest, deps: {
     if ((kind !== 2 && kind !== 3) || [zeroAddress, tokenIn, tokenOut, executor].some((item) => same(spender, item))) return rejected('venue-changed');
     if (kind === 3 && amountIn > (1n << 160n) - 1n) return null;
     const quoted = amount(summary.amountOut);
-    const slippage = (quoted - minimum) * 10_000n / quoted;
+    const amountOutMin = quoteBoundMinimum(minimum, quoted, request.pancakeOut);
+    // Round bps DOWN: floor(quoted * (10000 - slippage) / 10000) stays >= amountOutMin.
+    const slippage = (quoted - amountOutMin) * 10_000n / quoted;
     const built = await json(`${API}/route/build`, { method: 'POST', body: JSON.stringify({
       routeSummary: summary, sender: executor, recipient: executor, deadline: Number(deadline),
       slippageTolerance: Number(slippage > 2000n ? 2000n : slippage), source: 'cre8-atp',
@@ -88,11 +93,15 @@ export async function quoteKyberSwap(request: AggregatorRequest, deps: {
     // APIv1 routerAddress is the transaction target (tx.to). Reject a differing explicit to too.
     const to = address(built.routerAddress);
     if (!same(to, venue) || (built.to !== undefined && !same(address(built.to), venue))) return rejected('venue-changed');
-    if (amount(built.amountOut) < minimum) return rejected('below-floor');
+    // Sanity check only: both summary and built.amountOut are untrusted API claims.
+    // Opaque calldata cannot prove minReturn or recipient here. AtpExecutor must enforce
+    // the actual tokenOut balance delta >= step.amountOutMin (cre8-contracts#24).
+    if (amount(built.amountOut) < amountOutMin) return rejected('below-floor');
     if (amount(built.transactionValue) !== 0n || amount(built.amountIn) !== amountIn ||
         typeof built.data !== 'string' || !isHex(built.data, { strict: true }) ||
         !/^0x(?:[0-9a-fA-F]{2}){4,}$/.test(built.data)) return null;
-    return { venue: to, data: built.data, amountOut: amount(built.amountOut) };
+    // Keep the same quote used to build slippage; the build response cannot inflate route ranking.
+    return { venue: to, data: built.data, amountOut: quoted };
   };
   try {
     const quote = await Promise.race([work().catch(() => null), timeout]);

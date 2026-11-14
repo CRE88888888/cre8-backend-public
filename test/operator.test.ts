@@ -1428,7 +1428,8 @@ test('#47 redeem and close planning share aggregator routing after applying the 
       assert.equal(request.tokenIn, DOGE);
       assert.equal(request.tokenOut, CASH);
       assert.equal(request.executor, f.deps.executor);
-      return { venue: ACCOUNT, data: '0x12345678', amountOut: request.minimum + 1n };
+      assert.ok(request.pancakeOut !== undefined && request.pancakeOut !== null);
+      return { venue: ACCOUNT, data: '0x12345678', amountOut: request.pancakeOut + 1n };
     } });
   assert.equal(result.plan.kind, 'ready');
   if (result.plan.kind !== 'ready') return;

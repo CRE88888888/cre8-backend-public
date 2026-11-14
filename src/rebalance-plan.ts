@@ -96,7 +96,8 @@
 import { EXECUTOR_BUY_ABI, EXECUTOR_ABI, PANCAKE_UR, PANCAKE_DATA_ABI, describePriceSourceError, decodePriceSourceError, PriceSourceError } from './chain.js';
 import { quoteKyberSwap, aggregatorWins } from './aggregator.js';
 import type { AggregatorFailure, AggregatorQuoter } from './aggregator.js';
-import { chooseBestPath, routeImpactBps, singleHopPath } from './routing.js';
+import { quoteBoundMinimum } from './swap-slippage.js';
+import { chooseBestPath, routeImpactBps, singleHopPath, V3_QUOTER } from './routing.js';
 import type { RouteCandidate } from './routing.js';
 import { V2_FACTORY_ADDRESS, V3_FACTORY_ADDRESS, WBNB_ADDRESS } from './addresses.js';
 import { decodeAbiParameters, encodeAbiParameters, encodePacked, getAddress, isAddressEqual } from 'viem';
@@ -114,7 +115,7 @@ export type PlannedStep = {
   tokenOut: Address;
   /** tokenIn 的原幣單位（exact-input）。 */
   amountIn: bigint;
-  /** = minGross：合約要求 `amountOutMin >= minGross`，而 router 用的也是這個值。 */
+  /** 報價扣容差與 buffered minGross 的較大值；實際到帳量仍須由 executor 驗證。 */
   amountOutMin: bigint;
   /** `previewSwap` 的 `minimum`，留作稽核（minGross 是它放大後的結果，看得到原值才對得起來）。 */
   oracleFloor: bigint;
@@ -607,7 +608,7 @@ async function readHead(
  */
 export const AMOUNT_OUT_MIN_BUFFER_BPS = 10n;
 
-/** 把地板加上緩衝，得到實際帶給合約/路由的 `amountOutMin`（見上面的說明）。 */
+/** 地板加上緩衝；實際 amountOutMin 還會取報價扣容差的較大值。 */
 export function amountOutMinWithBuffer(minGross: bigint): bigint {
   return minGross + ceilDiv(minGross * AMOUNT_OUT_MIN_BUFFER_BPS, BPS_BIG);
 }
@@ -620,6 +621,8 @@ export function buildStep(params: {
   amountIn: bigint;
   oracleFloor: bigint;
   minGross: bigint;
+  /** Exact-input quoter output. Omit only for the low-level legacy encoder; routing requires a quote. */
+  quotedAmountOut?: bigint;
   poolFee: number;
   /**
    * 實際成交用的 V3 path（可多跳）。省略 = 用 `poolFee` 組單跳（既有行為）。
@@ -636,7 +639,8 @@ export function buildStep(params: {
   // ⚠ 這個值必須**同時**放進 struct 欄位與 calldata：合約的 pre-check 讀 `step.amountOutMin`，
   // 真正約束成交的是 router 從 `inputs` 解出來的 `amountOutMin`。兩者分岔就是「合約以為有地板、
   // router 卻用另一個值」—— 曾經只加在欄位上，於是 router 仍用未緩衝值（實測差 100 ppm 就 revert）。
-  const amountOutMin = amountOutMinWithBuffer(params.minGross);
+  const minimum = amountOutMinWithBuffer(params.minGross);
+  const amountOutMin = params.quotedAmountOut === undefined ? minimum : quoteBoundMinimum(minimum, params.quotedAmountOut);
   if (params.v2Tokens !== undefined && params.v2Tokens !== null) {
     return {
       tokenIn: params.tokenIn,
@@ -681,9 +685,10 @@ export const PANCAKE_QUOTE_GAS_LIMIT = 500_000n;
 /** Bounds even non-cooperative RPCs; a refresh requires an actual executable quote. */
 async function quotePancake(params: {
   publicClient: PublicClient; tokenIn: Address; tokenOut: Address; amountIn: bigint;
-  poolFee: number | null; blockNumber?: bigint;
+  poolFee: number | null; blockNumber?: bigint; path?: Hex;
 }): Promise<RouteCandidate | null> {
   const { publicClient, tokenIn, tokenOut, amountIn, blockNumber } = params;
+  const path = params.path;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let active = true;
   const quoteClient: PublicClient = { ...publicClient,
@@ -695,9 +700,16 @@ async function quotePancake(params: {
   };
   try {
     return await Promise.race([
-      chooseBestPath(quoteClient, { tokenIn, tokenOut, amountIn, via: WBNB_ADDRESS, factory: V3_FACTORY_ADDRESS,
+      (path === undefined ? chooseBestPath(quoteClient, { tokenIn, tokenOut, amountIn, via: WBNB_ADDRESS, factory: V3_FACTORY_ADDRESS,
         pinnedFee: params.poolFee, blockNumber,
-        v2Factory: process.env.ROUTE_V2_ENABLED === '1' ? V2_FACTORY_ADDRESS : null }).catch(() => null),
+        v2Factory: process.env.ROUTE_V2_ENABLED === '1' ? V2_FACTORY_ADDRESS : null }) :
+        quoteClient.readContract({ address: V3_QUOTER, abi: [{ type: 'function', name: 'quoteExactInput',
+          stateMutability: 'nonpayable', inputs: [{ type: 'bytes' }, { type: 'uint256' }],
+          outputs: [{ type: 'uint256' }, { type: 'uint160[]' }] }] as const, functionName: 'quoteExactInput',
+          args: [path, amountIn], ...(blockNumber === undefined ? {} : { blockNumber }) })
+          .then((result: unknown): RouteCandidate | null => Array.isArray(result) &&
+            typeof result[0] === 'bigint' && result[0] > 0n ? {
+            kind: 'v3', path, amountOut: result[0], hops: (path.length - 42) / 46 } : null)).catch(() => null),
       new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), PANCAKE_QUOTE_TIMEOUT_MS); }),
     ]);
   } finally { active = false; clearTimeout(timer); }
@@ -709,20 +721,22 @@ export async function buildRoutedStep(params: Parameters<typeof buildStep>[0] & 
 }, deps: { quoteAggregator?: AggregatorQuoter } = {}): Promise<PlannedStep | null> {
   const { publicClient, tokenIn, tokenOut, amountIn, executor, blockNumber } = params;
   const minimum = amountOutMinWithBuffer(params.minGross);
-  const [pancake, aggregator, allowed] = await Promise.all([
+  const [pancake, allowed] = await Promise.all([
     quotePancake(params),
-    (deps.quoteAggregator ?? quoteKyberSwap)({ publicClient, executor, tokenIn, tokenOut, amountIn, minimum,
-      deadline: params.deadline, blockNumber }).catch(() => null),
     publicClient.readContract({ address: executor, abi: EXECUTOR_ABI, functionName: 'venues', args: [PANCAKE_UR], blockNumber })
       .then(([kind, spender]) => kind === 1 && isAddressEqual(spender, PANCAKE_UR)).catch(() => false),
   ]);
+  // Build only after the independent quote is known so Kyber and the step use one minimum.
+  const pancakeOut = pancake?.amountOut ?? null;
+  const aggregator = await (deps.quoteAggregator ?? quoteKyberSwap)({ publicClient, executor, tokenIn, tokenOut,
+    amountIn, minimum, pancakeOut, deadline: params.deadline, blockNumber }).catch(() => null);
   if (aggregatorWins(aggregator, allowed ? pancake?.amountOut ?? null : null, minimum, params.feeBps) && aggregator !== null) {
-    return { tokenIn, tokenOut, amountIn, amountOutMin: minimum, oracleFloor: params.oracleFloor,
+    return { tokenIn, tokenOut, amountIn, amountOutMin: quoteBoundMinimum(minimum, aggregator.amountOut, pancakeOut), oracleFloor: params.oracleFloor,
       venue: aggregator.venue, data: aggregator.data };
   }
-  if (!allowed || (pancake !== null && pancake.amountOut < minimum)) return null;
-  return buildStep({ ...params, ...(pancake?.kind === 'v3' ? { path: pancake.path } :
-    pancake?.kind === 'v2' ? { v2Tokens: pancake.tokens } : {}) });
+  if (!allowed || pancake === null || pancake.amountOut < minimum) return null;
+  return buildStep({ ...params, quotedAmountOut: pancake.amountOut, ...(pancake.kind === 'v3' ? { path: pancake.path } :
+    { v2Tokens: pancake.tokens }) });
 }
 
 // ---------------------------------------------------------------------------
@@ -863,28 +877,12 @@ function decodeStepIdentity(
 }
 
 /**
- * 送出前對**每一個** step 重問一次地板，並用新鮮的 `minimum` 重算 `amountOutMin`（= `minGross`）。
- *
- * ## 為什麼是「新鮮值」，不是 `max(規劃值, 新鮮值)`
- *
- * 合約在執行那一塊**自己**重算地板（`_checkStep`：先 `previewSwap`，再
- * `require(step.amountOutMin >= minGross)`），所以 `amountOutMin` 的身份是「下限的下限」：
- *
- *   * `max` 只在「地板變差」時才不等於新鮮值，而那一邊 `max` 剛好是**錯的**方向：它把一個已經不成立
- *     的高值塞進 router 的滑價檢查（`inputs` 裡的 `amountOutMin`），成交價已經下來了，router 就
- *     revert `Too little received`。用過期的約束擋一個已經移動的市場，換來的是另一種 revert，不是安全。
- *   * 新鮮值才是「我不接受比**現在**這個地板更差的成交」—— 地板語意本來就是當下的事實。
- *
- * 「新鮮地板明顯變差還要不要送」是**政策**問題、不是覆寫方向問題，所以另外用
- * `MAX_FLOOR_WORSENING_BPS` 擋（`kind: 'floor-collapsed'`）。
- *
- * ## 為什麼一定要重建 `inputs`
- *
- * `amountOutMin` 在 calldata 裡出現**兩次**：`step.amountOutMin`（合約驗的）與 `inputs[0]` 裡
- * `(recipient, amountIn, amountOutMin, path, payerIsUser)` 的第三個欄位（router 驗的）。只改前者，
- * router 仍然拿舊地板去擋成交（`AtpExecutor` 的 TODO 也說它今天不會替我們覆寫那個值）。所以這裡用
- * 與規劃時**同一個** `buildStep` 重建 commands/inputs，recipient 與 path（含 fee tier）從原本的
- * `inputs[0]` 解回來 —— 除了地板，這一步不該改任何東西。
+ * 送出前逐步重讀地板與可執行報價。amountOutMin = max(buffered minGross, 報價扣容差)，
+ * 聚合器使用 min(API 報價, Pancake 報價)，Pancake 使用原路徑的 quoter 結果。
+ * 新鮮報價取代規劃值，避免市場已移動卻保留過期下限；地板惡化仍由 MAX_FLOOR_WORSENING_BPS 擋。
+ * Pancake 的 struct 與 inputs 一起重建，聚合器 calldata 則重新 build，同時帶入相同下限。
+ * API 自報數字不能證明 calldata 的 minReturn；不透明 venue 的實際 tokenOut 到帳量必須由
+ * AtpExecutor 對 step.amountOutMin 驗證（cre8-contracts#24）。
  */
 export async function refreshFloors(params: {
   publicClient: PublicClient;
@@ -965,28 +963,40 @@ export async function refreshFloors(params: {
       freshAmountOutMin,
       deltaBps,
     });
+    if (deltaBps <= -maxWorseningBps) return { ok: false, kind: 'floor-collapsed',
+      reason: `送出前重問地板：step#${index} 差 ${deltaBps} bps 已超過惡化上限 ${maxWorseningBps} bps，不送交易` };
+    const pancake = await quotePancake({ publicClient, tokenIn: step.tokenIn, tokenOut: step.tokenOut,
+      amountIn: step.amountIn, poolFee: identity?.poolFee ?? null,
+      ...(identity?.path === undefined || identity.path === null ? {} : { path: identity.path }),
+      ...(params.blockNumber === undefined ? {} : { blockNumber: params.blockNumber }) });
     if (identity === null) {
       if (params.executor === undefined || params.deadline === undefined) return { ok: false, kind: 'quote-failed', reason: '聚合器刷新缺少 executor/deadline，不送交易' };
       let failure: AggregatorFailure = 'api-failed';
       const buffered = amountOutMinWithBuffer(freshAmountOutMin);
       const candidate = await (params.quoteAggregator ?? quoteKyberSwap)({ publicClient, executor: params.executor,
         tokenIn: step.tokenIn, tokenOut: step.tokenOut, amountIn: step.amountIn,
-        minimum: buffered, deadline: params.deadline,
+        minimum: buffered, pancakeOut: pancake?.amountOut ?? null, deadline: params.deadline,
         onFailure: (reason) => { failure = reason; },
         ...(params.blockNumber === undefined ? {} : { blockNumber: params.blockNumber }) }).catch(() => null);
       if (candidate !== null && candidate.amountOut >= buffered && isAddressEqual(candidate.venue, step.venue)) {
-        rebuilt.push({ ...step, venue: candidate.venue, data: candidate.data, oracleFloor: minimum, amountOutMin: buffered });
+        rebuilt.push({ ...step, venue: candidate.venue, data: candidate.data, oracleFloor: minimum,
+          amountOutMin: quoteBoundMinimum(buffered, candidate.amountOut, pancake?.amountOut) });
       } else {
         if (candidate !== null) failure = !isAddressEqual(candidate.venue, step.venue) ? 'venue-changed' : 'below-floor';
         const label = { 'api-failed': 'API 失敗／逾時', 'below-floor': '低於地板', 'venue-changed': 'venue 改變' }[failure];
         const diagnostic = `step#${index} 聚合器刷新 ${failure}（${label}），退回 Pancake`;
         (params.log ?? console.log)(`[routing] ${diagnostic}`);
-        const fallback = await pancakeFallback({ ...params, executor: params.executor, step, minimum, minGross: freshAmountOutMin });
+        const fallback = await pancakeFallback({ ...params, executor: params.executor, step, minimum, minGross: freshAmountOutMin, route: pancake });
         if (fallback === null) return { ok: false, kind: 'quote-failed', reason: `${diagnostic}；Pancake 沒有符合新鮮地板的白名單報價，不送交易` };
         rebuilt.push(fallback);
         usedFallback = true;
       }
       continue;
+    }
+    if (pancake === null || pancake.amountOut < amountOutMinWithBuffer(freshAmountOutMin) ||
+        (identity.v2Tokens !== null && (pancake.kind !== 'v2' ||
+          pancake.tokens.map((token) => token.toLowerCase()).join() !== identity.v2Tokens.map((token) => token.toLowerCase()).join()))) {
+      return { ok: false, kind: 'quote-failed', reason: `送出前重問地板失敗：step#${index} 沒有符合地板的原路徑報價，不送交易` };
     }
     rebuilt.push(
       buildStep({
@@ -996,6 +1006,7 @@ export async function refreshFloors(params: {
         amountIn: step.amountIn,
         oracleFloor: minimum,
         minGross: freshAmountOutMin,
+        quotedAmountOut: pancake.amountOut,
         poolFee: identity.poolFee,
         // 逐字保留原本的路徑（V3 可能多跳；V2 是 address[]）。
         ...(identity.v2Tokens === null ? { path: identity.path } : { v2Tokens: identity.v2Tokens }),
@@ -1003,22 +1014,13 @@ export async function refreshFloors(params: {
     );
   }
 
-  const collapsed = refreshes.filter((entry) => entry.deltaBps <= -maxWorseningBps);
-  if (collapsed.length > 0) {
-    return {
-      ok: false,
-      kind: 'floor-collapsed',
-      reason:
-        `送出前重問地板：${collapsed
-          .map((entry) => `step#${entry.index} ${short(entry.tokenIn)}→${short(entry.tokenOut)} 差 ${entry.deltaBps} bps`)
-          .join('；')}` +
-        ` 已超過惡化上限 ${maxWorseningBps} bps → 放棄這一輪（價格前提已不成立，下一輪重新規劃）`,
-    };
-  }
-
   if (usedFallback) {
     const problem = await validateFallbackPlan({ ...params, steps: rebuilt });
     if (problem !== null) return { ok: false, kind: 'quote-failed', reason: problem };
+  }
+  for (const [index, step] of rebuilt.entries()) {
+    const refresh = refreshes[index];
+    if (refresh !== undefined) refresh.freshAmountOutMin = step.amountOutMin;
   }
   return { ok: true, steps: rebuilt, refreshes, note: describeRefreshes(refreshes) };
 }
@@ -1026,20 +1028,19 @@ export async function refreshFloors(params: {
 /** Opaque aggregator data contains no reusable Pancake path. Search without guessing a fee. */
 async function pancakeFallback(params: {
   publicClient: PublicClient; executor: Address; step: PlannedStep; minimum: bigint; minGross: bigint; blockNumber?: bigint;
+  route: RouteCandidate | null;
 }): Promise<PlannedStep | null> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([(async () => {
-      const [route, venue] = await Promise.all([
-        quotePancake({ publicClient: params.publicClient, ...params.step, poolFee: null,
-          ...(params.blockNumber === undefined ? {} : { blockNumber: params.blockNumber }) }),
-        params.publicClient.readContract({ address: params.executor, abi: EXECUTOR_ABI, functionName: 'venues',
-          args: [PANCAKE_UR], ...(params.blockNumber === undefined ? {} : { blockNumber: params.blockNumber }) }),
-      ]);
+      const route = params.route;
+      if (route === null) return null;
+      const venue = await params.publicClient.readContract({ address: params.executor, abi: EXECUTOR_ABI, functionName: 'venues',
+          args: [PANCAKE_UR], ...(params.blockNumber === undefined ? {} : { blockNumber: params.blockNumber }) });
       if (venue[0] !== 1 || !isAddressEqual(venue[1], PANCAKE_UR) || route === null ||
           route.amountOut < amountOutMinWithBuffer(params.minGross)) return null;
       return buildStep({ ...params.step, executor: params.executor, oracleFloor: params.minimum,
-        minGross: params.minGross, poolFee: 0,
+        minGross: params.minGross, quotedAmountOut: route.amountOut, poolFee: 0,
         ...(route.kind === 'v3' ? { path: route.path } : { v2Tokens: route.tokens }) });
     })().catch(() => null), new Promise<null>((resolve) => {
       timer = setTimeout(() => resolve(null), PANCAKE_QUOTE_TIMEOUT_MS);

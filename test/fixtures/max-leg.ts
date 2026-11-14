@@ -46,7 +46,12 @@ export function sellFixture() {
       case 'oracle': case 'oracleOf': case 'pool': return encodeFunctionResult({ abi: ABI, functionName: decoded.functionName, result: ORACLE });
       case 'venues': return encodeFunctionResult({ abi: ABI, functionName: 'venues', result: [1, PANCAKE_UR] });
       case 'getPool': return encodeFunctionResult({ abi: ABI, functionName: 'getPool', result: '0x0000000000000000000000000000000000000000' });
-      case 'quoteExactInput': throw new Error('quoter unavailable in fixture');
+      case 'quoteExactInput': {
+        const selling = decoded.args[0].slice(0, 42).toLowerCase() === DOGE.toLowerCase();
+        const factor = selling ? 10n ** 10n : 1n;
+        const output = decoded.args[1] * factor * state.price + state.quoteOffset;
+        return encodeFunctionResult({ abi: ABI, functionName: 'quoteExactInput', result: [output, []] });
+      }
       case 'fee': return encodeFunctionResult({ abi: ABI, functionName: 'fee', result: 10000 });
       case 'effectiveFeeBps': return encodeFunctionResult({ abi: ABI, functionName: 'effectiveFeeBps', result: 0 });
       case 'decimals': return encodeFunctionResult({ abi: ABI, functionName: 'decimals', result: 18 });

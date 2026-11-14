@@ -1,6 +1,8 @@
 import { PANCAKE_UR, EXECUTOR_ABI } from '../src/chain.js';
 import { quoteKyberSwap, aggregatorWins } from '../src/aggregator.js';
+import { quoteBoundMinimum } from '../src/swap-slippage.js';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
 import { createPublicClient, custom, decodeAbiParameters, decodeFunctionData, encodeFunctionResult, encodePacked, getAddress, http, isHex, parseAbi, zeroAddress } from 'viem';
 import type { Address, Hex, PublicClient } from 'viem';
@@ -134,6 +136,22 @@ function stubClient(chain: StubChain): PublicClient {
     Object.values(chain.oracle.pairs ?? {}).some((pair) => pair.pool.toLowerCase() === target);
 
   const client = {
+    call: createPublicClient({ transport: custom({ request: async ({ params }) => {
+      assert.ok(Array.isArray(params)); const raw: unknown = params[0];
+      assert.ok(typeof raw === 'object' && raw !== null);
+      const data: unknown = Reflect.get(raw, 'data'); assert.ok(typeof data === 'string' && isHex(data));
+      const abi = parseAbi(['function quoteExactInput(bytes,uint256) returns(uint256,uint160[])']);
+      const decoded = decodeFunctionData({ abi, data });
+      const [path, input] = decoded.args;
+      const key = `${path.slice(0, 42).toLowerCase()}:0x${path.slice(-40).toLowerCase()}`;
+      const quote = chain.oracle.quotes?.[key];
+      const floor = quoteByRate(input)?.[1] ?? quote?.minimum ?? chain.oracle.minimum;
+      // These legacy cases isolate oracle/fee/budget arithmetic. Supply an executable spot
+      // quote 30 bps above the fee-adjusted floor; #58 cases below use independent spot prices.
+      const gross = (floor * 10000n + BigInt(9999 - chain.registry.feeBps)) / BigInt(10000 - chain.registry.feeBps);
+      const output = gross + (gross * 30n + 9999n) / 10000n;
+      return encodeFunctionResult({ abi, functionName: 'quoteExactInput', result: [output, []] });
+    } }, { retryCount: 0 }) }).call,
     getBlock: async (args: { blockNumber?: bigint }) => {
       chain.blockReads += 1;
       return { number: chain.block.number, timestamp: chain.block.timestamp, hash: '0x', transactions: [] };
@@ -2410,6 +2428,7 @@ test('#47 route comparison uses integer net receipts, keeps ties on Pancake, req
 
 test('#47 shared routing selects aggregator, falls back on failure, and blocks an unreadable Pancake whitelist', async () => {
   const chain = baseChain();
+  chain.oracle.minimum = 100n;
   const client = stubClient(chain);
   const params = { publicClient: client, executor: EXECUTOR, tokenIn: WBNB, tokenOut: USDT, amountIn: 1n,
     oracleFloor: 100n, minGross: 100n, poolFee: 500, deadline: 2000000000n, feeBps: 0, blockNumber: 42n };
@@ -2555,6 +2574,143 @@ function refreshFallbackFixture() {
   return { state, planned, params };
 }
 
+function minOutFixture() {
+  const f = refreshFallbackFixture();
+  f.state.floor = f.planned.oracleFloor = 9000n;
+  f.state.pancakeOut = 10000n;
+  f.planned.amountOutMin = 9950n;
+  const route = { publicClient: f.params.publicClient, executor: EXECUTOR, tokenIn: USDT, tokenOut: WBNB,
+    amountIn: 100n, oracleFloor: f.state.floor, minGross: f.state.floor, poolFee: 500,
+    deadline: f.params.deadline, feeBps: 0, blockNumber: 42n };
+  return { ...f, route };
+}
+
+test('#58 inflated aggregator quote is bounded by Pancake minus 50 bps', async () => {
+  const f = minOutFixture();
+  const step = await buildRoutedStep(f.route, { quoteAggregator: async () => ({
+    venue: REGISTRY, data: '0x12345678', amountOut: f.state.pancakeOut * 105n / 100n }) });
+  assert.equal(step?.venue, REGISTRY);
+  assert.equal(step.amountOutMin, 9950n);
+});
+
+test('#58 Pancake minOut is encoded from its quoter, including the exact floor boundary', async () => {
+  const f = minOutFixture();
+  for (const output of [10000n, 9055n, 9010n, 9009n]) {
+    f.state.pancakeOut = output;
+    const step = await buildRoutedStep(f.route, { quoteAggregator: async () => null });
+    assert.ok(step);
+    const expected = output === 10000n ? 9950n : amountOutMinWithBuffer(f.state.floor);
+    assert.equal(step.amountOutMin, expected);
+    assert.equal(decodeStepInput(step).amountOutMin, expected);
+  }
+});
+
+test('#58 no Pancake quote uses the aggregator quote and rejects an absent or zero quote', async () => {
+  const f = minOutFixture(); f.state.failure = 'quoteExactInput';
+  const step = await buildRoutedStep(f.route, { quoteAggregator: async () => ({ venue: REGISTRY,
+    data: '0x12345678', amountOut: 10500n }) });
+  assert.equal(step?.amountOutMin, 10447n);
+  for (const quote of [null, { venue: REGISTRY, data: '0x12345678' as const, amountOut: 0n }]) {
+    assert.equal(await buildRoutedStep(f.route, { quoteAggregator: async () => quote }), null);
+  }
+});
+
+test('#58 below-floor Pancake and a failed aggregator cannot produce a step', async () => {
+  const f = minOutFixture();
+  for (const output of [0n, 9008n]) {
+    f.state.pancakeOut = output;
+    assert.equal(await buildRoutedStep(f.route, { quoteAggregator: async () => null }), null);
+  }
+});
+
+test('#58 quote discount floors integer units, keeps the floor and handles uint256 output', () => {
+  assert.equal(quoteBoundMinimum(1n, 101n), 100n);
+  assert.equal(quoteBoundMinimum(101n, 101n), 101n);
+  assert.equal(quoteBoundMinimum(100n, 0n), 100n);
+  const max = (1n << 256n) - 1n;
+  assert.equal(quoteBoundMinimum(1n, max), max * 9950n / 10000n);
+  assert.equal(quoteBoundMinimum(9000n, 10500n, 8000n), 9000n);
+});
+
+test('#58 below-floor aggregator falls back to a quote-bound Pancake step', async () => {
+  const f = minOutFixture();
+  const step = await buildRoutedStep(f.route, { quoteAggregator: async () => ({ venue: REGISTRY,
+    data: '0x12345678', amountOut: f.state.floor - 1n }) });
+  assert.equal(step?.venue, PANCAKE_UR);
+  assert.equal(step.amountOutMin, 9950n);
+});
+
+test('#58 refresh keeps both aggregator and Pancake execution minima bound to fresh quotes', async () => {
+  const f = minOutFixture();
+  const aggregator = await refreshFloors({ ...f.params, quoteAggregator: async () => ({ venue: REGISTRY,
+    data: '0x87654321', amountOut: 10500n }) });
+  assert.ok(aggregator.ok);
+  assert.equal(aggregator.steps[0]?.amountOutMin, 9950n);
+  assert.equal(aggregator.refreshes[0]?.freshAmountOutMin, 9950n);
+  assert.match(aggregator.note, /amountOutMin 9950 → 9950/);
+  const pancake = await buildRoutedStep(f.route, { quoteAggregator: async () => null }); assert.ok(pancake);
+  const refreshed = await refreshFloors({ ...f.params, steps: [pancake] });
+  assert.ok(refreshed.ok);
+  assert.equal(refreshed.steps[0]?.amountOutMin, 9950n);
+  const refreshedStep = refreshed.steps[0]; assert.ok(refreshedStep);
+  assert.equal(decodeStepInput(refreshedStep).amountOutMin, 9950n);
+  f.state.pancakeOut = 9990n;
+  const moved = await refreshFloors({ ...f.params, steps: [pancake] });
+  assert.ok(moved.ok);
+  assert.equal(moved.steps[0]?.amountOutMin, 9940n, 'use a fresh quote when spot moves, not the old bound');
+  for (const output of [0n, 9008n]) {
+    f.state.pancakeOut = output;
+    assert.equal((await refreshFloors({ ...f.params, steps: [pancake] })).ok, false);
+  }
+  f.state.failure = 'quoteExactInput';
+  const failed = await refreshFloors({ ...f.params, steps: [pancake] });
+  assert.equal(failed.ok, false);
+  assert.doesNotMatch(JSON.stringify(failed), /private-token/);
+});
+
+test('#58 refresh fallback to Pancake retains the quote-bound minOut', async () => {
+  const f = minOutFixture();
+  const result = await refreshFloors({ ...f.params, quoteAggregator: async () => null });
+  assert.ok(result.ok);
+  const step = result.steps[0]; assert.ok(step);
+  assert.equal(step.venue, PANCAKE_UR);
+  assert.equal(step.amountOutMin, 9950n);
+  assert.equal(decodeStepInput(step).amountOutMin, 9950n);
+});
+
+test('#58 Kyber builds with the same Pancake-capped minimum and ignores an inflated build amountOut', async () => {
+  const f = kyberFixture();
+  f.summary.amountOut = '10500'; f.built.data.amountOut = '999999';
+  const quoted = await quoteKyberSwap({ ...f.request, minimum: 9000n, pancakeOut: 10000n }, { fetch: f.fetcher });
+  assert.equal(quoted?.amountOut, 10500n);
+  const build = f.state.requests[1]; assert.ok(build && typeof build.init.body === 'string');
+  const body: unknown = JSON.parse(build.init.body);
+  assert.ok(typeof body === 'object' && body !== null);
+  const slippage: unknown = Reflect.get(body, 'slippageTolerance'); assert.equal(slippage, 523);
+  assert.ok(10500n * (10000n - BigInt(Number(slippage))) / 10000n >= 9950n);
+});
+
+for (const value of ['0', '9', '201', '-1', '50.5', 'NaN', 'Infinity', '', 'private-token']) {
+  test(`#58 invalid tolerance fails at module startup (${value === 'private-token' ? 'redacted' : value})`, () => {
+    const result = spawnSync(process.execPath, ['-e', "import './src/rebalance-plan.ts'"], {
+      cwd: process.cwd(), encoding: 'utf8', env: { ...process.env, SWAP_SLIPPAGE_BPS: value },
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /SWAP_SLIPPAGE_BPS/);
+    assert.doesNotMatch(result.stderr, /private-token/);
+  });
+}
+
+for (const bps of [10, 200]) {
+  test(`#58 tolerance boundary ${bps} bps is accepted and used`, () => {
+    const result = spawnSync(process.execPath, ['-e', "import { quoteBoundMinimum } from './src/swap-slippage.ts'; console.log(quoteBoundMinimum(1n,10000n).toString())"], {
+      cwd: process.cwd(), encoding: 'utf8', env: { ...process.env, SWAP_SLIPPAGE_BPS: String(bps) },
+    });
+    assert.equal(result.status, 0);
+    assert.equal(result.stdout.trim(), String(10000 - bps));
+  });
+}
+
 for (const failure of ['api-failed', 'below-floor', 'venue-changed'] as const) {
   test(`#54 ${failure} rebuilds only the failed leg on Pancake at the fresh buffered floor`, async () => {
     const f = refreshFallbackFixture();
@@ -2569,7 +2725,7 @@ for (const failure of ['api-failed', 'below-floor', 'venue-changed'] as const) {
     assert.equal(fallback.venue, PANCAKE_UR);
     const input = decodeStepInput(fallback);
     assert.equal(input.recipient, getAddress(EXECUTOR)); assert.equal(input.amountIn, f.planned.amountIn);
-    assert.equal(input.amountOutMin, amountOutMinWithBuffer(f.state.floor));
+    assert.equal(input.amountOutMin, 109n);
     assert.equal(fallback.amountOutMin, input.amountOutMin);
     assert.equal(fallback.oracleFloor, f.state.floor);
     assert.equal(result.steps[1]?.venue, REGISTRY); assert.equal(result.steps[1]?.data, healthy.data);
@@ -2691,11 +2847,11 @@ test('#54 fallback amountIn rejects zero and uint160 overflow and accepts uint16
 });
 
 test('#54 rebuilt buys must also fit fresh cash plus prior net sell floors', async () => {
-  for (const cash of [97n, 98n, 99n]) {
+  for (const cash of [91n, 92n, 93n]) {
     const f = refreshFallbackFixture(); f.state.cash = cash;
     const result = await refreshFloors({ ...f.params, feeBps: 100,
       steps: [{ ...f.planned, tokenIn: WBNB, tokenOut: USDT }, { ...f.planned, amountIn: 200n }], quoteAggregator: async () => null });
-    // Net guarantee: minGross(100, 100bps)=102, buffered=103, fee=floor(103/100)=1 -> 102.
-    assert.equal(result.ok, cash + 102n >= 200n);
+    // Quote-bound gross = floor(110 * 9950/10000) = 109; net after 100bps fee = 108.
+    assert.equal(result.ok, cash + 108n >= 200n);
   }
 });

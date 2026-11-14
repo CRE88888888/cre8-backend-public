@@ -5,7 +5,7 @@ import { createServer as createHttpServer } from 'node:http';
 import { promisify } from 'node:util';
 import { serialize } from 'node:v8';
 import { after, test } from 'node:test';
-import { decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeErrorResult, encodeFunctionData, encodePacked, getAddress, isHex, keccak256, parseAbi, toBytes } from 'viem';
+import { createPublicClient, custom, decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeErrorResult, encodeFunctionData, encodeFunctionResult, encodePacked, getAddress, isHex, keccak256, parseAbi, toBytes } from 'viem';
 import { getUserOperationHash } from 'viem/account-abstraction';
 import type { GetUserOperationReturnType, UserOperationReceipt } from 'viem/account-abstraction';
 import { EXECUTOR_PAUSE_ABI } from '../src/chain.js';
@@ -2882,8 +2882,13 @@ function encodableStep(overrides: Partial<PlannedStep> = {}): PlannedStep {
 }
 
 /** 只認 `previewSwap` 的 stub client：回 `[quoted, minimum]`，或丟出指定的錯誤。 */
-function floorClient(result: { minimum: bigint; quoted?: bigint } | { error: Error }): PublicClient {
+function floorClient(result: { minimum: bigint; quoted?: bigint; spot?: bigint } | { error: Error }): PublicClient {
   return {
+    call: createPublicClient({ transport: custom({ request: async () => {
+      if ('error' in result) throw result.error;
+      return encodeFunctionResult({ abi: parseAbi(['function quoteExactInput(bytes,uint256) returns(uint256,uint160[])']),
+        functionName: 'quoteExactInput', result: [result.spot ?? result.minimum * 10030n / 10000n, []] });
+    } }, { retryCount: 0 }) }).call,
     readContract: async (args: { functionName: string }) => {
       if (args.functionName !== 'previewSwap') throw new Error(`stub 沒有 ${args.functionName}`);
       if ('error' in result) throw result.error;
@@ -3138,6 +3143,7 @@ test('refreshFloors：feeBps 走 minGrossFor（fee 0 ≠ fee 2500），而且每
   const planned = encodableStep({ oracleFloor: 500_000_000_000_000_000n, amountOutMin: 500_000_000_000_000_000n });
   const quoted: bigint[] = [];
   const client = {
+    call: floorClient({ minimum: 500_000_000_000_000_000n, spot: 668_000_000_000_000_000n }).call,
     readContract: async () => {
       quoted.push(1n);
       return [500_000_000_000_000_000n, 500_000_000_000_000_000n];
@@ -3175,6 +3181,7 @@ test('#34 預設送出前路徑每輪重讀 effectiveFeeBps：0→25→300、無
       'function oracle() view returns (address)',
       'function effectiveFeeBps(uint256 id) view returns (uint16)',
       'function previewSwap(address tokenIn, address tokenOut, uint256 amountIn) view returns (uint256 quoted, uint256 minimum)',
+      'function quoteExactInput(bytes,uint256) returns(uint256,uint160[])',
     ]), data: call.data });
     let result: Hex | undefined;
     if (decoded.functionName === 'globalPaused') result = encodeAbiParameters([{ type: 'bool' }], [false]);
@@ -3186,6 +3193,11 @@ test('#34 預設送出前路徑每輪重讀 effectiveFeeBps：0→25→300、無
     }
     if (decoded.functionName === 'previewSwap') {
       result = encodeAbiParameters([{ type: 'uint256' }, { type: 'uint256' }], [500_000_000_000_000_000n, 500_000_000_000_000_000n]);
+    }
+    if (decoded.functionName === 'quoteExactInput') {
+      const denominator = 10000n - BigInt(fees[feeReads - 1] ?? 0);
+      const gross = (500_000_000_000_000_000n * 10000n + denominator - 1n) / denominator;
+      result = encodeAbiParameters([{ type: 'uint256' }, { type: 'uint160[]' }], [gross * 10030n / 10000n, []]);
     }
     response.setHeader('content-type', 'application/json');
     response.end(JSON.stringify(result === undefined

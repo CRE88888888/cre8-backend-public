@@ -14,9 +14,9 @@ test('#66 sponsorship requires login before parsing or signing', async () => {
     login: async () => { throw new Error('unexpected login'); },
     logout: async () => { throw new Error('unexpected logout'); },
   } });
-  await new Promise<void>((resolve) => server.listen(8093, '127.0.0.1', resolve));
+  await new Promise<void>((resolve) => server.listen(8094, '127.0.0.1', resolve));
   try {
-    const response = await fetch('http://127.0.0.1:8093/paymaster/sponsor', { method: 'POST', body: 'invalid json' });
+    const response = await fetch('http://127.0.0.1:8094/paymaster/sponsor', { method: 'POST', body: 'invalid json' });
     assert.equal(response.status, 401);
     assert.deepEqual(await response.json(), { error: { code: 'UNAUTHORIZED', message: 'authentication required' } });
   } finally {
@@ -40,8 +40,8 @@ test('#66 authenticated sponsor response, method, disabled 503 and #59 shared re
         paymasterPostOpGasLimit: 0n, validUntil: NOW + 300, validAfter: 0, userOpHash: '0x1234' };
     },
   });
-  await new Promise<void>((resolve) => server.listen(8093, '127.0.0.1', resolve));
-  const url = 'http://127.0.0.1:8093/paymaster/sponsor';
+  await new Promise<void>((resolve) => server.listen(8094, '127.0.0.1', resolve));
+  const url = 'http://127.0.0.1:8094/paymaster/sponsor';
   const body = JSON.stringify({ userOperation: operation(), validUntil: NOW + 300 }, (_key, value: unknown) => typeof value === 'bigint' ? '0x' + value.toString(16) : value);
   try {
     const method = await fetch(url);

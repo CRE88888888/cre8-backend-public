@@ -1,16 +1,22 @@
 import {
   concatHex, createPublicClient, decodeAbiParameters, decodeFunctionData, encodeAbiParameters,
-  encodeFunctionData, http, isAddressEqual, keccak256, parseAbi, slice, toHex, toFunctionSelector,
+  encodeFunctionData, http, isAddressEqual, keccak256, pad, parseAbi, slice, toHex, toFunctionSelector, zeroAddress,
 } from 'viem';
+import { KernelV3_3AccountAbi } from '@zerodev/sdk';
+import { PolicyFlags } from '@zerodev/permissions';
+import { CallPolicyVersion, toCallPolicy, toGasPolicy, toPolicyId, toTimestampPolicy } from '@zerodev/permissions/policies';
+import { toEmptyECDSASigner, toSignerId } from '@zerodev/permissions/signers';
 import type { Address, Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import type { GetPaymasterDataParameters, PaymasterActions } from 'viem/account-abstraction';
-import { EXECUTOR_ABI, REGISTRY_ABI } from './chain.js';
+import { EXECUTOR_ABI, EXECUTOR_SELECTOR, REGISTRY_ABI } from './chain.js';
 import { KERNEL_V3_3_ADDRESSES } from './addresses.js';
 import { loadPaymasterConfig } from './config.js';
 import type { PaymasterConfig } from './config.js';
 import { query, withTransaction } from './db.js';
 import { AppError } from './errors.js';
+import { TESTNET_97, testnetAssets } from './testnet-profile.js';
+import { SESSION_GAS_ALLOWED_WEI } from './permissions.js';
 
 export type PackedSponsorOperation = {
   sender: Address; nonce: bigint; initCode: Hex; callData: Hex; accountGasLimits: Hex;
@@ -30,6 +36,8 @@ export type PaymasterDeps = {
 };
 export const KERNEL_EXECUTE_ABI = parseAbi(['function execute(bytes32 execMode,bytes executionCalldata) payable']);
 const CLAIM_ABI = parseAbi(['function claim(uint256 amount)']);
+const TOKEN_ABI = parseAbi(['function approve(address spender,uint256 amount)', 'function transfer(address recipient,uint256 amount)']);
+const BYTES_ARRAY_ABI = [{ type: 'bytes[]' }] as const;
 const META_FACTORY_ABI = parseAbi(['function deployWithFactory(address factory,bytes createData,bytes32 salt) returns(address)']);
 const BATCH_ABI = [{ type: 'tuple[]', components: [{ name: 'target', type: 'address' }, { name: 'value', type: 'uint256' }, { name: 'callData', type: 'bytes' }] }] as const;
 const EXECUTE_USER_OP_SELECTOR = toFunctionSelector('executeUserOp((address,uint256,bytes,bytes,bytes32,uint256,bytes32,bytes,bytes),bytes32)');
@@ -67,8 +75,8 @@ export function parsePackedSponsorOperation(value: unknown): PackedSponsorOperat
     paymasterAndData: hex(op.paymasterAndData ?? '0x'), signature: hex(op.signature ?? '0x') };
 }
 
-/** Only canonical Kernel CALL / BATCH DEFAULT modes. No delegatecall, try-exec or hidden mode payload. */
-export function validateSponsoredCalls(op: PackedSponsorOperation, c: PaymasterConfig): void {
+/** Only canonical Kernel CALL / BATCH DEFAULT modes. Nested renewal delegation is checked separately. */
+function sponsoredCalls(op: PackedSponsorOperation) {
   try {
     const data = op.callData.startsWith(EXECUTE_USER_OP_SELECTOR) ? slice(op.callData, 4) : op.callData;
     const decoded = decodeFunctionData({ abi: KERNEL_EXECUTE_ABI, data });
@@ -80,9 +88,61 @@ export function validateSponsoredCalls(op: PackedSponsorOperation, c: PaymasterC
       : mode === batch ? decodeAbiParameters(BATCH_ABI, payload)[0] : [];
     if (calls.length === 0 || calls.length > 32) throw new Error('empty/invalid mode');
     if (mode === batch && encodeAbiParameters(BATCH_ABI, [calls]).toLowerCase() !== payload.toLowerCase()) throw new Error('noncanonical batch');
-    for (const call of calls) {
+    return calls;
+  } catch { throw rejected('PAYMASTER_CALL_FORBIDDEN', 403); }
+}
+
+/** Match the SDK's complete two-call toInitConfig, never a general-purpose self-call or delegatecall. */
+function validateRenewal(install: Hex, grant: Hex, c: PaymasterConfig): void {
+  const decoded = decodeFunctionData({ abi: KernelV3_3AccountAbi, data: install });
+  if (decoded.functionName !== 'installValidations') throw new Error('invalid install');
+  const enableData = decoded.args[2][0];
+  if (enableData === undefined) throw new Error('missing policies');
+  const [parts] = decodeAbiParameters(BYTES_ARRAY_ABI, enableData);
+  if (parts.length !== 4) throw new Error('invalid policies');
+  const timestampData = parts[2];
+  const signerData = parts[3];
+  if (timestampData === undefined || signerData === undefined) throw new Error('missing policy data');
+  const [validAfter, validUntil] = decodeAbiParameters([{ type: 'uint48' }, { type: 'uint48' }], slice(timestampData, 22));
+  const signerAddress = slice(signerData, 22);
+  if (validAfter !== 0 || validUntil === 0 || signerAddress.length !== 42 || isAddressEqual(signerAddress, zeroAddress)) throw new Error('invalid session');
+  const p = TESTNET_97.contracts; // Canonical SDK policy/signer contracts, also pinned in the chain 97 profile.
+  const policies = [
+    toCallPolicy({ policyVersion: CallPolicyVersion.V0_0_4, policyAddress: p.callPolicy, permissions: [{ target: c.executor, selector: EXECUTOR_SELECTOR }] }),
+    toGasPolicy({ policyAddress: p.gasPolicy, allowed: SESSION_GAS_ALLOWED_WEI, enforcePaymaster: true, allowedPaymaster: c.address }),
+    toTimestampPolicy({ policyAddress: p.timestampPolicy, validAfter, validUntil }),
+  ];
+  const signer = toEmptyECDSASigner(signerAddress, p.ecdsaSigner);
+  const flag = PolicyFlags.FOR_ALL_VALIDATION;
+  const expectedEnableData = encodeAbiParameters(BYTES_ARRAY_ABI, [[
+    ...policies.map((policy) => concatHex([policy.getPolicyInfoInBytes(), policy.getPolicyData()])),
+    concatHex([flag, signer.signerContractAddress, signer.getSignerData()]),
+  ]]);
+  const permissionId = slice(keccak256(encodeAbiParameters(BYTES_ARRAY_ABI, [[toPolicyId(policies), flag, toSignerId(signer)]])), 0, 4);
+  const validationId = pad(concatHex(['0x02', permissionId]), { size: 21, dir: 'right' });
+  const expectedInstall = encodeFunctionData({ abi: KernelV3_3AccountAbi, functionName: 'installValidations',
+    args: [[validationId], [{ nonce: 1, hook: zeroAddress }], [expectedEnableData], ['0x']] });
+  const grantData = encodeFunctionData({ abi: KernelV3_3AccountAbi, functionName: 'grantAccess',
+    args: [validationId, toFunctionSelector(KERNEL_EXECUTE_ABI[0]), true] });
+  const expectedGrant = encodeFunctionData({ abi: KERNEL_EXECUTE_ABI, functionName: 'execute',
+    args: [toHex(255n << 248n, { size: 32 }), concatHex([KERNEL_V3_3_ADDRESSES.kernelImplV33, grantData])] });
+  if (install.toLowerCase() !== expectedInstall.toLowerCase() || grant.toLowerCase() !== expectedGrant.toLowerCase()) throw new Error('noncanonical renewal');
+}
+
+type CallContext = { owner?: Address; assets?: readonly Address[] };
+export function validateSponsoredCalls(op: PackedSponsorOperation, c: PaymasterConfig, context: CallContext = {}): void {
+  try {
+    const calls = sponsoredCalls(op);
+    const assets = c.chainId === 97 ? testnetAssets().map((asset) => asset.address) : context.assets ?? [];
+    for (let index = 0; index < calls.length; index++) {
+      const call = calls[index];
+      if (call === undefined) throw new Error('missing call');
       if (call.value !== 0n) throw new Error('native transfer');
-      if (isAddressEqual(call.target, c.executor)) {
+      if (isAddressEqual(call.target, op.sender)) {
+        const next = calls[++index];
+        if (next === undefined || next.value !== 0n || !isAddressEqual(next.target, op.sender)) throw new Error('incomplete renewal');
+        validateRenewal(call.callData, next.callData, c);
+      } else if (isAddressEqual(call.target, c.executor)) {
         const inner = decodeFunctionData({ abi: EXECUTOR_ABI, data: call.callData });
         if (inner.functionName !== 'executeRebalance' || !isAddressEqual(inner.args[0], op.sender) || inner.args[1].length === 0 ||
             encodeFunctionData({ abi: EXECUTOR_ABI, functionName: inner.functionName, args: inner.args }).toLowerCase() !== call.callData.toLowerCase()) throw new Error('invalid rebalance');
@@ -90,6 +150,13 @@ export function validateSponsoredCalls(op: PackedSponsorOperation, c: PaymasterC
         const inner = decodeFunctionData({ abi: REGISTRY_ABI, data: call.callData });
         if (inner.functionName !== 'enroll' || !isAddressEqual(inner.args[0], op.sender) || inner.args[1] === 0n ||
             encodeFunctionData({ abi: REGISTRY_ABI, functionName: inner.functionName, args: inner.args }).toLowerCase() !== call.callData.toLowerCase()) throw new Error('invalid enrollment');
+      } else if (assets.some((asset) => isAddressEqual(call.target, asset)) &&
+          TOKEN_ABI.some((fn) => call.callData.toLowerCase().startsWith(toFunctionSelector(fn)))) {
+        const inner = decodeFunctionData({ abi: TOKEN_ABI, data: call.callData });
+        if (encodeFunctionData({ abi: TOKEN_ABI, functionName: inner.functionName, args: inner.args }).toLowerCase() !== call.callData.toLowerCase()) throw new Error('noncanonical token call');
+        if (inner.functionName === 'approve') {
+          if (!isAddressEqual(inner.args[0], c.executor)) throw new Error('invalid spender');
+        } else if (context.owner === undefined || !isAddressEqual(inner.args[0], context.owner) || inner.args[1] === 0n) throw new Error('invalid withdrawal');
       } else if (c.mockUsdt !== null && isAddressEqual(call.target, c.mockUsdt)) {
         const inner = decodeFunctionData({ abi: CLAIM_ABI, data: call.callData });
         if (inner.args[0] === 0n || encodeFunctionData({ abi: CLAIM_ABI, functionName: inner.functionName, args: inner.args }).toLowerCase() !== call.callData.toLowerCase()) throw new Error('invalid claim');
@@ -215,12 +282,23 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
       const validUntil = request.validUntil ?? now + 300;
       if (typeof validUntil !== 'number' || !Number.isSafeInteger(validUntil) || validUntil <= now || validUntil > now + 300) throw rejected('PAYMASTER_EXPIRED');
       if (op.paymasterAndData !== '0x') throw rejected('PAYMASTER_INVALID_OPERATION');
-      validateSponsoredCalls(op, c);
+      const calls = sponsoredCalls(op);
       const known = await bounded((deps.query ?? query)(`select s.owner, p.user_id from smart_accounts s join portfolios p on p.id = s.portfolio_id
         where s.chain_id = $1 and s.address = $2 and s.account_type = 'KERNEL'`, [c.chainId, op.sender]), c.timeoutMs);
       const owner = known.rows.length === 1 ? object(known.rows[0]) : null;
       if (!owner || typeof owner.owner !== 'string' || typeof owner.user_id !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(wallet) ||
           owner.owner.toLowerCase() !== wallet.toLowerCase() || owner.user_id.toLowerCase() !== wallet.toLowerCase()) throw rejected('PAYMASTER_SENDER_FORBIDDEN', 403);
+      // Chain 97 never falls back to mainnet's DB seed. Local forks use the existing enabled address book.
+      let assets: Address[] = [];
+      if (c.chainId !== 97 && calls.some((call) => TOKEN_ABI.some((fn) => call.callData.startsWith(toFunctionSelector(fn))))) {
+        const result = await bounded((deps.query ?? query)('select address from priceable_assets where enabled', []), c.timeoutMs);
+        assets = result.rows.map((row) => {
+          const address = object(row).address;
+          if (typeof address !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(address)) throw new Error('invalid asset address');
+          return hex(address, 20);
+        });
+      }
+      validateSponsoredCalls(op, c, { owner: hex(owner.owner, 20), assets });
       await bounded((deps.checkChain ?? checkChain)(op, c), c.timeoutMs);
       const signedOp = { ...op, paymasterAndData: header(c) };
       const hash = verifyingPaymasterHash(signedOp, c, validUntil, 0);

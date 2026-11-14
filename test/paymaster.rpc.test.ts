@@ -36,8 +36,8 @@ test('#66 RPC guards chain, signer, EntryPoint, deposit, deployed implementation
     res.setHeader('content-type', 'application/json');
     res.end(JSON.stringify({ jsonrpc: '2.0', id: rpc.id, result }));
   });
-  await new Promise<void>((resolve) => server.listen(8093, '127.0.0.1', resolve));
-  const service = createPaymasterService({ config: { ...config(), rpcUrl: 'http://127.0.0.1:8093' }, now: () => NOW,
+  await new Promise<void>((resolve) => server.listen(8094, '127.0.0.1', resolve));
+  const service = createPaymasterService({ config: { ...config(), rpcUrl: 'http://127.0.0.1:8094' }, now: () => NOW,
     query: async () => ({ rows: [{ owner: OWNER, user_id: OWNER }] }), reserve: async () => { reserved++; } });
   try {
     await service.sponsor({ userOperation: operation() }, OWNER);

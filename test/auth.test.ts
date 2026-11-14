@@ -27,6 +27,10 @@ import { createServer } from '../src/server.js';
 import type { ServerDeps } from '../src/server.js';
 import { assertProviderOwns, createStrategy } from '../src/strategies.js';
 import type { PublishVersionInput, Strategy, StrategyVersion } from '../src/strategies.js';
+import { createPrivyLogin, PostgresPrivyUserRepository } from '../src/privy.js';
+import { privyFixture } from './fixtures/privy.js';
+import { runScript } from './fixtures/secret-output.js';
+import { getPool } from '../src/db.js';
 
 const ASSET_A = '0x00000000000000000000000000000000000000a1';
 const ASSET_B = '0x00000000000000000000000000000000000000b2';
@@ -889,4 +893,120 @@ test('#59 HTTP logout removes the real Postgres session and a fresh repository r
       assert.equal((await postJson(base, '/auth/logout', undefined, first.token)).status, 204);
     } finally { await query('delete from auth_sessions where token_hash = any($1::text[])', [[firstHash, secondHash]]); }
   });
+});
+
+test('#63 Postgres Privy HTTP session survives a fresh instance, keeps owner after linking and supports logout', async () => {
+  await migrate();
+  const f = privyFixture();
+  const hashes: string[] = [];
+  const login = createPrivyLogin({ config: () => f.config });
+  const observed: string[] = [];
+  try {
+    await withServer(async (base) => {
+      for (const accounts of [[{ type: 'email' }, f.wallet],
+        [{ type: 'apple_oauth' }, { ...f.wallet, address: f.other }],
+        [f.wallet, { ...f.wallet, address: f.other }], []]) {
+        const identityToken = await f.sign({ linked_accounts: JSON.stringify(accounts) });
+        const response = await postJson(base, '/auth/privy', { identityToken, owner: f.other });
+        assert.equal(response.status, 200);
+        const session = await response.json() as SessionCredentials;
+        hashes.push(sha256Hex(session.token));
+        assert.match(session.token, /^[0-9a-f]{64}$/);
+        assert.equal(await new AuthStore().authenticate('Bearer ' + session.token), f.owner);
+        const stored = await query<{ wallet: string; token_hash: string }>(
+          'select wallet, token_hash from auth_sessions where token_hash = $1', [sha256Hex(session.token)]);
+        assert.equal(stored.rows[0]?.wallet, f.owner);
+        const portfolios = await fetch(base + '/portfolios?owner=' + f.other, { headers: { authorization: 'Bearer ' + session.token } });
+        assert.equal(portfolios.status, 200);
+        assert.equal(observed.at(-1), f.owner);
+        assert.equal(await new PostgresPrivyUserRepository().find(f.userId), f.owner);
+        assert.equal((await postJson(base, '/auth/logout', undefined, session.token)).status, 204);
+        await assert.rejects(new AuthStore().authenticate('Bearer ' + session.token), UnauthorizedError);
+      }
+    }, { privyLogin: login, listPortfolios: async (wallet) => { observed.push(wallet); return []; } });
+    const freshLogin = createPrivyLogin({ config: () => f.config });
+    const session = await freshLogin({ identityToken: await f.sign({ linked_accounts: JSON.stringify([{ ...f.wallet, address: f.other }]) }) });
+    hashes.push(sha256Hex(session.token));
+    assert.equal(await new AuthStore().authenticate('Bearer ' + session.token), f.owner);
+    const mapping = await query<{ count: string }>('select count(*) from privy_users where privy_user_id = $1', [f.userId]);
+    assert.equal(mapping.rows[0]?.count, '1');
+  } finally {
+    await query('delete from auth_sessions where token_hash = any($1::text[])', [hashes]);
+    await query('delete from privy_users where privy_user_id = $1', [f.userId]);
+  }
+});
+
+test('#63 concurrent first Privy logins with different wallets all use the one Postgres winner', async () => {
+  await migrate();
+  const f = privyFixture();
+  const tokens = await Promise.all(Array.from({ length: 8 }, (_, index) => f.sign({
+    linked_accounts: JSON.stringify([{ ...f.wallet, address: index % 2 === 0 ? f.owner : f.other }]),
+  })));
+  let entered = 0;
+  let release = () => {};
+  const allRead = new Promise<void>((resolve) => { release = resolve; });
+  const sessions: SessionCredentials[] = [];
+  try {
+    const results = await Promise.allSettled(tokens.map(async (identityToken) => {
+      const repository = new PostgresPrivyUserRepository();
+      const login = createPrivyLogin({ config: () => f.config, users: {
+        find: async (id) => {
+          const owner = await repository.find(id);
+          assert.equal(owner, null, 'all eight requests must observe the initial missing mapping');
+          if (++entered === tokens.length) release();
+          await allRead;
+          return owner;
+        }, create: (id, owner) => repository.create(id, owner),
+      } });
+      const session = await login({ identityToken });
+      sessions.push(session);
+      return session;
+    }));
+    assert.equal(results.filter((result) => result.status === 'fulfilled').length, 8);
+    const owner = await new PostgresPrivyUserRepository().find(f.userId);
+    assert.ok(owner === f.owner || owner === f.other);
+    for (const session of sessions) assert.equal(await new AuthStore().authenticate('Bearer ' + session.token), owner);
+    const mappings = await query<{ count: string }>('select count(*) from privy_users where privy_user_id = $1', [f.userId]);
+    assert.equal(mappings.rows[0]?.count, '1');
+  } finally {
+    await query('delete from auth_sessions where token_hash = any($1::text[])', [sessions.map((session) => sha256Hex(session.token))]);
+    await query('delete from privy_users where privy_user_id = $1', [f.userId]);
+  }
+});
+
+test('#63 real Postgres conflict wait timeout returns sanitized 503 with no session or owner overwrite', async () => {
+  await migrate();
+  const f = privyFixture();
+  const client = await getPool().connect();
+  try {
+    await client.query('begin');
+    await client.query('insert into privy_users (privy_user_id, owner_address) values ($1, $2)', [f.userId, f.owner]);
+    const identityToken = await f.sign({ linked_accounts: JSON.stringify([{ ...f.wallet, address: f.other }]) });
+    const result = await runScript('src/privy.ts', {
+      DATABASE_URL: process.env.DATABASE_URL, DB_STATEMENT_TIMEOUT_MS: '50',
+    }, `
+      const { createPrivyLogin } = await import('./src/privy.ts');
+      const { closePool } = await import('./src/db.ts');
+      let mintCalls = 0;
+      const login = createPrivyLogin({ config: () => (${JSON.stringify(f.config)}),
+        issueSession: async () => { mintCalls++; throw new Error('session must not be minted'); } });
+      try {
+        await login({ identityToken: ${JSON.stringify(identityToken)} });
+        throw new Error('timeout must fail');
+      } catch (error) {
+        if (error.status !== 503 || error.code !== 'PRIVY_UNAVAILABLE' || error.message !== 'Privy login is unavailable') throw error;
+        console.log('expected sanitized Privy DB timeout');
+      } finally { await closePool(); }
+      if (mintCalls !== 0) throw new Error('timeout reached session issuance');
+    `);
+    assert.equal(result.code, 0, result.output);
+    assert.match(result.output, /expected sanitized Privy DB timeout/);
+    assert.ok(!result.output.includes(identityToken), 'JWT must not reach output');
+    const owner = await client.query<{ owner_address: string }>('select owner_address from privy_users where privy_user_id = $1', [f.userId]);
+    assert.equal(owner.rows[0]?.owner_address, f.owner);
+    assert.equal(await new PostgresPrivyUserRepository().find(f.userId), null);
+  } finally {
+    await client.query('rollback');
+    client.release();
+  }
 });

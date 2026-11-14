@@ -19,6 +19,11 @@ import type { PlatformStatusConfig } from '../src/chain.js';
 import { closePool, query as dbQuery } from '../src/db.js';
 import { createServer, resolveOperatorWallets } from '../src/server.js';
 import { assertNoSecretSlices, runScript } from './fixtures/secret-output.js';
+import { loadPrivyConfig } from '../src/config.js';
+import { SESSION_TTL_MS, sha256Hex } from '../src/auth.js';
+import { AppError } from '../src/errors.js';
+import { createPrivyLogin, MAX_PRIVY_TOKEN_LENGTH } from '../src/privy.js';
+import { privyFixture, privyMemory } from './fixtures/privy.js';
 
 test('#59 nonce flood stops at the IP allowance', async () => {
   const server = createServer({ rateLimiter: new RequestRateLimiter(loadRateLimitConfig({}), undefined, () => 1_000) });
@@ -745,5 +750,300 @@ test('#59 invalid trusted proxy configuration is rejected before serving request
       assert.ok(error instanceof Error && error.message.includes('RATE_LIMIT_TRUSTED_PROXY_IPS') && !error.message.includes(raw));
       return true;
     });
+  }
+});
+
+function privyHarness() {
+  const fixture = privyFixture();
+  const memory = privyMemory();
+  let clock = fixture.now;
+  const auth = new AuthStore({ sessions: memory.sessions, now: () => clock });
+  const login = createPrivyLogin({ config: () => fixture.config, users: memory.users,
+    issueSession: (owner) => auth.issueSession(owner), now: () => clock });
+  return { fixture, memory, auth, login, setClock: (value: number) => { clock = value; } };
+}
+
+function privyError(status: number, code: string): (error: unknown) => boolean {
+  return (error) => error instanceof AppError && error.status === status && error.code === code;
+}
+
+test('#63 Privy config is optional, needs both values and preserves escaped public PEM newlines', () => {
+  for (const env of [{}, { PRIVY_APP_ID: 'test' }, { PRIVY_VERIFICATION_KEY: 'key' },
+    { PRIVY_APP_ID: ' ', PRIVY_VERIFICATION_KEY: 'key' }]) assert.equal(loadPrivyConfig(env), null);
+  assert.deepEqual(loadPrivyConfig({ PRIVY_APP_ID: ' test ', PRIVY_VERIFICATION_KEY: ' a\\nb ' }),
+    { appId: 'test', verificationKey: 'a\nb' });
+});
+
+test('#63 embedded email/Google/Apple and external-wallet registration mint the same hashed 24h sessions', async () => {
+  for (const provider of ['email', 'google_oauth', 'apple_oauth', 'external']) {
+    const { fixture: f, memory, auth, login } = privyHarness();
+    const accounts = provider === 'external'
+      ? [{ ...f.wallet, wallet_client_type: 'metamask' }]
+      : [{ type: provider }, { ...f.wallet, address: f.owner.toUpperCase().replace('0X', '0x') }];
+    const session = await login({ identityToken: await f.sign({ linked_accounts: JSON.stringify(accounts) }), owner: f.other, loginMethod: 'external' });
+    assert.match(session.token, /^[0-9a-f]{64}$/);
+    assert.equal(Date.parse(session.expiresAt), f.now + SESSION_TTL_MS);
+    assert.equal(await auth.authenticate('Bearer ' + session.token), f.owner);
+    assert.equal(memory.mappings.get(f.userId), f.owner);
+    assert.equal(memory.rows.size, 1);
+    assert.ok(memory.rows.has(sha256Hex(session.token)));
+    assert.ok(!memory.rows.has(session.token));
+    await auth.logout('Bearer ' + session.token);
+    await assert.rejects(auth.authenticate('Bearer ' + session.token), privyError(401, 'UNAUTHORIZED'));
+  }
+});
+
+test('#63 JWT failures are 401 before any mapping or session writes, with sanitized messages', async () => {
+  const h = privyHarness();
+  const f = h.fixture;
+  const seconds = Math.floor(f.now / 1000);
+  const claims = [
+    { exp: seconds - 1 }, { exp: seconds }, { exp: 0 }, { exp: undefined }, { exp: 'never' },
+    { aud: 'wrong-app' }, { aud: undefined }, { aud: [f.config.appId] },
+    { iss: 'https://privy.io' }, { iss: undefined }, { sub: '' }, { sub: 'did:privy: ' }, { sub: undefined },
+    { iat: seconds + 1 }, { iat: -1 }, { iat: undefined }, { iat: seconds + 0.5 },
+    { exp: seconds + 0.5 }, { iat: seconds + 1, exp: seconds + 1 }, { nbf: seconds + 1 },
+    { linked_accounts: undefined }, { linked_accounts: [] }, { linked_accounts: '{' },
+    { linked_accounts: '{}' }, { linked_accounts: '[null]' }, { linked_accounts: '[1]' },
+  ];
+  const valid = await f.sign();
+  const other = privyFixture();
+  const tokens = await Promise.all(claims.map((claim) => f.signRaw(claim)));
+  tokens.push(await other.sign({ sub: f.userId }), 'broken', valid.slice(0, -16) + 'AAAAAAAAAAAAAAAA',
+    Buffer.from(JSON.stringify({ alg: 'none' })).toString('base64url') + '.' + valid.split('.')[1] + '.');
+  // Unsupported algorithms are rejected even when correctly signed with this public key.
+  const { SignJWT } = await import('jose');
+  tokens.push(await new SignJWT({ sub: f.userId }).setProtectedHeader({ alg: 'HS256' })
+    .sign(new TextEncoder().encode(f.config.verificationKey)));
+  for (const identityToken of tokens) {
+    await assert.rejects(h.login({ identityToken }), (error: unknown) => {
+      assert.ok(error instanceof AppError);
+      assert.equal(error.status, 401);
+      assert.equal(error.message, 'invalid or expired Privy identity token');
+      return true;
+    });
+  }
+  assert.equal(h.memory.mappings.size, 0);
+  assert.equal(h.memory.rows.size, 0);
+});
+
+test('#63 token exp/nbf and CRE8 session expiry enforce exact second and 24h boundaries', async () => {
+  const h = privyHarness();
+  const f = h.fixture;
+  const seconds = Math.floor(f.now / 1000);
+  const identityToken = await f.sign({ exp: seconds + 1, nbf: seconds });
+  h.setClock(seconds * 1000 + 999);
+  const session = await h.login({ identityToken });
+  h.setClock((seconds + 1) * 1000);
+  await assert.rejects(h.login({ identityToken }), privyError(401, 'UNAUTHORIZED'));
+  h.setClock(Date.parse(session.expiresAt) - 1);
+  assert.equal(await h.auth.authenticate('Bearer ' + session.token), f.owner);
+  h.setClock(Date.parse(session.expiresAt));
+  await assert.rejects(h.auth.authenticate('Bearer ' + session.token), privyError(401, 'UNAUTHORIZED'));
+});
+
+test('#63 request shape and token size are bounded; max-length token still reaches verification', async () => {
+  const { fixture: f, memory, login } = privyHarness();
+  for (const body of [null, [], 'token', {}, { identityToken: 0 }, { identityToken: '' }, { identityToken: ' ' },
+    { accessToken: await f.sign() }, { identityToken: 'x'.repeat(MAX_PRIVY_TOKEN_LENGTH + 1) }]) {
+    await assert.rejects(login(body), privyError(400, 'INVALID_AUTH'));
+  }
+  await assert.rejects(login({ identityToken: 'x'.repeat(MAX_PRIVY_TOKEN_LENGTH) }), privyError(401, 'UNAUTHORIZED'));
+  assert.equal(memory.mappings.size, 0);
+  assert.equal(memory.rows.size, 0);
+});
+
+test('#63 first login rejects zero or multiple valid EVM wallets and never writes; duplicate casing is one wallet', async () => {
+  const { fixture: f, memory, login } = privyHarness();
+  for (const accounts of [[], [{ type: 'email' }], [{ ...f.wallet, address: '0x' + '0'.repeat(40) }],
+    [{ ...f.wallet, address: '0x1234' }], [{ ...f.wallet, address: 123 }], [{ ...f.wallet, address: undefined }],
+    [{ ...f.wallet, chain_type: 'solana' }], [{ ...f.wallet, chain_type: undefined }],
+    [{ ...f.wallet, type: 'smart_wallet' }], [f.wallet, { ...f.wallet, address: f.other }]]) {
+    const code = accounts.length === 2 ? 'PRIVY_OWNER_AMBIGUOUS' : 'PRIVY_NO_WALLET';
+    await assert.rejects(login({ identityToken: await f.sign({ linked_accounts: JSON.stringify(accounts) }), owner: f.owner }), privyError(409, code));
+    assert.equal(memory.mappings.size, 0);
+    assert.equal(memory.rows.size, 0);
+  }
+  await login({ identityToken: await f.sign({ linked_accounts: JSON.stringify([
+    f.wallet, { ...f.wallet, address: f.owner.toUpperCase().replace('0X', '0x') },
+    { ...f.wallet, chain_type: 'solana' },
+  ]) }) });
+  assert.equal(memory.mappings.get(f.userId), f.owner);
+});
+
+test('#63 existing owner survives added/removed wallets and social-only login across fresh login handlers', async () => {
+  const { fixture: f, memory, auth, login } = privyHarness();
+  await login({ identityToken: await f.sign() });
+  const fresh = createPrivyLogin({ config: () => f.config, users: memory.users,
+    issueSession: (owner) => auth.issueSession(owner), now: () => f.now });
+  for (const accounts of [[], [{ type: 'google_oauth' }], [{ ...f.wallet, address: f.other }],
+    [f.wallet, { ...f.wallet, address: f.other }]]) {
+    const session = await fresh({ identityToken: await f.sign({ linked_accounts: JSON.stringify(accounts) }), owner: f.other });
+    assert.equal(await auth.authenticate('Bearer ' + session.token), f.owner);
+    assert.equal(memory.mappings.get(f.userId), f.owner);
+  }
+  // A different Privy identity must never reuse this user's mapping.
+  await assert.rejects(fresh({ identityToken: await f.sign({ sub: 'did:privy:someone-else', linked_accounts: '[]' }) }),
+    privyError(409, 'PRIVY_NO_WALLET'));
+});
+
+test('#63 disabled/bad verification key returns 503 without touching persistence; SIWE still works', async () => {
+  const f = privyFixture();
+  for (const config of [null, { ...f.config, verificationKey: 'misplaced-secret-value' }]) {
+    let persistenceCalls = 0;
+    const login = createPrivyLogin({ config: () => config, users: {
+      find: async () => { persistenceCalls++; return null; },
+      create: async () => { persistenceCalls++; return f.owner; },
+    } });
+    await assert.rejects(login({ identityToken: await f.sign() }), privyError(503, 'PRIVY_UNAVAILABLE'));
+    assert.equal(persistenceCalls, 0, 'disabled or invalid key must not touch persistence');
+  }
+  const auth = new AuthStore({ sessions: privyMemory().sessions });
+  const account = privateKeyToAccount(generatePrivateKey());
+  const challenge = auth.issueNonce();
+  const message = createSiweMessage({ ...challenge, address: account.address, version: '1', issuedAt: new Date(challenge.issuedAt) });
+  const session = await auth.login(message, await account.signMessage({ message }));
+  assert.equal(await auth.authenticate('Bearer ' + session.token), account.address.toLowerCase());
+});
+
+test('#63 mapping lookup/insert and session DB failure/timeout fail closed without leaking errors', async () => {
+  const f = privyFixture();
+  const identityToken = await f.sign();
+  for (const stage of ['find', 'create', 'session'] as const) {
+    for (const code of ['ECONNREFUSED', '57014', 'ETIMEDOUT']) {
+      const memory = privyMemory();
+      const fail = async (): Promise<never> => { throw Object.assign(new Error('secret-token-database-url'), { code }); };
+      const auth = new AuthStore({ sessions: { ...memory.sessions, save: stage === 'session' ? fail : memory.sessions.save } });
+      const login = createPrivyLogin({ config: () => f.config, users: {
+        find: stage === 'find' ? fail : memory.users.find,
+        create: stage === 'create' ? fail : memory.users.create,
+      }, issueSession: (owner) => auth.issueSession(owner), now: () => f.now });
+      await assert.rejects(login({ identityToken }), (error: unknown) => {
+        assert.ok(error instanceof AppError);
+        assert.equal(error.status, 503);
+        assert.equal(error.message, 'Privy login is unavailable');
+        assert.equal(error.cause, undefined);
+        return true;
+      });
+      assert.equal(memory.rows.size, 0);
+      assert.equal(memory.mappings.size, stage === 'session' ? 1 : 0);
+      if (stage === 'session') {
+        const recovered = new AuthStore({ sessions: memory.sessions });
+        const retry = createPrivyLogin({ config: () => f.config, users: memory.users,
+          issueSession: (owner) => recovered.issueSession(owner) });
+        const session = await retry({ identityToken: await f.sign({
+          linked_accounts: JSON.stringify([{ ...f.wallet, address: f.other }]),
+        }) });
+        assert.equal(await recovered.authenticate('Bearer ' + session.token), f.owner);
+      }
+    }
+  }
+  for (const owner of ['', '0x123', '0x' + '0'.repeat(40)]) {
+    let insertCalls = 0;
+    let mintCalls = 0;
+    const login = createPrivyLogin({ config: () => f.config, users: { find: async () => owner,
+      create: async () => { insertCalls++; return f.owner; } },
+    issueSession: async () => { mintCalls++; throw new Error('invalid owner'); } });
+    await assert.rejects(login({ identityToken }), privyError(503, 'PRIVY_UNAVAILABLE'));
+    assert.equal(insertCalls, 0, 'must not replace corrupt owner');
+    assert.equal(mintCalls, 0, 'must not mint invalid owner session');
+  }
+});
+
+test('#63 HTTP Privy shares auth IP limits with SIWE, rejects methods and malformed JSON, and hides tokens in logs', async () => {
+  const { fixture: f, memory, auth, login } = privyHarness();
+  const server = createServer({ privyLogin: login, auth: {
+    issueNonce: () => auth.issueNonce(), login: (m, s) => auth.login(m, s),
+    authenticate: (header) => auth.authenticate(header), logout: (header) => auth.logout(header),
+  }, rateLimiter: new RequestRateLimiter({ ...loadRateLimitConfig({}), authPerMinute: 5 }, undefined, () => 1000) });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address !== null && typeof address !== 'string');
+  const url = `http://127.0.0.1:${address.port}/auth/privy`;
+  const identityToken = await f.sign();
+  const logs: string[] = [];
+  const originalLog = console.log;
+  console.log = (...values: unknown[]) => { logs.push(values.map(String).join(' ')); };
+  try {
+    assert.equal((await fetch(url, { method: 'OPTIONS' })).status, 204);
+    const method = await fetch(url);
+    assert.equal(method.status, 405);
+    assert.equal(method.headers.get('allow'), 'POST');
+    assert.equal((await fetch(url, { method: 'POST', body: '{' })).status, 400);
+    const response = await fetch(url, { method: 'POST', body: JSON.stringify({ identityToken }) });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    const session: unknown = await response.json();
+    assert.ok(typeof session === 'object' && session !== null && 'token' in session && typeof session.token === 'string');
+    assert.equal(await auth.authenticate('Bearer ' + session.token), f.owner);
+    assert.equal((await fetch(url.replace('privy', 'nonce'), { method: 'POST' })).status, 200);
+    assert.equal((await fetch(url, { method: 'POST', body: JSON.stringify({ identityToken: 'invalid' }) })).status, 401);
+    const limited = await fetch(url, { method: 'POST', body: JSON.stringify({ identityToken }), headers: { 'x-forwarded-for': '192.0.2.1' } });
+    assert.equal(limited.status, 429);
+    assert.equal(limited.headers.get('retry-after'), '59');
+    assert.equal(memory.rows.size, 1);
+    assert.ok(!logs.join('\n').includes(identityToken), 'JWT must not appear in logs');
+    assert.ok(!logs.join('\n').includes(session.token), 'session must not appear in logs');
+  } finally {
+    console.log = originalLog;
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test('#63 HTTP maps owner conflicts to 409, disabled login and DB failure to 503 without issuing sessions', async () => {
+  const h = privyHarness();
+  const f = h.fixture;
+  const disabled = createPrivyLogin({ config: () => null });
+  const failing = createPrivyLogin({ config: () => f.config, users: {
+    find: async () => { throw new Error('secret-db-connection'); }, create: async () => assert.fail('must not insert'),
+  } });
+  for (const entry of [
+    { login: h.login, accounts: [], status: 409, code: 'PRIVY_NO_WALLET' },
+    { login: h.login, accounts: [f.wallet, { ...f.wallet, address: f.other }], status: 409, code: 'PRIVY_OWNER_AMBIGUOUS' },
+    { login: disabled, accounts: [f.wallet], status: 503, code: 'PRIVY_UNAVAILABLE' },
+    { login: failing, accounts: [f.wallet], status: 503, code: 'PRIVY_UNAVAILABLE' },
+  ]) {
+    await withBudgetServer(async (base) => {
+      const response = await fetch(base + '/auth/privy', { method: 'POST', body: JSON.stringify({
+        identityToken: await f.sign({ linked_accounts: JSON.stringify(entry.accounts) }),
+      }) });
+      assert.equal(response.status, entry.status);
+      const body: unknown = await response.json();
+      assert.ok(typeof body === 'object' && body !== null && 'error' in body);
+      assert.ok(typeof body.error === 'object' && body.error !== null && 'code' in body.error);
+      assert.equal(body.error.code, entry.code);
+      assert.ok(!JSON.stringify(body).includes('secret-db-connection'));
+    }, { privyLogin: entry.login });
+  }
+  assert.equal(h.memory.mappings.size, 0);
+  assert.equal(h.memory.rows.size, 0);
+});
+
+test('#63 default HTTP dependency loads optional Privy env without affecting SIWE nonce', async () => {
+  const f = privyFixture();
+  const identityToken = await f.sign({ iss: 'wrong-issuer' });
+  for (const settings of [
+    { appId: '', key: '', status: 503 },
+    { appId: f.config.appId, key: '', status: 503 },
+    { appId: '', key: f.config.verificationKey, status: 503 },
+    { appId: f.config.appId, key: f.config.verificationKey, status: 401 },
+  ]) {
+    const result = await runScript('src/privy.ts', {
+      PRIVY_APP_ID: settings.appId, PRIVY_VERIFICATION_KEY: settings.key,
+    }, `
+      const assert = (await import('node:assert/strict')).default;
+      const { createServer } = await import('./src/server.ts');
+      const server = createServer();
+      await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+      const base = 'http://127.0.0.1:' + server.address().port;
+      try {
+        const result = await fetch(base + '/auth/privy', { method: 'POST', body: JSON.stringify({ identityToken: ${JSON.stringify(identityToken)} }) });
+        assert.equal(result.status, ${settings.status});
+        assert.equal((await fetch(base + '/auth/nonce', { method: 'POST' })).status, 200);
+      } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+    `);
+    assert.equal(result.code, 0, result.output);
+    assert.ok(!result.output.includes(identityToken), 'JWT must not reach output');
   }
 });

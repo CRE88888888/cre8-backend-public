@@ -10,6 +10,7 @@ import type { RedeemAmount } from './operator.js';
 import { EXECUTOR_ORACLE_ABI, ORACLE_OF_ABI, listPriceableAssets } from './assets.js';
 import type { PriceableAsset, TradableProbe } from './assets.js';
 import { authenticate, issueNonce, login, logout, parseLoginBody } from './auth.js';
+import { loginWithPrivy } from './privy.js';
 import { RateLimitError, RequestRateLimiter } from './ratelimit.js';
 import { getConfig, getSessionKeyConfig } from './config.js';
 import { createPlatformStatusReader } from './chain.js';
@@ -165,6 +166,7 @@ export const BUNDLER_TIMEOUT_MS = 30_000;
  * merged over the defaults, so a test can stub one dependency and leave the rest real.
  */
 export type ServerDeps = {
+  privyLogin: typeof loginWithPrivy;
   rateLimiter: RequestRateLimiter;
   auth: { authenticate: typeof authenticate; issueNonce: typeof issueNonce; login: typeof login; logout: typeof logout };
   /** Public platform snapshot, with a process-wide TTL cache and no wallet/DB reads. */
@@ -282,6 +284,7 @@ async function defaultListAssets(): Promise<PriceableAsset[]> {
 }
 
 const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
+  privyLogin: loginWithPrivy,
   auth: { authenticate, issueNonce, login, logout },
   platformStatus: createPlatformStatusReader(),
   createStrategy,
@@ -412,6 +415,11 @@ async function route(
 
   if (root === 'auth') {
     await deps.rateLimiter.auth(deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
+    if (segments.length === 2 && segments[1] === 'privy') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      sendJson(res, 200, await deps.privyLogin(await readJsonBody(req)));
+      return;
+    }
     if (segments.length === 2 && segments[1] === 'logout') {
       if (method !== 'POST') return methodNotAllowed(res, ['POST']);
       await deps.auth.logout(req.headers.authorization);

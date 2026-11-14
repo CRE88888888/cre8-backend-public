@@ -273,7 +273,14 @@ export class AuthStore {
       throw new InvalidSignatureError('signature does not match the address in the SIWE message');
     }
 
-    const wallet = parsed.address.toLowerCase();
+    return this.issueSession(parsed.address);
+  }
+
+  /** Internal entry point: call only after SIWE or Privy has established the trusted owner. */
+  async issueSession(owner: string): Promise<SessionCredentials> {
+    const wallet = owner.toLowerCase();
+    if (!ADDRESS_PATTERN.test(wallet)) throw new Error('invalid verified session owner');
+    const now = this.#now();
     const token = randomToken();
     const expiresAt = now + SESSION_TTL_MS;
     // 先把過期列清掉：這是唯一的寫入路徑，順手做就不需要一個背景排程。
@@ -461,6 +468,11 @@ export function issueNonce(): SiweChallenge {
 
 export function login(message: string, signature: string): Promise<SessionCredentials> {
   return store().login(message, signature);
+}
+
+/** Internal session issuance shared by the two verified login paths. */
+export function issueSession(owner: string): Promise<SessionCredentials> {
+  return store().issueSession(owner);
 }
 
 export function authenticate(authHeader: string | null | undefined): Promise<string> {

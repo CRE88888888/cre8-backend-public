@@ -19,6 +19,20 @@ export type AuthConfig = {
   chainId: number;
 };
 
+export type PrivyConfig = { appId: string; verificationKey: string };
+
+/** Optional offline identity-token verification. Incomplete settings disable only Privy login. */
+export function loadPrivyConfig(env: NodeJS.ProcessEnv = process.env): PrivyConfig | null {
+  const appId = env.PRIVY_APP_ID?.trim();
+  const verificationKey = env.PRIVY_VERIFICATION_KEY?.trim();
+  return appId && verificationKey ? { appId, verificationKey: verificationKey.replace(/\\n/g, '\n') } : null;
+}
+
+export function getPrivyConfig(): PrivyConfig | null {
+  loadDotenv({ override: false });
+  return loadPrivyConfig();
+}
+
 /**
  * Session key（Kernel permission validator）需要的兩個設定。
  *

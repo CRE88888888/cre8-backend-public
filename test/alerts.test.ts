@@ -7,6 +7,7 @@ import {
   detectAlerts,
   detectLowGas,
   detectRelayerLowGas,
+  detectPaymasterLowGas,
   detectPortfolioFailures,
   detectOperationReleases,
   detectSessionKeyExpiry,
@@ -25,6 +26,7 @@ import { announceAlerts, inspectSessionKeyDerivation, runSchedulerOnce } from '.
 import type { SchedulerQueryFn } from '../src/scheduler.js';
 import { deriveSessionKey } from '../src/permissions.js';
 import type { Address, Hex } from 'viem';
+import { loadPaymasterConfig } from '../src/config.js';
 import { checkSessionKeySeed } from '../scripts/preflight.js';
 
 /**
@@ -65,6 +67,47 @@ function finding(overrides: Partial<AlertFinding> = {}): AlertFinding {
 }
 
 type Seen = { sql: string; params: readonly unknown[] };
+
+const PAYMASTER_ALERT_ENV = { CHAIN_ID: '1337', RPC_URL: 'http://127.0.0.1:8557',
+  PAYMASTER_SIGNER_PRIVATE_KEY: '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80',
+  PAYMASTER_ADDRESS: '0x1000000000000000000000000000000000000001',
+  EXECUTOR_ADDRESS: '0x1000000000000000000000000000000000000002',
+  REGISTRY_ADDRESS: '0x1000000000000000000000000000000000000003', PAYMASTER_MIN_DEPOSIT_WEI: '100' };
+
+test('#66 EntryPoint deposit threshold: zero/below/equal/above, RPC error and bounded timeout', async () => {
+  for (const deposit of [0n, 99n, 100n, 101n]) {
+    const result = await detectPaymasterLowGas({ env: PAYMASTER_ALERT_ENV, readDeposit: async (config) => {
+      assert.equal(config.address, PAYMASTER_ALERT_ENV.PAYMASTER_ADDRESS);
+      return deposit;
+    } });
+    assert.equal(result.complete, true);
+    assert.equal(result.finding !== null, deposit < 100n);
+    if (result.finding) assert.match(result.finding.detail, /paymaster.*EntryPoint.*100 wei/);
+  }
+  assert.deepEqual(await detectPaymasterLowGas({ env: {} }), { complete: true, finding: null });
+  for (const readDeposit of [async () => -1n, async () => { throw new Error('secret-rpc'); }, () => new Promise<bigint>(() => {})]) {
+    await assert.rejects(detectPaymasterLowGas({ env: PAYMASTER_ALERT_ENV, readDeposit, timeoutMs: 5 }), (error: unknown) => error instanceof Error && !error.message.includes('secret-rpc'));
+  }
+  assert.equal((await detectPaymasterLowGas({ env: { ...PAYMASTER_ALERT_ENV, PAYMASTER_MIN_DEPOSIT_WEI: '0' }, readDeposit: async () => 0n })).finding, null);
+  assert.ok(loadPaymasterConfig(PAYMASTER_ALERT_ENV));
+});
+
+test('#66 global gas alert merges both sources, never resolves unknown, preserves last low source detail', async () => {
+  for (const relayer of ['low', 'healthy', 'unknown']) for (const pm of ['low', 'healthy', 'unknown']) {
+    const { query, seen } = stubQuery((sql) => sql.includes('select detail') ? [{ detail: 'paymaster previous-low\nrelayer previous-low' }] : []);
+    await announceAlerts({ query, now: NOW, chainId: 1337, log: () => {},
+      relayerGasChecks: { env: { OPERATOR_PRIVATE_KEY: PAYMASTER_ALERT_ENV.PAYMASTER_SIGNER_PRIVATE_KEY, MIN_RELAYER_GAS_WEI: '100' },
+        readNativeBalance: async () => { if (relayer === 'unknown') throw new Error('secret'); return relayer === 'low' ? 0n : 100n; } },
+      paymasterGasChecks: { env: PAYMASTER_ALERT_ENV,
+        readDeposit: async () => { if (pm === 'unknown') throw new Error('secret'); return pm === 'low' ? 0n : 100n; } } });
+    const resolution = findSeen(seen, 'update scheduler_alerts');
+    assert.equal(Array.isArray(resolution.params[1]) && resolution.params[1].includes('gas_low:-1'), relayer !== 'healthy' || pm !== 'healthy');
+    const inserts = seen.filter((entry) => entry.sql.includes('insert into scheduler_alerts') && entry.params[0] === 'gas_low');
+    assert.equal(inserts.length, relayer === 'low' || pm === 'low' ? 1 : 0);
+    if (relayer === 'low' && pm === 'low') assert.match(String(inserts[0]?.params[3]), /relayer[\s\S]*paymaster|paymaster[\s\S]*relayer/);
+    if (relayer === 'low' && pm === 'unknown') assert.match(String(inserts[0]?.params[3]), /paymaster previous-low/);
+  }
+});
 
 /** 依 SQL 內容回列；順便把每一條 SQL 記下來（斷言要看 WHERE／ON CONFLICT 的原文）。 */
 function stubQuery(
@@ -1433,6 +1476,8 @@ async function assertRelayerNotifications(): Promise<void> {
     await client.query("delete from scheduler_alerts where kind = 'gas_low' and portfolio_id is null");
     let balance = 0n;
     let down = false;
+    let deposit = 100n;
+    let depositDown = false;
     const messages: string[] = [];
     const q: SchedulerQueryFn = async (sql, params = []) => {
       // Other detectors' data is isolated; upsert/resolve/list SQL executes against the real schema.
@@ -1444,6 +1489,9 @@ async function assertRelayerNotifications(): Promise<void> {
       relayerGasChecks: { env: RELAYER_TEST_ENV, readNativeBalance: async () => {
         if (down) throw new Error('RPC unavailable');
         return balance;
+      } }, paymasterGasChecks: { env: PAYMASTER_ALERT_ENV, readDeposit: async () => {
+        if (depositDown) throw new Error('RPC secret unavailable');
+        return deposit;
       } }, sendNotification: async (message) => { messages.push(message); } });
     const open = async () => (await listOpenAlerts(q)).filter((alert) => alert.kind === 'gas_low' && alert.portfolioId === null);
     await round();
@@ -1461,7 +1509,24 @@ async function assertRelayerNotifications(): Promise<void> {
     assert.equal((await open()).length, 0);
     assert.equal(messages.length, 2);
     assert.match(messages[1] ?? '', /已解除/);
+    deposit = 0n;
+    await round();
+    await round();
+    assert.equal((await open())[0]?.occurrences, 2);
+    assert.match((await open())[0]?.detail ?? '', /paymaster.*EntryPoint/);
+    assert.equal(messages.length, 3, 'two low deposit rounds notify once');
+    depositDown = true;
+    await round();
+    assert.equal((await open()).length, 1);
+    assert.equal(messages.length, 3, 'healthy relayer cannot resolve an unreadable paymaster');
+    depositDown = false;
+    deposit = 100n;
+    await round();
+    assert.equal((await open()).length, 0);
+    assert.equal(messages.length, 4);
+    assert.match(messages[3] ?? '', /已解除/);
     assert.ok(!messages.join('\n').includes(RELAYER_TEST_KEY));
+    assert.ok(!messages.join('\n').includes(PAYMASTER_ALERT_ENV.PAYMASTER_SIGNER_PRIVATE_KEY));
     throw new Error('rollback relayer fixture');
   }), /rollback relayer fixture/);
 }

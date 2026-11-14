@@ -77,6 +77,9 @@ import { EXECUTOR_ABI, EXECUTOR_SELECTOR, PLAN_HASH_ABI } from './chain.js';
  */
 
 import { HDKey } from '@scure/bip32';
+import { estimationPaymaster, paymasterExecutionError, schedulerPaymaster } from './paymaster.js';
+import { detectPaymasterLowGas } from './alerts.js';
+import type { PaymasterGasChecks } from './alerts.js';
 import { signerToEcdsaValidator } from '@zerodev/ecdsa-validator';
 import { toECDSASigner } from '@zerodev/permissions/signers';
 import { addressToEmptyAccount, createKernelAccount, createKernelAccountClient } from '@zerodev/sdk';
@@ -1330,6 +1333,7 @@ async function rebalanceKernelAccount(args: Pick<ExecuteArgs, 'account' | 'sessi
 
 async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<ExecutionOutcome> {
   const publicClient = defaultPublicClient();
+  const paymaster = schedulerPaymaster(args.account);
   try {
     const network = activeChain();
     const account = await rebalanceKernelAccount(args);
@@ -1355,6 +1359,7 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
 
     const client = createKernelAccountClient({
       account,
+      paymaster,
       chain: network,
       client: publicClient,
       bundlerTransport: http(bundlerUrl()),
@@ -1372,7 +1377,8 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
     // ---- ① gas：`callGasLimit` 明確覆寫，不讓 alto 的估算單獨決定 ---------------------------------
     // alto 對「一筆 op 跑完整條 DeFi 路徑」系統性低估（§8.16 實測 367,885 vs 需要 450–500k），
     // 而 gas 不足的後果不是 revert，是「success = false 但 tx.status = 1」—— 錢扣了、幣沒換。
-    const estimate = await client.estimateUserOperationGas({ calls, nonce: args.nonce });
+    const estimate = await client.estimateUserOperationGas({ calls, nonce: args.nonce,
+      ...(paymaster === undefined ? {} : { paymaster: estimationPaymaster(paymaster) }) });
     let numeraire: Address;
     try {
       numeraire = await publicClient.readContract({ address: args.executor, abi: EXECUTOR_BUY_ABI, functionName: 'numeraire' });
@@ -1424,7 +1430,7 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
     });
   } catch (error) {
     const decoded = decodePriceSourceError(error);
-    if (decoded === null) throw error;
+    if (decoded === null) throw paymaster === undefined ? error : paymasterExecutionError(error);
     let detailed = decoded;
     try {
       const oracle = await publicClient.readContract({ address: args.executor, abi: EXECUTOR_ABI, functionName: 'oracle' });
@@ -1750,6 +1756,7 @@ export async function runSchedulerOnce(
  */
 export async function announceAlerts(args: {
   relayerGasChecks?: RelayerGasChecks;
+  paymasterGasChecks?: PaymasterGasChecks;
   priceSourceChecks?: () => Promise<PriceSourceObservation[]>;
   priceSourceTracker?: PriceSourceTracker;
   /** null/omitted = not verified; keep an existing global pause alert open. */
@@ -1807,14 +1814,36 @@ export async function announceAlerts(args: {
       const relayer = await detectRelayerLowGas(args.relayerGasChecks);
       relayerComplete = relayer.complete;
       relayerFinding = relayer.finding;
-      // Persist this independently: portfolio/seed DB failures must not hide a low relayer balance.
-      if (relayerFinding !== null) {
-        args.log(formatAlert(relayerFinding));
-        await recordAlerts(args.query, [relayerFinding], args.now, notifications);
-      }
     } catch {
       relayerComplete = false;
       args.log('[ALERT] relayer 餘額檢查失敗；本輪保留既有全域 gas_low 警示');
+    }
+    let paymasterComplete = false;
+    let paymasterFinding: AlertFinding | null = null;
+    try {
+      const paymaster = await detectPaymasterLowGas(args.paymasterGasChecks);
+      paymasterComplete = paymaster.complete;
+      paymasterFinding = paymaster.finding;
+    } catch { args.log('[ALERT] paymaster 存款檢查失敗；本輪保留既有全域 gas_low 警示'); }
+    let globalGasFinding: AlertFinding | null = null;
+    if (relayerFinding !== null || paymasterFinding !== null) {
+      const details = [relayerFinding?.detail, paymasterFinding?.detail].filter((detail): detail is string => detail !== undefined);
+      if (!relayerComplete || !paymasterComplete) {
+        // Preserve the other source's last confirmed low observation while it is unreadable.
+        try {
+          const previous = await args.query("select detail from scheduler_alerts where kind = 'gas_low' and portfolio_id is null and resolved_at is null");
+          const row = previous.rows[0];
+          const oldDetail: unknown = typeof row === 'object' && row !== null ? Reflect.get(row, 'detail') : undefined;
+          if (typeof oldDetail === 'string') for (const line of oldDetail.split('\n')) {
+            if ((!relayerComplete && line.startsWith('relayer ')) || (!paymasterComplete && line.startsWith('paymaster '))) details.push(line);
+          }
+        } catch { /* The existing alert remains open; current known-low evidence must still be persisted. */ }
+      }
+      globalGasFinding = { kind: 'gas_low', severity: 'critical', portfolioId: null, detail: details.join('\n') };
+      args.log(formatAlert(globalGasFinding));
+      // Persist independently of the portfolio/seed detectors; exactly one upsert per round.
+      try { await recordAlerts(args.query, [globalGasFinding], args.now, notifications); }
+      catch { args.log('[ALERT] 全域 gas_low 寫入失敗；本輪保留既有警示'); return; }
     }
     const findings = await detectAlerts(args.query, { now: args.now, ...args.gasChecks });
     let seedCheckComplete = false;
@@ -1837,10 +1866,10 @@ export async function announceAlerts(args: {
     if (!priceComplete) unverified.push('price_source_unavailable');
     if (priceFinding !== null) findings.push(priceFinding);
     if (args.executorPaused !== true && args.executorPaused !== false) unverified.push('executor_paused');
-    const present = [...findings, ...(pauseFinding === null ? [] : [pauseFinding]), ...(relayerFinding === null ? [] : [relayerFinding])];
-    const resolved = await resolveAlerts(args.query, present, args.now, notifications, unverified, relayerComplete ? [] : ['gas_low:-1']);
+    const present = [...findings, ...(pauseFinding === null ? [] : [pauseFinding]), ...(globalGasFinding === null ? [] : [globalGasFinding])];
+    const resolved = await resolveAlerts(args.query, present, args.now, notifications, unverified, relayerComplete && paymasterComplete ? [] : ['gas_low:-1']);
 
-    if (findings.length === 0 && pauseFinding === null && relayerFinding === null) {
+    if (findings.length === 0 && pauseFinding === null && globalGasFinding === null) {
       args.log(`[ALERT] ${seedCheckComplete ? '沒有警示' : '其他規則未偵測到警示'}${resolved > 0 ? `（已解除 ${resolved} 筆）` : ''}`);
       return;
     }

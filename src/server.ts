@@ -1,5 +1,5 @@
 import { createServer as createHttpServer } from 'node:http';
-import { createPublicClient, http } from 'viem';
+import { createPublicClient, http, toHex } from 'viem';
 import type { Address } from 'viem';
 import { activeChain } from './chain-object.js';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
@@ -11,6 +11,7 @@ import { EXECUTOR_ORACLE_ABI, ORACLE_OF_ABI, listPriceableAssets } from './asset
 import type { PriceableAsset, TradableProbe } from './assets.js';
 import { authenticate, issueNonce, login, logout, parseLoginBody } from './auth.js';
 import { loginWithPrivy } from './privy.js';
+import { sponsorUserOperation } from './paymaster.js';
 import { RateLimitError, RequestRateLimiter } from './ratelimit.js';
 import { getConfig, getSessionKeyConfig } from './config.js';
 import { createPlatformStatusReader } from './chain.js';
@@ -166,6 +167,7 @@ export const BUNDLER_TIMEOUT_MS = 30_000;
  * merged over the defaults, so a test can stub one dependency and leave the rest real.
  */
 export type ServerDeps = {
+  sponsorUserOperation: typeof sponsorUserOperation;
   privyLogin: typeof loginWithPrivy;
   rateLimiter: RequestRateLimiter;
   auth: { authenticate: typeof authenticate; issueNonce: typeof issueNonce; login: typeof login; logout: typeof logout };
@@ -284,6 +286,7 @@ async function defaultListAssets(): Promise<PriceableAsset[]> {
 }
 
 const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
+  sponsorUserOperation,
   privyLogin: loginWithPrivy,
   auth: { authenticate, issueNonce, login, logout },
   platformStatus: createPlatformStatusReader(),
@@ -394,6 +397,17 @@ async function route(
   if (root === 'health' && segments.length === 1) {
     if (method !== 'GET') return methodNotAllowed(res, ['GET']);
     return health(res);
+  }
+
+  if (root === 'paymaster' && segments.length === 2 && segments[1] === 'sponsor') {
+    if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    // Reuse #59's bounded wallet/minute policy; daily money budgets are durable in 0027.
+    await deps.rateLimiter.wallet('plan', wallet);
+    const result = await deps.sponsorUserOperation(await readJsonBody(req), wallet);
+    sendJson(res, 200, { ...result, paymasterVerificationGasLimit: toHex(result.paymasterVerificationGasLimit),
+      paymasterPostOpGasLimit: toHex(result.paymasterPostOpGasLimit) });
+    return;
   }
 
   if (root === 'platform' && segments.length === 2 && segments[1] === 'status') {

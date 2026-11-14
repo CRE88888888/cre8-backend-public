@@ -21,7 +21,7 @@ export async function runScript(path: string, env: NodeJS.ProcessEnv = {}, setup
     env: {
       ...process.env,
       DATABASE_URL: 'postgres://ci:ci@127.0.0.1:1/unused',
-      PORT: '8092', CHAIN_ID: '1337', MIGRATIONS_ENABLED: '0',
+      PORT: process.env.TEST_BACKEND_PORT ?? '8092', CHAIN_ID: '1337', MIGRATIONS_ENABLED: '0',
       RPC_URL: '', ANVIL_RPC_URL: '', BUNDLER_URL: '',
       EXECUTOR_ADDRESS: '', REGISTRY_ADDRESS: '', SESSION_KEY_MASTER_SEED: '', OPERATOR_PRIVATE_KEY: '',
       TELEGRAM_BOT_TOKEN: '', TELEGRAM_CHAT_ID: '', TELEGRAM_API_BASE: '',

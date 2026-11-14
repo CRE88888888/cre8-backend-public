@@ -1,4 +1,8 @@
 import assert from 'node:assert/strict';
+// Keep the split sponsorship security/HTTP tests on this existing no-DB CI entry point.
+import './paymaster.test.js';
+import './paymaster-route.test.js';
+import './paymaster.rpc.test.js';
 import { AuthStore } from '../src/auth.js';
 import { loadRateLimitConfig, loadRelayerGasConfig } from '../src/config.js';
 import { MemoryRateLimitStore, RateLimitError, RequestRateLimiter } from '../src/ratelimit.js';

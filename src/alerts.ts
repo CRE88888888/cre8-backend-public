@@ -2,7 +2,9 @@ import type { Address, Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import type { PriceSourceObservation } from './chain.js';
 import { getAccountGasBalance, getGasPriceWei } from './chain.js';
-import { DEFAULT_CHAIN_ID, loadRelayerGasConfig } from './config.js';
+import { DEFAULT_CHAIN_ID, loadRelayerGasConfig, loadPaymasterConfig } from './config.js';
+import type { PaymasterConfig } from './config.js';
+import { readPaymasterDeposit } from './paymaster.js';
 import { perOperationCostWei } from './funding.js';
 import { sendTelegram } from './notify.js';
 
@@ -33,6 +35,31 @@ export type RelayerGasChecks = {
   readNativeBalance?: (address: Address) => Promise<bigint>;
   timeoutMs?: number;
 };
+
+export type PaymasterGasChecks = {
+  env?: NodeJS.ProcessEnv;
+  readDeposit?: (config: PaymasterConfig) => Promise<bigint>;
+  timeoutMs?: number;
+};
+
+/** A disabled paymaster has no live spending source; an enabled but unreadable deposit is unknown. */
+export async function detectPaymasterLowGas(args: PaymasterGasChecks = {}): Promise<{ complete: boolean; finding: AlertFinding | null }> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const config = loadPaymasterConfig(args.env ?? process.env);
+    if (config === null) return { complete: true, finding: null };
+    const timeoutMs = args.timeoutMs ?? config.timeoutMs;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new Error('invalid deposit timeout');
+    const deposit = await Promise.race([(args.readDeposit ?? readPaymasterDeposit)(config),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('deposit timeout')), timeoutMs); })]);
+    if (typeof deposit !== 'bigint' || deposit < 0n) throw new Error('invalid deposit');
+    return { complete: true, finding: deposit < config.minDepositWei ? {
+      kind: 'gas_low', severity: 'critical', portfolioId: null,
+      detail: `paymaster ${config.address}：EntryPoint 存款 ${deposit} wei，低於門檻 ${config.minDepositWei} wei，請補充代付 gas`,
+    } : null };
+  } catch { throw new Error('paymaster 存款檢查失敗；本輪保留既有全域 gas_low 警示'); }
+  finally { if (timer !== undefined) clearTimeout(timer); }
+}
 
 /** Unknown is distinct from healthy: callers must preserve the existing global gas_low finding. */
 export async function detectRelayerLowGas(args: RelayerGasChecks = {}): Promise<{

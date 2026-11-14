@@ -1,6 +1,63 @@
 import { config as loadDotenv } from 'dotenv';
 import { isIP } from 'node:net';
 import type { Address, Hex } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
+
+export type PaymasterConfig = {
+  signerPrivateKey: Hex;
+  address: Address;
+  executor: Address;
+  registry: Address;
+  mockUsdt: Address | null;
+  rpcUrl: string;
+  chainId: number;
+  verificationGasLimit: bigint;
+  postOpGasLimit: bigint;
+  accountDailyCount: bigint;
+  accountDailyGas: bigint;
+  accountDailyWei: bigint;
+  siteDailyGas: bigint;
+  siteDailyWei: bigint;
+  minDepositWei: bigint;
+  timeoutMs: number;
+};
+
+/** Optional feature. Zero budgets block sponsorship; they never disable a safeguard. */
+export function loadPaymasterConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfig | null {
+  const raw = env.PAYMASTER_SIGNER_PRIVATE_KEY?.trim();
+  if (!raw) return null;
+  if (!/^0x[0-9a-fA-F]{64}$/.test(raw)) throw new ConfigurationError('PAYMASTER_SIGNER_PRIVATE_KEY must be a 32-byte hex key');
+  const signerPrivateKey = raw as Hex;
+  try { privateKeyToAccount(signerPrivateKey); }
+  catch { throw new ConfigurationError('PAYMASTER_SIGNER_PRIVATE_KEY must be a valid secp256k1 key'); }
+  const requiredAddress = (name: string): Address => {
+    const address = parseOptionalAddress(env, name);
+    if (address === null || /^0x0{40}$/.test(address)) throw new ConfigurationError(name + ' must be a nonzero address');
+    return address;
+  };
+  const rpcUrl = env.RPC_URL?.trim();
+  if (!rpcUrl) throw new ConfigurationError('RPC_URL is required for paymaster sponsorship');
+  const chainId = parseInteger(env, 'CHAIN_ID', DEFAULT_CHAIN_ID, { min: 1, max: Number.MAX_SAFE_INTEGER });
+  // This signer is initially authorized for testnet and local anvil only. Mainnet needs separate approval.
+  if (![97, 1337, 31337].includes(chainId)) throw new ConfigurationError('PAYMASTER signing requires CHAIN_ID 97, 1337 or 31337');
+  const verificationGasLimit = parseBigInt(env, 'PAYMASTER_VERIFICATION_GAS_LIMIT', 100_000n);
+  const postOpGasLimit = parseBigInt(env, 'PAYMASTER_POST_OP_GAS_LIMIT', 0n);
+  if (verificationGasLimit < 1n || verificationGasLimit >= (1n << 128n) || postOpGasLimit >= (1n << 128n)) {
+    throw new ConfigurationError('PAYMASTER_VERIFICATION_GAS_LIMIT / PAYMASTER_POST_OP_GAS_LIMIT exceed uint128 bounds');
+  }
+  return {
+    signerPrivateKey, address: requiredAddress('PAYMASTER_ADDRESS'), executor: requiredAddress('EXECUTOR_ADDRESS'),
+    registry: requiredAddress('REGISTRY_ADDRESS'), mockUsdt: parseOptionalAddress(env, 'PAYMASTER_MOCK_USDT_ADDRESS'), rpcUrl, chainId,
+    verificationGasLimit, postOpGasLimit,
+    accountDailyCount: parseBigInt(env, 'PAYMASTER_ACCOUNT_DAILY_COUNT', 20n),
+    accountDailyGas: parseBigInt(env, 'PAYMASTER_ACCOUNT_DAILY_GAS', 20_000_000n),
+    accountDailyWei: parseBigInt(env, 'PAYMASTER_ACCOUNT_DAILY_WEI', 10n ** 16n),
+    siteDailyGas: parseBigInt(env, 'PAYMASTER_SITE_DAILY_GAS', 200_000_000n),
+    siteDailyWei: parseBigInt(env, 'PAYMASTER_SITE_DAILY_WEI', 10n ** 17n),
+    minDepositWei: parseBigInt(env, 'PAYMASTER_MIN_DEPOSIT_WEI', 10n ** 16n),
+    timeoutMs: parseInteger(env, 'PAYMASTER_TIMEOUT_MS', 5_000, { min: 1, max: 30_000 }),
+  };
+}
 
 /** 僅含變數名與格式診斷，不含 env 原值；可安全寫入 server log。 */
 export class ConfigurationError extends Error {}
@@ -180,6 +237,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   loadTelegramConfig(env);
   loadRateLimitConfig(env);
   loadRelayerGasConfig(env);
+  loadPaymasterConfig(env);
 
   return {
     databaseUrl,

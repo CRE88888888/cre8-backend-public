@@ -9,7 +9,8 @@ import { listPortfolioActivity, readOperatorActivity, readOperatorOverview, runO
 import type { RedeemAmount } from './operator.js';
 import { EXECUTOR_ORACLE_ABI, ORACLE_OF_ABI, listPriceableAssets } from './assets.js';
 import type { PriceableAsset, TradableProbe } from './assets.js';
-import { authenticate, issueNonce, login, parseLoginBody } from './auth.js';
+import { authenticate, issueNonce, login, logout, parseLoginBody } from './auth.js';
+import { RateLimitError, RequestRateLimiter } from './ratelimit.js';
 import { getConfig, getSessionKeyConfig } from './config.js';
 import { createPlatformStatusReader } from './chain.js';
 import { query } from './db.js';
@@ -164,6 +165,8 @@ export const BUNDLER_TIMEOUT_MS = 30_000;
  * merged over the defaults, so a test can stub one dependency and leave the rest real.
  */
 export type ServerDeps = {
+  rateLimiter: RequestRateLimiter;
+  auth: { authenticate: typeof authenticate; issueNonce: typeof issueNonce; login: typeof login; logout: typeof logout };
   /** Public platform snapshot, with a process-wide TTL cache and no wallet/DB reads. */
   platformStatus: ReturnType<typeof createPlatformStatusReader>;
   createStrategy: typeof createStrategy;
@@ -278,7 +281,8 @@ async function defaultListAssets(): Promise<PriceableAsset[]> {
   return listPriceableAssets(undefined, probe);
 }
 
-const defaultDeps: ServerDeps = {
+const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
+  auth: { authenticate, issueNonce, login, logout },
   platformStatus: createPlatformStatusReader(),
   createStrategy,
   publishVersion,
@@ -311,7 +315,7 @@ const defaultDeps: ServerDeps = {
 };
 
 export function createServer(overrides: Partial<ServerDeps> = {}): Server {
-  const deps: ServerDeps = { ...defaultDeps, ...overrides };
+  const deps: ServerDeps = { ...defaultDeps, ...overrides, rateLimiter: overrides.rateLimiter ?? new RequestRateLimiter() };
   return createHttpServer((req, res) => {
     void handleRequest(req, res, deps);
   });
@@ -372,11 +376,15 @@ async function route(
   // 所有 /operator/* 共用同一道授權，不能只靠登入或鏈上的交易限制。
   // 先驗登入（401），再驗寫入開關（403，與 /portfolios/:id/rebalance 一致），最後驗身分。
   if (root === 'operator') {
-    const wallet = await authenticate(req.headers.authorization);
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
     if (method === 'POST') requireOperatorRebalanceEnabled(deps);
     const wallets = deps.operatorWallets ?? resolveOperatorWallets();
     if (!wallets.some((allowed) => allowed.toLowerCase() === wallet.toLowerCase())) {
       throw new AppError(403, 'OPERATOR_FORBIDDEN', 'wallet is not authorized to use operator endpoints');
+    }
+    if (segments.length === 4 && segments[1] === 'portfolios') {
+      if (method === 'GET' && segments[3] === 'plan') await deps.rateLimiter.wallet('plan', wallet);
+      if (method === 'POST' && segments[3] === 'close') await deps.rateLimiter.wallet('close', wallet);
     }
   }
 
@@ -396,19 +404,28 @@ async function route(
     // 公開的 /platform/status 不會公開這份資產清單。
   if (root === 'assets' && segments.length === 1) {
     if (method !== 'GET') return methodNotAllowed(res, ['GET']);
-    await authenticate(req.headers.authorization);
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    await deps.rateLimiter.wallet('assets', wallet);
     sendJson(res, 200, { assets: await deps.listAssets() });
     return;
   }
 
   if (root === 'auth') {
+    await deps.rateLimiter.auth(deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
+    if (segments.length === 2 && segments[1] === 'logout') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      await deps.auth.logout(req.headers.authorization);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
     if (segments.length === 2 && segments[1] === 'nonce') {
       if (method !== 'POST') return methodNotAllowed(res, ['POST']);
-      return nonceRoute(res);
+      return nonceRoute(res, deps);
     }
     if (segments.length === 2 && segments[1] === 'login') {
       if (method !== 'POST') return methodNotAllowed(res, ['POST']);
-      return loginRoute(req, res);
+      return loginRoute(req, res, deps);
     }
   }
 
@@ -462,7 +479,8 @@ async function route(
       }
       if (segments[2] === 'close') {
         if (method !== 'POST') return methodNotAllowed(res, ['POST']);
-        const closeWallet = await authenticate(req.headers.authorization);
+        const closeWallet = await deps.auth.authenticate(req.headers.authorization);
+        await deps.rateLimiter.wallet('close', closeWallet);
         sendJson(res, 200, await deps.operatorClose(portfolioId(), closeWallet));
         return;
       }
@@ -574,14 +592,14 @@ async function health(res: ServerResponse): Promise<void> {
 }
 
 /** POST /auth/nonce — mint a single-use nonce plus the EIP-4361 fields the wallet must sign. */
-function nonceRoute(res: ServerResponse): void {
-  sendJson(res, 200, issueNonce());
+function nonceRoute(res: ServerResponse, deps: ServerDeps): void {
+  sendJson(res, 200, deps.auth.issueNonce());
 }
 
 /** POST /auth/login — exchange { message, signature } for a bearer session token. */
-async function loginRoute(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function loginRoute(req: IncomingMessage, res: ServerResponse, deps: ServerDeps): Promise<void> {
   const credentials = parseLoginBody(await readJsonBody(req));
-  const session = await login(credentials.message, credentials.signature);
+  const session = await deps.auth.login(credentials.message, credentials.signature);
   sendJson(res, 200, session);
 }
 
@@ -613,7 +631,8 @@ async function createRoute(
   res: ServerResponse,
   deps: ServerDeps,
 ): Promise<void> {
-  const provider = await authenticate(req.headers.authorization);
+  const provider = await deps.auth.authenticate(req.headers.authorization);
+  await deps.rateLimiter.wallet('strategies', provider);
   const body = await readJsonBody(req);
   const strategy = await deps.createStrategy(body, provider);
   sendJson(res, 201, strategy, { location: `/strategies/${strategy.id}` });
@@ -629,7 +648,8 @@ async function publishVersionRoute(
   id: number,
   deps: ServerDeps,
 ): Promise<void> {
-  const provider = await authenticate(req.headers.authorization);
+  const provider = await deps.auth.authenticate(req.headers.authorization);
+  await deps.rateLimiter.wallet('versions', provider);
   const body = await readJsonBody(req);
   // publishVersion expects an object; without this guard a JSON `null` body would be a 500.
   if (typeof body !== 'object' || body === null || Array.isArray(body)) {
@@ -644,7 +664,8 @@ async function publishVersionRoute(
  * Body is { strategyId }. Requires a bearer token; the wallet is the session wallet.
  */
 async function enrollRoute(req: IncomingMessage, res: ServerResponse, deps: ServerDeps): Promise<void> {
-  const provider = await authenticate(req.headers.authorization);
+  const provider = await deps.auth.authenticate(req.headers.authorization);
+  await deps.rateLimiter.wallet('portfolios', provider);
   const body = await readJsonBody(req);
   if (typeof body !== 'object' || body === null || Array.isArray(body)) {
     throw new ValidationError('INVALID_PORTFOLIO', 'request body must be a JSON object');
@@ -665,7 +686,7 @@ async function listPortfoliosRoute(
   res: ServerResponse,
   deps: ServerDeps,
 ): Promise<void> {
-  const wallet = await authenticate(req.headers.authorization);
+  const wallet = await deps.auth.authenticate(req.headers.authorization);
   sendJson(res, 200, { portfolios: await deps.listPortfolios(wallet) });
 }
 
@@ -680,7 +701,7 @@ async function renewalParamsRoute(
   id: number,
   deps: ServerDeps,
 ): Promise<void> {
-  const wallet = await authenticate(req.headers.authorization);
+  const wallet = await deps.auth.authenticate(req.headers.authorization);
   sendJson(res, 200, await deps.buildRenewalParams(id, wallet));
 }
 
@@ -695,7 +716,7 @@ async function renewalResultRoute(
   id: number,
   deps: ServerDeps,
 ): Promise<void> {
-  const wallet = await authenticate(req.headers.authorization);
+  const wallet = await deps.auth.authenticate(req.headers.authorization);
   const body = await readJsonBody(req);
   if (typeof body !== 'object' || body === null || Array.isArray(body)) {
     throw new ValidationError('INVALID_RENEWAL', 'request body must be a JSON object');
@@ -723,7 +744,7 @@ async function portfolioActivityRoute(
   id: number,
   deps: ServerDeps,
 ): Promise<void> {
-  const wallet = await authenticate(req.headers.authorization);
+  const wallet = await deps.auth.authenticate(req.headers.authorization);
   sendJson(res, 200, { activity: await deps.portfolioActivity(id, wallet) });
 }
 
@@ -733,7 +754,7 @@ async function portfolioStatusRoute(
   id: number,
   deps: ServerDeps,
 ): Promise<void> {
-  const wallet = await authenticate(req.headers.authorization);
+  const wallet = await deps.auth.authenticate(req.headers.authorization);
   sendJson(res, 200, await deps.portfolioStatus(id, wallet));
 }
 
@@ -752,7 +773,8 @@ async function planPreviewRoute(
   id: number,
   deps: ServerDeps,
 ): Promise<void> {
-  const wallet = await authenticate(req.headers.authorization);
+  const wallet = await deps.auth.authenticate(req.headers.authorization);
+  await deps.rateLimiter.wallet('plan', wallet);
   sendJson(res, 200, await deps.planPreview(id, wallet));
 }
 
@@ -785,7 +807,8 @@ async function redeemRoute(
   id: number,
   deps: ServerDeps,
 ): Promise<void> {
-  const wallet = await authenticate(req.headers.authorization);
+  const wallet = await deps.auth.authenticate(req.headers.authorization);
+  await deps.rateLimiter.wallet('redeem', wallet);
   const body = await readJsonBody(req);
   if (typeof body !== 'object' || body === null || Array.isArray(body)) throw new AppError(400, 'INVALID_AMOUNT', 'body must contain usd or sellUsdE8');
   if ('sellUsdE8' in body) {
@@ -813,7 +836,7 @@ async function operatorRebalanceRoute(
   id: number,
   deps: ServerDeps,
 ): Promise<void> {
-  const wallet = await authenticate(req.headers.authorization);
+  const wallet = await deps.auth.authenticate(req.headers.authorization);
   requireOperatorRebalanceEnabled(deps);
   sendJson(res, 200, await deps.operatorRebalance(id, wallet));
 }
@@ -853,7 +876,7 @@ async function bundlerRelayRoute(
   deps: ServerDeps,
 ): Promise<void> {
   // token 先驗、body 後讀：順序與其他寫入路由一致（沒 token 又不合法的 body 是 401，不是 400）。
-  await authenticate(req.headers.authorization);
+  await deps.auth.authenticate(req.headers.authorization);
 
   const raw = await readBodyText(req);
   let request: unknown;
@@ -1013,6 +1036,10 @@ function sendError(res: ServerResponse, err: unknown): void {
     return;
   }
 
+  if (err instanceof RateLimitError) {
+    res.setHeader('retry-after', String(err.retryAfterSeconds));
+    res.setHeader('access-control-expose-headers', 'Retry-After');
+  }
   if (err instanceof AppError) {
     sendJson(res, err.status, { error: { code: err.code, message: err.message } });
     return;

@@ -1,4 +1,12 @@
 import assert from 'node:assert/strict';
+import { AuthStore } from '../src/auth.js';
+import { loadRateLimitConfig, loadRelayerGasConfig } from '../src/config.js';
+import { MemoryRateLimitStore, RateLimitError, RequestRateLimiter } from '../src/ratelimit.js';
+import type { RateLimitStore, WalletAction } from '../src/ratelimit.js';
+import type { ServerDeps } from '../src/server.js';
+import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
+import { createSiweMessage } from 'viem/siwe';
+
 import { execFile } from 'node:child_process';
 import { createServer as createHttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -12,6 +20,23 @@ import { closePool, query as dbQuery } from '../src/db.js';
 import { createServer, resolveOperatorWallets } from '../src/server.js';
 import { assertNoSecretSlices, runScript } from './fixtures/secret-output.js';
 
+test('#59 nonce flood stops at the IP allowance', async () => {
+  const server = createServer({ rateLimiter: new RequestRateLimiter(loadRateLimitConfig({}), undefined, () => 1_000) });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const { port } = server.address() as AddressInfo;
+    for (let i = 0; i < 120; i++) {
+      const response = await fetch(`http://127.0.0.1:${port}/auth/nonce`, { method: 'POST' });
+      assert.equal(response.status, 200);
+      await response.arrayBuffer();
+    }
+    const response = await fetch(`http://127.0.0.1:${port}/auth/nonce`, { method: 'POST' });
+    assert.equal(response.status, 429);
+    assert.ok(Number(response.headers.get('retry-after')) > 0);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
 test('#56 API validates malformed session config before migration or listening', async () => {
   const seed = '0123456789abcdef'.repeat(4);
   for (const raw of [seed, `0x${seed.slice(1)}`, `0x${seed}0`, `"0x${seed}"`]) {
@@ -469,5 +494,256 @@ test('default public reader handles a down DB, unused signing configuration, mis
     }
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+// #59: all of these route tests use real SIWE recovery with an isolated session repository.
+async function withBudgetServer(run: (base: string) => Promise<void>, overrides: Partial<ServerDeps> = {}) {
+  const rows = new Map<string, { wallet: string; expiresAt: Date }>();
+  const auth = new AuthStore({ auth: { authDomain: 'localhost', authUri: 'http://localhost', chainId: 1337 }, sessions: {
+    save: async (hash, wallet, expiresAt) => { rows.set(hash, { wallet, expiresAt }); },
+    find: async (hash) => rows.get(hash) ?? null,
+    remove: async (hash) => { rows.delete(hash); },
+    prune: async () => {},
+  } });
+  const server = createServer({
+    auth: { issueNonce: () => auth.issueNonce(), login: (message, signature) => auth.login(message, signature),
+      authenticate: (header) => auth.authenticate(header), logout: (header) => auth.logout(header) },
+    ...overrides,
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    await run(`http://127.0.0.1:${address.port}`);
+  } finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
+}
+
+async function budgetToken(base: string, account = privateKeyToAccount(generatePrivateKey())) {
+  const challenge: unknown = await (await fetch(`${base}/auth/nonce`, { method: 'POST' })).json();
+  assert.ok(typeof challenge === 'object' && challenge !== null);
+  const field = (name: string): string => {
+    const value: unknown = Reflect.get(challenge, name);
+    assert.equal(typeof value, 'string');
+    return String(value);
+  };
+  const message = createSiweMessage({ address: account.address, domain: field('domain'), uri: field('uri'),
+    statement: field('statement'), nonce: field('nonce'), version: '1', chainId: 1337, issuedAt: new Date(field('issuedAt')) });
+  const response = await fetch(`${base}/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ message, signature: await account.signMessage({ message }) }) });
+  assert.equal(response.status, 200);
+  const result: unknown = await response.json();
+  assert.ok(typeof result === 'object' && result !== null);
+  const token: unknown = Reflect.get(result, 'token');
+  assert.equal(typeof token, 'string');
+  return String(token);
+}
+
+test('#59 memory budget is atomic at zero, limit, limit+1, UTC boundary and capacity', async () => {
+  const store = new MemoryRateLimitStore(2);
+  const policy = { limit: 2, windowMs: 60_000 };
+  assert.deepEqual(await store.consume('zero', { ...policy, limit: 0 }, 0), { allowed: false, retryAfterSeconds: 60 });
+  const decisions = await Promise.all(Array.from({ length: 8 }, () => store.consume('a', policy, 0)));
+  assert.equal(decisions.filter((decision) => decision.allowed).length, 2);
+  assert.deepEqual(await store.consume('a', policy, 59_999), { allowed: false, retryAfterSeconds: 1 });
+  assert.equal((await store.consume('b', policy, 59_999)).allowed, true);
+  await assert.rejects(store.consume('c', policy, 59_999), { status: 503, code: 'RATE_LIMIT_CAPACITY' });
+  assert.equal((await store.consume('a', policy, 59_999)).allowed, false, 'capacity pressure never resets active buckets');
+  assert.equal((await store.consume('c', policy, 60_000)).allowed, true, 'expired keys are reclaimed exactly at reset');
+  assert.equal((await store.consume('a', policy, 60_000)).allowed, true);
+  for (const limit of [-1, 0.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1]) {
+    await assert.rejects(store.consume('x', { ...policy, limit }, 0), RangeError);
+  }
+  for (const windowMs of [0, -1, 0.5]) await assert.rejects(store.consume('x', { ...policy, windowMs }, 0), RangeError);
+  for (const now of [-1, 0.5, Number.NaN]) await assert.rejects(store.consume('x', policy, now), RangeError);
+  for (const size of [0, -1, 0.5]) assert.throws(() => new MemoryRateLimitStore(size), RangeError);
+});
+
+test('#59 wallet, operation and IP budgets are independent; casing and new tokens cannot reset wallets', async () => {
+  let now = 0;
+  const config = loadRateLimitConfig({ RATE_LIMIT_STRATEGIES_PER_DAY: '1', RATE_LIMIT_AUTH_PER_MINUTE: '1' });
+  const limiter = new RequestRateLimiter(config, undefined, () => now);
+  await limiter.wallet('strategies', '0xAB');
+  await assert.rejects(limiter.wallet('strategies', '0xab'), RateLimitError);
+  await limiter.wallet('strategies', '0xcd');
+  await limiter.wallet('versions', '0xab');
+  await limiter.auth('192.0.2.1');
+  await assert.rejects(limiter.auth('192.0.2.1'), RateLimitError);
+  await limiter.auth('192.0.2.2');
+  now = 86_399_999;
+  await assert.rejects(limiter.wallet('strategies', '0xab'), (error: unknown) => error instanceof RateLimitError && error.retryAfterSeconds === 1);
+  now++;
+  await limiter.wallet('strategies', '0xab');
+});
+
+test('#59 proxy trust walks right-to-left, isolates users and rejects forged or malformed forwarding', () => {
+  const direct = new RequestRateLimiter(loadRateLimitConfig({}));
+  assert.equal(direct.clientIp('::ffff:127.0.0.1', '192.0.2.2'), '127.0.0.1');
+  assert.equal(direct.clientIp('::FFFF:127.0.0.1', undefined), '127.0.0.1');
+  assert.equal(direct.clientIp('::ffff:7f00:1', undefined), '127.0.0.1');
+  const mapped = new RequestRateLimiter({ ...loadRateLimitConfig({}), trustedProxyIps: ['::ffff:7f00:1'] });
+  assert.equal(mapped.clientIp('::ffff:127.0.0.1', '192.0.2.1'), '192.0.2.1');
+  const limiter = new RequestRateLimiter({ ...loadRateLimitConfig({}), trustedProxyIps: ['127.0.0.1', '::1'] });
+  assert.equal(limiter.clientIp('127.0.0.1', '198.51.100.1, 192.0.2.1'), '192.0.2.1');
+  assert.equal(limiter.clientIp('127.0.0.1', '198.51.100.1, 192.0.2.2'), '192.0.2.2');
+  assert.equal(limiter.clientIp('::1', '192.0.2.1, 127.0.0.1'), '192.0.2.1');
+  assert.equal(limiter.clientIp('127.0.0.1', ['192.0.2.1']), '127.0.0.1');
+  for (const header of ['', 'bad-ip', '192.0.2.1,', Array(21).fill('127.0.0.1').join(',')]) {
+    assert.equal(limiter.clientIp('127.0.0.1', header), '127.0.0.1');
+  }
+  assert.equal(limiter.clientIp(undefined, '192.0.2.1'), 'unknown');
+  assert.equal(limiter.clientIp('2001:0db8::1', undefined), '[2001:db8::1]');
+  assert.throws(() => new RequestRateLimiter({ ...loadRateLimitConfig({}), trustedProxyIps: ['private-token'] }), /RATE_LIMIT_TRUSTED_PROXY_IPS/);
+});
+
+test('#59 config validates budgets, nonce capacity and relayer wei without echoing raw values', () => {
+  const names = ['RATE_LIMIT_AUTH_PER_MINUTE', 'RATE_LIMIT_STRATEGIES_PER_DAY', 'RATE_LIMIT_VERSIONS_PER_DAY',
+    'RATE_LIMIT_PORTFOLIOS_PER_DAY', 'RATE_LIMIT_PLAN_PER_MINUTE', 'RATE_LIMIT_REDEEM_PER_MINUTE',
+    'RATE_LIMIT_CLOSE_PER_MINUTE', 'RATE_LIMIT_ASSETS_PER_MINUTE'];
+  for (const name of names) {
+    assert.ok(Object.values(loadRateLimitConfig({ [name]: '0' })).includes(0));
+    for (const raw of ['secret-invalid-value', '-1', '0.5', '1000001', 'Infinity']) {
+      assert.throws(() => loadRateLimitConfig({ [name]: raw }), (error: unknown) => {
+        assert.ok(error instanceof Error && error.message.includes(name) && !error.message.includes(raw));
+        return true;
+      });
+    }
+  }
+  for (const raw of ['0', '-1', '1.5', '1000001']) assert.throws(() => loadRateLimitConfig({ AUTH_MAX_NONCES: raw }));
+  assert.equal(loadRateLimitConfig({ AUTH_MAX_NONCES: '1' }).maxNonces, 1);
+  assert.equal(loadRelayerGasConfig({ MIN_RELAYER_GAS_WEI: '9007199254740993' }).minRelayerGasWei, 9007199254740993n);
+  assert.equal(loadRelayerGasConfig({ MIN_RELAYER_GAS_WEI: '0' }).minRelayerGasWei, 0n);
+  for (const raw of ['-1', '0x10', '1.5', 'secret-invalid-value']) assert.throws(() => loadRelayerGasConfig({ MIN_RELAYER_GAS_WEI: raw }));
+});
+
+const budgetActions: { action: WalletAction; path: string; method: string; body?: unknown }[] = [
+  { action: 'strategies', path: '/strategies', method: 'POST', body: { name: 'fund' } },
+  { action: 'versions', path: '/strategies/1/versions', method: 'POST', body: {} },
+  { action: 'portfolios', path: '/portfolios', method: 'POST', body: { strategyId: 1 } },
+  { action: 'plan', path: '/portfolios/1/plan', method: 'GET' },
+  { action: 'redeem', path: '/portfolios/1/redeem', method: 'POST', body: { usd: 1 } },
+  { action: 'close', path: '/portfolios/1/close', method: 'POST' },
+  { action: 'assets', path: '/assets', method: 'GET' },
+];
+for (const entry of budgetActions) {
+  test('#59 HTTP ' + entry.action + ': authenticated wallet limit, other wallet, parallel calls and reset', async () => {
+    let now = 1_000;
+    let calls = 0;
+    const touch = async () => { calls++; return {}; };
+    const limiter = new RequestRateLimiter({ ...loadRateLimitConfig({}), strategiesPerDay: 2, versionsPerDay: 2,
+      portfoliosPerDay: 2, planPerMinute: 2, redeemPerMinute: 2, closePerMinute: 2, assetsPerMinute: 2 }, undefined, () => now);
+    await withBudgetServer(async (base) => {
+      const account = privateKeyToAccount(generatePrivateKey());
+      const firstToken = await budgetToken(base, account);
+      const secondToken = await budgetToken(base, account);
+      const otherToken = await budgetToken(base);
+      const request = (token?: string) => fetch(base + entry.path, { method: entry.method,
+        headers: { ...(token ? { authorization: 'Bearer ' + token } : {}), 'content-type': 'application/json', origin: 'http://localhost:5173' },
+        ...(entry.body === undefined ? {} : { body: JSON.stringify(entry.body) }) });
+      assert.equal((await request()).status, 401);
+      const responses = await Promise.all(Array.from({ length: 5 }, (_, i) => request(i % 2 ? firstToken : secondToken)));
+      assert.equal(responses.filter((r) => r.status < 300).length, 2);
+      for (const r of responses.filter((r) => r.status === 429)) {
+        assert.ok(Number(r.headers.get('retry-after')) >= 1);
+        assert.equal(r.headers.get('access-control-allow-origin'), 'http://localhost:5173');
+      }
+      assert.equal(calls, 2, '429 never reaches relayer/planner/DB dependency');
+      assert.ok((await request(otherToken)).status < 300);
+      now = 86_400_000;
+      assert.ok((await request(firstToken)).status < 300);
+      assert.equal(calls, 4);
+    }, { rateLimiter: limiter,
+      createStrategy: async (_body, provider) => { calls++; return { id: 1, provider, name: 'fund', description: '', isPublic: false, swapFeeBps: 0, onchainId: null, createdAt: new Date().toISOString() }; },
+      publishVersion: async () => { calls++; return { strategyId: 1, version: 1, allocation: { assets: [] }, schedule: { kind: 'interval', intervalSeconds: 60 }, changeLog: null, activeAt: null, createdAt: new Date().toISOString() }; },
+      enrollPortfolio: async (_id, userId) => { calls++; return { id: 1, userId, strategyId: 1, strategyName: 'fund', version: 1, scheduleState: 'active', createdAt: new Date().toISOString(), smartAccounts: [], gas: null }; },
+      planPreview: async (portfolioId) => { calls++; return { portfolioId, outcome: 'noop', reason: 'aligned', steps: [], rationale: null }; },
+      operatorRedeem: touch, operatorClose: touch, listAssets: async () => { calls++; return []; },
+    });
+  });
+}
+
+test('#59 HTTP: auth IP limits apply to login/nonce/logout; preflight is free and fake XFF cannot bypass', async () => {
+  const limiter = new RequestRateLimiter({ ...loadRateLimitConfig({}), authPerMinute: 2 }, undefined, () => 1_000);
+  await withBudgetServer(async (base) => {
+    const options = await fetch(base + '/auth/nonce', { method: 'OPTIONS' });
+    assert.equal(options.status, 204);
+    assert.equal((await fetch(base + '/auth/login', { method: 'POST', body: '{}' })).status, 400);
+    assert.equal((await fetch(base + '/auth/nonce', { method: 'POST' })).status, 200);
+    const result = await fetch(base + '/auth/logout', { method: 'POST', headers: { 'x-forwarded-for': '192.0.2.3' } });
+    assert.equal(result.status, 429);
+    assert.equal(result.headers.get('retry-after'), '59');
+  }, { rateLimiter: limiter });
+});
+
+test('#59 HTTP: trusted proxy users get separate auth budgets and logout revokes only its token', async () => {
+  const limiter = new RequestRateLimiter({ ...loadRateLimitConfig({}), authPerMinute: 1, trustedProxyIps: ['127.0.0.1'] }, undefined, () => 1_000);
+  await withBudgetServer(async (base) => {
+    for (const ip of ['192.0.2.1', '192.0.2.2']) {
+      assert.equal((await fetch(base + '/auth/nonce', { method: 'POST', headers: { 'x-forwarded-for': ip } })).status, 200);
+      assert.equal((await fetch(base + '/auth/nonce', { method: 'POST', headers: { 'x-forwarded-for': ip } })).status, 429);
+    }
+  }, { rateLimiter: limiter });
+  await withBudgetServer(async (base) => {
+    const first = await budgetToken(base);
+    const second = await budgetToken(base);
+    const headers = { authorization: 'Bearer ' + first };
+    assert.equal((await fetch(base + '/assets', { headers })).status, 200);
+    for (let i = 0; i < 2; i++) assert.equal((await fetch(base + '/auth/logout', { method: 'POST', headers })).status, 204);
+    assert.equal((await fetch(base + '/assets', { headers })).status, 401);
+    assert.equal((await fetch(base + '/assets', { headers: { authorization: 'Bearer ' + second } })).status, 200);
+    assert.equal((await fetch(base + '/auth/logout', { method: 'POST' })).status, 401);
+    assert.equal((await fetch(base + '/auth/logout', { method: 'POST', headers: { authorization: 'Bearer unknown' } })).status, 204);
+    assert.equal((await fetch(base + '/auth/logout')).status, 405);
+  }, { listAssets: async () => [] });
+});
+
+test('#59 HTTP: failed dependencies consume attempts and unavailable budget storage fails closed', async () => {
+  let calls = 0;
+  await withBudgetServer(async (base) => {
+    const token = await budgetToken(base);
+    const request = () => fetch(base + '/portfolios/1/plan', { headers: { authorization: 'Bearer ' + token } });
+    assert.equal((await request()).status, 503);
+    assert.equal((await request()).status, 429);
+    assert.equal(calls, 1);
+  }, { rateLimiter: new RequestRateLimiter({ ...loadRateLimitConfig({}), planPerMinute: 1 }, undefined, () => 1_000),
+    planPreview: async () => { calls++; throw Object.assign(new Error('database unavailable'), { code: 'ECONNREFUSED' }); } });
+  const store: RateLimitStore = { consume: async () => { throw new Error('sensitive database connection'); } };
+  await withBudgetServer(async (base) => {
+    const response = await fetch(base + '/auth/nonce', { method: 'POST' });
+    assert.equal(response.status, 503);
+    const text = await response.text();
+    assert.match(text, /RATE_LIMIT_UNAVAILABLE/);
+    assert.doesNotMatch(text, /sensitive/);
+  }, { rateLimiter: new RequestRateLimiter(loadRateLimitConfig({}), store) });
+});
+
+test('#59 operator plan/close budgets cannot bypass the wallet limits, while unauthorized callers remain forbidden', async () => {
+  const account = privateKeyToAccount(generatePrivateKey());
+  let calls = 0;
+  await withBudgetServer(async (base) => {
+    const token = await budgetToken(base, account);
+    const other = await budgetToken(base);
+    for (const [path, method] of [['/operator/portfolios/1/plan', 'GET'], ['/operator/portfolios/1/close', 'POST']]) {
+      const request = (value: string) => fetch(base + path, { method, headers: { authorization: 'Bearer ' + value } });
+      assert.equal((await request(other)).status, 403);
+      assert.equal((await request(token)).status, 200);
+      const denied = await request(token);
+      assert.equal(denied.status, 429);
+      assert.equal(denied.headers.get('access-control-expose-headers'), 'Retry-After');
+    }
+    assert.equal(calls, 2);
+  }, { operatorWallets: [account.address], operatorRebalanceEnabled: () => true,
+    rateLimiter: new RequestRateLimiter({ ...loadRateLimitConfig({}), planPerMinute: 1, closePerMinute: 1 }, undefined, () => 1_000),
+    operatorPlanPreview: async (portfolioId) => { calls++; return { portfolioId, outcome: 'noop', reason: 'aligned', steps: [], rationale: null }; },
+    operatorForceClose: async () => { calls++; return {}; },
+  });
+});
+
+test('#59 invalid trusted proxy configuration is rejected before serving requests', () => {
+  for (const raw of ['*', '127.0.0.1,', 'fe80::1%en0', 'sensitive-invalid-value']) {
+    assert.throws(() => loadRateLimitConfig({ RATE_LIMIT_TRUSTED_PROXY_IPS: raw }), (error: unknown) => {
+      assert.ok(error instanceof Error && error.message.includes('RATE_LIMIT_TRUSTED_PROXY_IPS') && !error.message.includes(raw));
+      return true;
+    });
   }
 });

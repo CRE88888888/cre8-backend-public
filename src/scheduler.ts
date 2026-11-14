@@ -103,8 +103,8 @@ import { createBundlerClient, entryPoint07Abi, formatUserOperation, formatUserOp
 import type { GetUserOperationReturnType, UserOperationReceipt } from 'viem/account-abstraction';
 import { activeChain } from './chain-object.js';
 import { KERNEL_V3_3_ADDRESSES } from './addresses.js';
-import { detectAlerts, formatAlert, recordAlerts, resolveAlerts, createPriceSourceTracker, priceSourceAlertAssets } from './alerts.js';
-import type { AlertFinding, AlertKind, PriceSourceTracker } from './alerts.js';
+import { detectAlerts, detectRelayerLowGas, formatAlert, recordAlerts, resolveAlerts, createPriceSourceTracker, priceSourceAlertAssets } from './alerts.js';
+import type { AlertFinding, AlertKind, PriceSourceTracker, RelayerGasChecks } from './alerts.js';
 import { a10ErrorMessage, EXECUTOR_BUY_ABI, readGlobalPaused, decodePriceSourceError, describePriceSourceError, PriceSourceError, inspectPriceSources } from './chain.js';
 import { getConfig, getSessionKeyConfig, requireSessionKeyConfig } from './config.js';
 import { errorMessage, query as dbQuery, withTransaction, withPortfolioLock } from './db.js';
@@ -574,6 +574,8 @@ export type SchedulerDeps = {
 };
 
 export type RunSchedulerArgs = {
+  /** HTTP single-portfolio calls omit global monitoring; background rounds retain it by default. */
+  skipAlerts?: boolean;
   /** **預設 true**（省略即 dry run）。要送交易必須明確給 false。 */
   dryRun?: boolean;
   limit?: number;
@@ -1730,7 +1732,7 @@ export async function runSchedulerOnce(
   // ---- 一輪的尾端：告警（偵測 → 寫入 → 解除 → 一行 stdout）----
   // 只加在這裡：認領、前置檢查、間隔推進的邏輯一個字都沒動。
   // Live clock must include releases committed during this round; preserve an explicitly injected test clock.
-  await announceAlerts({ query: resolved.query, log: resolved.log, now: args.now ?? new Date(), dryRun, chainId: resolved.chainId, sessionKeyChecks: resolved, executorPaused, priceSourceChecks: resolved.priceSourceChecks, priceSourceTracker: resolved.priceSourceTracker });
+  if (args.skipAlerts !== true) await announceAlerts({ query: resolved.query, log: resolved.log, now: args.now ?? new Date(), dryRun, chainId: resolved.chainId, sessionKeyChecks: resolved, executorPaused, priceSourceChecks: resolved.priceSourceChecks, priceSourceTracker: resolved.priceSourceTracker });
 
   return { claimed: claimed.length, dryRun, results };
 }
@@ -1747,6 +1749,7 @@ export async function runSchedulerOnce(
  * 累積，而「無人值守」正是靠這個累積被看見。
  */
 export async function announceAlerts(args: {
+  relayerGasChecks?: RelayerGasChecks;
   priceSourceChecks?: () => Promise<PriceSourceObservation[]>;
   priceSourceTracker?: PriceSourceTracker;
   /** null/omitted = not verified; keep an existing global pause alert open. */
@@ -1798,6 +1801,21 @@ export async function announceAlerts(args: {
         args.log('[ALERT] 價格來源檢查失敗；本輪保留既有 price_source_unavailable 警示');
       }
     }
+    let relayerComplete = false;
+    let relayerFinding: AlertFinding | null = null;
+    try {
+      const relayer = await detectRelayerLowGas(args.relayerGasChecks);
+      relayerComplete = relayer.complete;
+      relayerFinding = relayer.finding;
+      // Persist this independently: portfolio/seed DB failures must not hide a low relayer balance.
+      if (relayerFinding !== null) {
+        args.log(formatAlert(relayerFinding));
+        await recordAlerts(args.query, [relayerFinding], args.now, notifications);
+      }
+    } catch {
+      relayerComplete = false;
+      args.log('[ALERT] relayer 餘額檢查失敗；本輪保留既有全域 gas_low 警示');
+    }
     const findings = await detectAlerts(args.query, { now: args.now, ...args.gasChecks });
     let seedCheckComplete = false;
     try {
@@ -1819,9 +1837,10 @@ export async function announceAlerts(args: {
     if (!priceComplete) unverified.push('price_source_unavailable');
     if (priceFinding !== null) findings.push(priceFinding);
     if (args.executorPaused !== true && args.executorPaused !== false) unverified.push('executor_paused');
-    const resolved = await resolveAlerts(args.query, pauseFinding === null ? findings : [...findings, pauseFinding], args.now, notifications, unverified);
+    const present = [...findings, ...(pauseFinding === null ? [] : [pauseFinding]), ...(relayerFinding === null ? [] : [relayerFinding])];
+    const resolved = await resolveAlerts(args.query, present, args.now, notifications, unverified, relayerComplete ? [] : ['gas_low:-1']);
 
-    if (findings.length === 0 && pauseFinding === null) {
+    if (findings.length === 0 && pauseFinding === null && relayerFinding === null) {
       args.log(`[ALERT] ${seedCheckComplete ? '沒有警示' : '其他規則未偵測到警示'}${resolved > 0 ? `（已解除 ${resolved} 筆）` : ''}`);
       return;
     }

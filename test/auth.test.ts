@@ -7,6 +7,8 @@ import { createSiweMessage } from 'viem/siwe';
 import type { SiweMessage } from 'viem/siwe';
 import {
   AuthStore,
+  PostgresSessionRepository,
+  sha256Hex,
   NONCE_TTL_MS,
   SESSION_TTL_MS,
   SIWE_CLOCK_SKEW_MS,
@@ -163,6 +165,25 @@ function isAppError(err: unknown, status: number, code: string): boolean {
   assert.equal(actualCode, code);
   return true;
 }
+
+test('#59 concurrent nonce redemption mints exactly one session', async () => {
+  const store = newStore();
+  const signed = await signChallenge(newAccount(), store.issueNonce());
+  const results = await Promise.allSettled(Array.from({ length: 8 }, () => store.login(signed.message, signed.signature)));
+  assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
+  for (const result of results) if (result.status === 'rejected') isAppError(result.reason, 400, 'INVALID_NONCE');
+});
+
+test('#59 a bad signature consumes the nonce before crypto, including malformed signatures', async () => {
+  for (const malformed of [false, true]) {
+    const store = newStore();
+    const alice = newAccount();
+    const signed = await signChallenge(alice, store.issueNonce());
+    const wrong = malformed ? '0xdeadbeef' : await newAccount().signMessage({ message: signed.message });
+    await assert.rejects(store.login(signed.message, wrong), (err: unknown) => isAppError(err, 401, 'INVALID_SIGNATURE'));
+    await assert.rejects(store.login(signed.message, signed.signature), (err: unknown) => isAppError(err, 400, 'INVALID_NONCE'));
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Nonce challenge
@@ -790,4 +811,82 @@ test('DB: provider ownership is enforced end to end over HTTP', { skip: skipDbCh
   } finally {
     await query('delete from strategies where id = $1', [strategy.id]);
   }
+});
+
+test('#59 nonce capacity rejects excess without evicting live challenges, reclaims at exact TTL', async () => {
+  let now = 1_700_000_000_000;
+  const store = new AuthStore({ auth: TEST_AUTH, sessions: memorySessions(), maxNonces: 2, now: () => now });
+  const account = newAccount();
+  const first = store.issueNonce();
+  store.issueNonce();
+  for (let i = 0; i < 25; i++) assert.throws(() => store.issueNonce(), (err: unknown) => isAppError(err, 429, 'RATE_LIMITED'));
+  await attemptLogin(store, account, first);
+  const next = store.issueNonce();
+  now += NONCE_TTL_MS - 1;
+  assert.throws(() => store.issueNonce(), (err: unknown) => isAppError(err, 429, 'RATE_LIMITED'));
+  now++;
+  await assert.rejects(attemptLogin(store, account, next), (err: unknown) => isAppError(err, 400, 'NONCE_EXPIRED'));
+  assert.doesNotThrow(() => store.issueNonce());
+  assert.doesNotThrow(() => store.issueNonce());
+  assert.throws(() => store.issueNonce(), (err: unknown) => isAppError(err, 429, 'RATE_LIMITED'));
+  for (const maxNonces of [0, -1, 0.5]) assert.throws(() => new AuthStore({ auth: TEST_AUTH, maxNonces }), RangeError);
+});
+
+test('#59 session save failure cannot reuse nonce; prune failure permits valid login', async () => {
+  for (const failSave of [false, true]) {
+    const sessions = memorySessions();
+    const store = new AuthStore({ auth: TEST_AUTH, sessions: { ...sessions,
+      prune: async () => { throw new Error('cleanup unavailable'); },
+      save: failSave ? async () => { throw new Error('save unavailable'); } : sessions.save,
+    } });
+    const signed = await signChallenge(newAccount(), store.issueNonce());
+    if (failSave) await assert.rejects(store.login(signed.message, signed.signature), /save unavailable/);
+    else await assert.doesNotReject(store.login(signed.message, signed.signature));
+    await assert.rejects(store.login(signed.message, signed.signature), (err: unknown) => isAppError(err, 400, 'INVALID_NONCE'));
+  }
+});
+
+test('#59 logout propagates DB failure, hashes token and leaves other sessions intact', async () => {
+  const sessions = memorySessions();
+  let down = false;
+  let removed: string | undefined;
+  const store = new AuthStore({ auth: TEST_AUTH, sessions: { ...sessions, remove: async (hash) => {
+    removed = hash;
+    if (down) throw new Error('remove unavailable');
+    await sessions.remove(hash);
+  } } });
+  const account = newAccount();
+  const first = await attemptLogin(store, account, store.issueNonce());
+  const second = await attemptLogin(store, account, store.issueNonce());
+  down = true;
+  await assert.rejects(store.logout('Bearer ' + first.token), /remove unavailable/);
+  assert.match(removed ?? '', /^[0-9a-f]{64}$/);
+  assert.notEqual(removed, first.token);
+  await assert.doesNotReject(store.authenticate('Bearer ' + first.token));
+  down = false;
+  await store.logout('Bearer ' + first.token);
+  await assert.rejects(store.authenticate('Bearer ' + first.token), UnauthorizedError);
+  await assert.doesNotReject(store.authenticate('Bearer ' + second.token));
+  await store.logout('Bearer ' + first.token);
+  for (const header of [undefined, '', 'Basic token', 'Bearer']) await assert.rejects(store.logout(header), UnauthorizedError);
+});
+
+test('#59 HTTP logout removes the real Postgres session and a fresh repository rejects it', async () => {
+  await withServer(async (base) => {
+    const account = newAccount();
+    const first = await loginOverHttp(base, account);
+    const second = await loginOverHttp(base, account);
+    const firstHash = sha256Hex(first.token);
+    const secondHash = sha256Hex(second.token);
+    try {
+      const repository = new PostgresSessionRepository();
+      assert.equal((await repository.find(firstHash))?.wallet, account.address.toLowerCase());
+      assert.equal((await postJson(base, '/auth/logout', undefined, first.token)).status, 204);
+      assert.equal(await new PostgresSessionRepository().find(firstHash), null);
+      const fresh = new AuthStore();
+      await assert.rejects(fresh.authenticate('Bearer ' + first.token), UnauthorizedError);
+      assert.equal(await fresh.authenticate('Bearer ' + second.token), account.address.toLowerCase());
+      assert.equal((await postJson(base, '/auth/logout', undefined, first.token)).status, 204);
+    } finally { await query('delete from auth_sessions where token_hash = any($1::text[])', [[firstHash, secondHash]]); }
+  });
 });

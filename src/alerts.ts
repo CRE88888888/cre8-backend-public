@@ -1,7 +1,8 @@
-import type { Address } from 'viem';
+import type { Address, Hex } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
 import type { PriceSourceObservation } from './chain.js';
 import { getAccountGasBalance, getGasPriceWei } from './chain.js';
-import { DEFAULT_CHAIN_ID } from './config.js';
+import { DEFAULT_CHAIN_ID, loadRelayerGasConfig } from './config.js';
 import { perOperationCostWei } from './funding.js';
 import { sendTelegram } from './notify.js';
 
@@ -26,6 +27,44 @@ import { sendTelegram } from './notify.js';
 
 /** DB 的最小介面：只要 `{ rows }`。`db.query` 與 `scheduler.ts` 的 `SchedulerQueryFn` 都接得上。 */
 export type QueryFn = (text: string, params?: readonly unknown[]) => Promise<{ rows: unknown[] }>;
+
+export type RelayerGasChecks = {
+  env?: NodeJS.ProcessEnv;
+  readNativeBalance?: (address: Address) => Promise<bigint>;
+  timeoutMs?: number;
+};
+
+/** Unknown is distinct from healthy: callers must preserve the existing global gas_low finding. */
+export async function detectRelayerLowGas(args: RelayerGasChecks = {}): Promise<{
+  complete: boolean; finding: AlertFinding | null;
+}> {
+  const env = args.env ?? process.env;
+  const rawKey = env.OPERATOR_PRIVATE_KEY?.trim();
+  if (!rawKey) return { complete: false, finding: null };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const minimum = loadRelayerGasConfig(env).minRelayerGasWei;
+    const key = rawKey.startsWith('0x') ? rawKey : '0x' + rawKey;
+    if (!/^0x[0-9a-fA-F]{64}$/.test(key)) throw new Error('invalid signing configuration');
+    const address = privateKeyToAccount(key as Hex).address;
+    const timeoutMs = args.timeoutMs ?? 10_000;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new Error('invalid balance timeout');
+    const balance = await Promise.race([
+      (args.readNativeBalance ?? getAccountGasBalance)(address),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('balance timeout')), timeoutMs); }),
+    ]);
+    if (typeof balance !== 'bigint' || balance < 0n) throw new Error('invalid balance');
+    return { complete: true, finding: balance < minimum ? {
+      kind: 'gas_low', severity: 'critical', portfolioId: null,
+      detail: 'relayer ' + address + '：BNB 餘額 ' + balance.toString() + ' wei，低於門檻 ' + minimum.toString() + ' wei，請補充營運 gas',
+    } : null };
+  } catch {
+    // RPC errors and malformed keys can contain secrets; never include the original error.
+    throw new Error('relayer 餘額檢查失敗；本輪保留既有全域 gas_low 警示');
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
 
 /**
  * 告警種類的**唯一來源**：型別從這個陣列推導，執行期的白名單也用它。
@@ -495,8 +534,9 @@ export async function resolveAlerts(
   now: Date = new Date(),
   notifications?: AlertNotificationOptions,
   unverifiedKinds: readonly AlertKind[] = [],
+  unverifiedKeys: readonly string[] = [],
 ): Promise<number> {
-  const keys = present.map((finding) => alertKey(finding.kind, finding.portfolioId));
+  const keys = [...present.map((finding) => alertKey(finding.kind, finding.portfolioId)), ...unverifiedKeys];
   const { rows } = await query(SQL_RESOLVE_ALERTS, [now.toISOString(), keys, unverifiedKinds]);
   for (const row of rows) {
     const fields = row as Record<string, unknown>;

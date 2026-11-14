@@ -6,6 +6,7 @@ import {
   alertCounts,
   detectAlerts,
   detectLowGas,
+  detectRelayerLowGas,
   detectPortfolioFailures,
   detectOperationReleases,
   detectSessionKeyExpiry,
@@ -264,7 +265,7 @@ for (const executorPaused of [true, false, null, undefined]) {
       assert.ok(!lines.some((line) => /沒有警示/.test(line)));
     }
     const resolution = findSeen(seen, 'update scheduler_alerts');
-    assert.deepEqual(resolution.params[1], executorPaused === true ? ['executor_paused:-1'] : []);
+    assert.deepEqual(resolution.params[1], executorPaused === true ? ['executor_paused:-1', 'gas_low:-1'] : ['gas_low:-1']);
     assert.deepEqual(resolution.params[2], executorPaused === null || executorPaused === undefined ? ['price_source_unavailable', 'executor_paused'] : ['price_source_unavailable']);
   });
 }
@@ -985,6 +986,7 @@ test('真 Postgres：seed mismatch 彙整、去重、Telegram、health 與換回
 });
 
 test('真 Postgres：Telegram 新開／升級／重複／解除／再次發生與 NULL portfolio 的 returning 判斷', dbGate, async () => {
+  await assertRelayerNotifications();
   await assert.rejects(() => withTransaction(async (client) => {
     const q: QueryFn = (sql, params = []) => client.query(sql, [...params]);
     const strategy = await client.query<{ id: string }>("insert into strategies (provider, name) values ('0xnotify-test', 'notify fixture') returning id");
@@ -1360,3 +1362,106 @@ test('#52 an unrelated unknown asset cannot hide three verified failures or eras
   assert.match(unknown.finding?.detail ?? '', new RegExp(`asset ${CASH}:`, 'i'));
   assert.equal(unknown.complete, false);
 });
+
+// Only public anvil #0 material is used; balance reads are injected and never submit transactions.
+const RELAYER_TEST_KEY = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
+const RELAYER_TEST_ADDRESS = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266';
+const RELAYER_TEST_ENV = { OPERATOR_PRIVATE_KEY: RELAYER_TEST_KEY, MIN_RELAYER_GAS_WEI: '100' };
+
+test('#59 relayer gas: 0, below, equal, above, zero threshold, missing config and invalid balances', async () => {
+  for (const balance of [0n, 99n, 100n, 101n]) {
+    const result = await detectRelayerLowGas({ env: RELAYER_TEST_ENV, readNativeBalance: async (address) => {
+      assert.equal(address, RELAYER_TEST_ADDRESS);
+      return balance;
+    } });
+    assert.equal(result.complete, true);
+    assert.equal(result.finding !== null, balance < 100n);
+    if (result.finding) {
+      assert.equal(result.finding.kind, 'gas_low');
+      assert.equal(result.finding.portfolioId, null);
+      assert.equal(result.finding.severity, 'critical');
+      assert.match(result.finding.detail, /relayer.*100 wei/);
+      assert.ok(!result.finding.detail.includes(RELAYER_TEST_KEY));
+    }
+  }
+  assert.equal((await detectRelayerLowGas({ env: { ...RELAYER_TEST_ENV, MIN_RELAYER_GAS_WEI: '0' }, readNativeBalance: async () => 0n })).finding, null);
+  assert.deepEqual(await detectRelayerLowGas({ env: {}, readNativeBalance: async () => { throw new Error('must not read'); } }), { complete: false, finding: null });
+  await assert.rejects(detectRelayerLowGas({ env: RELAYER_TEST_ENV, readNativeBalance: async () => -1n }), /本輪保留/);
+  for (const raw of ['invalid-private-key', '0x' + '0'.repeat(64)]) {
+    await assert.rejects(detectRelayerLowGas({ env: { OPERATOR_PRIVATE_KEY: raw } }), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.doesNotMatch(error.message, /invalid-private-key|0x000000/);
+      return true;
+    });
+  }
+});
+
+test('#59 relayer RPC errors and bounded timeout preserve global gas alert without exposing credentials', async () => {
+  for (const mode of ['rpc', 'timeout', 'missing']) {
+    const { query, seen } = stubQuery(() => []);
+    const lines: string[] = [];
+    await announceAlerts({ query, now: NOW, chainId: 1337, executorPaused: false, log: (line) => lines.push(line),
+      relayerGasChecks: { env: mode === 'missing' ? {} : RELAYER_TEST_ENV, timeoutMs: 5,
+        readNativeBalance: mode === 'timeout' ? () => new Promise<bigint>(() => {}) : async () => { throw new Error('RPC secret-token'); } } });
+    const resolve = findSeen(seen, 'update scheduler_alerts');
+    assert.ok(Array.isArray(resolve.params[1]) && resolve.params[1].includes('gas_low:-1'));
+    assert.ok(Array.isArray(resolve.params[2]) && !resolve.params[2].includes('gas_low'), 'other portfolio gas alerts can still resolve');
+    assert.doesNotMatch(lines.join('\n'), /secret-token/);
+    assert.equal(seen.some((entry) => entry.sql.includes('insert into scheduler_alerts') && entry.params[0] === 'gas_low'), false);
+  }
+});
+
+test('#59 low relayer finding persists even if portfolio DB detection fails, and DB write failure never resolves it', async () => {
+  for (const phase of ['detection', 'write']) {
+    const { query, seen } = stubQuery((sql) => {
+      if (phase === 'detection' && sql.includes('with ranked')) throw new Error('database down');
+      if (phase === 'write' && sql.includes('insert into scheduler_alerts')) throw new Error('sensitive DB value');
+      return [];
+    });
+    const lines: string[] = [];
+    await announceAlerts({ query, now: NOW, chainId: 1337, log: (line) => lines.push(line),
+      relayerGasChecks: { env: RELAYER_TEST_ENV, readNativeBalance: async () => 0n } });
+    assert.ok(seen.some((entry) => entry.sql.includes('insert into scheduler_alerts') && entry.params[0] === 'gas_low'));
+    const resolve = seen.find((entry) => entry.sql.includes('update scheduler_alerts'));
+    assert.ok(resolve === undefined || (Array.isArray(resolve.params[1]) && resolve.params[1].includes('gas_low:-1')));
+    assert.doesNotMatch(lines.join('\n'), /sensitive DB value/);
+  }
+});
+
+async function assertRelayerNotifications(): Promise<void> {
+  await assert.rejects(withTransaction(async (client) => {
+    await client.query("delete from scheduler_alerts where kind = 'gas_low' and portfolio_id is null");
+    let balance = 0n;
+    let down = false;
+    const messages: string[] = [];
+    const q: SchedulerQueryFn = async (sql, params = []) => {
+      // Other detectors' data is isolated; upsert/resolve/list SQL executes against the real schema.
+      if (sql.includes('with ranked') || sql.includes('as release_count') || sql.includes('k.expires_at <=') ||
+          sql.includes('h.confirmed_count') || sql.includes('with latest') || sql.includes('from session_keys')) return { rows: [] };
+      return client.query(sql, [...params]);
+    };
+    const round = () => announceAlerts({ query: q, now: NOW, chainId: 1337, log: () => {},
+      relayerGasChecks: { env: RELAYER_TEST_ENV, readNativeBalance: async () => {
+        if (down) throw new Error('RPC unavailable');
+        return balance;
+      } }, sendNotification: async (message) => { messages.push(message); } });
+    const open = async () => (await listOpenAlerts(q)).filter((alert) => alert.kind === 'gas_low' && alert.portfolioId === null);
+    await round();
+    await round();
+    assert.equal((await open())[0]?.occurrences, 2);
+    assert.equal(messages.length, 1);
+    assert.match(messages[0] ?? '', /critical.*警示/);
+    down = true;
+    await round();
+    assert.equal((await open()).length, 1);
+    assert.equal(messages.length, 1, 'unknown is not recovery');
+    down = false;
+    balance = 100n;
+    await round();
+    assert.equal((await open()).length, 0);
+    assert.equal(messages.length, 2);
+    assert.match(messages[1] ?? '', /已解除/);
+    assert.ok(!messages.join('\n').includes(RELAYER_TEST_KEY));
+    throw new Error('rollback relayer fixture');
+  }), /rollback relayer fixture/);
+}

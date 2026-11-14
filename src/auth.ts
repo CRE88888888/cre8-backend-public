@@ -2,7 +2,8 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { query } from './db.js';
 import { recoverMessageAddress } from 'viem';
 import { parseSiweMessage } from 'viem/siwe';
-import { getAuthConfig } from './config.js';
+import { getAuthConfig, loadRateLimitConfig } from './config.js';
+import { RateLimitError } from './ratelimit.js';
 import type { AuthConfig } from './config.js';
 import {
   InvalidNonceError,
@@ -85,6 +86,7 @@ export type SessionRepository = {
 };
 
 export type AuthStoreOptions = {
+  maxNonces?: number;
   /** Injectable clock (ms since epoch). Tests use it to expire nonces and sessions without waiting. */
   now?: () => number;
   /** Override the SIWE binding (domain/uri/chainId). Defaults to the process config. */
@@ -168,11 +170,14 @@ export class AuthStore {
   readonly #auth: AuthConfig;
   readonly #nonces = new Map<string, NonceEntry>();
   readonly #sessions: SessionRepository;
+  readonly #maxNonces: number;
 
   constructor(options: AuthStoreOptions = {}) {
     this.#now = options.now ?? Date.now;
     this.#auth = options.auth ?? getAuthConfig();
     this.#sessions = options.sessions ?? new PostgresSessionRepository();
+    this.#maxNonces = options.maxNonces ?? loadRateLimitConfig().maxNonces;
+    if (!Number.isSafeInteger(this.#maxNonces) || this.#maxNonces < 1) throw new RangeError('maxNonces must be a positive integer');
   }
 
   /** The bindings this store accepts, so the HTTP layer and clients describe the same challenge. */
@@ -185,6 +190,10 @@ export class AuthStore {
     this.#pruneExpired();
     const nonce = randomToken();
     const now = this.#now();
+    if (this.#nonces.size >= this.#maxNonces) {
+      const earliest = this.#nonces.values().next().value;
+      throw new RateLimitError(Math.max(1, Math.ceil(((earliest?.expiresAt ?? now + NONCE_TTL_MS) - now) / 1000)));
+    }
     const expiresAt = now + NONCE_TTL_MS;
     this.#nonces.set(nonce, { expiresAt });
     return {
@@ -205,7 +214,7 @@ export class AuthStore {
    *   2. its nonce must exist (INVALID_NONCE) and be unexpired (NONCE_EXPIRED),
    *   3. issuedAt/expirationTime must be current (SIWE_EXPIRED),
    *   4. the signature must recover to the address inside the message (INVALID_SIGNATURE),
-   *   5. the nonce is then deleted, so it can never mint a second session.
+   * The nonce is consumed before asynchronous signature recovery, including failed signatures.
    * Sessions live SESSION_TTL_MS; the returned wallet is lowercased and is the only trusted
    * identity for provider-scoped writes.
    */
@@ -246,6 +255,8 @@ export class AuthStore {
     }
 
     this.#assertMessageIsCurrent(parsed, now);
+    // No await may precede this deletion: concurrent requests must not share the challenge.
+    this.#nonces.delete(parsed.nonce);
 
     let recovered: string;
     try {
@@ -261,8 +272,6 @@ export class AuthStore {
     if (recovered.toLowerCase() !== parsed.address.toLowerCase()) {
       throw new InvalidSignatureError('signature does not match the address in the SIWE message');
     }
-
-    this.#nonces.delete(parsed.nonce);
 
     const wallet = parsed.address.toLowerCase();
     const token = randomToken();
@@ -290,6 +299,11 @@ export class AuthStore {
     }
 
     return session.wallet;
+  }
+
+  /** Revoke only this session. Unknown/already-revoked tokens have the same idempotent result. */
+  async logout(authHeader: string | null | undefined): Promise<void> {
+    await this.#sessions.remove(sha256Hex(parseBearerToken(authHeader)));
   }
 
   /** Drop expired nonces (sessions are pruned by the repository). Called on the write paths. */
@@ -451,4 +465,8 @@ export function login(message: string, signature: string): Promise<SessionCreden
 
 export function authenticate(authHeader: string | null | undefined): Promise<string> {
   return store().authenticate(authHeader);
+}
+
+export function logout(authHeader: string | null | undefined): Promise<void> {
+  return store().logout(authHeader);
 }

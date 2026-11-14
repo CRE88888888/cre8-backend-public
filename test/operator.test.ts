@@ -18,6 +18,8 @@ import {
   resolveStatusSessionKey,
   previewOperatorRebalance,
   runOperatorRebalance,
+  runOperatorRedeem,
+  runOperatorClose,
   singlePortfolioClaim,
   listPortfolioActivity,
   buildRedeemPlan,
@@ -1465,3 +1467,18 @@ for (const request of ['first', 'continue', 'close'] as const) {
     }
   });
 }
+
+test('#59 rebalance, preview, redeem and close all explicitly skip global alerts', async () => {
+  const seen: Parameters<typeof runSchedulerOnce>[0][] = [];
+  const run: typeof runSchedulerOnce = async (args) => {
+    seen.push(args);
+    return { claimed: 0, dryRun: args.dryRun ?? true, results: [] };
+  };
+  const options = { requireOwnedPortfolio: OWNED, runSchedulerOnce: run };
+  await runOperatorRebalance(PORTFOLIO_ID, WALLET.address, options);
+  await previewOperatorRebalance(PORTFOLIO_ID, WALLET.address, options);
+  await runOperatorRedeem(PORTFOLIO_ID, WALLET.address, 1n, options);
+  await runOperatorClose(PORTFOLIO_ID, WALLET.address, options);
+  assert.deepEqual(seen.map((args) => args.skipAlerts), [true, true, true, true]);
+  assert.deepEqual(seen.map((args) => args.dryRun), [false, true, false, false]);
+});

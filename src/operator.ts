@@ -833,7 +833,7 @@ export async function runOperatorRebalance(
   const run = deps.runSchedulerOnce ?? runSchedulerOnce;
   const round = await run(
     // `dryRun: false` 是這支端點存在的理由，所以逐字寫出來（排程器的預設是 dry-run）。
-    { dryRun: false, limit: 1 },
+    { dryRun: false, limit: 1, skipAlerts: true },
     {
       withTransaction: singlePortfolioClaim(portfolioId, deps.withTransaction),
       ...(deps.log === undefined ? {} : { log: deps.log }),
@@ -907,7 +907,7 @@ export async function previewOperatorRebalance(
   const run = deps.runSchedulerOnce ?? runSchedulerOnce;
   const round = await run(
     // `dryRun: true` 逐字寫出來：這支端點**不會**動錢，而排程器的預設也是 dry-run（不靠預設值表達意圖）。
-    { dryRun: true, limit: 1 },
+    { dryRun: true, limit: 1, skipAlerts: true },
     {
       withTransaction: singlePortfolioClaim(portfolioId, deps.withTransaction),
       ...(deps.log === undefined ? {} : { log: deps.log }),
@@ -1253,7 +1253,7 @@ async function runOperatorSell(portfolioId: number, wallet: string, request: Sel
   const closing = typeof request === 'object' && 'close' in request;
   const planning: { result: RedeemPlanningResult | null } = { result: null };
   const round = await (deps.runSchedulerOnce ?? runSchedulerOnce)(
-    { dryRun: false, limit: 1 },
+    { dryRun: false, limit: 1, skipAlerts: true },
     {
       withTransaction: singlePortfolioClaim(portfolioId, deps.withTransaction, { allowPaused: closing, preserveNextRunAt: true }),
       ...(deps.query === undefined ? {} : { query: deps.query }),

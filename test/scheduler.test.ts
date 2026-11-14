@@ -1263,11 +1263,11 @@ for (const dryRun of [true, false]) {
     const next = await runSchedulerOnce({ now: NOW, dryRun }, options);
     assert.equal(next.claimed, 0);
     assert.equal(writes.length, 2);
-    assert.deepEqual(preserved, ['session_key_derivation_mismatch:-1']);
+    assert.deepEqual(preserved, ['session_key_derivation_mismatch:-1', 'gas_low:-1']);
     chain.derivedAddress = SESSION_KEY;
     await runSchedulerOnce({ now: NOW, dryRun }, options);
     assert.equal(writes.length, 2, '修正 seed 不再產生 mismatch finding');
-    assert.deepEqual(preserved, [], '交給既有 resolve 流程解除');
+    assert.deepEqual(preserved, ['gas_low:-1'], '解除 seed 警示；未設定 relayer 仍不能聲稱餘額已恢復');
   });
 }
 
@@ -3519,4 +3519,18 @@ test('#54 fallback Pancake venue/data are executed and hashed, and account reach
   assert.equal(result.plan?.planHash, planHashFor([fallback], 1_800_000_300n));
   assert.notEqual(result.plan?.planHash, planHashFor([planned], 1_800_000_300n));
   assert.equal(db.operations[0]?.payloadHash, result.plan?.planHash);
+});
+
+test('#59 HTTP scheduler skips all global monitoring; background defaults keep it and safety checks still run', async () => {
+  for (const skipAlerts of [undefined, false, true]) {
+    const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+    const chain = stubChain();
+    const alerts: string[] = [];
+    const options = deps(db, chain, { readGlobalPaused: async () => true, log: (line) => alerts.push(line) });
+    const round = await runSchedulerOnce({ dryRun: false, now: NOW, skipAlerts }, options);
+    assert.deepEqual(outcomes(round), ['blocked']);
+    assert.equal(chain.executeCalls.length, 0, 'skipping monitoring never bypasses global pause');
+    assert.equal(alerts.some((line) => line.startsWith('[ALERT]')), skipAlerts !== true);
+    assert.equal(db.statements.some((entry) => entry.sql.includes('scheduler_alerts')), skipAlerts !== true);
+  }
 });

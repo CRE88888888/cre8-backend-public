@@ -1,4 +1,5 @@
 import { config as loadDotenv } from 'dotenv';
+import { isIP } from 'node:net';
 import type { Address, Hex } from 'viem';
 
 /** 僅含變數名與格式診斷，不含 env 原值；可安全寫入 server log。 */
@@ -53,6 +54,45 @@ export type TelegramConfig = {
   chatId: string | null;
   apiBase: string;
 };
+
+export type RateLimitConfig = {
+  authPerMinute: number;
+  strategiesPerDay: number;
+  versionsPerDay: number;
+  portfoliosPerDay: number;
+  planPerMinute: number;
+  redeemPerMinute: number;
+  closePerMinute: number;
+  assetsPerMinute: number;
+  maxNonces: number;
+  trustedProxyIps: string[];
+};
+
+/** Single-instance attempt budgets. Zero blocks that operation; it never disables protection. */
+export function loadRateLimitConfig(env: NodeJS.ProcessEnv = process.env): RateLimitConfig {
+  const budget = (name: string, fallback: number) => parseInteger(env, name, fallback, { min: 0, max: 1_000_000 });
+  const rawProxies = env.RATE_LIMIT_TRUSTED_PROXY_IPS?.trim() || '';
+  const trustedProxyIps = rawProxies === '' ? [] : rawProxies.split(',').map((ip) => ip.trim());
+  if (trustedProxyIps.some((ip) => isIP(ip) === 0 || ip.includes('%'))) {
+    throw new ConfigurationError('RATE_LIMIT_TRUSTED_PROXY_IPS must contain comma-separated IP addresses');
+  }
+  return {
+    authPerMinute: budget('RATE_LIMIT_AUTH_PER_MINUTE', 120),
+    strategiesPerDay: budget('RATE_LIMIT_STRATEGIES_PER_DAY', 10),
+    versionsPerDay: budget('RATE_LIMIT_VERSIONS_PER_DAY', 50),
+    portfoliosPerDay: budget('RATE_LIMIT_PORTFOLIOS_PER_DAY', 20),
+    planPerMinute: budget('RATE_LIMIT_PLAN_PER_MINUTE', 30),
+    redeemPerMinute: budget('RATE_LIMIT_REDEEM_PER_MINUTE', 30),
+    closePerMinute: budget('RATE_LIMIT_CLOSE_PER_MINUTE', 30),
+    assetsPerMinute: budget('RATE_LIMIT_ASSETS_PER_MINUTE', 120),
+    maxNonces: parseInteger(env, 'AUTH_MAX_NONCES', 10_000, { min: 1, max: 1_000_000 }),
+    trustedProxyIps,
+  };
+}
+
+export function loadRelayerGasConfig(env: NodeJS.ProcessEnv = process.env): { minRelayerGasWei: bigint } {
+  return { minRelayerGasWei: parseBigInt(env, 'MIN_RELAYER_GAS_WEI', 10n ** 16n) };
+}
 
 /** 選填但必須成對設定；錯誤訊息只列變數名，不回顯憑證。 */
 export function loadTelegramConfig(env: NodeJS.ProcessEnv = process.env): TelegramConfig {
@@ -124,6 +164,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const registryAddress = parseOptionalAddress(env, 'REGISTRY_ADDRESS');
   // API 與 scheduler 的啟動都走這裡；不要等第一則警示才發現只填了一半。
   loadTelegramConfig(env);
+  loadRateLimitConfig(env);
+  loadRelayerGasConfig(env);
 
   return {
     databaseUrl,

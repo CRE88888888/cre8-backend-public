@@ -1,0 +1,253 @@
+{
+  "version": 1,
+  "stepSeconds": 60,
+  "maxStepBps": 1,
+  "assets": {
+    "AAPLB": "356976000000000000000",
+    "AMZNB": "264729000000000000000",
+    "AVAX": "8019980000000000000",
+    "BABAB": "93783500000000000000",
+    "BTCB": "67123700000000000000000",
+    "CRCLB": "60586400000000000000",
+    "DJTB": "4586300000000000000",
+    "DOGE": "62730900000000000",
+    "ETH": "1906330000000000000000",
+    "EWYB": "140701000000000000000",
+    "GOOGLB": "293439000000000000000",
+    "HOODB": "76282500000000000000",
+    "INTCB": "58566900000000000000",
+    "METAB": "639072000000000000000",
+    "MRNAB": "221708000000000000000",
+    "MSFTB": "522467000000000000000",
+    "MSTRB": "107424000000000000000",
+    "MUB": "766962000000000000000",
+    "NFLXB": "61987300000000000000",
+    "NOKB": "8009990000000000000",
+    "NVDAB": "162413000000000000000",
+    "QQQB": "676113000000000000000",
+    "SGOVon": "102904000000000000000",
+    "SKHYB": "130353000000000000000",
+    "SNDKB": "863817000000000000000",
+    "SOL": "75800600000000000000",
+    "SPCXB": "136068000000000000000",
+    "SPYB": "752689000000000000000",
+    "TLTon": "83495600000000000000",
+    "TRX": "312407000000000000",
+    "TSLAB": "388543000000000000000",
+    "TSMB": "396058000000000000000",
+    "WBNB": "614427000000000000000",
+    "XAUt": "3866590000000000000000",
+    "XRP": "993055000000000000",
+    "USDC": "1000730000000000000",
+    "DAI": "1001540000000000000",
+    "LTC": "48359900000000000000"
+  },
+  "timeline": [
+    {
+      "steps": 120,
+      "mode": "sideways",
+      "stepBps": 1
+    }
+  ],
+  "overrides": {
+    "AAPLB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "AMZNB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "BABAB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "CRCLB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "DJTB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "EWYB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "GOOGLB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "HOODB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "INTCB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "METAB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "MRNAB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "MSFTB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "MSTRB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "MUB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "NFLXB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "NOKB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "NVDAB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "QQQB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "SGOVon": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "SKHYB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "SNDKB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "SPCXB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "SPYB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "TLTon": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "TSLAB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "TSMB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "ETH": [
+      {
+        "steps": 30,
+        "mode": "rise",
+        "stepBps": 1
+      },
+      {
+        "steps": 60,
+        "mode": "paused",
+        "stepBps": 0
+      },
+      {
+        "steps": 30,
+        "mode": "fall",
+        "stepBps": 1
+      }
+    ]
+  }
+}

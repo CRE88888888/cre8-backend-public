@@ -1,3 +1,6 @@
+// The existing CI entry point also runs chain 97 profile and alto configuration checks.
+import './testnet-profile.test.js';
+import './alto.test.js';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
@@ -552,4 +555,19 @@ test('#52 disagreement zero denominator, exact 100 bps and uint256 upper bound s
   assert.match(zero?.detail ?? '', /無法計算（secondary=0）/);
   assert.match(decodePriceSourceError({ data: { errorName: 'SourcesDisagree', args: [ASSET, 10100n, 10000n] } })?.detail ?? '', /差距 100 bps/);
   assert.equal(decodePriceSourceError({ data: { errorName: 'SourcesDisagree', args: [ASSET, (1n << 256n) - 1n, 1n] } })?.code, 'SourcesDisagree');
+});
+
+test('#69 preflight accepts only the pinned testnet EOA owner; unreadable owner code still fails closed', async () => {
+  const { TESTNET_97 } = await import('../src/testnet-profile.js');
+  const { zeroAddress } = await import('viem');
+  const base = { label: 'registry' as const, owner: TESTNET_97.roles.owner, safe: TESTNET_97.roles.owner, pendingOwner: zeroAddress, safeHasCode: false, strict: true };
+  assert.ok(checkOwnership({ ...base, testnet: true }).every((check) => check.level === 'ok'));
+  assert.ok(checkOwnership(base).some((check) => check.level === 'fail'));
+  assert.ok(checkOwnership({ ...base, safeHasCode: null, testnet: true }).some((check) => check.level === 'fail'));
+});
+
+test('#69 chain 56 preflight preserves the raw-address checksum validation', async () => {
+  const result = await runScript('scripts/preflight.ts', { CHAIN_ID: '56', REGISTRY_ADDRESS: '0x55D398326f99059fF775485246999027B3197955' });
+  assert.equal(result.code, 1);
+  assert.match(result.output, /✗ REGISTRY_ADDRESS[^\n]*未設定或不是合法/);
 });

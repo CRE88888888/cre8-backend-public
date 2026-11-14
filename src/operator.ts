@@ -1,3 +1,4 @@
+import { configuredChainId, TESTNET_97, testnetAssets } from './testnet-profile.js';
 import type { AggregatorQuoter } from './aggregator.js';
 /**
  * 操作員的兩支端點實作：`GET /portfolios/:id/status` 與 `POST /portfolios/:id/rebalance`。
@@ -183,7 +184,7 @@ function oneLine(error: unknown): string {
  */
 async function loadSymbols(deps: StatusDeps): Promise<Map<string, string>> {
   const query = deps.query ?? dbQuery;
-  const result = await query(SQL_SYMBOLS);
+  const result = { rows: (deps.publicClient?.chain?.id ?? configuredChainId()) === 97 ? testnetAssets() : (await query(SQL_SYMBOLS)).rows };
   const symbols = new Map<string, string>();
   for (const row of result.rows) {
     const typed = row as { address?: unknown; symbol?: unknown };
@@ -1340,7 +1341,8 @@ async function readPoolFee(client: PublicClient, router: Address, asset: Address
   return Number(await client.readContract({ address: pool, abi: POOL_FEE_ABI, functionName: 'fee', blockNumber }));
 }
 
-async function readNumeraireAddress(query: QueryFn): Promise<Address> {
+async function readNumeraireAddress(query: QueryFn, chainId: number): Promise<Address> {
+  if (chainId === 97) return TESTNET_97.contracts.usdt;
   const { rows } = await query('select address from priceable_assets where is_numeraire order by symbol limit 1');
   const row: unknown = rows[0];
   const address: unknown = typeof row === 'object' && row !== null ? Reflect.get(row, 'address') : null;
@@ -1368,7 +1370,7 @@ export async function buildRedeemPlan(input: RebalancePlanningInput, request: Se
   try {
     const { snapshot, report, pinnedVersion } = input.plan;
     const query = deps.query ?? dbQuery;
-    const numeraire = await readNumeraireAddress(query);
+    const numeraire = await readNumeraireAddress(query, deps.publicClient?.chain?.id ?? configuredChainId());
     const totalE8 = report?.totalUsdE8;
     if (typeof request === 'bigint' && totalE8 !== undefined && request > totalE8) return reply({ kind: 'blocked', reason: '要提領的 usd 超過投組總值' });
     const holdings = snapshot.holdings.filter((holding) => holding.asset.toLowerCase() !== numeraire.toLowerCase() && holding.amountWei > 0n);
@@ -1386,7 +1388,7 @@ export async function buildRedeemPlan(input: RebalancePlanningInput, request: Se
     const router = await client.readContract({ address: executor, abi: [{ type: 'function', name: 'oracle', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] }], functionName: 'oracle', blockNumber });
     const decimals = await numeraireDecimals(client, numeraire, snapshot.holdings, blockNumber);
     const scale = 10n ** BigInt(decimals);
-    const limits = await readMaxLegUsdE8(holdings.map((holding) => holding.asset), query);
+    const limits = await readMaxLegUsdE8(holdings.map((holding) => holding.asset), query, client.chain?.id);
     const notes: string[] = [];
     const nominal = await Promise.all(holdings.map(async (holding) => {
       try { return await nominalSellQuote(client, router, holding.asset as Address, numeraire, holding.amountWei, blockNumber); }

@@ -11,6 +11,7 @@ import { EXECUTOR_ORACLE_ABI, ORACLE_OF_ABI, listPriceableAssets } from './asset
 import type { PriceableAsset, TradableProbe } from './assets.js';
 import { authenticate, issueNonce, login, logout, parseLoginBody } from './auth.js';
 import { loginWithPrivy } from './privy.js';
+import { claimFaucetUsdt } from './faucet.js';
 import { sponsorUserOperation } from './paymaster.js';
 import { RateLimitError, RequestRateLimiter } from './ratelimit.js';
 import { getConfig, getSessionKeyConfig } from './config.js';
@@ -167,6 +168,7 @@ export const BUNDLER_TIMEOUT_MS = 30_000;
  * merged over the defaults, so a test can stub one dependency and leave the rest real.
  */
 export type ServerDeps = {
+  claimFaucetUsdt: typeof claimFaucetUsdt;
   sponsorUserOperation: typeof sponsorUserOperation;
   privyLogin: typeof loginWithPrivy;
   rateLimiter: RequestRateLimiter;
@@ -286,6 +288,7 @@ async function defaultListAssets(): Promise<PriceableAsset[]> {
 }
 
 const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
+  claimFaucetUsdt,
   sponsorUserOperation,
   privyLogin: loginWithPrivy,
   auth: { authenticate, issueNonce, login, logout },
@@ -397,6 +400,15 @@ async function route(
   if (root === 'health' && segments.length === 1) {
     if (method !== 'GET') return methodNotAllowed(res, ['GET']);
     return health(res);
+  }
+
+  if (root === 'faucet' && segments.length === 2 && segments[1] === 'usdt') {
+    if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    await deps.rateLimiter.wallet('plan', wallet);
+    const result = await deps.claimFaucetUsdt(await readJsonBody(req), wallet);
+    sendJson(res, result.state === 'unknown' ? 202 : result.state === 'failed' ? 502 : 200, result);
+    return;
   }
 
   if (root === 'paymaster' && segments.length === 2 && segments[1] === 'sponsor') {

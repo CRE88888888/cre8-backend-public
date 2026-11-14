@@ -1,7 +1,7 @@
 import { encodePacked, getAddress, isAddress } from 'viem';
 import type { Address, Hex, PublicClient } from 'viem';
 
-import { V2_FACTORY_ADDRESS } from './addresses.js';
+import { V2_FACTORY_ADDRESS, pancakeRoutingForChain } from './addresses.js';
 
 /**
  * 挑一條「實際成交最好」的 V3 路徑。
@@ -126,7 +126,7 @@ export async function chooseBestPath(
   },
 ): Promise<RouteCandidate | null> {
   if (params.amountIn <= 0n) return null;
-  const quoter = params.quoter ?? V3_QUOTER;
+  const quoter = params.quoter ?? pancakeRoutingForChain(client.chain?.id).quoter;
   const blockNumber = params.blockNumber;
 
   /** 池子存在性快取：同一個 (a,b,fee) 在一輪裡會被問很多次。 */
@@ -326,7 +326,7 @@ export async function routeImpactBps(
   },
 ): Promise<number | null> {
   if (params.amountIn <= 0n) return null;
-  const quoter = params.quoter ?? V3_QUOTER;
+  const quoter = params.quoter ?? pancakeRoutingForChain(client.chain?.id).quoter;
   const dust = params.amountIn / 1000n > 0n ? params.amountIn / 1000n : 1n;
 
   const quote = async (amount: bigint): Promise<bigint | null> => {

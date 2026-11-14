@@ -267,9 +267,11 @@ export function schedulerPaymaster(expectedSender: Address, deps: PaymasterDeps 
   return {
     getPaymasterStubData: async (args) => {
       ensureDomain(args);
-      // Recoverable low-s dummy signature, deliberately invalid for every real sponsorship hash.
+      // A real low-s signature over zero (public anvil test vector), not repeated r/s bytes.
+      // Its valid curve point lets v0.7 return SIG_VALIDATION_FAILED during estimation,
+      // rather than reverting with ECDSAInvalidSignature before gas can be estimated.
       return { paymaster: c.address, paymasterVerificationGasLimit: c.verificationGasLimit, paymasterPostOpGasLimit: c.postOpGasLimit,
-        paymasterData: concatHex([encodeAbiParameters([{ type: 'uint48' }, { type: 'uint48' }], [0, 0]), `0x${'11'.repeat(64)}1b`]) };
+        paymasterData: concatHex([encodeAbiParameters([{ type: 'uint48' }, { type: 'uint48' }], [0, 0]), '0xe82ed51b2b3964a6779171ee6589b1b2f5b5ebb77c1555626205d4619cb8df271a3f5c43f6b0ea3c76d852252d8a19539aa3ca2cb9fb66af3ac4dee7e846b4321c']) };
     },
     getPaymasterData: async (args) => {
       try {

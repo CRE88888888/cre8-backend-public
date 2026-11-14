@@ -1,4 +1,5 @@
 import { config as loadDotenv } from 'dotenv';
+import { profileAddress } from './testnet-profile.js';
 import { isIP } from 'node:net';
 import type { Address, Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
@@ -31,7 +32,7 @@ export function loadPaymasterConfig(env: NodeJS.ProcessEnv = process.env): Payma
   try { privateKeyToAccount(signerPrivateKey); }
   catch { throw new ConfigurationError('PAYMASTER_SIGNER_PRIVATE_KEY must be a valid secp256k1 key'); }
   const requiredAddress = (name: string): Address => {
-    const address = parseOptionalAddress(env, name);
+    const address = configuredAddress(env, name);
     if (address === null || /^0x0{40}$/.test(address)) throw new ConfigurationError(name + ' must be a nonzero address');
     return address;
   };
@@ -47,7 +48,7 @@ export function loadPaymasterConfig(env: NodeJS.ProcessEnv = process.env): Payma
   }
   return {
     signerPrivateKey, address: requiredAddress('PAYMASTER_ADDRESS'), executor: requiredAddress('EXECUTOR_ADDRESS'),
-    registry: requiredAddress('REGISTRY_ADDRESS'), mockUsdt: parseOptionalAddress(env, 'PAYMASTER_MOCK_USDT_ADDRESS'), rpcUrl, chainId,
+    registry: requiredAddress('REGISTRY_ADDRESS'), mockUsdt: configuredAddress(env, 'PAYMASTER_MOCK_USDT_ADDRESS'), rpcUrl, chainId,
     verificationGasLimit, postOpGasLimit,
     accountDailyCount: parseBigInt(env, 'PAYMASTER_ACCOUNT_DAILY_COUNT', 20n),
     accountDailyGas: parseBigInt(env, 'PAYMASTER_ACCOUNT_DAILY_GAS', 20_000_000n),
@@ -232,7 +233,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const port = parseInteger(env, 'PORT', DEFAULT_PORT, { min: 1, max: 65_535 });
   const rpcUrl = env.RPC_URL?.trim() ? env.RPC_URL.trim() : null;
   const operatorPrivateKey = env.OPERATOR_PRIVATE_KEY?.trim() ? env.OPERATOR_PRIVATE_KEY.trim() : null;
-  const registryAddress = parseOptionalAddress(env, 'REGISTRY_ADDRESS');
+  const registryAddress = configuredAddress(env, 'REGISTRY_ADDRESS');
+  if (parseInteger(env, 'CHAIN_ID', DEFAULT_CHAIN_ID, { min: 1 }) === 97) {
+    configuredAddress(env, 'EXECUTOR_ADDRESS');
+    configuredAddress(env, 'PAYMASTER_ADDRESS');
+    configuredAddress(env, 'PAYMASTER_MOCK_USDT_ADDRESS');
+  }
+  loadFaucetConfig(env);
   // API 與 scheduler 的啟動都走這裡；不要等第一則警示才發現只填了一半。
   loadTelegramConfig(env);
   loadRateLimitConfig(env);
@@ -282,7 +289,7 @@ export function getAuthConfig(): AuthConfig {
  */
 export function loadSessionKeyConfig(env: NodeJS.ProcessEnv = process.env): SessionKeyConfig {
   return {
-    executorAddress: parseOptionalAddress(env, 'EXECUTOR_ADDRESS'),
+    executorAddress: configuredAddress(env, 'EXECUTOR_ADDRESS'),
     sessionKeyMasterSeed: parseOptionalSeed(env, 'SESSION_KEY_MASTER_SEED'),
   };
 }
@@ -432,4 +439,25 @@ function parseAuthUri(env: NodeJS.ProcessEnv, authDomain: string): string {
     throw new ConfigurationError('AUTH_URI must use http or https');
   }
   return value;
+}
+
+function configuredAddress(env: NodeJS.ProcessEnv, name: string): Address | null {
+  const chainId = parseInteger(env, 'CHAIN_ID', DEFAULT_CHAIN_ID, { min: 1, max: Number.MAX_SAFE_INTEGER });
+  const address = parseOptionalAddress(env, name);
+  if (chainId !== 97) return address;
+  try { return profileAddress(chainId, name, address); }
+  catch { throw new ConfigurationError(name + ' must match the chain 97 profile / address format'); }
+}
+
+export type FaucetConfig = { chainId: 97; amountWei: bigint; siteDailyWei: bigint; timeoutMs: number };
+
+/** Fixed ONE claim per owner/UTC day. Only token amount and site cap are configurable (18 decimals). */
+export function loadFaucetConfig(env: NodeJS.ProcessEnv = process.env): FaucetConfig | null {
+  if (parseInteger(env, 'CHAIN_ID', DEFAULT_CHAIN_ID, { min: 1 }) !== 97) return null;
+  const amountWei = parseBigInt(env, 'FAUCET_USDT_AMOUNT_WEI', 1_000n * 10n ** 18n);
+  const siteDailyWei = parseBigInt(env, 'FAUCET_USDT_SITE_DAILY_WEI', 1_000_000n * 10n ** 18n);
+  if (amountWei > 10_000n * 10n ** 18n || siteDailyWei >= 1n << 256n) {
+    throw new ConfigurationError('FAUCET_USDT_AMOUNT_WEI exceeds the 10,000 USDT contract cap or FAUCET_USDT_SITE_DAILY_WEI exceeds uint256');
+  }
+  return { chainId: 97, amountWei, siteDailyWei, timeoutMs: 5_000 };
 }

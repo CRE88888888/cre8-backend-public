@@ -93,13 +93,14 @@
  * 的 `AssetNotAllowed`），hub 不是策略資產就收不了賣出的 USDT、也付不出買的 USDT。
  */
 
-import { EXECUTOR_BUY_ABI, EXECUTOR_ABI, PANCAKE_UR, PANCAKE_DATA_ABI, describePriceSourceError, decodePriceSourceError, PriceSourceError } from './chain.js';
+import { EXECUTOR_BUY_ABI, EXECUTOR_ABI, PANCAKE_DATA_ABI, describePriceSourceError, decodePriceSourceError, PriceSourceError } from './chain.js';
 import { quoteKyberSwap, aggregatorWins } from './aggregator.js';
 import type { AggregatorFailure, AggregatorQuoter } from './aggregator.js';
 import { quoteBoundMinimum } from './swap-slippage.js';
-import { chooseBestPath, routeImpactBps, singleHopPath, V3_QUOTER } from './routing.js';
+import { chooseBestPath, routeImpactBps, singleHopPath } from './routing.js';
 import type { RouteCandidate } from './routing.js';
-import { V2_FACTORY_ADDRESS, V3_FACTORY_ADDRESS, WBNB_ADDRESS } from './addresses.js';
+import { pancakeRoutingForChain, pancakeRouterForChain } from './addresses.js';
+import { configuredChainId, testnetAssets } from './testnet-profile.js';
 import { decodeAbiParameters, encodeAbiParameters, encodePacked, getAddress, isAddressEqual } from 'viem';
 import type { Address, Hex, PublicClient } from 'viem';
 import { readContract } from 'viem/actions';
@@ -247,9 +248,9 @@ const BPS_BIG = 10_000n;
 const USD_E8 = 100_000_000n;
 
 /** PostgreSQL numeric 全程以字串解析；超出 E8 的小數向下取整，絕不放大限額。 */
-export async function readMaxLegUsdE8(assets: readonly string[], query: QueryFn = dbQuery): Promise<Map<string, bigint | null>> {
+export async function readMaxLegUsdE8(assets: readonly string[], query: QueryFn = dbQuery, chainId = configuredChainId()): Promise<Map<string, bigint | null>> {
   try {
-    const { rows } = await query('select address, max_leg_usdt::text as max_leg_usdt from priceable_assets where lower(address) = any($1::text[])', [assets.map((asset) => asset.toLowerCase())]);
+    const { rows } = chainId === 97 ? { rows: testnetAssets() } : await query('select address, max_leg_usdt::text as max_leg_usdt from priceable_assets where lower(address) = any($1::text[])', [assets.map((asset) => asset.toLowerCase())]);
     const limits = new Map<string, bigint | null>();
     for (const raw of rows) {
       if (typeof raw !== 'object' || raw === null) throw new Error('invalid row');
@@ -615,6 +616,7 @@ export function amountOutMinWithBuffer(minGross: bigint): bigint {
 
 /** 一個 step 的 commands / inputs：`recipient` 必須是 executor（`_checkRecipient`），`payerIsUser = true`。 */
 export function buildStep(params: {
+  chainId?: number;
   executor: Address;
   tokenIn: Address;
   tokenOut: Address;
@@ -648,7 +650,7 @@ export function buildStep(params: {
       amountIn: params.amountIn,
       amountOutMin,
       oracleFloor: params.oracleFloor,
-      venue: PANCAKE_UR,
+      venue: pancakeRouterForChain(params.chainId),
       data: encodeAbiParameters(PANCAKE_DATA_ABI, [V2_SWAP_EXACT_IN, [
         encodeAbiParameters(V2_SWAP_EXACT_IN_INPUT, [
           getAddress(params.executor),
@@ -666,7 +668,7 @@ export function buildStep(params: {
     amountIn: params.amountIn,
     amountOutMin,
     oracleFloor: params.oracleFloor,
-    venue: PANCAKE_UR,
+    venue: pancakeRouterForChain(params.chainId),
     data: encodeAbiParameters(PANCAKE_DATA_ABI, [V3_SWAP_EXACT_IN, [
       encodeAbiParameters(V3_SWAP_EXACT_IN_INPUT, [
         getAddress(params.executor),
@@ -700,10 +702,9 @@ async function quotePancake(params: {
   };
   try {
     return await Promise.race([
-      (path === undefined ? chooseBestPath(quoteClient, { tokenIn, tokenOut, amountIn, via: WBNB_ADDRESS, factory: V3_FACTORY_ADDRESS,
-        pinnedFee: params.poolFee, blockNumber,
-        v2Factory: process.env.ROUTE_V2_ENABLED === '1' ? V2_FACTORY_ADDRESS : null }) :
-        quoteClient.readContract({ address: V3_QUOTER, abi: [{ type: 'function', name: 'quoteExactInput',
+      (path === undefined ? chooseBestPath(quoteClient, { tokenIn, tokenOut, amountIn, ...pancakeRoutingForChain(publicClient.chain?.id),
+        pinnedFee: params.poolFee, blockNumber }) :
+        quoteClient.readContract({ address: pancakeRoutingForChain(publicClient.chain?.id).quoter, abi: [{ type: 'function', name: 'quoteExactInput',
           stateMutability: 'nonpayable', inputs: [{ type: 'bytes' }, { type: 'uint256' }],
           outputs: [{ type: 'uint256' }, { type: 'uint160[]' }] }] as const, functionName: 'quoteExactInput',
           args: [path, amountIn], ...(blockNumber === undefined ? {} : { blockNumber }) })
@@ -720,6 +721,7 @@ export async function buildRoutedStep(params: Parameters<typeof buildStep>[0] & 
   publicClient: PublicClient; deadline: bigint; feeBps: number; blockNumber: bigint;
 }, deps: { quoteAggregator?: AggregatorQuoter } = {}): Promise<PlannedStep | null> {
   const { publicClient, tokenIn, tokenOut, amountIn, executor, blockNumber } = params;
+  const PANCAKE_UR = pancakeRouterForChain(publicClient.chain?.id);
   const minimum = amountOutMinWithBuffer(params.minGross);
   const [pancake, allowed] = await Promise.all([
     quotePancake(params),
@@ -728,14 +730,14 @@ export async function buildRoutedStep(params: Parameters<typeof buildStep>[0] & 
   ]);
   // Build only after the independent quote is known so Kyber and the step use one minimum.
   const pancakeOut = pancake?.amountOut ?? null;
-  const aggregator = await (deps.quoteAggregator ?? quoteKyberSwap)({ publicClient, executor, tokenIn, tokenOut,
+  const aggregator = (publicClient.chain?.id ?? configuredChainId()) === 97 ? null : await (deps.quoteAggregator ?? quoteKyberSwap)({ publicClient, executor, tokenIn, tokenOut,
     amountIn, minimum, pancakeOut, deadline: params.deadline, blockNumber }).catch(() => null);
   if (aggregatorWins(aggregator, allowed ? pancake?.amountOut ?? null : null, minimum, params.feeBps) && aggregator !== null) {
     return { tokenIn, tokenOut, amountIn, amountOutMin: quoteBoundMinimum(minimum, aggregator.amountOut, pancakeOut), oracleFloor: params.oracleFloor,
       venue: aggregator.venue, data: aggregator.data };
   }
   if (!allowed || pancake === null || pancake.amountOut < minimum) return null;
-  return buildStep({ ...params, quotedAmountOut: pancake.amountOut, ...(pancake.kind === 'v3' ? { path: pancake.path } :
+  return buildStep({ ...params, chainId: publicClient.chain?.id, quotedAmountOut: pancake.amountOut, ...(pancake.kind === 'v3' ? { path: pancake.path } :
     { v2Tokens: pancake.tokens }) });
 }
 
@@ -906,6 +908,7 @@ export async function refreshFloors(params: {
   log?: (line: string) => void;
 }): Promise<RefreshFloorsResult> {
   const { publicClient, oracle, steps, feeBps } = params;
+  const PANCAKE_UR = pancakeRouterForChain(publicClient.chain?.id);
   const maxWorseningBps = params.maxWorseningBps ?? MAX_FLOOR_WORSENING_BPS;
   const refreshes: FloorRefresh[] = [];
   const rebuilt: PlannedStep[] = [];
@@ -970,6 +973,7 @@ export async function refreshFloors(params: {
       ...(identity?.path === undefined || identity.path === null ? {} : { path: identity.path }),
       ...(params.blockNumber === undefined ? {} : { blockNumber: params.blockNumber }) });
     if (identity === null) {
+      if ((publicClient.chain?.id ?? configuredChainId()) === 97) return { ok: false, kind: 'quote-failed', reason: 'chain 97 only supports Pancake V3' };
       if (params.executor === undefined || params.deadline === undefined) return { ok: false, kind: 'quote-failed', reason: '聚合器刷新缺少 executor/deadline，不送交易' };
       let failure: AggregatorFailure = 'api-failed';
       const buffered = amountOutMinWithBuffer(freshAmountOutMin);
@@ -1000,6 +1004,7 @@ export async function refreshFloors(params: {
     }
     rebuilt.push(
       buildStep({
+        chainId: publicClient.chain?.id,
         executor: identity.recipient,
         tokenIn: step.tokenIn,
         tokenOut: step.tokenOut,
@@ -1036,10 +1041,10 @@ async function pancakeFallback(params: {
       const route = params.route;
       if (route === null) return null;
       const venue = await params.publicClient.readContract({ address: params.executor, abi: EXECUTOR_ABI, functionName: 'venues',
-          args: [PANCAKE_UR], ...(params.blockNumber === undefined ? {} : { blockNumber: params.blockNumber }) });
-      if (venue[0] !== 1 || !isAddressEqual(venue[1], PANCAKE_UR) || route === null ||
+          args: [pancakeRouterForChain(params.publicClient.chain?.id)], ...(params.blockNumber === undefined ? {} : { blockNumber: params.blockNumber }) });
+      if (venue[0] !== 1 || !isAddressEqual(venue[1], pancakeRouterForChain(params.publicClient.chain?.id)) || route === null ||
           route.amountOut < amountOutMinWithBuffer(params.minGross)) return null;
-      return buildStep({ ...params.step, executor: params.executor, oracleFloor: params.minimum,
+      return buildStep({ ...params.step, chainId: params.publicClient.chain?.id, executor: params.executor, oracleFloor: params.minimum,
         minGross: params.minGross, quotedAmountOut: route.amountOut, poolFee: 0,
         ...(route.kind === 'v3' ? { path: route.path } : { v2Tokens: route.tokens }) });
     })().catch(() => null), new Promise<null>((resolve) => {
@@ -1061,7 +1066,7 @@ async function validateFallbackPlan(params: {
     const decimals = await numeraireDecimals(params.publicClient, numeraire, [], blockNumber);
     const scale = 10n ** BigInt(decimals);
     const assets = params.steps.map((step) => sameAsset(step.tokenIn, numeraire) ? step.tokenOut : step.tokenIn);
-    const limits = await readMaxLegUsdE8(assets, params.query);
+    const limits = await readMaxLegUsdE8(assets, params.query, params.publicClient.chain?.id);
     const hasBuy = params.steps.some((step) => sameAsset(step.tokenIn, numeraire));
     let cash = hasBuy ? await params.publicClient.readContract({ address: numeraire, abi: [{ type: 'function', name: 'balanceOf',
       stateMutability: 'view', inputs: [{ type: 'address' }], outputs: [{ type: 'uint256' }] }],
@@ -1554,6 +1559,7 @@ async function planHub(
   maxImpactBps: number | null,
 ): Promise<RebalancePlan> {
   const { publicClient, executor, oracle, registry, strategyId, holdings, targets, drift, blockNumber } = args;
+  const PANCAKE_UR = pancakeRouterForChain(publicClient.chain?.id);
   const hubKey = hub.toLowerCase();
 
   // 約束 ①：執行器只換 version.assets 裡的代幣（AtpExecutor.sol:180-182）。hub 不在裡面 →
@@ -2110,6 +2116,7 @@ export async function planRebalance(
   deps: PlanRebalanceDeps = {},
 ): Promise<RebalancePlan> {
   const { publicClient, executor, oracle, registry, strategyId, holdings, targets, drift, blockNumber } = args;
+  const PANCAKE_UR = pancakeRouterForChain(publicClient.chain?.id);
   const thresholdBps = args.thresholdBps;
   const deadlineSeconds = args.deadlineSeconds ?? DEFAULT_DEADLINE_SECONDS;
 
@@ -2158,7 +2165,7 @@ export async function planRebalance(
     return { kind: 'blocked', reason: '目標資產包含同一個地址，不能在同一輪產生多步交易' };
   }
   if (args.maxLegUsdE8 === undefined) {
-    try { args = { ...args, maxLegUsdE8: await readMaxLegUsdE8(targets.map((target) => target.asset), deps.query) }; }
+    try { args = { ...args, maxLegUsdE8: await readMaxLegUsdE8(targets.map((target) => target.asset), deps.query, publicClient.chain?.id) }; }
     catch { return { kind: 'blocked', reason: '[MAX_LEG_UNAVAILABLE] 資產單筆限額讀取失敗或資料缺漏，不送交易' }; }
   }
 

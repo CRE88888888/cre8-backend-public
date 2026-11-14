@@ -10,7 +10,8 @@ import type { GetKernelVersion } from '@zerodev/sdk/types';
 import { encodePacked, hexToBytes, keccak256 } from 'viem';
 import type { Address, Hex, PublicClient } from 'viem';
 import { hdKeyToAccount } from 'viem/accounts';
-import { KERNEL_VERSION_STRING, KERNEL_V3_3_ADDRESSES } from './addresses.js';
+import { KERNEL_VERSION_STRING, KERNEL_V3_3_ADDRESSES, kernelAddressesForChain } from './addresses.js';
+import { TESTNET_97, configuredChainId } from './testnet-profile.js';
 import { requireSessionKeyConfig } from './config.js';
 import { EXECUTOR_SELECTOR } from './chain.js';
 export { EXECUTOR_SELECTOR } from './chain.js';
@@ -232,25 +233,26 @@ export type SessionPolicySnapshot = SessionPolicies & {
 /** 一次算好的三層 policy 物件；snapshot 與 validator 都從同一份長出來。 */
 type BuiltPolicies = { call: Policy; gas: Policy; timestamp: Policy };
 
-function buildPolicies(executorAddress: Address, validAfter: number, validUntil: number): BuiltPolicies {
+function buildPolicies(executorAddress: Address, validAfter: number, validUntil: number, chainId = configuredChainId()): BuiltPolicies {
   return {
     // 只給 target + selector：CallPolicy 不驗參數，所以這裡沒得鎖更細。
     call: toCallPolicy({
+      ...(chainId === 97 ? { policyAddress: TESTNET_97.contracts.callPolicy } : {}),
       policyVersion: SESSION_CALL_POLICY_VERSION,
       permissions: [{ target: executorAddress, selector: EXECUTOR_SELECTOR }],
     }),
-    gas: toGasPolicy({ allowed: SESSION_GAS_ALLOWED_WEI }),
-    timestamp: toTimestampPolicy({ validAfter, validUntil }),
+    gas: toGasPolicy({ allowed: SESSION_GAS_ALLOWED_WEI, ...(chainId === 97 ? { policyAddress: TESTNET_97.contracts.gasPolicy, enforcePaymaster: true, allowedPaymaster: TESTNET_97.contracts.paymaster } : {}) }),
+    timestamp: toTimestampPolicy({ validAfter, validUntil, ...(chainId === 97 ? { policyAddress: TESTNET_97.contracts.timestampPolicy } : {}) }),
   };
 }
 
 /** 目前使用的三層 policy 參數（測試與 log 用）。`validUntil` 未給就用 `sessionValidUntil()`。 */
-export function describePolicies(args: { executorAddress: Address; validUntil?: number }): SessionPolicies {
+export function describePolicies(args: { executorAddress: Address; validUntil?: number; chainId?: number }): SessionPolicies {
   const executorAddress = assertAddressArg(args.executorAddress, 'executorAddress');
   const validUntil = args.validUntil ?? sessionValidUntil();
   assertValidUntil(validUntil);
 
-  const policies = buildPolicies(executorAddress, SESSION_VALID_AFTER, validUntil);
+  const policies = buildPolicies(executorAddress, SESSION_VALID_AFTER, validUntil, args.chainId);
   return snapshotPolicies(policies);
 }
 
@@ -344,6 +346,7 @@ export async function sudoValidator(publicClient: PublicClient, owner: Address) 
     signer: addressToEmptyAccount(ownerAddress),
     entryPoint: ENTRY_POINT,
     kernelVersion: KERNEL_V3_3,
+    validatorAddress: kernelAddressesForChain(publicClient.chain?.id ?? await publicClient.getChainId()).ecdsaValidatorV31,
   });
 }
 
@@ -388,13 +391,14 @@ export async function buildSessionPermissions(args: BuildSessionPermissionsArgs)
     throw new Error('Session key 權限算不出來：需要 publicClient（toPermissionValidator 要讀 chain id）');
   }
 
-  const policies = buildPolicies(executorAddress, SESSION_VALID_AFTER, validUntil);
+  const chainId = args.publicClient.chain?.id ?? await args.publicClient.getChainId();
+  const policies = buildPolicies(executorAddress, SESSION_VALID_AFTER, validUntil, chainId);
 
   // 型別理由同 src/kernel.ts：SDK 把 kernelVersion 收窄成 GetKernelVersion<"0.7">。
   const kernelVersion: GetKernelVersion<'0.7'> = KERNEL_V3_3;
 
   const permissionValidator = await toPermissionValidator(args.publicClient, {
-    signer: args.signer ?? toEmptyECDSASigner(sessionKeyAddress),
+    signer: args.signer ?? toEmptyECDSASigner(sessionKeyAddress, chainId === 97 ? TESTNET_97.contracts.ecdsaSigner : undefined),
     // 順序會進 permissionId（toPolicyId 是對這個陣列做 abi.encode），所以固定在這裡排。
     policies: [policies.call, policies.gas, policies.timestamp],
     entryPoint: ENTRY_POINT,

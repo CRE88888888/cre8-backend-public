@@ -1,3 +1,5 @@
+// Keep faucet HTTP coverage in the existing no-DB CI entry point.
+import './faucet.test.js';
 import assert from 'node:assert/strict';
 // Keep the split sponsorship security/HTTP tests on this existing no-DB CI entry point.
 import './paymaster.test.js';

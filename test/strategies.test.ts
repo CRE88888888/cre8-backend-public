@@ -1,3 +1,4 @@
+import { TESTNET_97 } from '../src/testnet-profile.js';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, test } from 'node:test';
@@ -311,7 +312,7 @@ test('loadConfig requires DATABASE_URL and defaults to chain 56 / port 8080', ()
     chainId: 97,
     rpcUrl: 'https://rpc.example',
     operatorPrivateKey: null,
-    registryAddress: null,
+    registryAddress: TESTNET_97.contracts.registry,
   });
 
   assert.throws(() => loadConfig({ DATABASE_URL: 'postgres://localhost/cre8', PORT: 'abc' }), /PORT/);

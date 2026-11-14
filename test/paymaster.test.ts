@@ -122,3 +122,17 @@ test('#66 expiry while committing keeps the charge but never hands out authoriza
     assert.doesNotMatch(output, /private RPC token|DATABASE_URL|userOperation|nonce|callData/);
   } finally { console.warn = original; }
 });
+
+test('#69 estimation paymaster signature is recoverable for every hash, so v0.7 reports SIG_VALIDATION_FAILED instead of reverting', async () => {
+  const { schedulerPaymaster } = await import('../src/paymaster.js');
+  const { slice } = await import('viem');
+  const hooks = schedulerPaymaster(SENDER, { config: config() });
+  assert.ok(hooks?.getPaymasterStubData);
+  const stub = await hooks.getPaymasterStubData({ chainId: 1337, entryPointAddress: '0x0000000071727De22E5E9d8BAf0edAc6f37da032', sender: SENDER, nonce: 0n, callData: '0x' });
+  assert.ok(stub?.paymasterData);
+  for (const value of [0n, 1n, (1n << 256n) - 1n]) {
+    const recovered = await recoverMessageAddress({ message: { raw: toHex(value, { size: 32 }) }, signature: slice(stub.paymasterData, 64) });
+    assert.match(recovered, /^0x[0-9a-fA-F]{40}$/);
+    if (value !== 0n) assert.notEqual(recovered.toLowerCase(), OWNER);
+  }
+});

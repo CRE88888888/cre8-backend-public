@@ -1,3 +1,4 @@
+import { configuredChainId, TESTNET_97, testnetAssets } from './testnet-profile.js';
 import { isChainConfigured, publishVersionOnchain, registerStrategyOnchain } from './chain.js';
 import { isForeignKeyViolation, isUniqueViolation, query } from './db.js';
 import { ForbiddenError, NotFoundError, ValidationError } from './errors.js';
@@ -125,7 +126,9 @@ type VersionRow = {
  *   - integer weights in 1..10000 (USDT may be 0) summing to exactly 10000
  *   - append USDT at weight 0 if absent, so deposits can be spent by the executor
  */
-export function validateAllocation(input: unknown): Allocation {
+export function validateAllocation(input: unknown, chainId = configuredChainId()): Allocation {
+  const numeraire = chainId === 97 ? TESTNET_97.contracts.usdt : USDT_NUMERAIRE_ADDRESS;
+  const allowed = chainId === 97 ? new Set<string>(testnetAssets().map((asset) => asset.address)) : null;
   if (!isRecord(input)) {
     throw new ValidationError('INVALID_ALLOCATION', 'allocation must be an object: { assets: [...] }');
   }
@@ -161,13 +164,14 @@ export function validateAllocation(input: unknown): Allocation {
       );
     }
     const address = rawAddress.trim().toLowerCase();
+    if (allowed !== null && !allowed.has(address)) throw new ValidationError('INVALID_ASSET', 'asset is not in the chain 97 profile');
     if (seen.has(address)) {
       throw new ValidationError('DUPLICATE_ASSET', `allocation.assets[${index}] duplicates asset ${address}`);
     }
     seen.add(address);
 
     const weightBps = entry.weightBps;
-    const minWeightBps = address === USDT_NUMERAIRE_ADDRESS ? 0 : 1;
+    const minWeightBps = address === numeraire ? 0 : 1;
     if (
       typeof weightBps !== 'number' ||
       !Number.isInteger(weightBps) ||
@@ -205,14 +209,14 @@ export function validateAllocation(input: unknown): Allocation {
     );
   }
 
-  if (!seen.has(USDT_NUMERAIRE_ADDRESS)) {
+  if (!seen.has(numeraire)) {
     if (normalised.length === MAX_VERSION_ASSETS) {
       throw new ValidationError(
         'TOO_MANY_ASSETS',
         `allocation.assets must contain at most ${MAX_VERSION_ASSETS} assets including USDT; leave one slot for the automatic USDT row`,
       );
     }
-    normalised.push({ address: USDT_NUMERAIRE_ADDRESS, symbol: 'USDT', weightBps: 0 });
+    normalised.push({ address: numeraire, symbol: 'USDT', weightBps: 0 });
   }
 
   return { assets: normalised };

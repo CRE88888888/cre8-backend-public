@@ -1,3 +1,4 @@
+import { testnetAssets, configuredChainId } from './testnet-profile.js';
 import { query as dbQuery } from './db.js';
 
 /**
@@ -70,8 +71,9 @@ export type TradableProbe = {
 export async function listPriceableAssets(
   query: QueryFn = dbQuery,
   probe?: TradableProbe,
+  chainId = configuredChainId(),
 ): Promise<PriceableAsset[]> {
-  const { rows } = await query(SQL_ASSETS);
+  const rows = chainId === 97 ? testnetAssets() : (await query(SQL_ASSETS)).rows;
 
   const assets: PriceableAsset[] = [];
   for (const row of rows) {

@@ -1,5 +1,6 @@
 import { createPublicClient, http } from 'viem';
 import type { Address, PublicClient } from 'viem';
+import { testnetAssets } from './testnet-profile.js';
 import { activeChain } from './chain-object.js';
 import { getConfig } from './config.js';
 import { query as dbQuery } from './db.js';
@@ -262,8 +263,8 @@ async function loadPortfolioContext(
  * `is_numeraire` 一定是 boolean 才算數：這一欄決定「要不要去問池子」，猜錯或預設成 false 會讓 USDT
  * 退回「無價」，於是持有 USDT 的帳戶又開始拒算漂移——一個看起來很安全、實際上讓索引器失效的狀態。
  */
-async function loadPriceTable(query: QueryFn): Promise<Map<string, PriceableAsset>> {
-  const result = await query(SQL_TOKENS);
+async function loadPriceTable(query: QueryFn, chainId: number): Promise<Map<string, PriceableAsset>> {
+  const result = { rows: chainId === 97 ? testnetAssets() : (await query(SQL_TOKENS)).rows };
   const table = new Map<string, PriceableAsset>();
   result.rows.forEach((row, index) => {
     const typed = row as { address?: unknown; symbol?: unknown; usdt_pool?: unknown; is_numeraire?: unknown };
@@ -357,7 +358,7 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
   }
   // 先讀 priceable_assets：targets 的 symbol 以它為權威（見 `parseAllocation` 的註解）。
   // 這一次查詢本來就會發生（後面定價要用），提前到這裡只是把同一個結果用在兩處。
-  const priceTableForSymbols = await loadPriceTable(query);
+  const priceTableForSymbols = await loadPriceTable(query, chainId);
   const symbolByAddress = new Map(
     [...priceTableForSymbols.entries()].map(([address, asset]) => [address.toLowerCase(), asset.symbol]),
   );
@@ -409,7 +410,7 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
   //
   // 查價表只用來回答「這個地址的價格怎麼查」。策略資產不在查價表裡 = 沒有定價來源，仍然照讀餘額，
   // 但一持有就擋下漂移（`UNPRICED_HOLDINGS`）：我們不知道策略成分值多少，就算不出權重——那是真問題。
-  const priceTable = await loadPriceTable(query);
+  const priceTable = await loadPriceTable(query, chainId);
   const symbolsByAsset = new Map(targets.map((target) => [target.asset, target.symbol]));
   const universe: PriceableAsset[] = chainTargets.map((target) => {
     const known = priceTable.get(target.asset);

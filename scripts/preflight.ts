@@ -30,7 +30,10 @@ import { BaseError, createPublicClient, http, isAddress, getAddress, zeroAddress
 import { privateKeyToAccount } from 'viem/accounts';
 import type { Address, PublicClient } from 'viem';
 
-import { readGlobalPaused, REGISTRY_ABI, EXECUTOR_BUY_ABI, EXECUTOR_ABI, PANCAKE_UR, readSecondaryHealth } from '../src/chain.js';
+import { readGlobalPaused, REGISTRY_ABI, EXECUTOR_BUY_ABI, EXECUTOR_ABI, readSecondaryHealth } from '../src/chain.js';
+import { TESTNET_97, testnetAssets } from '../src/testnet-profile.js';
+import { checkTestnetProfile } from '../src/testnet-preflight.js';
+import { pancakeRouterForChain } from '../src/addresses.js';
 import { activeChain } from '../src/chain-object.js';
 import { getConfig, requireSessionKeyConfig } from '../src/config.js';
 import { query } from '../src/db.js';
@@ -71,11 +74,11 @@ export function checkGlobalPaused(paused: boolean | null, strict: boolean): Chec
   };
 }
 
-export function checkBuyConfig(maxBuyBps: number | null, numeraire: Address | null, strict: boolean): Check[] {
+export function checkBuyConfig(maxBuyBps: number | null, numeraire: Address | null, strict: boolean, expectedNumeraire: Address = USDT_ADDRESS): Check[] {
   return [
     { name: 'executor.maxBuyBps', level: maxBuyBps === null ? 'fail' : maxBuyBps === 10000 ? 'ok' : strict ? 'fail' : 'warn',
       detail: maxBuyBps === null ? '讀不到 maxBuyBps()' : `${maxBuyBps}（預期 10000）` },
-    { name: 'executor.numeraire', level: numeraire === null ? 'fail' : sameAddress(numeraire, USDT_ADDRESS) ? 'ok' : strict ? 'fail' : 'warn',
+    { name: 'executor.numeraire', level: numeraire === null ? 'fail' : sameAddress(numeraire, expectedNumeraire) ? 'ok' : strict ? 'fail' : 'warn',
       detail: numeraire === null ? '讀不到 numeraire()' : `${numeraire}（預期 USDT）` },
   ];
 }
@@ -83,6 +86,7 @@ export function checkBuyConfig(maxBuyBps: number | null, numeraire: Address | nu
 /** Enumerate targets from events, then read current state (including removals) at one block. */
 export async function checkVenues(client: PublicClient, executor: Address, deploymentBlock: bigint): Promise<Check[]> {
   try {
+    const pancakeRouter = pancakeRouterForChain(client.chain?.id);
     const blockNumber = await client.getBlockNumber({ cacheTime: 0 });
     if (deploymentBlock < 0n || deploymentBlock > blockNumber) throw new Error('invalid deployment block');
     const deployedCode = await client.getCode({ address: executor, blockNumber: deploymentBlock });
@@ -93,16 +97,16 @@ export async function checkVenues(client: PublicClient, executor: Address, deplo
     }
     const events = await client.getContractEvents({ address: executor, abi: EXECUTOR_ABI,
       eventName: 'VenueSet', fromBlock: deploymentBlock, toBlock: blockNumber, strict: true });
-    const targets = new Map<string, Address>([[PANCAKE_UR.toLowerCase(), PANCAKE_UR]]);
+    const targets = new Map<string, Address>([[pancakeRouter.toLowerCase(), pancakeRouter]]);
     for (const event of events) targets.set(event.args.target.toLowerCase(), event.args.target);
     const checks: Check[] = [];
     for (const target of targets.values()) {
       const [kind, spender] = await client.readContract({ address: executor, abi: EXECUTOR_ABI,
         functionName: 'venues', args: [target], blockNumber });
-      const pancake = sameAddress(target, PANCAKE_UR);
+      const pancake = sameAddress(target, pancakeRouter);
       if (!pancake && kind === 0) continue;
-      const valid = pancake ? kind === 1 && sameAddress(spender, PANCAKE_UR)
-        : (kind === 2 || kind === 3) && !sameAddress(spender, zeroAddress);
+      const valid = pancake ? kind === 1 && sameAddress(spender, pancakeRouter)
+        : client.chain?.id !== 97 && (kind === 2 || kind === 3) && !sameAddress(spender, zeroAddress);
       checks.push({ name: `executor venue ${target}`, level: valid ? 'ok' : 'fail',
         detail: `kind=${['NONE', 'PANCAKE_UR', 'ERC20_APPROVE', 'PERMIT2'][kind] ?? 'UNKNOWN'} spender=${spender}` });
     }
@@ -155,6 +159,7 @@ export function checkOwnership(input: {
   pendingOwner: Address | null;
   safe: Address | null;
   safeHasCode: boolean | null;
+  testnet?: boolean;
   strict: boolean;
 }): Check[] {
   const { label, owner, pendingOwner, safe, safeHasCode, strict } = input;
@@ -179,12 +184,13 @@ export function checkOwnership(input: {
   }
 
   if (safe !== null && !sameAddress(safe, zeroAddress)) {
+    const testnetOwner = input.testnet === true && safeHasCode === false && sameAddress(safe, TESTNET_97.roles.owner);
     checks.push({
-      level: safeHasCode === true ? 'ok' : level,
+      level: safeHasCode === true || testnetOwner ? 'ok' : level,
       name: `${label} owner code`,
-      detail: safeHasCode === true ? 'ATP_SAFE 有合約 code'
+      detail: testnetOwner ? 'chain 97 manifest 測試 owner（EOA）' : safeHasCode === true ? 'ATP_SAFE 有合約 code'
         : safeHasCode === false ? 'ATP_SAFE 沒有合約 code（EOA）' : '讀不到 ATP_SAFE 的 code',
-      ...(safeHasCode === true ? {} : { fix: '確認 ATP_SAFE 是已部署的 Safe 合約，並確認 RPC' }),
+      ...(safeHasCode === true || testnetOwner ? {} : { fix: '確認 ATP_SAFE 是已部署的 Safe 合約，並確認 RPC' }),
     });
   }
 
@@ -424,13 +430,13 @@ async function main(): Promise<number> {
   }
 
   // --- 3. 合約位址格式 ---------------------------------------------------
-  const registry = asAddressOrNull(process.env.REGISTRY_ADDRESS);
+  const registry = config.chainId === 97 ? TESTNET_97.contracts.registry : asAddressOrNull(process.env.REGISTRY_ADDRESS);
   if (registry === null) {
     fail('REGISTRY_ADDRESS', '未設定或不是合法的 20-byte 位址', '部署合約後填入');
   } else {
     ok('REGISTRY_ADDRESS', registry);
   }
-  const executor = asAddressOrNull(process.env.EXECUTOR_ADDRESS);
+  const executor = config.chainId === 97 ? TESTNET_97.contracts.executor : asAddressOrNull(process.env.EXECUTOR_ADDRESS);
   if (executor === null) {
     fail('EXECUTOR_ADDRESS', '未設定或不是合法的 20-byte 位址', '部署合約後填入');
   } else {
@@ -438,12 +444,12 @@ async function main(): Promise<number> {
   }
 
   // 地址與金鑰分離不依賴 RPC；即使鏈連不上也先回報設定問題。
-  const safe = asAddressOrNull(process.env.ATP_SAFE);
+  const safe = config.chainId === 97 ? TESTNET_97.roles.owner : asAddressOrNull(process.env.ATP_SAFE);
   const expectedOperator = operatorAddress(process.env.OPERATOR_PRIVATE_KEY);
   checkRoleSeparation({
     relayer: expectedOperator,
-    deployer: process.env.DEPLOYER_ADDRESS,
-    bundler: process.env.BUNDLER_EXECUTOR_ADDRESS,
+    deployer: process.env.DEPLOYER_ADDRESS ?? (config.chainId === 97 ? TESTNET_97.roles.deployer : undefined),
+    bundler: process.env.BUNDLER_EXECUTOR_ADDRESS ?? (config.chainId === 97 ? TESTNET_97.roles.bundlerExecutor : undefined),
     safe,
     strict: args.strict,
   }).forEach(record);
@@ -479,6 +485,8 @@ async function main(): Promise<number> {
     print();
     return 1;
   }
+
+  if (config.chainId === 97) (await checkTestnetProfile(client)).forEach(record);
 
   // --- 5. 合約上真的有 code ---------------------------------------------
   for (const [label, address] of [
@@ -521,7 +529,7 @@ async function main(): Promise<number> {
 
   if (registry !== null) {
     const ownership = await readOwnership(registry);
-    checkOwnership({ label: 'registry', ...ownership, safe, safeHasCode, strict: args.strict }).forEach(record);
+    checkOwnership({ label: 'registry', ...ownership, safe, safeHasCode, testnet: config.chainId === 97, strict: args.strict }).forEach(record);
     let operator: Address | null = null;
     try {
       operator = await client.readContract({ address: registry, abi: REGISTRY_ABI, functionName: 'operator' });
@@ -540,7 +548,7 @@ async function main(): Promise<number> {
     let numeraire: Address | null = null;
     try { maxBuyBps = await client.readContract({ address: executor, abi: EXECUTOR_BUY_ABI, functionName: 'maxBuyBps' }); } catch { /* unreadable fails */ }
     try { numeraire = await client.readContract({ address: executor, abi: EXECUTOR_BUY_ABI, functionName: 'numeraire' }); } catch { /* unreadable fails */ }
-    checkBuyConfig(maxBuyBps, numeraire, args.strict).forEach(record);
+    checkBuyConfig(maxBuyBps, numeraire, args.strict, config.chainId === 97 ? TESTNET_97.contracts.usdt : USDT_ADDRESS).forEach(record);
     const deploymentBlock = process.env.EXECUTOR_DEPLOYMENT_BLOCK?.trim();
     if (deploymentBlock === undefined || !/^\d+$/.test(deploymentBlock)) {
       fail('executor venues', '缺少合法的 EXECUTOR_DEPLOYMENT_BLOCK', '填 executor 部署 receipt 的 blockNumber，才能完整列出 venue 並避免從 genesis 掃描');
@@ -561,6 +569,9 @@ async function main(): Promise<number> {
         ] as const,
         functionName: 'oracle',
       });
+      if (config.chainId === 97 && !sameAddress(oracle, TESTNET_97.contracts.router)) {
+        fail('executor.oracle profile', '不符合 chain 97 manifest router', '確認 executor oracle 設定');
+      }
       if (oracle === '0x0000000000000000000000000000000000000000') {
         fail('executor.oracle', '是零位址', '_checkStep 會 re-quote 失敗，所有再平衡都會 revert');
       } else {
@@ -570,7 +581,7 @@ async function main(): Promise<number> {
         } else {
           ok('executor.oracle', oracle);
           try {
-            const { rows } = await query<{ address: string }>('select address from priceable_assets where enabled order by address');
+            const rows = config.chainId === 97 ? testnetAssets() : (await query<{ address: string }>('select address from priceable_assets where enabled order by address')).rows;
             const assets = rows.map((row) => {
               const asset = asAddressOrNull(row.address);
               if (asset === null) throw new Error('invalid asset address');
@@ -581,7 +592,7 @@ async function main(): Promise<number> {
             fail('secondary assets', '資產清單讀取失敗，無法完整檢查 secondary', '確認 DB migration 與資產資料');
           }
           const ownership = await readOwnership(oracle);
-          checkOwnership({ label: 'router', ...ownership, safe, safeHasCode, strict: args.strict }).forEach(record);
+          checkOwnership({ label: 'router', ...ownership, safe, safeHasCode, testnet: config.chainId === 97, strict: args.strict }).forEach(record);
         }
       }
     } catch (cause) {
@@ -603,7 +614,7 @@ async function main(): Promise<number> {
       });
       const body: unknown = await response.json();
       const result = typeof body === 'object' && body !== null && 'result' in body ? body.result : undefined;
-      if (Array.isArray(result) && result.length > 0 && result.every((value: unknown) => typeof value === 'string' && isAddress(value))) {
+      if (Array.isArray(result) && result.length > 0 && result.every((value: unknown) => typeof value === 'string' && isAddress(value)) && (config.chainId !== 97 || result.some((value: string) => value.toLowerCase() === TESTNET_97.contracts.entryPoint))) {
         ok('bundler', `entryPoints: ${result.join(', ')}`);
       } else {
         warn('bundler', '沒有回 entryPoints（上游錯誤內容不輸出）', '確認 alto / 第三方 bundler 的版本與設定');

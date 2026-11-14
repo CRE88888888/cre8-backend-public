@@ -1,4 +1,4 @@
-import { bsc } from 'viem/chains';
+import { bsc, bscTestnet } from 'viem/chains';
 import type { Chain } from 'viem';
 
 import { getConfig } from './config.js';
@@ -16,6 +16,7 @@ import { getConfig } from './config.js';
 export function activeChain(): Chain {
   const { chainId } = getConfig();
   if (chainId === bsc.id) return bsc;
+  if (chainId === 97) return bscTestnet;
   return {
     ...bsc,
     id: chainId,

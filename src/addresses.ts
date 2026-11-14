@@ -1,3 +1,5 @@
+import { TESTNET_97, configuredChainId } from './testnet-profile.js';
+import { getAddress } from 'viem';
 import type { Address } from 'viem';
 
 /**
@@ -38,13 +40,26 @@ export const V2_FACTORY_ADDRESS = '0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73';
 
 /**
  * 回傳該 chain 可用的 Kernel v3.3 位址組。
- * 支援 BSC mainnet（56）與本機 fork（**1337** 或舊的 31337）：Kernel 的 canonical 位址在所有鏈相同。
+ * 支援 BSC testnet（97，pinned profile）、mainnet（56）與本機 fork（**1337** 或舊的 31337）：Kernel 的 canonical 位址在所有鏈相同。
  */
-export function kernelAddressesForChain(chainId: number): typeof KERNEL_V3_3_ADDRESSES {
+export function kernelAddressesForChain(chainId: number): Record<keyof typeof KERNEL_V3_3_ADDRESSES, Address> {
+  if (chainId === 97) return { entryPointV07: TESTNET_97.contracts.entryPoint, kernelMetaFactory: TESTNET_97.contracts.kernelMetaFactory,
+    kernelFactoryV33: TESTNET_97.contracts.kernelFactoryV33, kernelImplV33: TESTNET_97.contracts.kernelImplV33,
+    ecdsaValidatorV31: TESTNET_97.contracts.ecdsaValidatorV31 };
   if (chainId === 56 || chainId === 31337 || chainId === 1337) {
     return KERNEL_V3_3_ADDRESSES;
   }
   throw new Error(
-    `Unsupported chainId ${chainId}: CRE8 ATP 目前只支援 BSC mainnet (56) 與 anvil fork (31337) 的 Kernel v3.3 canonical 位址`,
+    `Unsupported chainId ${chainId}: CRE8 ATP 目前只支援 BSC testnet (97)、mainnet (56) 與 anvil fork (1337/31337) 的 Kernel v3.3 canonical 位址`,
   );
+}
+
+export function pancakeRouterForChain(chainId = configuredChainId()): Address {
+  return chainId === 97 ? TESTNET_97.contracts.universalRouter : getAddress('0x1a0a18ac4becddbd6389559687d1a73d8927e416');
+}
+export function pancakeRoutingForChain(chainId = configuredChainId()): { factory: Address; via: Address; quoter: Address; v2Factory: Address | null } {
+  return chainId === 97
+    ? { factory: TESTNET_97.contracts.v3Factory, via: TESTNET_97.assets.WBNB.token, quoter: TESTNET_97.contracts.quoter, v2Factory: null }
+    : { factory: V3_FACTORY_ADDRESS, via: WBNB_ADDRESS, quoter: '0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997' as Address,
+        v2Factory: process.env.ROUTE_V2_ENABLED === '1' ? V2_FACTORY_ADDRESS : null };
 }

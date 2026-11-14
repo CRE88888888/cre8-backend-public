@@ -15,6 +15,16 @@ set -eu
 # 安全預設：safe-mode 必須開（關掉等於不強制 ERC-4337 驗證規則，護欄失效）。
 SAFE_MODE="${SAFE_MODE:-true}"
 # BSC 上 1 BNB 的 refill 門檻太高；預設 0.05，讓 utility wallet 只在真的見底時補。
+MIN_EXECUTOR_BALANCE="${MIN_EXECUTOR_BALANCE:-}"
+
+if [ "${CHAIN_ID:-56}" = "97" ]; then
+  : "${UTILITY_PRIVATE_KEY:?chain 97 requires a distinct UTILITY_PRIVATE_KEY}"
+  [ "$UTILITY_PRIVATE_KEY" != "$EXECUTOR_PRIVATE_KEY" ] || { echo "chain 97 executor and utility keys must differ"; exit 1; }
+  [ "$SAFE_MODE" = true ] || { echo "chain 97 requires SAFE_MODE=true"; exit 1; }
+  EP=$(echo "${ENTRYPOINTS:-0x0000000071727De22E5E9d8BAf0edAc6f37da032}" | tr '[:upper:]' '[:lower:]')
+  [ "$EP" = '0x0000000071727de22e5e9d8baf0edac6f37da032' ] || { echo "chain 97 requires EntryPoint v0.7"; exit 1; }
+  MIN_EXECUTOR_BALANCE="${MIN_EXECUTOR_BALANCE:-10000000000000000}"
+fi
 MIN_EXECUTOR_BALANCE="${MIN_EXECUTOR_BALANCE:-50000000000000000}"
 
 set -- \
@@ -28,6 +38,10 @@ set -- \
   --min-entity-unstake-delay 1 \
   --min-executor-balance "$MIN_EXECUTOR_BALANCE"
 
+if [ "${CHAIN_ID:-56}" = "97" ]; then
+  set -- "$@" --max-block-range "${MAX_BLOCK_RANGE:-100}"
+fi
+
 if [ "$SAFE_MODE" = "true" ]; then
   set -- "$@" --safe-mode
 else
@@ -37,4 +51,4 @@ fi
 echo "[alto] starting: rpc=(configured) port=${PORT:-3001} safeMode=${SAFE_MODE} entrypoints=${ENTRYPOINTS:-default}"
 # 不要把整串參數印出來 —— 裡面有私鑰。
 
-exec node src/lib/cli/alto.js "$@"
+exec node "${ALTO_CLI_PATH:-src/lib/cli/alto.js}" "$@"

@@ -4,7 +4,7 @@ import type { GetKernelVersion } from '@zerodev/sdk/types';
 import { signerToEcdsaValidator } from '@zerodev/ecdsa-validator';
 import { encodePacked, isAddressEqual, keccak256, zeroAddress } from 'viem';
 import type { Address, Hex, PublicClient } from 'viem';
-import { KERNEL_V3_3_ADDRESSES, SALT_DOMAIN_TAG } from './addresses.js';
+import { KERNEL_V3_3_ADDRESSES, SALT_DOMAIN_TAG, kernelAddressesForChain } from './addresses.js';
 
 /**
  * Kernel v3.3 smart account 的 counterfactual 部署參數，實作由 `@zerodev/sdk` 提供。
@@ -90,7 +90,10 @@ export async function getKernelAccountParams(
   // 在 "0.3.3" 上會被收窄成 never。執行期仍是 KERNEL_V3_3，行為不受影響。
   const kernelVersion: GetKernelVersion<'0.7'> = KERNEL_V3_3;
 
+  const addresses = kernelAddressesForChain(publicClient.chain?.id ?? await publicClient.getChainId());
   const account = await createKernelAccount(publicClient, {
+    factoryAddress: addresses.kernelFactoryV33, metaFactoryAddress: addresses.kernelMetaFactory,
+    accountImplementationAddress: addresses.kernelImplV33,
     plugins: options.plugins ?? { sudo: await sudoValidatorFor(publicClient, owner) },
     entryPoint: ENTRY_POINT,
     kernelVersion,
@@ -170,5 +173,6 @@ async function sudoValidatorFor(publicClient: PublicClient, owner: Address) {
     signer: addressToEmptyAccount(owner),
     entryPoint: ENTRY_POINT,
     kernelVersion: KERNEL_V3_3,
+    validatorAddress: kernelAddressesForChain(publicClient.chain?.id ?? await publicClient.getChainId()).ecdsaValidatorV31,
   });
 }

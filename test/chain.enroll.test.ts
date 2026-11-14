@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { decodeErrorResult, encodeErrorResult, getAddress, toFunctionSelector, zeroAddress } from 'viem';
-import type { Abi, Address, PublicClient, WalletClient } from 'viem';
+import type { Abi, Account, Address, PublicClient, WalletClient } from 'viem';
 import { KERNEL_V3_3_ADDRESSES } from '../src/addresses.js';
 import { a10ErrorMessage, EXECUTOR_BUY_ABI, enrollOnchain, EXECUTOR_PAUSE_ABI, pauseSources, REGISTRY_ABI } from '../src/chain.js';
 import type { ChainConfig } from '../src/chain.js';
@@ -26,7 +26,7 @@ function fakeChain(operator: Address, signer = SIGNER) {
     chainId: 56,
     rpcUrl: 'http://127.0.0.1:8546',
     registryAddress: REGISTRY,
-    account: { address: signer },
+    account: { address: signer, type: 'json-rpc' } satisfies Account,
     kernel: KERNEL_V3_3_ADDRESSES,
     publicClient: {
       getBlockNumber: async () => 100n,

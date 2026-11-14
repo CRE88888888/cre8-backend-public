@@ -1,3 +1,4 @@
+import { withRelayerLock } from './relayer-lock.js';
 import {
   createPublicClient,
   createWalletClient,
@@ -191,7 +192,7 @@ function platformStatusConfig(): PlatformStatusConfig {
   let executor: Address | null = null;
   try {
     // This public read needs no signing key or seed, including their parsers.
-    executor = loadSessionKeyConfig({ EXECUTOR_ADDRESS: process.env.EXECUTOR_ADDRESS }).executorAddress;
+    executor = loadSessionKeyConfig({ EXECUTOR_ADDRESS: process.env.EXECUTOR_ADDRESS, CHAIN_ID: String(config.chainId) }).executorAddress;
   } catch {
     // An invalid executor is unavailable, never an unpaused platform.
   }
@@ -353,14 +354,14 @@ export async function registerStrategyOnchain(meta: {
 }): Promise<number> {
   const { wallet, publicClient, registryAddress, account: operator } = getChain();
 
-  const hash = await wallet.writeContract({
+  const hash = await withRelayerLock(getConfig().chainId, () => wallet.writeContract({
     account: operator,
     chain: activeChain(),
     address: registryAddress,
     abi: REGISTRY_ABI,
     functionName: 'registerStrategy',
     args: [meta.name, meta.description, meta.isPublic],
-  });
+  }));
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
 
   return decodeReturnedId(receipt.logs, 'StrategyRegistered', 'id');
@@ -382,7 +383,7 @@ export async function publishVersionOnchain(
 ): Promise<number> {
   const { wallet, publicClient, registryAddress, account: operator } = getChain();
 
-  const hash = await wallet.writeContract({
+  const hash = await withRelayerLock(getConfig().chainId, () => wallet.writeContract({
     account: operator,
     chain: activeChain(),
     address: registryAddress,
@@ -395,7 +396,7 @@ export async function publishVersionOnchain(
       canonicalScheduleHash(version.schedule),
       BigInt(Math.floor(version.activeAt.getTime() / 1000)),
     ],
-  });
+  }));
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
 
   return decodeReturnedId(receipt.logs, 'VersionPublished', 'version');
@@ -438,14 +439,14 @@ export async function enrollOnchain(account: Address, onchainId: number, chain?:
       );
     }
 
-    const hash = await wallet.writeContract({
+    const hash = await withRelayerLock(getConfig().chainId, () => wallet.writeContract({
       account: operator,
       chain: activeChain(),
       address: registryAddress,
       abi: REGISTRY_ABI,
       functionName: 'enroll',
       args: [account, BigInt(onchainId)],
-    });
+    }));
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
     if (receipt.status !== 'success') throw new AppError(502, 'ENROLL_REVERTED', 'enroll transaction reverted：未完成 enrollment');
     const enrolledVersion = await readEnrollment(receipt.blockNumber);
@@ -508,7 +509,7 @@ export async function deploySmartAccount(
 
   // factoryData is the MetaFactory `deployWithFactory(KernelFactory, initData, salt)` calldata, built
   // by the SDK; getKernelAccountParams has already refused anything but the MetaFactory.
-  const hash = await wallet.sendTransaction({ account: operator, chain: activeChain(), to: factory, data: factoryData });
+  const hash = await withRelayerLock(getConfig().chainId, () => wallet.sendTransaction({ account: operator, chain: activeChain(), to: factory, data: factoryData }));
   await publicClient.waitForTransactionReceipt({ hash });
 
   return { address, deployed: true };

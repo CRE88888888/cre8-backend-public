@@ -105,6 +105,7 @@ import { hdKeyToAccount } from 'viem/accounts';
 import { createBundlerClient, entryPoint07Abi, formatUserOperation, formatUserOperationReceipt, getUserOperationHash } from 'viem/account-abstraction';
 import type { GetUserOperationReturnType, UserOperationReceipt } from 'viem/account-abstraction';
 import { activeChain } from './chain-object.js';
+import { testnetAssets } from './testnet-profile.js';
 import { KERNEL_V3_3_ADDRESSES } from './addresses.js';
 import { detectAlerts, detectRelayerLowGas, formatAlert, recordAlerts, resolveAlerts, createPriceSourceTracker, priceSourceAlertAssets } from './alerts.js';
 import type { AlertFinding, AlertKind, PriceSourceTracker, RelayerGasChecks } from './alerts.js';
@@ -1516,7 +1517,7 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
       return tracker;
     })(),
     priceSourceChecks: provided.priceSourceChecks ?? (async () => {
-      const { rows } = await query("select address from priceable_assets where enabled");
+      const rows = chainId === 97 ? testnetAssets() : (await query("select address from priceable_assets where enabled")).rows;
       const assets = rows.map((row) => asAddress(typeof row === 'object' && row !== null ? Reflect.get(row, 'address') : null, 'priceable_assets.address'));
       const previous = await query("select detail from scheduler_alerts where kind = 'price_source_unavailable' and portfolio_id is null and resolved_at is null");
       for (const row of previous.rows) {
@@ -1561,7 +1562,7 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
           throw new Error('planPortfolio 沒有漂移報告（blocked）：不該進到規劃器');
         }
         return planRebalance({
-          maxLegUsdE8: await readMaxLegUsdE8(plan.targets.map((target) => target.asset), query),
+          maxLegUsdE8: await readMaxLegUsdE8(plan.targets.map((target) => target.asset), query, chainId),
           publicClient,
           account,
           executor,

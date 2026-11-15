@@ -339,6 +339,25 @@ test('#83 all-hold monthly rebalancing waits for a new UTC month after the previ
   await s.once(new Date('2026-12-01T00:00:00Z'));assert.equal(calls,1);assert.equal(s.sends.length,0);
 });
 
+test('#104 monthly rebalance withdraws yield before swaps and resumes without revoking consent',async()=>{
+  const f=await fixture('hold',0,4,'monthly');await f.fund(100n*U);
+  const initial=(await f.reserve())?.job;assert.ok(initial);await complete(f,initial);
+  await query('update portfolios set last_rebalance_at=$2 where id=$1',[f.id,start]);
+  const {yieldFixture}=await import('./fixtures/yield.js');
+  const lending=yieldFixture(['venus']).read.positions;
+  const position=lending[0];assert.ok(position);position.receipt=100n;position.market={...position.market,asset:a};
+  const p=plan(f);p.snapshot.yieldPositions=lending;
+  let withdrawals=0,swaps=0,pending=true;
+  const s=scheduler(f,{planPortfolio:async()=>p,planRebalance:async()=>{swaps++;return {kind:'ready',steps:[{tokenIn:cash,tokenOut:a,amountIn:50n*U,amountOutMin:90n,oracleFloor:80n,venue:TESTNET_97.contracts.universalRouter,data:'0x'}],deadline:BigInt(at.getTime()/1000)+1800n,rationale:'capped candidate'};}});
+  s.deps.newMoney={...s.deps.newMoney,yieldHoldings:async()=>p,withdrawYield:async()=>{withdrawals++;return pending?'[YIELD_REBALANCE_PENDING] 領回待確認':null;}};
+  const at=new Date('2026-12-01T00:00:00Z');
+  assert.match((await s.once(at)).results[0]?.reason??'',/YIELD_REBALANCE_PENDING/);
+  assert.equal(withdrawals,1);assert.equal(swaps,1);assert.equal(s.sends.length,0);
+  pending=false;
+  await s.once(at);assert.equal(withdrawals,2);assert.equal(swaps,2);assert.equal(s.sends.length,1);
+  assert.equal((await query('select id from yield_exit_requests where portfolio_id=$1',[f.id])).rows.length,0);
+});
+
 test('#83 source-level fee rounding cannot exceed an admitted asset cap by one raw unit',async()=>{
   const f=await fixture();await f.fund(100n*U+2n);await f.fund(100n*U);
   // Aggregate fees split exactly in half; per-source floors give the first asset one less

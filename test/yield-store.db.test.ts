@@ -15,13 +15,13 @@ import { config, kernelCall, operation } from './fixtures/paymaster.js';
 
 const paymasters:string[]=[];
 after(async()=>{if(paymasters.length)await query('delete from paymaster_sponsorships where chain_id=97 and paymaster=any($1::text[])',[paymasters]);await closePool();});
-async function fixture(read?:YieldRead){
+async function fixture(read?:YieldRead,rebalance:'none'|'monthly'|'drift'='none'){
   await migrate();const f=yieldFixture(['venus']),r=read??f.read;
   await syncYieldCatalog(r);const market=r.profile.markets[0];assert.ok(market);
   const owner=address(),account=f.account;
   const strategy=(await query<{id:string}>("insert into strategies(provider,name) values($1,'be84-yield') returning id::text",[owner])).rows[0];assert.ok(strategy);
   await query('update strategies set onchain_id=$2 where id=$1',[strategy.id,BigInt(strategy.id)+84000000n]);
-  const execution={kind:'per_asset',numeraire:market.asset,rebalance:'none',assets:[{asset:market.asset,weightBps:10000,yield:{market:market.id}}]};
+  const execution={kind:'per_asset',numeraire:market.asset,rebalance,assets:[{asset:market.asset,weightBps:10000,yield:{market:market.id}}]};
   await query(`insert into strategy_versions(strategy_id,version,allocation,schedule,active_at,execution_schema_version,execution,execution_chain_id,config_hash)
     values($1,1,$2,'{"kind":"funding"}',now()-interval '1 day',2,$3,97,$4)`,[strategy.id,JSON.stringify({assets:[{address:market.asset,weightBps:10000}]}),JSON.stringify(execution),hash()]);
   const p=(await query<{id:string}>("insert into portfolios(user_id,strategy_id,version,schedule_state) values($1,$2,1,'active') returning id::text",[owner,strategy.id])).rows[0];assert.ok(p);
@@ -242,4 +242,115 @@ test('BE84 final prepare rejects an orphaned quote before reserving gas or cash'
   assert.equal(await balance(f.context.portfolioId),(1000n*WAD).toString());
   assert.equal((await query('select execution_key from yield_actions where portfolio_id=$1',[f.context.portfolioId])).rows.length,0);
   assert.equal((await query('select execution_key from gas_budget_reservations where execution_key=$1',[f.current.input.executionKey])).rows.length,0);
+});
+
+async function rebalanceFixture(){
+  const f=await fixture(),i=f.current.input;
+  await locked(f.context.portfolioId,()=>f.journal.prepare(i));
+  const p=f.read.positions[0];assert.ok(p);
+  Object.assign(p,{receipt:50n*WAD,observedUnits:50n*WAD,trackedUnits:50n*WAD,claim:50n*WAD,value:50n*WAD,maxWithdraw:50n*WAD,maxRedeem:50n*WAD});
+  f.read.risks=f.read.risks.map(r=>({...r,exposure:50n*WAD}));
+  f.setProof({read:f.read,logIndex:0,blockNumber:f.read.observation.block,blockHash:f.blockHash,occurredAt:f.at});
+  await locked(f.context.portfolioId,()=>f.journal.confirmed(i.executionKey,{assets:50n*WAD,shares:50n*WAD,remainingReceipts:50n*WAD,txHash:hash(),userOpHash:i.userOpHash,gasUsed:1n}));
+  const {buildSessionPermissions}=await import('../src/permissions.js');
+  const session=await buildSessionPermissions({publicClient:f.client,sessionKeyAddress:f.owner,executorAddress:f.read.profile.executor,
+    validUntil:Math.floor(Date.now()/1000)+86400,yieldAccount:f.account});
+  await query(`insert into session_keys(portfolio_id,key_ref,permissions,status,expires_at) values($1,$2,$3,'active',$4)`,
+    [f.context.portfolioId,`m/44'/60'/0'/0/${f.context.portfolioId}`,JSON.stringify(session.policySnapshot),session.expiresAt]);
+  const {yieldRebalancePlan}=await import('./fixtures/yield.js');
+  const request={plan:yieldRebalancePlan(f,f.context.portfolioId),reserve:0n,
+    steps:[{tokenIn:f.asset,tokenOut:address(),amountIn:20n*WAD,amountOutMin:1n,oracleFloor:1n,venue:address(),data:'0x' as const}]};
+  return {...f,request};
+}
+
+test('#104 partial rebalance withdrawal uses exit journal; restart reconciles original snapshot once and keeps remaining yield/consent',async()=>{
+  const f=await rebalanceFixture();const {createYieldService}=await import('../src/yield-service.js');
+  f.current=f.prepared({...f.plan,kind:'withdraw',amount:20n*WAD,minimum:20n*WAD,receiptBalance:50n*WAD},1n);
+  let sends=0,reconciles=0;
+  const evidence:YieldEvidence={assets:20n*WAD,shares:20n*WAD,remainingReceipts:30n*WAD,txHash:hash(),userOpHash:f.current.input.userOpHash,gasUsed:1n};
+  const overrides={profile:()=>f.read.profile,client:()=>f.client,read:async()=>structuredClone(f.read),canSend:()=>true,
+    port:async()=>({submitYieldAction:async(args:Parameters<import('../src/yield-port.js').YieldExecutionPort['submitYieldAction']>[0])=>{
+      sends++;assert.deepEqual(args.action,{kind:'withdraw',marketId:f.market.marketId,amount:20n*WAD});
+      assert.equal(f.current.reservation.budget.purpose,'exit');assert.ok(args.paymaster?.reserve);
+      await args.paymaster.reserve(f.current.reservation);await args.journal.prepare(f.current.input);await args.journal.sending(f.current.input.executionKey);
+      throw new Error('SECRET_RPC_TIMEOUT');
+    },reconcileYieldOperation:async(_client:unknown,_url:unknown,saved:import('../src/yield-port.js').SavedYieldOperation)=>{
+      reconciles++;assert.equal(saved.plan.amount,20n*WAD);assert.equal(saved.userOpHash,f.current.input.userOpHash);
+      return {status:'confirmed' as const,evidence};
+    }})};
+  await assert.rejects(locked(f.context.portfolioId,()=>createYieldService(overrides).tick(f.context,false,f.request)),(e:unknown)=>e instanceof Error&&!e.message.includes('SECRET'));
+  assert.equal((await query<{state:string}>('select state from yield_actions where execution_key=$1',[f.current.input.executionKey])).rows[0]?.state,'unknown');
+  const p=f.read.positions[0];assert.ok(p);Object.assign(p,{receipt:30n*WAD,observedUnits:30n*WAD,trackedUnits:30n*WAD,claim:30n*WAD,value:30n*WAD});
+  Object.assign(f.state,{proofKind:'withdraw',proofHash:evidence.txHash,proofAssets:evidence.assets,proofShares:evidence.shares,proofRemaining:evidence.remainingReceipts});
+  await locked(f.context.portfolioId,()=>createYieldService(overrides).tick(f.context,false,f.request));
+  const {yieldRebalancePlan}=await import('./fixtures/yield.js');
+  f.request.plan=yieldRebalancePlan(f,f.context.portfolioId,20n*WAD);
+  assert.equal(await locked(f.context.portfolioId,()=>createYieldService(overrides).tick(f.context,false,f.request)),null);
+  assert.equal(sends,1);assert.equal(reconciles,1);
+  assert.equal((await query<{state:string}>('select state from yield_actions where execution_key=$1',[f.current.input.executionKey])).rows[0]?.state,'confirmed');
+  assert.equal((await query('select * from yield_events where execution_key=$1',[f.current.input.executionKey])).rows.length,1);
+  assert.deepEqual((await query<{receipt:string;exit_state:string}>('select receipt_raw::text as receipt,exit_state from yield_positions where portfolio_id=$1',[f.context.portfolioId])).rows[0],{receipt:(30n*WAD).toString(),exit_state:'none'});
+  assert.equal((await query('select * from yield_consents where portfolio_id=$1 and opted_out_at is null',[f.context.portfolioId])).rows.length,1);
+  assert.equal((await query('select * from yield_exit_requests where portfolio_id=$1',[f.context.portfolioId])).rows.length,0);
+});
+
+test('#104 pause/illiquidity/disabled execution and DB/RPC errors defer rebalance without sticky full exit or losing claims',async()=>{
+  const f=await rebalanceFixture(),p=f.read.positions[0];assert.ok(p);
+  const {createYieldService}=await import('../src/yield-service.js');let sends=0;
+  const overrides={profile:()=>f.read.profile,client:()=>f.client,read:async()=>structuredClone(f.read),canSend:()=>false,port:async()=>{sends++;throw new Error('unexpected send');}};
+  const before=(await query('select id from yield_position_snapshots where portfolio_id=$1',[f.context.portfolioId])).rows.length;
+  await locked(f.context.portfolioId,()=>createYieldService(overrides).tick(f.context,true,f.request));
+  assert.equal((await query('select id from yield_position_snapshots where portfolio_id=$1',[f.context.portfolioId])).rows.length,before,'dry-run does not persist or send');
+  const orphan=structuredClone(f.request),original=orphan.plan.snapshot.yieldPositions?.[0];assert.ok(original);original.blockHash=hash();
+  await assert.rejects(locked(f.context.portfolioId,()=>createYieldService(overrides).tick(f.context,false,orphan)));
+  for(const patch of [{maxRedeem:0n,maxWithdraw:0n},{withdrawPaused:true},{withdrawPaused:false,maxRedeem:50n*WAD,maxWithdraw:50n*WAD}]){
+    Object.assign(p,patch);assert.ok(await locked(f.context.portfolioId,()=>createYieldService(overrides).tick(f.context,false,f.request)));
+  }
+  await assert.rejects(locked(f.context.portfolioId,()=>createYieldService({...overrides,read:async()=>{throw new Error('SECRET_RPC_TIMEOUT');}}).tick(f.context,false,f.request)),(e:unknown)=>e instanceof Error&&!e.message.includes('SECRET'));
+  await assert.rejects(locked(f.context.portfolioId,()=>createYieldService({...overrides,query:async()=>{throw new Error('SECRET_DB_TIMEOUT');}}).tick(f.context,false,f.request)),(e:unknown)=>e instanceof Error&&!e.message.includes('SECRET'));
+  assert.equal(sends,0);
+  assert.deepEqual((await query<{receipt:string;exit_state:string}>('select receipt_raw::text as receipt,exit_state from yield_positions where portfolio_id=$1',[f.context.portfolioId])).rows[0],{receipt:(50n*WAD).toString(),exit_state:'none'});
+  assert.equal((await query('select * from yield_actions where portfolio_id=$1 and kind=\'withdraw\'',[f.context.portfolioId])).rows.length,0);
+});
+
+test('#104 reorg of a confirmed source freezes rebalance and keeps consent and its receipt claim',async()=>{
+  const f=await rebalanceFixture();f.state.blockHash=hash();
+  const {createYieldService}=await import('../src/yield-service.js');let sends=0;
+  const service=createYieldService({profile:()=>f.read.profile,client:()=>f.client,read:async()=>structuredClone(f.read),canSend:()=>true,port:async()=>{sends++;throw new Error('unexpected send');}});
+  await assert.rejects(locked(f.context.portfolioId,()=>service.tick(f.context,false,f.request)));
+  assert.equal(sends,0);
+  assert.equal((await query<{state:string}>('select state from yield_events where portfolio_id=$1',[f.context.portfolioId])).rows[0]?.state,'reorged');
+  assert.equal((await query<{receipt:string}>('select receipt_raw::text as receipt from yield_positions where portfolio_id=$1',[f.context.portfolioId])).rows[0]?.receipt,(50n*WAD).toString());
+});
+
+test('#104 monthly/drift pending survives a new service and suppresses re-supply until the persisted anchor / fresh drift clears',async()=>{
+  const {createYieldService}=await import('../src/yield-service.js');
+  const {yieldRebalancePlan}=await import('./fixtures/yield.js');
+  for(const mode of ['monthly','drift'] as const){
+    const f=await fixture(undefined,mode),plan=yieldRebalancePlan(f,f.context.portfolioId);assert.ok(plan.report);
+    const {buildSessionPermissions}=await import('../src/permissions.js');
+    const session=await buildSessionPermissions({publicClient:f.client,sessionKeyAddress:f.owner,executorAddress:f.read.profile.executor,
+      validUntil:Math.floor(Date.now()/1000)+86400,yieldAccount:f.account});
+    await query(`insert into session_keys(portfolio_id,key_ref,permissions,status,expires_at) values($1,$2,$3,'active',$4)`,
+      [f.context.portfolioId,`m/44'/60'/0'/0/${f.context.portfolioId}`,JSON.stringify(session.policySnapshot),session.expiresAt]);
+    f.state.proofSid=BigInt(f.strategyId)+84000000n;
+    const last=new Date(f.at);last.setUTCMonth(last.getUTCMonth()-1);
+    await query('update portfolios set last_rebalance_at=$2 where id=$1',[f.context.portfolioId,last]);
+    let sends=0;
+    const overrides={profile:()=>f.read.profile,client:()=>f.client,read:async()=>structuredClone(f.read),plan:async()=>plan,canSend:()=>true,
+      port:async()=>({reconcileYieldOperation:async()=>{throw new Error('unexpected recovery');},submitYieldAction:async(args:Parameters<import('../src/yield-port.js').YieldExecutionPort['submitYieldAction']>[0])=>{
+        sends++;assert.equal(args.action.kind,'supply');return {assets:args.action.amount,shares:args.action.amount,remainingReceipts:args.action.amount,txHash:hash(),userOpHash:hash(),gasUsed:1n};
+      }})};
+    plan.report.maxAbsDeltaBps=501;
+    assert.match(await locked(f.context.portfolioId,()=>createYieldService(overrides).tick(f.context,false))??'',/暫緩新供給/);
+    assert.equal(sends,0);
+    if(mode==='drift'){
+      await assert.rejects(locked(f.context.portfolioId,()=>createYieldService({...overrides,plan:async()=>{throw new Error('SECRET_RPC_TIMEOUT');}}).tick(f.context,false)),(e:unknown)=>e instanceof Error&&!e.message.includes('SECRET'));
+      assert.equal(sends,0);
+    }
+    await query('update portfolios set last_rebalance_at=$2 where id=$1',[f.context.portfolioId,f.at]);
+    plan.report.maxAbsDeltaBps=500;
+    await locked(f.context.portfolioId,()=>createYieldService(overrides).tick(f.context,false));
+    assert.equal(sends,1,'remaining consent and normal idle/cooldown/cap rules can supply again');
+  }
 });

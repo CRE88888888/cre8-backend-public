@@ -29,7 +29,11 @@ U=8000 bps 允許；8001 不供給；9000 開始退出。退出黏住至零，�
 
 供給需目前 owner consent、enrollment／version、逐資產市場選擇、U／容量、24 小時及 50 USDT 下限都通過。USDT 僅使用 allocated cash／已實收 yield；本次**保留全部 stack_prefund**，因此一定保留下一期本金及費用。unallocated hold、買入／費用／在途／待領款與未辨識款不得供給。非 USDT 用已持有的實際資產，不借用 USDT 現金桶。
 
-基金 monthly／drift 再平衡遇到仍有生息收據時，明確要求先停止並領回，避免將債權當作可賣出 underlying。新投入的買入流程仍依既有現金／期次帳執行。這兩項是本次保守取捨，不自動換市場、不預測可領時間。
+基金 monthly／drift 再平衡改由 scheduler 自動領回本批缺少的資產（backend#104）：先以同區塊債權投影詢問既有 planner，保留單筆限額、深度、交易時段與容量分批，再從批次 input 扣除實際可花餘額及前面賣出的保證 floor；USDT 同時保留最低費補差。投影不寫回 spendable holdings，也不作為餘額證明。只領回所需 nominal receipts（向上取整至能覆蓋缺口），不足時最多領回該資產全部部位；其他資產市場與剩餘收據不動，不建立全退 request、不撤銷 consent。新投入仍走既有現金／期次帳。
+
+一次只送一筆 BE-4 withdraw，使用既有 exit purpose／共用 gas 安全額度，無新送出管線。領回確認當輪不做賣買、不更新 last_rebalance_at；下一輪重新讀實際餘額、NAV 及市場狀態，再規劃既有再平衡。市場暫停／缺現金時保留債權及既有排程重試；可部分領回時先領目前可領量，缺口尚未備妥前整批不賣買。RPC／DB 失敗、送出／commit 未知仍由 0036／0040 原 execution key 與快照對帳，不重送；canonical 來源重組沿用永久 tombstone 凍結。純粹再平衡等待不寫入全退的 sticky exit_state。
+
+monthly 的持久化月份錨點或 drift 的新鮮 >500 bps 報告尚待完成時，yield round 暫緩新供給，避免重啟後把剛領回的 input 又存入。資料不完整也暫緩；完成或偏離回到 ≤500 後，剩餘同意、24 小時、50 USDT 與原風控規則繼續適用。保守取捨：領回與賣買分輪，等待期間價格可能改變，下一輪按新價格重算；planner 因買入額度／深度／時段而 blocked 時，先不領回。沒有預測可領時間、沒有替用戶墊付。
 
 領回採可對帳來源的 FIFO 收據成本，最後一份還原 raw 尾差。實收收益進 yield_raw；已配置現金仍回 allocated_cash。若已驗證的 canonical 贖回有損失，僅將實收本金按來源比例與最大餘數分配，不補造現金或負利息；原事件與來源足以重算損失。未知／缺歷史來源維持待對帳，不按餘額差自動造本金。
 

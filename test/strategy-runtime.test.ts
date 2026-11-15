@@ -67,3 +67,23 @@ test('#92 policy preserves buyAllowance raw units and converts only USD-E8 leg l
     await assert.rejects(deps.policy(due,plan,[asset]),(error:unknown)=>error instanceof Error&&!error.message.includes('credential'));
   }
 });
+
+test('#104 yield planning projects claim units once, prices missing direct assets and never changes the spendable snapshot',async()=>{
+  const U=10n**18n;
+  const {yieldFixture,yieldRebalancePlan}=await import('./fixtures/yield.js');
+  const f=yieldFixture(['venus']),p=f.read.positions[0];assert.ok(p);
+  f.state.claim=4n*U;
+  Object.assign(p,{receipt:2n*U,observedUnits:2n*U,trackedUnits:2n*U,claim:4n*U,value:4n*U});
+  const plan=yieldRebalancePlan(f,1,3n*U);
+  const deps=defaultNewMoneyDeps(()=>f.client,()=>f.executor,()=>f.registry,async()=>({rows:[]}),97);
+  const projected=await deps.yieldHoldings(plan);
+  assert.equal(projected.snapshot.holdings[0]?.amountWei,7n*U);
+  assert.equal(plan.snapshot.holdings[0]?.amountWei,3n*U);
+  plan.snapshot.holdings=[];
+  const missing=await deps.yieldHoldings(plan);assert.equal(missing.snapshot.holdings[0]?.amountWei,4n*U);
+  assert.equal(plan.snapshot.holdings.length,0);
+  p.claim=0n;assert.equal((await deps.yieldHoldings(plan)).snapshot.holdings.length,0);
+  p.claim=null;await assert.rejects(deps.yieldHoldings(plan));
+  p.claim=4n*U;p.state='unknown';await assert.rejects(deps.yieldHoldings(plan));
+  p.state='known';f.state.fail='eth_call';await assert.rejects(deps.yieldHoldings(plan));
+});

@@ -10,11 +10,12 @@ import { basketBatch, batchCountFor, maxBasketBatches, sumInputs, windowBasketBa
 import type { InputVector } from './new-money-plan.js';
 import { fundingLots, prepareStrategyJob, readJob } from './strategy-jobs.js';
 import type { FundingLot, JobContext, StrategyJob } from './strategy-jobs.js';
-import { minimumFeeReserve, quoteNewMoney, readBuyBudget, readMaxLegUsdE8, newMoneyDepthCap } from './rebalance-plan.js';
-import type { RebalancePlan } from './rebalance-plan.js';
+import { minimumFeeReserve, quoteNewMoney, readBuyBudget, readMaxLegUsdE8, newMoneyDepthCap, nominalSellQuote } from './rebalance-plan.js';
+import type { PlannedStep, RebalancePlan } from './rebalance-plan.js';
 import type { DuePortfolio, SchedulerQueryFn, WithTransactionFn } from './scheduler.js';
 import type { PortfolioPlan } from './snapshot.js';
 import { assetsMarketOpen } from './trading-calendar.js';
+import { yieldRebalanceDue } from './yield-rebalance.js';
 
 export type NewMoneyPolicy = { reserve: bigint; caps: Map<string,bigint|null>; buyLimit: bigint; cash: bigint };
 export type NewMoneyDeps = {
@@ -22,6 +23,8 @@ export type NewMoneyDeps = {
   policy: (due:DuePortfolio,plan:PortfolioPlan,assets:readonly string[])=>Promise<NewMoneyPolicy>;
   withdrawals: (due:DuePortfolio,plan:PortfolioPlan)=>Promise<CashWithdrawal[]>;
   rebalanceReserve: (plan:PortfolioPlan)=>Promise<bigint>;
+  yieldHoldings: (plan:PortfolioPlan)=>Promise<PortfolioPlan>;
+  withdrawYield: (due:DuePortfolio,plan:PortfolioPlan,reserve:bigint,steps:readonly PlannedStep[])=>Promise<string|null>;
   verifyLots: (lots:readonly FundingLot[])=>Promise<void>;
   quote: (due:DuePortfolio,plan:PortfolioPlan,inputs:InputVector,deadline:bigint)=>Promise<RebalancePlan>;
   marketOpen: (version:StrategyVersion,now:Date)=>boolean;
@@ -31,6 +34,26 @@ export function defaultNewMoneyDeps(client:()=>PublicClient,executor:()=>Address
     version:requireTypedVersion,
     withdrawals:(due,plan)=>readCashWithdrawals(client(),query,{chainId,portfolioId:due.portfolioId,account:due.account,cash:numeraireFor(chainId) as Address,blockNumber:plan.snapshot.block}),
     rebalanceReserve:plan=>minimumFeeReserve(client(),executor(),BigInt(plan.pinnedVersion.onchainStrategyId),plan.snapshot.block,plan.account,chainId===97),
+    yieldHoldings:async(plan)=>{
+      const holdings=plan.snapshot.holdings.map(h=>({...h}));
+      for(const p of plan.snapshot.yieldPositions??[]){
+        if(p.state!=='known'||p.claim===null)throw new Error('[YIELD_UNAVAILABLE] 生息債權未知');
+        if(p.claim===0n)continue;
+        const existing=holdings.find(h=>h.asset.toLowerCase()===p.market.asset);
+        if(existing){existing.amountWei+=p.claim;continue;}
+        const oracle=await client().readContract({address:executor(),abi:EXECUTOR_ABI,functionName:'oracle',blockNumber:plan.snapshot.block});
+        // Price absent direct holdings at the same block through the existing oracle ABI.
+        const usdPriceE8=p.market.asset===numeraireFor(chainId)?100000000n:await nominalSellQuote(client(),oracle,p.market.asset,
+          numeraireFor(chainId) as Address,10n**BigInt(p.underlyingDecimals),plan.snapshot.block)/10n**10n;
+        if(usdPriceE8<=0n)throw new Error('[YIELD_UNAVAILABLE] 生息標的價格未知');
+        holdings.push({asset:p.market.asset,amountWei:p.claim,decimals:p.underlyingDecimals,usdPriceE8,priceSource:'pancakeswap-v3'});
+      }
+      return {...plan,snapshot:{...plan.snapshot,holdings}};
+    },
+    withdrawYield:async(due,plan,reserve,steps)=>{
+      const {createYieldService}=await import('./yield-service.js');
+      return createYieldService().tick({chainId,portfolioId:due.portfolioId,account:due.account},false,{plan,reserve,steps});
+    },
     policy:async(due,plan,assets)=>{
       const publicClient=client(),blockNumber=plan.snapshot.block;
       const oracle=await publicClient.readContract({address:executor(),abi:EXECUTOR_ABI,functionName:'oracle',blockNumber});
@@ -115,11 +138,11 @@ export async function prepareNewMoney(args:{due:DuePortfolio;plan:PortfolioPlan;
     const balance=(await query('select unallocated_hold_raw::text,stack_prefund_raw::text,reserved_input_raw::text,reserved_fee_raw::text from strategy_cash_balances where chain_id=$1 and portfolio_id=$2',[chainId,due.portfolioId])).rows[0] as Record<string,string>|undefined;
     const waiting=balance&&Object.values(balance).some(n=>BigInt(n)>0n);
     const last=(await query("select coalesce(last_rebalance_at,(select min(created_at) from strategy_funding_lots where portfolio_id=$1 and state='confirmed')) as last_rebalance_at from portfolios where id=$1",[due.portfolioId])).rows[0] as {last_rebalance_at:Date|null}|undefined;
-    const monthly=version.execution.rebalance==='monthly'&&last?.last_rebalance_at!=null&&
-      (last.last_rebalance_at.getUTCFullYear()!==now.getUTCFullYear()||last.last_rebalance_at.getUTCMonth()!==now.getUTCMonth());
-    const drift=version.execution.rebalance==='drift'&&(plan.report?.maxAbsDeltaBps??0)>500;
-    if(!waiting&&(monthly||drift)&&plan.snapshot.yieldPositions?.some(p=>p.receipt===null||p.receipt>0n))return {job:null,context,rebalance:{kind:'blocked',reason:'[YIELD_WITHDRAW_REQUIRED] 基金再平衡須先停止生息並領回，收據債權不是可賣出餘額'}};
-    if(!waiting&&(monthly||drift)){context.reserve=await deps.rebalanceReserve(plan);return {job:null,context,useTargetWeights:true,rebalance:{kind:'noop',reason:'全hold基金設定再平衡'}};}
+    const dueRebalance=yieldRebalanceDue(version.execution.rebalance,last?.last_rebalance_at??null,plan.report?.maxAbsDeltaBps??null,now);
+    if(!waiting&&dueRebalance){
+      context.reserve=await deps.rebalanceReserve(plan);
+      return {job:null,context,useTargetWeights:true,rebalance:{kind:'noop',reason:'全hold基金設定再平衡'}};
+    }
   }
   if(!job||job.state==='completed'||job.state==='paused'||!context.enabled||!(context.marketOpenFor?.(Object.keys(job.remaining_input))??context.marketOpen)||job.next_check_at>now){
     return {job,context,rebalance:{kind:'noop',reason:prepared.reason}};

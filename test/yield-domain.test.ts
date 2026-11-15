@@ -60,3 +60,50 @@ test('unsettled supply cash differences remain unknown before/after mining and n
   assert.deepEqual(cashDifference(-1n,false),{unclassifiedRaw:null,deficitRaw:'1',reconciliationPending:false});
   assert.deepEqual(cashDifference(1n,false),{unclassifiedRaw:'1',deficitRaw:'0',reconciliationPending:false});
 });
+
+test('#104 capped sell deficits redeem only needed nominal receipts, including zero/equality/uint256 and protocol rounding',async()=>{
+  const {rebalanceWithdrawals}=await import('../src/yield-rebalance.js');
+  const {yieldFixture,yieldRebalancePlan,address}=await import('./fixtures/yield.js');
+  for(const protocol of ['venus','lista','aave_v3'] as const){
+    const f=yieldFixture([protocol]),p=f.read.positions[0];assert.ok(p);
+    Object.assign(p,{receipt:100n,observedUnits:100n,trackedUnits:100n,claim:200n,value:200n,rate:2n*WAD,scale:WAD,maxWithdraw:200n,maxRedeem:100n});
+    const cash=address(),plan=yieldRebalancePlan(f,1,10n);
+    const step={tokenIn:f.asset,tokenOut:cash,amountIn:30n,amountOutMin:1n,oracleFloor:1n,venue:address(),data:'0x' as const};
+    assert.deepEqual(rebalanceWithdrawals(plan,f.read.positions,[step],cash,0n,f.at),[{marketId:p.market.marketId,amount:protocol==='aave_v3'?20n:10n,blocked:false}]);
+    assert.deepEqual(rebalanceWithdrawals(plan,f.read.positions,[{...step,amountIn:10n}],cash,0n,f.at),[]);
+    assert.deepEqual(rebalanceWithdrawals(plan,f.read.positions,[],cash,0n,f.at),[]);
+    assert.equal(rebalanceWithdrawals(plan,f.read.positions,[{...step,amountIn:31n}],cash,0n,f.at)[0]?.amount,protocol==='aave_v3'?21n:11n);
+    assert.equal(rebalanceWithdrawals(plan,f.read.positions,[{...step,amountIn:UINT256_MAX}],cash,0n,f.at)[0]?.amount,100n,'insufficient position redeems all its receipts');
+  }
+});
+
+test('#104 market cash shortage/pause is pending; unknown, stale, reorg block and missing units cannot become zero',async()=>{
+  const {rebalanceWithdrawals}=await import('../src/yield-rebalance.js');
+  const {yieldFixture,yieldRebalancePlan,address}=await import('./fixtures/yield.js');
+  const f=yieldFixture(['venus']),p=f.read.positions[0];assert.ok(p);
+  Object.assign(p,{receipt:100n,observedUnits:100n,trackedUnits:100n,claim:100n,value:100n,maxWithdraw:20n,maxRedeem:20n});
+  const plan=yieldRebalancePlan(f),cash=address(),step={tokenIn:f.asset,tokenOut:cash,amountIn:30n,amountOutMin:1n,oracleFloor:1n,venue:address(),data:'0x' as const};
+  assert.equal(rebalanceWithdrawals(plan,f.read.positions,[step],cash,0n,f.at)[0]?.amount,20n);
+  for(const patch of [{maxRedeem:0n},{withdrawPaused:true}])assert.equal(rebalanceWithdrawals(plan,[{...p,...patch}],[step],cash,0n,f.at)[0]?.blocked,true);
+  for(const patch of [{state:'unknown' as const},{receipt:null},{trackedUnits:null},{rate:0n},{block:99n},{at:new Date(+f.at-60001)}])assert.throws(()=>rebalanceWithdrawals(plan,[{...p,...patch}],[step],cash,0n,f.at));
+});
+
+test('#104 sequential sell floors fund buys, retain the fee top-up and do not touch unrelated markets',async()=>{
+  const {rebalanceWithdrawals,yieldRebalanceDue}=await import('../src/yield-rebalance.js');
+  const {yieldFixture,yieldRebalancePlan,address,hash}=await import('./fixtures/yield.js');
+  const f=yieldFixture(['aave_v3']),p=f.read.positions[0];assert.ok(p);
+  Object.assign(p,{receipt:100n,observedUnits:100n,trackedUnits:100n,claim:100n,value:100n,maxWithdraw:100n,maxRedeem:100n});
+  const other=address(),out=address(),plan=yieldRebalancePlan(f);
+  f.read.positions.push({...p,market:{...p.market,asset:out,marketId:hash()}});
+  plan.snapshot.holdings.push({asset:other,amountWei:50n,decimals:18,usdPriceE8:100000000n,priceSource:'numeraire'});
+  const base={amountOutMin:50n,oracleFloor:50n,venue:address(),data:'0x' as const};
+  const sell={...base,tokenIn:other,tokenOut:f.asset,amountIn:50n};
+  const buy={...base,tokenIn:f.asset,tokenOut:out,amountIn:60n};
+  assert.deepEqual(rebalanceWithdrawals(plan,f.read.positions,[sell,buy],f.asset,3n,f.at),[{marketId:p.market.marketId,amount:13n,blocked:false}]);
+  const now=new Date('2026-12-01T00:00:00Z'),last=new Date('2026-11-30T23:59:59Z');
+  assert.equal(yieldRebalanceDue('monthly',last,0,now),true);
+  assert.equal(yieldRebalanceDue('monthly',now,9000,now),false);
+  assert.equal(yieldRebalanceDue('drift',last,500,now),false);
+  assert.equal(yieldRebalanceDue('drift',last,501,now),true);
+  assert.equal(yieldRebalanceDue('none',last,9000,now),false);
+});

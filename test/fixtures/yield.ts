@@ -4,6 +4,9 @@ import type { Address, Hex } from 'viem';
 import type { YieldProfile, YieldRead, YieldPosition, YieldProtocol } from '../../src/yield-domain.js';
 import type { YieldReaderDeps } from '../../src/yield-reader.js';
 import { WAD, RAY, UINT256_MAX } from '../../src/yield-domain.js';
+import type { PortfolioPlan } from '../../src/snapshot.js';
+import { valuationHoldings } from '../../src/snapshot.js';
+import { computeDrift } from '../../src/drift.js';
 export const address=():Address=>`0x${randomBytes(20).toString('hex')}`;
 export const hash=():Hex=>`0x${randomBytes(32).toString('hex')}`;
 export function yieldFixture(protocols:YieldProtocol[]=['venus','lista','aave_v3']){
@@ -15,7 +18,7 @@ export function yieldFixture(protocols:YieldProtocol[]=['venus','lista','aave_v3
     rate:m.protocol==='aave_v3'?RAY:WAD,scale:m.protocol==='aave_v3'?RAY:WAD,aprBps:500n,supplyOpen:true,exiting:false,underlyingDecimals:18,receiptDecimals:m.protocol==='aave_v3'?18:8}));
   const read:YieldRead={profile,observation,positions,accountValue:1000n*WAD,risks:profile.markets.map(m=>({...observation,key:`${m.protocol}:${riskSource}:${asset}`,protocol:m.protocol,asset,riskSource,underlyingMarketId:null,
     configuration:blockHash,state:'known',reason:null,supply:10_000_000n*WAD,liquidity:10_000_000n*WAD,exposure:0n,externalReserved:0n,headroom:1_000_000n*WAD,utilizationBps:0}))};
-  const state={fail:'',chainId:97,blockHash,at,receipt:10n*10n**8n,units:10n*10n**8n,tracked:10n*10n**8n,rate:WAD,claim:10n*10n**8n,utilization:8000n,reads:[] as string[],nav:1000n*WAD,paused:false,withdrawPaused:false,reserved:7n,registryCode:'0x6000' as Hex,proofHash:hash(),proofAccount:account,proofMarket:profile.markets[0]?.marketId??hash(),proofSid:1n,proofVersion:1,proofEnabled:true,proofDaily:UINT256_MAX,proofKind:'policy',proofRemoved:false,proofDuplicate:false,proofSuccess:true};
+  const state={fail:'',chainId:97,blockHash,at,receipt:10n*10n**8n,units:10n*10n**8n,tracked:10n*10n**8n,rate:WAD,claim:10n*10n**8n,utilization:8000n,reads:[] as string[],nav:1000n*WAD,paused:false,withdrawPaused:false,reserved:7n,registryCode:'0x6000' as Hex,proofHash:hash(),proofAccount:account,proofMarket:profile.markets[0]?.marketId??hash(),proofSid:1n,proofVersion:1,proofEnabled:true,proofDaily:UINT256_MAX,proofKind:'policy',proofAssets:0n,proofShares:0n,proofRemaining:0n,proofRemoved:false,proofDuplicate:false,proofSuccess:true};
   const client=createPublicClient({transport:custom({request:async({method,params})=>{
     if(state.fail===method)throw new Error('SECRET_RPC_KEY');
     if(method==='eth_getCode')return state.registryCode;
@@ -27,6 +30,7 @@ export function yieldFixture(protocols:YieldProtocol[]=['venus','lista','aave_v3
       if(data.startsWith(toFunctionSelector('registry()')))return encodeAbiParameters([{type:'address'}],[registry]);
       if(data.startsWith(toFunctionSelector('numeraire()')))return encodeAbiParameters([{type:'address'}],[asset]);
       if(data.startsWith(toFunctionSelector('oracle()')))return encodeAbiParameters([{type:'address'}],[oracle]);
+      if(data.startsWith(toFunctionSelector('previewSwap(address,address,uint256)')))return encodeAbiParameters([{type:'uint256'},{type:'uint256'}],[state.claim,state.claim]);
       if(data.startsWith(toFunctionSelector('enrollments(address)')))return encodeAbiParameters([{type:'uint256'},{type:'uint16'},{type:'bool'}],[state.proofSid,state.proofVersion,false]);
       if(data.startsWith(toFunctionSelector('policies(address,bytes32)')))return encodeAbiParameters([{type:'uint256'},{type:'uint256'},{type:'uint16'},{type:'bool'}],[state.proofDaily,state.proofSid,state.proofVersion,state.proofEnabled]);
       if(data.startsWith(toFunctionSelector('exiting(address,bytes32)')))return encodeAbiParameters([{type:'bool'}],[true]);
@@ -34,9 +38,10 @@ export function yieldFixture(protocols:YieldProtocol[]=['venus','lista','aave_v3
       if(data.startsWith(toFunctionSelector('lastSupply(address,address)')))return encodeAbiParameters([{type:'uint256'}],[0n]);
     }
     if(method==='eth_getTransactionReceipt'){
-      const log={address:registry,blockHash:state.blockHash,blockNumber:toHex(block),transactionHash:state.proofHash,transactionIndex:'0x0',logIndex:'0x0',removed:state.proofRemoved,
-        topics:[toEventSelector(state.proofKind==='exit'?'YieldExitRequested(address,bytes32)':'YieldPolicySet(address,bytes32,uint256,uint256,uint16,bool)'),encodeAbiParameters([{type:'address'}],[state.proofAccount]),state.proofMarket],
-        data:state.proofKind==='exit'?'0x':encodeAbiParameters([{type:'uint256'},{type:'uint256'},{type:'uint16'},{type:'bool'}],[state.proofDaily,state.proofSid,state.proofVersion,state.proofEnabled])};
+      const business=state.proofKind==='withdraw';
+      const log={address:business?executor:registry,blockHash:state.blockHash,blockNumber:toHex(block),transactionHash:state.proofHash,transactionIndex:'0x0',logIndex:business?'0x1':'0x0',removed:state.proofRemoved,
+        topics:[toEventSelector(business?'WithdrawExecuted(address,bytes32,uint256,uint256,uint256)':state.proofKind==='exit'?'YieldExitRequested(address,bytes32)':'YieldPolicySet(address,bytes32,uint256,uint256,uint16,bool)'),encodeAbiParameters([{type:'address'}],[state.proofAccount]),state.proofMarket],
+        data:business?encodeAbiParameters([{type:'uint256'},{type:'uint256'},{type:'uint256'}],[state.proofAssets,state.proofShares,state.proofRemaining]):state.proofKind==='exit'?'0x':encodeAbiParameters([{type:'uint256'},{type:'uint256'},{type:'uint16'},{type:'bool'}],[state.proofDaily,state.proofSid,state.proofVersion,state.proofEnabled])};
       return{transactionHash:state.proofHash,transactionIndex:'0x0',blockHash:state.blockHash,blockNumber:toHex(block),from:account,to:registry,gasUsed:'0x100',cumulativeGasUsed:'0x100',effectiveGasPrice:'0x1',type:'0x2',status:state.proofSuccess?'0x1':'0x0',contractAddress:null,logsBloom:`0x${'0'.repeat(512)}`,logs:state.proofDuplicate?[log,log]:[log]};
     }
     throw new Error('unexpected RPC');
@@ -69,4 +74,12 @@ export function yieldFixture(protocols:YieldProtocol[]=['venus','lista','aave_v3
     });
   };
   return{profile,account,asset,read,state,client,batch,at,blockHash,executor,registry,riskSource};
+}
+
+export function yieldRebalancePlan(f:ReturnType<typeof yieldFixture>,portfolioId=1,direct=0n):PortfolioPlan{
+  const snapshot={portfolioId,block:f.read.observation.block,nativeBalanceWei:0n,holdings:direct===0n?[]:[{asset:f.asset,amountWei:direct,decimals:18,usdPriceE8:100000000n,priceSource:'numeraire' as const}],unpriced:[],yieldPositions:f.read.positions};
+  const targets=[{asset:f.asset,weightBps:10000,symbol:'USDT'}];
+  return {portfolioId,strategyId:1,chainId:97,account:f.account,snapshot,targets,report:computeDrift(valuationHoldings(snapshot),targets,100),blocked:[],
+    scan:{portfolioId,block:snapshot.block,cursor:{portfolioId,startBlock:1n,lastScannedBlock:snapshot.block},scannedRange:null,candidateCount:0,unknownHoldings:[],zeroBalanceCount:0,unreadableCandidates:[],deployment:{block:1n,reason:'resolved',detail:'test'},universeComplete:true,incompleteReasons:[]},
+    pinnedVersion:{version:1,onchainStrategyId:1,paused:false},allocationCheck:{consistent:true,chain:[],mismatches:[]},thresholdBps:100};
 }

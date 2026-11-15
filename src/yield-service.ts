@@ -15,6 +15,10 @@ import type { YieldExecutionPort, YieldPrepare } from './yield-port.js';
 import type { Reservation, PaymasterDeps } from './paymaster.js';
 import type { SessionKeyRef } from './scheduler.js';
 import { resolveBundlerUrl } from './renewal.js';
+import { planPortfolio } from './snapshot.js';
+import type { PortfolioPlan } from './snapshot.js';
+import type { PlannedStep } from './rebalance-plan.js';
+import { rebalanceWithdrawals, yieldRebalanceDue } from './yield-rebalance.js';
 
 const POLICY = parseAbi([
   'event YieldPolicySet(address indexed account,bytes32 indexed marketId,uint256 dailyAssets,uint256 strategyId,uint16 version,bool enabled)',
@@ -31,9 +35,9 @@ const POLICY = parseAbi([
   'event WithdrawExecuted(address indexed account,bytes32 indexed marketId,uint256 shares,uint256 assets,uint256 remainingReceipts)',
 ]);
 export type YieldServiceDeps = YieldStoreDeps & { lock:typeof withPortfolioLock; owned:typeof requireOwnedPortfolio;
-  profile:()=>YieldProfile|null; client:()=>PublicClient; read:typeof readYieldAccount; now:()=>Date; port:()=>Promise<YieldExecutionPort>; canSend:()=>boolean };
+  profile:()=>YieldProfile|null; client:()=>PublicClient; read:typeof readYieldAccount; plan:typeof planPortfolio; now:()=>Date; port:()=>Promise<YieldExecutionPort>; canSend:()=>boolean };
 const defaults:YieldServiceDeps={query,transaction:withTransaction,lock:withPortfolioLock,owned:requireOwnedPortfolio,profile:()=>configuredChainId()===97?yieldProfile():null,client:()=>getChain().publicClient,
-  read:readYieldAccount,now:()=>new Date(),port:yieldExecutionPort,canSend:()=>process.env.ENABLE_YIELD_EXECUTION==='1'};
+  read:readYieldAccount,plan:planPortfolio,now:()=>new Date(),port:yieldExecutionPort,canSend:()=>process.env.ENABLE_YIELD_EXECUTION==='1'};
 function body(value:unknown,profile:YieldProfile):{markets:Hex[];txHash:Hex}{
   if(!value||typeof value!=='object'||Array.isArray(value))throw new ValidationError('INVALID_YIELD_REQUEST','需要 markets 與 txHash');
   const v=object(value);
@@ -170,7 +174,7 @@ export function createYieldService(overrides:Partial<YieldServiceDeps>={}){
     consent:(id:number,wallet:string,value:unknown)=>request(id,wallet,value,'consent'),
     revoke:(id:number,wallet:string,value:unknown)=>request(id,wallet,value,'revoke'),
     exit:(id:number,wallet:string,value:unknown)=>request(id,wallet,value,'exit'),
-    tick:(p:YieldAccount,dryRun:boolean)=>safe(async()=>{
+    tick:(p:YieldAccount,dryRun:boolean,rebalance?:{plan:PortfolioPlan;reserve:bigint;steps:readonly PlannedStep[]})=>safe(async()=>{
       const f=profile(),client=deps.client();
       await verifyHistory(p,!dryRun);
       const unresolved=(await deps.query<{execution_key:string}>('select execution_key from yield_actions where chain_id=$1 and portfolio_id=$2 and state in (\'reserved\',\'submitted\',\'unknown\')',[p.chainId,p.portfolioId])).rows;
@@ -207,12 +211,23 @@ export function createYieldService(overrides:Partial<YieldServiceDeps>={}){
         }catch{await journal.unknown(key);return '生息原操作證據不足，保留 unknown，不重送';}
       }
       if((await deps.query(`select id from operations where portfolio_id=$1 and (state in ('pending','submitted') or (state='failed' and (tx_hash is not null or user_op_hash is not null)))`,[p.portfolioId])).rows.length)return '其他帳戶操作待對帳';
-      const state=await read(p).catch(async()=>{
-        if(!dryRun)await deps.transaction(async db=>{await yieldLocks(db,p);await db.query("update yield_positions set exit_state='retry',exit_reason='data_unavailable',next_retry_at=clock_timestamp()+interval '30 seconds',updated_at=clock_timestamp() where chain_id=$1 and portfolio_id=$2 and (receipt_raw>0 or tracked_units_raw>0)",[p.chainId,p.portfolioId]);});
+      const state=await read(p,rebalance?.plan.snapshot.block).catch(async()=>{
+        if(!dryRun&&rebalance===undefined)await deps.transaction(async db=>{await yieldLocks(db,p);await db.query("update yield_positions set exit_state='retry',exit_reason='data_unavailable',next_retry_at=clock_timestamp()+interval '30 seconds',updated_at=clock_timestamp() where chain_id=$1 and portfolio_id=$2 and (receipt_raw>0 or tracked_units_raw>0)",[p.chainId,p.portfolioId]);});
         throw unavailable();
       });
       if(dryRun)return '生息讀值完成（dry-run，未寫入／送出）';
       await persistYieldRead(p,state,store);
+      if(rebalance!==undefined){
+        if(rebalance.plan.portfolioId!==p.portfolioId||rebalance.plan.account.toLowerCase()!==p.account||rebalance.plan.chainId!==p.chainId||
+          state.observation.block!==rebalance.plan.snapshot.block||!fresh(state.observation.at,deps.now()))throw unavailable();
+        if(rebalance.plan.snapshot.yieldPositions?.some(s=>s.blockHash!==state.observation.blockHash))throw unavailable();
+        const needs=rebalanceWithdrawals(rebalance.plan,state.positions,rebalance.steps,cashAsset,rebalance.reserve,deps.now());
+        if(!needs.length)return null;
+        const next=needs.find(n=>!n.blocked);
+        if(!next)return '生息市場暫停或現金不足，保留再平衡，下輪重試';
+        const result=await send(next.marketId,'withdraw',next.amount);
+        return `${result}；本輪不賣買，重新讀值後續作再平衡`;
+      }
       const exits=(await deps.query<{id:string;requested_at:Date}>('select id::text,requested_at from yield_exit_requests where chain_id=$1 and portfolio_id=$2 and state<>\'completed\'',[p.chainId,p.portfolioId])).rows;
       const existing=(await deps.query<{market_id:Hex;exit_state:string}>('select market_id,exit_state from yield_positions where chain_id=$1 and portfolio_id=$2',[p.chainId,p.portfolioId])).rows;
       for(const s of state.positions){
@@ -240,6 +255,13 @@ export function createYieldService(overrides:Partial<YieldServiceDeps>={}){
       const current=(await deps.query<{strategy_id:string;onchain_id:string|null;version:number;schedule_state:string;execution:unknown}>(`select p.strategy_id::text,(select onchain_id::text from strategies where id=p.strategy_id) as onchain_id,p.version,p.schedule_state,v.execution from portfolios p join strategy_versions v on (v.strategy_id,v.version)=(p.strategy_id,p.version) where p.id=$1`,[p.portfolioId])).rows[0];
       if(!current||!current.onchain_id||current.schedule_state!=='active')return '帳戶停止新供給';
       const execution=object(current.execution);if(execution.kind!=='per_asset'||!Array.isArray(execution.assets))return '此版本未選生息市場';
+      // Persisted monthly anchor / fresh drift survive restarts. Do not re-supply redeemed inputs before the swap round.
+      if(execution.rebalance==='monthly'||execution.rebalance==='drift'){
+        const last=(await deps.query<{last_rebalance_at:Date|null}>("select coalesce(last_rebalance_at,(select min(created_at) from strategy_funding_lots where portfolio_id=$1 and state='confirmed')) as last_rebalance_at from portfolios where id=$1",[p.portfolioId])).rows[0];
+        if(!last)throw unavailable();
+        const plan=execution.rebalance==='drift'?await deps.plan(p.portfolioId,{publicClient:client}):null;
+        if((plan!==null&&(plan.blocked.length>0||plan.report===null))||yieldRebalanceDue(execution.rebalance,last.last_rebalance_at,plan?.report?.maxAbsDeltaBps??null,deps.now()))return '再平衡尚待完成，暫緩新供給';
+      }
       for(const selected of execution.assets){
         const setting=object(selected);if(setting.yield===null)continue;const choice=object(setting.yield);
         const s=state.positions.find(s=>s.market.id===choice.market&&s.market.asset===setting.asset);if(!s||s.state!=='known'||!s.supplyOpen)continue;

@@ -2307,7 +2307,10 @@ async function decideAndMaybeExecute(
 
   const money = due.executionKind === undefined || ctx.forcePlan === true ? null : await prepareNewMoney({due,plan,query:ctx.deps.query,
     run:ctx.deps.withTransaction,chainId:ctx.deps.chainId,now:ctx.now,dryRun:ctx.dryRun,deps:ctx.deps.newMoney});
-  let rebalance = (money?.useTargetWeights?null:money?.rebalance) ?? await ctx.deps.planRebalance({ portfolioId: due.portfolioId, account: due.account, plan,
+  const yieldRebalance=money?.useTargetWeights===true&&plan.snapshot.yieldPositions?.some(p=>p.receipt===null||p.receipt>0n)===true;
+  // This projection is only for quoting capped inputs. Actual balances remain authoritative for withdrawal and execution.
+  const quotePlan=yieldRebalance?await ctx.deps.newMoney.yieldHoldings(plan):plan;
+  let rebalance = (money?.useTargetWeights?null:money?.rebalance) ?? await ctx.deps.planRebalance({ portfolioId: due.portfolioId, account: due.account, plan:quotePlan,
     ...(money?.useTargetWeights?{inclusiveFeeReserveRaw:money.context.reserve}:{}) });
   if (rebalance.kind === 'noop') {
     return { ...base, outcome: 'noop', ...(money?.useTargetWeights&&plan.report.maxAbsDeltaBps<=plan.report.thresholdBps?{rebalanceComplete:true}:{}), reason: `Planner returned noop: ${rebalance.reason}` };
@@ -2346,6 +2349,10 @@ async function decideAndMaybeExecute(
   if(rebalance.steps.length>limit)rebalance={...rebalance,steps:rebalance.steps.slice(0,limit),
     partial:{...rebalance.partial,remainingDriftBps:null,shrunk:rebalance.partial?.shrunk??[],maxLegBatched:true},rationale:rebalance.rationale+'；交易容量分批，剩餘依下一輪持倉續作'};
   if(!assetsMarketOpen(ctx.deps.chainId,rebalance.steps.flatMap(step=>[step.tokenIn,step.tokenOut]),ctx.now))return {...base,outcome:'blocked',reason:'[MARKET_CLOSED] 股票休市，等待交易時段'};
+  if(yieldRebalance){
+    const pending=await ctx.deps.newMoney.withdrawYield(due,plan,money.context.reserve,rebalance.steps);
+    if(pending!==null)return {...base,outcome:'blocked',reason:`[YIELD_REBALANCE_PENDING] ${pending}`};
+  }
   const gasPurpose = rebalance.purpose ?? 'ordinary';
   const cash = ctx.deps.chainId === 97 ? TESTNET_97.contracts.usdt : '0x55d398326f99059ff775485246999027b3197955';
   const hasBuy = rebalance.steps.some((step) => !isAddressEqual(step.tokenOut, cash));

@@ -6,6 +6,7 @@ import { closePool, migrate, query, withTransaction, withPortfolioLock } from '.
 import { persistYieldRead, syncYieldCatalog, createYieldJournal, restoreYieldOperation } from '../src/yield-store.js';
 import type { JournalContext, SnapshotRow, SettlementRead } from '../src/yield-store.js';
 import { WAD, UINT256_MAX } from '../src/yield-domain.js';
+import { AppError } from '../src/errors.js';
 import type { YieldRead } from '../src/yield-domain.js';
 import type { YieldPlan, YieldPrepare, YieldEvidence } from '../src/yield-port.js';
 import { gasExecutionKey } from '../src/paymaster.js';
@@ -166,6 +167,76 @@ test('BE84 owner policy proof binds chain, account, market and enrollment; revok
   assert.equal(first.requestId,second.requestId);assert.equal(second.replayed,true);
   for(const patch of [{proofRemoved:true},{proofDuplicate:true},{proofSuccess:false},{proofAccount:address()}]){
     const old={...f.state};Object.assign(f.state,patch);await assert.rejects(service.exit(f.context.portfolioId,f.owner,input()));Object.assign(f.state,old);
+  }
+});
+
+test('#105 consented survives receipt boundaries and changes only with current enrollment owner consent',async()=>{
+  const f=await fixture();
+  const {createYieldService}=await import('../src/yield-service.js');
+  const {requireOwnedPortfolio}=await import('../src/portfolios.js');
+  const service=createYieldService({profile:()=>f.read.profile,read:async()=>structuredClone(f.read),client:()=>f.client,
+    owned:(id,wallet)=>requireOwnedPortfolio(id,wallet,{chainId:97})});
+  const p=f.read.positions[0];assert.ok(p);
+  const current=async()=>{const status=await service.status(f.context.portfolioId,f.owner);assert.ok(status);const asset=status.assets[0];assert.ok(asset);return asset;};
+  assert.equal((await current()).consented,true);
+  for(const receipt of [1n,UINT256_MAX]){
+    Object.assign(p,{receipt,observedUnits:receipt,trackedUnits:receipt,claim:receipt,value:receipt,maxWithdraw:receipt,maxRedeem:receipt});
+    const asset=await current();assert.equal(asset.consented,true);assert.equal(asset.state,'supplied');assert.equal(asset.receiptValue,receipt.toString());
+  }
+  const receipt=50n*WAD;
+  Object.assign(p,{receipt,observedUnits:receipt,trackedUnits:receipt,claim:receipt,value:receipt,maxWithdraw:receipt,maxRedeem:receipt});
+  f.state.proofSid=BigInt(f.strategyId)+84000000n;f.state.proofEnabled=false;
+  const input=()=>({markets:[f.market.id],txHash:f.state.proofHash});
+  await service.revoke(f.context.portfolioId,f.owner,input());
+  const revoked=await current();assert.equal(revoked.consented,false);assert.equal(revoked.state,'supplied');assert.equal(revoked.receiptValue,receipt.toString());assert.equal(revoked.pending,null);
+  f.state.proofHash=hash();f.state.proofEnabled=true;
+  await service.consent(f.context.portfolioId,f.owner,input());
+  const consented=await current();assert.equal(consented.consented,true);assert.equal(consented.state,'supplied');
+  f.state.proofHash=hash();f.state.proofKind='exit';
+  await service.exit(f.context.portfolioId,f.owner,input());
+  const exiting=await current();assert.equal(exiting.consented,false);assert.equal(exiting.state,'exiting');assert.equal(exiting.receiptValue,receipt.toString());
+  const at=new Date();
+  Object.assign(p,{receipt:0n,observedUnits:0n,trackedUnits:0n,claim:0n,value:0n,maxWithdraw:0n,maxRedeem:0n,at});
+  f.read.observation.at=at;f.read.risks=f.read.risks.map(r=>({...r,at}));
+  await locked(f.context.portfolioId,()=>service.tick(f.context,false));
+  const stopped=await current();assert.equal(stopped.consented,false);assert.equal(stopped.state,'stopped');assert.equal(stopped.receiptValue,'0');
+  f.state.proofHash=hash();f.state.proofKind='policy';
+  await service.consent(f.context.portfolioId,f.owner,input());
+  const restarted=await current();assert.equal(restarted.consented,true);assert.equal(restarted.state,'cash');
+});
+
+test('#105 consented excludes old enrollment versions and absent consent even with zero receipts',async()=>{
+  const f=await fixture();
+  const {createYieldService}=await import('../src/yield-service.js');
+  const {requireOwnedPortfolio}=await import('../src/portfolios.js');
+  const service=createYieldService({profile:()=>f.read.profile,read:async()=>structuredClone(f.read),client:()=>f.client,
+    owned:(id,wallet)=>requireOwnedPortfolio(id,wallet,{chainId:97})});
+  await query(`insert into strategy_versions(strategy_id,version,allocation,schedule,active_at,execution_schema_version,execution,execution_chain_id,config_hash)
+    select strategy_id,2,allocation,schedule,active_at,execution_schema_version,execution,execution_chain_id,config_hash from strategy_versions where strategy_id=$1 and version=1`,[f.strategyId]);
+  await query('update portfolios set version=2 where id=$1',[f.context.portfolioId]);
+  const status=await service.status(f.context.portfolioId,f.owner);assert.ok(status);
+  assert.equal(status.assets[0]?.consented,false);assert.equal(status.assets[0]?.state,'not_consented');assert.equal(status.assets[0]?.receiptValue,'0');
+  await query('update portfolios set version=1 where id=$1',[f.context.portfolioId]);
+  assert.equal((await service.status(f.context.portfolioId,f.owner))?.assets[0]?.consented,true);
+  await query('update yield_consents set opted_out_at=clock_timestamp(),updated_at=clock_timestamp() where portfolio_id=$1',[f.context.portfolioId]);
+  assert.equal((await service.status(f.context.portfolioId,f.owner))?.assets[0]?.consented,false);
+});
+
+test('#105 valuation gaps preserve consent; DB/RPC failures and timeouts cannot serialize false consent or leak details',async()=>{
+  const f=await fixture();
+  const {createYieldService}=await import('../src/yield-service.js');
+  const {requireOwnedPortfolio}=await import('../src/portfolios.js');
+  const deps={profile:()=>f.read.profile,read:async()=>structuredClone(f.read),client:()=>f.client,
+    owned:(id:number,wallet:string)=>requireOwnedPortfolio(id,wallet,{chainId:97})};
+  const p=f.read.positions[0];assert.ok(p);Object.assign(p,{state:'unknown',receipt:null,claim:null,value:null});
+  const unknown=await createYieldService(deps).status(f.context.portfolioId,f.owner);assert.ok(unknown);
+  assert.equal(unknown.assets[0]?.consented,true);assert.equal(unknown.assets[0]?.receiptValue,null);assert.equal(unknown.assets[0]?.valuationState,'unknown');
+  for(const message of ['SECRET_DB_CONNECTION','SECRET_RPC_ENDPOINT','SECRET_RPC_TIMEOUT']){
+    const fail=async()=>{throw new Error(message);};
+    const service=createYieldService({...deps,...(message==='SECRET_DB_CONNECTION'?{query:fail}:{read:fail})});
+    await assert.rejects(service.status(f.context.portfolioId,f.owner),error=>{
+      assert.ok(error instanceof AppError);assert.equal(error.status,503);assert.equal(error.code,'YIELD_UNAVAILABLE');assert.doesNotMatch(error.message,/SECRET/);return true;
+    });
   }
 });
 

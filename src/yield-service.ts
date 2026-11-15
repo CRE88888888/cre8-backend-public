@@ -165,9 +165,10 @@ export function createYieldService(overrides:Partial<YieldServiceDeps>={}){
       const keys=await keyRows(id),permissions=await Promise.all(keys.map(k=>permission(k.permissions,a.account,f.executor)));
       return {permission:permissions.includes('ok')?'ok':'needs_update',accountValue:frozen||state.positions.some(s=>s.state==='unknown'||s.value===null)?null:state.accountValue?.toString()??null,assets:state.positions.filter(s=>choices.includes(s.market.id)||s.receipt!==null&&s.receipt>0n||rows.rows.some(p=>p.market_id===s.market.marketId&&raw(p.receipt_raw)>0n)||consents.rows.some(c=>c.market_id===s.market.marketId)).map(s=>{
         const prior=rows.rows.find(r=>r.market_id===s.market.marketId),risk=state.risks.filter(r=>r.protocol===s.market.protocol&&r.asset===s.market.asset);
+        const consented=consents.rows.some(c=>c.market_id===s.market.marketId);
         const exiting=(frozen||s.receipt===null||s.receipt>0n||prior?.exit_state==='exiting'||prior?.exit_state==='retry')&&(frozen||mustExit(s,risk,prior?.exit_state==='exiting'||prior?.exit_state==='retry',deps.now()));
         const reason=frozen||s.state==='unknown'?'unknown':s.withdrawPaused?'market_paused':risk.some(r=>r.utilizationBps!==null&&r.utilizationBps>=9000)?'high_utilization':s.claim!==null&&s.maxWithdraw!==null&&s.maxWithdraw<s.claim?'low_liquidity':'unknown';
-        return {asset:s.market.asset,symbol:s.market.symbol,market:s.market.id,state:exiting?'exiting':s.receipt===0n&&(s.exiting||prior?.exit_state==='completed')?'stopped':s.receipt===0n?(consents.rows.some(c=>c.market_id===s.market.marketId)?'cash':'not_consented'):'supplied',
+        return {asset:s.market.asset,symbol:s.market.symbol,market:s.market.id,consented,state:exiting?'exiting':s.receipt===0n&&(s.exiting||prior?.exit_state==='completed')?'stopped':s.receipt===0n?(consented?'cash':'not_consented'):'supplied',
           receiptValue:frozen?null:s.value?.toString()??null,pending:exiting?{value:frozen?null:s.value?.toString()??null,reason}:null,dataAt:s.at.toISOString(),simulated:s.market.simulated,is_simulated:s.market.simulated,valuationState:frozen?'unknown':s.state,
           maxWithdraw:frozen?null:s.maxWithdraw?.toString()??null,claimAssets:frozen?null:s.claim?.toString()??null};})};
     }),

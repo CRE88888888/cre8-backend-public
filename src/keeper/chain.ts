@@ -53,7 +53,7 @@ export function parseManifest(input: unknown): Manifest {
   if (manifest.chainId !== 97) throw new Error('manifest must be chain 97');
   const contracts = record(manifest.contracts);
   const assets = record(manifest.assets);
-  if (Object.keys(assets).length !== TESTNET_ASSETS.length) throw new Error('manifest requires 38 markets');
+  if (Object.keys(assets).length !== TESTNET_ASSETS.length) throw new Error(`manifest requires ${TESTNET_ASSETS.length} markets`);
   const markets = TESTNET_ASSETS.map((spec): Market => {
     const asset = record(assets[spec.symbol]);
     if (!spec.hasFeed && (asset.feed !== undefined || asset.secondary !== undefined)) throw new Error('unexpected secondary');
@@ -65,8 +65,8 @@ export function parseManifest(input: unknown): Manifest {
   });
   const result = { keeper: address(record(manifest.roles).keeper), usdt: address(contracts.usdt), cashFeed: address(contracts['feed.USDT/USD']), router: address(contracts.router), markets };
   const tokens = [result.usdt, ...markets.map((market) => market.token)];
-  if (new Set(tokens).size !== 39 || new Set(markets.map((market) => market.pool)).size !== 38 ||
-    new Set([result.cashFeed, ...markets.flatMap((market) => market.feed ? [market.feed] : [])]).size !== 12) throw new Error('duplicate manifest contracts');
+  if (new Set(tokens).size !== markets.length + 1 || new Set(markets.map((market) => market.pool)).size !== markets.length ||
+    new Set([result.cashFeed, ...markets.flatMap((market) => market.feed ? [market.feed] : [])]).size !== 1 + TESTNET_ASSETS.filter((spec) => spec.hasFeed).length) throw new Error('duplicate manifest contracts');
   return result;
 }
 

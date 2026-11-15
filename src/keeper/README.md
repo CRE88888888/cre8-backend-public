@@ -2,7 +2,7 @@
 
 獨立執行 `bun run price-keeper`，不啟動 API、scheduler 或 DB。預設停用；只有
 `PRICE_KEEPER_ENABLED=1` 才讀取檔案、連線或簽名。只接受實際 RPC chain id 97，
-啟動時核對 manifest、38 個池／oracle、minter 和 12 個 feed 的 keeper 權限。
+啟動時核對 manifest、92 個池／oracle、minter 和 12 個 feed 的 keeper 權限。
 
 ## 設定
 
@@ -19,15 +19,15 @@
 | `PRICE_KEEPER_SWAP_BUDGET_E18` | 單筆 input 價值上限；預設 10,000 × 10^18，不能大於門檻 |
 | `TELEGRAM_BOT_TOKEN`／`TELEGRAM_CHAT_ID` | 沿用 `src/notify.ts`；留空停用通知 |
 
-這次驗收只允許 `http://127.0.0.1:8557` anvil fork。金鑰只能在本機驗收時由
+這次驗收只允許 `http://127.0.0.1:8562` anvil fork。金鑰只能在本機驗收時由
 `~/.cre8-testnet/keeper.json` 的 `data[0].private_key` 讀進子程序 env；不要放命令列參數、
 檔案副本、log 或 repo。`--once` 做一輪後退出；常駐每 15 秒檢查區塊進度，依劇本步距執行。
 停用 env 後重啟即可關閉；SIGINT／SIGTERM 會完成當前輪次後退出。
 
 ## 劇本與 swap
 
-JSON `version=1`，必須完整列出 38 個 `assets`，值固定為 contracts
-`f1608ee`（PR #32，與 `f7e5d52` 基準一致）的 `script/testnet/TestnetAssets.sol` 原始 `priceE18`；不套 UI multiplier。
+JSON `version=1`，必須完整列出 92 個 `assets`，值固定為 contracts
+`b767bf6`（PR #43）的 `script/testnet/TestnetAssets.sol` 原始 `priceE18`；不套 UI multiplier。
 未知欄位、不同基準價、缺漏資產、錯誤型別與超出上限的數值一律拒絕。
 
 - `stepSeconds`：60–300 秒，保守留出 600 observation slots 的容量。
@@ -35,11 +35,15 @@ JSON `version=1`，必須完整列出 38 個 `assets`，值固定為 contracts
 - `timeline`：依序的 `{steps, mode, stepBps}`；最多 100 段、共 10,080 步。
 - `overrides`：單一資產的完整替代時間線；省略則使用共用 timeline。
 - `mode`：`rise`／`fall` 每步複利；`sideways` 在段落起點與起點上方 `stepBps` 間交替；
-  `closed`／`paused` 不交易但持續更新 feed。後兩者的 `stepBps` 必須為 0。
+  `closed`／`paused` 凍結劇本目標價，仍每 30 分鐘維持 observation 並更新 feed。後兩者的 `stepBps` 必須為 0。
 
 第 0 步是基準價；第 1..N 步執行該段，最後一步仍屬該段。全部步驟結束後維持價格。
 同一起點與鏈上時間得到相同目標價。延遲或重啟時只移動一個 `maxStepBps`，不跳追累積落差。
 每池每輪最多一次 swap，且檢查鏈上最後 observation 時間，所以重啟不會提高頻率。
+休市、暫停、劇本結束，或目標與現價僅有 sub-ppm 差距時，鏈上最後 observation 滿 1,800 秒才做維護成交：
+以凍結目標上下 1 bps 為交替方向，仍受 `maxStepBps` 約束；方向由現價相對目標決定，
+重啟沿用鏈上 observation 時間，不額外加速。劇本價格不改；真實池價會有小幅擺動。
+這更新 #70 的「完全不成交」語義；使用者的交易時段規則不變。
 此限制約束 keeper；測試環境仍應限制其他交易者的總交易頻率，以保留 TWAP 歷史。
 
 QuoterV2 先確認預算足夠抵達目標 `sqrtPriceLimitX96`，再透過官方 V3 SwapRouter
@@ -63,9 +67,15 @@ RPC 讀寫或確認逾時、區塊倒退／超過 90 秒未前進／時鐘異常
 完整 `bun test` 仍需 repo 的可拋棄 Postgres 設定。
 
 整合驗收另用 `bun test ./test/price-keeper.fork.ts --timeout=1800000`，需上述本機 env。
-先從 contracts **乾淨的 origin/main** 用 `git archive` 建立獨立、乾淨的 git 副本（部署腳本會核對 HEAD 與 origin/main），執行
-`FORK_RPC=http://127.0.0.1:8557 scripts/testnet/deploy-97.sh fork`，不能複製主 clone 的未提交程式。
-測試會核對 anvil 和 chain id，快轉 2 小時，做 912 次雙向 preview、核對 Swap event 與 60 秒間隔，
+先從 contracts **乾淨的 origin/main** 用 `git worktree add --detach /tmp/cre8-c97-be87 origin/main` 建立獨立乾淨副本（部署腳本會核對 HEAD 與 origin/main），執行
+`FORK_RPC=http://127.0.0.1:8562 scripts/testnet/deploy-97.sh fork`，不能複製主 clone 的未提交程式。
+測試會核對 anvil 和 chain id，快轉 2 小時，做 2,208 次雙向 preview、核對 Swap event 與 60 秒間隔，
 再驗跌價、休市與單一資產暫停；結束回復自己的 snapshot。
 本機驗收只用 anvil 補原生測試 gas；mock 庫存由合約 mint，所有池價都由正常 swap 改變。
 整合測試檔名是 `.fork.ts`，只會在明確指定時執行，不會由預設 `bun test` 送交易。
+
+#87 的短驗收：`bun test ./test/testnet-92.fork.ts --timeout=600000`，只接受 8562、固定 chain 97
+及 anvil。先從乾淨 contracts main 用 `deploy-97.sh fork` 部署，anvil 必須加 `--prune-history 3072`。
+它在 snapshot 內暖機，92 池各做一次漲價成交，再驗兩輪休市／暫停／劇本結束的 30 分鐘維護，
+共 276 筆真實 swap、368 次雙向 preview；每池核對 Swap event 的 tick 改變和 observation 時間。
+所有寫入只送本機，最後回復 snapshot；執行結果與完整 E2E 見 `docs/testnet-deploy.zh-TW.md`。

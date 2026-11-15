@@ -1,4 +1,4 @@
-// Fixed raw prices from cre8-contracts f1608ee (baselines unchanged from f7e5d52), script/testnet/TestnetAssets.sol.
+// Fixed raw prices from cre8-contracts b767bf6b22bb697a0b86abf8ed683916fe81502d, script/testnet/TestnetAssets.sol.
 export const TESTNET_ASSETS = [
   {
     "symbol": "AAPLB",
@@ -303,5 +303,437 @@ export const TESTNET_ASSETS = [
     "priceE18": "48359900000000000000",
     "hasFeed": true,
     "maxFeedAge": 3600
+  },
+  {
+    "symbol": "ABBVon",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "293300000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "ALABB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "216870000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "AMATB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "370827000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "AMDB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "508580000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "APHon",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "80710000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "APLDon",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "16720000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "AVGOB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "319885000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "AXPon",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "324310000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "BEB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "193880000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "BLKon",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "1214710000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "CBRSB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "96700000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "CEGon",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "276090000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "CIENon",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "269330000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "COHRB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "225190000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "CORZon",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "12720000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "CRDOB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "132890000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "CRMB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "215204000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "CRWVB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "48980000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "CVXon",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "210780000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "GEVB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "829340000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "GLDon",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "379530000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "GOOGon",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "286010000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "GPROB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "880000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "IEFon",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "91800000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "IRENB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "21410000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "IVVon",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "756050000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "KOon",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "96030000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "LLYB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "1430490000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "MAon",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "655810000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "NBISB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "141450000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "NEMon",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "125160000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "ORCLB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "120098000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "PANWon",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "330890000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "PYPLB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "60156400000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "SHAZB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "23930000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "STXB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "506423000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "UBERon",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "71170000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "VRTon",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "200470000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "VSTB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "133920000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "Von",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "422160000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "ADA",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "150164000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "LINK",
+    "decimals": 18,
+    "fee": 10000,
+    "priceE18": "9127500000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "BCH",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "204300000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "NEAR",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "3133340000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "UNI",
+    "decimals": 18,
+    "fee": 10000,
+    "priceE18": "5024790000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "ZEC",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "897060000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "TONCOIN",
+    "decimals": 9,
+    "fee": 2500,
+    "priceE18": "1051000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "DOT",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "719267000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "SHIB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "3880000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "PEPE",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "3928280000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "AAVE",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "105860000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "Cake",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "1615720000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "FIL",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "614694000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "ATOM",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "1280000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
   }
 ] as const;

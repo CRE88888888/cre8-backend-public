@@ -9,8 +9,8 @@ export function manifestInput() {
     chainId: 97, roles: { keeper: signingAccount(`0x${'0'.repeat(63)}1`).address },
     contracts: { usdt: keeperAddress(1), router: keeperAddress(2), 'feed.USDT/USD': keeperAddress(3) },
     assets: Object.fromEntries(TESTNET_ASSETS.map((spec, index) => [spec.symbol, {
-      token: keeperAddress(index + 10), pool: keeperAddress(index + 100), oracle: keeperAddress(index + 200),
-      ...(spec.hasFeed ? { feed: keeperAddress(index + 300), secondary: keeperAddress(index + 400) } : {}),
+      token: keeperAddress(index + 10), pool: keeperAddress(index + 1000), oracle: keeperAddress(index + 2000),
+      ...(spec.hasFeed ? { feed: keeperAddress(index + 3000), secondary: keeperAddress(index + 4000) } : {}),
     }])),
   };
 }

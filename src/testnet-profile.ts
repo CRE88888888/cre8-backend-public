@@ -1,20 +1,21 @@
 import type { Address } from 'viem';
 
 /** Generated from cre8-contracts deployments/testnet-97.json (manifest gitCommit below),
- * script/testnet/TestnetAssets.sol at 068d471fc2c4592c12442ef35602ad1d1a7fe9c3.
+ * script/testnet/TestnetAssets.sol at b767bf6b22bb697a0b86abf8ed683916fe81502d.
  * Kernel/policy: pinned backend SDK versions, verified on the chain 97 fork.
  * Quoter: https://developer.pancakeswap.finance/contracts/v3/addresses (BSC TESTNET).
  * maxLegUsdt: conservative existing admission caps, db 0024 at 3dd4302;
- * copied by symbol at generation time, never looked up in the mainnet DB at runtime.
+ * new 54 assets: 5,000 MockUSDT per leg (C3 decision, backend#87), testnet only.
+ * Existing launch caps copied by symbol at generation time, never looked up in the mainnet DB at runtime.
  */
 export const TESTNET_97 = {
   "chainId": 97,
-  "sourceCommit": "068d471fc2c4592c12442ef35602ad1d1a7fe9c3",
+  "sourceCommit": "b767bf6b22bb697a0b86abf8ed683916fe81502d",
   "mode": "fork",
   "note": "fork = verified on a local anvil fork of chain 97; the public deployment lands on the same CREATE2 addresses",
-  "verifiedAtBlock": 142810197,
-  "generatedAt": "2026-11-15T04:21:54Z",
-  "gitCommit": "45b2ce7200b5f958555f043a31b3a533fecacbff",
+  "verifiedAtBlock": 142841703,
+  "generatedAt": "2026-11-15T08:27:14Z",
+  "gitCommit": "b8517cc4848c69a974553782a810dace31d82383",
   "roles": {
     "deployer": "0x55662b4183fca1230694d5d57f56e4f2e0e3008a",
     "owner": "0x09bbb9a06a0c49ad24bddb18808944041783054e",
@@ -374,6 +375,438 @@ export const TESTNET_97 = {
       "decimals": 18,
       "poolFee": 2500,
       "maxLegUsdt": "42000"
+    },
+    "ABBVon": {
+      "token": "0x9b76b0cd3eb101e4c7e7d9a80397648ff5ba985b",
+      "pool": "0x9bb843b64d6a49e2e9eee9edd38b5ccf4f40094d",
+      "oracle": "0x5005dc4856ae99cdc9819ec32ab148b707674807",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "ALABB": {
+      "token": "0x1e267ead867a6eb5e8beb2e66f91fd20eed426d5",
+      "pool": "0x97573f650a95164bc0adc100cb81dcd7583fbb0f",
+      "oracle": "0x43594936619b153638dd6ef6b8b1d8a9f8a2b0de",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "AMATB": {
+      "token": "0x255cfdd632600a289a181caab4511c30a10f7949",
+      "pool": "0x9b8eaed5f4a68b3669d1c80f7680c7dccf7ea521",
+      "oracle": "0x0e54f641193e8361cee5bcbf6be90b70b11ecde1",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "AMDB": {
+      "token": "0xa887f513a46aefa98bf42ae28b74ff2c6ca70fc7",
+      "pool": "0x24ed5bc652ae7c7b0e179656adbf7c004e7c10da",
+      "oracle": "0x7162606bd02247b0ba756519a3c0b3408df17c04",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "APHon": {
+      "token": "0x0ad9f1644333a3dc950901c793998bb18663e4d8",
+      "pool": "0x74071947885acdb42adec69defb123f48adc86ef",
+      "oracle": "0xda59c1da4cf36161d42998565cf5b98f98aa9a43",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "APLDon": {
+      "token": "0xa5611547b984a7deef1e4fc0e8e0d8b0798e3300",
+      "pool": "0x0f5c638272749bd81ac52c862f327577d819ce7a",
+      "oracle": "0x852ca75e7999e41bbf6c210829acef19fa8cdc83",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "AVGOB": {
+      "token": "0x1b686f1268f05dfe9f2effe2117f2e7807d59cf2",
+      "pool": "0xd16a76dc1acd5247d29f7dcb0e48fe6034344b19",
+      "oracle": "0x638d9bdedf90430d634b657f78e5482421de5605",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "AXPon": {
+      "token": "0x9b3fb69e3998e371399128f80fc9ff941d50b55f",
+      "pool": "0x8121188cd3901960b733a4dddc1c151a93d92457",
+      "oracle": "0x988a27dcdaac15b30e6f6b88fe69e44a0c6fd555",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "BEB": {
+      "token": "0x4aa1d4149724e6cc5003a12faca47eef48f8cc40",
+      "pool": "0xe967c310a0458dcad4d664121e2d0796acd30ead",
+      "oracle": "0x4506100935d738fff1815e43a420afbf0d87314c",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "BLKon": {
+      "token": "0x70de7713d83eb54ea02749a57b4c510b087aba29",
+      "pool": "0x7b6450fd0ada5dd791ff9f4c95e23cc6ae8d9f2a",
+      "oracle": "0x62916a8e073427b85fd80369daccfb70a6d41c7b",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "CBRSB": {
+      "token": "0x026275af378d498fb7eea6d6cb7539393a9e0c6c",
+      "pool": "0xc8eb810a22736a2112790b51c5fe5d8167385ca6",
+      "oracle": "0x057d82ec5afdf3409fd07020680fc708a5b645e7",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "CEGon": {
+      "token": "0x1a6a9d761c14f5f5722de0f258a8c1ede5b1c4e7",
+      "pool": "0x7a62139416e5f1d3483834b68f937762e9c3edca",
+      "oracle": "0x521fd925c1d9ed7fec7631045ac742af19c93838",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "CIENon": {
+      "token": "0x319fe02ddfe1bb894825b0813712f8a71e3a4368",
+      "pool": "0x01e09acb3552aa13af899e62d10b1c1633eade1e",
+      "oracle": "0x670472d662e8189c128a55af80d8d55f4d3c3225",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "COHRB": {
+      "token": "0xab415c7b7eaa29f5870ae4e88ce6518b4566356f",
+      "pool": "0x9c3a1fa0f319ee9810b6d625bf093d487772efc9",
+      "oracle": "0x3558db7ec5743c8747617463732baa2e43d868c3",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "CORZon": {
+      "token": "0x015ebadf7fcad8d86b32cdb8ce29844edda95b70",
+      "pool": "0x83638b35505648779280e6634da56fda608df2f8",
+      "oracle": "0xb3e82c958fcb42f002369838e2487c551de6b0e8",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "CRDOB": {
+      "token": "0xed752a446d117a081a304b670ccc3239843918e3",
+      "pool": "0x3931df2c0d1266c826367c26c53fca216239300c",
+      "oracle": "0xc7314d7516f89bac6780a67310c55c135c68e572",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "CRMB": {
+      "token": "0xe96ddbd298c460f1a3ba0c0c043093f62c8e875a",
+      "pool": "0xdf932a7a74853210e49904ace5dd468ceafb0df7",
+      "oracle": "0xa42bbe6c6e6495463ff138d84eb6a2afc528f84f",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "CRWVB": {
+      "token": "0x1812c38838cfa3a2d65bbad032c2b37b6ecfb737",
+      "pool": "0xc7bcdb1bae5e332b708b0c6fb6ddf8c39ca1eed9",
+      "oracle": "0x1e52eb15b8a99d3a74f0f6ab414050358004f53e",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "CVXon": {
+      "token": "0xdea3e81b35c4f550b3e1ae824c139be7a378e4c0",
+      "pool": "0xf441ff81b85b4e2346599c9d1a9737c35f7bac6e",
+      "oracle": "0xdd50ff3e416a5aa682dd41f0641f830bc64c6892",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "GEVB": {
+      "token": "0x2e4b59f91ec2ee494f7daa209201f8f27f67bbff",
+      "pool": "0xb6c312557a02d14589e6f911b1d132897391d258",
+      "oracle": "0x650050a1e7505929377f426b9cb466fcace1ef70",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "GLDon": {
+      "token": "0x1e018aa559d3b947ab37646327713d07fad50912",
+      "pool": "0x3b900ce213460dcf1656fd163185d8a7d86c7c30",
+      "oracle": "0x70f483706ab460ec35b8941ac2dca1913ea15b7b",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "GOOGon": {
+      "token": "0x0fabfd379349c0ea8a4606c4658497e61ee14760",
+      "pool": "0xf47b10e0810fff64e49241c5028d4d7523471dc1",
+      "oracle": "0x5ded651bb2fb218899e78e71bd760f8c91b228b3",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "GPROB": {
+      "token": "0x146a3b6d848119158fb9add261ecc1f3554b5b89",
+      "pool": "0xc99004275a561b5e52c3366b840b96e2d05b3e2a",
+      "oracle": "0xb0e552926954e2f399346fdf9c85570548ff5c33",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "IEFon": {
+      "token": "0xbb261723a59f85cec235c77ca3c8b2b5f60cd4aa",
+      "pool": "0xa326ecfc89bf05bbab6d70606322960877cf7ca4",
+      "oracle": "0x19f44e0199300a069baa37f1e83d980648ed79c1",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "IRENB": {
+      "token": "0xaf83b816ac2df259cce113be85c9072f6641b34b",
+      "pool": "0xd5b419ad5dea375335be0b3ce0f0c2de4b6e0742",
+      "oracle": "0x194818bd9157c2ea01e93f78627e989a77bdfc40",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "IVVon": {
+      "token": "0x616494e6043dc5c362878db6c4c126dd586abe28",
+      "pool": "0xbd279ee78fc20b55b5dca2f9d872783b5b27e8fb",
+      "oracle": "0x3d53e27b2826e78fdeb2e3f3515cb456c5da07de",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "KOon": {
+      "token": "0x02d2700fe3f1e28954ce9fa41966d1c944d72b52",
+      "pool": "0x5bffa3203abb2e250ba1b22ccab015e75f856b33",
+      "oracle": "0xf9b37e7cc8a98a5d928219e316a6f34343f5a39a",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "LLYB": {
+      "token": "0x59c67ff7f24a0c2325c6372f0ef2809cf5cb546f",
+      "pool": "0x69f493dfd083c8d34c8e86935eac9a32c2153445",
+      "oracle": "0x55db4e91ea516959f1388c9269d689e8c55d3357",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "MAon": {
+      "token": "0x09ba441bfca50ea559f0766b7e5b7baead3c2c8a",
+      "pool": "0xfb71c4ba15515a59494bb9d9e7c5efab349b7cce",
+      "oracle": "0x5ebf55935d67fc51f466ad7dfb140739aeb85efc",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "NBISB": {
+      "token": "0xd8ef174bb435d31f89468544c7f9f1e4b19c298c",
+      "pool": "0x4deb25731c0b8d976e84b4089469b4a838effa05",
+      "oracle": "0x17360fdc7657808480477b0cb5936e24d740c5ea",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "NEMon": {
+      "token": "0xfac7a975d0bf254c438d9d7c4e2754977eb836d6",
+      "pool": "0xc96768ed4643f6f6ccd808d7d215efcb37b46b72",
+      "oracle": "0xa9f5f436858ebaf2911ccc64f232fb9ea992adde",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "ORCLB": {
+      "token": "0x5ec68aba17671d211c0d79d070c9acc193889955",
+      "pool": "0xc870ba30ebc6d1ec7225bab6c9a6dba093a53d70",
+      "oracle": "0x5f1d54aeeacc4488768b3f8f6ad314d7bca296a9",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "PANWon": {
+      "token": "0x9aedd320474b527234e0fcf95594112c3f781c91",
+      "pool": "0xcebcc2ad89c811a39dfe3529768a2f7ba83f1bd0",
+      "oracle": "0x05c0197239f36f6c20b51f3e53d1bd46a5c09ac5",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "PYPLB": {
+      "token": "0x6e417454adfcb7d0ca0eba7b4b5318da0f53ab81",
+      "pool": "0x4b7baf58f3972f2acba2b259204b58c9b50b8881",
+      "oracle": "0x5d4007ac0e6a479052979799f352ad8be910beab",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "SHAZB": {
+      "token": "0x7022ea5bca8737d3245430bd2db49ed7711ff01a",
+      "pool": "0xd489f1abdc6c0a73251521a3b80fd39467f83ffa",
+      "oracle": "0x35b39cd2e9a0b8a062d9a96c161013e6f6fc72e5",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "STXB": {
+      "token": "0x1b70a09a974f269bd86632cc81c1c12d775590db",
+      "pool": "0x896c6e70aebe7257e523d717dc9a87961043d757",
+      "oracle": "0xa6f0b54633a972d1d901baa526584eb67bd83cd7",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "UBERon": {
+      "token": "0x7a6e6f404dfe67e4f064a173ab52d838baa9498a",
+      "pool": "0x1ca305056a0819e2d09458c173e5a7553be7f49c",
+      "oracle": "0xc72ee1066059f3a4e7cc47008033b57f7b455bf2",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "VRTon": {
+      "token": "0x88aa53ed64f8b06f7c4ba7cc6c87869fd5b646a4",
+      "pool": "0xe158d97784b46ff34bd24c2c690682e84606069e",
+      "oracle": "0x2b0dce43042e3ec199633fddcdc5802914d20961",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "VSTB": {
+      "token": "0xf697267d420faf19f10059d015eacb8fd76799f6",
+      "pool": "0x6f1e432faf2e59d42ce4178fe5e443b7111dc729",
+      "oracle": "0x9fbc0f5c01d569308e34beca6fb5b69c99e16dde",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "Von": {
+      "token": "0xaf518cac016d5c16dab03cca329e308db7391e1e",
+      "pool": "0xb4ffcae4eabae80e44dd657df51433464f6e1a0a",
+      "oracle": "0xe3289b9287c19ab4525fae7f97c3e784782eb7a4",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "ADA": {
+      "token": "0x286d41ea9845a879ac76494650ff59b9d69cb164",
+      "pool": "0x2d79732e662209114a06fa2ff7be24f555a06b09",
+      "oracle": "0x328694fd3483287a71de0d473288e5fefed25c48",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "LINK": {
+      "token": "0x456fac6c36fbc8d1cb4245d3b80a807a3e2a5d1d",
+      "pool": "0xcff470f26ea455536e758da2b268842f201416a8",
+      "oracle": "0xdc7a72dbe4a56be0f92459ae9a1f34e990f317b7",
+      "decimals": 18,
+      "poolFee": 10000,
+      "maxLegUsdt": "5000"
+    },
+    "BCH": {
+      "token": "0xcc4f64d93399e66a5a0fbf25a015da02e1364208",
+      "pool": "0x6b713adc102486c036dc239e8fe1eb97f578fc9c",
+      "oracle": "0x64b6efefa9deb4b6f6b85eb793ae203cdc43041e",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "NEAR": {
+      "token": "0xa3c6f5b3196cfb745c3be1bc914c83f064121565",
+      "pool": "0xb3c9173e9299f7ee71bab709f163a56d3b869f64",
+      "oracle": "0xec411d3be266f0a55cb82e84d01dcf9a6d8bb855",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "UNI": {
+      "token": "0x1224c02ba57a0ccdf994c96f3e0f2400ca5559a2",
+      "pool": "0x92acdf9ce8d39e8c78fa1f668a847850b3eadb5e",
+      "oracle": "0x03d5d281babba781e39bf43daa6b9b2384b47b98",
+      "decimals": 18,
+      "poolFee": 10000,
+      "maxLegUsdt": "5000"
+    },
+    "ZEC": {
+      "token": "0x92e51e050c6232528d4eca5b64a176b5a9e12bed",
+      "pool": "0x4613676a9ed1790ba4bb5d6fce9c5b99b4b480a9",
+      "oracle": "0xbb51f2a47bc9c27a4c10df8bbf13feaecdf58300",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "TONCOIN": {
+      "token": "0x5f8b9da554e35ca80b931280c9c5fd9a54c923f0",
+      "pool": "0x8d39c85a542d3d05b053ed4a56761beed67fc5aa",
+      "oracle": "0xd652dfac675ed271543e4c4a8742e3da5462ae7a",
+      "decimals": 9,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "DOT": {
+      "token": "0xc9341a66c56a60cfbef718402fde69b59d2fc014",
+      "pool": "0x5827671cb4251034a38eb0f28ab4114d13d5b8a3",
+      "oracle": "0xceb440d67fc16c79c1bc86ba7b13b0b6abcd94de",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "SHIB": {
+      "token": "0xdb91a5977d35b0cc32e84de2f974d86582941c6e",
+      "pool": "0x948452f61d487ff8945d9fa07a2d8aade1fdcf69",
+      "oracle": "0x812bc2892777169dabc61eff66f9f1e243c8a507",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "PEPE": {
+      "token": "0xed6d9c53d6369ccfbff8e2cae264a298ad3921b8",
+      "pool": "0xbdea3a5c76f040737854516a12c4e4984109fc55",
+      "oracle": "0xd41249663fd410dc3d0de4d8ae386e4576f96bc3",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "AAVE": {
+      "token": "0xc11dbf7979f0fa2a40fdff8c8f9c02971e3460e0",
+      "pool": "0x76738a335364a7be2669a33c58521a3e43af0917",
+      "oracle": "0xef817c46726729b7e9950c5ce42e2e6f36f6e10e",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "Cake": {
+      "token": "0x163d2a0119ec959019ad43662eca66b70dc7d81a",
+      "pool": "0x1b6312f1146ba2d9fdf26c8d223ec3a2356d7de0",
+      "oracle": "0x3b38eb9819aa6babeb3985dccd64fe893453ae0c",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "FIL": {
+      "token": "0x5adfdb29bfa979a4a91ea01b849373005d00ccd6",
+      "pool": "0x77bee8b4cf9e754c53d7d46a238af639c6c7d207",
+      "oracle": "0x948d56a2b5c6386f7fea787eaae4199ca46431d8",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "ATOM": {
+      "token": "0x0a289c717912a1ab7dc49d278b5e4afff9f5042a",
+      "pool": "0x291c1357b3b027143cb33b566a5ff472e6260bf7",
+      "oracle": "0xd1263b7a74a55df4b8c33422bc818593da2c0b32",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
     }
   }
 } as const;

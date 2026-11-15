@@ -8,7 +8,7 @@ import { parseScenario } from '../src/keeper/scenario.js';
 import { PriceKeeper } from '../src/keeper/engine.js';
 import type { KeeperIO } from '../src/keeper/engine.js';
 
-const rpc = 'http://127.0.0.1:8557';
+const rpc = 'http://127.0.0.1:8562';
 const client = createPublicClient({ transport: http(rpc, { timeout: 10_000, retryCount: 0 }), cacheTime: 0 });
 const poolAbi = parseAbi(['event Swap(address indexed sender,address indexed recipient,int256 amount0,int256 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick,uint128 protocolFeesToken0,uint128 protocolFeesToken1)']);
 async function local(method: string, params: readonly unknown[] = []): Promise<unknown> {
@@ -17,7 +17,7 @@ async function local(method: string, params: readonly unknown[] = []): Promise<u
   return Reflect.get(body, 'result');
 }
 
-test('#70 local chain 97: two hours, 38 markets every ten minutes, both directions and no source errors', { timeout: 1_800_000 }, async () => {
+test('#70 local chain 97: two hours, 92 markets every ten minutes, both directions and no source errors', { timeout: 1_800_000 }, async () => {
   assert.equal(process.env.PRICE_KEEPER_RPC_URL, rpc);
   assert.equal(await client.getChainId(), 97); await local('anvil_nodeInfo');
   const manifestPath = process.env.PRICE_KEEPER_MANIFEST; assert.ok(manifestPath);
@@ -82,8 +82,8 @@ test('#70 local chain 97: two hours, 38 markets every ten minutes, both directio
       }
       console.log(`#70 replay minute=${step} previews=${previews} swaps=${swaps} pushes=${pushes}`);
     }
-    assert.equal(previews, 12 * 38 * 2); assert.equal(alerts.length, 0); assert.equal(swaps, 120 * 38);
-    assert.ok(mints >= 39); assert.ok(pushes >= 120 * 12);
+    assert.equal(previews, 12 * 92 * 2); assert.equal(alerts.length, 0); assert.equal(swaps, 120 * 92);
+    assert.ok(mints >= 93); assert.ok(pushes >= 120 * 12);
     // Check the real pool events, including both token orders and all decimal variants.
     for (const market of manifest.markets) {
       const logs = await client.getContractEvents({ address: market.pool, abi: poolAbi, eventName: 'Swap', fromBlock: firstBlock });
@@ -105,7 +105,7 @@ test('#70 local chain 97: two hours, 38 markets every ten minutes, both directio
         swapBudgetUsdtE18: 10_000n * 10n ** 18n, stallSeconds: 90,
       }, (line) => { if (line.includes('] swap ')) swaps++; }, async (line) => { alerts.push(line); }, () => Number(clock) * 1000);
       await secondary.round();
-      assert.equal(swaps - before, file === 'gentle-fall' ? 38 : 11);
+      assert.equal(swaps - before, file === 'gentle-fall' ? 92 : 25);
     }
     assert.equal(alerts.length, 0);
     console.log(`#70 acceptance: previews=${previews}; source errors=0; alerts=0; swaps=${swaps}; pushes=${pushes}; mints=${mints}; duration=7200s`);

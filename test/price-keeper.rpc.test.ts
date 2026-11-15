@@ -8,11 +8,15 @@ import { keeperChainFixture, manifestInput } from './fixtures/price-keeper.js';
 import { runScript, assertNoSecretSlices } from './fixtures/secret-output.js';
 
 test('keeper manifest: rejects wrong chain, missing/zero/duplicate contracts and unwanted feeds', () => {
-  assert.equal(parseManifest(manifestInput()).markets.length, 38);
+  assert.equal(parseManifest(manifestInput()).markets.length, 92);
   const wrongChain = manifestInput(); wrongChain.chainId = 56; assert.throws(() => parseManifest(wrongChain));
   const missing = manifestInput(); delete missing.assets.ETH; assert.throws(() => parseManifest(missing));
   const duplicate = manifestInput(); const eth = duplicate.assets.ETH; const btc = duplicate.assets.BTCB; assert.ok(eth && btc);
   eth.token = btc.token; assert.throws(() => parseManifest(duplicate));
+  const duplicatePool = manifestInput(); const first = duplicatePool.assets.AAPLB; const last = duplicatePool.assets.ATOM;
+  assert.ok(first && last); last.pool = first.pool; assert.throws(() => parseManifest(duplicatePool));
+  const duplicateFeed = manifestInput(); const secondary = duplicateFeed.assets.ETH; assert.ok(secondary);
+  secondary.feed = duplicateFeed.contracts['feed.USDT/USD']; assert.throws(() => parseManifest(duplicateFeed));
   const zero = manifestInput(); zero.contracts.router = '0x0000000000000000000000000000000000000000'; assert.throws(() => parseManifest(zero));
   const extra = manifestInput(); const stock = extra.assets.AAPLB; assert.ok(stock); stock.feed = extra.contracts['feed.USDT/USD'];
   assert.throws(() => parseManifest(extra));
@@ -20,7 +24,7 @@ test('keeper manifest: rejects wrong chain, missing/zero/duplicate contracts and
 
 test('keeper chain verifies all pools, minters, keeper permissions and oracle/feed wiring before writes', async () => {
   const { chain, state } = keeperChainFixture(); await chain.verify(); assert.equal(state.sends, 0);
-  assert.equal(state.calls.filter((c) => c.name === 'isMinter').length, 39);
+  assert.equal(state.calls.filter((c) => c.name === 'isMinter').length, 93);
   assert.equal(state.calls.filter((c) => c.name === 'keeper').length, 12);
   for (const bad of ['missing code', 'factory', 'numeraire', 'symbol', 'decimals', 'isMinter', 'keeper', 'getPool',
     'oracleOf', 'pool', 'twapWindow', 'RECENT_WINDOW', 'secondaryOf', 'assetFeed', 'numeraireFeed', 'maxAge']) {
@@ -37,10 +41,10 @@ test('keeper wrong chain is rejected before reads and before every possible writ
   }
 });
 
-test('keeper inspects 38 markets and both oracle directions at one pinned block', async () => {
+test('keeper inspects 92 markets and both oracle directions at one pinned block', async () => {
   const { state, chain } = keeperChainFixture(); const observations = await chain.io.inspect({ number: 100n, timestamp: 1060n });
-  assert.equal(observations.length, 38); assert.equal(observations.filter((o) => o.feedUpdatedAt !== null).length, 11);
-  assert.equal(state.calls.filter((c) => c.name === 'previewSwap').length, 38 * 3);
+  assert.equal(observations.length, 92); assert.equal(observations.filter((o) => o.feedUpdatedAt !== null).length, 11);
+  assert.equal(state.calls.filter((c) => c.name === 'previewSwap').length, 92 * 3);
   assert.ok(state.calls.every((c) => c.block === '0x64')); assert.equal(state.sends, 0);
 });
 

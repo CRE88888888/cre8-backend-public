@@ -4,8 +4,8 @@
 
 ## 來源與封裝
 
-- contracts：乾淨 `git archive origin/main`，`068d471fc2c4592c12442ef35602ad1d1a7fe9c3`。`deploy/testnet-97.json` 是該版本的原始地址簿，供 keeper 讀取；其中 `gitCommit` 是產生 manifest 的程式版本，與地址簿提交版本分開記錄。
-- backend：`src/testnet-profile.ts` 同步 manifest 的每個地址，保留既有 decimals、fee tier 與 admission caps；`src/testnet-codehashes.ts` 記錄同一個本機區塊擷取的 157 項 runtime hash。不能從主 clone 的未提交檔案產生地址，不能跳過 hash／selector 檢查。
+- contracts：目前 repo 地址簿同步乾淨 main worktree `b767bf6b22bb697a0b86abf8ed683916fe81502d`（#87，92 市場）。`deploy/testnet-97.json` 是該版本的原始地址簿，供 keeper 讀取；其中 `gitCommit` 是產生 manifest 的程式版本，與地址簿提交版本分開記錄。#79 已部署的舊產物來源仍是乾淨 archive `068d471fc2c4592c12442ef35602ad1d1a7fe9c3`，本張沒有更新 Railway。
+- backend：`src/testnet-profile.ts` 同步 manifest 的每個地址與 decimals／fee tier；原 38 個 admission caps 不變，新增 54 個各 5,000 MockUSDT；`src/testnet-codehashes.ts` 記錄同一個本機區塊擷取的 319 項 runtime hash。不能從主 clone 的未提交檔案產生地址，不能跳過 hash／selector 檢查。
 - app：唯讀使用 `f531ec639ee0d12402c4189b0089d922cbbc2027`（#76），在家目錄外由 archive 建置。chain、RPC、API base、Privy app ID 都是建置時設定；所有 `VITE_*` 都會出現在公開 bundle，禁止放 secret。
 - migration：來源仍是 db repo，這裡只封裝，不新增或修改 SQL。
 
@@ -65,7 +65,7 @@ Railway 的 `X-Forwarded-For` 含額外代理 hop，不能取最右側當使用�
 - [ ] 使用者在 Privy 開啟 **Return user data in an identity token**。目前尚未開啟；後端 `/auth/privy` 驗的是 identity token。
 - [ ] 使用者將 Railway 網站臨時 origin 加入 Privy allowed origins，確認 email／Google／X 的回跳設定；由真使用者在手機走登入驗收。
 - [ ] C1 完成公開 chain 97 部署、角色 tBNB、paymaster deposit，交付 `mode: public` 地址簿與 executor 建立區塊。
-- [ ] 逐一核對公開 manifest 與這次 fork 的 CREATE2 地址；157 項 codehash／selector 全通過。任一不同即停，重走對應 lane 的同步流程。
+- [ ] 逐一核對公開 manifest 與這次 fork 的 CREATE2 地址；319 項 codehash／selector 全通過。任一不同即停，重走對應 lane 的同步流程。
 - [ ] 先啟 API、套用封裝 migration。API 的交易端點在此階段仍須限制外部使用；下列 alto／keeper 準備好後，再統一跑 chain 97 strict preflight，確認私網、DB、operator、paymaster、bundler、oracle 均正常。
 - [ ] **部署後第 30–60 分鐘啟動價格 keeper**，之後每池每小時至少一筆會動到 tick 的成交；超過 1 小時未成交 oracle 會停報價。secondary 維持 1 小時，AVAX 1 天；USDT feed 同樣必須續推。第一次啟用設定新的劇本起始時間，不能沿用 fork 時間。
 - [ ] 啟用 alto，確認 safe-mode、不同 executor／utility key 與 EntryPoint v0.7；啟用代付前核對額度與餘額。
@@ -87,7 +87,7 @@ railway up .deploy --path-as-root --no-gitignore --detach --service api --projec
 
 回滾前先停用 scheduler、keeper、alto、points-sync 與 API 的交易能力；保留 DB volume 與 session seed，再回到已記錄的相容 deployment／封裝版本。只把 scheduler 切回 dry-run 不足以停掉其他角色。migration 有 checksum，**不修改已套用 SQL、不刪 DB、不自動降 schema**；舊版不相容時維持停用，由 C3 協調 db lane。不能靠回滾應用撤銷鏈上交易。keep-alive／進程狀態與舊 DNS 必須重驗。
 
-## 驗收紀錄
+## #79 驗收紀錄（歷史交付，#87 結果見末節）
 
 最終 PR 附實際指令、pass／skip／fail、服務 deployment 與健康狀態。上面未勾選的項目屬公開上線前置，不能宣稱完成公開端到端操作。暫存包含乾淨 archive、依賴、build、fork log、CLI 與部署產物，交付後清除；保留 worktree 供 C3 合併後處理。
 
@@ -112,3 +112,71 @@ dry run 揭露 #77 的既有送單回歸：`prepareUserOperation()` 產生的 st
 本機 backend E2E：22 pass／0 skip／0 fail；strict preflight：254 ok／0 warn／0 fail。Railway HTTP（含入口資產、SPA、代理、停用與禁止檔案）：40 pass／0 skip／0 fail；Railway header 防偽：3 pass／0 skip／0 fail。真 Privy／手機與兩個不同用戶網路的操作沒跑，需使用者完成上線清單；瀏覽器視覺驗收沒跑，這次 browser access host 無法連線。價格 keeper 的兩小時測試另屬原本 8557 驗收環境，這張未重跑該長測試。
 
 keeper 在本張 8556 上另做唯讀設定驗證：3 pass／0 skip／0 fail，涵蓋 38 個市場的地址、minter／keeper 權限、oracle／secondary 接線與即時 observation。`bun scripts/points-sync.ts --once` 也在本機 fork／DB 實際完成一輪（exit 0）；這個 worker 不送鏈上交易。
+
+## 92 資產同步（backend#87）
+
+來源是 contracts 乾淨 main `b767bf6b22bb697a0b86abf8ed683916fe81502d` 的
+`deployments/testnet-97.json` 與 `script/testnet/TestnetAssets.sol`。原 38 個資產與核心地址、
+單筆上限不變；新增 54 個資產的 `maxLegUsdt` 依 C3 決定統一 **5,000 MockUSDT／筆**。
+這是測試網值，主網仍需各自准入，不會讀寫主網資產表。共 92 個市場＋MockUSDT，
+profile 的 319 個 runtime targets 均須有 codehash；11 個 secondary 的設定不變。
+三份劇本完整涵蓋 92 個 raw 基準價；休市劇本也包含新增 40 個股票／ETF 的 closed override。
+
+keeper 每輪巡查全部 92 池；休市、暫停、劇本結束仍在 observation 滿 30 分鐘後
+以正常 swap 維護，凍結目標價上下 1 bps 交替，沿用每輪每池一次、步距及庫存限制。
+不修改劇本價格，也不改使用者交易時段規則。故障仍 fail closed，人工核對後重啟。
+
+本次只改 repo；沒有重新部署或啟用 Railway 服務，也沒有送公開鏈交易。
+本機使用 anvil 8562（`--prune-history`）、API 3062、alto 3162、DB `cre8_be87`；
+MIGRATIONS_DIR 指向共用 db 的絕對路徑。C3 授權的測試網角色金鑰僅載入子程序 env，
+不讀 deployer／owner 私鑰，不保存 env 檔。驗收完成清除自己的程序與 contracts 暫時 worktree；
+backend worktree 留給總管。strict preflight 的 `EXECUTOR_DEPLOYMENT_BLOCK` 取真實部署 receipt，
+避免 prune-history 環境用過期歷史 state 搜尋建立區塊。
+
+#86 已把 HTTP 新版本建立改為 hold／stack＋funding；BE-2 尚未實作，既有 drift scheduler
+會明確拒絕 funding schedule。因此 #87 E2E 使用保留的 production `publishVersion()`
+建立 legacy interval fixture，再走真實 HTTP enroll／faucet、production scheduler 代付與
+owner 清倉提領。它驗證 97 地址簿與新 TONCOIN（9 decimals）成交，不宣稱 hold／stack 已自動執行。
+
+本張本機正路徑使用 `--prune-history 3072 --gas-price 10000000 --disable-min-priority-fee`，只保留 3,072 個記憶體
+state、不持久化完整歷史；SDK 的近期區塊讀取仍可驗證。UserOp 階段的
+`TESTNET_ACCEPTANCE_GAS_PRICE_WEI=100000000` 是明確的 **本機 0.1 gwei base fee 情境**，
+不是公開鏈費率通過的證據；EOA setup 仍用獨立的高 base fee 情境。
+
+2026-11-15 唯讀公開 RPC 的 `eth_gasPrice` 是 1 gwei。在本機照該報價試跑，
+單一 TONCOIN 的普通再平衡也被原有 `GAS_BUDGET_EXCEEDED` 正常擋下；
+`ACCOUNT_DAILY_GAS`／`ACCOUNT_DAILY_GAS_USD_E8` 都未調高（預設 1,000 萬 gas／0.30 USDT）。
+**公開啟用前需 C3 決定測試網費率／每日預算策略**，不能把本機低費率 E2E 當作公開網已可持續代付。
+
+本機沿用 contracts 驗收的 `@pimlico/alto@0.0.18`，`ALTO_CLI_PATH` 指向套件的
+`esm/cli/alto.js`；目前 Node 將套件視為 ESM，不能誤指向 CommonJS 的 `lib/cli/alto.js`。
+產品 Docker image 仍 pin v1.2.5，`SAFE_MODE=true` 不變。
+
+keeper fork fixture 在每次 EOA 寫入前維持本機 10 gwei 的下一塊 base fee，
+容納 anvil 固定建議的 1 gwei tip；不改 keeper 的報價、步距、receipt 或 source guard。
+這和 UserOp 的低費率預算情境分開，兩者都只在自己的本機 anvil 使用。
+
+strict preflight 仍核對 executor 建立區塊及前一塊的 code，不能只靠 receipt 區塊號
+略過該檢查。92 市場部署約 1,300 多筆交易；因此 E2E 用 `--prune-history 3072`
+保留有界歷史，覆蓋部署與驗收所需區間。先前 keeper 獨立驗收用 128 也通過；
+128 不足以在整套部署後回讀 executor 的建立 state，不能宣稱 strict preflight 通過。
+本機必須明設 `AUTH_DOMAIN=localhost:3062`、`AUTH_URI=http://localhost:3062`，不沿用隱含預設。
+
+### #87 實際驗收結果（2026-11-15）
+
+| 指令／檢查 | 結果 |
+| --- | --- |
+| `bun install --frozen-lockfile` | Checked 85 installs／83 packages，no changes |
+| `bun run typecheck` | src／test／scripts 0 錯 |
+| CI 相同 23 檔 no-DB 清單 | 861 pass／27 skip／0 fail（888 tests） |
+| 專用 DB，`bun test --timeout=15000` | 1218 pass／16 skip／0 fail（1234 tests／42 files） |
+| profile／keeper 單元與 RPC 測試 | 39 pass／0 skip／0 fail |
+| `bun test ./test/testnet-92.fork.ts --timeout=600000` | 1 pass／0 skip／0 fail；92 池、276 swaps、368 previews、兩輪維護、0 source errors／alerts |
+| `bun run test/testnet-97.e2e.ts` | 24 pass／0 skip／0 fail；TONCOIN 買入、清倉、完整 USDT 轉出、真 paymaster 付 gas |
+| E2E 內 `scripts/preflight.ts --chain 97 --strict` | 470 ok／0 warn／0 fail，含 319 codehash／selectors、建立區塊與 venue 檢查 |
+| diff／secret scan | `git diff --check` 通過；角色金鑰、當次 seed 與實際 DB URL 0 命中 |
+
+預設 `bun test` 的 5 秒上限會撞上既有 #82 測試的 5 秒 DB lock timeout；
+上列完整 suite 用 15 秒測試上限，保留產品的 DB timeout。沒有新增 skip／only 或放寬型別。
+原兩小時 keeper 長測試沒跑：本張以新增 92 池＋兩輪維護驗收覆蓋要求；
+公開鏈交易、Railway／Cloudflare、Privy／手機驗收沒跑，均非本張授權範圍。

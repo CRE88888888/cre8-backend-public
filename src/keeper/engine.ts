@@ -58,16 +58,18 @@ export class PriceKeeper {
         const target = targetAt(this.scenario, market.symbol, this.settings.start, head.timestamp);
         await this.inventory(market.token, market.symbol, market.decimals, spotE18);
         if (feedUpdatedAt !== null && head.timestamp - feedUpdatedAt >= BigInt(this.scenario.stepSeconds)) feedsDue = true;
-        if (target.mode === 'closed' || target.mode === 'paused') {
-          this.log(`[price-keeper] hold ${market.symbol} ${target.mode}`);
-          continue;
-        }
         if (!canSwap(head.timestamp, lastObservation, this.scenario.stepSeconds)) continue;
-        const bounded = boundedTarget(spotE18, target.price, this.scenario.maxStepBps);
+        let bounded = boundedTarget(spotE18, target.price, this.scenario.maxStepBps);
         const gap = bounded > spotE18 ? bounded - spotE18 : spotE18 - bounded;
-        // Ignore sub-ppm integer/sqrt rounding dust, without consuming an observation slot.
-        if (gap * 1_000_000n <= spotE18) continue;
-        // All 38 pools share cash inventory. Refill between trades, including a near-empty late round.
+        const held = target.mode === 'closed' || target.mode === 'paused';
+        // Frozen script targets (also exhausted/flat timelines) still need observations.
+        // Infer direction from spot vs the frozen anchor so restarts cannot reset it.
+        if (held || gap * 1_000_000n <= spotE18) {
+          if (head.timestamp - lastObservation < 1800n) continue;
+          const maintenance = target.price * (spotE18 >= target.price ? 9999n : 10001n) / 10_000n;
+          bounded = boundedTarget(spotE18, maintenance, this.scenario.maxStepBps);
+        }
+        // All markets share cash inventory. Refill between trades, including a near-empty late round.
         if (bounded > spotE18) await this.inventory(this.usdt, 'USDT', 18, 10n ** 18n);
         await this.io.swap(observation, bounded, this.settings.swapBudgetUsdtE18);
         this.log(`[price-keeper] swap ${market.symbol} targetE18=${bounded}`);

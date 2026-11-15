@@ -5,10 +5,14 @@ import { kernelAddressesForChain } from '../src/addresses.js';
 import { listPriceableAssets } from '../src/assets.js';
 import { readMaxLegUsdE8 } from '../src/rebalance-plan.js';
 import { TESTNET_97, testnetAssets } from '../src/testnet-profile.js';
+import launchCaps from './fixtures/testnet-launch-caps.json' with { type: 'json' };
+import { TESTNET_ASSETS } from '../src/keeper/assets.js';
+import hashes from '../src/testnet-codehashes.js';
+import { testnetProfileTargets } from '../src/testnet-preflight.js';
 import manifest from '../deploy/testnet-97.json' with { type: 'json' };
 
-test('#79 profile matches every address in contracts 068d471 manifest, retaining admission caps', () => {
-  assert.equal(TESTNET_97.sourceCommit, '068d471fc2c4592c12442ef35602ad1d1a7fe9c3');
+test('#79 profile matches every address in contracts b767bf6 manifest, retaining admission caps', () => {
+  assert.equal(TESTNET_97.sourceCommit, 'b767bf6b22bb697a0b86abf8ed683916fe81502d');
   assert.equal(TESTNET_97.gitCommit, manifest.gitCommit);
   assert.deepEqual(TESTNET_97.roles, Object.fromEntries(Object.entries(manifest.roles).map(([k, v]) => [k, v.toLowerCase()])));
   for (const [name, address] of Object.entries(manifest.contracts)) {
@@ -34,15 +38,15 @@ test('#69 chain 97 resolves its manifest without mainnet env overrides', async (
   }
 });
 
-test('#69 39 profile assets and max-leg never query the mainnet seed; unknown assets fail closed', async () => {
+test('#69 93 profile assets and max-leg never query the mainnet seed; unknown assets fail closed', async () => {
   const noDb = async () => { throw new Error('mainnet seed must not be read'); };
   const assets = await listPriceableAssets(noDb, undefined, 97);
-  assert.equal(assets.length, 39);
+  assert.equal(assets.length, 93);
   assert.equal(assets.filter((asset) => asset.isNumeraire).length, 1);
   assert.equal(assets.find((asset) => asset.isNumeraire)?.address, TESTNET_97.contracts.usdt);
   assert.equal(testnetAssets().find((asset) => asset.symbol === 'DOGE')?.decimals, 8);
   const limits = await readMaxLegUsdE8(assets.map((asset) => asset.address), noDb, 97);
-  assert.equal(limits.size, 39);
+  assert.equal(limits.size, 93);
   await assert.rejects(readMaxLegUsdE8(['0x55d398326f99059ff775485246999027b3197955'], noDb, 97), /MAX_LEG_UNAVAILABLE/);
 });
 
@@ -86,7 +90,7 @@ test('#69 profile preflight verifies every codehash and selector; wrong chain, e
     const checks = await checkTestnetProfile(client, expected);
     assert.equal(checks.some((c) => c.level === 'fail'), mode !== 'ok', mode);
     assert.doesNotMatch(JSON.stringify(checks), /secret-rpc/);
-    if (mode === 'ok') assert.equal(checks.length, 157);
+    if (mode === 'ok') assert.equal(checks.length, 319);
   }
 });
 
@@ -127,4 +131,33 @@ test('#69 routing never calls aggregators on 97, including refresh; only testnet
 test('#69 chain 56 keeps its existing address-format diagnostics', () => {
   assert.throws(() => loadSessionKeyConfig({ CHAIN_ID: '56', EXECUTOR_ADDRESS: 'invalid' }),
     (error: unknown) => error instanceof Error && error.message === 'EXECUTOR_ADDRESS must be a 0x-prefixed 20-byte hex address');
+});
+
+
+test('#87 all 92 raw specs/caps align, original caps stay fixed and every runtime target is pinned', async () => {
+  assert.equal(TESTNET_ASSETS.length, 92);
+  assert.equal(Object.keys(launchCaps).length, 38);
+  let extensions = 0;
+  const noDb = async () => { throw new Error('testnet must not query mainnet caps'); };
+  const caps = await readMaxLegUsdE8(TESTNET_ASSETS.map((s) => {
+    const asset = TESTNET_97.assets[s.symbol];
+    return asset.token;
+  }), noDb, 97);
+  for (const spec of TESTNET_ASSETS) {
+    const asset = TESTNET_97.assets[spec.symbol];
+    assert.equal(asset.decimals, spec.decimals); assert.equal(asset.poolFee, spec.fee);
+    const approved = Object.entries(launchCaps).find(([symbol]) => symbol === spec.symbol)?.[1];
+    if (approved !== undefined) assert.equal(asset.maxLegUsdt, approved);
+    else {
+      extensions++;
+      assert.equal(asset.maxLegUsdt, '5000');
+      assert.equal(caps.get(asset.token), 5000n * 100_000_000n);
+      assert.ok(!Object.hasOwn(asset, 'secondary') && !spec.hasFeed);
+    }
+  }
+  assert.equal(extensions, 54);
+  assert.deepEqual(Object.keys(hashes).sort(), testnetProfileTargets().map((t) => t.name).sort());
+  assert.equal(testnetProfileTargets().length, 319);
+  assert.equal(TESTNET_97.assets.TONCOIN.decimals, 9);
+  assert.ok(Object.hasOwn(TESTNET_97.assets, 'Cake'));
 });

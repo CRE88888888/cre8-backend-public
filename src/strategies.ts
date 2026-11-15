@@ -565,7 +565,7 @@ async function publishTypedVersion(strategyId: number, raw: PublishVersionInput,
       deps.validateChain();
     }
     for (const asset of execution.assets) if (asset.yield !== null) {
-      const market = await query('select 1 from strategy_asset_yield_markets where chain_id=$1 and asset=$2 and market_id=$3 and enabled', [chainId,asset.asset,asset.yield.market]);
+      const market = await query(`select 1 from strategy_asset_yield_markets a join yield_markets m on m.chain_id=a.chain_id and m.underlying=a.asset and m.platform_market_id=a.market_id where a.chain_id=$1 and a.asset=$2 and a.market_id=$3 and a.enabled and m.state='active'`, [chainId,asset.asset,asset.yield.market]);
       if (!market.rows.length) throw new ValidationError('YIELD_UNAVAILABLE', 'market is not enabled for this chain and asset');
     }
     // Admit the shared signer before persisting a new immutable version. Busy is safely retryable.

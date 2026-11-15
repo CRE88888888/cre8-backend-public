@@ -1,3 +1,4 @@
+import { cashDifference } from './yield-domain.js';
 import { planContribution } from './asset-plan.js';
 import { minimumFeeReserve } from './rebalance-plan.js';
 import { loadSessionKeyConfig } from './config.js';
@@ -259,6 +260,7 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
       const classified = Object.entries(balances ?? {}).filter(([key]) => key !== 'unclassified_raw')
         .reduce((sum, [, value]) => { if (typeof value !== 'string' || !/^\d+$/.test(value)) throw storageUnavailable(); return sum + BigInt(value); }, 0n);
       const difference = BigInt(observed.amountRaw) - classified;
+      const yieldPending=(await deps.query("select execution_key from yield_actions where chain_id=$1 and portfolio_id=$2 and state in ('reserved','submitted','unknown') limit 1",[p.chainId,id])).rows.length>0;
       const lotAssets = await deps.query(`select a.* from strategy_lot_assets a join strategy_funding_lots l on l.id=a.lot_id where l.chain_id=$1 and l.portfolio_id=$2 order by a.lot_id,a.asset`,[p.chainId,id]);
       const slices = await deps.query(`select s.* from strategy_asset_slices s join strategy_funding_lots l on l.id=s.lot_id where l.chain_id=$1 and l.portfolio_id=$2 order by s.lot_id,s.asset,s.slice_index`,[p.chainId,id]);
       const jobs = await deps.query(`select id::text,kind,lot_id::text,instruction_revision::text,slot_index::text,through_slot_index::text,
@@ -267,7 +269,7 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
       return { portfolioId: id, chainId: p.chainId, version: p.version, execution: version.execution, configHash: version.configHash,
         lotAssets: lotAssets.rows, slices:slices.rows, enabled: p.scheduleState === 'active', automation: p.chainId===97?'enabled':'testnet_only', jobs:jobs.rows,
         defaultAmountUsdt: version.execution.kind==='per_asset'?formatUnits(minimumAssetContribution(version.execution),18):defaultAmountUsdt(version.allocation, p.chainId),
-        cash: { ...observed, unclassifiedRaw: difference >= 0n ? difference.toString() : null, deficitRaw: difference < 0n ? (-difference).toString() : '0' },
+        cash: { ...observed, ...cashDifference(difference,yieldPending) },
         balances, instructions: instructions.rows.map(mapInstruction), lots: lots.rows.map(mapLot) };
       });
     }),

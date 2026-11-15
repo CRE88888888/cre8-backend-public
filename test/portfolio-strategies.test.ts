@@ -363,6 +363,9 @@ test('#83 DB yield publication requires the exact enabled chain/asset/market and
   await query('insert into strategy_asset_yield_markets(chain_id,asset,market_id,enabled) values(97,$1,$2,false)',[basket.assets[0]?.address,market]);
   await assert.rejects(publishVersion(strategy.id,input,owner),denied('YIELD_UNAVAILABLE'));
   await query('update strategy_asset_yield_markets set enabled=true where chain_id=97 and asset=$1 and market_id=$2',[basket.assets[0]?.address,market]);
+  await assert.rejects(publishVersion(strategy.id,input,owner),denied('YIELD_UNAVAILABLE'),'0032 alone cannot admit a market');
+  const receipt=address();
+  await query(`insert into yield_markets(chain_id,market_id,platform_market_id,protocol,underlying,receipt,target,risk_source,underlying_decimals,receipt_decimals,is_simulated,simulated_apr_bps,state) values(97,$1,$2,'venus',$3,$4,$4,$5,18,8,true,500,'active')`,[txHash(),market,basket.assets[0]?.address,receipt,address()]);
   const published=await publishVersion(strategy.id,input,owner);assert.equal(published.executionSchemaVersion,2);assert.deepEqual(published.execution,selected);
   await query('update strategy_asset_yield_markets set enabled=false,updated_at=clock_timestamp() where chain_id=97 and asset=$1 and market_id=$2',[basket.assets[0]?.address,market]);
   assert.deepEqual((await getStrategy(strategy.id)).versions[0]?.execution,selected);

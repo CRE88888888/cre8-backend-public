@@ -1,3 +1,4 @@
+import type { YieldPosition } from './yield-domain.js';
 import { decodeFunctionResult, encodeFunctionData } from 'viem';
 import type { Address, Hex, PublicClient } from 'viem';
 import type { Holding } from './drift.js';
@@ -94,6 +95,9 @@ export type UnpricedAsset = {
 export type PricedHolding = Holding & { priceSource: PriceSource };
 
 export type PositionSnapshot = {
+  /** Separate valuation evidence; never made into spendable underlying holdings. */
+  yieldPositions?: YieldPosition[];
+  accountValueRaw?: bigint | null;
   portfolioId: number;
   /** 這次讀取的塊高；`holdings`／`nativeBalanceWei` 都是在這個塊上讀的。 */
   block: bigint;

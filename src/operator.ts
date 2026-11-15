@@ -546,7 +546,7 @@ async function statusOf(portfolioId: number, deps: StatusDeps): Promise<Portfoli
     account: plan.account,
     holdings,
     unpriced,
-    totalUsdE8: report === null ? null : report.totalUsdE8.toString(),
+    totalUsdE8: plan.snapshot.accountValueRaw===undefined?(report===null?null:report.totalUsdE8.toString()):plan.snapshot.accountValueRaw===null?null:(plan.snapshot.accountValueRaw/10000000000n).toString(),
     targets,
     drift,
     blocked: plan.blocked.map((block) => ({ code: block.code, detail: block.detail })),

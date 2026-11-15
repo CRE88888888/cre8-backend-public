@@ -1,3 +1,4 @@
+import { createYieldService } from './yield-service.js';
 import { createServer as createHttpServer } from 'node:http';
 import { createPublicClient, http, toHex } from 'viem';
 import type { Address } from 'viem';
@@ -169,6 +170,7 @@ export const BUNDLER_TIMEOUT_MS = 30_000;
  * merged over the defaults, so a test can stub one dependency and leave the rest real.
  */
 export type ServerDeps = {
+  yieldService: ReturnType<typeof createYieldService>;
   portfolioStrategies: ReturnType<typeof createPortfolioStrategyService>;
   points: ReturnType<typeof createPointsService>;
   claimFaucetUsdt: typeof claimFaucetUsdt;
@@ -291,6 +293,7 @@ async function defaultListAssets(): Promise<PriceableAsset[]> {
 }
 
 const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
+  yieldService: createYieldService(),
   portfolioStrategies: createPortfolioStrategyService(),
   points: createPointsService(),
   claimFaucetUsdt,
@@ -387,6 +390,19 @@ async function route(
   const segments = url.pathname.split('/').filter((segment) => segment.length > 0);
   const [root] = segments;
 
+  if(root==='yield'&&segments.length===2&&segments[1]==='markets'){
+    if(method!=='GET')return methodNotAllowed(res,['GET']);
+    const chainId=parsePositiveInteger(url.searchParams.get('chainId')??String(getConfig().chainId),'chainId');
+    sendJson(res,200,await deps.yieldService.markets(chainId));return;
+  }
+  if(root==='portfolios'&&segments.length===4&&segments[2]==='yield'&&['consent','exit','revoke'].includes(segments[3]??'')){
+    if(method!=='POST')return methodNotAllowed(res,['POST']);
+    const wallet=await deps.auth.authenticate(req.headers.authorization);
+    await deps.rateLimiter.wallet('plan',wallet);
+    const id=parsePositiveInteger(segments[1]??'','portfolioId'),input=await readJsonBody(req);
+    const result=segments[3]==='exit'?await deps.yieldService.exit(id,wallet,input):segments[3]==='revoke'?await deps.yieldService.revoke(id,wallet,input):await deps.yieldService.consent(id,wallet,input);
+    sendJson(res,200,result);return;
+  }
   if (root === 'portfolios' && segments.length === 3 && ['execution', 'funding-lots', 'buy-funding', 'execution-state'].includes(segments[2] ?? '')) {
     const action = segments[2];
     const expected = action === 'execution' ? 'GET' : 'POST';
@@ -395,7 +411,9 @@ async function route(
     await deps.rateLimiter.wallet('plan', wallet);
     const id = parsePositiveInteger(segments[1] ?? '', 'portfolioId');
     if (action === 'execution') {
-      sendJson(res, 200, await deps.portfolioStrategies.read(id, wallet));
+      const execution=await deps.portfolioStrategies.read(id,wallet);
+      const lending=await deps.yieldService.status(id,wallet);
+      sendJson(res,200,lending===null?execution:{...execution,yield:lending});
     } else {
       const input = await readJsonBody(req);
       const result = action === 'funding-lots' ? await deps.portfolioStrategies.funding(id, wallet, input)

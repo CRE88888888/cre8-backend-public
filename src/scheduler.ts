@@ -1,4 +1,5 @@
 import { assetsMarketOpen } from './trading-calendar.js';
+import { runYieldRound } from './yield-service.js';
 import { assertUserOpCapacity, boundedCallGasLimit, executionBatchSize, MAX_USER_OP_STEPS, userOpGasOverhead } from './execution-batch.js';
 import { EXECUTOR_ABI, EXECUTOR_SELECTOR, PLAN_HASH_ABI } from './chain.js';
 /**
@@ -537,6 +538,7 @@ export type FloorRefreshInput = {
 };
 
 export type SchedulerDeps = {
+  yieldRound?: typeof runYieldRound;
   clock?:()=>Date;
   withDexLock?: typeof withDexLock;
   dexGate?: (chainId:number,portfolioId:number)=>Promise<string|null>;
@@ -878,7 +880,7 @@ const SQL_GET_OPERATION = 'select state, attempts from operations where idempote
 
 // 不依賴 planHash（deadline／價格變了仍擋）。也保護舊版將已送出操作誤寫成 failed 的列。
 const SQL_UNRESOLVED_OPERATIONS = `
-  select idempotency_key, payload_hash, state, user_op_hash, tx_hash, deadline, user_op_nonce, strategy_job_id, strategy_batch_index
+  select idempotency_key, payload_hash, state, user_op_hash, tx_hash, deadline, user_op_nonce, strategy_job_id, strategy_batch_index, to_jsonb(operations)->>'yield_execution_key' as yield_execution_key
     from operations
    where portfolio_id = $1
      and (state in ('pending', 'submitted')
@@ -887,6 +889,7 @@ const SQL_UNRESOLVED_OPERATIONS = `
 `;
 
 type UnresolvedOperation = {
+  yield_execution_key?:string|null;
   strategy_job_id?: string | null; strategy_batch_index?: number | null;
   idempotency_key: string;
   payload_hash: Hex;
@@ -1844,6 +1847,9 @@ export async function runSchedulerOnce(
   const thresholdBps = args.thresholdBps ?? DEFAULT_THRESHOLD_BPS;
   const resolved = resolveDeps({ thresholdBps }, {...deps,clock:deps.clock??(args.now?()=>new Date(now):()=>new Date())});
 
+  // Yield exits/recovery have their own account lock and precede DEX queues, buy throttles and price gates.
+  try { await (deps.yieldRound??runYieldRound)({dryRun,limit}); } catch { resolved.log('[yield] 生息讀值／對帳未完成，保留原部位與預留'); }
+
   let executorPaused: boolean | null = null;
   try {
     const paused = await resolved.readGlobalPaused();
@@ -2189,6 +2195,7 @@ async function decideAndMaybeExecute(
   if (unresolved.length > 0) {
     // dry-run 只能報在途，不能因預演而改 operations 或假稱 ready。
     const op = unresolved[0]!;
+    if(op.yield_execution_key!=null)return {...base,outcome:'blocked',reason:'[YIELD_RECONCILIATION_REQUIRED] 生息由原始快照獨立對帳，不經再平衡路徑重送或釋放'};
     if (op.strategy_job_id != null) return reconcileStrategyOperation(due,ctx,base,op);
     if (ctx.dryRun || unresolved.length > 1) {
       return { ...base, outcome: 'blocked', reason: `portfolio 還在 ${op.state}（${unresolved.length} 筆未決操作），結果未知，先對帳，不重送` };

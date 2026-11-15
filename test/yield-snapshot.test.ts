@@ -1,0 +1,20 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { valuationHoldings, writeSnapshot } from '../src/snapshot.js';
+import { computeDrift } from '../src/drift.js';
+import { WAD } from '../src/yield-domain.js';
+import { yieldFixture } from './fixtures/yield.js';
+import type { PositionSnapshot } from '../src/positions.js';
+test('yield snapshots include receipt claims once, preserve spendable balances, and keep null valuation incomplete',async()=>{
+  const f=yieldFixture(['venus']),p=f.read.positions[0];assert.ok(p);
+  Object.assign(p,{receipt:10n**8n,trackedUnits:10n**8n,observedUnits:10n**8n,claim:2n*WAD,value:2n*WAD});
+  const s:PositionSnapshot={portfolioId:1,block:100n,nativeBalanceWei:0n,holdings:[{asset:f.asset,amountWei:3n*WAD,decimals:18,usdPriceE8:100000000n,priceSource:'numeraire'}],unpriced:[],yieldPositions:[p],accountValueRaw:5n*WAD};
+  const report=computeDrift(valuationHoldings(s),[{asset:f.asset,weightBps:10000}],100);
+  assert.equal(report.totalUsdE8,500000000n);assert.equal(s.holdings[0]?.amountWei,3n*WAD);
+  let params:readonly unknown[]=[];
+  await writeSnapshot(s,report,{query:async(_sql,p=[])=>{params=p;return{rows:[{header_inserted:true,inserted:2,updated:0}]};}});
+  assert.equal(params[3],'500000000');assert.equal(params[8],true);assert.ok(params.includes('yield-receipt'));
+  const bad={...s,accountValueRaw:null,yieldPositions:[{...p,state:'unknown' as const,value:null,receipt:null}]};
+  await writeSnapshot(bad,null,{query:async(_sql,p=[])=>{params=p;return{rows:[{header_inserted:true,inserted:1,updated:0}]};}});
+  assert.equal(params[8],false);assert.equal(params[9],1);assert.equal(params.includes('yield-receipt'),false);
+});

@@ -1,3 +1,4 @@
+import { yieldProfile } from './yield-domain.js';
 import { createPublicClient, http } from 'viem';
 import type { Address, Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
@@ -239,6 +240,10 @@ export async function detectAlerts(
     else failures.push(release);
   }
 
+  const stuck=await detectPortfolioStuck(query,thresholds.stuckHours);
+  if(chainIdFromEnv(env)===97&&yieldProfile()!==null)for(const finding of await detectYieldAttention(query)){
+    const prior=stuck.find(s=>s.portfolioId===finding.portfolioId);if(prior)prior.detail+='；'+finding.detail;else stuck.push(finding);
+  }
   return [
     ...failures,
     ...(await detectSessionKeyExpiry(query, { now, expiryDays: thresholds.keyExpiryDays })),
@@ -250,7 +255,7 @@ export async function detectAlerts(
     })),
     // 卡住：最新快照仍 needs_rebalance 而太久沒有成功執行。放最後是因為它與前三個都不同源
     // （前三個看 operations / session_keys / 鏈上餘額，這個看快照）。
-    ...(await detectPortfolioStuck(query, thresholds.stuckHours)),
+    ...stuck,
   ];
 }
 
@@ -866,4 +871,18 @@ export function createPriceSourceTracker() {
 
 export function priceSourceAlertAssets(detail: string): Address[] {
   return [...detail.matchAll(/^asset (0x[0-9a-fA-F]{40}):/gm)].map((match) => match[1] as Address);
+}
+
+/** A durable receipt/unknown execution needs attention even when direct-asset drift is zero. */
+export async function detectYieldAttention(query:QueryFn):Promise<AlertFinding[]>{
+  const result=await query(`select distinct p.id::text as portfolio_id from portfolios p where
+    exists(select 1 from yield_actions a where a.portfolio_id=p.id and a.state='unknown')
+    or exists(select 1 from yield_events e where e.portfolio_id=p.id and e.state='reorged')
+    or exists(select 1 from yield_positions yp left join yield_position_snapshots s on s.id=yp.latest_snapshot_id
+      where yp.portfolio_id=p.id and (yp.receipt_raw>0 or yp.tracked_units_raw>0) and
+      (yp.exit_state='retry' or s.id is null or s.valuation_state='unknown' or s.observed_at<clock_timestamp()-interval '60 seconds'))`);
+  return result.rows.map(row=>{const id=typeof row==='object'&&row!==null?Reflect.get(row,'portfolio_id'):null;
+    const portfolioId=Number(id);if(!Number.isSafeInteger(portfolioId)||portfolioId<=0)throw new Error('yield alert identity unavailable');
+    return {kind:'portfolio_stuck',severity:'warn',portfolioId,detail:'生息部位待領回或原交易／估值證據不足；保留收據與預留，需持續對帳'};
+  });
 }

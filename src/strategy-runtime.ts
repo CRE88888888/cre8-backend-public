@@ -118,6 +118,7 @@ export async function prepareNewMoney(args:{due:DuePortfolio;plan:PortfolioPlan;
     const monthly=version.execution.rebalance==='monthly'&&last?.last_rebalance_at!=null&&
       (last.last_rebalance_at.getUTCFullYear()!==now.getUTCFullYear()||last.last_rebalance_at.getUTCMonth()!==now.getUTCMonth());
     const drift=version.execution.rebalance==='drift'&&(plan.report?.maxAbsDeltaBps??0)>500;
+    if(!waiting&&(monthly||drift)&&plan.snapshot.yieldPositions?.some(p=>p.receipt===null||p.receipt>0n))return {job:null,context,rebalance:{kind:'blocked',reason:'[YIELD_WITHDRAW_REQUIRED] 基金再平衡須先停止生息並領回，收據債權不是可賣出餘額'}};
     if(!waiting&&(monthly||drift)){context.reserve=await deps.rebalanceReserve(plan);return {job:null,context,useTargetWeights:true,rebalance:{kind:'noop',reason:'全hold基金設定再平衡'}};}
   }
   if(!job||job.state==='completed'||job.state==='paused'||!context.enabled||!(context.marketOpenFor?.(Object.keys(job.remaining_input))??context.marketOpen)||job.next_check_at>now){

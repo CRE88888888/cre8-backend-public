@@ -1,3 +1,5 @@
+import { yieldProfile,object as yieldObject,raw as yieldRaw } from './yield-domain.js';
+import { readYieldAccount } from './yield-reader.js';
 import { createPublicClient, http } from 'viem';
 import type { Address, PublicClient } from 'viem';
 import { testnetAssets } from './testnet-profile.js';
@@ -132,7 +134,7 @@ export type AllocationCheck = {
 
 /** 拒算漂移的原因。空的 `blocked` = 有報告。 */
 export type PlanBlock = {
-  code: 'UNPRICED_HOLDINGS' | 'ALLOCATION_MISMATCH';
+  code: 'UNPRICED_HOLDINGS' | 'ALLOCATION_MISMATCH' | 'YIELD_VALUATION_UNAVAILABLE';
   detail: string;
 };
 
@@ -471,7 +473,22 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
     }),
   ]);
 
+  const yieldConfig = chainId===97 ? yieldProfile() : null;
+  if(yieldConfig!==null){
+    const lending=await readYieldAccount(client,yieldConfig,account,{block});
+    snapshot.yieldPositions=lending.positions;
+    snapshot.accountValueRaw=snapshot.unpriced.some(a=>a.amountWei>0n)?null:lending.accountValue;
+    try{
+      const history=await query('select distinct block_number::text,block_hash,state from yield_events where chain_id=$1 and portfolio_id=$2',[chainId,portfolioId]);
+      for(const row of history.rows){const e=yieldObject(row);
+        if(e.state!=='confirmed'||(await client.getBlock({blockNumber:yieldRaw(e.block_number)})).hash!==e.block_hash){snapshot.accountValueRaw=null;break;}
+      }
+    }catch{snapshot.accountValueRaw=null;}
+
+  }
+
   const blocked: PlanBlock[] = [];
+  if(snapshot.accountValueRaw===null)blocked.push({code:'YIELD_VALUATION_UNAVAILABLE',detail:'生息或帳戶估值未知，停止新增風險；純領出繼續獨立處理'});
   const heldUnpriced = snapshot.unpriced.filter((asset) => asset.amountWei > 0n);
   if (heldUnpriced.length > 0) {
     blocked.push({
@@ -499,13 +516,24 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
     chainId,
     snapshot,
     scan,
-    report: blocked.length === 0 ? computeDrift(snapshot.holdings, targets, thresholdBps) : null,
+    report: blocked.length === 0 ? computeDrift(valuationHoldings(snapshot), targets, thresholdBps) : null,
     blocked,
     targets,
     pinnedVersion: { version: pinned, onchainStrategyId: enrolledStrategyId, paused: enrollment[2] },
     allocationCheck,
     thresholdBps,
   };
+}
+
+/** Valuation-only vector. It never replaces the actual balances used by the swap planner. */
+export function valuationHoldings(snapshot:PositionSnapshot):Holding[]{
+  const values=new Map<string,bigint>();
+  for(const h of snapshot.holdings)values.set(h.asset,(values.get(h.asset)??0n)+usdValueE8(h));
+  for(const p of snapshot.yieldPositions??[]){
+    if(p.value===null)continue;
+    values.set(p.market.asset,(values.get(p.market.asset)??0n)+p.value/E8_TO_E18);
+  }
+  return [...values].map(([asset,value])=>({asset,amountWei:value,decimals:8,usdPriceE8:E8}));
 }
 
 // ---------------------------------------------------------------------------
@@ -703,6 +731,14 @@ export async function writeSnapshot(
     });
   }
 
+  for(const p of snapshot.yieldPositions??[]){
+    if(p.receipt===null||p.receipt===0n&&p.state==='known')continue;
+    if(seen.has(p.market.receipt))throw new Error('receipt already valued as a direct asset');
+    seen.add(p.market.receipt);
+    rows.push({asset:p.market.receipt,amount:formatNumeric18(tokenAmountTo18(p.receipt,p.receiptDecimals)),
+      usdValue:p.value===null?null:formatNumeric18(p.value),priceSource:p.value===null?null:'yield-receipt',pricedAt:p.value===null?null:p.at});
+    if(p.value!==null)pricedTotal+=p.value/E8_TO_E18;
+  }
   if (report !== null && pricedTotal !== report.totalUsdE8) {
     throw new Error(
       `快照能重算的總額 ${pricedTotal}（E8）與報告的 totalUsdE8 ${report.totalUsdE8} 不同：` +
@@ -710,7 +746,7 @@ export async function writeSnapshot(
     );
   }
 
-  const complete = report !== null;
+  const complete = report !== null && snapshot.accountValueRaw!==null;
   const thresholdBps = report?.thresholdBps ?? deps.thresholdBps ?? DEFAULT_THRESHOLD_BPS;
   if (!Number.isInteger(thresholdBps) || thresholdBps < 0 || thresholdBps > 10_000) {
     throw new RangeError(`thresholdBps 必須是 0..10000 的整數（收到 ${String(thresholdBps)}）`);
@@ -720,14 +756,14 @@ export async function writeSnapshot(
     snapshot.block.toString(),
     snapshot.nativeBalanceWei.toString(),
     // 拒算時這是「已定價部位的部分總額」，不是投組總值；完整的說明在 0008 的 COMMENT。
-    (report?.totalUsdE8 ?? pricedTotal).toString(),
-    report?.grossDriftBps ?? 0,
-    report?.maxAbsDeltaBps ?? 0,
+    pricedTotal.toString(),
+    complete ? report?.grossDriftBps ?? 0 : 0,
+    complete ? report?.maxAbsDeltaBps ?? 0 : 0,
     thresholdBps,
-    report?.needsRebalance ?? false,
+    complete ? report?.needsRebalance ?? false : false,
     complete,
     // 只有「持有但無價」會擋下漂移，所以 0 餘額的無價標的不計入：那是資料缺口，不是這一輪的 blocker。
-    snapshot.unpriced.filter((asset) => asset.amountWei > 0n).length,
+    snapshot.unpriced.filter((asset) => asset.amountWei > 0n).length + (snapshot.yieldPositions??[]).filter(p=>p.state==='unknown').length,
     pinnedVersion,
     // 策略外持倉的顆數：**觀測訊號**，不影響 `complete`。它賣不掉（AtpExecutor.sol:180-182），
     // 所以不在漂移的分母裡；運維仍然要看得到「這帳戶收到過什麼」。

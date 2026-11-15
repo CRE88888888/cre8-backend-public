@@ -72,7 +72,7 @@ type Fixture=Awaited<ReturnType<typeof fixture>>;
 async function balances(f:Fixture){return (await query<{unallocated_hold_raw:string;stack_prefund_raw:string;allocated_cash_raw:string;reserved_input_raw:string;reserved_fee_raw:string}>(
   'select unallocated_hold_raw::text,stack_prefund_raw::text,allocated_cash_raw::text,reserved_input_raw::text,reserved_fee_raw::text from strategy_cash_balances where portfolio_id=$1',[f.id])).rows[0];}
 async function job(f:Fixture){return readJob(query,f.context);}
-async function complete(f:Fixture,j:StrategyJob,input=j.remaining_input,feePaid=0n){
+async function complete(f:Fixture,j:StrategyJob,input=j.remaining_input,feePaid=0n,settlementRun=run){
   const userOpHash=hash(),txHash=hash();
   const op=await withTransaction(async client=>{
     const index=Number((await client.query<{n:number}>('select coalesce(max(batch_index)+1,0) as n from strategy_job_batches where job_id=$1',[j.id])).rows[0]?.n);
@@ -82,8 +82,42 @@ async function complete(f:Fixture,j:StrategyJob,input=j.remaining_input,feePaid=
       values($1,'rebalance','pending',$2,$3,'2030-01-01',0,$4,$5) returning id`,[f.id,hash(),hash(),j.id,index])).rows[0];assert.ok(row);
     await client.query("update operations set state='submitted',user_op_hash=$2,tx_hash=$3 where id=$1",[row.id,userOpHash,txHash]);return row.id;
   });
-  await settleStrategyBatch(run,f.context,op,{received:Object.fromEntries(Object.keys(input).map(a=>[a,'100'])),fees:{},feePaid,blockNumber:11n,blockHash:hash()});
+  await settleStrategyBatch(settlementRun,f.context,op,{received:Object.fromEntries(Object.keys(input).map(a=>[a,'100'])),fees:{},feePaid,blockNumber:11n,blockHash:hash()});
 }
+test('#100 DB 100-USDT capacity split spends one reserve, resumes at zero reserve and never rebuys released cash',async()=>{
+  const f=await fixture();await f.fund(100n*U);const s=scheduler(f);assert.ok(s.deps.newMoney);
+  s.deps.newMoney.policy=async()=>({reserve:s.sends.length===0?R:0n,caps:new Map([[a,25n*U],[b,25n*U]]),buyLimit:50n*U,cash:10000n*U});
+  const reconcile=s.deps.reconcileRebalance;assert.ok(reconcile);
+  s.deps.reconcileRebalance=async input=>{const result=await reconcile(input);if(result.kind==='found'&&result.outcome.batchEvidence)result.outcome.batchEvidence.feePaid=s.sends.length===1?R-1n:0n;return result;};
+  assert.equal((await s.once()).results[0]?.outcome,'executed');
+  const first=await job(f);assert.ok(first);assert.equal(first.fee_reserve_raw,R.toString());
+  assert.equal(sumInputs(first.remaining_input),50n*U);assert.equal(first.remaining_fee_raw,'1');
+  assert.equal((await s.once(new Date(start.getTime()+60000))).results[0]?.outcome,'executed');
+  assert.equal(await job(f),null);const saved=await balances(f);assert.equal(saved?.reserved_fee_raw,'0');assert.equal(saved?.allocated_cash_raw,'1');
+  assert.equal((await s.once(new Date(start.getTime()+120000))).results[0]?.outcome,'noop');assert.equal(s.sends.length,2);
+});
+test('#100 DB fee release rolls back atomically and duplicate confirmation releases only once',async()=>{
+  const f=await fixture();await f.fund(200n*U);
+  const initial=(await f.reserve({...f.context,reserve:2n*R,caps:new Map([[a,50n*U],[b,50n*U]])}))?.job;assert.ok(initial);
+  assert.equal(initial.fee_reserve_raw,(2n*R).toString(),'persist the oversized reserve carried by pre-upgrade jobs');
+  // The existing settlement contract also covers pre-upgrade over-reservations:
+  // remaining_fee_raw is historical reserve minus paid, while active cash is released.
+  const before=await balances(f);
+  const failed:WithTransactionFn=fn=>run(async client=>fn({query:async(sql,params)=>{
+    const result=await client.query(sql,params);
+    if(sql.includes('allocated_cash_raw=allocated_cash_raw+$5::numeric'))throw new Error('fee release rollback');
+    return result;
+  }}));
+  await assert.rejects(complete(f,initial,initial.remaining_input,R/2n,failed),/fee release rollback/);
+  assert.deepEqual(await balances(f),before);
+  const op=(await query<{id:string}>('select id from operations where strategy_job_id=$1',[initial.id])).rows[0];assert.ok(op);
+  assert.equal((await query<{state:string}>('select state from operations where id=$1',[op.id])).rows[0]?.state,'submitted');
+  const evidence={received:Object.fromEntries(Object.keys(initial.remaining_input).map(a=>[a,'100'])),fees:{},feePaid:R/2n,blockNumber:11n,blockHash:hash()};
+  await settleStrategyBatch(run,f.context,op.id,evidence);
+  const saved=await balances(f);assert.equal(saved?.allocated_cash_raw,(BigInt(initial.fee_reserve_raw)-R/2n).toString());
+  await settleStrategyBatch(run,f.context,op.id,evidence);
+  assert.deepEqual(await balances(f),saved);assert.equal((await f.reserve())?.job,null);
+});
 test('#83 DB V3 hold combines same-time lots once and allocates 50% cash only once',async()=>{
   const f=await fixture('hold',5000);await f.fund(100n*U);await f.fund(120n*U);
   const first=(await f.reserve())?.job;assert.ok(first);assert.equal(BigInt(first.amount_raw)+BigInt(first.fee_reserve_raw),110n*U);
@@ -200,9 +234,9 @@ test('#83 scheduler partial batches persist vectors and never exceed A even with
   assert.ok(s.deps.newMoney);
   s.deps.newMoney.policy=async()=>({reserve:R,caps:new Map([[a,50n*U],[b,50n*U]]),buyLimit:UINT256_MAX,cash:10000n*U});
   assert.equal((await s.once()).results[0]?.outcome,'executed');const first=await job(f);assert.ok(first);
-  const afterFirst=sumInputs(first.remaining_input);assert.ok(afterFirst>0n);assert.ok(afterFirst<100n*U);
+  const afterFirst=sumInputs(first.remaining_input);assert.ok(afterFirst>0n);assert.ok(afterFirst<=100n*U);
   assert.equal((await s.once(new Date(start.getTime()+60000))).results[0]?.outcome,'executed');assert.equal(await job(f),null);
-  const spent=s.sends.flatMap(s=>s.steps).reduce((sum,s)=>sum+s.amountIn,0n);assert.equal(spent,200n*U-2n*R);
+  const spent=s.sends.flatMap(s=>s.steps).reduce((sum,s)=>sum+s.amountIn,0n);assert.equal(spent,200n*U-R);
   assert.notEqual(planHashFor(s.sends[0]?.steps??[],s.sends[0]?.deadline??0n),planHashFor(s.sends[1]?.steps??[],s.sends[1]?.deadline??0n));
 });
 test('#83 scheduler DB unknown settlement keeps pending; retry restores once after DB recovery',async()=>{
@@ -417,10 +451,10 @@ test('#83 pausing a partially confirmed mixed job releases only its unspent hold
   const f=await fixture('hold',5000,4,'none',{kind:'stack',every:'daily',weekday:null,timeUtc:'13:00',slices:4});
   await f.fund(800n*U);
   const initial=(await f.reserve({...f.context,caps:new Map([[a,100n*U],[b,25n*U]])}))?.job;assert.ok(initial);
-  assert.equal(BigInt(initial.amount_raw)+BigInt(initial.fee_reserve_raw),250n*U);assert.equal(initial.fee_reserve_raw,(2n*R).toString());
+  assert.equal(BigInt(initial.amount_raw)+BigInt(initial.fee_reserve_raw),250n*U);assert.equal(initial.fee_reserve_raw,R.toString());
   const half=Object.fromEntries(Object.entries(initial.remaining_input).map(([asset,raw])=>[asset,(BigInt(raw)/2n).toString()]));
-  await complete(f,initial,half,R);
-  const partial=await job(f);assert.ok(partial);assert.equal(partial.state,'running');assert.equal(partial.remaining_fee_raw,R.toString());
+  await complete(f,initial,half,R/2n);
+  const partial=await job(f);assert.ok(partial);assert.equal(partial.state,'running');assert.equal(partial.remaining_fee_raw,(R/2n).toString());
   const confirmed=(await query<{state:string;input_raw:Record<string,string>}>('select state,input_raw from strategy_job_batches where job_id=$1',[initial.id])).rows;assert.equal(confirmed.length,1);assert.equal(confirmed[0]?.state,'confirmed');
   await query("update portfolios set schedule_state='paused' where id=$1",[f.id]);
   await f.reserve({...f.context,enabled:false,now:new Date(start.getTime()+60000)});
@@ -428,7 +462,7 @@ test('#83 pausing a partially confirmed mixed job releases only its unspent hold
   assert.equal(cancelled.state,'cancelled');assert.deepEqual(cancelled.remaining_input,partial.remaining_input);assert.equal(cancelled.remaining_fee_raw,partial.remaining_fee_raw);
   const saved=await balances(f);assert.ok(saved);assert.equal(saved.reserved_input_raw,'0');assert.equal(saved.reserved_fee_raw,'0');assert.equal(saved.allocated_cash_raw,(400n*U).toString());
   assert.equal(saved.unallocated_hold_raw,(100n*U).toString());assert.equal(saved.stack_prefund_raw,(175n*U).toString());
-  assert.equal(BigInt(saved.unallocated_hold_raw)+BigInt(saved.stack_prefund_raw)+BigInt(saved.allocated_cash_raw)+sumInputs(half)+R,800n*U);
+  assert.equal(BigInt(saved.unallocated_hold_raw)+BigInt(saved.stack_prefund_raw)+BigInt(saved.allocated_cash_raw)+sumInputs(half)+R/2n,800n*U);
   assert.deepEqual((await query<{state:string;input_raw:Record<string,string>}>('select state,input_raw from strategy_job_batches where job_id=$1',[initial.id])).rows,confirmed,'pausing cannot reverse the confirmed child batch');
   assert.equal(await job(f),null);
 });
@@ -595,6 +629,7 @@ test('#92 93-asset DB job survives timeout/restart and buys each original input 
   s.setStatus('unknown');
   assert.equal((await s.once(marketAt)).results[0]?.outcome,'blocked');
   const original=await job(f);assert.ok(original);assert.equal(Object.keys(original.original_input).length,92);
+  assert.equal(original.fee_reserve_raw,R.toString());
   const attempts=(await query('select payload_hash,user_op_nonce from operations where portfolio_id=$1',[f.id])).rows;
   assert.equal((await s.once(marketAt)).results[0]?.outcome,'executed');assert.equal(s.sends.length,1,'unknown original must reconcile without sending a different subset');
   assert.deepEqual((await query('select payload_hash,user_op_nonce from operations where portfolio_id=$1',[f.id])).rows,attempts);
@@ -604,7 +639,7 @@ test('#92 93-asset DB job survives timeout/restart and buys each original input 
     assert.equal((await s.once(new Date(marketAt.getTime()+(round+1)*60000))).results[0]?.outcome,'executed');
   }
   assert.equal(await job(f),null);
-  assert.ok(s.sends.length>1&&s.sends.every(send=>send.steps.length<=16));
+  assert.equal(s.sends.length,7);assert.ok(s.sends.every(send=>send.steps.length<=16));
   assert.ok((s.sends.at(-1)?.steps.length??16)<16);
   const spent:Record<string,bigint>={};
   for(const send of s.sends)for(const step of send.steps)spent[step.tokenOut.toLowerCase()]=(spent[step.tokenOut.toLowerCase()]??0n)+step.amountIn;
@@ -618,7 +653,7 @@ test('#92 unequal 17-asset job shares its whale across children and settles the 
   const f=await fixture('hold',0,4,'none',undefined,[...Array.from({length:16},()=>20),9680],17);
   await f.fund(1000n*U);
   const s=scheduler(f);assert.equal((await s.once(marketAt)).results[0]?.outcome,'executed');
-  const original=await job(f);assert.ok(original);assert.equal(BigInt(original.fee_reserve_raw),2n*R);
+  const original=await job(f);assert.ok(original);assert.equal(BigInt(original.fee_reserve_raw),R);
   assert.equal((await s.once(new Date(marketAt.getTime()+60000))).results[0]?.outcome,'executed');
   assert.equal(await job(f),null);assert.equal(s.sends.length,2);
   const spent:Record<string,bigint>={};
@@ -636,10 +671,10 @@ test('#92 two large positions distribute across 18-asset DB batches at exact 1/5
   const f=await fixture('hold',0,4,'none',undefined,[...Array.from({length:16},()=>200),3400,3400],18);
   await f.fund(100n*U);const s=scheduler(f);
   assert.equal((await s.once(marketAt)).results[0]?.outcome,'executed');
-  const original=await job(f);assert.ok(original);assert.equal(BigInt(original.fee_reserve_raw),2n*R);
+  const original=await job(f);assert.ok(original);assert.equal(BigInt(original.fee_reserve_raw),R);
   assert.equal((await s.once(new Date(marketAt.getTime()+60000))).results[0]?.outcome,'executed');assert.equal(await job(f),null);
   const spent:Record<string,bigint>={};assert.equal(s.sends.length,2);
-  for(const send of s.sends){assert.equal(send.steps.length,9);assert.equal(send.steps.reduce((sum,step)=>sum+step.amountIn,R),50n*U);
+  for(const [index,send] of s.sends.entries()){assert.ok(send.steps.length<=16);assert.equal(send.steps.reduce((sum,step)=>sum+step.amountIn,index===0?R:0n),50n*U);
     for(const step of send.steps){assert.ok(step.amountIn>=U);spent[step.tokenOut]=(spent[step.tokenOut]??0n)+step.amountIn;}}
   assert.deepEqual(Object.fromEntries(Object.entries(spent).map(([a,n])=>[a,n.toString()])),original.original_input);
 });

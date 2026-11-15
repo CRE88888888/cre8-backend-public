@@ -58,14 +58,16 @@ export function assertUserOpCapacity(steps: number, gas: bigint): void {
  * those groups. Every raw unit stays in the original asset's budget. No new
  * principal is created. Only final installments may include a positive sub-1 remainder.
  */
-export function executionInputGroups(inputs: Record<string,string>, limit: number, reserve: bigint, finalAssets: ReadonlySet<string> = new Set()): Record<string,string>[] | null {
-  const unit = 10n ** 18n, minimum = 50n * unit - reserve;
+export function executionInputGroups(inputs: Record<string,string>, limit: number, reserve: bigint, finalAssets: ReadonlySet<string> = new Set(), feeWindow=false): Record<string,string>[] | null {
+  const unit = 10n ** 18n;
+  const minimum=(index:number)=>50n*unit-(!feeWindow||index===0?reserve:0n);
   if (reserve < 0n) throw new RangeError('invalid fee reserve');
   const entries = Object.entries(inputs).filter(([,raw])=>BigInt(raw)>0n);
   const groups = executionGroups(entries,limit).map(group=>Object.fromEntries(group));
   const sum = (group: Record<string,string>)=>Object.values(group).reduce((n,raw)=>n+BigInt(raw),0n);
   if (!entries.length || entries.some(([asset,raw])=>BigInt(raw)<unit&&!finalAssets.has(asset))) return null;
-  if (groups.every(group=>sum(group)>=minimum)) return groups;
+  if(feeWindow)groups.sort((a,b)=>sum(a)<sum(b)?-1:sum(a)>sum(b)?1:0);
+  if (groups.every((group,i)=>sum(group)>=minimum(i))) return groups;
   // Spread multiple large positions before splitting one donor. Grouping only
   // by entry order can strand a valid small tail beside two fully funded groups.
   const byBudget=[...entries].sort((a,b)=>BigInt(a[1])>BigInt(b[1])?-1:BigInt(a[1])<BigInt(b[1])?1:a[0].localeCompare(b[0]));
@@ -75,7 +77,8 @@ export function executionInputGroups(inputs: Record<string,string>, limit: numbe
     const child=candidates[0];if(!child)throw new Error('execution group capacity mismatch');
     child[asset]=raw;
   }
-  if(balanced.every(group=>sum(group)>=minimum))return balanced;
+  if(feeWindow)balanced.sort((a,b)=>sum(a)<sum(b)?-1:sum(a)>sum(b)?1:0);
+  if(balanced.every((group,i)=>sum(group)>=minimum(i)))return balanced;
   if (limit===1) return null;
   const sorted = [...entries].sort((a,b)=>BigInt(a[1])<BigInt(b[1])?-1:BigInt(a[1])>BigInt(b[1])?1:a[0].localeCompare(b[0]));
   const donor = sorted.pop();
@@ -83,8 +86,8 @@ export function executionInputGroups(inputs: Record<string,string>, limit: numbe
   const children = executionGroups(sorted,limit-1).map(group=>Object.fromEntries(group));
   if (!children.length) return null;
   let left = BigInt(donor[1]);
-  for (const child of children) {
-    const needed = minimum-sum(child);
+  for (const [index,child] of children.entries()) {
+    const needed = minimum(index)-sum(child);
     // Reserve a >=1 leg in each child. This also leaves room to distribute the
     // remainder without ever introducing a dust-only transaction.
     const amount = needed>unit?needed:unit;

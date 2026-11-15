@@ -4,7 +4,7 @@ import type { AssetExecution, AssetMode } from './strategy-execution.js';
 import type { FundingLot, JobContext, StrategyJob } from './strategy-jobs.js';
 import { lockCash, readJob, unresolvedSql, cancelJob } from './strategy-jobs.js';
 import { assetBatchBudget, assetPeriod } from './asset-plan.js';
-import { addInputs, basketBatch, sumInputs, USDT_UNIT as U } from './new-money-plan.js';
+import { addInputs, basketBatch, sumInputs, USDT_UNIT as U, windowCapacityFits } from './new-money-plan.js';
 import type { InputVector } from './new-money-plan.js';
 import type { SchedulerQueryFn, WithTransactionFn } from './scheduler.js';
 
@@ -127,7 +127,7 @@ export async function prepareAssetJob(run:WithTransactionFn,c:JobContext,config:
   due=due.filter(s=>!dust.has(s.asset));budgets={};for(const s of due)budgets=addInputs(budgets,{[s.asset]:s.budget.toString()});
   await completeAssetSchedules(query,c.portfolioId);
   if(!due.length)return {job:null,reason:'[DEFERRED_MIN_ASSET] 小於1 USDT，留至該資產下期'};
-  const budget=assetBatchBudget(budgets,c.reserve,c.caps,c.buyLimit,c.batchStepLimit,finalAssets);
+  const budget=assetBatchBudget(budgets,c.reserve,c.caps,c.buyLimit,c.batchStepLimit,finalAssets,c.chainId===97);
   if(!budget)return {job:null,reason:'[BASKET_WAITING] 完整合單門檻、容量或額度不足'};
   const end=due.reduce((a,b)=>a.end<b.end?a:b).end;
   const prior=await query("select id from strategy_jobs where chain_id=$1 and portfolio_id=$2 and kind='asset' and slot_at=$3",[c.chainId,c.portfolioId,slot]);
@@ -142,8 +142,10 @@ export async function prepareAssetJob(run:WithTransactionFn,c:JobContext,config:
     if(s.mode.kind==='hold')hold+=s.budget;else stack+=s.budget;
   }
   const largest=basketBatch(inputs,budget.count);
+  const capacity=c.chainId===97?windowCapacityFits(inputs,budget.count,c.reserve,c.caps,c.buyLimit):sumInputs(largest)<=c.buyLimit&&
+    Object.entries(largest).every(([a,v])=>{const cap=c.caps.get(a);return cap===null||(cap!==undefined&&BigInt(v)<=cap);});
   if(Object.entries(inputs).some(([asset,v])=>BigInt(v)/budget.count<(finalAssets.has(asset)?1n:U))||sumInputs(largest)>c.buyLimit||
-    Object.entries(largest).some(([a,v])=>{const cap=c.caps.get(a);return cap===undefined||(cap!==null&&BigInt(v)>cap);})){
+    !capacity){
     return {job:null,reason:'[BASKET_WAITING] 逐來源費用尾差超過容量或低於門檻'};
   }
   const job=(await query(`insert into strategy_jobs(chain_id,portfolio_id,kind,asset_strategy_id,asset_version,slot_at,window_end_at,amount_raw,fee_reserve_raw,allocated_cash_raw,original_input,remaining_input,remaining_fee_raw,state,next_check_at)

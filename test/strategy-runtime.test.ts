@@ -12,13 +12,15 @@ import type { DuePortfolio, SchedulerQueryFn } from '../src/scheduler.js';
 test('#92 policy preserves buyAllowance raw units and converts only USD-E8 leg limits; failures cannot authorize buys', async () => {
   const U=10n**18n,cash=P.contracts.usdt,asset=P.assets.WBNB.token,account=P.roles.operator;
   const abi=parseAbi(['function oracle() view returns(address)','function buyAllowance(address) view returns(uint256,uint256,uint64)',
-    'function minBatchFee() view returns(uint256)','function minFeeTopUp(uint256,uint256) view returns(uint256)','function effectiveFeeBps(uint256) view returns(uint16)',
+    'function minBatchFee() view returns(uint256)','function minFeeTopUp(uint256,uint256) view returns(uint256)','function minFeeDue(address,uint256) view returns(uint256)',
+    'function minFeeWindowOf(address) view returns(uint64,uint192,uint256)','function effectiveFeeBps(uint256) view returns(uint16)',
     'function oracleOf(address) view returns(address)','function pool() view returns(address)','function fee() view returns(uint24)',
     'function previewSwap(address,address,uint256) view returns(uint256,uint256)','function token0() view returns(address)',
     'function slot0() view returns(uint160,int24,uint16,uint16,uint16,uint32,bool)','function liquidity() view returns(uint128)']);
   const uppers:bigint[]=[];
   const state={cap:1100n*U,bought:0n,limit:'5000',failure:'',uppers};
   const client=createPublicClient({chain:bscTestnet,transport:custom({request:async({method,params})=>{
+    if(method==='eth_getBlockByNumber')return {number:'0x14',timestamp:'0x2710',transactions:[]};
     assert.equal(method,'eth_call');assert.ok(Array.isArray(params));const raw:unknown=params[0];
     assert.ok(typeof raw==='object'&&raw!==null);const data:unknown=Reflect.get(raw,'data');assert.ok(typeof data==='string'&&isHex(data));
     const call=decodeFunctionData({abi,data});assert.equal(params[1],'0x14');
@@ -29,6 +31,8 @@ test('#92 policy preserves buyAllowance raw units and converts only USD-E8 leg l
       case 'buyAllowance':return result([state.cap,state.bought,0n]);
       case 'minBatchFee':return result(3n*U/10n);
       case 'minFeeTopUp':return result(27n*U/100n);
+      case 'minFeeWindowOf':return result([10000n,100n*U,2n*U/10n]);
+      case 'minFeeDue':assert.equal(call.args[0].toLowerCase(),account);return result(0n);
       case 'effectiveFeeBps':return result(10);
       case 'oracleOf':return result(P.assets.WBNB.oracle);
       case 'pool':return result(P.assets.WBNB.pool);
@@ -55,6 +59,9 @@ test('#92 policy preserves buyAllowance raw units and converts only USD-E8 leg l
   state.limit='5000';state.bought=1078n*U;assert.equal((await deps.policy(due,plan,[asset])).buyLimit,0n);
   state.bought=0n;state.cap=0n;assert.equal((await deps.policy(due,plan,[asset])).buyLimit,0n);
   state.cap=1100n*U;
+  const window=defaultNewMoneyDeps(()=>client,()=>P.contracts.executor,()=>P.contracts.registry,query,97);
+  assert.equal((await window.policy(due,plan,[asset])).reserve,0n);
+  assert.equal(await window.rebalanceReserve(plan),0n,'all-hold rebalance shares the account window');
   for(const failure of ['buyAllowance','DB','missing','previewSwap','slot0']){
     state.failure=failure;
     await assert.rejects(deps.policy(due,plan,[asset]),(error:unknown)=>error instanceof Error&&!error.message.includes('credential'));

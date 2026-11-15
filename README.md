@@ -564,7 +564,8 @@ curl -s -X POST "$API/strategies/1/versions" -H "authorization: Bearer $TOKEN" -
 - 未提供 BSC USDT（`0x55d398326f99059fF775485246999027B3197955`）時，自動在最後補上
   `{ address: "0x55d398326f99059ff775485246999027b3197955", symbol: "USDT", weightBps: 0 }`，不調整原有權重。
   回傳、DB 與鏈上 `version.assets` 都包含此列，讓存入的 USDT 能被核准並配置到目標資產。
-  已提供 USDT 時保留其權重、不重複補列。單筆 UserOp 最多 16 步，買入依已持有資產數縮小；送出前驗 prepared UserOp 總 gas ≤14M。chain 97 的額外 gas 餘裕以此容量為限，預留 50k 給最終 preparation，絕不低於 bundler 原始估算，仍用實際 gas 上限模擬再送。大檔基金保留原投入向量、分批對帳，建立 job 時一次預留各子批費用，子批仍須滿足 1／50 USDT 門檻。
+  已提供 USDT 時保留其權重、不重複補列。單筆 UserOp 最多 16 步，買入依已持有資產數縮小；送出前驗 prepared UserOp 總 gas ≤14M。chain 97 的額外 gas 餘裕以此容量為限，預留 50k 給最終 preparation，絕不低於 bundler 原始估算，仍用實際 gas 上限模擬再送。大檔基金保留原投入向量、分批對帳，子批仍須滿足 1／50 USDT 門檻。
+- chain 97 的最低費按同帳戶一小時窗口計算：job 只預留一次最低費差額，比例費仍從換幣輸出扣除；只有第一個子批可把這筆預留算入 50 USDT 門檻，後續子批須留下完整 50 USDT 本金。送出前以最新區塊的 `minFeeDue(account, notional)` 核對現金、授權和原 job 費用上限；跨窗口不足就擋下並保留原向量，不挪用其他投入。完成後依收據實付金額把多預留的部分釋放到 `allocated_cash_raw`，不成為新本金。`remaining_fee_raw` 依 DB 契約保留歷史「預留減實付」，已完成 job 不再占用現金預留。chain 56 保留舊的每批預留算法與最低費介面。
 - chain 97 每帳戶每日 gas 預設 100M、無預設美元上限；主網維持 10M gas 與 0.30 USD，環境變數覆寫仍有效。chain 97 代付預設每帳戶每日 60 次、100M gas、無每帳戶 wei 上限；全站每日仍限制 0.1 tBNB。顯式 `PAYMASTER_ACCOUNT_DAILY_WEI`（含 0）仍套用。
   建立基金的初版與後續版本皆走此發布規則；不修改既有版本或既有投組固定的版本。
 - 買賣的預設 80 bps 只計價格衝擊、不含已知 oracle 參考池費；總成本上限為池費 + 80 bps，若超過該資產 `maxSlippageBps`，以原 oracle floor 的較嚴限制為準。實際路由報價、平台費、buffer 與送出前刷新仍必須通過。此規則也影響主網：DOGE 的 1% 池費不再單獨耗盡原 80 bps 預算；不修改鏈上滑價參數。`buyAllowance` 已是 USDT raw 單位，不再乘上 USD-E8 的換算倍率。

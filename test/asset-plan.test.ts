@@ -136,3 +136,16 @@ test('#92 two large positions reserve exactly two fees at the 100-USDT contribut
   assert.equal(planned.fee,2n*R);assert.equal(planned.count,1n);assert.equal(sumInputs(planned.inputs)+planned.fee,100n*U);
   for(const [asset,raw] of Object.entries(budgets))assert.equal(BigInt(planned.inputs[asset]??'0'),BigInt(raw)*9946n/10000n);
 });
+
+test('#100 window reserves one top-up across 92 assets / seven children and a 100-USDT split',()=>{
+  const addresses=Object.values(TESTNET_97.assets).map(a=>a.token);
+  const budgets=Object.fromEntries(addresses.map(a=>[a,(100n*U).toString()]));
+  const caps=new Map(addresses.map(a=>[a,null]));
+  const large=assetBatchBudget(budgets,R,caps,UINT256_MAX,14,new Set(),true);
+  assert.ok(large);assert.equal(large.fee,R);assert.equal(sumInputs(large.inputs)+large.fee,9200n*U);
+  const upper=assetBatchBudget({[a]:UINT256_MAX.toString()},R,new Map([[a,null]]),UINT256_MAX,16,new Set(),true);
+  assert.ok(upper);assert.equal(sumInputs(upper.inputs)+upper.fee,UINT256_MAX);
+  const small=assetBatchBudget({[a]:(50n*U).toString(),[b]:(50n*U).toString()},R,new Map([[a,25n*U],[b,25n*U]]),50n*U,16,new Set(),true);
+  assert.ok(small);assert.equal(small.count,2n);assert.equal(small.fee,R);assert.equal(sumInputs(small.inputs),100n*U-R);
+  assert.equal(assetBatchBudget({[a]:(50n*U-1n).toString()},0n,new Map([[a,null]]),UINT256_MAX,16,new Set(),true),null);
+});

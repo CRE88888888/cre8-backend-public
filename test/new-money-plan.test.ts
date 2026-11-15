@@ -77,3 +77,18 @@ test('#83 huge remaining vectors with zero/exhausted capacity return immediately
   const count=batchCountFor(vector,new Map([[a,100n*U],[b,100n*U]]),200n*U,UINT256_MAX);
   assert.ok(count);assert.ok(count>1n);
 });
+
+test('#100 window hold/stack split reserves one top-up while legacy still reserves each batch',()=>{
+  for(const kind of ['hold','stack'] as const){
+    const result=moneyBudget(200n*U,kind,allocation(),cash,R,new Map([[a,50n*U],[b,50n*U]]),100n*U,true);
+    assert.ok(result);assert.equal(result.batchCount,2n);assert.equal(result.fee,R);
+    assert.equal(result.amount,200n*U-(kind==='hold'?R:0n));
+  }
+  assert.equal(moneyBudget(200n*U,'hold',allocation(),cash,R,new Map([[a,50n*U],[b,50n*U]]),100n*U)?.fee,2n*R);
+});
+test('#100 window hold admits exactly 50 including fees and 100 split into two gross-50 children',()=>{
+  assert.ok(moneyBudget(50n*U,'hold',allocation(),cash,R,caps,UINT256_MAX,true));
+  assert.equal(moneyBudget(50n*U-1n,'hold',allocation(),cash,R,caps,UINT256_MAX,true),null);
+  const result=moneyBudget(100n*U,'hold',allocation(),cash,R,new Map([[a,25n*U],[b,25n*U]]),50n*U,true);
+  assert.ok(result);assert.equal(result.batchCount,2n);assert.equal(result.fee,R);
+});

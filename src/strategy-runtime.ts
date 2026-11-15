@@ -6,7 +6,7 @@ import { EXECUTOR_ABI } from './chain.js';
 import { requireTypedVersion } from './strategies.js';
 import type { StrategyVersion } from './strategies.js';
 import { numeraireFor } from './strategy-execution.js';
-import { basketBatch, batchCountFor, maxBasketBatches, sumInputs } from './new-money-plan.js';
+import { basketBatch, batchCountFor, maxBasketBatches, sumInputs, windowBasketBatch, windowCapacityFits, maxWindowBatches, windowBatchCountFor } from './new-money-plan.js';
 import type { InputVector } from './new-money-plan.js';
 import { fundingLots, prepareStrategyJob, readJob } from './strategy-jobs.js';
 import type { FundingLot, JobContext, StrategyJob } from './strategy-jobs.js';
@@ -30,7 +30,7 @@ export function defaultNewMoneyDeps(client:()=>PublicClient,executor:()=>Address
   return {
     version:requireTypedVersion,
     withdrawals:(due,plan)=>readCashWithdrawals(client(),query,{chainId,portfolioId:due.portfolioId,account:due.account,cash:numeraireFor(chainId) as Address,blockNumber:plan.snapshot.block}),
-    rebalanceReserve:plan=>minimumFeeReserve(client(),executor(),BigInt(plan.pinnedVersion.onchainStrategyId),plan.snapshot.block),
+    rebalanceReserve:plan=>minimumFeeReserve(client(),executor(),BigInt(plan.pinnedVersion.onchainStrategyId),plan.snapshot.block,plan.account,chainId===97),
     policy:async(due,plan,assets)=>{
       const publicClient=client(),blockNumber=plan.snapshot.block;
       const oracle=await publicClient.readContract({address:executor(),abi:EXECUTOR_ABI,functionName:'oracle',blockNumber});
@@ -38,7 +38,7 @@ export function defaultNewMoneyDeps(client:()=>PublicClient,executor:()=>Address
       if('kind' in buy && buy.reason.includes('UNAVAILABLE'))throw new Error('[BUY_ALLOWANCE_UNAVAILABLE] 買入額度無法確認');
       const limits=await readMaxLegUsdE8(assets,query,chainId);
       const holding=plan.snapshot.holdings.find(h=>h.asset.toLowerCase()===numeraireFor(chainId));
-      const reserve=await minimumFeeReserve(publicClient,executor(),BigInt(plan.pinnedVersion.onchainStrategyId),blockNumber);
+      const reserve=await minimumFeeReserve(publicClient,executor(),BigInt(plan.pinnedVersion.onchainStrategyId),blockNumber,due.account,chainId===97);
       // Executor buyAllowance is already in numeraire raw units (18 decimals).
       const buyLimit='kind' in buy?0n:buy.remaining;
       const fee=Number(await publicClient.readContract({address:registry(),abi:[{type:'function',name:'effectiveFeeBps',stateMutability:'view',inputs:[{type:'uint256'}],outputs:[{type:'uint16'}]}],functionName:'effectiveFeeBps',args:[BigInt(plan.pinnedVersion.onchainStrategyId)],blockNumber}));
@@ -128,17 +128,23 @@ export async function prepareNewMoney(args:{due:DuePortfolio;plan:PortfolioPlan;
   const deadline=BigInt(Math.floor(now.getTime()/1000))+1800n;
   const feeBatches=policy.reserve===0n?sumInputs(job.remaining_input)/(50n*10n**18n):BigInt(job.remaining_fee_raw)/policy.reserve;
   const newMode=job.kind==='asset';
+  const feeWindow=chainId===97;
+  // Leftover fees are a funding ceiling, never additional principal or a credit
+  // on every technical child. A new window still passes the fresh sender check.
+  const reserve=feeWindow&&BigInt(job.remaining_fee_raw)<policy.reserve?BigInt(job.remaining_fee_raw):policy.reserve;
+  context.reserve=reserve;
   const remaining=Object.fromEntries(Object.entries(job.remaining_input).filter(([,n])=>BigInt(n)>0n));
   const held=plan.snapshot.holdings.filter(h=>h.amountWei>0n&&h.asset.toLowerCase()!==cash&&version.allocation.assets.some(a=>a.address===h.asset.toLowerCase())).length;
   const stepLimit=executionBatchSize(held);
   if(stepLimit===0)return {job,context,rebalance:{kind:'blocked',reason:'[USER_OP_CAPACITY] 估值已超過單筆容量'}};
-  const maximum=newMode?maximumRemainingBatches(remaining,BigInt(job.remaining_fee_raw),policy.reserve,stepLimit,context.finalAssets):maxBasketBatches(job.remaining_input,feeBatches);
-  let count=newMode?newRemainingCount(remaining,policy.caps,policy.buyLimit,BigInt(job.remaining_fee_raw),policy.reserve,stepLimit,context.finalAssets):batchCountFor(job.remaining_input,policy.caps,policy.buyLimit,feeBatches);
+  const maximum=newMode?maximumRemainingBatches(remaining,BigInt(job.remaining_fee_raw),reserve,stepLimit,context.finalAssets,feeWindow):feeWindow?maxWindowBatches(remaining,reserve):maxBasketBatches(job.remaining_input,feeBatches);
+  let count=newMode?newRemainingCount(remaining,policy.caps,policy.buyLimit,BigInt(job.remaining_fee_raw),reserve,stepLimit,context.finalAssets,feeWindow):feeWindow?windowBatchCountFor(remaining,reserve,policy.caps,policy.buyLimit):batchCountFor(job.remaining_input,policy.caps,policy.buyLimit,feeBatches);
   if(count===null)return {job,context,rebalance:{kind:'blocked',reason:'[BASKET_WAITING] 原向量無可行完整批次或費用預留'}};
+  const minimumRound=newMode?50n*10n**18n*BigInt(executionInputGroups(remaining,stepLimit,reserve,context.finalAssets,feeWindow)?.length??1):50n*10n**18n;
   for (;;) {
-    const vector=basketBatch(newMode?remaining:job.remaining_input,count);
-    const inputs=newMode?executionInputGroups(vector,stepLimit,policy.reserve,context.finalAssets)?.[0]??{}:vector;
-    if(newMode&&sumInputs(inputs)+policy.reserve<50n*10n**18n)return {job,context,rebalance:{kind:'blocked',reason:'[BASKET_WAITING] 子批不足50 USDT'}};
+    const vector=feeWindow?windowBasketBatch(newMode?remaining:job.remaining_input,count,reserve,minimumRound):basketBatch(newMode?remaining:job.remaining_input,count);
+    const inputs=newMode?executionInputGroups(vector,stepLimit,reserve,context.finalAssets,feeWindow)?.[0]??{}:vector;
+    if(newMode&&sumInputs(inputs)+reserve<50n*10n**18n)return {job,context,rebalance:{kind:'blocked',reason:'[BASKET_WAITING] 子批不足50 USDT'}};
     const rebalance=await deps.quote(due,plan,inputs,deadline);
     if(rebalance.kind==='ready')return {job,context,rebalance};
     if(rebalance.kind!=='blocked'||!rebalance.reason.includes('[BASKET_DEPTH]')||count===maximum)return {job,context,rebalance};
@@ -147,22 +153,24 @@ export async function prepareNewMoney(args:{due:DuePortfolio;plan:PortfolioPlan;
 }
 
 /** Resume the frozen vector; fee leftovers never become new principal. */
-function newRemainingCount(inputs:InputVector,caps:ReadonlyMap<string,bigint|null>,buyLimit:bigint,fee:bigint,reserve:bigint,stepLimit:number,finalAssets:ReadonlySet<string>=new Set()):bigint|null{
-  const maximum=maximumRemainingBatches(inputs,fee,reserve,stepLimit,finalAssets);
+function newRemainingCount(inputs:InputVector,caps:ReadonlyMap<string,bigint|null>,buyLimit:bigint,fee:bigint,reserve:bigint,stepLimit:number,finalAssets:ReadonlySet<string>=new Set(),feeWindow=false):bigint|null{
+  const maximum=maximumRemainingBatches(inputs,fee,reserve,stepLimit,finalAssets,feeWindow);
   if(maximum<1n||buyLimit<=0n)return null;
-  const fits=(k:bigint)=>{const batch=basketBatch(inputs,k);return sumInputs(batch)<=buyLimit&&Object.entries(batch).every(([a,v])=>{if(!caps.has(a))throw new Error('missing capacity');const cap=caps.get(a);return cap===null||(cap!==undefined&&BigInt(v)<=cap);});};
+  const minimumRound=50n*10n**18n*BigInt(executionInputGroups(inputs,stepLimit,reserve,finalAssets,feeWindow)?.length??1);
+  const fits=(k:bigint)=>{if(feeWindow)return windowCapacityFits(inputs,k,reserve,caps,buyLimit,minimumRound);const batch=basketBatch(inputs,k);return sumInputs(batch)<=buyLimit&&Object.entries(batch).every(([a,v])=>{if(!caps.has(a))throw new Error('missing capacity');const cap=caps.get(a);return cap===null||(cap!==undefined&&BigInt(v)<=cap);});};
   if(!fits(maximum))return null;
   let low=1n,high=maximum;while(low<high){const mid=(low+high)/2n;if(fits(mid))high=mid;else low=mid+1n;}
   return low;
 }
 
-function maximumRemainingBatches(inputs:InputVector,fee:bigint,reserve:bigint,stepLimit:number,finalAssets:ReadonlySet<string>=new Set()):bigint{
+function maximumRemainingBatches(inputs:InputVector,fee:bigint,reserve:bigint,stepLimit:number,finalAssets:ReadonlySet<string>=new Set(),feeWindow=false):bigint{
   const total=sumInputs(inputs),U=10n**18n;
-  let maximum=(total+fee)/(50n*U);
-  const groups=executionInputGroups(inputs,stepLimit,reserve,finalAssets);
+  let maximum=(total+(feeWindow?reserve:fee))/(50n*U);
+  const groups=executionInputGroups(inputs,stepLimit,reserve,finalAssets,feeWindow);
   if(!groups)return 0n;
+  if(feeWindow)maximum/=BigInt(groups.length);
   const groupReserve=reserve*BigInt(groups.length);
-  if(groupReserve>0n&&fee/groupReserve<maximum)maximum=fee/groupReserve;
+  if(!feeWindow&&groupReserve>0n&&fee/groupReserve<maximum)maximum=fee/groupReserve;
   for(const [asset,value] of Object.entries(inputs)){const n=BigInt(value)/(finalAssets.has(asset)?1n:U);if(n<maximum)maximum=n;}
   return maximum;
 }

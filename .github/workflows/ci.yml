@@ -82,6 +82,7 @@ jobs:
           test/rebalance-plan.test.ts
           test/asset-plan.test.ts
           test/execution-batch.test.ts
+          test/fee-window.test.ts
           test/new-money-plan.test.ts
           test/strategy-runtime.test.ts
           test/cash-reconciliation.test.ts

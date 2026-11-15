@@ -146,17 +146,31 @@ export function assetTradeMinimumReason(inputs:readonly bigint[],budgetRaw:bigin
 const MIN_FEE_ABI = [
   { type: 'function', name: 'minBatchFee', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint256' }] },
   { type: 'function', name: 'minFeeTopUp', stateMutability: 'view', inputs: [{ type: 'uint256' }, { type: 'uint256' }], outputs: [{ type: 'uint256' }] },
+  { type: 'function', name: 'minFeeDue', stateMutability: 'view', inputs: [{ type: 'address' }, { type: 'uint256' }], outputs: [{ type: 'uint256' }] },
+  { type: 'function', name: 'minFeeWindowOf', stateMutability: 'view', inputs: [{ type: 'address' }], outputs: [{ type: 'uint64' }, { type: 'uint192' }, { type: 'uint256' }] },
 ] as const;
 
 /** Reserve the maximum top-up at its 1% saturation point, before sizing buys.
  * Shrinking/filtering a buy can increase its top-up, so a quote at the original size is unsafe.
  * This bound remains sufficient even when a sale's actual gross output differs from its quote.
  */
-export async function minimumFeeReserve(client: PublicClient, executor: Address, strategyId: bigint, blockNumber: bigint): Promise<bigint> {
+export async function minimumFeeReserve(client: PublicClient, executor: Address, strategyId: bigint, blockNumber: bigint, account?:Address, feeWindow=client.chain?.id===97): Promise<bigint> {
   try {
     const minimum = await client.readContract({ address: executor, abi: MIN_FEE_ABI, functionName: 'minBatchFee', blockNumber });
     if (minimum < 0n) throw new Error('invalid minimum fee');
-    const topUp = await client.readContract({ address: executor, abi: MIN_FEE_ABI, functionName: 'minFeeTopUp', args: [strategyId, minimum * 100n], blockNumber });
+    let topUp:bigint;
+    if(feeWindow){
+      if(!account)throw new Error('missing fee account');
+      const [window,block]=await Promise.all([
+        client.readContract({address:executor,abi:MIN_FEE_ABI,functionName:'minFeeWindowOf',args:[account],blockNumber}),
+        client.getBlock({blockNumber}),
+      ]);
+      // T(c) peaks at the 1% saturation point. Query only the additional
+      // notional needed to reach it, preserving prior dust and unpaid debt.
+      const cumulative=window[0]!==0n&&block.timestamp<window[0]+3600n?window[1]:0n;
+      const peak=minimum*100n;
+      topUp=await client.readContract({address:executor,abi:MIN_FEE_ABI,functionName:'minFeeDue',args:[account,peak>cumulative?peak-cumulative:1n],blockNumber});
+    }else topUp = await client.readContract({ address: executor, abi: MIN_FEE_ABI, functionName: 'minFeeTopUp', args: [strategyId, minimum * 100n], blockNumber });
     if (topUp < 0n || topUp > minimum) throw new Error('invalid top-up');
     return topUp;
   } catch { throw new Error('[MIN_FEE_UNAVAILABLE] 無法確認最低費預留，不買入'); }
@@ -198,12 +212,17 @@ export async function checkBuyFeeReserve(params: {
       { type: 'function', name: 'balanceOf', stateMutability: 'view', inputs: [{ type: 'address' }], outputs: [{ type: 'uint256' }] },
       { type: 'function', name: 'allowance', stateMutability: 'view', inputs: [{ type: 'address' }, { type: 'address' }], outputs: [{ type: 'uint256' }] },
     ] as const;
+    const window=client.chain?.id===97;
+    const notional=steps.reduce((sum,step)=>sum+(sameAsset(step.tokenIn,numeraire)?step.amountIn:step.amountOutMin),0n);
     const [reserve, balance, allowance, fee] = await Promise.all([
-      minimumFeeReserve(client, executor, strategyId, blockNumber),
+      window&&steps.every(step=>sameAsset(step.tokenIn,numeraire))?
+        client.readContract({address:executor,abi:MIN_FEE_ABI,functionName:'minFeeDue',args:[account,notional],blockNumber}):
+        minimumFeeReserve(client, executor, strategyId, blockNumber,account),
       client.readContract({ address: numeraire, abi: tokenAbi, functionName: 'balanceOf', args: [account], blockNumber }),
       client.readContract({ address: numeraire, abi: tokenAbi, functionName: 'allowance', args: [account, executor], blockNumber }),
       client.readContract({ address: registry, abi: REGISTRY_ABI, functionName: 'effectiveFeeBps', args: [strategyId], blockNumber }),
     ]);
+    if(reserve<0n)throw new Error('invalid fee due');
     if (!Number.isInteger(fee) || fee < 0 || fee >= 10000) throw new Error('invalid fee');
     if(params.maximumReserve!==undefined&&reserve>params.maximumReserve)throw new Error('original fee budget insufficient');
     let cash = balance;
@@ -2043,7 +2062,7 @@ async function planHub(
     .reduce((sum, leg) => sum + leg.oracleFloor - (leg.oracleFloor * BigInt(sellFeeBps)) / BPS_BIG, 0n);
   let feeReserve = 0n;
   try {
-    if (legs.some((leg) => leg.deltaUsdE8 < 0n) && buySourceBlock === null) feeReserve = await minimumFeeReserve(publicClient, executor, strategyId, blockNumber);
+    if (legs.some((leg) => leg.deltaUsdE8 < 0n) && buySourceBlock === null) feeReserve = await minimumFeeReserve(publicClient, executor, strategyId, blockNumber,args.account);
   } catch { return { kind: 'blocked', reason: '[MIN_FEE_UNAVAILABLE] 無法確認最低費預留，不買入' }; }
   const availableCash = (hubHolding?.amountWei ?? 0n) + sellProceeds;
   const spendable = availableCash > feeReserve ? availableCash - feeReserve : 0n;
@@ -2473,7 +2492,7 @@ export async function planRebalance(
     if (amountIn > budget.remaining) amountIn = budget.remaining;
     const cash = holdings.find((holding) => sameAsset(holding.asset, numeraire));
     let reserve: bigint;
-    try { reserve = await minimumFeeReserve(publicClient, executor, strategyId, blockNumber); }
+    try { reserve = await minimumFeeReserve(publicClient, executor, strategyId, blockNumber,args.account); }
     catch { return { kind: 'blocked', reason: '[MIN_FEE_UNAVAILABLE] 無法確認最低費預留，不買入' }; }
     const spendable = (cash?.amountWei ?? 0n) > reserve ? (cash?.amountWei ?? 0n) - reserve : 0n;
     if (amountIn > spendable) amountIn = spendable;

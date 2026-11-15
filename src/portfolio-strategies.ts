@@ -97,7 +97,7 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
       const block = await chain.publicClient.getBlockNumber({cacheTime:0});
       const sid = (await query<{onchain_id:string}>('select onchain_id from strategies where id=$1',[p.strategyId])).rows[0];
       if(!sid)throw storageUnavailable();
-      return minimumFeeReserve(chain.publicClient, loadSessionKeyConfig().executorAddress ?? (()=>{throw storageUnavailable();})(), BigInt(sid.onchain_id), block);
+      return minimumFeeReserve(chain.publicClient, loadSessionKeyConfig().executorAddress ?? (()=>{throw storageUnavailable();})(), BigInt(sid.onchain_id), block,p.accountAddress as Address,p.chainId===97);
     }, ...overrides };
 
   async function safe<T>(run: () => Promise<T>): Promise<T> {
@@ -201,7 +201,7 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
         if(Number(original.portfolio_id)!==id||Number(original.strategy_id)!==p.strategyId||original.version!==p.version||original.kind!==kind||original.amount_raw!==evidence.amountRaw||original.state!=='confirmed')throw new AppError(409,'FUNDING_EVENT_CONFLICT','funding event conflicts with its original authorization');
         return { ...mapLot(original), source, replayed:true, fundingStatus:'recorded' };
       }
-      const standalone = version.execution.kind === 'per_asset' ? planContribution(BigInt(evidence.amountRaw),version.execution,confirmedAt,feeReserve) : null;
+      const standalone = version.execution.kind === 'per_asset' ? planContribution(BigInt(evidence.amountRaw),version.execution,confirmedAt,feeReserve,p.chainId===97) : null;
       // Subscription minimum is distinct from the eventual account/time batch.
       // An individually small source may join another lot at the same creator slot.
       const minimum=version.execution.kind==='per_asset'?minimumAssetContribution(version.execution):0n;

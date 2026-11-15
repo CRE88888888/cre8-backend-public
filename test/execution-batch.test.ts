@@ -3,6 +3,15 @@ import { test } from 'node:test';
 import { assertUserOpCapacity, boundedCallGasLimit, estimatedBatchGas, executionBatchSize, executionGroups, executionInputGroups, MAX_USER_OP_GAS, userOpGasOverhead } from '../src/execution-batch.js';
 import { loadTradingConfig } from '../src/config.js';
 
+test('#100 only first technical child can count the window top-up toward 50 USDT',()=>{
+  const U=10n**18n,R=27n*U/100n;
+  const inputs={a:(49n*U+865n*U/1000n).toString(),b:(49n*U+865n*U/1000n).toString()};
+  const children=executionInputGroups(inputs,2,R,new Set(),true);assert.ok(children);
+  assert.equal(executionInputGroups(inputs,1,R,new Set(),true),null,'two sub-50 children cannot both claim the same reserve');
+  assert.ok(executionInputGroups({a:(50n*U-R).toString(),b:(50n*U).toString()},1,R,new Set(),true));
+  assert.equal(executionInputGroups({a:(50n*U-R).toString(),b:(50n*U-1n).toString()},1,R,new Set(),true),null);
+});
+
 test('#92 batch size is <=16, shrinks with held assets and never authorizes over 14M', () => {
   assert.equal(executionBatchSize(0),16);
   assert.equal(executionBatchSize(92,false),16);

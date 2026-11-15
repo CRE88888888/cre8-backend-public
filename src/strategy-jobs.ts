@@ -4,7 +4,7 @@ import type { AssetExecution } from './strategy-execution.js';
 import type { Address, Hex } from 'viem';
 import type { Allocation } from './strategies.js';
 import type { WithTransactionFn, SchedulerQueryFn } from './scheduler.js';
-import { addInputs, allocationInputs, basketFits, currentSlot, moneyBudget, subtractInputs, sumInputs } from './new-money-plan.js';
+import { addInputs, allocationInputs, basketFits, currentSlot, moneyBudget, subtractInputs, sumInputs, windowBasketFits } from './new-money-plan.js';
 import type { InputVector, MoneyBudget } from './new-money-plan.js';
 
 export type StrategyJob = { id: string; chain_id: string; portfolio_id: string; kind: 'hold' | 'stack' | 'asset'; asset_started_at?:Date|null; lot_id: string | null;
@@ -85,7 +85,7 @@ export async function prepareStrategyJob(run: WithTransactionFn, c: JobContext, 
         if (!ended && existing) {
           await skipSlots(query,c,instruction,slot.index,slot.index,'skipped_previous_inflight');
         } else if (!ended && !existing && c.marketOpen) {
-          const budget=moneyBudget(BigInt(instruction.amount_raw),'stack',c.allocation,c.cash,c.reserve,c.caps,c.buyLimit);
+          const budget=moneyBudget(BigInt(instruction.amount_raw),'stack',c.allocation,c.cash,c.reserve,c.caps,c.buyLimit,c.chainId===97);
           // Even if capacity is currently unknown, insufficient *original A + one reserve* is definitive.
           if (BigInt(balance.stack_prefund_raw)<BigInt(instruction.amount_raw)+(budget?.fee??c.reserve)) {
             await skipSlots(query,c,instruction,slot.index,slot.index,'skipped_insufficient_funds');
@@ -107,7 +107,7 @@ export async function prepareStrategyJob(run: WithTransactionFn, c: JobContext, 
     if (lots.length===0) return {job:null,reason:'[NO_NEW_MONEY] 沒有未配置投入；價格漂移不觸發交易'};
     if (lots.some(l=>!verifiedLots.some(v=>v.id===l.id&&v.block_hash===l.block_hash&&v.amount_raw===l.amount_raw))) throw new Error('funding changed before reservation');
     const total=lots.reduce((sum,l)=>sum+BigInt(l.amount_raw),0n);
-    const budget=moneyBudget(total,'hold',c.allocation,c.cash,c.reserve,c.caps,c.buyLimit);
+    const budget=moneyBudget(total,'hold',c.allocation,c.cash,c.reserve,c.caps,c.buyLimit,c.chainId===97);
     if (!budget) return {job:null,reason:'[BASKET_WAITING] 投入不足完整籃子，等待同版本後續投入'};
     const sources: {lot:FundingLot;budget:MoneyBudget}[]=[];
     let feeLeft=budget.fee;
@@ -121,7 +121,7 @@ export async function prepareStrategyJob(run: WithTransactionFn, c: JobContext, 
     }
     const first=sources[0]; if (!first) throw new Error('missing hold source');
     const actualInputs=sources.reduce((sum,source)=>addInputs(sum,source.budget.inputs),{});
-    if(Object.keys(actualInputs).length>0&&!basketFits(actualInputs,budget.batchCount,c.caps,c.buyLimit)){
+    if(Object.keys(actualInputs).length>0&&!(c.chainId===97?windowBasketFits(actualInputs,budget.batchCount,c.reserve,c.caps,c.buyLimit):basketFits(actualInputs,budget.batchCount,c.caps,c.buyLimit))){
       return {job:null,reason:'[BASKET_WAITING] 逐筆取整後仍不足完整籃子，等待同版本後續投入'};
     }
     // One cash-only root can cover all lots without a non-root append to a terminal job.

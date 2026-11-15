@@ -35,6 +35,55 @@ export function basketBatch(vector: InputVector, count: bigint): InputVector {
   return Object.fromEntries(Object.entries(vector).filter(([, value]) => BigInt(value) > 0n)
     .map(([asset, value]) => [asset, ((BigInt(value) + count - 1n) / count).toString()]));
 }
+/** Spend the window reserve in the first child only. Keep the later children at
+ * their full principal budget (100 including one reserve can still make 2 x 50).
+ * The frozen vector is only partitioned; no fee remainder becomes principal.
+ */
+export function windowBasketBatch(vector: InputVector, count: bigint, reserve: bigint, minimum=50n*USDT_UNIT): InputVector {
+  if(count<=0n||reserve<0n||minimum<0n)throw new RangeError('invalid window batch');
+  if(count===1n)return basketBatch(vector,1n);
+  const total=sumInputs(vector),ordinary=basketBatch(vector,count),amount=total-minimum*(count-1n);
+  if(sumInputs(ordinary)<=amount)return ordinary;
+  if(amount<=0n||amount>total)throw new RangeError('insufficient window budget');
+  let left=amount;
+  let remainingTotal=total;
+  const entries=Object.entries(vector).filter(([,raw])=>BigInt(raw)>0n);
+  return Object.fromEntries(entries.map(([asset,raw],i)=>{
+    const part=i===entries.length-1?left:BigInt(raw)*left/remainingTotal;
+    left-=part;remainingTotal-=BigInt(raw);
+    return [asset,part.toString()];
+  }));
+}
+/** Both the first and largest later child must respect capacities. */
+export function windowCapacityFits(vector:InputVector,count:bigint,reserve:bigint,caps:ReadonlyMap<string,bigint|null>,buyLimit:bigint,minimum=50n*USDT_UNIT):boolean{
+  const first=windowBasketBatch(vector,count,reserve,minimum);
+  const candidates=count===1n?[first]:[first,basketBatch(subtractInputs(vector,first),count-1n)];
+  return candidates.every(batch=>sumInputs(batch)<=buyLimit&&Object.entries(batch).every(([asset,raw])=>{
+    if(!caps.has(asset))throw new Error('missing asset capacity');
+    const cap=caps.get(asset);return cap===null||(cap!==undefined&&BigInt(raw)<=cap);
+  }));
+}
+export function maxWindowBatches(vector:InputVector,reserve:bigint):bigint{
+  let maximum=(sumInputs(vector)+reserve)/(50n*USDT_UNIT);
+  for(const raw of Object.values(vector)){const n=BigInt(raw)/(5n*USDT_UNIT);if(n<maximum)maximum=n;}
+  return maximum;
+}
+export function windowBasketFits(vector:InputVector,count:bigint,reserve:bigint,caps:ReadonlyMap<string,bigint|null>,buyLimit:bigint):boolean{
+  const first=windowBasketBatch(vector,count,reserve);
+  if(sumInputs(first)+reserve<50n*USDT_UNIT||Object.values(first).some(n=>BigInt(n)<5n*USDT_UNIT))return false;
+  if(count>1n){
+    const smallest=Object.fromEntries(Object.entries(subtractInputs(vector,first)).map(([a,v])=>[a,(BigInt(v)/(count-1n)).toString()]));
+    if(!basketMinimum(smallest))return false;
+  }
+  return windowCapacityFits(vector,count,reserve,caps,buyLimit);
+}
+export function windowBatchCountFor(vector:InputVector,reserve:bigint,caps:ReadonlyMap<string,bigint|null>,buyLimit:bigint):bigint|null{
+  const maximum=maxWindowBatches(vector,reserve);
+  if(maximum<1n||buyLimit<=0n||!windowCapacityFits(vector,maximum,reserve,caps,buyLimit))return null;
+  let low=1n,high=maximum;
+  while(low<high){const mid=(low+high)/2n;if(windowCapacityFits(vector,mid,reserve,caps,buyLimit))high=mid;else low=mid+1n;}
+  return windowBasketFits(vector,low,reserve,caps,buyLimit)?low:null;
+}
 export function basketMinimum(vector: InputVector): boolean {
   const values = Object.values(vector).map(BigInt);
   return values.length > 0 && values.every(value => value >= 5n * USDT_UNIT) && sumInputs(vector) >= 50n * USDT_UNIT;
@@ -74,10 +123,17 @@ export function batchCountFor(vector:InputVector,caps:ReadonlyMap<string,bigint|
 export type MoneyBudget = { amount: bigint; fee: bigint; cash: bigint; inputs: InputVector; batchCount: bigint };
 /** k is bounded by the complete-basket minimum, never by an arbitrary retry count. */
 export function moneyBudget(total: bigint, kind: 'hold' | 'stack', allocation: Allocation, cash: string,
-  reserve: bigint, caps: ReadonlyMap<string, bigint | null>, buyLimit: bigint): MoneyBudget | null {
+  reserve: bigint, caps: ReadonlyMap<string, bigint | null>, buyLimit: bigint, feeWindow=false): MoneyBudget | null {
   if (total <= 0n || total > UINT256_MAX || reserve < 0n || buyLimit < 0n) throw new RangeError('invalid budget');
   const risky = allocation.assets.filter(a => a.weightBps > 0 && a.address.toLowerCase() !== cash.toLowerCase());
   if (risky.length === 0) return kind === 'hold' ? { amount: total, fee: 0n, cash: total, inputs: {}, batchCount: 0n } : null;
+  if(feeWindow){
+    const amount=total-(kind==='hold'?reserve:0n);
+    if(amount<=0n)return null;
+    const vector=allocationInputs(amount,allocation,cash);
+    const count=windowBatchCountFor(vector.inputs,reserve,caps,buyLimit);
+    return count===null?null:{amount,fee:reserve,cash:vector.cash,inputs:vector.inputs,batchCount:count};
+  }
   const perBatchReserve = kind === 'hold' ? reserve : 0n;
   const riskWeight = risky.reduce((sum, a) => sum + BigInt(a.weightBps), 0n);
   let maximum = total * riskWeight / (500_000n * USDT_UNIT + perBatchReserve * riskWeight);

@@ -113,7 +113,7 @@ export type TradingConfig = {
 export function loadTradingConfig(env: NodeJS.ProcessEnv = process.env,
   chainId = parseInteger(env, 'CHAIN_ID', DEFAULT_CHAIN_ID, { min: 1, max: Number.MAX_SAFE_INTEGER })): TradingConfig {
   return {
-    minStepUsdE8: parseBigInt(env, 'MIN_STEP_USD_E8', 500_000_000n),
+    minStepUsdE8: parseBigInt(env, 'MIN_STEP_USD_E8', 100_000_000n),
     minBatchUsdE8: parseBigInt(env, 'MIN_BATCH_USD_E8', 5_000_000_000n),
     minDepositUsdE8: parseBigInt(env, 'MIN_DEPOSIT_USD_E8', 5_000_000_000n),
     dailyGas: parseBigInt(env, 'ACCOUNT_DAILY_GAS', chainId === 97 ? 100_000_000n : 10_000_000n),

@@ -120,7 +120,7 @@ export function faucetReceiptState(receipt: Pick<TransactionReceipt, 'status' | 
   return issued ? 'confirmed' : 'unknown';
 }
 
-export type FaucetFundingEvidence = { txHash: Hex; logIndex: number; blockNumber: bigint; blockHash: Hex; amountRaw: string };
+export type FaucetFundingEvidence = { txHash: Hex; logIndex: number; blockNumber: bigint; blockHash: Hex; amountRaw: string; confirmedAt: Date };
 
 /** Funding evidence is stricter than a quota settlement: check canonical block and exact log identity. */
 export async function readFaucetFundingEvidence(claim: Pick<FaucetClaim, 'chainId' | 'account' | 'amountWei'> & { txHash: Hex },
@@ -144,7 +144,9 @@ export async function readFaucetFundingEvidence(claim: Pick<FaucetClaim, 'chainI
       faucetReceiptState({ status: 'success', logs: [log] }, claim, TESTNET_97.roles.operator) === 'confirmed');
     const log = matches[0];
     if (matches.length !== 1 || log === undefined || log.logIndex === null) throw new AppError(409, 'FUNDING_NOT_CONFIRMED', 'one exact canonical Claimed event is required');
-    return { txHash: claim.txHash, logIndex: log.logIndex, blockNumber: receipt.blockNumber, blockHash: receipt.blockHash, amountRaw: claim.amountWei.toString() };
+    const confirmedAt = new Date(Number(block.timestamp) * 1000);
+    if (!Number.isSafeInteger(Number(block.timestamp)) || block.timestamp < 0n || !Number.isFinite(confirmedAt.getTime())) throw new Error('invalid confirmation time');
+    return { txHash: claim.txHash, logIndex: log.logIndex, blockNumber: receipt.blockNumber, blockHash: receipt.blockHash, amountRaw: claim.amountWei.toString(), confirmedAt };
   } catch (error) {
     if (error instanceof AppError) throw error;
     throw new AppError(503, 'FUNDING_RPC_UNAVAILABLE', 'funding confirmation unavailable; no new lot credited');

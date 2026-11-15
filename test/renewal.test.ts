@@ -338,7 +338,7 @@ test('listPortfolios only returns rows whose user_id is the token wallet (case-i
   });
 
   assert.equal(portfolios.length, 1, 'another wallet’s portfolio must not leak into the list');
-  assert.equal(portfolios[0]?.minDepositUsdtWei, '80000000000000000000');
+  assert.equal(portfolios[0]?.minDepositUsdtWei, '50000000000000000000');
   assert.match(calls[0]?.text ?? '', /sv\.version=p\.version/);
   assert.equal(portfolios[0]?.id, PORTFOLIO_ID);
   assert.equal(calls[0]?.params[0], WALLET_LOWER, 'the query param is the authenticated wallet, lowercased');

@@ -42,7 +42,7 @@ const PUBLISH_BODY = {
       { address: ASSET_B, weightBps: 4000 },
     ],
   },
-  schedule: { kind: 'funding' },
+  schedule: { kind: 'interval', intervalSeconds: 3600 },
   changeLog: 'rebalance',
 };
 

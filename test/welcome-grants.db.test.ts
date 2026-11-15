@@ -86,7 +86,7 @@ test('#91 DB cap zero, one raw below, equality and +1; all unresolved states cha
     if (state !== 'reserved') {
       if (state === 'confirmed') {
         const txHash = hash(); await settleWelcomeGrant(grant, 'submitted', txHash);
-        await settleWelcomeGrant({ ...grant, state: 'submitted', txHash }, 'confirmed', txHash, { txHash, logIndex: 0, blockNumber: 0n, blockHash: hash(), amountRaw: grant.amountWei.toString() });
+        await settleWelcomeGrant({ ...grant, state: 'submitted', txHash }, 'confirmed', txHash, { txHash, logIndex: 0, blockNumber: 0n, blockHash: hash(), amountRaw: grant.amountWei.toString(), confirmedAt: new Date(0) });
       } else await settleWelcomeGrant(grant, state, state === 'submitted' || state === 'unknown' ? hash() : null);
     }
     assert.equal((await reserveWelcomeGrant(f.recipient, { ...welcomeConfig, siteDailyWei: 0n })).created, false, 'zero never blocks original lifetime lookup');

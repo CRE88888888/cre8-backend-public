@@ -105,7 +105,7 @@ import type { Address, Hex, PublicClient } from 'viem';
 import { readContract } from 'viem/actions';
 import type { AssetDrift, DriftReport, Holding, TargetWeight } from './drift.js';
 import { computeDrift } from './drift.js';
-import { capAmountInForImpact, estimateImpact, impactStateProblem } from './impact.js';
+import { amountOutFor, capAmountInForImpact, estimateImpact, impactStateProblem } from './impact.js';
 import type { PoolImpactState } from './impact.js';
 import { query as dbQuery } from './db.js';
 import type { QueryFn } from './snapshot.js';
@@ -136,10 +136,10 @@ export function tradeMinimumReason(nominal: readonly bigint[], purpose: 'ordinar
   return null;
 }
 
-/** C3 #83: only new per-asset purchases use 1 USDT input and 50 USDT including reserved fees. */
-export function assetTradeMinimumReason(inputs:readonly bigint[],budgetRaw:bigint):string|null{
+/** Per-asset purchases and all-hold rebalances use 1 USDT and 50 USDT including fees. */
+export function assetTradeMinimumReason(inputs:readonly bigint[],budgetRaw:bigint,finalIndexes:ReadonlySet<number>=new Set()):string|null{
   if(inputs.length===0||inputs.some(n=>n<0n)||budgetRaw<inputs.reduce((s,n)=>s+n,0n))throw new Error('invalid new money budget');
-  if(inputs.some(n=>n<10n**18n))return '[BELOW_MIN_STEP] 每資產不足1 USDT，等待下期';
+  if(inputs.some((n,index)=>n===0n||(n<10n**18n&&!finalIndexes.has(index))))return '[BELOW_MIN_STEP] 每資產不足1 USDT，等待下期';
   return budgetRaw<50n*10n**18n?'[BELOW_MIN_BATCH] 含費批次不足50 USDT':null;
 }
 
@@ -162,7 +162,7 @@ export async function minimumFeeReserve(client: PublicClient, executor: Address,
   } catch { throw new Error('[MIN_FEE_UNAVAILABLE] 無法確認最低費預留，不買入'); }
 }
 
-export async function checkTradeMinimums(client: PublicClient, executor: Address, steps: readonly PlannedStep[], purpose: 'ordinary' | 'exit', blockNumber: bigint, assetBudgetRaw?: bigint): Promise<string | null> {
+export async function checkTradeMinimums(client: PublicClient, executor: Address, steps: readonly PlannedStep[], purpose: 'ordinary' | 'exit', blockNumber: bigint, assetBudgetRaw?: bigint, finalAssets:ReadonlySet<string>=new Set(), rebalanceReserveRaw?:bigint): Promise<string | null> {
   if (purpose === 'exit') return null;
   try {
     const numeraire = await client.readContract({ address: executor, abi: ORACLE_ABI, functionName: 'numeraire', blockNumber });
@@ -173,9 +173,13 @@ export async function checkTradeMinimums(client: PublicClient, executor: Address
         await nominalSellQuote(client, oracle, step.tokenIn, numeraire, step.amountIn, blockNumber);
       return raw;
     }));
+    if(rebalanceReserveRaw!==undefined){
+      if(decimals!==18||rebalanceReserveRaw<0n)return '[TRADE_MINIMUM_UNAVAILABLE] 再平衡費用或單位不符';
+      return assetTradeMinimumReason(nominal,nominal.reduce((a,b)=>a+b,0n)+rebalanceReserveRaw);
+    }
     if(assetBudgetRaw!==undefined){
       if(decimals!==18||steps.some(s=>!sameAsset(s.tokenIn,numeraire))||assetBudgetRaw<nominal.reduce((a,b)=>a+b,0n))return '[TRADE_MINIMUM_UNAVAILABLE] 新錢預算或單位不符';
-      return assetTradeMinimumReason(nominal,assetBudgetRaw);
+      return assetTradeMinimumReason(nominal,assetBudgetRaw,new Set(steps.flatMap((step,index)=>sameAsset(step.tokenIn,numeraire)&&finalAssets.has(step.tokenOut.toLowerCase())?[index]:[])));
     }
     return tradeMinimumReason(nominal, purpose, loadTradingConfig(), decimals);
   } catch (error) { return decodePriceSourceError(error)?.detail ?? '[TRADE_MINIMUM_UNAVAILABLE] 無法確認交易名義額，不送交易'; }
@@ -224,7 +228,7 @@ export type PlannedStep = {
   amountOutMin: bigint;
   /** `previewSwap` 的 `minimum`，留作稽核（minGross 是它放大後的結果，看得到原值才對得起來）。 */
   oracleFloor: bigint;
-  /** Oracle reference pool fee + price-impact budget. Retained for fresh quotes before signing. */
+  /** Total fee/impact ceiling, tightened to the actual Pancake path before signing. */
   costBudgetBps?: number;
   venue: Address;
   data: Hex;
@@ -285,6 +289,8 @@ export type PlanPartial = {
 
 
 export type PlanRebalanceArgs = {
+  /** Only typed all-hold rebalances count the saved fee reserve in the 50 USDT batch. */
+  inclusiveFeeReserveRaw?:bigint;
   tradingConfig?: TradingConfig;
   /** DB max_leg_usdt 轉成 E8；NULL 不限、0 阻擋。省略時規劃器讀 DB，CLI 也不能繞過限額。 */
   maxLegUsdE8?: ReadonlyMap<string, bigint | null>;
@@ -454,6 +460,15 @@ function costBudgetBps(poolFeeUnits: number, impactBps: number): number {
   if (!Number.isInteger(poolFeeUnits) || poolFeeUnits < 0 || poolFeeUnits >= 1_000_000 ||
       !Number.isInteger(impactBps) || impactBps < 1 || impactBps >= 10000) throw new Error('invalid swap cost budget');
   return Math.min(9999, Math.floor(poolFeeUnits / 100) + impactBps);
+}
+function pathCostBudget(path:Hex):number {
+  let retained=1000000n;
+  for(let offset=42;offset<path.length;offset+=46){
+    const fee=BigInt(`0x${path.slice(offset,offset+6)}`);
+    if(fee>=1000000n)throw new Error('invalid route fee');
+    retained=retained*(1000000n-fee)/1000000n;
+  }
+  return Math.min(9999,Number((1000000n-retained)/100n)+DEFAULT_MAX_IMPACT_BPS);
 }
 function costFloor(quoted: bigint, oracleFloor: bigint, budgetBps: number): bigint {
   if (quoted <= 0n || oracleFloor <= 0n || !Number.isInteger(budgetBps) || budgetBps < 1 || budgetBps >= 10000) throw new Error('invalid swap cost floor');
@@ -861,9 +876,12 @@ export async function buildRoutedStep(params: Parameters<typeof buildStep>[0] & 
     return { tokenIn, tokenOut, amountIn, amountOutMin: quoteBoundMinimum(minimum, aggregator.amountOut, pancakeOut), oracleFloor: params.oracleFloor,
       venue: aggregator.venue, data: aggregator.data, ...(budget === undefined ? {} : {costBudgetBps:budget}) };
   }
-  if (!allowed || pancake === null || pancake.amountOut < minimum) return null;
-  return {...buildStep({ ...params, minGross: minimumGross, chainId: publicClient.chain?.id, quotedAmountOut: pancake.amountOut, ...(pancake.kind === 'v3' ? { path: pancake.path } :
-    { v2Tokens: pancake.tokens }) }), ...(budget === undefined ? {} : {costBudgetBps:budget})};
+  if (!allowed || pancake === null) return null;
+  const actualBudget=budget===undefined||pancake.kind!=='v3'?budget:Math.min(budget,pathCostBudget(pancake.path));
+  const actualGross=actualBudget===undefined||params.oracleQuoted===undefined?minimumGross:minGrossFor(costFloor(params.oracleQuoted,params.oracleFloor,actualBudget),params.feeBps);
+  if(pancake.amountOut<amountOutMinWithBuffer(actualGross))return null;
+  return {...buildStep({ ...params, minGross: actualGross, chainId: publicClient.chain?.id, quotedAmountOut: pancake.amountOut, ...(pancake.kind === 'v3' ? { path: pancake.path } :
+    { v2Tokens: pancake.tokens }) }), ...(actualBudget === undefined ? {} : {costBudgetBps:actualBudget})};
 }
 
 // ---------------------------------------------------------------------------
@@ -1079,8 +1097,9 @@ export async function refreshFloors(params: {
       };
     }
 
+    const freshCost=step.costBudgetBps===undefined?undefined:identity!==null&&'path' in identity&&identity.path!==null?Math.min(step.costBudgetBps,pathCostBudget(identity.path)):step.costBudgetBps;
     let freshAmountOutMin: bigint;
-    try { freshAmountOutMin = minGrossFor(step.costBudgetBps === undefined ? minimum : costFloor(quoted, minimum, step.costBudgetBps), feeBps); }
+    try { freshAmountOutMin = minGrossFor(freshCost === undefined ? minimum : costFloor(quoted, minimum, freshCost), feeBps); }
     catch { return {ok:false,kind:'quote-failed',reason:'送出前成本預算或報價無效，不送交易'}; }
     const deltaBps = floorDeltaBps(step.oracleFloor, minimum);
     refreshes.push({
@@ -1117,7 +1136,7 @@ export async function refreshFloors(params: {
         const label = { 'api-failed': 'API 失敗／逾時', 'below-floor': '低於地板', 'venue-changed': 'venue 改變' }[failure];
         const diagnostic = `step#${index} 聚合器刷新 ${failure}（${label}），退回 Pancake`;
         (params.log ?? console.log)(`[routing] ${diagnostic}`);
-        const fallback = await pancakeFallback({ ...params, executor: params.executor, step, minimum, minGross: freshAmountOutMin, route: pancake });
+        const fallback = await pancakeFallback({ ...params, executor: params.executor, step, minimum, quoted, minGross: freshAmountOutMin, route: pancake });
         if (fallback === null) return { ok: false, kind: 'quote-failed', reason: `${diagnostic}；Pancake 沒有符合新鮮地板的白名單報價，不送交易` };
         rebuilt.push(fallback);
         usedFallback = true;
@@ -1142,10 +1161,21 @@ export async function refreshFloors(params: {
         poolFee: identity.poolFee,
         // 逐字保留原本的路徑（V3 可能多跳；V2 是 address[]）。
         ...(identity.v2Tokens === null ? { path: identity.path } : { v2Tokens: identity.v2Tokens }),
-      }), ...(step.costBudgetBps === undefined ? {} : {costBudgetBps:step.costBudgetBps})},
+      }), ...(step.costBudgetBps === undefined ? {} : {costBudgetBps:freshCost})},
     );
   }
 
+  for(const [index,step] of rebuilt.entries()){
+    if(step.costBudgetBps===undefined||!isAddressEqual(step.venue,PANCAKE_UR))continue;
+    const identity=decodeStepIdentity(step);
+    if('problem' in identity||identity.path===null)return {ok:false,kind:'quote-failed',reason:'[ROUTE_IMPACT_UNAVAILABLE] 無法確認實際路徑衝擊'};
+    let timer:ReturnType<typeof setTimeout>|undefined;
+    const impact=await Promise.race([
+      routeImpactBps(publicClient,{path:identity.path,amountIn:step.amountIn,...(params.blockNumber===undefined?{}:{blockNumber:params.blockNumber})}).catch(()=>null),
+      new Promise<null>(resolve=>{timer=setTimeout(()=>resolve(null),PANCAKE_QUOTE_TIMEOUT_MS);}),
+    ]).finally(()=>clearTimeout(timer));
+    if(impact===null||impact>DEFAULT_MAX_IMPACT_BPS)return {ok:false,kind:'quote-failed',reason:`[ROUTE_IMPACT] step#${index} 實際路徑衝擊超過80 bps或資料不可用，不送交易`};
+  }
   if (usedFallback) {
     const problem = await validateFallbackPlan({ ...params, steps: rebuilt });
     if (problem !== null) return { ok: false, kind: 'quote-failed', reason: problem };
@@ -1159,7 +1189,7 @@ export async function refreshFloors(params: {
 
 /** Opaque aggregator data contains no reusable Pancake path. Search without guessing a fee. */
 async function pancakeFallback(params: {
-  publicClient: PublicClient; executor: Address; step: PlannedStep; minimum: bigint; minGross: bigint; blockNumber?: bigint;
+  publicClient: PublicClient; executor: Address; step: PlannedStep; minimum: bigint; quoted:bigint; feeBps:number; minGross: bigint; blockNumber?: bigint;
   route: RouteCandidate | null;
 }): Promise<PlannedStep | null> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1167,14 +1197,16 @@ async function pancakeFallback(params: {
     return await Promise.race([(async () => {
       const route = params.route;
       if (route === null) return null;
+      const budget=params.step.costBudgetBps===undefined?undefined:route.kind==='v3'?Math.min(params.step.costBudgetBps,pathCostBudget(route.path)):params.step.costBudgetBps;
+      const minGross=budget===undefined?params.minGross:minGrossFor(costFloor(params.quoted,params.minimum,budget),params.feeBps);
       const venue = await params.publicClient.readContract({ address: params.executor, abi: EXECUTOR_ABI, functionName: 'venues',
           args: [pancakeRouterForChain(params.publicClient.chain?.id)], ...(params.blockNumber === undefined ? {} : { blockNumber: params.blockNumber }) });
       if (venue[0] !== 1 || !isAddressEqual(venue[1], pancakeRouterForChain(params.publicClient.chain?.id)) || route === null ||
-          route.amountOut < amountOutMinWithBuffer(params.minGross)) return null;
+          route.amountOut < amountOutMinWithBuffer(minGross)) return null;
       return {...buildStep({ ...params.step, chainId: params.publicClient.chain?.id, executor: params.executor, oracleFloor: params.minimum,
-        minGross: params.minGross, quotedAmountOut: route.amountOut, poolFee: 0,
+        minGross, quotedAmountOut: route.amountOut, poolFee: 0,
         ...(route.kind === 'v3' ? { path: route.path } : { v2Tokens: route.tokens }) }),
-        ...(params.step.costBudgetBps === undefined ? {} : {costBudgetBps:params.step.costBudgetBps})};
+        ...(budget === undefined ? {} : {costBudgetBps:budget})};
     })().catch(() => null), new Promise<null>((resolve) => {
       timer = setTimeout(() => resolve(null), PANCAKE_QUOTE_TIMEOUT_MS);
     })]);
@@ -1694,7 +1726,7 @@ export async function quoteNewMoney(args: Pick<PlanRebalanceArgs,'publicClient'|
       if(deviation===null||deviation>Number(MAX_TWAP_SPOT_DEVIATION_BPS))return {kind:'blocked',reason:'[BASKET_DEPTH] TWAP 與現價無法確認，整籃子等待'};
       const step=await buildRoutedStep({publicClient,executor,tokenIn:args.cash,tokenOut,amountIn,oracleFloor:quote.floor,oracleQuoted:quote.quoted,
         minGross:minGrossFor(quote.floor,feeBps),poolFee:pair.poolFee,blockNumber,feeBps,deadline:args.deadline},deps);
-      if(step===null)return {kind:'blocked',reason:'[BASKET_QUOTE_UNAVAILABLE] 整籃子沒有符合地板的路徑'};
+      if(step===null)return {kind:'blocked',reason:'[BASKET_DEPTH] 整籃子沒有符合成交下限的路徑，等待縮量'};
       if(isAddressEqual(step.venue,pancakeRouterForChain(publicClient.chain?.id))) {
         const identity=decodeStepIdentity(step);
         if('problem' in identity||identity.path===null)return {kind:'blocked',reason:'[BASKET_DEPTH] 無法確認路徑深度'};
@@ -1711,7 +1743,7 @@ export async function quoteNewMoney(args: Pick<PlanRebalanceArgs,'publicClient'|
 /** Conservative per-pool capacity used to reserve the *whole* job's fee upper bound before starting.
  * The final route quote still has to pass independently; missing depth never becomes unlimited.
  */
-export async function newMoneyDepthCap(client:PublicClient,oracle:Address,cash:Address,asset:Address,upper:bigint,blockNumber:bigint):Promise<bigint>{
+export async function newMoneyDepthCap(client:PublicClient,oracle:Address,cash:Address,asset:Address,upper:bigint,blockNumber:bigint,feeBps=0):Promise<bigint>{
   if(upper<=0n)return 0n;
   const pair=await resolveHubPair(client,{router:oracle,asset,blockNumber});
   if('skip' in pair)throw new Error('new money pool unavailable');
@@ -1721,8 +1753,17 @@ export async function newMoneyDepthCap(client:PublicClient,oracle:Address,cash:A
   if(state===null)throw new Error('new money depth unavailable');
   const full={...state,feeUnits:pair.poolFee};
   if(impactStateProblem(full)!==null)throw new Error('new money depth invalid');
-  const budget=cappedCostBudget(quote.quoted,quote.floor,pair.poolFee,DEFAULT_MAX_IMPACT_BPS);
-  return budget<1?0n:capAmountInForImpact({state:full,idealAmountIn:upper,idealQuoted:quote.quoted,maxImpactBps:budget}).amountIn;
+  const floor=costFloor(quote.quoted,quote.floor,costBudgetBps(pair.poolFee,DEFAULT_MAX_IMPACT_BPS));
+  const gross=amountOutMinWithBuffer(minGrossFor(floor,feeBps));
+  if(gross>=quote.quoted)return 0n;
+  const budget=Number((quote.quoted-gross)*10000n/quote.quoted);
+  // Whole-bps truncation leaves a conservative margin for oracle rounding.
+  const cap=budget<=1?0n:capAmountInForImpact({state:full,idealAmountIn:upper,idealQuoted:quote.quoted,maxImpactBps:budget-1}).amountIn;
+  if(cap===0n)return 0n;
+  const fresh=await quoteHub(client,{router:oracle,tokenIn:cash,tokenOut:asset,amountIn:cap,blockNumber});
+  if('skip' in fresh)throw new Error('new money oracle unavailable');
+  const required=amountOutMinWithBuffer(minGrossFor(costFloor(fresh.quoted,fresh.floor,costBudgetBps(pair.poolFee,DEFAULT_MAX_IMPACT_BPS)),feeBps));
+  return amountOutFor(full,cap)>=required?cap:0n;
 }
 
 async function executorNumeraire(args: PlanRebalanceArgs): Promise<Address | null> {
@@ -1764,7 +1805,8 @@ async function planHub(
   const driftByAsset = new Map<string, (typeof drift.assets)[number]>();
   for (const row of drift.assets) driftByAsset.set(row.asset.toLowerCase(), row);
   const hubHolding = holdingsByAsset.get(hubKey);
-  const policy = args.tradingConfig ?? loadTradingConfig();
+  const configuredPolicy = args.tradingConfig ?? loadTradingConfig();
+  const policy = args.inclusiveFeeReserveRaw===undefined?configuredPolicy:{...configuredPolicy,minStepUsdE8:100000000n,minBatchUsdE8:5000000000n};
 
   // 約束 ③：deltaUsd_i = 實際 USD − 目標 USD，目標值取上界（ceil）→「該賣的量」只會少不會多。
   const legs: { asset: Address; row: (typeof drift.assets)[number]; deltaUsdE8: bigint }[] = [];
@@ -2089,8 +2131,10 @@ async function planHub(
   const deadline = deadlineBaseSeconds + BigInt(deadlineSeconds);
 
   const steps = priced.map((leg) => leg.routed);
-  const minimumReason = tradeMinimumReason(priced.map((leg) =>
-    sameAsset(leg.tokenIn, hub) ? leg.amountIn : leg.oracleQuoted), 'ordinary', policy, cashDecimals);
+  const nominal=priced.map((leg)=>sameAsset(leg.tokenIn,hub)?leg.amountIn:leg.oracleQuoted);
+  const minimumReason = args.inclusiveFeeReserveRaw===undefined?tradeMinimumReason(nominal,'ordinary',policy,cashDecimals):
+    cashDecimals!==18||args.inclusiveFeeReserveRaw<0n?'[TRADE_MINIMUM_UNAVAILABLE] 含費批次單位或預留無效':
+    assetTradeMinimumReason(nominal,nominal.reduce((n,value)=>n+value,0n)+args.inclusiveFeeReserveRaw);
   if (minimumReason !== null) return { kind: 'blocked', reason: minimumReason };
 
   const legNotes = priced.map((leg, index) => {
@@ -2561,11 +2605,14 @@ export async function planRebalance(
     amountIn: finalAmountIn, oracleFloor: finalFloor, minGross }, deps);
   if (step === null) return { kind: 'blocked', reason: '縮量後沒有符合地板的白名單路徑' };
 
-  const policy = args.tradingConfig ?? loadTradingConfig();
+  const configuredPolicy = args.tradingConfig ?? loadTradingConfig();
+  const policy = args.inclusiveFeeReserveRaw===undefined?configuredPolicy:{...configuredPolicy,minStepUsdE8:100000000n,minBatchUsdE8:5000000000n};
   if (policy.minStepUsdE8 > 0n || policy.minBatchUsdE8 > 0n) {
     const decimals = await numeraireDecimals(publicClient, numeraire, holdings, blockNumber);
     const nominal = sameAsset(tokenIn, numeraire) ? finalAmountIn : await nominalSellQuote(publicClient, oracle, tokenIn, numeraire, finalAmountIn, blockNumber);
-    const minimumReason = tradeMinimumReason([nominal], 'ordinary', policy, decimals);
+    const minimumReason = args.inclusiveFeeReserveRaw===undefined?tradeMinimumReason([nominal],'ordinary',policy,decimals):
+      decimals!==18||args.inclusiveFeeReserveRaw<0n?'[TRADE_MINIMUM_UNAVAILABLE] 含費批次單位或預留無效':
+      assetTradeMinimumReason([nominal],nominal+args.inclusiveFeeReserveRaw);
     if (minimumReason !== null) return { kind: 'blocked', reason: minimumReason };
   }
 

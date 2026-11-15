@@ -1,3 +1,5 @@
+import { readCashWithdrawals } from './cash-reconciliation.js';
+import type { CashWithdrawal } from './cash-reconciliation.js';
 import { executionBatchSize, executionInputGroups } from './execution-batch.js';
 import type { Address, PublicClient } from 'viem';
 import { EXECUTOR_ABI } from './chain.js';
@@ -12,14 +14,14 @@ import { minimumFeeReserve, quoteNewMoney, readBuyBudget, readMaxLegUsdE8, newMo
 import type { RebalancePlan } from './rebalance-plan.js';
 import type { DuePortfolio, SchedulerQueryFn, WithTransactionFn } from './scheduler.js';
 import type { PortfolioPlan } from './snapshot.js';
-import { stockMarketOpen } from './trading-calendar.js';
-import { TESTNET_ASSETS } from './keeper/assets.js';
-import { testnetAssets } from './testnet-profile.js';
+import { assetsMarketOpen } from './trading-calendar.js';
 
 export type NewMoneyPolicy = { reserve: bigint; caps: Map<string,bigint|null>; buyLimit: bigint; cash: bigint };
 export type NewMoneyDeps = {
   version: typeof requireTypedVersion;
   policy: (due:DuePortfolio,plan:PortfolioPlan,assets:readonly string[])=>Promise<NewMoneyPolicy>;
+  withdrawals: (due:DuePortfolio,plan:PortfolioPlan)=>Promise<CashWithdrawal[]>;
+  rebalanceReserve: (plan:PortfolioPlan)=>Promise<bigint>;
   verifyLots: (lots:readonly FundingLot[])=>Promise<void>;
   quote: (due:DuePortfolio,plan:PortfolioPlan,inputs:InputVector,deadline:bigint)=>Promise<RebalancePlan>;
   marketOpen: (version:StrategyVersion,now:Date)=>boolean;
@@ -27,6 +29,8 @@ export type NewMoneyDeps = {
 export function defaultNewMoneyDeps(client:()=>PublicClient,executor:()=>Address,registry:()=>Address,query:SchedulerQueryFn,chainId:number):NewMoneyDeps {
   return {
     version:requireTypedVersion,
+    withdrawals:(due,plan)=>readCashWithdrawals(client(),query,{chainId,portfolioId:due.portfolioId,account:due.account,cash:numeraireFor(chainId) as Address,blockNumber:plan.snapshot.block}),
+    rebalanceReserve:plan=>minimumFeeReserve(client(),executor(),BigInt(plan.pinnedVersion.onchainStrategyId),plan.snapshot.block),
     policy:async(due,plan,assets)=>{
       const publicClient=client(),blockNumber=plan.snapshot.block;
       const oracle=await publicClient.readContract({address:executor(),abi:EXECUTOR_ABI,functionName:'oracle',blockNumber});
@@ -37,12 +41,13 @@ export function defaultNewMoneyDeps(client:()=>PublicClient,executor:()=>Address
       const reserve=await minimumFeeReserve(publicClient,executor(),BigInt(plan.pinnedVersion.onchainStrategyId),blockNumber);
       // Executor buyAllowance is already in numeraire raw units (18 decimals).
       const buyLimit='kind' in buy?0n:buy.remaining;
+      const fee=Number(await publicClient.readContract({address:registry(),abi:[{type:'function',name:'effectiveFeeBps',stateMutability:'view',inputs:[{type:'uint256'}],outputs:[{type:'uint16'}]}],functionName:'effectiveFeeBps',args:[BigInt(plan.pinnedVersion.onchainStrategyId)],blockNumber}));
       const caps=new Map<string,bigint|null>();
       for(const asset of assets){
         const limit=limits.get(asset.toLowerCase());
         if(limit===undefined)throw new Error('asset capacity missing');
         const upper=limit===null?buyLimit:limit*10n**10n;
-        caps.set(asset.toLowerCase(),await newMoneyDepthCap(publicClient,oracle,numeraireFor(chainId) as Address,asset as Address,upper,blockNumber));
+        caps.set(asset.toLowerCase(),await newMoneyDepthCap(publicClient,oracle,numeraireFor(chainId) as Address,asset as Address,upper,blockNumber,fee));
       }
       return {reserve,caps,buyLimit,
         cash:holding?.amountWei??0n};
@@ -64,9 +69,7 @@ export function defaultNewMoneyDeps(client:()=>PublicClient,executor:()=>Address
     marketOpen:(version,now)=>{
       // Typed automation is opened on 97 only. Stock identity comes from the admitted manifest, never client display symbols.
       if(chainId!==97)return false;
-      const stocks:ReadonlySet<string>=new Set(TESTNET_ASSETS.filter(a=>!a.hasFeed && a.symbol!=='XAUt').map(a=>a.symbol));
-      const stockAddresses:ReadonlySet<string>=new Set(testnetAssets().filter(a=>stocks.has(a.symbol)).map(a=>a.address));
-      return !version.allocation.assets.some(a=>a.weightBps>0&&stockAddresses.has(a.address))||stockMarketOpen(now);
+      return assetsMarketOpen(chainId,version.allocation.assets.filter(a=>a.weightBps>0).map(a=>a.address),now);
     },
   };
 }
@@ -106,19 +109,21 @@ export async function prepareNewMoney(args:{due:DuePortfolio;plan:PortfolioPlan;
     union select l.* from strategy_funding_lots l join strategy_asset_slices s on s.lot_id=l.id join strategy_jobs j on j.id=s.job_id where j.chain_id=$1 and j.portfolio_id=$2 and j.state in ('reserved','running','unknown','paused')`,[chainId,due.portfolioId])).rows as FundingLot[];
   await deps.verifyLots([...lots,...prior]);
   if(args.dryRun)return {job:null,context,rebalance:{kind:'blocked',reason:'[DRY_RUN_NEW_MONEY] 只讀檢查完成；未預留投入或期次，沒有送交易'}};
+  context.withdrawals=await deps.withdrawals(due,plan);
   const prepared=await prepareStrategyJob(run,context,lots),job=prepared.job;
   if(!job&&version.execution.kind==='per_asset'&&version.execution.rebalance!=='none'&&context.enabled&&context.marketOpen){
     const balance=(await query('select unallocated_hold_raw::text,stack_prefund_raw::text,reserved_input_raw::text,reserved_fee_raw::text from strategy_cash_balances where chain_id=$1 and portfolio_id=$2',[chainId,due.portfolioId])).rows[0] as Record<string,string>|undefined;
     const waiting=balance&&Object.values(balance).some(n=>BigInt(n)>0n);
-    const last=(await query('select last_rebalance_at from portfolios where id=$1',[due.portfolioId])).rows[0] as {last_rebalance_at:Date|null}|undefined;
+    const last=(await query("select coalesce(last_rebalance_at,(select min(created_at) from strategy_funding_lots where portfolio_id=$1 and state='confirmed')) as last_rebalance_at from portfolios where id=$1",[due.portfolioId])).rows[0] as {last_rebalance_at:Date|null}|undefined;
     const monthly=version.execution.rebalance==='monthly'&&last?.last_rebalance_at!=null&&
       (last.last_rebalance_at.getUTCFullYear()!==now.getUTCFullYear()||last.last_rebalance_at.getUTCMonth()!==now.getUTCMonth());
     const drift=version.execution.rebalance==='drift'&&(plan.report?.maxAbsDeltaBps??0)>500;
-    if(!waiting&&(monthly||drift))return {job:null,context,useTargetWeights:true,rebalance:{kind:'noop',reason:'全hold基金設定再平衡'}};
+    if(!waiting&&(monthly||drift)){context.reserve=await deps.rebalanceReserve(plan);return {job:null,context,useTargetWeights:true,rebalance:{kind:'noop',reason:'全hold基金設定再平衡'}};}
   }
   if(!job||job.state==='completed'||job.state==='paused'||!context.enabled||!(context.marketOpenFor?.(Object.keys(job.remaining_input))??context.marketOpen)||job.next_check_at>now){
     return {job,context,rebalance:{kind:'noop',reason:prepared.reason}};
   }
+  if(job.kind==='asset')context.finalAssets=new Set((await query(`select distinct s.asset from strategy_asset_slices s join strategy_lot_assets a on (a.lot_id,a.asset)=(s.lot_id,s.asset) where s.job_id=$1 and s.slice_index=a.effective_slices-1`,[job.id])).rows.map(row=>{if(typeof row!=='object'||row===null||!('asset' in row)||typeof row.asset!=='string')throw new Error('invalid final source');return row.asset;}));
   // The same original vector survives new quotes, different prices and process restarts.
   const deadline=BigInt(Math.floor(now.getTime()/1000))+1800n;
   const feeBatches=policy.reserve===0n?sumInputs(job.remaining_input)/(50n*10n**18n):BigInt(job.remaining_fee_raw)/policy.reserve;
@@ -127,12 +132,12 @@ export async function prepareNewMoney(args:{due:DuePortfolio;plan:PortfolioPlan;
   const held=plan.snapshot.holdings.filter(h=>h.amountWei>0n&&h.asset.toLowerCase()!==cash&&version.allocation.assets.some(a=>a.address===h.asset.toLowerCase())).length;
   const stepLimit=executionBatchSize(held);
   if(stepLimit===0)return {job,context,rebalance:{kind:'blocked',reason:'[USER_OP_CAPACITY] 估值已超過單筆容量'}};
-  const maximum=newMode?maximumRemainingBatches(remaining,BigInt(job.remaining_fee_raw),policy.reserve,stepLimit):maxBasketBatches(job.remaining_input,feeBatches);
-  let count=newMode?newRemainingCount(remaining,policy.caps,policy.buyLimit,BigInt(job.remaining_fee_raw),policy.reserve,stepLimit):batchCountFor(job.remaining_input,policy.caps,policy.buyLimit,feeBatches);
+  const maximum=newMode?maximumRemainingBatches(remaining,BigInt(job.remaining_fee_raw),policy.reserve,stepLimit,context.finalAssets):maxBasketBatches(job.remaining_input,feeBatches);
+  let count=newMode?newRemainingCount(remaining,policy.caps,policy.buyLimit,BigInt(job.remaining_fee_raw),policy.reserve,stepLimit,context.finalAssets):batchCountFor(job.remaining_input,policy.caps,policy.buyLimit,feeBatches);
   if(count===null)return {job,context,rebalance:{kind:'blocked',reason:'[BASKET_WAITING] 原向量無可行完整批次或費用預留'}};
   for (;;) {
     const vector=basketBatch(newMode?remaining:job.remaining_input,count);
-    const inputs=newMode?executionInputGroups(vector,stepLimit,policy.reserve)?.[0]??{}:vector;
+    const inputs=newMode?executionInputGroups(vector,stepLimit,policy.reserve,context.finalAssets)?.[0]??{}:vector;
     if(newMode&&sumInputs(inputs)+policy.reserve<50n*10n**18n)return {job,context,rebalance:{kind:'blocked',reason:'[BASKET_WAITING] 子批不足50 USDT'}};
     const rebalance=await deps.quote(due,plan,inputs,deadline);
     if(rebalance.kind==='ready')return {job,context,rebalance};
@@ -142,8 +147,8 @@ export async function prepareNewMoney(args:{due:DuePortfolio;plan:PortfolioPlan;
 }
 
 /** Resume the frozen vector; fee leftovers never become new principal. */
-function newRemainingCount(inputs:InputVector,caps:ReadonlyMap<string,bigint|null>,buyLimit:bigint,fee:bigint,reserve:bigint,stepLimit:number):bigint|null{
-  const maximum=maximumRemainingBatches(inputs,fee,reserve,stepLimit);
+function newRemainingCount(inputs:InputVector,caps:ReadonlyMap<string,bigint|null>,buyLimit:bigint,fee:bigint,reserve:bigint,stepLimit:number,finalAssets:ReadonlySet<string>=new Set()):bigint|null{
+  const maximum=maximumRemainingBatches(inputs,fee,reserve,stepLimit,finalAssets);
   if(maximum<1n||buyLimit<=0n)return null;
   const fits=(k:bigint)=>{const batch=basketBatch(inputs,k);return sumInputs(batch)<=buyLimit&&Object.entries(batch).every(([a,v])=>{if(!caps.has(a))throw new Error('missing capacity');const cap=caps.get(a);return cap===null||(cap!==undefined&&BigInt(v)<=cap);});};
   if(!fits(maximum))return null;
@@ -151,13 +156,13 @@ function newRemainingCount(inputs:InputVector,caps:ReadonlyMap<string,bigint|nul
   return low;
 }
 
-function maximumRemainingBatches(inputs:InputVector,fee:bigint,reserve:bigint,stepLimit:number):bigint{
+function maximumRemainingBatches(inputs:InputVector,fee:bigint,reserve:bigint,stepLimit:number,finalAssets:ReadonlySet<string>=new Set()):bigint{
   const total=sumInputs(inputs),U=10n**18n;
   let maximum=(total+fee)/(50n*U);
-  const groups=executionInputGroups(inputs,stepLimit,reserve);
+  const groups=executionInputGroups(inputs,stepLimit,reserve,finalAssets);
   if(!groups)return 0n;
   const groupReserve=reserve*BigInt(groups.length);
   if(groupReserve>0n&&fee/groupReserve<maximum)maximum=fee/groupReserve;
-  for(const value of Object.values(inputs)){const n=BigInt(value)/U;if(n<maximum)maximum=n;}
+  for(const [asset,value] of Object.entries(inputs)){const n=BigInt(value)/(finalAssets.has(asset)?1n:U);if(n<maximum)maximum=n;}
   return maximum;
 }

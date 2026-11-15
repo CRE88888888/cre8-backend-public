@@ -1,3 +1,4 @@
+import { TESTNET_97 } from '../src/testnet-profile.js';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { getAddress, keccak256, toBytes } from 'viem';
@@ -1552,5 +1553,22 @@ test('#92 close plans at most 16 sell steps and resumes remaining holdings, incl
     const next=await buildRedeemPlan({portfolioId:PORTFOLIO_ID,account:ACCOUNT,plan},{close:true},options);
     if(count<=16)assert.equal(next.plan.kind,'noop');
     else {assert.ok(next.plan.kind==='ready');assert.equal(next.plan.steps.length,Math.min(16,count-16));assert.ok(next.plan.steps.every(s=>!sold.has(s.tokenIn.toLowerCase())));}
+  }
+});
+
+
+test('#96 closed-market stock redemption blocks first, continuation and close without a quote',async()=>{
+  const f=sellFixture();const base=f.plan(samplePlan());
+  const stock=TESTNET_97.assets.AAPLB.token;
+  const holding=base.snapshot.holdings.find(h=>h.asset.toLowerCase()!==CASH.toLowerCase());assert.ok(holding);
+  f.state.extraLimits=[{address:stock,max_leg_usdt:'150'}];
+  const stockPlan:PortfolioPlan={...base,chainId:97,snapshot:{...base.snapshot,holdings:[{...holding,asset:stock,amountWei:200n*10n**18n,decimals:18},{asset:CASH,amountWei:100n*10n**18n,decimals:18,usdPriceE8:100000000n,priceSource:NUMERAIRE_PRICE_SOURCE}]}};
+  for(const request of [10000000000n,{sellUsdE8:10000000000n},{close:true}] as const){
+    f.state.reads=[];
+    const result=await buildRedeemPlan({portfolioId:PORTFOLIO_ID,account:ACCOUNT,plan:stockPlan},request,{...f.deps,now:()=>new Date('2026-11-15T16:00:00Z')});
+    assert.equal(result.plan.kind,'blocked');if(result.plan.kind==='blocked')assert.match(result.plan.reason,/MARKET_CLOSED/);
+    assert.equal(f.state.reads.length,0,'closed-market batches must stop before any quote');
+    const open=await buildRedeemPlan({portfolioId:PORTFOLIO_ID,account:ACCOUNT,plan:stockPlan},request,{...f.deps,now:()=>new Date('2026-11-16T16:00:00Z')});
+    assert.equal(open.plan.kind,'ready',open.plan.kind==='blocked'?open.plan.reason:'stock sale must resume during trading hours');
   }
 });

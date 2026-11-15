@@ -22,7 +22,7 @@ import {
   buildRoutedStep,
   refreshFloors,
   readMaxLegUsdE8,
-  minimumDepositUsdtWei, tradeMinimumReason, checkBuyFeeReserve, checkTradeMinimums,
+  minimumDepositUsdtWei, tradeMinimumReason, assetTradeMinimumReason, checkBuyFeeReserve, checkTradeMinimums,
   amountOutMinWithBuffer,} from '../src/rebalance-plan.js';
 import { quoteNewMoney, newMoneyDepthCap } from '../src/rebalance-plan.js';
 import type { PlanRebalanceArgs, PlannedStep, RebalancePlan } from '../src/rebalance-plan.js';
@@ -89,6 +89,7 @@ type StubQuote = { minimum: bigint; quoted?: bigint };
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000' as Address;
 
 type StubChain = {
+  ammQuotes?: boolean;
   routeQuotes?: boolean;
   minBatchFee?: bigint;
   buyAllowance?: unknown;
@@ -162,7 +163,10 @@ function stubClient(chain: StubChain): PublicClient {
       const routeFee=chain.oracle.pairs?.[key.split(':').find(a=>a!==USDT)??'']?.fee??chain.pool.fee;
       const spot=oracleQuote*BigInt(1_000_000-routeFee)/1_000_000n;
       const buffered=gross+(gross*30n+9999n)/10000n;
-      const output=spot>buffered?spot:buffered;
+      const fee=Number(BigInt(`0x${path.slice(42,48)}`));
+      const net=input*BigInt(1000000-fee)/1000000n;
+      const depth=chain.poolState?.liquidity??0n;
+      const output=chain.ammQuotes?net*depth/(depth+net):(spot>buffered?spot:buffered);
       return encodeFunctionResult({ abi, functionName: 'quoteExactInput', result: [output, []] });
     } }, { retryCount: 0 }) }).call,
     getBlock: async (args: { blockNumber?: bigint }) => {
@@ -245,7 +249,9 @@ function stubClient(chain: StubChain): PublicClient {
         case 'quoteExactInput': {
           if(chain.routeQuotes!==true)throw new Error('route quote not configured');
           const amount=args.args?.[1];if(typeof amount!=='bigint')throw new Error('invalid route amount');
-          return [amount*99n/100n,[]];
+          const path=args.args?.[0];assert.equal(typeof path,'string');
+          const fee=Number(BigInt(`0x${String(path).slice(42,48)}`)),net=amount*BigInt(1000000-fee)/1000000n,depth=chain.poolState?.liquidity??0n;
+          return [chain.ammQuotes?net*depth/(depth+net):amount*99n/100n,[]];
         }
         case 'pool':
           return chain.oracle.pool;
@@ -423,7 +429,7 @@ test('#75 dropped sub-5 sale cannot fund a subsequent buy', async () => {
   const plan = expectReady(await planRebalance(hubArgs(chain, {
     holdings: [holding(WBNB, 10n * 10n ** 18n, 18, PRICE_1_USD), holding(USDT, 90n * 10n ** 18n, 18, PRICE_1_USD)],
     targets: [{ asset: WBNB, weightBps: 600 }, { asset: TOKEN3, weightBps: 9400 }, { asset: USDT, weightBps: 0 }],
-    thresholdBps: 100, maxImpactBps: null, tradingConfig: loadTradingConfig({}),
+    thresholdBps: 100, maxImpactBps: null, tradingConfig: loadTradingConfig({MIN_STEP_USD_E8:'500000000'}),
   })));
   assert.equal(plan.steps.length, 1);
   assert.equal(plan.steps[0]?.tokenIn.toLowerCase(), USDT);
@@ -2667,7 +2673,7 @@ function refreshFallbackFixture() {
     'function balanceOf(address) view returns(uint256)', 'function buyAllowance(address) view returns(uint256,uint256,uint64)',
   ]);
   const state: { floor: bigint; nominal: bigint; pancakeOut: bigint; cash: bigint; allowed: boolean; cap: bigint; bought: bigint;
-    limit: string | null; failure: string; calls: string[]; logs: string[] } = {
+    impactTimeout?:boolean; impactQuotes?:boolean; limit: string | null; failure: string; calls: string[]; logs: string[] } = {
     floor: 100n, nominal: 105n, pancakeOut: 110n, cash: 2n ** 255n, allowed: true, cap: 1000n, bought: 0n,
     limit: '0.00000001', failure: '', calls: [], logs: [] };
   const client = createPublicClient({ transport: custom({ request: async ({ method, params }) => {
@@ -2680,7 +2686,8 @@ function refreshFallbackFixture() {
     if (call.functionName === 'previewSwap') return encodeFunctionResult({ abi, functionName: call.functionName, result: [state.nominal, state.floor] });
     if (call.functionName === 'venues') return encodeFunctionResult({ abi, functionName: call.functionName, result: [state.allowed ? 1 : 0, PANCAKE_UR] });
     if (call.functionName === 'getPool') return encodeFunctionResult({ abi, functionName: call.functionName, result: call.args[2] === 500 ? WBNB_USDT_POOL : zeroAddress });
-    if (call.functionName === 'quoteExactInput') return encodeFunctionResult({ abi, functionName: call.functionName, result: [state.pancakeOut, []] });
+    if(call.functionName==='quoteExactInput' && state.impactTimeout && call.args[1]<100n)return new Promise<never>(()=>{});
+    if (call.functionName === 'quoteExactInput') return encodeFunctionResult({ abi, functionName: call.functionName, result: [state.impactQuotes && call.args[1]<100n ? state.pancakeOut*call.args[1]/100n : state.pancakeOut, []] });
     if (call.functionName === 'balanceOf') return encodeFunctionResult({ abi, functionName: call.functionName, result: state.cash });
     if (call.functionName === 'numeraire') return encodeFunctionResult({ abi, functionName: call.functionName, result: USDT });
     if (call.functionName === 'decimals') return encodeFunctionResult({ abi, functionName: call.functionName, result: 18 });
@@ -2985,7 +2992,7 @@ const THRESHOLD_CASH = '0x55d398326f99059ff775485246999027b3197955';
 const THRESHOLD_ASSET = '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c';
 
 test('#75 minimum deposit includes the cash weight and rounds up exactly (50 / 80 / skew)', () => {
-  const policy = loadTradingConfig({});
+  const policy = loadTradingConfig({MIN_STEP_USD_E8:'500000000'});
   assert.equal(minimumDepositUsdtWei([{ asset: THRESHOLD_CASH, weightBps: 9000 }, { asset: THRESHOLD_ASSET, weightBps: 1000 }], THRESHOLD_CASH, policy), 50n * 10n ** 18n);
   const equal: TargetWeight[] = Array.from({ length: 15 }, (_, i) => ({ asset: `0x${(i + 1).toString(16).padStart(40, '0')}`, weightBps: 625 }));
   assert.equal(minimumDepositUsdtWei([...equal, { asset: THRESHOLD_CASH, weightBps: 625 }], THRESHOLD_CASH, policy), 80n * 10n ** 18n);
@@ -2997,7 +3004,7 @@ test('#75 minimum deposit includes the cash weight and rounds up exactly (50 / 8
 test('#75 ordinary step/batch equality passes; zero and just below wait; exit dust is exempt', () => {
   const policy = loadTradingConfig({});
   for (const [legs, expected] of [
-    [[5n, 45n], null], [[50n], null], [[0n], 'BELOW_MIN_STEP'], [[4n, 46n], 'BELOW_MIN_STEP'], [[49n], 'BELOW_MIN_BATCH'],
+    [[1n, 49n], null], [[4n, 46n], null], [[50n], null], [[0n], 'BELOW_MIN_STEP'], [[49n], 'BELOW_MIN_BATCH'],
   ] as const) {
     const nominal = legs.map((value) => value * 100000000n);
     const reason = tradeMinimumReason(nominal, 'ordinary', policy);
@@ -3141,7 +3148,7 @@ test('#92 a 1% pool gets 80 bps of price impact in addition to its fee; oracle f
 
 test('#92 actual buy/sell quotes obey fee + 80, the tighter oracle floor, and exact buffered boundaries',async()=>{
   for(const poolFee of [0,500,2500,10000])for(const sell of [false,true]){
-    const f=minOutFixture(),budget=80+poolFee/100;
+    const f=minOutFixture(),budget=Math.min(80+poolFee/100,85);
     const policyFloor=10000n-BigInt(budget),minimum=amountOutMinWithBuffer(policyFloor);
     const route={...f.route,poolFee,oracleQuoted:10000n,...(sell?{tokenIn:WBNB,tokenOut:USDT}:{})};
     f.state.pancakeOut=minimum;
@@ -3151,7 +3158,7 @@ test('#92 actual buy/sell quotes obey fee + 80, the tighter oracle floor, and ex
     f.state.pancakeOut--;
     assert.equal(await buildRoutedStep(route,{quoteAggregator:async()=>null}),null,'one raw unit below policy must wait');
     const tighter={...route,oracleFloor:9900n,minGross:9900n};
-    const tightMinimum=amountOutMinWithBuffer(poolFee<2500?policyFloor:9900n);
+    const tightMinimum=amountOutMinWithBuffer(budget<100?policyFloor:9900n);
     f.state.pancakeOut=tightMinimum;
     assert.ok(await buildRoutedStep(tighter,{quoteAggregator:async()=>null}));
     f.state.pancakeOut--;
@@ -3169,20 +3176,95 @@ test('#92 actual buy/sell quotes obey fee + 80, the tighter oracle floor, and ex
 });
 
 test('#92 fresh quotes and aggregator-to-Pancake fallback retain the cost bound; invalid data and RPC failure block',async()=>{
-  const f=minOutFixture();f.state.nominal=10000n;
+  const f=minOutFixture();f.state.nominal=10000n;f.state.impactQuotes=true;
   const route={...f.route,poolFee:10000,oracleQuoted:10000n};
   const initial=await buildRoutedStep(route,{quoteAggregator:async()=>null});assert.ok(initial);
-  const minimum=amountOutMinWithBuffer(9820n);
+  const minimum=amountOutMinWithBuffer(9915n);
   f.state.pancakeOut=minimum;
   const fresh=await refreshFloors({...f.params,steps:[initial]});assert.ok(fresh.ok);
-  assert.equal(fresh.steps[0]?.costBudgetBps,180);assert.equal(fresh.steps[0]?.amountOutMin,minimum);
+  assert.equal(fresh.steps[0]?.costBudgetBps,85);assert.equal(fresh.steps[0]?.amountOutMin,minimum);
   f.state.pancakeOut--;assert.equal((await refreshFloors({...f.params,steps:[initial]})).ok,false);
   f.state.pancakeOut=minimum;
   const opaque={...initial,venue:REGISTRY,data:'0x12345678' as const};
   const fallback=await refreshFloors({...f.params,steps:[opaque],quoteAggregator:async()=>null});assert.ok(fallback.ok);
-  assert.equal(fallback.steps[0]?.costBudgetBps,180);assert.equal(fallback.steps[0]?.amountOutMin,minimum);
+  assert.equal(fallback.steps[0]?.costBudgetBps,85);assert.equal(fallback.steps[0]?.amountOutMin,minimum);
   for(const failure of ['previewSwap','quoteExactInput']){
     f.state.failure=failure;assert.equal((await refreshFloors({...f.params,steps:[initial]})).ok,false);
   }
   f.state.failure='';f.state.nominal=0n;assert.equal((await refreshFloors({...f.params,steps:[initial]})).ok,false);
+});
+
+
+test('#96 depth capacity includes platform fee and buffer before freezing the job',async()=>{
+  const U=10n**18n,chain=hubChain({pairs:{[WBNB]:{oracle:ORACLE_WBNB_USDT,pool:WBNB_USDT_POOL,fee:10000}}});
+  chain.rate={rateE18:U,slippageBps:300};chain.registry.feeBps=10;chain.routeQuotes=true;chain.ammQuotes=true;
+  chain.poolState={sqrtPriceX96:1n<<96n,liquidity:100000n*U,token0:USDT};
+  const client=stubClient(chain),upper=1000n*U;
+  const cap=await newMoneyDepthCap(client,ROUTER,USDT,WBNB,upper,chain.block.number,10);
+  assert.ok(cap>50n*U&&cap<upper);
+  const params={publicClient:client,executor:EXECUTOR_MULTI,oracle:ROUTER,registry:REGISTRY,strategyId:1n,blockNumber:chain.block.number,cash:USDT,deadline:1900000000n};
+  const quote=await quoteNewMoney({...params,inputs:{[WBNB]:cap.toString()}},{quoteAggregator:async()=>null});
+  assert.equal(quote.kind,'ready',quote.kind==='blocked'?quote.reason:'expected executable capacity');
+  const large=await quoteNewMoney({...params,inputs:{[WBNB]:upper.toString()}},{quoteAggregator:async()=>null});
+  assert.equal(large.kind,'blocked');if(large.kind==='blocked')assert.match(large.reason,/BASKET_DEPTH/);
+});
+
+test('#96 fresh original path independently rejects over-80 impact despite a loose reference-pool cost budget',async()=>{
+  const U=10n**18n,chain=hubChain();chain.rate={rateE18:U,slippageBps:300};chain.routeQuotes=true;chain.ammQuotes=true;
+  chain.poolState={sqrtPriceX96:1n<<96n,liquidity:100000n*U,token0:USDT};
+  const step={...buildStep({executor:EXECUTOR_MULTI,tokenIn:USDT,tokenOut:WBNB,amountIn:1200n*U,oracleFloor:1164n*U,minGross:1164n*U,poolFee:500}),costBudgetBps:180};
+  const result=await refreshFloors({publicClient:stubClient(chain),oracle:ROUTER,steps:[step],feeBps:0,blockNumber:chain.block.number});
+  assert.equal(result.ok,false,'the 5-bps actual path has >80 bps impact, even if oracle and original reference fee permit it');
+});
+
+test('#96 default ordinary step minimum is 1 USDT and per-asset hold batches count reserved fees',async()=>{
+  assert.equal(loadTradingConfig({}).minStepUsdE8,100000000n);
+  const U=10n**18n,f=oracleFixture();
+  f.step.amountIn=4973n*U/100n;
+  assert.equal(await checkTradeMinimums(f.client,getAddress(THRESHOLD_CASH),[f.step],'ordinary',123n,50n*U),null);
+});
+
+
+test('#96 final installment exception permits positive remainder but never a zero input',()=>{
+  const U=10n**18n;
+  assert.equal(assetTradeMinimumReason([1n,50n*U-1n],50n*U,new Set([0])),null);
+  assert.match(assetTradeMinimumReason([0n,50n*U],50n*U,new Set([0]))??'',/BELOW_MIN_STEP/);
+});
+
+test('#96 all-hold rebalance uses fresh oracle notional plus fee at 1/50 equality, including sell legs',async()=>{
+  const U=10n**18n,f=oracleFixture(),reserve=27n*U/100n;
+  for(const delta of [-1n,0n,1n]){
+    const steps=[{...f.step,amountIn:4n*U},{...f.step,amountIn:4573n*U/100n+delta}];
+    const result=await checkTradeMinimums(f.client,getAddress(THRESHOLD_CASH),steps,'ordinary',123n,undefined,undefined,reserve);
+    assert.equal(result===null,delta>=0n);
+  }
+  const sell={...f.step,tokenIn:f.step.tokenOut,tokenOut:f.step.tokenIn,amountIn:U};
+  assert.equal(await checkTradeMinimums(f.client,getAddress(THRESHOLD_CASH),[sell],'ordinary',123n,undefined,undefined,reserve),null);
+  f.state.fail='previewSwap';assert.match(await checkTradeMinimums(f.client,getAddress(THRESHOLD_CASH),[sell],'ordinary',123n,undefined,undefined,reserve)??'',/TRADE_MINIMUM_UNAVAILABLE/);
+});
+
+test('#96 actual all-hold planning admits 49.73 input plus 0.27 fee while legacy planning still waits',async()=>{
+  const chain=hubChain({feeBps:10});chain.rate={rateE18:10n**18n,slippageBps:100};chain.minBatchFee=3n*10n**17n;
+  const args=hubArgs(chain,{holdings:[holding(USDT,50n*10n**18n,18,PRICE_1_USD)],targets:targetsOf(WBNB,USDT,10000),thresholdBps:100,maxImpactBps:null,tradingConfig:loadTradingConfig({})});
+  assert.equal((await planRebalance(args)).kind,'blocked');
+  const result=await planRebalance({...args,inclusiveFeeReserveRaw:27n*10n**16n});
+  assert.equal(result.kind,'ready',result.kind==='blocked'?result.reason:'expected fee-inclusive batch');
+  if(result.kind==='ready')assert.equal(result.steps[0]?.amountIn,4973n*10n**16n);
+});
+
+
+test('#96 refresh times out if only the marginal impact quote stalls',{timeout:10000},async()=>{
+  const f=minOutFixture();f.state.nominal=10000n;f.state.impactQuotes=true;
+  const initial=await buildRoutedStep({...f.route,oracleQuoted:10000n},{quoteAggregator:async()=>null});assert.ok(initial);
+  f.state.impactTimeout=true;
+  const result=await refreshFloors({...f.params,steps:[initial]});
+  assert.equal(result.ok,false);if(!result.ok)assert.match(result.reason,/ROUTE_IMPACT/);
+});
+
+test('#96 all-hold 1-USDT policy is independent of a legacy 5-USDT override',async()=>{
+  const chain=hubChain();chain.rate={rateE18:10n**18n,slippageBps:100};
+  const args=hubArgs(chain,{holdings:[holding(WBNB,10n*10n**18n,18,PRICE_1_USD),holding(USDT,90n*10n**18n,18,PRICE_1_USD)],
+    targets:[{asset:WBNB,weightBps:600},{asset:TOKEN3,weightBps:9400},{asset:USDT,weightBps:0}],thresholdBps:100,maxImpactBps:null,
+    tradingConfig:loadTradingConfig({MIN_STEP_USD_E8:'500000000'}),inclusiveFeeReserveRaw:0n});
+  const result=expectReady(await planRebalance(args));assert.equal(result.steps.length,2);assert.ok(result.steps.some(step=>step.amountIn===4n*10n**18n));
 });

@@ -139,6 +139,15 @@ export function typedVersionInput(input: unknown): PublishVersionInput {
   exactKeys(input.allocation,['assets'],'INVALID_ALLOCATION');
   if(Array.isArray(input.allocation.assets))for(const a of input.allocation.assets)if(record(a))exactKeys(a,['address','weightBps','symbol'],'INVALID_ASSET');
   const allocation = validateAllocation(input.allocation, chainId);
+  if (chainId !== 97) {
+    if (chainId !== configuredChainId()) throw new ValidationError('CHAIN_MISMATCH','chainId must match this API deployment');
+    if (input.execution !== undefined || input.idleYield !== undefined || (record(input.schedule) && input.schedule.kind === 'funding')) {
+      throw new ValidationError('EXECUTION_UNAVAILABLE', 'per-asset funding is only available on chain 97');
+    }
+    return { allocation, schedule: validateSchedule(input.schedule),
+      ...(input.changeLog === undefined ? {} : { changeLog: validateChangeLog(input.changeLog) }),
+      ...(input.activeAt === undefined ? {} : { activeAt: validateActiveAt(input.activeAt) }) };
+  }
   return { ...input, allocation, execution: validateAssetConfig(input.execution, allocation, chainId),
     schedule: validateFundingSchedule(input.schedule), idleYield: validateIdleYield(input.idleYield) };
 }
@@ -234,6 +243,8 @@ export function validateAllocation(input: unknown, chainId = configuredChainId()
   if (!seen.has(numeraire)) {
     normalised.push({ address: numeraire, symbol: 'USDT', weightBps: 0 });
   }
+
+  if (chainId === 56 && normalised.length > 16) throw new ValidationError('TOO_MANY_ASSETS', 'chain 56 supports at most 16 assets including USDT');
 
   return { assets: normalised };
 }
@@ -524,6 +535,7 @@ export async function publishVersion(
 async function publishTypedVersion(strategyId: number, raw: PublishVersionInput, provider: string, overrides: Partial<TypedPublishDeps>): Promise<StrategyVersion> {
   const deps: TypedPublishDeps = { isChainConfigured, validateChain: () => { getChain(); }, publishOnchain: publishVersionOnchain, relayerLock: withRelayerLock, ...overrides };
   if(raw.chainId!==undefined&&raw.chainId!==configuredChainId())throw new ValidationError('CHAIN_MISMATCH','chainId must match this API deployment');
+  if(configuredChainId()!==97)throw new ValidationError('EXECUTION_UNAVAILABLE','per-asset funding is only available on chain 97');
   const input = typedVersionInput(raw);
   const chainId = input.chainId === undefined ? configuredChainId() : input.chainId;
   if (chainId !== configuredChainId()) throw new ValidationError('CHAIN_MISMATCH', 'chainId must match this API deployment');
@@ -668,7 +680,7 @@ async function nextVersion(strategyId: number): Promise<number> {
 // Small validators
 // ---------------------------------------------------------------------------
 
-function validateChangeLog(value: string | null | undefined): string | null {
+function validateChangeLog(value: unknown): string | null {
   if (value === undefined || value === null) return null;
   if (typeof value !== 'string') {
     throw new ValidationError('INVALID_CHANGE_LOG', 'changeLog must be a string');
@@ -684,8 +696,9 @@ function validateChangeLog(value: string | null | undefined): string | null {
   return trimmed;
 }
 
-function validateActiveAt(value: string | Date | null | undefined): Date {
+function validateActiveAt(value: unknown): Date {
   if (value === undefined || value === null) return new Date();
+  if(typeof value!=='string'&&!(value instanceof Date))throw new ValidationError('INVALID_ACTIVE_AT','activeAt must be a valid ISO-8601 timestamp');
   const parsed = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(parsed.getTime())) {
     throw new ValidationError('INVALID_ACTIVE_AT', 'activeAt must be a valid ISO-8601 timestamp');

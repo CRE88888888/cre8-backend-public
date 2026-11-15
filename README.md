@@ -568,7 +568,7 @@ curl -s -X POST "$API/strategies/1/versions" -H "authorization: Bearer $TOKEN" -
 - chain 97 每帳戶每日 gas 預設 100M、無預設美元上限；主網維持 10M gas 與 0.30 USD，環境變數覆寫仍有效。chain 97 代付預設每帳戶每日 60 次、100M gas、無每帳戶 wei 上限；全站每日仍限制 0.1 tBNB。顯式 `PAYMASTER_ACCOUNT_DAILY_WEI`（含 0）仍套用。
   建立基金的初版與後續版本皆走此發布規則；不修改既有版本或既有投組固定的版本。
 - 買賣的預設 80 bps 只計價格衝擊、不含已知 oracle 參考池費；總成本上限為池費 + 80 bps，若超過該資產 `maxSlippageBps`，以原 oracle floor 的較嚴限制為準。實際路由報價、平台費、buffer 與送出前刷新仍必須通過。此規則也影響主網：DOGE 的 1% 池費不再單獨耗盡原 80 bps 預算；不修改鏈上滑價參數。`buyAllowance` 已是 USDT raw 單位，不再乘上 USD-E8 的換算倍率。
-- 新HTTP `execution`僅hold／stack、`schedule`僅`{"kind":"funding"}`；省略時明示回預設值。舊schema0列及內部legacy writer保留interval／cron，讀回target_weight。
+- chain 97 新 HTTP `execution` 僅 hold／stack、`schedule` 僅 `{"kind":"funding"}`；省略時明示回預設值。chain 56 HTTP 保留 schema 0 的 interval／cron，拒絕新 per_asset／funding，含 USDT 最多 16 個資產。逐資產不足跳期與可去重的 pending 使用者通知同交易落庫（需 db 0038），資料契約見 [策略 API](docs/strategy-api.zh-TW.md#不足跳期通知事件db-0038)。
 - canonical config hash放既有Version.scheduleHash。BE-2接入前，typed版本的funding標記使舊漂移scheduler blocked；個人投入／指令與hash golden見 [API契約](docs/strategy-api.zh-TW.md)。
 - `changeLog` 選填，≤ 2000 字；typed `activeAt`為含時區的整秒時間，省略固定第一次發版時間。已存設定重試只核對原鏈上版本，不重送未知publish交易。
 - 必須帶 token，且該策略 DB 的 `provider` 必須等於 session 錢包（不分大小寫），否則 403 `FORBIDDEN`。

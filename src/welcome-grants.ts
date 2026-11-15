@@ -110,7 +110,9 @@ export async function readWelcomeFundingEvidence(grant: { chainId: number; accou
     });
     const log = matches[0];
     if (matches.length !== 1 || !log || log.logIndex === null) throw new AppError(409, 'FUNDING_NOT_CONFIRMED', 'one exact canonical welcome Transfer is required');
-    return { txHash: grant.txHash, logIndex: log.logIndex, blockNumber: receipt.blockNumber, blockHash: receipt.blockHash, amountRaw: WELCOME_AMOUNT_WEI.toString() };
+    const confirmedAt = new Date(Number(block.timestamp) * 1000);
+    if (!Number.isSafeInteger(Number(block.timestamp)) || block.timestamp < 0n || !Number.isFinite(confirmedAt.getTime())) throw new Error('invalid confirmation time');
+    return { txHash: grant.txHash, logIndex: log.logIndex, blockNumber: receipt.blockNumber, blockHash: receipt.blockHash, amountRaw: WELCOME_AMOUNT_WEI.toString(), confirmedAt };
   } catch (error) {
     if (error instanceof AppError) throw error;
     throw new AppError(503, 'FUNDING_RPC_UNAVAILABLE', 'welcome confirmation unavailable; retry original purchase');

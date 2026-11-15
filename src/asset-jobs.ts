@@ -1,3 +1,4 @@
+import { reconcileCashWithdrawals } from './cash-reconciliation.js';
 import { record as isRecord } from './strategy-execution.js';
 import type { AssetExecution, AssetMode } from './strategy-execution.js';
 import type { FundingLot, JobContext, StrategyJob } from './strategy-jobs.js';
@@ -42,6 +43,32 @@ async function record(query:SchedulerQueryFn,s:Due,state:string,job?:{id:string;
     values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,[s.lot_id,s.asset,s.index,s.slot,s.end,s.budget.toString(),job?.id??null,
     job?.amount.toString()??'0',job?.fee.toString()??'0',JSON.stringify(job?{[s.asset]:job.amount.toString()}:{}),state]);
 }
+/** Caller holds the cash row lock. Both writes use its transaction; a failed
+ * notification must never commit a skipped installment without its event.
+ */
+async function recordInsufficient(query:SchedulerQueryFn,c:JobContext,due:readonly Due[]):Promise<void>{
+  const recipient=(await query(`select a.owner from smart_accounts a join strategy_cash_balances b
+    on (a.chain_id,a.portfolio_id,a.address)=(b.chain_id,b.portfolio_id,b.account)
+    where b.chain_id=$1 and b.portfolio_id=$2 and b.account=$3`,[c.chainId,c.portfolioId,c.account])).rows[0];
+  if(!isRecord(recipient)||typeof recipient.owner!=='string'||!/^0x[0-9a-f]{40}$/.test(recipient.owner))throw new Error('notification recipient unavailable');
+  for(const s of due){
+    await record(query,s,'skipped_insufficient_funds');
+    // Explicit public facts only: never spread context, upstream errors or credentials.
+    const payload=JSON.stringify({budgetRaw:s.budget.toString(),slotAt:s.slot.toISOString(),windowEndAt:s.end.toISOString()});
+    const params=[c.chainId,c.portfolioId,recipient.owner,s.lot_id,s.asset,s.index,payload];
+    const inserted=await query(`insert into user_notifications(chain_id,portfolio_id,owner,kind,dedup_key,lot_id,asset,slice_index,payload)
+      values($1,$2,$3,'stack_slot_skipped_insufficient_funds',$4::bigint::text || ':' || $5::text || ':' || $6::int::text,$4,$5,$6,$7::jsonb)
+      on conflict (chain_id,kind,dedup_key) do nothing returning id`,params);
+    if(inserted.rows.length===0){
+      // A separate READ COMMITTED statement sees the winner after a unique-key wait.
+      // Preserve its permanent ID, payload and delivered/failed state on retries.
+      const original=await query(`select id from user_notifications where chain_id=$1 and portfolio_id=$2 and owner=$3
+        and kind='stack_slot_skipped_insufficient_funds' and dedup_key=$4::bigint::text || ':' || $5::text || ':' || $6::int::text
+        and lot_id=$4 and asset=$5 and slice_index=$6 and payload=$7::jsonb`,params);
+      if(original.rows.length!==1)throw new Error('notification identity mismatch');
+    }
+  }
+}
 /** Record bounded (<=52 per asset) missed windows. Never turn skipped base into a later debit. */
 async function collect(query:SchedulerQueryFn,c:JobContext,inflight:boolean):Promise<Due[]>{
   const result:Due[]=[];
@@ -73,6 +100,7 @@ export async function prepareAssetJob(run:WithTransactionFn,c:JobContext,config:
   if(unresolved){await collect(query,c,true);return {job:existing,reason:'[PREVIOUS_INFLIGHT] 原操作需先對帳'};}
   if(existing?.kind==='asset'&&existing.asset_started_at==null&&existing.window_end_at!==null&&existing.window_end_at<=c.now){await cancelJob(query,c,existing);existing=null;}
   if(!c.enabled){if(existing)await cancelJob(query,c,existing);return {job:null,reason:'[STOPPED] 本人已暫停新買入'};}
+  await reconcileCashWithdrawals(query,c,c.withdrawals??[]);
   if(existing){await collect(query,c,true);return {job:existing,reason:'繼續原工作，後續期次不補扣'};}
   let due=await collect(query,c,false);
   if(due.length===0)return {job:null,reason:'[NO_DUE_SLOT] 沒有新投入或到期期次'};
@@ -83,21 +111,23 @@ export async function prepareAssetJob(run:WithTransactionFn,c:JobContext,config:
   const slot=due.reduce((a,b)=>a.slot<b.slot?a:b).slot;
   due=due.filter(s=>s.slot.getTime()===slot.getTime());
   if(!(c.marketOpenFor?.(due.map(s=>s.asset))??c.marketOpen))return {job:null,reason:'[MARKET_CLOSED] 同一批等待所有資產交易時段'};
-  const balance=(await query(`select (unallocated_hold_raw+stack_prefund_raw+allocated_cash_raw+reserved_input_raw+reserved_fee_raw+withdrawal_raw+yield_raw)::text as total from strategy_cash_balances where chain_id=$1 and portfolio_id=$2`,[c.chainId,c.portfolioId])).rows[0] as {total:string}|undefined;
+  const balance=(await query(`select unallocated_hold_raw::text,stack_prefund_raw::text,(unallocated_hold_raw+stack_prefund_raw+allocated_cash_raw+reserved_input_raw+reserved_fee_raw+withdrawal_raw+yield_raw)::text as total from strategy_cash_balances where chain_id=$1 and portfolio_id=$2`,[c.chainId,c.portfolioId])).rows[0] as {total:string;unallocated_hold_raw:string;stack_prefund_raw:string}|undefined;
   if(!balance)throw new Error('missing cash row');
-  if(BigInt(balance.total)>c.observedCash){
-    for(const s of due)await record(query,s,'skipped_insufficient_funds');
+  const holdDue=due.filter(s=>s.mode.kind==='hold').reduce((n,s)=>n+s.budget,0n),stackDue=due.filter(s=>s.mode.kind==='stack').reduce((n,s)=>n+s.budget,0n);
+  if(BigInt(balance.total)>c.observedCash||holdDue>BigInt(balance.unallocated_hold_raw)||stackDue>BigInt(balance.stack_prefund_raw)){
+    await recordInsufficient(query,c,due);
     await completeAssetSchedules(query,c.portfolioId);
     return {job:null,reason:'[SKIPPED_INSUFFICIENT_FUNDS] 本期不足，已略過且不追扣'};
   }
+  const finalAssets=new Set(due.filter(s=>s.index===s.effective_slices-1).map(s=>s.asset));
   // Determine dust on the MERGED asset, not each small lot separately.
   let budgets:InputVector={};for(const s of due)budgets=addInputs(budgets,{[s.asset]:s.budget.toString()});
-  const dust=new Set(Object.entries(budgets).filter(([,v])=>BigInt(v)-c.reserve*BigInt(v)/sumInputs(budgets)<U).map(([a])=>a));
+  const dust=new Set(Object.entries(budgets).filter(([asset,v])=>!finalAssets.has(asset)&&BigInt(v)-c.reserve*BigInt(v)/sumInputs(budgets)<U).map(([a])=>a));
   for(const s of due.filter(s=>dust.has(s.asset)))await record(query,s,'deferred_min_asset');
   due=due.filter(s=>!dust.has(s.asset));budgets={};for(const s of due)budgets=addInputs(budgets,{[s.asset]:s.budget.toString()});
   await completeAssetSchedules(query,c.portfolioId);
   if(!due.length)return {job:null,reason:'[DEFERRED_MIN_ASSET] 小於1 USDT，留至該資產下期'};
-  const budget=assetBatchBudget(budgets,c.reserve,c.caps,c.buyLimit,c.batchStepLimit);
+  const budget=assetBatchBudget(budgets,c.reserve,c.caps,c.buyLimit,c.batchStepLimit,finalAssets);
   if(!budget)return {job:null,reason:'[BASKET_WAITING] 完整合單門檻、容量或額度不足'};
   const end=due.reduce((a,b)=>a.end<b.end?a:b).end;
   const prior=await query("select id from strategy_jobs where chain_id=$1 and portfolio_id=$2 and kind='asset' and slot_at=$3",[c.chainId,c.portfolioId,slot]);
@@ -112,7 +142,7 @@ export async function prepareAssetJob(run:WithTransactionFn,c:JobContext,config:
     if(s.mode.kind==='hold')hold+=s.budget;else stack+=s.budget;
   }
   const largest=basketBatch(inputs,budget.count);
-  if(Object.values(inputs).some(v=>BigInt(v)/budget.count<U)||sumInputs(largest)>c.buyLimit||
+  if(Object.entries(inputs).some(([asset,v])=>BigInt(v)/budget.count<(finalAssets.has(asset)?1n:U))||sumInputs(largest)>c.buyLimit||
     Object.entries(largest).some(([a,v])=>{const cap=c.caps.get(a);return cap===undefined||(cap!==null&&BigInt(v)>cap);})){
     return {job:null,reason:'[BASKET_WAITING] 逐來源費用尾差超過容量或低於門檻'};
   }

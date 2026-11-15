@@ -31,7 +31,7 @@ test('#34 上游整數 bps 案例守恆；自動零權重 USDT、超過16資產�
     }
   }
   const sixteen = Array.from({ length: 16 }, (_, i) => ({ address: address(i), weightBps: 625 }));
-  assert.equal(validateAllocation({ assets: sixteen }).assets.length,17);
+  assert.throws(()=>validateAllocation({assets:sixteen},56),/at most 16/);
   sixteen[15] = { address: '0x55d398326f99059ff775485246999027b3197955', weightBps: 625 };
   const max = validateAllocation({ assets: sixteen });
   assert.equal(max.assets.length, 16);

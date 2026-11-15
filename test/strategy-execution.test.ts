@@ -86,7 +86,7 @@ test('#83 contribution minimum keeps new 50 inclusive fee without changing legac
     assert.equal(minimumAllocationRaw(basket,97),usdtRaw(expected));
     assert.equal(defaultAmountUsdt(basket,97),expected);
     const execution=validateAssetConfig(undefined,basket,97);
-    assert.equal(minimumAssetContribution(execution),usdtRaw(cashWeight===5000?'100':'50'));
+    assert.equal(minimumAssetContribution(execution),usdtRaw('50'));
   }
 });
 
@@ -148,7 +148,7 @@ test('#82 faucet lot proof needs one exact canonical Claimed event; Transfer/don
     if(scenario==='malformed')rpc.state.malformed=true;
     if(scenario==='rpc')rpc.state.fail='eth_getTransactionReceipt';
     const action=readFaucetFundingEvidence({chainId:97,account:TEST_ACCOUNT,amountWei:TEST_AMOUNT,txHash:OTHER_HASH},rpc.client);
-    if(scenario==='ok')assert.deepEqual(await action,{txHash:OTHER_HASH,logIndex:0,blockNumber:130n,blockHash:BLOCK_HASH,amountRaw:TEST_AMOUNT.toString()});
+    if(scenario==='ok')assert.deepEqual(await action,{txHash:OTHER_HASH,logIndex:0,blockNumber:130n,blockHash:BLOCK_HASH,amountRaw:TEST_AMOUNT.toString(),confirmedAt:activeAt});
     else await assert.rejects(action,(error:unknown)=>error instanceof AppError && !error.message.includes('SECRET'));
   }
   await assert.rejects(readFaucetFundingEvidence({chainId:56,account:TEST_ACCOUNT,amountWei:TEST_AMOUNT,txHash:OTHER_HASH}),denied('FUNDING_SOURCE_DISABLED'));
@@ -260,4 +260,28 @@ test('#83 per-asset full configuration rejects cash execution, tampered weights,
   assert.equal(validateAssetConfig(undefined,sized,56).assets.length,16);
   const larger={assets:[...sized.assets.map((a,i)=>({...a,weightBps:a.weightBps-(i===0?1:0)})),{address:'0x0000000000000000000000000000000000000010',weightBps:1}]};
   assert.equal(validateAssetConfig(undefined,larger,56).assets.length,17);
+});
+
+
+test('#96 chain 56 HTTP preserves interval schema 0 and caps the final allocation at 16',()=>{
+  const cash56='0x55d398326f99059ff775485246999027b3197955';
+  const basket={assets:[{address:cash56,weightBps:10000}]};
+  assert.deepEqual(typedVersionInput({allocation:basket,chainId:56,schedule:{kind:'interval',intervalSeconds:60}}),{allocation:basket,schedule:{kind:'interval',intervalSeconds:60}});
+  assert.throws(()=>typedVersionInput({allocation:basket,chainId:56,execution:{kind:'per_asset'}}),denied('EXECUTION_UNAVAILABLE'));
+  const entries=Array.from({length:16},(_,n)=>({address:`0x${(n+1).toString(16).padStart(40,'0')}`,weightBps:625}));
+  assert.throws(()=>validateAllocation({assets:entries},56),denied('TOO_MANY_ASSETS'),'appending USDT would exceed mainnet registry capacity');
+  assert.equal(validateAllocation({assets:[...entries.slice(0,15).map(a=>({...a,weightBps:600})),{address:cash56,weightBps:1000}]},56).assets.length,16);
+});
+
+test('#96 subscription minimum is exactly 50 independently of the cash allocation',()=>{
+  for(const weightBps of [0,5000,9900,10000]){
+    const basket={assets:weightBps===10000?[{address:cash,weightBps}]:[{address:risky,weightBps:10000-weightBps},{address:cash,weightBps}]};
+    assert.equal(minimumAssetContribution(validateAssetConfig(undefined,basket,97)),50n*10n**18n);
+  }
+});
+
+
+test('#96 legacy HTTP normalization cannot erase an explicit wrong chain identity',()=>{
+  const allocation={assets:[{address:'0x55d398326f99059ff775485246999027b3197955',weightBps:10000}]};
+  assert.throws(()=>typedVersionInput({allocation,chainId:1337,schedule:{kind:'interval',intervalSeconds:60}}),denied('CHAIN_MISMATCH'));
 });

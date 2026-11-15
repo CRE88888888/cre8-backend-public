@@ -109,7 +109,9 @@ test('validateAllocation accepts an automatic USDT row beyond the former 16-asse
     address: `0x${(index + 1).toString(16).padStart(40, '0')}`,
     weightBps: 625,
   }));
-  assert.equal(validateAllocation({ assets }).assets.length,17);
+  const admitted=Object.values(TESTNET_97.assets).slice(0,16).map(a=>({address:a.token,weightBps:625}));
+  assert.equal(validateAllocation({ assets:admitted },97).assets.length,17);
+  expectValidationError(()=>validateAllocation({assets},56),'TOO_MANY_ASSETS');
   const fifteen = assets.slice(0, 15).map((asset, index) => ({
     ...asset, weightBps: index === 0 ? 1250 : 625,
   }));
@@ -329,7 +331,7 @@ const PUBLISH_BODY = {
       { address: ASSET_B, weightBps: 4000 },
     ],
   },
-  schedule: { kind: 'funding' },
+  schedule: { kind: 'interval', intervalSeconds: 3600 },
   changeLog: 'rebalance',
 };
 
@@ -419,10 +421,10 @@ test('POST /strategies/:id/versions returns 201 with the created version record'
       assert.equal(response.status, 201);
       assert.match(response.headers.get('content-type') ?? '', /^application\/json/);
       assert.deepEqual(await response.json(), { ...published, minDepositUsdtWei: '50000000000000000000' });
-      // The route applies explicit execution/yield defaults (id from the path), and the
-      // provider is the session wallet, never a body field.
+      // Mainnet keeps the legacy schedule; the provider is the session wallet,
+      // never a body field.
       assert.deepEqual(calls, [
-        { id: 1, input: { ...PUBLISH_BODY, allocation: validateAllocation(PUBLISH_BODY.allocation), execution: { kind:'per_asset', numeraire:'0x55d398326f99059ff775485246999027b3197955', rebalance:'none', assets:validateAllocation(PUBLISH_BODY.allocation).assets.map(a=>({asset:a.address,weightBps:a.weightBps,...(a.address==='0x55d398326f99059ff775485246999027b3197955'?{}:{execution:{kind:'hold'}}),yield:null})).sort((a,b)=>a.asset.localeCompare(b.asset)) }, idleYield: { enabled: false } }, provider: ROUTE_WALLET.address.toLowerCase() },
+        { id: 1, input: { ...PUBLISH_BODY, allocation: validateAllocation(PUBLISH_BODY.allocation) }, provider: ROUTE_WALLET.address.toLowerCase() },
       ]);
     },
     {

@@ -56,15 +56,15 @@ export function assertUserOpCapacity(steps: number, gas: bigint): void {
 
 /** Keep small legs together; if a group is below 50, split the largest leg across
  * those groups. Every raw unit stays in the original asset's budget. No new
- * principal is created and no sub-1 input is authorized to fill a group.
+ * principal is created. Only final installments may include a positive sub-1 remainder.
  */
-export function executionInputGroups(inputs: Record<string,string>, limit: number, reserve: bigint): Record<string,string>[] | null {
+export function executionInputGroups(inputs: Record<string,string>, limit: number, reserve: bigint, finalAssets: ReadonlySet<string> = new Set()): Record<string,string>[] | null {
   const unit = 10n ** 18n, minimum = 50n * unit - reserve;
   if (reserve < 0n) throw new RangeError('invalid fee reserve');
   const entries = Object.entries(inputs).filter(([,raw])=>BigInt(raw)>0n);
   const groups = executionGroups(entries,limit).map(group=>Object.fromEntries(group));
   const sum = (group: Record<string,string>)=>Object.values(group).reduce((n,raw)=>n+BigInt(raw),0n);
-  if (!entries.length || entries.some(([,raw])=>BigInt(raw)<unit)) return null;
+  if (!entries.length || entries.some(([asset,raw])=>BigInt(raw)<unit&&!finalAssets.has(asset))) return null;
   if (groups.every(group=>sum(group)>=minimum)) return groups;
   // Spread multiple large positions before splitting one donor. Grouping only
   // by entry order can strand a valid small tail beside two fully funded groups.

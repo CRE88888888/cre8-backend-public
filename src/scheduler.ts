@@ -1,3 +1,4 @@
+import { assetsMarketOpen } from './trading-calendar.js';
 import { assertUserOpCapacity, boundedCallGasLimit, executionBatchSize, MAX_USER_OP_STEPS, userOpGasOverhead } from './execution-batch.js';
 import { EXECUTOR_ABI, EXECUTOR_SELECTOR, PLAN_HASH_ABI } from './chain.js';
 /**
@@ -437,6 +438,7 @@ export type PlannedSummary = {
 };
 
 export type PortfolioRunResult = {
+  rebalanceComplete?:boolean;
   portfolioId: number;
   strategyId: number;
   account: Address;
@@ -520,7 +522,7 @@ export type ExecutionOutcome = {
 };
 
 /** 決策所需的輸入：portfolio 與它的 drift 計畫（`planPortfolio` 的產物）。 */
-export type RebalancePlanningInput = { portfolioId: number; account: Address; plan: PortfolioPlan };
+export type RebalancePlanningInput = { portfolioId: number; account: Address; plan: PortfolioPlan; inclusiveFeeReserveRaw?:bigint };
 
 /** 送出前重問地板的輸入。`executor` 是 chain 上 `oracle()` 的讀取點，`strategyId` 是 `effectiveFeeBps` 的 key。 */
 export type FloorRefreshInput = {
@@ -537,7 +539,7 @@ export type SchedulerDeps = {
   withDexLock?: typeof withDexLock;
   dexGate?: (chainId:number,portfolioId:number)=>Promise<string|null>;
   newMoney?: Partial<NewMoneyDeps>;
-  checkTradingMinimums?: (steps: readonly PlannedStep[], purpose: 'ordinary' | 'exit', blockNumber: bigint, assetBudgetRaw?:bigint) => Promise<string | null>;
+  checkTradingMinimums?: (steps: readonly PlannedStep[], purpose: 'ordinary' | 'exit', blockNumber: bigint, assetBudgetRaw?:bigint, finalAssets?:ReadonlySet<string>, rebalanceReserveRaw?:bigint) => Promise<string | null>;
   hasBoughtBefore?: (account: Address, executor: Address, blockNumber: bigint) => Promise<boolean>;
   /** Must hold exclusion from the first snapshot through settlement. null means busy. */
   withPortfolioLock?: typeof withPortfolioLock;
@@ -1629,8 +1631,8 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
       blockNumber: () => defaultPublicClient().getBlockNumber({cacheTime:0}),
     }),
     newMoney: { ...defaultNewMoneyDeps(defaultPublicClient, () => provided.executor ?? executorAddress(), registryAddress, query, chainId), ...provided.newMoney },
-    checkTradingMinimums: provided.checkTradingMinimums ?? ((steps: readonly PlannedStep[], purpose: 'ordinary' | 'exit', blockNumber: bigint, assetBudgetRaw?:bigint) =>
-      checkTradeMinimums(defaultPublicClient(), provided.executor ?? executorAddress(), steps, purpose, blockNumber, assetBudgetRaw)),
+    checkTradingMinimums: provided.checkTradingMinimums ?? ((steps: readonly PlannedStep[], purpose: 'ordinary' | 'exit', blockNumber: bigint, assetBudgetRaw?:bigint, finalAssets?:ReadonlySet<string>, rebalanceReserveRaw?:bigint) =>
+      checkTradeMinimums(defaultPublicClient(), provided.executor ?? executorAddress(), steps, purpose, blockNumber, assetBudgetRaw, finalAssets, rebalanceReserveRaw)),
     hasBoughtBefore: provided.hasBoughtBefore ?? (async (account: Address, executor: Address, blockNumber: bigint) => {
       const [start] = await defaultPublicClient().readContract({ address: executor,
         abi: parseAbi(['function buyWindowOf(address) view returns(uint64 start,uint192 bought)']), functionName: 'buyWindowOf', args: [account], blockNumber });
@@ -1677,7 +1679,7 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
         })),
     planRebalance:
       provided.planRebalance ??
-      (async ({ account, plan }: RebalancePlanningInput) => {
+      (async ({ account, plan, inclusiveFeeReserveRaw }: RebalancePlanningInput) => {
         const publicClient = defaultPublicClient();
         const executor = executorAddress();
         const oracle = await publicClient.readContract({
@@ -1690,6 +1692,7 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
           throw new Error('planPortfolio 沒有漂移報告（blocked）：不該進到規劃器');
         }
         return planRebalance({
+          ...(inclusiveFeeReserveRaw===undefined?{}:{inclusiveFeeReserveRaw}),
           maxLegUsdE8: await readMaxLegUsdE8(plan.targets.map((target) => target.asset), query, chainId),
           publicClient,
           account,
@@ -2151,7 +2154,7 @@ async function runOne(
   }
 
   try {
-    await ctx.deps.query(SQL_MARK_CHECKED, [due.portfolioId, ctx.now.toISOString(), result.outcome === 'executed']);
+    await ctx.deps.query(SQL_MARK_CHECKED, [due.portfolioId, ctx.now.toISOString(), due.executionKind===undefined?result.outcome==='executed':result.rebalanceComplete===true]);
   } catch (error) {
     ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} 的 last_checked_at 寫不進去：${due.executionKind===undefined?oneLine(error):'DB unavailable'}`);
   }
@@ -2293,9 +2296,10 @@ async function decideAndMaybeExecute(
 
   const money = due.executionKind === undefined || ctx.forcePlan === true ? null : await prepareNewMoney({due,plan,query:ctx.deps.query,
     run:ctx.deps.withTransaction,chainId:ctx.deps.chainId,now:ctx.now,dryRun:ctx.dryRun,deps:ctx.deps.newMoney});
-  let rebalance = (money?.useTargetWeights?null:money?.rebalance) ?? await ctx.deps.planRebalance({ portfolioId: due.portfolioId, account: due.account, plan });
+  let rebalance = (money?.useTargetWeights?null:money?.rebalance) ?? await ctx.deps.planRebalance({ portfolioId: due.portfolioId, account: due.account, plan,
+    ...(money?.useTargetWeights?{inclusiveFeeReserveRaw:money.context.reserve}:{}) });
   if (rebalance.kind === 'noop') {
-    return { ...base, outcome: 'noop', reason: `Planner returned noop: ${rebalance.reason}` };
+    return { ...base, outcome: 'noop', ...(money?.useTargetWeights&&plan.report.maxAbsDeltaBps<=plan.report.thresholdBps?{rebalanceComplete:true}:{}), reason: `Planner returned noop: ${rebalance.reason}` };
   }
   if (rebalance.kind === 'blocked') {
     let nextRunAt = base.nextRunAt;
@@ -2330,11 +2334,12 @@ async function decideAndMaybeExecute(
   if(limit===0)return {...base,outcome:'blocked',reason:'[USER_OP_CAPACITY] 無可行的安全批次'};
   if(rebalance.steps.length>limit)rebalance={...rebalance,steps:rebalance.steps.slice(0,limit),
     partial:{...rebalance.partial,remainingDriftBps:null,shrunk:rebalance.partial?.shrunk??[],maxLegBatched:true},rationale:rebalance.rationale+'；交易容量分批，剩餘依下一輪持倉續作'};
+  if(!assetsMarketOpen(ctx.deps.chainId,rebalance.steps.flatMap(step=>[step.tokenIn,step.tokenOut]),ctx.now))return {...base,outcome:'blocked',reason:'[MARKET_CLOSED] 股票休市，等待交易時段'};
   const gasPurpose = rebalance.purpose ?? 'ordinary';
   const cash = ctx.deps.chainId === 97 ? TESTNET_97.contracts.usdt : '0x55d398326f99059ff775485246999027b3197955';
   const hasBuy = rebalance.steps.some((step) => !isAddressEqual(step.tokenOut, cash));
   if (gasPurpose === 'exit' && hasBuy) return { ...base, outcome: 'blocked', reason: '[INVALID_EXIT] 退出計畫包含買入，不送交易' };
-  if (hasBuy && money?.job?.kind!=='asset') {
+  if (hasBuy && due.executionKind===undefined) {
     try {
       const minimum = minimumDepositUsdtWei(plan.targets, cash);
       if (plan.report.totalUsdE8 * 10n ** 10n < minimum &&
@@ -2343,7 +2348,9 @@ async function decideAndMaybeExecute(
       }
     } catch { return { ...base, outcome: 'blocked', reason: '[MIN_DEPOSIT_UNAVAILABLE] 無法確認首次買入與最低入金，不送交易' }; }
   }
-  const minimumReason = await ctx.deps.checkTradingMinimums(rebalance.steps, gasPurpose, plan.snapshot.block, money?.job?.kind==='asset'?rebalance.steps.reduce((s,step)=>s+step.amountIn,0n)+money.context.reserve:undefined);
+  let inclusiveBudget:bigint|undefined;
+  if(money?.job?.kind==='asset')inclusiveBudget=rebalance.steps.reduce((s,step)=>s+step.amountIn,0n)+money.context.reserve;
+  const minimumReason = await ctx.deps.checkTradingMinimums(rebalance.steps, gasPurpose, plan.snapshot.block,inclusiveBudget,money?.context.finalAssets,money?.useTargetWeights?money.context.reserve:undefined);
   if (minimumReason !== null) return { ...base, outcome: 'blocked', reason: minimumReason };
 
   // ---- ⑤ 送出前重問地板：`rebalance.steps` 的 `amountOutMin` 是**規劃當時**的地板 --------------
@@ -2540,6 +2547,7 @@ async function decideAndMaybeExecute(
     return {
       ...withPlan,
       outcome: 'executed',
+      ...(money?.useTargetWeights&&rebalance.partial===undefined?{rebalanceComplete:true}:{}),
       reason: `Landed on-chain: tx ${execution.txHash ?? '(unknown)'} (attempt ${gate.attempts})`,
       execution,
     };

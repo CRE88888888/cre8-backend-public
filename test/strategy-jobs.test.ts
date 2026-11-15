@@ -163,7 +163,7 @@ function scheduler(f:Fixture,extra:SchedulerDeps={}){
     planPortfolio:async()=>plan(f),planRebalance:async()=>{throw new Error('hold/stack must never enter drift planner');},
     readPermissionConfig:async()=>({signer:f.owner,policyCount:3}),deriveSessionKeyAddress:async()=>f.owner,readAllowance:async()=>UINT256_MAX,readBalance:async()=>UINT256_MAX,
     readRebalanceNonce:async()=>0n,checkTradingMinimums:async()=>null,hasBoughtBefore:async()=>true,refreshFloors:async i=>({ok:true,steps:[...i.steps],refreshes:[],note:'fresh'}),
-    newMoney:{version:(sid,v,onchainId,account,options)=>requireTypedVersion(sid,v,onchainId,account,{...options,verifyChain:false}),
+    newMoney:{withdrawals:async()=>[],rebalanceReserve:async()=>R,version:(sid,v,onchainId,account,options)=>requireTypedVersion(sid,v,onchainId,account,{...options,verifyChain:false}),
       policy:async()=>({reserve:R,caps:new Map(f.context.caps),buyLimit:UINT256_MAX,cash:10000n*U}),verifyLots:async()=>{},marketOpen:()=>true,
       quote:async(_due,_plan,inputs,deadline)=>({kind:'ready',steps:Object.entries(inputs).map(([token,raw])=>({tokenIn:cash,tokenOut:token as Address,amountIn:BigInt(raw),amountOutMin:90n,oracleFloor:80n,venue:TESTNET_97.contracts.universalRouter,data:'0x'})),deadline,rationale:'test exact new money'})},
     executeRebalance:async args=>{sends.push(args);args.onSending();await args.onSubmitted({userOpHash:userHash});return {status,userOpHash:userHash,txHash:status==='unknown'?null:txHash,gasUsed:'100',error:status==='success'?null:'receipt timeout'};},
@@ -433,13 +433,59 @@ test('#83 pausing a partially confirmed mixed job releases only its unspent hold
   assert.equal(await job(f),null);
 });
 
-test('#83 dust-aware shortened 99/1 funding buys the executable asset and preserves tiny final dust',async()=>{
+test('#96 final installment buys all remaining asset dust and never reuses it',async()=>{
+  const f=await fixture('hold',0,4,'none',undefined,[9900,100]);
+  for(let index=0;index<2;index++){
+    const at=new Date(start.getTime()+index*60000);
+    await f.fund(100n*U,new Date(at.getTime()-1));
+    const j=(await f.reserve({...f.context,now:at}))?.job;assert.ok(j);
+    assert.ok(BigInt(j.original_input[b]??'0')>0n&&BigInt(j.original_input[b]??'0')<U,'the only/final installment must include sub-1 input after fees');
+    assert.equal(BigInt(j.amount_raw)+BigInt(j.fee_reserve_raw),100n*U);
+    assert.equal((await f.reserve({...f.context,now:at}))?.job?.id,j.id);
+    await complete(f,j,j.remaining_input,R);
+    assert.equal((await balances(f))?.unallocated_hold_raw,'0');
+    assert.equal((await f.reserve({...f.context,now:at}))?.job,null);
+  }
+  assert.equal((await query("select 1 from strategy_asset_slices s join strategy_funding_lots l on l.id=s.lot_id where l.portfolio_id=$1 and s.state='deferred_min_asset'",[f.id])).rows.length,0);
+});
+
+test('#96 partial withdrawal preserves affordable current installments and does not repeatedly debit cash',async()=>{
+  const f=await fixture('stack');await f.fund(200n*U);
+  let observed=190n*U;const withdrawals=[{txHash:hash(),blockNumber:11n,blockHash:hash(),logIndex:0,amount:10n*U}];
+  for(let index=0;index<2;index++){
+    const at=new Date(start.getTime()+index*86400000);
+    const j=(await f.reserve({...f.context,now:at,observedCash:observed,withdrawals}))?.job;assert.ok(j,'190 then 140 can each fund the next 50 budget');
+    assert.equal(BigInt(j.amount_raw)+BigInt(j.fee_reserve_raw),50n*U);
+    assert.equal((await f.reserve({...f.context,now:at,observedCash:observed,withdrawals}))?.job?.id,j.id);
+    await complete(f,j,j.remaining_input,R);observed-=50n*U;
+    const saved=await balances(f);assert.ok(saved);assert.equal(Object.values(saved).reduce((n,v)=>n+BigInt(v),0n),observed);
+  }
+});
+
+test('#96 monthly partial execution resumes after restart and new money never marks monthly complete',async()=>{
+  const f=await fixture('hold',0,4,'monthly');await f.fund(100n*U);
+  const initial=scheduler(f);assert.equal((await initial.once()).results[0]?.outcome,'executed');
+  assert.equal((await query('select last_rebalance_at from portfolios where id=$1',[f.id])).rows[0]?.last_rebalance_at,null);
+  await query('update portfolios set last_rebalance_at=$2 where id=$1',[f.id,start]);
+  const at=new Date('2026-12-01T00:00:00Z');let planned=0;
+  const next=()=>scheduler(f,{reconcileRebalance:async()=>({kind:'found',outcome:{status:'success',userOpHash:hash(),txHash:hash(),gasUsed:'100',error:null,cashDeltaRaw:'0'}}),planRebalance:async()=>{
+    planned++;return {kind:'ready',steps:[{tokenIn:cash,tokenOut:a,amountIn:50n*U,amountOutMin:90n,oracleFloor:80n,venue:TESTNET_97.contracts.universalRouter,data:'0x'}],deadline:BigInt(at.getTime()/1000)+1800n+BigInt(planned),rationale:'monthly target',
+      ...(planned===1?{partial:{remainingDriftBps:501,shrunk:[],maxLegBatched:true}}:{})};
+  },executeRebalance:async args=>{args.onSending();await args.onSubmitted({userOpHash:hash()});return {status:'success',txHash:hash(),userOpHash:hash(),gasUsed:'100',error:null,cashDeltaRaw:'0'};}});
+  const firstResult=(await next().once(at)).results[0];assert.equal(firstResult?.outcome,'executed',firstResult?.reason);
+  assert.equal((await query<{last_rebalance_at:Date}>('select last_rebalance_at from portfolios where id=$1',[f.id])).rows[0]?.last_rebalance_at.toISOString(),start.toISOString());
+  assert.equal((await next().once(new Date(at.getTime()+60000))).results[0]?.outcome,'executed');assert.equal(planned,2);
+  assert.equal((await next().once(new Date(at.getTime()+120000))).results[0]?.outcome,'noop');assert.equal(planned,2);
+});
+
+test('#83 dust-aware shortened 99/1 funding buys the final remainder with its executable batch',async()=>{
   const f=await fixture('stack',0,12,'none',undefined,[9900,100]);const lot=await f.fund(100n*U);
   const result=(await f.reserve())?.job;assert.ok(result,'shortening must avoid leaving the large asset in two 49.5-budget slices');
-  assert.deepEqual(Object.keys(result.original_input),[a]);assert.equal(result.original_input[a],(99n*U-R).toString());assert.equal(result.fee_reserve_raw,R.toString());
-  const dust=(await query<{state:string;budget_raw:string;job_id:string|null}>('select state,budget_raw::text,job_id from strategy_asset_slices where lot_id=$1 and asset=$2',[lot,b])).rows[0];assert.ok(dust);assert.equal(dust.state,'deferred_min_asset');assert.equal(dust.budget_raw,U.toString());assert.equal(dust.job_id,null);
+  assert.deepEqual(new Set(Object.keys(result.original_input)),new Set([a,b]));assert.equal(result.fee_reserve_raw,R.toString());
+  assert.equal(sumInputs(result.original_input)+R,100n*U);
+  const small=(await query<{state:string;job_id:string|null}>('select state,job_id from strategy_asset_slices where lot_id=$1 and asset=$2',[lot,b])).rows[0];assert.ok(small);assert.equal(small.state,'reserved');assert.equal(small.job_id,result.id);
   await complete(f,result,result.remaining_input,R);
-  assert.equal((await balances(f))?.stack_prefund_raw,U.toString(),'unspent final dust remains classified and withdrawable');assert.equal((await balances(f))?.reserved_input_raw,'0');
+  assert.equal((await balances(f))?.stack_prefund_raw,'0');assert.equal((await balances(f))?.reserved_input_raw,'0');
 });
 
 for(const missingHash of [true,false])test(`#83 typed target_weight ${missingHash?'hashless pending':'not_found receipt'} cannot expire without authoritative cash evidence`,async()=>{
@@ -536,6 +582,7 @@ test('#83 completed weekly installments stay out of policy reads until their nex
 });
 
 test('#92 93-asset DB job survives timeout/restart and buys each original input exactly once in <=16-step batches',async()=>{
+  const marketAt=new Date('2026-11-16T15:00:00Z');
   const f=await fixture('hold',0,4,'none',undefined,undefined,92);
   await f.fund(10000n*U);
   let held=new Set<Address>();
@@ -546,15 +593,15 @@ test('#92 93-asset DB job survives timeout/restart and buys each original input 
     return current;
   };
   s.setStatus('unknown');
-  assert.equal((await s.once()).results[0]?.outcome,'blocked');
+  assert.equal((await s.once(marketAt)).results[0]?.outcome,'blocked');
   const original=await job(f);assert.ok(original);assert.equal(Object.keys(original.original_input).length,92);
   const attempts=(await query('select payload_hash,user_op_nonce from operations where portfolio_id=$1',[f.id])).rows;
-  assert.equal((await s.once()).results[0]?.outcome,'executed');assert.equal(s.sends.length,1,'unknown original must reconcile without sending a different subset');
+  assert.equal((await s.once(marketAt)).results[0]?.outcome,'executed');assert.equal(s.sends.length,1,'unknown original must reconcile without sending a different subset');
   assert.deepEqual((await query('select payload_hash,user_op_nonce from operations where portfolio_id=$1',[f.id])).rows,attempts);
   s.setStatus('success');
   for(let round=0;round<20&&await job(f);round++){
     held=new Set(s.sends.flatMap(send=>send.steps.map(step=>step.tokenOut)));
-    assert.equal((await s.once(new Date(start.getTime()+(round+1)*60000))).results[0]?.outcome,'executed');
+    assert.equal((await s.once(new Date(marketAt.getTime()+(round+1)*60000))).results[0]?.outcome,'executed');
   }
   assert.equal(await job(f),null);
   assert.ok(s.sends.length>1&&s.sends.every(send=>send.steps.length<=16));
@@ -567,11 +614,12 @@ test('#92 93-asset DB job survives timeout/restart and buys each original input 
  });
 
 test('#92 unequal 17-asset job shares its whale across children and settles the exact frozen vector',async()=>{
+  const marketAt=new Date('2026-11-16T15:00:00Z');
   const f=await fixture('hold',0,4,'none',undefined,[...Array.from({length:16},()=>20),9680],17);
   await f.fund(1000n*U);
-  const s=scheduler(f);assert.equal((await s.once()).results[0]?.outcome,'executed');
+  const s=scheduler(f);assert.equal((await s.once(marketAt)).results[0]?.outcome,'executed');
   const original=await job(f);assert.ok(original);assert.equal(BigInt(original.fee_reserve_raw),2n*R);
-  assert.equal((await s.once(new Date(start.getTime()+60000))).results[0]?.outcome,'executed');
+  assert.equal((await s.once(new Date(marketAt.getTime()+60000))).results[0]?.outcome,'executed');
   assert.equal(await job(f),null);assert.equal(s.sends.length,2);
   const spent:Record<string,bigint>={};
   for(const send of s.sends){
@@ -584,13 +632,180 @@ test('#92 unequal 17-asset job shares its whale across children and settles the 
 });
 
 test('#92 two large positions distribute across 18-asset DB batches at exact 1/50 thresholds',async()=>{
+  const marketAt=new Date('2026-11-16T15:00:00Z');
   const f=await fixture('hold',0,4,'none',undefined,[...Array.from({length:16},()=>200),3400,3400],18);
   await f.fund(100n*U);const s=scheduler(f);
-  assert.equal((await s.once()).results[0]?.outcome,'executed');
+  assert.equal((await s.once(marketAt)).results[0]?.outcome,'executed');
   const original=await job(f);assert.ok(original);assert.equal(BigInt(original.fee_reserve_raw),2n*R);
-  assert.equal((await s.once(new Date(start.getTime()+60000))).results[0]?.outcome,'executed');assert.equal(await job(f),null);
+  assert.equal((await s.once(new Date(marketAt.getTime()+60000))).results[0]?.outcome,'executed');assert.equal(await job(f),null);
   const spent:Record<string,bigint>={};assert.equal(s.sends.length,2);
   for(const send of s.sends){assert.equal(send.steps.length,9);assert.equal(send.steps.reduce((sum,step)=>sum+step.amountIn,R),50n*U);
     for(const step of send.steps){assert.ok(step.amountIn>=U);spent[step.tokenOut]=(spent[step.tokenOut]??0n)+step.amountIn;}}
   assert.deepEqual(Object.fromEntries(Object.entries(spent).map(([a,n])=>[a,n.toString()])),original.original_input);
+});
+
+test('#96 withdrawal at the current-budget boundary spends only affordable periods, without catch-up',async()=>{
+  const f=await fixture('stack');await f.fund(200n*U);
+  const withdrawals=[{txHash:hash(),blockNumber:11n,blockHash:hash(),logIndex:0,amount:150n*U}];
+  const first=(await f.reserve({...f.context,observedCash:50n*U,withdrawals}))?.job;assert.ok(first);
+  assert.equal(BigInt(first.amount_raw)+BigInt(first.fee_reserve_raw),50n*U);
+  await complete(f,first,first.remaining_input,R);
+  const next=await f.reserve({...f.context,now:new Date(start.getTime()+86400000),observedCash:0n,withdrawals});
+  assert.match(next?.reason??'',/SKIPPED_INSUFFICIENT_FUNDS/);
+  assert.equal((await balances(f))?.stack_prefund_raw,'0');
+  assert.equal((await query("select id from operations where portfolio_id=$1 and idempotency_key like 'cash-withdrawal:%'",[f.id])).rows.length,1);
+});
+
+test('#96 withdrawal cannot debit reserved/unknown money; reorg and failed cash write roll back its identity',async()=>{
+  const f=await fixture('stack');await f.fund(200n*U);
+  const j=(await f.reserve())?.job;assert.ok(j);
+  const before=await balances(f);
+  const events=[{txHash:hash(),blockNumber:11n,blockHash:hash(),logIndex:0,amount:195n*U}];
+  await assert.rejects(f.reserve({...f.context,observedCash:5n*U,withdrawals:events}),/CASH_DEFICIT/);
+  assert.deepEqual(await balances(f),before);
+  const event=events[0];assert.ok(event);const evidence={...event,amount:10n*U};
+  const source=await fundingLots(query,f.context);
+  const fail:WithTransactionFn=fn=>run(async client=>fn({query:async(sql,params)=>{
+    const result=await client.query(sql,params);
+    if(sql.includes('set unclassified_raw='))throw new Error('cash write failed');
+    return result;
+  }}));
+  await assert.rejects(prepareStrategyJob(fail,{...f.context,observedCash:190n*U,withdrawals:[evidence]},source));
+  assert.deepEqual(await balances(f),before);
+  assert.equal((await query("select id from operations where portfolio_id=$1 and type='withdraw'",[f.id])).rows.length,0);
+  assert.equal((await f.reserve({...f.context,observedCash:190n*U,withdrawals:[evidence]}))?.job?.id,j.id);
+  const reconciled=await balances(f);
+  await assert.rejects(f.reserve({...f.context,observedCash:190n*U,withdrawals:[{...evidence,blockHash:hash()}]}),/CASH_REORGED/);
+  assert.deepEqual(await balances(f),reconciled);
+  await query("insert into operations(portfolio_id,type,state,idempotency_key) values($1,'rebalance','pending',$2)",[f.id,hash()]);
+  await f.reserve({...f.context,observedCash:180n*U,withdrawals:[evidence,{...evidence,txHash:hash()}]});
+  assert.deepEqual(await balances(f),reconciled,'unresolved operations protect every original bucket');
+});
+
+test('#96 accepted high-cash subscriptions wait and merge without enlarging their original budgets',async()=>{
+  const f=await fixture('hold',9900);
+  for(let n=0;n<5;n++){
+    await f.fund(1000n*U,new Date(start.getTime()-60000),{[a]:1,[b]:1});
+    const prepared=(await f.reserve())?.job;
+    if(n<4)assert.equal(prepared,null);
+    else {assert.ok(prepared);assert.equal(BigInt(prepared.amount_raw)+BigInt(prepared.fee_reserve_raw),50n*U);await complete(f,prepared,prepared.remaining_input,R);}
+  }
+  assert.equal((await balances(f))?.allocated_cash_raw,(4950n*U).toString());
+  assert.equal((await balances(f))?.unallocated_hold_raw,'0');
+});
+
+test('#96 all-hold monthly unknown partial receipt resumes without marking the month complete',async()=>{
+  const f=await fixture('hold',5000,4,'monthly');await f.fund(200n*U);
+  const initial=(await f.reserve())?.job;assert.ok(initial);await complete(f,initial);
+  const at=new Date('2026-12-01T15:00:00Z');let plans=0;
+  const make=(unknown=false)=>scheduler(f,{
+    planRebalance:async()=>({kind:'ready',steps:[{tokenIn:cash,tokenOut:a,amountIn:50n*U,amountOutMin:90n,oracleFloor:80n,venue:TESTNET_97.contracts.universalRouter,data:'0x'}],
+      deadline:BigInt(at.getTime()/1000)+1800n+BigInt(++plans),rationale:'monthly partial',...(plans===1?{partial:{remainingDriftBps:501,shrunk:[],maxLegBatched:true}}:{})}),
+    executeRebalance:async args=>{args.onSending();const userOpHash=hash();await args.onSubmitted({userOpHash});return {status:unknown?'unknown':'success',txHash:unknown?null:hash(),userOpHash,gasUsed:'100',error:unknown?'timeout':null,cashDeltaRaw:'0'};},
+    reconcileRebalance:async input=>({kind:'found',outcome:{status:'success',userOpHash:input.userOpHash,txHash:hash(),gasUsed:'100',error:null,cashDeltaRaw:'0'}}),
+  });
+  assert.equal((await make(true).once(at)).results[0]?.outcome,'blocked');
+  const last=async()=>(await query<{last_rebalance_at:Date|null}>('select last_rebalance_at from portfolios where id=$1',[f.id])).rows[0]?.last_rebalance_at;
+  assert.equal(await last(),null);
+  assert.equal((await make().once(new Date(at.getTime()+60000))).results[0]?.outcome,'executed');assert.equal(plans,1);assert.equal(await last(),null);
+  assert.equal((await make().once(new Date(at.getTime()+120000))).results[0]?.outcome,'executed');assert.equal(plans,2);assert.ok(await last());
+  assert.equal((await make().once(new Date(at.getTime()+180000))).results[0]?.outcome,'noop');assert.equal(plans,2);
+});
+
+async function notifications(f:Fixture){
+  return (await query<{id:string;chain_id:string;portfolio_id:string;owner:string;kind:string;dedup_key:string;lot_id:string;asset:string;slice_index:number;payload:{budgetRaw:string;slotAt:string;windowEndAt:string};state:string}>(
+    'select * from user_notifications where portfolio_id=$1 order by lot_id,asset,slice_index',[f.id])).rows;
+}
+test('#96 insufficient notifications retain one pending event per source with an owned recipient and safe payload',async()=>{
+  const f=await fixture('stack'),lot=await f.fund(200n*U);
+  // Recipient is the smart-account owner, never the portfolio user or provider.
+  await query('update portfolios set user_id=$2 where id=$1',[f.id,address()]);
+  await query('update strategies set provider=$2 where id=$1',[f.strategyId,address()]);
+  for(let retry=0;retry<2;retry++)assert.match((await f.reserve({...f.context,observedCash:0n}))?.reason??'',retry===0?/SKIPPED_INSUFFICIENT_FUNDS/:/NO_DUE_SLOT/);
+  const events=await notifications(f);assert.equal(events.length,2);
+  for(const event of events){
+    assert.equal(event.chain_id,'97');assert.equal(event.portfolio_id,String(f.id));assert.equal(event.owner,f.owner);
+    assert.equal(event.kind,'stack_slot_skipped_insufficient_funds');assert.equal(event.state,'pending');
+    assert.equal(event.dedup_key,`${lot}:${event.asset}:0`);assert.equal(event.lot_id,lot);assert.equal(event.slice_index,0);
+    assert.deepEqual(event.payload,{budgetRaw:(25n*U).toString(),slotAt:start.toISOString(),windowEndAt:new Date(start.getTime()+86400000).toISOString()});
+  }
+  assert.equal((await query('select id from operations where portfolio_id=$1',[f.id])).rows.length,0);
+  assert.equal((await f.reserve({...f.context,now:new Date(start.getTime()+86400000)}))?.job?.amount_raw,(50n*U-R).toString(),'top-up buys only the next installment');
+  assert.deepEqual(await notifications(f),events);
+});
+test('#96 insufficient notifications distinguish every slot through index 51 and never reset terminal events',async()=>{
+  const f=await fixture('stack',0,52);await f.fund(2600n*U);
+  for(let index=0;index<52;index++){
+    const c={...f.context,observedCash:0n,now:new Date(start.getTime()+index*86400000)};
+    assert.match((await f.reserve(c))?.reason??'',/SKIPPED_INSUFFICIENT_FUNDS/);
+    if(index===0){
+      const first=await notifications(f);assert.equal(first.length,2);
+      for(const [i,event] of first.entries())await query("update user_notifications set state=$2,updated_at=clock_timestamp() where id=$1 and state='pending'",[event.id,i===0?'delivered':'failed']);
+    }
+    const saved=await notifications(f);await f.reserve(c);assert.deepEqual(await notifications(f),saved);
+  }
+  const events=await notifications(f);assert.equal(events.length,104);assert.equal(new Set(events.map(e=>e.dedup_key)).size,104);
+  assert.equal(Math.max(...events.map(e=>e.slice_index)),51);assert.equal(Math.min(...events.map(e=>e.slice_index)),0);
+  assert.deepEqual(events.filter(e=>e.slice_index===0).map(e=>e.state),['delivered','failed']);
+  await f.reserve({...f.context,observedCash:0n,now:new Date(start.getTime()+52*86400000)});assert.deepEqual(await notifications(f),events);
+});
+test('#96 insufficient notifications serialize two writers and survive an unknown commit without duplication',async()=>{
+  const f=await fixture('stack');await f.fund(200n*U);const lots=await fundingLots(query,f.context),c={...f.context,observedCash:0n};
+  await Promise.all([prepareStrategyJob(run,c,lots),prepareStrategyJob(run,c,lots)]);
+  const saved=await notifications(f);assert.equal(saved.length,2);
+  const g=await fixture('stack');await g.fund(200n*U);const source=await fundingLots(query,g.context);
+  const lost:WithTransactionFn=async fn=>{await run(fn);throw new Error('unknown commit response');};
+  await assert.rejects(withPortfolioLock(g.id,()=>prepareStrategyJob(lost,{...g.context,observedCash:0n},source)),/unknown commit/);
+  const committed=await notifications(g);assert.equal(committed.length,2);
+  await g.reserve({...g.context,observedCash:0n});assert.deepEqual(await notifications(g),committed);
+  assert.deepEqual(await notifications(f),saved);
+});
+test('#96 insufficient notifications roll back every skipped source on SQL error or statement timeout and retry safely',async()=>{
+  for(const failure of ['sql','timeout'] as const){
+    const f=await fixture('stack');await f.fund(200n*U);const lots=await fundingLots(query,f.context),before=await balances(f);
+    let inserts=0;
+    const broken:WithTransactionFn=fn=>run(async client=>fn({query:async(sql,params)=>{
+      if(sql.includes('insert into user_notifications')&&++inserts===2){
+        if(failure==='timeout'){await client.query("set local statement_timeout='20ms'");await client.query('select pg_sleep(1)');}
+        else await client.query('select 1/0');
+      }
+      return client.query(sql,params);
+    }}));
+    await assert.rejects(withPortfolioLock(f.id,()=>prepareStrategyJob(broken,{...f.context,observedCash:0n},lots)),failure==='timeout'?/statement timeout/:/division by zero/);
+    assert.equal((await notifications(f)).length,0);
+    assert.equal((await query('select s.* from strategy_asset_slices s join strategy_funding_lots l on l.id=s.lot_id where l.portfolio_id=$1',[f.id])).rows.length,0);
+    assert.deepEqual(await balances(f),before);
+    await f.reserve({...f.context,observedCash:0n});assert.equal((await notifications(f)).length,2);
+  }
+});
+test('#96 insufficient notifications require recipient evidence and ignore normal, expired, or disabled work',async()=>{
+  const f=await fixture('stack');await f.fund(200n*U);const lots=await fundingLots(query,f.context);
+  const missing:WithTransactionFn=fn=>run(client=>fn({query:(sql,params)=>sql.includes('select a.owner')?Promise.resolve({rows:[]}):client.query(sql,params)}));
+  await assert.rejects(withPortfolioLock(f.id,()=>prepareStrategyJob(missing,{...f.context,observedCash:0n},lots)),/notification recipient unavailable/);
+  assert.equal((await notifications(f)).length,0);
+  assert.ok((await f.reserve({...f.context,observedCash:200n*U}))?.job,'exact cash boundary is affordable');
+  assert.equal((await notifications(f)).length,0);
+  const g=await fixture('stack');await g.fund(200n*U);
+  await g.reserve({...g.context,enabled:false,observedCash:0n});assert.equal((await notifications(g)).length,0);
+  await g.reserve({...g.context,marketOpen:false,observedCash:0n});assert.equal((await notifications(g)).length,0);
+  await g.reserve({...g.context,now:new Date(start.getTime()+4*86400000),observedCash:0n});assert.equal((await notifications(g)).length,0);
+  const h=await fixture('stack');await h.fund(200n*U);
+  await h.reserve({...h.context,observedCash:200n*U-1n});assert.equal((await notifications(h)).length,2,'one raw short of classified cash records the shortfall');
+});
+test('#96 insufficient notifications reread conflicts without resetting delivery and reject changed immutable payloads',async()=>{
+  for(const mismatch of [false,true]){
+    const f=await fixture('stack');await f.fund(200n*U);const lots=await fundingLots(query,f.context);
+    const competing:WithTransactionFn=fn=>run(client=>fn({query:async(sql,params)=>{
+      if(sql.includes('insert into user_notifications')){
+        const competingParams=params===undefined?[]:[...params];
+        if(mismatch)competingParams[6]=JSON.stringify({budgetRaw:'0'});
+        const inserted=await client.query(sql,competingParams);const event=inserted.rows[0];assert.ok(event&&typeof event==='object'&&'id' in event&&typeof event.id==='string');
+        await client.query("update user_notifications set state='delivered',updated_at=clock_timestamp() where id=$1",[event.id]);
+      }
+      return client.query(sql,params);
+    }}));
+    const attempt=()=>withPortfolioLock(f.id,()=>prepareStrategyJob(competing,{...f.context,observedCash:0n},lots));
+    if(mismatch){await assert.rejects(attempt(),/notification identity mismatch/);assert.equal((await notifications(f)).length,0);}
+    else {await attempt();const saved=await notifications(f);assert.equal(saved.length,2);assert.ok(saved.every(e=>e.state==='delivered'));await f.reserve({...f.context,observedCash:0n});assert.deepEqual(await notifications(f),saved);}
+  }
 });

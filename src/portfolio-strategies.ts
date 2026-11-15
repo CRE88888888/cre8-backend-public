@@ -183,7 +183,7 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
     const version = await deps.version(p.strategyId, p.version, Number(onchainId), p.accountAddress as Address);
     try { await deps.version(p.strategyId, p.version, Number(onchainId), p.accountAddress as Address, { blockNumber: evidence.blockNumber, blockHash: evidence.blockHash }); }
     catch (error) { await reconcileReorg(error); throw error; }
-    const confirmedAt = deps.now();
+    const confirmedAt = evidence.confirmedAt;
     const feeReserve = version.execution.kind === 'per_asset' && version.execution.assets.some(a=>a.asset!==numeraireFor(p.chainId)) ? await deps.feeReserve(p,version) : 0n;
     const result = await deps.transaction(async (client) => {
       await cashLock(client, p);

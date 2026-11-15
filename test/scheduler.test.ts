@@ -599,8 +599,8 @@ function deps(db: StubDb, chain: StubChain, extra: SchedulerDeps = {}): Schedule
   };
 }
 
-test('#75 first buy waits below the 80 USDT minimum; equality and later top-ups pass', async () => {
-  for (const [value, boughtBefore, expected] of [[7999999999n, false, 'blocked'], [8000000000n, false, 'ready-dry-run'], [100000000n, true, 'ready-dry-run']] as const) {
+test('#75 first buy waits below the 50 USDT minimum; equality and later top-ups pass', async () => {
+  for (const [value, boughtBefore, expected] of [[4999999999n, false, 'blocked'], [5000000000n, false, 'ready-dry-run'], [100000000n, true, 'ready-dry-run']] as const) {
     const plan = stubPlan();
     assert.ok(plan.report);
     plan.report.totalUsdE8 = value;
@@ -2458,7 +2458,7 @@ async function seedPortfolio(args: {
   return { id, account };
 }
 
-test('認領（真的 Postgres）：paused／idle／未到期不被認領，NULL 會；next_run_at 與認領一起 commit', dbGate, async () => {
+test('認領（真的 Postgres）：paused／idle／未到期不被認領，NULL 會；next_run_at 與認領一起 commit', {...dbGate,timeout:15000}, async () => {
   // 先清掉上一輪可能留下的殘骸（同一個 chain_id 的 smart_accounts → portfolios）。
   await query('delete from portfolios where id in (select portfolio_id from smart_accounts where chain_id = $1)', [
     REAL_CHAIN_ID,

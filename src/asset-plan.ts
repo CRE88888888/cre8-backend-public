@@ -30,7 +30,7 @@ export function planContribution(total:bigint,config:AssetExecution,confirmedAt:
   if(stepLimit===0)return null;
   if(total<minimum)return null;
   for(;;){
-    const slots=new Map<number,{budget:bigint;assets:string[];inputs:InputVector}>();
+    const slots=new Map<number,{budget:bigint;assets:string[];inputs:InputVector;finalAssets:Set<string>}>();
     for(const a of assets){
       if(!a.execution)throw new Error('missing execution');
       const n=counts[a.asset];if(n===undefined)throw new Error('missing count');
@@ -38,16 +38,16 @@ export function planContribution(total:bigint,config:AssetExecution,confirmedAt:
       const first=a.execution.kind==='stack'?nextAssetSlot(confirmedAt,a.execution).getTime():Math.floor(confirmedAt.getTime()/60000)*60000+60000;
       for(let index=0;index<n;index++){
         const time=first+index*assetPeriod(a.execution),budget=index===n-1?amount-base*BigInt(n-1):base;
-        const slot=slots.get(time)??{budget:0n,assets:[],inputs:{}};slot.budget+=budget;slot.assets.push(a.asset);slot.inputs[a.asset]=budget.toString();slots.set(time,slot);
+        const slot=slots.get(time)??{budget:0n,assets:[],inputs:{},finalAssets:new Set<string>()};if(index===n-1)slot.finalAssets.add(a.asset);slot.budget+=budget;slot.assets.push(a.asset);slot.inputs[a.asset]=budget.toString();slots.set(time,slot);
       }
     }
     const failing=[...slots.values()].filter(s=>{
       if(s.budget<=reserve)return true;
-      // Dust cannot count toward any child's minimum; it remains in its source.
-      const inputs=Object.fromEntries(Object.entries(s.inputs).filter(([,raw])=>{
-        const n=BigInt(raw);return n-reserve*n/s.budget>=U;
+      // Nonfinal dust stays in its source; a final remainder joins the full batch.
+      const inputs=Object.fromEntries(Object.entries(s.inputs).filter(([asset,raw])=>{
+        const n=BigInt(raw);return s.finalAssets.has(asset)||n-reserve*n/s.budget>=U;
       }));
-      return assetBatchBudget(inputs,reserve,new Map(Object.keys(inputs).map(a=>[a,null])),UINT256_MAX,stepLimit)===null;
+      return assetBatchBudget(inputs,reserve,new Map(Object.keys(inputs).map(a=>[a,null])),UINT256_MAX,stepLimit,s.finalAssets)===null;
     });
     if(failing.length===0)return {minimum,effectiveSlices:counts};
     const reducible=assets.filter(a=>failing.some(s=>s.assets.includes(a.asset))&&(counts[a.asset]??1)>1);
@@ -60,7 +60,7 @@ export function planContribution(total:bigint,config:AssetExecution,confirmedAt:
 /** Original source budgets include fee. Reserve every child once, then freeze
  * the complete input vector; execution only subtracts confirmed child inputs.
  */
-export function assetBatchBudget(budgets:InputVector,reserve:bigint,caps:ReadonlyMap<string,bigint|null>,buyLimit:bigint,stepLimit=16):{inputs:InputVector;fee:bigint;count:bigint}|null{
+export function assetBatchBudget(budgets:InputVector,reserve:bigint,caps:ReadonlyMap<string,bigint|null>,buyLimit:bigint,stepLimit=16,finalAssets:ReadonlySet<string>=new Set()):{inputs:InputVector;fee:bigint;count:bigint}|null{
   const total=sumInputs(budgets),entries=Object.entries(budgets);
   // Validate the step limit even on empty or otherwise unexecutable inputs.
   executionInputGroups({},stepLimit,reserve);
@@ -70,7 +70,7 @@ export function assetBatchBudget(budgets:InputVector,reserve:bigint,caps:Readonl
   for(let groups=minimumGroups;groups<=Math.max(minimumGroups,maximumGroups);groups++){
     const groupCount=BigInt(groups);
     let maximum=total/(50n*U*groupCount);
-    for(const [,raw] of entries){const n=BigInt(raw)/U;if(n<maximum)maximum=n;}
+    for(const [asset,raw] of entries){const n=BigInt(raw)/(finalAssets.has(asset)?1n:U);if(n<maximum)maximum=n;}
     if(maximum<1n)continue;
     const at=(count:bigint)=>{
       const fee=reserve*count*groupCount;if(fee>=total)return null;
@@ -87,7 +87,7 @@ export function assetBatchBudget(budgets:InputVector,reserve:bigint,caps:Readonl
     let low=1n,high=maximum;while(low<high){const mid=(low+high)/2n;if(capacity(mid))high=mid;else low=mid+1n;}
     const result=at(low);if(!result)continue;
     const smallest=Object.fromEntries(Object.entries(result.inputs).map(([a,v])=>[a,(BigInt(v)/low).toString()]));
-    const children=executionInputGroups(smallest,stepLimit,reserve);
+    const children=executionInputGroups(smallest,stepLimit,reserve,finalAssets);
     if(children&&children.length<=groups)return result;
   }
   return null;

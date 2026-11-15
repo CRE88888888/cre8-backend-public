@@ -1,3 +1,6 @@
+import { TESTNET_ASSETS } from './keeper/assets.js';
+import { testnetAssets } from './testnet-profile.js';
+
 /** NYSE published 2026–2028 calendar. Unknown years fail closed.
  * https://ir.theice.com/press/news-details/2025/NYSE-Group-Announces-2026-2027-and-2028-Holiday-and-Early-Closings-Calendar/default.aspx
  * America/New_York supplies DST rules; only the regular equity session is eligible.
@@ -17,4 +20,13 @@ export function stockMarketOpen(now: Date): boolean {
   if (!['2026','2027','2028'].includes(p.year ?? '') || p.weekday === 'Sat' || p.weekday === 'Sun' || holidays.has(day)) return false;
   const minutes = Number(p.hour) * 60 + Number(p.minute);
   return minutes >= 570 && minutes < (early.has(day) ? 780 : 960);
+}
+
+
+/** Asset identity comes from the admitted chain manifest, never a request symbol. */
+export function assetsMarketOpen(chainId:number,assets:readonly string[],now:Date):boolean {
+  if(chainId!==97)return true;
+  const stocks=new Set<string>(TESTNET_ASSETS.filter(a=>!a.hasFeed&&a.symbol!=='XAUt').map(a=>a.symbol));
+  const addresses=new Set<string>(testnetAssets().filter(a=>stocks.has(a.symbol)).map(a=>a.address));
+  return !assets.some(a=>addresses.has(a.toLowerCase()))||stockMarketOpen(now);
 }

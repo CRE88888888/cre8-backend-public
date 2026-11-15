@@ -1,6 +1,6 @@
 # 逐資產策略 API、投入與排程契約
 
-對應 backend#82／#83／#92、db 0031／0032／0034，以及 [測試網參數總表](https://github.com/CRE8Finance/docs/blob/main/docs/TESTNET_PARAMETERS.zh-TW.md)。每批 50 USDT 是**含費總預算**；每資產實際輸入至少 1 USDT。只在 chain 97 開新錢自動化；主網舊 target_weight 行為保留。版本不設資產數上限；單筆 UserOp 最多 16 步，依持有數縮小並驗總 gas ≤14M。保留完整原投入向量，僅按 confirmed 子批扣減；已配置現金與費用尾款不重算為新本金。
+對應 backend#82／#83／#92／#96、db 0031／0032／0034／0038，以及 [測試網參數總表](https://github.com/CRE8Finance/docs/blob/main/docs/TESTNET_PARAMETERS.zh-TW.md)。每批 50 USDT 是**含費總預算**；每資產實際輸入至少 1 USDT，最後一期正數餘額例外。只在 chain 97 開新錢自動化；主網舊 target_weight 行為保留。chain 97 版本不設資產數上限，chain 56 最終含 USDT 最多 16 個；單筆 UserOp 最多 16 步，依持有數縮小並驗總 gas ≤14M。保留完整原投入向量，僅按 confirmed 子批扣減；已配置現金與費用尾款不重算為新本金。
 
 ## 發版
 
@@ -29,6 +29,8 @@
 ```
 
 地址須符合該鏈 manifest；以上為 profile 範例，部署時以 manifest 為準。allocation 與 execution 必須完整對應、bps 總和 10000。USDT 項**不能有 execution**；其餘每項是 hold 或完整 stack。省略 execution 時明示展開各資產 hold；省略資產模式、yield、rebalance 分別明示套用 hold、null、none，再雜湊。省略 schedule／idleYield 補 funding／disabled。舊 bare `{kind:hold|stack}` 新發版拒絕；未支援功能、多餘欄位及個人金額不能默默丟棄。
+
+上述 schema 2 發版只開放 chain 97。chain 56 HTTP 沿用 interval／cron 的 schema 0 發版，拒絕 execution／idleYield／funding，不會自動轉成 per_asset；顯式 chainId 必須符合 API 部署鏈。
 
 stack 由創作者指定 daily／weekly、UTC 整分時刻、實際原設定 2–52 期。daily 的 weekday 為 null；weekly 為 0–6（週日為 0）。UI 先展示創作者當地預設每週一 09:00、12 期，再換成 UTC 送入；API 不猜時區。固定 UTC 後跨 DST 的當地時刻可能改變。買的人只決定投入總額。
 
@@ -73,20 +75,29 @@ APP 在已完成 enrollment 的基金買入前呼叫 `buy-funding`。有原迎�
 
 投入全額是**本金與費用的總預算**。新 lot 按原權重一次固定逐資產預算；非現金 floor(total×bps/10000)，尾差歸 cash。hold／stack 分別進 unallocated_hold／stack_prefund，cash 立即 allocated 且完成，不再乘權重。純現金無費用、無空買單。永久鍵 `(chain,txHash,logIndex)`；重播保留原確認時間，不重加桶。重組保留原預留並停止新工作，不復活來源。
 
-最低認購 50（含費）；現金權重不算換幣批次，因此 50% 現金至少投入 100。依實際各資產時點合單縮減該 lot 的期數，原版本 N／hash 不變。單資產 N12：50→M1、100→M2、600→M12。縮成一期的 stack 仍嚴格等確認後的下一指定點，等號等下次。
+最低認購固定 50（含費），不隨現金比重提高；例如 99% 現金的 1,000 投入仍先記帳，等非現金預算合單達含費 50 才買入。來源日曆使用驗證過的 canonical block 確認時間，API 延遲不改首期期次。依實際各資產時點合單縮減該 lot 的期數，原版本 N／hash 不變。單資產 N12：50→M1、100→M2、600→M12。縮成一期的 stack 仍嚴格等確認後的下一指定點，等號等下次。
 
 每個 lot 不獨立要求達到一整批 50：不同時點的小來源可保存一期計畫，`fundingStatus=waiting_for_merged_budget`，等同帳戶同版本同時點其他 lot 合單。這代表記帳成功，未承諾立即可成交。重播回 recorded。若目前窗口仍不達門檻就等待；過期略過、不把該期 base 補扣到下一期。
 
 ## 執行、零碎額與未知狀態
 
-同帳戶同 slot 所有到期資產／lot 先收齊成一個 asset job，window 取來源最早截止；一次估 k×R 並分攤所有來源。保留現金不進工作。每資產合單後實際輸入 <1 則 deferred_min_asset，無預留；下期攜帶前筆未掛 job 的零碎預算。略過只保留更早的 carry，不補扣該期 base；已掛 job／未知的預留永不再次 carry。最後剩餘零碎額仍可領出。
+同帳戶同 slot 所有到期資產／lot 先收齊成一個 asset job，window 取來源最早截止；一次估 k×R 並分攤所有來源。保留現金不進工作。非終期資產合單後實際輸入 <1 則 deferred_min_asset，無預留；下期攜帶前筆未掛 job 的零碎預算。最後一期（含 hold 唯一期）將正數餘額一起買入，豁免單資產 1 USDT，整批仍須含費 ≥50。略過只保留更早的 carry，不補扣該期 base；已掛 job／未知的預留永不再次 carry。既有已落終態 dust 不回補，只能提領退出。
 
-子批同比例分各成分，實際最小輸入 1、含費總預算 50；50 投入可輸入 49.73＋R0.27。k 批預留 k×R，未使用費用回已配置現金，實際收費依 receipt，不重複收。逐來源 raw 尾差後重查全部 cap／buyAllowance。任一成分缺報價、oracle、深度或休市，整個子批等候，不跳掉資產。舊 target_weight 維持原最低步／實際名目額口徑。
+子批同比例分各成分，實際最小輸入 1、含費總預算 50；50 投入可輸入 49.73＋R0.27。k 批預留 k×R，未使用費用回已配置現金，實際收費依 receipt，不重複收。逐來源 raw 尾差後重查全部 cap／buyAllowance。任一成分缺報價、oracle、深度或休市，整個子批等候，不跳掉資產。全 hold 再平衡也使用每資產 1／含費 50，賣出以同塊 oracle 名義額計算；新投入及部分成交不標記 monthly 完成，重啟續作到全數完成才記當月。legacy 最低步預設改為 1 USDT，仍保留原本環境變數覆寫與名義額口徑。
 
 股票使用 [NYSE 2026–2028 官方日曆](https://ir.theice.com/press/news-details/2025/NYSE-Group-Announces-2026-2027-and-2028-Holiday-and-Early-Closings-Calendar/default.aspx) 與 America/New_York DST，開盤含等號、收盤不含；未知年份不買股票。加密資產無股票日曆限制。跨基金共用每鏈保守 DEX 隊列：未知 operation 持久占位，成交後等下一區塊再取新報價。
 
 所有 gates 後以即時 clock 驗 `[slot,window_end)`，同交易寫 actual start、batch、operation payload／nonce／deadline；commit 成功才簽名廣播。receipt 成功需交易狀態、UserOp success、預期 swap／費用事件及實際 token transfers 全部吻合；operation、batch、remaining 向量、來源終態、cash buckets 同 commit。
 
-來源不足記 skipped_insufficient_funds，跨期停機記 skipped_window，在途跨期記 skipped_previous_inflight；GET slices 提供持久原因供畫面通知。補款不追扣。確定失敗按 1／5／30 分鐘退避，連續 3 次暫停原 job；gas 額度不足不算交易失敗。本人暫停可釋放尚未開始的預留，已送未知先對帳；剩餘向量不消失。
+來源不足記 skipped_insufficient_funds，並在同一交易寫入 user_notifications 的 pending 事件；跨期停機記 skipped_window，在途跨期記 skipped_previous_inflight。補款不追扣。確定失敗按 1／5／30 分鐘退避，連續 3 次暫停原 job；gas 額度不足不算交易失敗。本人暫停可釋放尚未開始的預留，已送未知先對帳；剩餘向量不消失。
 
 hashless 或 receipt 查無的 typed 操作保持未決：nonce 前進與 deadline 過期不能證明**過去沒有成交**，不能釋放重送。同一帳戶只一個未決 attempt。DB commit 回應遺失與重啟都回原鍵對帳；無法取得原成交證據時需營運對帳，不能用新鍵避開。
+
+
+## 不足跳期通知事件（db 0038）
+
+在 portfolio／cash-row 鎖內，先保存 skipped slice，再使用同一 client／交易寫 `stack_slot_skipped_insufficient_funds`。收件人取對應 smart account 的 owner 快照；永久鍵為 `(chain_id,kind,lot_id:小寫asset:零起算slice_index)`，包含 delivered／failed 終態。重試先讀來源期次，不重插 terminal slice；通知衝突以獨立 statement 讀回並核對不可變欄位，不覆寫 payload 或重設 state。任一步失敗皆回滾；未知 commit 重連後查原來源／事件。
+
+payload 僅含 `budgetRaw`（該來源當期含 carry 的 raw 整數字串）、`slotAt`、`windowEndAt`（UTC ISO 時間）。不接受外部任意欄位，不包含憑證、原始 RPC／DB 錯誤。可負擔、休市、暫停、過期或在途跳期不建立此通知。
+
+此介面將已 commit 的 pending 事件交給後續通知流程；本修正不新增渠道、不呼叫營運 Telegram、不回填歷史 skipped，也不宣告已外部送達。consumer 須以永久通知 ID 去重／對帳，外部發送在交易外；只有確認結果才條件更新 pending → delivered／failed，暫時或未知結果保持 pending。DB 去重不代表外部投遞 exactly-once。

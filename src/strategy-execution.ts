@@ -167,6 +167,5 @@ export function validateAssetConfig(value: unknown, allocation: Allocation, chai
 }
 
 export function minimumAssetContribution(config: AssetExecution): bigint {
-  const weight = config.assets.filter(a => a.asset !== config.numeraire).reduce((s,a) => s+BigInt(a.weightBps),0n);
-  return weight === 0n ? 50n * UNIT : (50n * UNIT * 10000n + weight - 1n) / weight;
+  return 50n * UNIT;
 }

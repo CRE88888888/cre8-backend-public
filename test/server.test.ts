@@ -631,7 +631,7 @@ test('#59 config validates budgets, nonce capacity and relayer wei without echoi
 
 const budgetActions: { action: WalletAction; path: string; method: string; body?: unknown }[] = [
   { action: 'strategies', path: '/strategies', method: 'POST', body: { name: 'fund' } },
-  { action: 'versions', path: '/strategies/1/versions', method: 'POST', body: {allocation:{assets:[{address:'0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c',weightBps:10000}]}} },
+  { action: 'versions', path: '/strategies/1/versions', method: 'POST', body: {allocation:{assets:[{address:'0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c',weightBps:10000}]},schedule:{kind:'interval',intervalSeconds:3600}} },
   { action: 'portfolios', path: '/portfolios', method: 'POST', body: { strategyId: 1 } },
   { action: 'plan', path: '/portfolios/1/plan', method: 'GET' },
   { action: 'redeem', path: '/portfolios/1/redeem', method: 'POST', body: { usd: 1 } },

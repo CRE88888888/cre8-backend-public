@@ -103,6 +103,7 @@ function ownedPortfolio(overrides: Partial<OwnedPortfolio> = {}): OwnedPortfolio
 
 function samplePortfolio(id = PORTFOLIO_ID): Portfolio {
   return {
+    minDepositUsdtWei: '50000000000000000000',
     id,
     userId: WALLET_LOWER,
     strategyId: STRATEGY_ID,
@@ -302,6 +303,7 @@ test('listPortfolios only returns rows whose user_id is the token wallet (case-i
       address: SMART_ACCOUNT.address.toLowerCase(),
       owner: WALLET_LOWER,
       account_type: 'KERNEL',
+      allocation: { assets: [{ address: '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c', weightBps: 625 }, { address: '0x55d398326f99059ff775485246999027b3197955', weightBps: 9375 }] },
     },
     {
       id: '4',
@@ -336,6 +338,8 @@ test('listPortfolios only returns rows whose user_id is the token wallet (case-i
   });
 
   assert.equal(portfolios.length, 1, 'another wallet’s portfolio must not leak into the list');
+  assert.equal(portfolios[0]?.minDepositUsdtWei, '80000000000000000000');
+  assert.match(calls[0]?.text ?? '', /sv\.version=p\.version/);
   assert.equal(portfolios[0]?.id, PORTFOLIO_ID);
   assert.equal(calls[0]?.params[0], WALLET_LOWER, 'the query param is the authenticated wallet, lowercased');
 });
@@ -472,6 +476,7 @@ test('GET /portfolios requires a bearer token and returns the { portfolios: [...
         'createdAt',
         'gas',
         'id',
+        'minDepositUsdtWei',
         'scheduleState',
         'sessionKey',
         'smartAccounts',

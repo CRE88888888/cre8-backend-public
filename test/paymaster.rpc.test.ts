@@ -36,8 +36,9 @@ test('#66 RPC guards chain, signer, EntryPoint, deposit, deployed implementation
     res.setHeader('content-type', 'application/json');
     res.end(JSON.stringify({ jsonrpc: '2.0', id: rpc.id, result }));
   });
-  await new Promise<void>((resolve) => server.listen(8094, '127.0.0.1', resolve));
-  const service = createPaymasterService({ config: { ...config(), rpcUrl: 'http://127.0.0.1:8094' }, now: () => NOW,
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  const service = createPaymasterService({ readBudgetContext: async () => ({ purpose: 'ordinary', nativePrice: 60000000000n, priceSource: 'fixture:oracle' }), config: { ...config(), rpcUrl: `http://127.0.0.1:${address.port}` }, now: () => NOW,
     query: async () => ({ rows: [{ owner: OWNER, user_id: OWNER }] }), reserve: async () => { reserved++; } });
   try {
     await service.sponsor({ userOperation: operation() }, OWNER);
@@ -66,7 +67,7 @@ test('#66 strict uint256/bytes parsing refuses missing, negative, overflow, nume
     assert.throws(() => parsePackedSponsorOperation({ ...operation(), ...change }), (error: unknown) => error instanceof AppError && error.code === 'PAYMASTER_INVALID_OPERATION');
   }
   let reserved = false;
-  const service = createPaymasterService({ config: config(), now: () => NOW, query: async () => ({ rows: [{ owner: OWNER, user_id: OWNER }] }),
+  const service = createPaymasterService({ readBudgetContext: async () => ({ purpose: 'ordinary', nativePrice: 60000000000n, priceSource: 'fixture:oracle' }), config: config(), now: () => NOW, query: async () => ({ rows: [{ owner: OWNER, user_id: OWNER }] }),
     checkChain: async () => {}, reserve: async () => { reserved = true; } });
   await assert.rejects(service.sponsor({ userOperation: operation({ paymasterAndData: initCode }) }, OWNER), (error: unknown) => error instanceof AppError);
   assert.equal(reserved, false);
@@ -74,7 +75,7 @@ test('#66 strict uint256/bytes parsing refuses missing, negative, overflow, nume
 
 test('#66 scheduler stub cannot authorize, final hook reserves exact gas through same service; missing fields/domain blocked', async () => {
   let reserved = 0;
-  const hooks = schedulerPaymaster(SENDER, { config: config(), now: () => NOW, checkChain: async () => {},
+  const hooks = schedulerPaymaster(SENDER, { readBudgetContext: async () => ({ purpose: 'ordinary', nativePrice: 60000000000n, priceSource: 'fixture:oracle' }), config: config(), now: () => NOW, checkChain: async () => {},
     query: async () => ({ rows: [{ owner: OWNER, user_id: OWNER }] }), reserve: async (r) => { assert.equal(r.gasLimit, 450_000n); reserved++; } });
   assert.ok(hooks);
   const args = { sender: SENDER, chainId: 1337, entryPointAddress: K.entryPointV07, nonce: 0n, callData: operation().callData } as const;
@@ -89,7 +90,7 @@ test('#66 scheduler stub cannot authorize, final hook reserves exact gas through
     await assert.rejects(hooks.getPaymasterData({ ...complete, ...change }), (error: unknown) => error instanceof AppError);
   }
   assert.equal(reserved, 1);
-  assert.equal(schedulerPaymaster(SENDER, { config: null }), undefined);
+  assert.equal(schedulerPaymaster(SENDER, { readBudgetContext: async () => ({ purpose: 'ordinary', nativePrice: 60000000000n, priceSource: 'fixture:oracle' }), config: null }), undefined);
 });
 
 test('#66 viem estimation must use only a paymaster stub, with no premature quota reservation', async () => {
@@ -104,7 +105,7 @@ test('#66 viem estimation must use only a paymaster stub, with no premature quot
     getAddress: async () => SENDER, encodeCalls: async () => operation().callData, getFactoryArgs: async () => ({}),
     getNonce: async () => 0n, getStubSignature: async () => '0x', signMessage: async () => '0x', signTypedData: async () => '0x', signUserOperation: async () => '0x' });
   let reservations = 0;
-  const hooks = schedulerPaymaster(SENDER, { config: config(), now: () => NOW,
+  const hooks = schedulerPaymaster(SENDER, { readBudgetContext: async () => ({ purpose: 'ordinary', nativePrice: 60000000000n, priceSource: 'fixture:oracle' }), config: config(), now: () => NOW,
     query: async () => ({ rows: [{ owner: OWNER, user_id: OWNER }] }), checkChain: async () => {}, reserve: async () => { reservations++; } });
   assert.ok(hooks);
   const bundler = createBundlerClient({ account, chain, transport, paymaster: hooks });

@@ -12,8 +12,22 @@ import { ForbiddenError, NotFoundError, ValidationError } from './errors.js';
 import { describeGasStatus } from './funding.js';
 import type { GasStatus } from './funding.js';
 import { buildSessionPermissions, deriveSessionKeyFor, sessionValidUntil, sudoValidator } from './permissions.js';
+import type { Allocation } from './strategies.js';
+import { configuredChainId, TESTNET_97 } from './testnet-profile.js';
+import { minimumDepositUsdtWei } from './rebalance-plan.js';
+
+export function allocationMinimumDeposit(allocation: Allocation | null | undefined): string | null {
+  if (allocation === null || allocation === undefined) return null;
+  const cash = configuredChainId() === 97 ? TESTNET_97.contracts.usdt : '0x55d398326f99059ff775485246999027b3197955';
+  return minimumDepositUsdtWei(allocation.assets.map((asset) => ({ asset: asset.address, weightBps: asset.weightBps })), cash).toString();
+}
+export async function strategyMinimumDeposit(strategyId: number): Promise<string | null> {
+  const result = await query<{ allocation: Allocation }>('select allocation from strategy_versions where strategy_id=$1 order by version desc limit 1', [strategyId]);
+  return allocationMinimumDeposit(result.rows[0]?.allocation);
+}
 
 export type Portfolio = {
+  minDepositUsdtWei: string | null;
   id: number;
   userId: string;
   strategyId: number;
@@ -45,6 +59,7 @@ export type SmartAccount = {
 
 type StrategyOnchainRow = { onchain_id: string | null; active_version: number | null };
 type PortfolioRow = {
+  allocation?: Allocation | null;
   id: string;
   user_id: string;
   strategy_id: string;
@@ -147,9 +162,10 @@ export type EnrollDeps = {
  * ending in a 23505 on smart_accounts(chain_id, address).
  */
 const ACTIVE_ENROLLMENT_SQL = `select p.id, p.user_id, p.strategy_id, p.version, p.schedule_state, p.created_at,
-          s.chain_id, s.address, s.owner, s.account_type
+          s.chain_id, s.address, s.owner, s.account_type, sv.allocation
      from portfolios p
      join smart_accounts s on s.portfolio_id = p.id
+     left join strategy_versions sv on sv.strategy_id = p.strategy_id and sv.version = p.version
     where p.user_id = $1 and p.strategy_id = $2 and p.schedule_state = 'active'
       and s.account_type = 'KERNEL'
     order by p.id
@@ -307,7 +323,8 @@ export async function enrollPortfolio(
     const inserted = await client.query<PortfolioRow>(
       `insert into portfolios (user_id, strategy_id, version, schedule_state)
        values ($1, $2, $3, 'active')
-       returning id, user_id, strategy_id, version, schedule_state, created_at`,
+       returning id, user_id, strategy_id, version, schedule_state, created_at,
+         (select allocation from strategy_versions sv where sv.strategy_id=portfolios.strategy_id and sv.version=portfolios.version) as allocation`,
       [account, strategyId, enrolledVersion],
     );
     const portfolioRow = inserted.rows[0];
@@ -406,10 +423,11 @@ export async function listPortfolios(
 
   const portfolios = await find<PortfolioListRow>(
     `select p.id, p.user_id, p.strategy_id, p.version, p.schedule_state, p.created_at,
-            st.name as strategy_name,
+            st.name as strategy_name, sv.allocation,
             sa.chain_id, sa.address, sa.owner, sa.account_type
        from portfolios p
        left join strategies st on st.id = p.strategy_id
+       left join strategy_versions sv on sv.strategy_id=p.strategy_id and sv.version=p.version
        left join smart_accounts sa on sa.portfolio_id = p.id
       where lower(p.user_id) = $1
       order by p.id, sa.chain_id`,
@@ -592,6 +610,7 @@ export async function requireOwnedPortfolio(
 /** Row shape → API shape. Shared by the idempotent return and the freshly written portfolio. */
 function toPortfolio(row: PortfolioRow, accounts: SmartAccountRow[], gas: GasStatus | null): Portfolio {
   return {
+    minDepositUsdtWei: allocationMinimumDeposit(row.allocation),
     id: Number(row.id),
     userId: row.user_id,
     strategyId: Number(row.strategy_id),

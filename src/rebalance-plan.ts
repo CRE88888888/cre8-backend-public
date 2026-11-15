@@ -110,6 +110,98 @@ import { capAmountInForImpact, estimateImpact, impactStateProblem } from './impa
 import type { PoolImpactState } from './impact.js';
 import { query as dbQuery } from './db.js';
 import type { QueryFn } from './snapshot.js';
+import { loadTradingConfig } from './config.js';
+import type { TradingConfig } from './config.js';
+
+/** API amount in 18-decimal USDT. Never renormalize away the cash allocation. */
+export function minimumDepositUsdtWei(targets: readonly TargetWeight[], numeraire: string, policy = loadTradingConfig()): bigint {
+  if (targets.length === 0 || new Set(targets.map((target) => target.asset.toLowerCase())).size !== targets.length ||
+      targets.reduce((sum, target) => sum + target.weightBps, 0) !== 10000) throw new Error('invalid allocation');
+  let required = policy.minDepositUsdE8 * 10n ** 10n;
+  for (const target of targets) {
+    const cash = sameAsset(target.asset, numeraire);
+    if (!Number.isSafeInteger(target.weightBps) || target.weightBps < (cash ? 0 : 1) || target.weightBps > 10000) throw new Error('invalid weight');
+    if (cash) continue;
+    const amount = ceilDiv(policy.minStepUsdE8 * 10n ** 10n * 10000n, BigInt(target.weightBps));
+    if (amount > required) required = amount;
+  }
+  return required;
+}
+
+export function tradeMinimumReason(nominal: readonly bigint[], purpose: 'ordinary' | 'exit', policy = loadTradingConfig(), decimals = 8): string | null {
+  if (nominal.some((value) => value < 0n) || !Number.isSafeInteger(decimals) || decimals < 0 || decimals > 36) throw new Error('invalid notional');
+  if (purpose === 'exit') return null;
+  const scale = 10n ** BigInt(decimals);
+  if (nominal.some((value) => value * 100000000n < policy.minStepUsdE8 * scale)) return '[BELOW_MIN_STEP] 單步不足交易門檻，等待累積';
+  if (nominal.reduce((sum, value) => sum + value, 0n) * 100000000n < policy.minBatchUsdE8 * scale) return '[BELOW_MIN_BATCH] 批次不足交易門檻，等待累積';
+  return null;
+}
+
+const MIN_FEE_ABI = [
+  { type: 'function', name: 'minBatchFee', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint256' }] },
+  { type: 'function', name: 'minFeeTopUp', stateMutability: 'view', inputs: [{ type: 'uint256' }, { type: 'uint256' }], outputs: [{ type: 'uint256' }] },
+] as const;
+
+/** Reserve the maximum top-up at its 1% saturation point, before sizing buys.
+ * Shrinking/filtering a buy can increase its top-up, so a quote at the original size is unsafe.
+ * This bound remains sufficient even when a sale's actual gross output differs from its quote.
+ */
+export async function minimumFeeReserve(client: PublicClient, executor: Address, strategyId: bigint, blockNumber: bigint): Promise<bigint> {
+  try {
+    const minimum = await client.readContract({ address: executor, abi: MIN_FEE_ABI, functionName: 'minBatchFee', blockNumber });
+    if (minimum < 0n) throw new Error('invalid minimum fee');
+    const topUp = await client.readContract({ address: executor, abi: MIN_FEE_ABI, functionName: 'minFeeTopUp', args: [strategyId, minimum * 100n], blockNumber });
+    if (topUp < 0n || topUp > minimum) throw new Error('invalid top-up');
+    return topUp;
+  } catch { throw new Error('[MIN_FEE_UNAVAILABLE] 無法確認最低費預留，不買入'); }
+}
+
+export async function checkTradeMinimums(client: PublicClient, executor: Address, steps: readonly PlannedStep[], purpose: 'ordinary' | 'exit', blockNumber: bigint): Promise<string | null> {
+  if (purpose === 'exit') return null;
+  try {
+    const numeraire = await client.readContract({ address: executor, abi: ORACLE_ABI, functionName: 'numeraire', blockNumber });
+    const oracle = await client.readContract({ address: executor, abi: EXECUTOR_ABI, functionName: 'oracle', blockNumber });
+    const decimals = await numeraireDecimals(client, numeraire, [], blockNumber);
+    const nominal = await Promise.all(steps.map(async (step) => {
+      const raw = sameAsset(step.tokenIn, numeraire) ? step.amountIn :
+        await nominalSellQuote(client, oracle, step.tokenIn, numeraire, step.amountIn, blockNumber);
+      return raw;
+    }));
+    return tradeMinimumReason(nominal, purpose, loadTradingConfig(), decimals);
+  } catch { return '[TRADE_MINIMUM_UNAVAILABLE] 無法確認交易名義額，不送交易'; }
+}
+
+/** Final funding check uses refreshed swap payloads and one fresh block. Never resizes opaque data. */
+export async function checkBuyFeeReserve(params: {
+  client: PublicClient; executor: Address; account: Address; strategyId: bigint; registry: Address;
+  steps: readonly PlannedStep[]; numeraire: Address; blockNumber: bigint;
+}): Promise<void> {
+  const { client, executor, account, strategyId, registry, steps, numeraire, blockNumber } = params;
+  if (steps.every((step) => sameAsset(step.tokenOut, numeraire))) return;
+  try {
+    const tokenAbi = [
+      { type: 'function', name: 'balanceOf', stateMutability: 'view', inputs: [{ type: 'address' }], outputs: [{ type: 'uint256' }] },
+      { type: 'function', name: 'allowance', stateMutability: 'view', inputs: [{ type: 'address' }, { type: 'address' }], outputs: [{ type: 'uint256' }] },
+    ] as const;
+    const [reserve, balance, allowance, fee] = await Promise.all([
+      minimumFeeReserve(client, executor, strategyId, blockNumber),
+      client.readContract({ address: numeraire, abi: tokenAbi, functionName: 'balanceOf', args: [account], blockNumber }),
+      client.readContract({ address: numeraire, abi: tokenAbi, functionName: 'allowance', args: [account, executor], blockNumber }),
+      client.readContract({ address: registry, abi: REGISTRY_ABI, functionName: 'effectiveFeeBps', args: [strategyId], blockNumber }),
+    ]);
+    if (!Number.isInteger(fee) || fee < 0 || fee >= 10000) throw new Error('invalid fee');
+    let cash = balance;
+    let spent = 0n;
+    for (const step of steps) {
+      if (sameAsset(step.tokenIn, numeraire)) {
+        if (step.amountIn > cash) throw new Error('insufficient sequential cash');
+        cash -= step.amountIn; spent += step.amountIn;
+      } else if (sameAsset(step.tokenOut, numeraire)) cash += step.amountOutMin - step.amountOutMin * BigInt(fee) / 10000n;
+      else throw new Error('invalid route');
+    }
+    if (cash < reserve || allowance < spent + reserve) throw new Error('minimum fee funding insufficient');
+  } catch { throw new Error('[MIN_FEE_RESERVE] 送出前無法確認現金與授權足以支付買入及最低費，不送交易'); }
+}
 
 export type PlannedStep = {
   tokenIn: Address;
@@ -132,6 +224,8 @@ export type RebalancePlan =
       steps: PlannedStep[];
       deadline: bigint;
       rationale: string;
+      /** Only the server's close/redeem planner may grant the sales-only exit exception. */
+      purpose?: 'exit';
       /**
        * 依這份 `steps` 執行之後，**預估漂移仍高於門檻**（＝還有事要做，下一輪要接著做）。
        * 缺席 = 執行後預估就收斂了（接著跑也只會拿到 noop），`steps` 是完整的一輪。
@@ -177,6 +271,7 @@ export type PlanPartial = {
 
 
 export type PlanRebalanceArgs = {
+  tradingConfig?: TradingConfig;
   /** DB max_leg_usdt 轉成 E8；NULL 不限、0 阻擋。省略時規劃器讀 DB，CLI 也不能繞過限額。 */
   maxLegUsdE8?: ReadonlyMap<string, bigint | null>;
   publicClient: PublicClient;
@@ -1579,6 +1674,7 @@ async function planHub(
   const driftByAsset = new Map<string, (typeof drift.assets)[number]>();
   for (const row of drift.assets) driftByAsset.set(row.asset.toLowerCase(), row);
   const hubHolding = holdingsByAsset.get(hubKey);
+  const policy = args.tradingConfig ?? loadTradingConfig();
 
   // 約束 ③：deltaUsd_i = 實際 USD − 目標 USD，目標值取上界（ceil）→「該賣的量」只會少不會多。
   const legs: { asset: Address; row: (typeof drift.assets)[number]; deltaUsdE8: bigint }[] = [];
@@ -1604,7 +1700,9 @@ async function planHub(
   let maxLegBatched = false;
   let maxLegBlocked = false;
   const needsDecimals = targets.some((target) => !sameAsset(target.asset, hub) && limitOf(args.maxLegUsdE8, target.asset) !== null);
-  const cashDecimals = needsDecimals ? await numeraireDecimals(publicClient, hub, holdings, blockNumber) : 18;
+  const cashDecimals = needsDecimals || hubHolding === undefined ? await numeraireDecimals(publicClient, hub, holdings, blockNumber) : hubHolding.decimals;
+  const cashScale = pow10(cashDecimals);
+  const minimumStepRaw = ceilDiv(policy.minStepUsdE8 * cashScale, USD_E8);
   const priced: PricedLeg[] = [];
   let head: Head | null = null;
   const ensureHead = async (): Promise<{ blocked: string } | Head> => {
@@ -1775,6 +1873,7 @@ async function planHub(
       notes.push(`賣 ${short(leg.asset)} 換 USDT 被跳過：${capped.skip}`);
       continue;
     }
+    if (capped.quoted < minimumStepRaw) { notes.push('[BELOW_MIN_STEP] 小額賣單等待累積'); continue; }
     priced.push({
       routed: capped.routed,
       tokenIn: leg.asset,
@@ -1805,7 +1904,12 @@ async function planHub(
   const sellProceeds = priced
     .slice(0, sellCount)
     .reduce((sum, leg) => sum + leg.oracleFloor - (leg.oracleFloor * BigInt(sellFeeBps)) / BPS_BIG, 0n);
-  const spendable = (hubHolding?.amountWei ?? 0n) + sellProceeds;
+  let feeReserve = 0n;
+  try {
+    if (legs.some((leg) => leg.deltaUsdE8 < 0n) && buySourceBlock === null) feeReserve = await minimumFeeReserve(publicClient, executor, strategyId, blockNumber);
+  } catch { return { kind: 'blocked', reason: '[MIN_FEE_UNAVAILABLE] 無法確認最低費預留，不買入' }; }
+  const availableCash = (hubHolding?.amountWei ?? 0n) + sellProceeds;
+  const spendable = availableCash > feeReserve ? availableCash - feeReserve : 0n;
   let spent = 0n;
 
   for (const leg of legs) {
@@ -1853,6 +1957,7 @@ async function planHub(
       notes.push(`買 ${short(leg.asset)}（付 ${amountIn} USDT）被跳過：${capped.skip}`);
       continue;
     }
+    if (capped.amountIn < minimumStepRaw) { notes.push('[BELOW_MIN_STEP] 小額買單等待累積'); continue; }
     priced.push({
       routed: capped.routed,
       tokenIn: hub,
@@ -1889,6 +1994,9 @@ async function planHub(
   const deadline = deadlineBaseSeconds + BigInt(deadlineSeconds);
 
   const steps = priced.map((leg) => leg.routed);
+  const minimumReason = tradeMinimumReason(priced.map((leg) =>
+    sameAsset(leg.tokenIn, hub) ? leg.amountIn : leg.oracleQuoted), 'ordinary', policy, cashDecimals);
+  if (minimumReason !== null) return { kind: 'blocked', reason: minimumReason };
 
   const legNotes = priced.map((leg, index) => {
     const row = driftByAsset.get(
@@ -2219,6 +2327,13 @@ export async function planRebalance(
     const budget = await readBuyBudget(args);
     if ('kind' in budget) return budget;
     if (amountIn > budget.remaining) amountIn = budget.remaining;
+    const cash = holdings.find((holding) => sameAsset(holding.asset, numeraire));
+    let reserve: bigint;
+    try { reserve = await minimumFeeReserve(publicClient, executor, strategyId, blockNumber); }
+    catch { return { kind: 'blocked', reason: '[MIN_FEE_UNAVAILABLE] 無法確認最低費預留，不買入' }; }
+    const spendable = (cash?.amountWei ?? 0n) > reserve ? (cash?.amountWei ?? 0n) - reserve : 0n;
+    if (amountIn > spendable) amountIn = spendable;
+    if (amountIn === 0n) return { kind: 'blocked', reason: '[MIN_FEE_RESERVE] 預留最低費後沒有可買入資金' };
     buyNote = budget.note;
   }
 
@@ -2340,6 +2455,14 @@ export async function planRebalance(
   const step = finalAmountIn === amountIn ? routed : await buildRoutedStep({ ...routeParams,
     amountIn: finalAmountIn, oracleFloor: finalFloor, minGross }, deps);
   if (step === null) return { kind: 'blocked', reason: '縮量後沒有符合地板的白名單路徑' };
+
+  const policy = args.tradingConfig ?? loadTradingConfig();
+  if (policy.minStepUsdE8 > 0n || policy.minBatchUsdE8 > 0n) {
+    const decimals = await numeraireDecimals(publicClient, numeraire, holdings, blockNumber);
+    const nominal = sameAsset(tokenIn, numeraire) ? finalAmountIn : await nominalSellQuote(publicClient, oracle, tokenIn, numeraire, finalAmountIn, blockNumber);
+    const minimumReason = tradeMinimumReason([nominal], 'ordinary', policy, decimals);
+    if (minimumReason !== null) return { kind: 'blocked', reason: minimumReason };
+  }
 
 
   // 判準是**執行後的預估漂移**（與 hub 路徑同一個定義：缺口還在就 partial）。

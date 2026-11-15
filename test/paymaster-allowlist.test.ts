@@ -27,7 +27,7 @@ const client = createPublicClient({ chain: defineChain({ id: 97, name: 'local fi
   rpcUrls: { default: { http: ['http://127.0.0.1:8558'] } } }), transport: http('http://127.0.0.1:8558') });
 
 function service(deps: PaymasterDeps = {}) {
-  return createPaymasterService({ config: c, now: () => NOW,
+  return createPaymasterService({ readBudgetContext: async () => ({ purpose: 'ordinary', nativePrice: 60000000000n, priceSource: 'fixture:oracle' }), config: c, now: () => NOW,
     query: async () => ({ rows: [{ owner: OWNER, user_id: OWNER }] }), checkChain: async () => {}, reserve: async () => {}, ...deps });
 }
 type RenewalOptions = {

@@ -77,7 +77,7 @@ import { EXECUTOR_ABI, EXECUTOR_SELECTOR, PLAN_HASH_ABI } from './chain.js';
  */
 
 import { HDKey } from '@scure/bip32';
-import { estimationPaymaster, paymasterExecutionError, schedulerPaymaster } from './paymaster.js';
+import { estimationPaymaster, paymasterExecutionError, schedulerPaymaster, gasExecutionKey, reserveGasBudget, readNativeBudgetPrice, existingBudgetContext, settleGasBudget, GasBudgetExceededError } from './paymaster.js';
 import { detectPaymasterLowGas } from './alerts.js';
 import type { PaymasterGasChecks } from './alerts.js';
 import { signerToEcdsaValidator } from '@zerodev/ecdsa-validator';
@@ -105,15 +105,16 @@ import { hdKeyToAccount } from 'viem/accounts';
 import { createBundlerClient, entryPoint07Abi, formatUserOperation, formatUserOperationReceipt, getUserOperationHash } from 'viem/account-abstraction';
 import type { GetUserOperationReturnType, UserOperationReceipt } from 'viem/account-abstraction';
 import { activeChain } from './chain-object.js';
-import { testnetAssets } from './testnet-profile.js';
+import { testnetAssets, TESTNET_97 } from './testnet-profile.js';
 import { KERNEL_V3_3_ADDRESSES } from './addresses.js';
 import { detectAlerts, detectRelayerLowGas, formatAlert, recordAlerts, resolveAlerts, createPriceSourceTracker, priceSourceAlertAssets } from './alerts.js';
 import type { AlertFinding, AlertKind, PriceSourceTracker, RelayerGasChecks } from './alerts.js';
 import { a10ErrorMessage, EXECUTOR_BUY_ABI, readGlobalPaused, decodePriceSourceError, describePriceSourceError, PriceSourceError, inspectPriceSources } from './chain.js';
 import { getConfig, getSessionKeyConfig, requireSessionKeyConfig } from './config.js';
 import { errorMessage, query as dbQuery, withTransaction, withPortfolioLock } from './db.js';
+import { AppError } from './errors.js';
 import { buildSessionPermissions } from './permissions.js';
-import { DEFAULT_DEADLINE_SECONDS as PLAN_DEFAULT_DEADLINE_SECONDS, planRebalance, readMaxLegUsdE8, refreshFloors } from './rebalance-plan.js';
+import { DEFAULT_DEADLINE_SECONDS as PLAN_DEFAULT_DEADLINE_SECONDS, planRebalance, readMaxLegUsdE8, refreshFloors, minimumDepositUsdtWei, checkTradeMinimums, checkBuyFeeReserve } from './rebalance-plan.js';
 import { writeSnapshot as writeSnapshotImpl } from './snapshot.js';
 import type { PlanPartial, PlannedStep, RebalancePlan, RefreshFloorsResult } from './rebalance-plan.js';
 import { DEFAULT_THRESHOLD_BPS, planPortfolio } from './snapshot.js';
@@ -460,6 +461,8 @@ export type PermissionInstallation = { signer: Address; policyCount: number };
 export type Erc20Args = { token: Address; owner: Address; spender?: Address };
 
 export type ExecuteArgs = {
+  gasPurpose?: 'ordinary' | 'exit';
+  strategyId?: bigint;
   portfolioId: number;
   account: Address;
   sessionKey: SessionKeyRef;
@@ -489,6 +492,8 @@ export type ExecuteArgs = {
  *             **沒有證據說它上鏈了**，所以要記成 failed 而不是 reverted —— 後者會讓人以為鏈上那一筆失敗了。
  */
 export type ExecutionOutcome = {
+  errorCode?: string;
+  budgetResetAt?: string;
   priceSourceFailure?: PriceSourceFailure;
   status: 'success' | 'reverted' | 'error' | 'unknown';
   userOpHash: Hex | null;
@@ -512,6 +517,8 @@ export type FloorRefreshInput = {
 };
 
 export type SchedulerDeps = {
+  checkTradingMinimums?: (steps: readonly PlannedStep[], purpose: 'ordinary' | 'exit', blockNumber: bigint) => Promise<string | null>;
+  hasBoughtBefore?: (account: Address, executor: Address, blockNumber: bigint) => Promise<boolean>;
   /** Must hold exclusion from the first snapshot through settlement. null means busy. */
   withPortfolioLock?: typeof withPortfolioLock;
   priceSourceChecks?: () => Promise<PriceSourceObservation[]>;
@@ -1334,7 +1341,8 @@ async function rebalanceKernelAccount(args: Pick<ExecuteArgs, 'account' | 'sessi
 
 async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<ExecutionOutcome> {
   const publicClient = defaultPublicClient();
-  const paymaster = schedulerPaymaster(args.account);
+  let paymaster: ReturnType<typeof schedulerPaymaster>;
+  let budgetKey: string | null = null;
   try {
     const network = activeChain();
     const account = await rebalanceKernelAccount(args);
@@ -1358,6 +1366,9 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
       throw new Error(`selector 不符：${data.slice(0, 10)} != ${EXECUTE_REBALANCE_SELECTOR}（CallPolicy 會擋下）`);
     }
 
+    const calls = [{ to: args.executor, data, value: 0n }] as const;
+    const callData = await account.encodeCalls(calls);
+    paymaster = schedulerPaymaster(args.account, args.gasPurpose === 'exit' ? { exitCallData: callData } : {});
     const client = createKernelAccountClient({
       account,
       paymaster,
@@ -1373,7 +1384,6 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
       },
     });
 
-    const calls = [{ to: args.executor, data, value: 0n }] as const;
 
     // ---- ① gas：`callGasLimit` 明確覆寫，不讓 alto 的估算單獨決定 ---------------------------------
     // alto 對「一筆 op 跑完整條 DeFi 路徑」系統性低估（§8.16 實測 367,885 vs 需要 450–500k），
@@ -1387,6 +1397,12 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
     const hasBuy = args.steps.some((step) => !isAddressEqual(step.tokenOut, numeraire));
     const valuationAssetCount = hasBuy ? new Set(args.valuationAssets.filter((asset) => !isAddressEqual(asset, numeraire)).map((asset) => asset.toLowerCase())).size : 0;
     const callGasLimit = rebalanceCallGasLimit(estimate.callGasLimit, valuationAssetCount);
+    if (hasBuy) {
+      if (args.strategyId === undefined) throw new Error('[MIN_FEE_RESERVE] 缺少策略，不送買入');
+      await checkBuyFeeReserve({ client: publicClient, executor: args.executor, account: args.account,
+        strategyId: args.strategyId, registry: registryAddress(), steps: args.steps, numeraire,
+        blockNumber: await publicClient.getBlockNumber({ cacheTime: 0 }) });
+    }
 
     // ---- ② 簽名前用 eth_call 模擬整格執行 ---------------------------------------------------------
     // `executeRebalance` 的第一個檢查是 `msg.sender != account → NotAccount`，所以 `from = 帳戶` 的
@@ -1411,12 +1427,26 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
 
     // 只覆寫 `callGasLimit`：其餘欄位（verificationGasLimit / preVerificationGas）仍由 alto 估算，
     // 它們與「執行路徑有多長」無關。
+    const prepared = await client.prepareUserOperation({ calls, callGasLimit, nonce: args.nonce,
+      verificationGasLimit: estimate.verificationGasLimit, preVerificationGas: estimate.preVerificationGas,
+      ...(paymaster === undefined ? {} : { paymaster }) });
+    budgetKey = gasExecutionKey(network.id, { sender: args.account, nonce: args.nonce, initCode: '0x', callData: prepared.callData });
+    if (paymaster === undefined) {
+      const op = { sender: args.account, nonce: args.nonce, initCode: '0x' as const, callData: prepared.callData };
+      const price = await existingBudgetContext(gasExecutionKey(network.id, op)) ?? await readNativeBudgetPrice(publicClient, args.executor, network.id);
+      await reserveGasBudget({ ...price, executionKey: gasExecutionKey(network.id, op), chainId: network.id,
+        account: getAddress(args.account).toLowerCase() as Address, purpose: args.gasPurpose ?? 'ordinary',
+        gasLimit: prepared.callGasLimit + prepared.verificationGasLimit + prepared.preVerificationGas,
+        maxFeePerGas: prepared.maxFeePerGas });
+    }
     args.onSending();
-    const userOpHash = await client.sendUserOperation({ calls, callGasLimit, nonce: args.nonce });
+    const userOpHash = await client.sendUserOperation(prepared);
     // alto 有 simulation：被拒的 op **不會**回 userOpHash。所以拿到 hash = 這一筆被接受了。
     await args.onSubmitted({ userOpHash });
+    await settleGasBudget(budgetKey, 'submitted');
 
     const receipt = await client.waitForUserOperationReceipt({ hash: userOpHash, timeout: USER_OP_RECEIPT_TIMEOUT_MS });
+    await settleGasBudget(budgetKey, receipt.success ? 'confirmed' : 'failed');
 
     // ---- ③ 三層判定（§8.16）：只驗 receipt.status 就是把「上鏈但什麼都沒換」記成成功 -----------------
     return judgeRebalanceOutcome({
@@ -1430,6 +1460,7 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
       ...(receipt.reason === undefined ? {} : { revertReason: receipt.reason }),
     });
   } catch (error) {
+    if (budgetKey !== null) await settleGasBudget(budgetKey, 'unknown').catch(() => {});
     const decoded = decodePriceSourceError(error);
     if (decoded === null) throw paymaster === undefined ? error : paymasterExecutionError(error);
     let detailed = decoded;
@@ -1508,6 +1539,13 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
 
   return {
     query,
+    checkTradingMinimums: provided.checkTradingMinimums ?? ((steps: readonly PlannedStep[], purpose: 'ordinary' | 'exit', blockNumber: bigint) =>
+      checkTradeMinimums(defaultPublicClient(), provided.executor ?? executorAddress(), steps, purpose, blockNumber)),
+    hasBoughtBefore: provided.hasBoughtBefore ?? (async (account: Address, executor: Address, blockNumber: bigint) => {
+      const [start] = await defaultPublicClient().readContract({ address: executor,
+        abi: parseAbi(['function buyWindowOf(address) view returns(uint64 start,uint192 bought)']), functionName: 'buyWindowOf', args: [account], blockNumber });
+      return start > 0n;
+    }),
     withPortfolioLock: provided.withPortfolioLock ?? withPortfolioLock,
     chainId,
     priceSourceTracker: provided.priceSourceTracker ?? (() => {
@@ -2175,6 +2213,22 @@ async function decideAndMaybeExecute(
     };
   }
 
+  const gasPurpose = rebalance.purpose ?? 'ordinary';
+  const cash = ctx.deps.chainId === 97 ? TESTNET_97.contracts.usdt : '0x55d398326f99059ff775485246999027b3197955';
+  const hasBuy = rebalance.steps.some((step) => !isAddressEqual(step.tokenOut, cash));
+  if (gasPurpose === 'exit' && hasBuy) return { ...base, outcome: 'blocked', reason: '[INVALID_EXIT] 退出計畫包含買入，不送交易' };
+  if (hasBuy) {
+    try {
+      const minimum = minimumDepositUsdtWei(plan.targets, cash);
+      if (plan.report.totalUsdE8 * 10n ** 10n < minimum &&
+          !await ctx.deps.hasBoughtBefore(due.account, ctx.deps.executor ?? executorAddress(), plan.snapshot.block)) {
+        return { ...base, outcome: 'blocked', reason: `[BELOW_MIN_DEPOSIT] 首次買入需累積 ${minimum} USDT 最小單位` };
+      }
+    } catch { return { ...base, outcome: 'blocked', reason: '[MIN_DEPOSIT_UNAVAILABLE] 無法確認首次買入與最低入金，不送交易' }; }
+  }
+  const minimumReason = await ctx.deps.checkTradingMinimums(rebalance.steps, gasPurpose, plan.snapshot.block);
+  if (minimumReason !== null) return { ...base, outcome: 'blocked', reason: minimumReason };
+
   // ---- ⑤ 送出前重問地板：`rebalance.steps` 的 `amountOutMin` 是**規劃當時**的地板 --------------
   // `planRebalance` 在 `plan.snapshot.block` 那一塊問到 `minimum`，然後我們簽名送出；合約在**執行**
   // 那一塊會自己再問一次（`AtpExecutor._checkStep`），而 oracle 的 `minimum` 含近 5 分鐘均值 ——
@@ -2319,6 +2373,8 @@ async function decideAndMaybeExecute(
   });
 
   const execution = await executeAndSettle(ctx.deps, {
+    gasPurpose,
+    strategyId: BigInt(plan.pinnedVersion.onchainStrategyId),
     portfolioId: due.portfolioId,
     account: due.account,
     sessionKey,
@@ -2329,6 +2385,16 @@ async function decideAndMaybeExecute(
     valuationAssets,
     idempotencyKey,
   });
+  if (execution.errorCode === 'GAS_BUDGET_EXCEEDED') {
+    const nextDay = execution.budgetResetAt === undefined ? new Date(ctx.now) : new Date(execution.budgetResetAt);
+    if (execution.budgetResetAt === undefined) nextDay.setUTCHours(24, 0, 0, 0);
+    try {
+      await ctx.deps.query(SQL_ADVANCE_CLAIMED, [[due.portfolioId], [nextDay.toISOString()]]);
+      return { ...withPlan, execution, outcome: 'blocked', nextRunAt: nextDay, reason: '[GAS_BUDGET_EXCEEDED] 普通操作每日 gas／美元預算不足，延至下一個 UTC 日' };
+    } catch {
+      return { ...withPlan, execution, outcome: 'blocked', reason: '[GAS_BUDGET_EXCEEDED] 普通操作預算不足；隔日排程寫回失敗，本輪不送交易' };
+    }
+  }
 
   // 落地後再記一張 —— **重新讀鏈**，不沿用送出前的觀測：這一張的全部意義就是「交易真的改變了什麼」。
   // 只有真的上鏈（success / reverted）才有 after；送出失敗（error）時鏈上沒變，寫一張相同的只是噪音。
@@ -2483,6 +2549,8 @@ export async function readRebalanceReceipt(input: ReconcileInput, reader: {
 async function executeAndSettle(
   deps: ResolvedDeps,
   args: {
+    gasPurpose: 'ordinary' | 'exit';
+    strategyId: bigint;
     portfolioId: number;
     account: Address;
     sessionKey: SessionKeyRef;
@@ -2505,6 +2573,8 @@ async function executeAndSettle(
 
   try {
     const outcome = await deps.executeRebalance({
+      gasPurpose: args.gasPurpose,
+      strategyId: args.strategyId,
       portfolioId: args.portfolioId,
       account: args.account,
       sessionKey: args.sessionKey,
@@ -2545,6 +2615,8 @@ async function executeAndSettle(
     const message = oneLine(error);
     const unknown = sending || (received !== null && received.status !== 'error');
     const outcome: ExecutionOutcome = { status: unknown ? 'unknown' : 'error',
+      ...(error instanceof AppError ? { errorCode: error.code } : {}),
+      ...(error instanceof GasBudgetExceededError ? { budgetResetAt: error.resetAt } : {}),
       userOpHash: received?.userOpHash ?? submitted.userOpHash ?? null,
       txHash: received?.txHash ?? submitted.txHash ?? null, gasUsed: received?.gasUsed ?? null, error: message,
       ...(failure === null ? {} : { priceSourceFailure: failure }) };

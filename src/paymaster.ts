@@ -6,13 +6,14 @@ import { KernelV3_3AccountAbi } from '@zerodev/sdk';
 import { PolicyFlags } from '@zerodev/permissions';
 import { CallPolicyVersion, toCallPolicy, toGasPolicy, toPolicyId, toTimestampPolicy } from '@zerodev/permissions/policies';
 import { toEmptyECDSASigner, toSignerId } from '@zerodev/permissions/signers';
-import type { Address, Hex } from 'viem';
+import type { Address, Hex, PublicClient } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import type { GetPaymasterDataParameters, PaymasterActions } from 'viem/account-abstraction';
 import { EXECUTOR_ABI, EXECUTOR_SELECTOR, REGISTRY_ABI } from './chain.js';
 import { KERNEL_V3_3_ADDRESSES } from './addresses.js';
-import { loadPaymasterConfig } from './config.js';
-import type { PaymasterConfig } from './config.js';
+import { loadPaymasterConfig, loadTradingConfig } from './config.js';
+import type { PaymasterConfig, TradingConfig } from './config.js';
+import type { PoolClient } from 'pg';
 import { query, withTransaction } from './db.js';
 import { AppError } from './errors.js';
 import { TESTNET_97, testnetAssets } from './testnet-profile.js';
@@ -25,7 +26,23 @@ export type PackedSponsorOperation = {
 export type Reservation = {
   hash: Hex; op: PackedSponsorOperation; config: PaymasterConfig; validUntil: number;
   verificationGas: bigint; callGas: bigint; maxFee: bigint; gasLimit: bigint; maxCostWei: bigint;
+  budget: GasBudgetRequest;
 };
+export type GasPurpose = 'ordinary' | 'setup' | 'exit';
+export type GasBudgetRequest = {
+  executionKey: string; chainId: number; account: Address; purpose: GasPurpose;
+  /** nativePrice / 10^priceDecimals is USD per BNB; omitted decimals means E8. */
+  gasLimit: bigint; maxFeePerGas: bigint; nativePrice: bigint; priceDecimals?: number; priceSource: string;
+};
+export type BudgetContext = Pick<GasBudgetRequest, 'purpose' | 'nativePrice' | 'priceDecimals' | 'priceSource'>;
+/** The DB's pinned reservation day controls backoff, including transactions spanning midnight. */
+export class GasBudgetExceededError extends AppError {
+  readonly resetAt: string;
+  constructor(day: string) {
+    super(429, 'GAS_BUDGET_EXCEEDED', 'ordinary gas budget exceeded');
+    this.resetAt = new Date(new Date(`${day}T00:00:00.000Z`).getTime() + 86400000).toISOString();
+  }
+}
 type Query = (sql: string, params?: readonly unknown[]) => Promise<{ rows: unknown[] }>;
 export type PaymasterDeps = {
   config?: PaymasterConfig | null;
@@ -33,6 +50,9 @@ export type PaymasterDeps = {
   query?: Query;
   checkChain?: (op: PackedSponsorOperation, config: PaymasterConfig) => Promise<void>;
   reserve?: (request: Reservation) => Promise<void>;
+  readBudgetContext?: (op: PackedSponsorOperation, config: PaymasterConfig) => Promise<BudgetContext>;
+  /** Internal scheduler evidence, bound to the exact canonical Kernel calldata. Never request input. */
+  exitCallData?: Hex;
 };
 export const KERNEL_EXECUTE_ABI = parseAbi(['function execute(bytes32 execMode,bytes executionCalldata) payable']);
 const CLAIM_ABI = parseAbi(['function claim(uint256 amount)']);
@@ -188,6 +208,161 @@ function gasCost(op: PackedSponsorOperation, c: PaymasterConfig) {
   return { verificationGas, callGas, maxFee, gasLimit, maxCostWei: gasLimit * maxFee };
 }
 
+/** Funding-independent execution identity: changing price, paymaster or gas bounds cannot create a new charge. */
+export function gasExecutionKey(chainId: number, op: Pick<PackedSponsorOperation, 'sender' | 'nonce' | 'initCode' | 'callData'>): string {
+  return keccak256(encodeAbiParameters([{ type: 'uint256' }, { type: 'address' }, { type: 'uint256' }, { type: 'bytes32' }, { type: 'bytes32' }],
+    [BigInt(chainId), op.sender, op.nonce, keccak256(op.initCode), keccak256(op.callData)]));
+}
+const BUDGET_ORACLE_ABI = parseAbi([
+  'function oracle() view returns(address)', 'function numeraire() view returns(address)',
+  'function previewSwap(address,address,uint256) view returns(uint256,uint256)',
+  'function balanceOf(address) view returns(uint256)',
+]);
+
+/** All reads share a fresh block. The price is the planner's WBNB/USDT oracle, never an external API. */
+export async function readNativeBudgetPrice(client: PublicClient, executor: Address, chainId: number): Promise<Pick<BudgetContext, 'nativePrice' | 'priceDecimals' | 'priceSource'>> {
+  try {
+    const blockNumber = await client.getBlockNumber({ cacheTime: 0 });
+    const [oracle, numeraire] = await Promise.all([
+      client.readContract({ address: executor, abi: BUDGET_ORACLE_ABI, functionName: 'oracle', blockNumber }),
+      client.readContract({ address: executor, abi: BUDGET_ORACLE_ABI, functionName: 'numeraire', blockNumber }),
+    ]);
+    const wbnb = chainId === 97 ? testnetAssets().find((asset) => asset.symbol === 'WBNB')?.address : '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c';
+    if (!wbnb) throw rejected('GAS_BUDGET_PRICE_UNAVAILABLE', 503);
+    const [quoted, floor] = await client.readContract({ address: oracle, abi: BUDGET_ORACLE_ABI, functionName: 'previewSwap', args: [wbnb, numeraire, 10n ** 18n], blockNumber });
+    const decimals = await client.readContract({ address: numeraire, abi: parseAbi(['function decimals() view returns(uint8)']), functionName: 'decimals', blockNumber });
+    if (decimals > 36 || quoted <= 0n || floor <= 0n) throw rejected('GAS_BUDGET_PRICE_UNAVAILABLE', 503);
+    return { nativePrice: quoted, priceDecimals: decimals, priceSource: `oracle:${chainId}:${oracle.toLowerCase()}:block:${blockNumber}` };
+  } catch { throw rejected('GAS_BUDGET_PRICE_UNAVAILABLE', 503); }
+}
+
+/** Retries retain the original price, source and purpose, even across UTC days or restarts. */
+export async function existingBudgetContext(executionKey: string): Promise<BudgetContext | null> {
+  try {
+    const result = await query<{ native_price_usd: string; price_source: string; purpose: GasPurpose }>(
+      'select native_price_usd::text,price_source,purpose from gas_budget_reservations where execution_key=$1', [executionKey]);
+    const row = result.rows[0];
+    if (row === undefined) return null;
+    if (!/^\d+(?:\.\d+)?$/.test(row.native_price_usd)) throw rejected('GAS_BUDGET_INVALID', 503);
+    const [whole, fractional = ''] = row.native_price_usd.split('.');
+    return { nativePrice: BigInt((whole ?? '') + fractional), priceDecimals: fractional.length, priceSource: row.price_source, purpose: row.purpose };
+  } catch { throw rejected('GAS_BUDGET_STORAGE_UNAVAILABLE', 503); }
+}
+
+async function readBudgetContext(op: PackedSponsorOperation, c: PaymasterConfig): Promise<BudgetContext> {
+  const previous = await existingBudgetContext(gasExecutionKey(c.chainId, op));
+  if (previous !== null) return previous;
+  const client = rpc(c);
+  const price = await readNativeBudgetPrice(client, c.executor, c.chainId);
+  const calls = sponsoredCalls(op);
+  const setup = calls.every((call) => call.callData.startsWith(toFunctionSelector('approve(address,uint256)')) || isAddressEqual(call.target, c.registry));
+  // Public requests get an exit exemption only when every strategy token balance is fully sold/transferred.
+  // A capped close is authorized through the internal scheduler evidence below instead.
+  const tokenCalls = calls.every((call) => call.callData.startsWith(toFunctionSelector('transfer(address,uint256)')));
+  const rebalance = calls.length === 1 && calls[0] !== undefined && isAddressEqual(calls[0].target, c.executor)
+    ? decodeFunctionData({ abi: EXECUTOR_ABI, data: calls[0].callData }) : null;
+  const priorSetup = setup ? await query("select execution_key from gas_budget_reservations where chain_id=$1 and account=$2 and purpose='setup' and state<>'failed'", [c.chainId, op.sender]) : null;
+  let purpose: GasPurpose = setup && priorSetup?.rows.length === 0 ? 'setup' : 'ordinary';
+  if (tokenCalls || rebalance?.functionName === 'executeRebalance') {
+    const blockNumber = await client.getBlockNumber({ cacheTime: 0 });
+    const numeraire = await client.readContract({ address: c.executor, abi: BUDGET_ORACLE_ABI, functionName: 'numeraire', blockNumber });
+    const enrollment = await client.readContract({ address: c.registry, abi: REGISTRY_ABI, functionName: 'enrollments', args: [op.sender], blockNumber });
+    const version = await client.readContract({ address: c.registry,
+      abi: parseAbi(['function version(uint256,uint16) view returns ((address[] assets,uint16[] weightsBps,bytes32 scheduleHash,uint64 activeAt))']),
+      functionName: 'version', args: [enrollment[0], enrollment[1]], blockNumber });
+    const assets = version.assets;
+    const moved = new Map<string, bigint>();
+    if (tokenCalls) {
+      for (const call of calls) {
+        const decoded = decodeFunctionData({ abi: TOKEN_ABI, data: call.callData });
+        if (decoded.functionName !== 'transfer') throw rejected('PAYMASTER_CALL_FORBIDDEN', 403);
+        moved.set(call.target.toLowerCase(), (moved.get(call.target.toLowerCase()) ?? 0n) + decoded.args[1]);
+      }
+    } else if (rebalance?.functionName === 'executeRebalance' && rebalance.args[1].every((step) => isAddressEqual(step.tokenOut, numeraire))) {
+      for (const step of rebalance.args[1]) moved.set(step.tokenIn.toLowerCase(), (moved.get(step.tokenIn.toLowerCase()) ?? 0n) + step.amountIn);
+    }
+    if (moved.size > 0 && assets.length > 0) {
+      let full = true;
+      if (!tokenCalls && [...moved.keys()].some((asset) => !assets.some((allowed) => allowed.toLowerCase() === asset))) full = false;
+      const checkedAssets = new Set([...assets, ...(tokenCalls ? calls.map((call) => call.target) : [])]);
+      const matches = await Promise.all([...checkedAssets].map(async (asset) => {
+        if (!tokenCalls && isAddressEqual(asset, numeraire)) return true;
+        const balance = await client.readContract({ address: asset, abi: BUDGET_ORACLE_ABI, functionName: 'balanceOf', args: [op.sender], blockNumber });
+        return (moved.get(asset.toLowerCase()) ?? 0n) === balance;
+      }));
+      if (!matches.every(Boolean)) full = false;
+      if (full) purpose = 'exit';
+    }
+  }
+  return { ...price, purpose };
+}
+
+function decimalE8(value: bigint): string {
+  return `${value / 100000000n}.${(value % 100000000n).toString().padStart(8, '0')}`;
+}
+function priceDecimal(r: GasBudgetRequest): string {
+  const decimals = r.priceDecimals ?? 8;
+  if (!Number.isSafeInteger(decimals) || decimals < 0 || decimals > 36) throw rejected('GAS_BUDGET_INVALID', 503);
+  const scale = 10n ** BigInt(decimals);
+  return decimals === 0 ? r.nativePrice.toString() : `${r.nativePrice / scale}.${(r.nativePrice % scale).toString().padStart(decimals, '0')}`;
+}
+type BudgetClient = Pick<PoolClient, 'query'>;
+async function reserveBudgetOnClient(r: GasBudgetRequest, client: BudgetClient, day: string, policy: TradingConfig): Promise<void> {
+  if (!r.executionKey.trim() || !/^0x[0-9a-f]{40}$/.test(r.account) || r.gasLimit < 0n || r.maxFeePerGas < 0n || r.nativePrice <= 0n || !r.priceSource.trim()) throw rejected('GAS_BUDGET_INVALID', 503);
+  await client.query("select pg_advisory_xact_lock(hashtextextended('gas_budget_reservations:' || $1::bigint::text || ':' || $2::text || ':' || to_char($3::date,'YYYY-MM-DD'),0))", [r.chainId, r.account, day]);
+  const params = [r.executionKey, r.chainId, r.account, r.purpose, r.gasLimit.toString(), r.maxFeePerGas.toString(), priceDecimal(r), r.priceSource];
+  const previous = await client.query<{ matches: boolean }>(`select (chain_id=$2 and account=$3 and purpose=$4 and gas_limit=$5::numeric and max_fee_per_gas=$6::numeric
+    and native_price_usd=$7::numeric and price_source=$8) as matches from gas_budget_reservations where execution_key=$1`, params);
+  if (previous.rows.length > 0) {
+    if (previous.rows[0]?.matches !== true) throw rejected('GAS_BUDGET_CONFLICT', 409);
+    return;
+  }
+  if (r.purpose === 'ordinary') {
+    const usage = await client.query<{ allowed: boolean }>(`select coalesce(sum(gas_limit),0)+$4::numeric <= $5::numeric and
+      coalesce(sum(max_cost_usd),0)+$6::numeric <= $7::numeric as allowed from gas_budget_reservations
+      where chain_id=$1 and account=$2 and utc_day=$3::date and purpose='ordinary'`,
+      [r.chainId, r.account, day, r.gasLimit.toString(), policy.dailyGas.toString(),
+        decimalE8((r.gasLimit * r.maxFeePerGas * r.nativePrice * 100000000n + 10n ** BigInt(18 + (r.priceDecimals ?? 8)) - 1n) / 10n ** BigInt(18 + (r.priceDecimals ?? 8))), decimalE8(policy.dailyUsdE8)]);
+    const allowed = usage.rows[0]?.allowed;
+    if (typeof allowed !== 'boolean') throw rejected('GAS_BUDGET_STORAGE_UNAVAILABLE', 503);
+    if (!allowed) throw new GasBudgetExceededError(day);
+  }
+  await client.query(`insert into gas_budget_reservations(execution_key,chain_id,account,purpose,gas_limit,max_fee_per_gas,native_price_usd,price_source)
+    values($1,$2,$3,$4,$5,$6,$7,$8)`, params);
+}
+
+export async function reserveGasBudget(r: GasBudgetRequest, transaction: typeof withTransaction = withTransaction, policy = loadTradingConfig()): Promise<void> {
+  try {
+    await transaction(async (client) => {
+      await client.query('set transaction isolation level read committed');
+      await client.query("select set_config('statement_timeout',$1,true),set_config('lock_timeout',$1,true)", [String(policy.timeoutMs)]);
+      const pinned = await client.query<{ day: string }>("select to_char(transaction_timestamp() at time zone 'UTC','YYYY-MM-DD') as day");
+      const day = pinned.rows[0]?.day;
+      if (!day) throw new Error('missing UTC day');
+      await reserveBudgetOnClient(r, client, day, policy);
+    });
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw rejected('GAS_BUDGET_STORAGE_UNAVAILABLE', 503);
+  }
+}
+
+/** Only verified receipts may use confirmed/failed. A timeout remains unknown, with its full charge. */
+export async function settleGasBudget(executionKey: string, state: 'submitted' | 'confirmed' | 'failed' | 'unknown'): Promise<void> {
+  try {
+    await withTransaction(async (client) => {
+      await client.query('set transaction isolation level read committed');
+      await client.query("select set_config('statement_timeout',$1,true),set_config('lock_timeout',$1,true)", [String(loadTradingConfig().timeoutMs)]);
+      const result = await client.query<{ chain_id: string; account: string; day: string }>(
+        "select chain_id::text,account,to_char(utc_day,'YYYY-MM-DD') as day from gas_budget_reservations where execution_key=$1", [executionKey]);
+      const row = result.rows[0];
+      if (!row) throw new Error('missing reservation');
+      await client.query("select pg_advisory_xact_lock(hashtextextended('gas_budget_reservations:' || $1::bigint::text || ':' || $2::text || ':' || to_char($3::date,'YYYY-MM-DD'),0))", [row.chain_id, row.account, row.day]);
+      await client.query("update gas_budget_reservations set state=$2,updated_at=greatest(updated_at,clock_timestamp()) where execution_key=$1 and state in ('reserved','submitted','unknown')", [executionKey, state]);
+    });
+  } catch { throw rejected('GAS_BUDGET_STORAGE_UNAVAILABLE', 503); }
+}
+
 /** Every state counts. Separate chain/day lock statement precedes the fresh aggregate snapshot (db 0027). */
 export async function reserveSponsorship(r: Reservation, transaction: typeof withTransaction = withTransaction): Promise<void> {
   const c = r.config;
@@ -199,6 +374,8 @@ export async function reserveSponsorship(r: Reservation, transaction: typeof wit
       const day = pinned.rows[0]?.day;
       if (!day) throw new Error('missing UTC day');
       await client.query("select pg_advisory_xact_lock(hashtextextended('paymaster_sponsorships:' || $1::bigint::text || ':' || to_char($2::date, 'YYYY-MM-DD'), 0))", [c.chainId, day]);
+      if (r.budget.chainId !== c.chainId || !isAddressEqual(r.budget.account, r.op.sender) || r.budget.gasLimit !== r.gasLimit || r.budget.maxFeePerGas !== r.maxFee) throw rejected('GAS_BUDGET_CONFLICT', 409);
+      await reserveBudgetOnClient(r.budget, client, day, loadTradingConfig());
       const previous = await client.query<{ matches: boolean }>(`select (chain_id = $2 and paymaster = $3 and sender = $4 and
         verification_gas_limit = $5::numeric and call_gas_limit = $6::numeric and pre_verification_gas = $7::numeric and
         paymaster_verification_gas_limit = $8::numeric and paymaster_post_op_gas_limit = $9::numeric and max_fee_per_gas = $10::numeric and
@@ -215,8 +392,9 @@ export async function reserveSponsorship(r: Reservation, transaction: typeof wit
           from paymaster_sponsorships where chain_id = $1 and utc_day = $2::date`, [c.chainId, day, r.op.sender]);
       const u = usage.rows[0];
       if (!u) throw new Error('missing usage');
-      const budgets = [[BigInt(u.account_count), 1n, c.accountDailyCount], [BigInt(u.account_gas), r.gasLimit, c.accountDailyGas],
-        [BigInt(u.account_wei), r.maxCostWei, c.accountDailyWei], [BigInt(u.gas), r.gasLimit, c.siteDailyGas], [BigInt(u.wei), r.maxCostWei, c.siteDailyWei]] as const;
+      const accountBudgets: (readonly [bigint, bigint, bigint])[] = r.budget.purpose !== 'ordinary' ? [] :
+        [[BigInt(u.account_count), 1n, c.accountDailyCount], [BigInt(u.account_gas), r.gasLimit, c.accountDailyGas], [BigInt(u.account_wei), r.maxCostWei, c.accountDailyWei]];
+      const budgets: (readonly [bigint, bigint, bigint])[] = [...accountBudgets, [BigInt(u.gas), r.gasLimit, c.siteDailyGas], [BigInt(u.wei), r.maxCostWei, c.siteDailyWei]];
       if (budgets.some(([used, amount, cap]) => cap === 0n || used + amount > cap)) throw rejected('PAYMASTER_QUOTA_EXCEEDED', 429);
       await client.query(`insert into paymaster_sponsorships (user_op_hash,chain_id,paymaster,sender,verification_gas_limit,call_gas_limit,
         pre_verification_gas,paymaster_verification_gas_limit,paymaster_post_op_gas_limit,max_fee_per_gas,valid_until)
@@ -310,7 +488,19 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
         [{ type: 'address' }, { type: 'uint256' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'uint256' }, { type: 'bytes32' }, { type: 'bytes32' }],
         [op.sender, op.nonce, keccak256(op.initCode), keccak256(op.callData), op.accountGasLimits, op.preVerificationGas, op.gasFees, keccak256(paymasterAndData)]));
       const userOpHash = keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'address' }, { type: 'uint256' }], [packedHash, KERNEL_V3_3_ADDRESSES.entryPointV07, BigInt(c.chainId)]));
-      await (deps.reserve ?? reserveSponsorship)({ hash: userOpHash, op, config: c, validUntil, ...gasCost(op, c) });
+      const context = await bounded((deps.readBudgetContext ?? readBudgetContext)(op, c), c.timeoutMs);
+      if (deps.exitCallData !== undefined && deps.exitCallData.toLowerCase() === op.callData.toLowerCase()) {
+        const executorCall = calls.length === 1 ? calls[0] : undefined;
+        const decoded = executorCall !== undefined && isAddressEqual(executorCall.target, c.executor)
+          ? decodeFunctionData({ abi: EXECUTOR_ABI, data: executorCall.callData }) : null;
+        const numeraire = c.chainId === 97 ? TESTNET_97.contracts.usdt : '0x55d398326f99059ff775485246999027b3197955';
+        if (decoded?.functionName !== 'executeRebalance' || !decoded.args[1].every((step) => isAddressEqual(step.tokenOut, numeraire))) throw rejected('GAS_BUDGET_INVALID', 503);
+        context.purpose = 'exit';
+      }
+      const cost = gasCost(op, c);
+      await (deps.reserve ?? reserveSponsorship)({ hash: userOpHash, op, config: c, validUntil, ...cost,
+        budget: { executionKey: gasExecutionKey(c.chainId, op), chainId: c.chainId, account: op.sender,
+          gasLimit: cost.gasLimit, maxFeePerGas: cost.maxFee, ...context } });
       if ((deps.now ?? (() => Math.floor(Date.now() / 1000)))() >= validUntil) throw rejected('PAYMASTER_EXPIRED');
       return { paymasterAndData, paymaster: c.address, paymasterData, paymasterVerificationGasLimit: c.verificationGasLimit,
         paymasterPostOpGasLimit: c.postOpGasLimit, validUntil, validAfter: 0, userOpHash };
@@ -331,7 +521,8 @@ export function estimationPaymaster(hooks: ReturnType<typeof schedulerPaymaster>
 
 /** viem RPC errors contain the entire UserOp. Sponsored send/estimate boundaries must not log them. */
 export function paymasterExecutionError(error: unknown): AppError {
-  return error instanceof AppError && error.code.startsWith('PAYMASTER_')
+  if (error instanceof GasBudgetExceededError) return error;
+  return error instanceof AppError && (error.code.startsWith('PAYMASTER_') || error.code.startsWith('GAS_BUDGET_'))
     ? rejected(error.code, error.status) : rejected('PAYMASTER_SUBMISSION_UNAVAILABLE', 503);
 }
 

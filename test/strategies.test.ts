@@ -417,7 +417,7 @@ test('POST /strategies/:id/versions returns 201 with the created version record'
 
       assert.equal(response.status, 201);
       assert.match(response.headers.get('content-type') ?? '', /^application\/json/);
-      assert.deepEqual(await response.json(), published);
+      assert.deepEqual(await response.json(), { ...published, minDepositUsdtWei: '50000000000000000000' });
       // The route hands the parsed body to publishVersion untouched (id from the path), and the
       // provider is the session wallet, never a body field.
       assert.deepEqual(calls, [

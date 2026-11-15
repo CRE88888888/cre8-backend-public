@@ -111,6 +111,7 @@ async function loginToken(baseUrl: string): Promise<string> {
 
 function samplePortfolio(id = 1): Portfolio {
   return {
+    minDepositUsdtWei: '50000000000000000000',
     id,
     userId: ROUTE_WALLET.address.toLowerCase(),
     strategyId: 1,

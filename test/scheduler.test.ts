@@ -11,6 +11,8 @@ import type { GetUserOperationReturnType, UserOperationReceipt } from 'viem/acco
 import { EXECUTOR_PAUSE_ABI } from '../src/chain.js';
 import type { Address, Hex, PublicClient } from 'viem';
 import { closePool, query } from '../src/db.js';
+import { AppError } from '../src/errors.js';
+import { GasBudgetExceededError } from '../src/paymaster.js';
 import { singlePortfolioClaim } from '../src/operator.js';
 import { TWAP_PRICE_SOURCE } from '../src/positions.js';
 import { DEFAULT_DEADLINE_SECONDS as PLANNER_DEFAULT_DEADLINE_SECONDS, MAX_FLOOR_WORSENING_BPS, refreshFloors, amountOutMinWithBuffer,
@@ -545,6 +547,8 @@ function stubChain(overrides: Partial<StubChain> = {}): StubChain {
 function deps(db: StubDb, chain: StubChain, extra: SchedulerDeps = {}): SchedulerDeps {
   return {
     ...stubPortfolioLock(db),
+    checkTradingMinimums: async () => null,
+    hasBoughtBefore: async () => true,
     withTransaction: stubWithTransaction(db),
     query: stubQuery(db),
     chainId: TEST_CHAIN_ID,
@@ -592,6 +596,60 @@ function deps(db: StubDb, chain: StubChain, extra: SchedulerDeps = {}): Schedule
     ...extra,
   };
 }
+
+test('#75 first buy waits below the 80 USDT minimum; equality and later top-ups pass', async () => {
+  for (const [value, boughtBefore, expected] of [[7999999999n, false, 'blocked'], [8000000000n, false, 'ready-dry-run'], [100000000n, true, 'ready-dry-run']] as const) {
+    const plan = stubPlan();
+    assert.ok(plan.report);
+    plan.report.totalUsdE8 = value;
+    plan.targets = [{ asset: TOKEN_IN, weightBps: 625, symbol: 'WBNB' }, { asset: TOKEN_OUT, weightBps: 9375, symbol: 'USDT' }];
+    const chain = stubChain({ plan, rebalance: readyPlan([step({ tokenIn: TOKEN_OUT, tokenOut: TOKEN_IN })]) });
+    const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+    const round = await runSchedulerOnce({}, deps(db, chain, { hasBoughtBefore: async () => boughtBefore }));
+    assert.equal(round.results[0]?.outcome, expected);
+    if (expected === 'blocked') assert.match(round.results[0]?.reason ?? '', /BELOW_MIN_DEPOSIT/);
+    assert.equal(chain.executeCalls.length, 0);
+  }
+});
+
+test('#75 first-buy history RPC failure blocks; exit never reads history or ordinary thresholds', async () => {
+  const plan = stubPlan(); assert.ok(plan.report); plan.report.totalUsdE8 = 1n;
+  const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+  const chain = stubChain({ plan, rebalance: readyPlan([step({ tokenIn: TOKEN_OUT, tokenOut: TOKEN_IN })]) });
+  const round = await runSchedulerOnce({}, deps(db, chain, { hasBoughtBefore: async () => { throw new Error('private RPC token'); } }));
+  assert.match(round.results[0]?.reason ?? '', /MIN_DEPOSIT_UNAVAILABLE/);
+  assert.doesNotMatch(round.results[0]?.reason ?? '', /private RPC token/);
+  chain.rebalance = { ...readyPlan(), purpose: 'exit' };
+  const exit = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(db, chain, {
+    hasBoughtBefore: async () => { assert.fail('exit must not read first-buy history'); },
+    checkTradingMinimums: async (_steps, purpose) => { assert.equal(purpose, 'exit'); return null; },
+  }));
+  assert.equal(exit.results[0]?.outcome, 'executed');
+  assert.equal(chain.executeCalls[0]?.gasPurpose, 'exit');
+});
+
+test('#75 exhausted ordinary budget defers until the next UTC day without broadcasting', async () => {
+  const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+  const chain = stubChain();
+  const now = new Date('2026-11-15T23:59:59.999Z');
+  const round = await runSchedulerOnce({ dryRun: false, now }, deps(db, chain, { executeRebalance: async () => {
+    throw new AppError(429, 'GAS_BUDGET_EXCEEDED', 'ordinary gas budget exceeded');
+  } }));
+  assert.equal(round.results[0]?.outcome, 'blocked');
+  assert.equal(round.results[0]?.nextRunAt.toISOString(), '2026-11-16T00:00:00.000Z');
+  assert.equal(db.portfolios[0]?.nextRunAt?.toISOString(), '2026-11-16T00:00:00.000Z');
+  assert.equal(db.operations[0]?.state, 'failed');
+  assert.equal(chain.executeCalls.length, 0);
+});
+
+test('#75 crossing midnight uses the DB reservation day, not the scheduler round start', async () => {
+  const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+  const chain = stubChain();
+  const round = await runSchedulerOnce({ dryRun: false, now: new Date('2026-11-15T23:59:59Z') }, deps(db, chain, {
+    executeRebalance: async () => { throw new GasBudgetExceededError('2026-11-16'); },
+  }));
+  assert.equal(round.results[0]?.nextRunAt.toISOString(), '2026-11-17T00:00:00.000Z');
+});
 
 const portfolioLocks = new WeakMap<StubDb, Set<number>>();
 function stubPortfolioLock(db: StubDb) {
@@ -2488,6 +2546,7 @@ test('認領（真的 Postgres）：paused／idle／未到期不被認領，NULL
   let sends = 0;
   const keys = stubQuery(stubDb({ sessionKeys: [sessionKey({ portfolioId: due.id })] }));
   const options: SchedulerDeps = {
+    checkTradingMinimums: async () => null,
     withTransaction: singlePortfolioClaim(due.id),
     readRebalanceNonce: async () => (1n << 256n) - 1n,
     readGlobalPaused: async () => false,
@@ -3218,7 +3277,7 @@ test('#34 預設送出前路徑每輪重讀 effectiveFeeBps：0→25→300、無
       const query=async(sql)=>({rows:sql.includes('for update of p') ? [{portfolio_id:String(p.id),strategy_id:String(p.strategyId),address:p.account,account_type:p.accountType,schedule:p.schedule}]
         : sql.includes('from session_keys k') ? [{key_ref:k.keyRef,owner:k.owner,permissions:{permissionId:k.permissionId,sessionKeyAddress:k.sessionKeyAddress,timestamp:{validUntil:k.validUntil}}}] : []});
       for(let i=0;i<5;i++){
-        const r=await runSchedulerOnce({}, {query,withTransaction:async fn=>fn({query}),chainId:${TEST_CHAIN_ID},executor:${JSON.stringify(EXECUTOR)},
+        const r=await runSchedulerOnce({}, {query,withTransaction:async fn=>fn({query}),chainId:${TEST_CHAIN_ID},executor:${JSON.stringify(EXECUTOR)},checkTradingMinimums:async()=>null,
           planPortfolio:async()=>plan,planRebalance:async()=>rebalance,readPermissionConfig:async()=>({signer:${JSON.stringify(SIGNER_CONTRACT)},policyCount:3}),
           deriveSessionKeyAddress:async()=>k.sessionKeyAddress,readAllowance:async()=>10n**20n,readBalance:async()=>10n**20n,log:()=>{}});
         console.log('FLOOR_RESULT '+r.results[0].outcome+' '+(r.results[0].plan?.steps[0]?.amountOutMin ?? 'none'));

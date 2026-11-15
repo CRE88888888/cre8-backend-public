@@ -22,6 +22,7 @@ import {
   buildRoutedStep,
   refreshFloors,
   readMaxLegUsdE8,
+  minimumDepositUsdtWei, tradeMinimumReason, checkBuyFeeReserve, checkTradeMinimums,
   amountOutMinWithBuffer,} from '../src/rebalance-plan.js';
 import type { PlanRebalanceArgs, PlannedStep, RebalancePlan } from '../src/rebalance-plan.js';
 import { DEFAULT_MAX_IMPACT_BPS, resolveMaxImpactBps } from '../src/rebalance-plan.js';
@@ -29,6 +30,8 @@ import { capAmountInForImpact, estimateImpact } from '../src/impact.js';
 import type { PoolImpactState } from '../src/impact.js';
 import { twapPriceInUsdt } from '../src/pricing.js';
 import { validateAllocation } from '../src/strategies.js';
+import { loadTradingConfig } from '../src/config.js';
+import { readNativeBudgetPrice } from '../src/paymaster.js';
 
 /**
  * 規劃器的測試。三種結果（noop / blocked / ready）各自的**理由**與**數字**都要釘死：
@@ -85,6 +88,7 @@ type StubQuote = { minimum: bigint; quoted?: bigint };
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000' as Address;
 
 type StubChain = {
+  minBatchFee?: bigint;
   buyAllowance?: unknown;
   executorNumeraire?: unknown;
   calls: ChainCall[];
@@ -171,6 +175,16 @@ function stubClient(chain: StubChain): PublicClient {
       const target = args.address.toLowerCase();
       if (args.functionName === 'venues') return [1, PANCAKE_UR];
       if (target === EXECUTOR.toLowerCase() || target === EXECUTOR_MULTI.toLowerCase()) {
+        if (args.functionName === 'minBatchFee') return chain.minBatchFee ?? 0n;
+        if (args.functionName === 'minFeeTopUp') {
+          const notional = args.args?.[1];
+          assert.equal(typeof notional, 'bigint');
+          const volume = typeof notional === 'bigint' ? notional : 0n;
+          const min = chain.minBatchFee ?? 0n;
+          const minimum = volume / 100n < min ? volume / 100n : min;
+          const proportional = volume * BigInt(chain.registry.feeBps) / 10000n;
+          return minimum > proportional ? minimum - proportional : 0n;
+        }
         if (args.functionName === 'numeraire') {
           if (chain.executorNumeraire instanceof Error) throw chain.executorNumeraire;
           return chain.executorNumeraire === undefined ? chain.oracle.token0 : chain.executorNumeraire;
@@ -248,6 +262,7 @@ function stubClient(chain: StubChain): PublicClient {
         }
         case 'effectiveFeeBps':
           return chain.registry.feeBps;
+        case 'decimals': return 18;
         default:
           throw new Error(`stub 沒有 ${args.functionName}`);
       }
@@ -358,6 +373,8 @@ function argsOf(
   // 四個必填欄位先解出來再展開剩下的：`drift` 沒給就用 computeDrift 當場算（通常是這樣）。
   const { holdings, targets, thresholdBps, drift: driftOverride, ...rest } = overrides;
   return {
+    // These fixtures isolate routing/impact arithmetic; #75 cases below exercise default trading minimums.
+    tradingConfig: loadTradingConfig({ MIN_STEP_USD_E8: '0', MIN_BATCH_USD_E8: '0' }),
     publicClient: stubClient(chain),
     maxLegUsdE8: new Map(targets.map((target) => [target.asset.toLowerCase(), null])),
     account: '0x2b082fadf8f3d620eaa242a9e36817af8640d042' as Address,
@@ -373,6 +390,50 @@ function argsOf(
     ...rest,
   };
 }
+
+test('#75 default batch minimum accepts exactly 50 and accumulates below 50', async () => {
+  for (const usd of [98n, 100n, 102n]) {
+    const chain = baseChain({ rate: RATE_WBNB_USDT });
+    const args = argsOf(chain, { holdings: [holding(WBNB, usd * 10n ** 15n, 18, PRICE_1000_USD), holding(USDT, 0n, 18, PRICE_1_USD)],
+      targets: targetsOf(WBNB, USDT), thresholdBps: 100, maxImpactBps: null, tradingConfig: loadTradingConfig({}) });
+    const plan = await planRebalance(args);
+    assert.equal(plan.kind, usd < 100n ? 'blocked' : 'ready');
+    if (plan.kind === 'blocked') assert.match(plan.reason, /BELOW_MIN_BATCH/);
+  }
+});
+
+test('#75 dropped sub-5 sale cannot fund a subsequent buy', async () => {
+  const chain = hubChain();
+  chain.rate = { rateE18: 10n ** 18n, slippageBps: 100 };
+  const plan = expectReady(await planRebalance(hubArgs(chain, {
+    holdings: [holding(WBNB, 10n * 10n ** 18n, 18, PRICE_1_USD), holding(USDT, 90n * 10n ** 18n, 18, PRICE_1_USD)],
+    targets: [{ asset: WBNB, weightBps: 600 }, { asset: TOKEN3, weightBps: 9400 }, { asset: USDT, weightBps: 0 }],
+    thresholdBps: 100, maxImpactBps: null, tradingConfig: loadTradingConfig({}),
+  })));
+  assert.equal(plan.steps.length, 1);
+  assert.equal(plan.steps[0]?.tokenIn.toLowerCase(), USDT);
+  assert.equal(plan.steps[0]?.amountIn, 90n * 10n ** 18n);
+  assert.match(plan.rationale, /BELOW_MIN_STEP/);
+});
+
+test('#75 buys reserve contract minimum-fee top-up before building the actual payload', async () => {
+  const chain = hubChain({ feeBps: 10 });
+  chain.rate = { rateE18: 10n ** 18n, slippageBps: 100 };
+  chain.minBatchFee = 3n * 10n ** 17n;
+  const plan = expectReady(await planRebalance(hubArgs(chain, {
+    holdings: [holding(USDT, 100n * 10n ** 18n, 18, PRICE_1_USD)], targets: targetsOf(WBNB, USDT, 10000),
+    thresholdBps: 100, maxImpactBps: null, tradingConfig: loadTradingConfig({}),
+  })));
+  assert.equal(plan.steps[0]?.amountIn, 9973n * 10n ** 16n);
+  const topup = chain.calls.find((call) => call.functionName === 'minFeeTopUp');
+  assert.deepEqual(topup?.args, [1n, 30n * 10n ** 18n]);
+  assert.equal(topup?.blockNumber, chain.block.number);
+  const step = plan.steps[0];
+  assert.ok(step);
+  const [, inputs] = decodeAbiParameters([{ type: 'bytes' }, { type: 'bytes[]' }], step.data);
+  const payload = inputs[0]; assert.ok(payload);
+  assert.equal(decodeAbiParameters(V3_INPUT_ABI, payload)[1], step.amountIn);
+});
 
 /** 手寫一份 DriftReport：只有「持倉算出來的漂移到不了那個數字」的邊界案例才用它。 */
 function craftedDrift(args: {
@@ -800,10 +861,10 @@ test('R5 塊時間落後牆鐘 14 分鐘（稀疏挖礦）→ deadline 仍然在
   // 14 分鐘。只用塊時間的話 deadline 就是「14 分鐘前 + deadlineSeconds」，簽下去就過期。
   const before = wallClockSeconds();
   chain.block.timestamp = before - 840n;
-  const after = wallClockSeconds();
   const plan = expectReady(
     await planRebalance(argsOf(chain, { holdings, targets: targetsOf(WBNB, USDT), thresholdBps: 100 })),
   );
+  const after = wallClockSeconds();
 
   assert.ok(plan.deadline > after, `deadline ${plan.deadline} 必須晚於牆鐘 ${after}：不然一送就 DeadlineExpired`);
   // 基準是牆鐘（牆鐘會走，所以是 before..after 的區間），不是那個已經過期的塊時間。
@@ -2854,4 +2915,118 @@ test('#54 rebuilt buys must also fit fresh cash plus prior net sell floors', asy
     // Quote-bound gross = floor(110 * 9950/10000) = 109; net after 100bps fee = 108.
     assert.equal(result.ok, cash + 108n >= 200n);
   }
+});
+
+
+const THRESHOLD_CASH = '0x55d398326f99059ff775485246999027b3197955';
+const THRESHOLD_ASSET = '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c';
+
+test('#75 minimum deposit includes the cash weight and rounds up exactly (50 / 80 / skew)', () => {
+  const policy = loadTradingConfig({});
+  assert.equal(minimumDepositUsdtWei([{ asset: THRESHOLD_CASH, weightBps: 9000 }, { asset: THRESHOLD_ASSET, weightBps: 1000 }], THRESHOLD_CASH, policy), 50n * 10n ** 18n);
+  const equal: TargetWeight[] = Array.from({ length: 15 }, (_, i) => ({ asset: `0x${(i + 1).toString(16).padStart(40, '0')}`, weightBps: 625 }));
+  assert.equal(minimumDepositUsdtWei([...equal, { asset: THRESHOLD_CASH, weightBps: 625 }], THRESHOLD_CASH, policy), 80n * 10n ** 18n);
+  const skew = minimumDepositUsdtWei([{ asset: THRESHOLD_ASSET, weightBps: 333 }, { asset: THRESHOLD_CASH, weightBps: 9667 }], THRESHOLD_CASH, policy);
+  assert.equal(skew, (5n * 10n ** 18n * 10000n + 332n) / 333n);
+  assert.throws(() => minimumDepositUsdtWei([{ asset: THRESHOLD_ASSET, weightBps: 0 }], THRESHOLD_CASH, policy));
+});
+
+test('#75 ordinary step/batch equality passes; zero and just below wait; exit dust is exempt', () => {
+  const policy = loadTradingConfig({});
+  for (const [legs, expected] of [
+    [[5n, 45n], null], [[50n], null], [[0n], 'BELOW_MIN_STEP'], [[4n, 46n], 'BELOW_MIN_STEP'], [[49n], 'BELOW_MIN_BATCH'],
+  ] as const) {
+    const nominal = legs.map((value) => value * 100000000n);
+    const reason = tradeMinimumReason(nominal, 'ordinary', policy);
+    if (expected === null) assert.equal(reason, null);
+    else assert.ok(reason?.includes(expected));
+    assert.equal(tradeMinimumReason(nominal, 'exit', policy), null);
+  }
+  const third = 50n * 10n ** 18n / 3n;
+  assert.equal(tradeMinimumReason([third, third, third + 2n], 'ordinary', policy, 18), null, 'sum before rounding: three fractional legs total exactly 50');
+  assert.match(tradeMinimumReason([third, third, third + 1n], 'ordinary', policy, 18) ?? '', /BELOW_MIN_BATCH/);
+});
+
+test('#75 configurable integer thresholds and budgets preserve zero; invalid settings never echo input', () => {
+  const config = loadTradingConfig({ MIN_STEP_USD_E8: '0', MIN_BATCH_USD_E8: '0', MIN_DEPOSIT_USD_E8: '0', ACCOUNT_DAILY_GAS: '0', ACCOUNT_DAILY_GAS_USD_E8: '0' });
+  assert.equal(config.dailyGas, 0n);
+  assert.equal(config.dailyUsdE8, 0n);
+  assert.equal(tradeMinimumReason([0n], 'ordinary', config), null);
+  for (const name of ['MIN_STEP_USD_E8', 'MIN_BATCH_USD_E8', 'MIN_DEPOSIT_USD_E8', 'ACCOUNT_DAILY_GAS', 'ACCOUNT_DAILY_GAS_USD_E8']) {
+    for (const value of ['-1', '1.5', 'secret-token']) assert.throws(() => loadTradingConfig({ [name]: value }), (error: unknown) => error instanceof Error && error.message.includes(name) && !error.message.includes(value));
+  }
+});
+
+function oracleFixture() {
+  const abi = parseAbi(['function oracle() view returns(address)', 'function numeraire() view returns(address)',
+    'function decimals() view returns(uint8)', 'function previewSwap(address,address,uint256) view returns(uint256,uint256)',
+    'function minBatchFee() view returns(uint256)', 'function minFeeTopUp(uint256,uint256) view returns(uint256)',
+    'function balanceOf(address) view returns(uint256)', 'function allowance(address,address) view returns(uint256)',
+    'function effectiveFeeBps(uint256) view returns(uint16)']);
+  const state = { fail: '', cash: 10027n * 10n ** 16n, allowance: 10027n * 10n ** 16n, calls: 0 };
+  const client = createPublicClient({ transport: custom({ request: async ({ method, params }) => {
+    if (method === 'eth_blockNumber') return '0x7b';
+    assert.equal(method, 'eth_call'); assert.ok(Array.isArray(params));
+    const call: unknown = params[0]; assert.ok(typeof call === 'object' && call !== null);
+    const data: unknown = Reflect.get(call, 'data'); assert.ok(typeof data === 'string' && isHex(data));
+    const decoded = decodeFunctionData({ abi, data });
+    state.calls++;
+    assert.equal(params[1], '0x7b', 'all price/funding reads must share the observation block');
+    if (state.fail === decoded.functionName) throw new Error('private RPC token');
+    switch (decoded.functionName) {
+      case 'oracle': case 'numeraire': return encodeFunctionResult({ abi, functionName: decoded.functionName, result: getAddress(THRESHOLD_CASH) });
+      case 'decimals': return encodeFunctionResult({ abi, functionName: 'decimals', result: 18 });
+      case 'minBatchFee': return encodeFunctionResult({ abi, functionName: 'minBatchFee', result: 3n * 10n ** 17n });
+      case 'minFeeTopUp': return encodeFunctionResult({ abi, functionName: 'minFeeTopUp', result: 27n * 10n ** 16n });
+      case 'effectiveFeeBps': return encodeFunctionResult({ abi, functionName: 'effectiveFeeBps', result: 10 });
+      case 'balanceOf': case 'allowance': return encodeFunctionResult({ abi, functionName: decoded.functionName, result: decoded.functionName === 'balanceOf' ? state.cash : state.allowance });
+      case 'previewSwap': {
+        const quoted = decoded.args[2] * 600n + 123456789n;
+        return encodeFunctionResult({ abi, functionName: 'previewSwap', result: [quoted, quoted * 99n / 100n] });
+      }
+    }
+  } }, { retryCount: 0 }) });
+  const step: PlannedStep = { tokenIn: getAddress(THRESHOLD_CASH), tokenOut: getAddress(THRESHOLD_ASSET), amountIn: 100n * 10n ** 18n,
+    amountOutMin: 1n, oracleFloor: 1n, venue: getAddress(THRESHOLD_CASH), data: '0x' };
+  return { state, client, step };
+}
+
+test('#75 gas valuation preserves every oracle decimal, records block/source; missing price/RPC fail closed', async () => {
+  const f = oracleFixture();
+  const price = await readNativeBudgetPrice(f.client, getAddress(THRESHOLD_CASH), 1337);
+  assert.equal(price.nativePrice, 600n * 10n ** 18n + 123456789n);
+  assert.equal(price.priceDecimals, 18);
+  assert.match(price.priceSource, /:block:123$/);
+  for (const failure of ['oracle', 'numeraire', 'previewSwap', 'decimals']) {
+    f.state.fail = failure;
+    await assert.rejects(readNativeBudgetPrice(f.client, getAddress(THRESHOLD_CASH), 1337), (error: unknown) => error instanceof Error && error.message.includes('GAS_BUDGET_PRICE_UNAVAILABLE') && !error.message.includes('private RPC token'));
+  }
+});
+
+test('#75 final buy funding includes minimum-fee balance AND aggregate allowance; equality passes, one wei below blocks', async () => {
+  const f = oracleFixture();
+  const args = { client: f.client, executor: getAddress(THRESHOLD_CASH), account: getAddress(THRESHOLD_ASSET), registry: getAddress(THRESHOLD_CASH),
+    strategyId: 1n, steps: [f.step], numeraire: getAddress(THRESHOLD_CASH), blockNumber: 123n };
+  await checkBuyFeeReserve(args);
+  f.state.cash--;
+  await assert.rejects(checkBuyFeeReserve(args), /MIN_FEE_RESERVE/);
+  f.state.cash++; f.state.allowance--;
+  await assert.rejects(checkBuyFeeReserve(args), /MIN_FEE_RESERVE/);
+  f.state.allowance++;
+  for (const failure of ['minBatchFee', 'minFeeTopUp', 'balanceOf', 'allowance', 'effectiveFeeBps']) {
+    f.state.fail = failure;
+    await assert.rejects(checkBuyFeeReserve(args), /MIN_FEE_RESERVE/);
+  }
+  const reads = f.state.calls;
+  await checkBuyFeeReserve({ ...args, steps: [{ ...f.step, tokenIn: f.step.tokenOut, tokenOut: f.step.tokenIn }] });
+  assert.equal(f.state.calls, reads, 'sales-only exit never waits for minimum-fee funding');
+});
+
+test('#75 ordinary oracle minimum validation fails closed; exit dust bypasses the reads', async () => {
+  const f = oracleFixture();
+  f.state.fail = 'oracle';
+  assert.match(await checkTradeMinimums(f.client, getAddress(THRESHOLD_CASH), [f.step], 'ordinary', 123n) ?? '', /TRADE_MINIMUM_UNAVAILABLE/);
+  const reads = f.state.calls;
+  assert.equal(await checkTradeMinimums(f.client, getAddress(THRESHOLD_CASH), [{ ...f.step, amountIn: 1n }], 'exit', 123n), null);
+  assert.equal(f.state.calls, reads);
 });

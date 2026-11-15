@@ -20,7 +20,7 @@ import { query } from './db.js';
 import { AppError, ValidationError } from './errors.js';
 import { createStrategy, getStrategy, listStrategies, publishVersion } from './strategies.js';
 import type { PublishVersionInput } from './strategies.js';
-import { listPortfolios, enrollPortfolio } from './portfolios.js';
+import { listPortfolios, enrollPortfolio, allocationMinimumDeposit, strategyMinimumDeposit } from './portfolios.js';
 import { buildRenewalParams, recordRenewalResult, resolveBundlerUrl } from './renewal.js';
 import {
   OPERATOR_REBALANCE_ENV,
@@ -646,12 +646,14 @@ async function listRoute(res: ServerResponse, url: URL): Promise<void> {
     provider: provider === '' ? undefined : provider,
     isPublic: parseBoolean(url.searchParams.get('public'), 'public'),
   });
-  sendJson(res, 200, page);
+  sendJson(res, 200, { ...page, items: await Promise.all(page.items.map(async (item) => ({ ...item, minDepositUsdtWei: await strategyMinimumDeposit(item.id) }))) });
 }
 
 /** GET /strategies/:id — metadata plus version history (newest first). */
 async function detailRoute(res: ServerResponse, id: number): Promise<void> {
-  sendJson(res, 200, await getStrategy(id));
+  const strategy = await getStrategy(id);
+  const versions = strategy.versions.map((version) => ({ ...version, minDepositUsdtWei: allocationMinimumDeposit(version.allocation) }));
+  sendJson(res, 200, { ...strategy, versions, minDepositUsdtWei: versions[0]?.minDepositUsdtWei ?? null });
 }
 
 /**
@@ -669,7 +671,7 @@ async function createRoute(
   await deps.rateLimiter.wallet('strategies', provider);
   const body = await readJsonBody(req);
   const strategy = await deps.createStrategy(body, provider);
-  sendJson(res, 201, strategy, { location: `/strategies/${strategy.id}` });
+  sendJson(res, 201, { ...strategy, minDepositUsdtWei: null }, { location: `/strategies/${strategy.id}` });
 }
 
 /**
@@ -690,7 +692,7 @@ async function publishVersionRoute(
     throw new ValidationError('INVALID_VERSION', 'request body must be a JSON object');
   }
   const version = await deps.publishVersion(id, body as PublishVersionInput, provider);
-  sendJson(res, 201, version);
+  sendJson(res, 201, { ...version, minDepositUsdtWei: allocationMinimumDeposit(version.allocation) });
 }
 
 /**

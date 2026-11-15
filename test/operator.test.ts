@@ -1440,6 +1440,24 @@ test('#47 redeem and close planning share aggregator routing after applying the 
   assert.equal(result.plan.steps[0]?.data, '0x12345678');
 });
 
+test('#75 capped close is exit, partial redeem stays ordinary, full liquidation and dust cleanup are exit', async () => {
+  for (const [request, limit, expected] of [
+    [{ close: true }, '150', 'exit'], [{ sellUsdE8: 16000000000n }, '150', undefined],
+    [{ sellUsdE8: 20000000000n }, null, 'exit'], [200000000000n, null, 'exit'],
+  ] as const) {
+    const f = sellFixture(); f.state.limit = limit;
+    const built = await buildRedeemPlan({ portfolioId: PORTFOLIO_ID, account: ACCOUNT, plan: f.plan(samplePlan()) }, request, { ...f.deps, quoteAggregator: async () => null });
+    assert.equal(built.plan.kind, 'ready');
+    if (built.plan.kind !== 'ready') assert.fail('expected executable sale');
+    assert.equal(built.plan.purpose, expected);
+  }
+  const f = sellFixture();
+  const dust = await buildRedeemPlan({ portfolioId: PORTFOLIO_ID, account: ACCOUNT, plan: f.plan(samplePlan(), 1n, 0n) }, { close: true }, { ...f.deps, quoteAggregator: async () => null });
+  assert.equal(dust.plan.kind, 'ready');
+  if (dust.plan.kind !== 'ready') assert.fail('dust exit must remain executable');
+  assert.equal(dust.plan.purpose, 'exit');
+});
+
 
 import { secondaryRevert } from './fixtures/secondary-price.js';
 for (const request of ['first', 'continue', 'close'] as const) {

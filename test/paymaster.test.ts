@@ -52,7 +52,7 @@ test('#66 executor account and registry enrollment account must equal sender; fa
 test('#66 service binds DB chain and owner, reserves before handing out signature; expiry includes exact boundary', async () => {
   let reserved = false;
   const reservations: Reservation[] = [];
-  const service = createPaymasterService({ config: config(), now: () => NOW,
+  const service = createPaymasterService({ readBudgetContext: async () => ({ purpose: 'ordinary', nativePrice: 60000000000n, priceSource: 'fixture:oracle' }), config: config(), now: () => NOW,
     query: async (_sql, params) => { assert.deepEqual(params, [1337, SENDER]); return { rows: [{ owner: OWNER, user_id: OWNER }] }; },
     checkChain: async () => {}, reserve: async (request) => { reservations.push(request); reserved = true; } });
   const result = await service.sponsor({ userOperation: operation(), validUntil: NOW + 300 }, OWNER);
@@ -69,10 +69,14 @@ test('#66 service binds DB chain and owner, reserves before handing out signatur
 });
 
 test('#66 disabled, unknown sender, DB/RPC failures and RPC timeout never reserve or return sensitive errors', async () => {
-  await assert.rejects(createPaymasterService({ config: null }).sponsor({}, OWNER), errorCode('PAYMASTER_DISABLED'));
+  await assert.rejects(createPaymasterService({ readBudgetContext: async () => ({ purpose: 'ordinary', nativePrice: 60000000000n, priceSource: 'fixture:oracle' }), config: null }).sponsor({}, OWNER), errorCode('PAYMASTER_DISABLED'));
   let reserved = 0;
-  for (const phase of ['unknown', 'db', 'db-timeout', 'rpc', 'timeout', 'reserve']) {
-    const service = createPaymasterService({ config: { ...config(), timeoutMs: 5 }, now: () => NOW,
+  for (const phase of ['unknown', 'db', 'db-timeout', 'rpc', 'timeout', 'budget', 'budget-timeout', 'reserve']) {
+    const service = createPaymasterService({ readBudgetContext: async () => {
+      if (phase === 'budget') throw new Error('secret-oracle');
+      if (phase === 'budget-timeout') return new Promise<never>(() => {});
+      return { purpose: 'ordinary', nativePrice: 60000000000n, priceSource: 'fixture:oracle' };
+    }, config: { ...config(), timeoutMs: 5 }, now: () => NOW,
       query: phase === 'db-timeout' ? () => new Promise<{ rows: unknown[] }>(() => {}) : async () => {
         if (phase === 'db') throw new Error('secret-connection');
         return { rows: phase === 'unknown' ? [] : [{ owner: OWNER, user_id: OWNER }] };
@@ -107,12 +111,12 @@ test('#66 expiry while committing keeps the charge but never hands out authoriza
   const original = console.warn;
   console.warn = (...values: unknown[]) => { logs.push(values.map(String).join(' ')); };
   try {
-    const service = createPaymasterService({ config: config(), now: () => clock,
+    const service = createPaymasterService({ readBudgetContext: async () => ({ purpose: 'ordinary', nativePrice: 60000000000n, priceSource: 'fixture:oracle' }), config: config(), now: () => clock,
       query: async () => ({ rows: [{ owner: OWNER, user_id: OWNER }] }), checkChain: async () => {},
       reserve: async () => { charged = true; clock += 300; } });
     await assert.rejects(service.sponsor({ userOperation: operation(), validUntil: NOW + 300 }, OWNER), errorCode('PAYMASTER_EXPIRED'));
     assert.equal(charged, true);
-    const failing = createPaymasterService({ config: config(), now: () => NOW,
+    const failing = createPaymasterService({ readBudgetContext: async () => ({ purpose: 'ordinary', nativePrice: 60000000000n, priceSource: 'fixture:oracle' }), config: config(), now: () => NOW,
       query: async () => { throw new Error('private RPC token ' + TEST_SIGNER + operation().callData); } });
     await assert.rejects(failing.sponsor({ userOperation: operation() }, OWNER), errorCode('PAYMASTER_DEPENDENCY_UNAVAILABLE'));
     const output = logs.join('\n');
@@ -126,7 +130,7 @@ test('#66 expiry while committing keeps the charge but never hands out authoriza
 test('#69 estimation paymaster signature is recoverable for every hash, so v0.7 reports SIG_VALIDATION_FAILED instead of reverting', async () => {
   const { schedulerPaymaster } = await import('../src/paymaster.js');
   const { slice } = await import('viem');
-  const hooks = schedulerPaymaster(SENDER, { config: config() });
+  const hooks = schedulerPaymaster(SENDER, { readBudgetContext: async () => ({ purpose: 'ordinary', nativePrice: 60000000000n, priceSource: 'fixture:oracle' }), config: config() });
   assert.ok(hooks?.getPaymasterStubData);
   const stub = await hooks.getPaymasterStubData({ chainId: 1337, entryPointAddress: '0x0000000071727De22E5E9d8BAf0edAc6f37da032', sender: SENDER, nonce: 0n, callData: '0x' });
   assert.ok(stub?.paymasterData);

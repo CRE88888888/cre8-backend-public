@@ -63,6 +63,22 @@ export function loadPaymasterConfig(env: NodeJS.ProcessEnv = process.env): Payma
 /** 僅含變數名與格式診斷，不含 env 原值；可安全寫入 server log。 */
 export class ConfigurationError extends Error {}
 
+/** USD uses exact E8 integers; zero caps block positive usage. Exit has no account cap. */
+export type TradingConfig = {
+  minStepUsdE8: bigint; minBatchUsdE8: bigint; minDepositUsdE8: bigint;
+  dailyGas: bigint; dailyUsdE8: bigint; timeoutMs: number;
+};
+export function loadTradingConfig(env: NodeJS.ProcessEnv = process.env): TradingConfig {
+  return {
+    minStepUsdE8: parseBigInt(env, 'MIN_STEP_USD_E8', 500_000_000n),
+    minBatchUsdE8: parseBigInt(env, 'MIN_BATCH_USD_E8', 5_000_000_000n),
+    minDepositUsdE8: parseBigInt(env, 'MIN_DEPOSIT_USD_E8', 5_000_000_000n),
+    dailyGas: parseBigInt(env, 'ACCOUNT_DAILY_GAS', 10_000_000n),
+    dailyUsdE8: parseBigInt(env, 'ACCOUNT_DAILY_GAS_USD_E8', 30_000_000n),
+    timeoutMs: parseInteger(env, 'GAS_BUDGET_TIMEOUT_MS', 5_000, { min: 1, max: 30_000 }),
+  };
+}
+
 /**
  * Settings the auth layer needs to build and check an EIP-4361 (SIWE) challenge. Kept separate
  * from the rest of the config so `src/auth.ts` can resolve it without `DATABASE_URL`: auth is the
@@ -245,6 +261,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   loadRateLimitConfig(env);
   loadRelayerGasConfig(env);
   loadPaymasterConfig(env);
+  loadTradingConfig(env);
 
   return {
     databaseUrl,

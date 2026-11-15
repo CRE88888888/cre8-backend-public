@@ -1455,7 +1455,10 @@ export async function buildRedeemPlan(input: RebalancePlanningInput, request: Se
     if (steps.length === 0) return reply({ kind: 'blocked', reason: `沒有可執行的賣出步驟：${notes.join('；') || '待賣量換算後為 0'}` });
     // Subtract the ceiling of aggregate nominal sold, so repeated E8 continuation never oversells by truncation.
     const soldE8 = (soldRaw * 100_000_000n + scale - 1n) / scale;
+    const fullExit = (typeof request === 'object' && 'close' in request) || holdings.every((holding) =>
+      steps.filter((step) => step.tokenIn.toLowerCase() === holding.asset.toLowerCase()).reduce((sum, step) => sum + step.amountIn, 0n) === holding.amountWei);
     return reply({ kind: 'ready', steps, deadline,
+      ...(fullExit ? { purpose: 'exit' } : {}),
       rationale: `賣出 ${steps.length} 檔，非現金待賣 ${wanted} E8，本批名義額 ${soldE8} E8；剩餘由 API 呼叫者以 sellUsdE8 續作（依當下非現金價值重新分配）${notes.length === 0 ? '' : `；blocked：${notes.join('；')}`}` }, soldE8);
   } catch (error) {
     return reply({ kind: 'blocked', reason: decodePriceSourceError(error)?.detail ?? '[REDEEM_PLAN_UNAVAILABLE] 持倉、限額、oracle 或 DB 資料不可用，不送交易' });

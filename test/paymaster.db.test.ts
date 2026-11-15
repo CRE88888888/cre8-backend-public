@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import pg from 'pg';
 import { concatHex, keccak256, toHex } from 'viem';
 import { closePool, query, withTransaction } from '../src/db.js';
-import { reserveSponsorship } from '../src/paymaster.js';
+import { reserveSponsorship, reserveGasBudget } from '../src/paymaster.js';
 import type { Reservation } from '../src/paymaster.js';
 import { loadPaymasterConfig } from '../src/config.js';
 import { AppError } from '../src/errors.js';
@@ -20,10 +20,36 @@ function request(id: number, sender = '0x100000000000000000000000000000000000000
   return { hash: keccak256(toHex(id, { size: 32 })), config: { ...config, chainId, verificationGasLimit: 3n, postOpGasLimit: 4n },
     op: { sender: sender as `0x${string}`, nonce: BigInt(id), initCode: '0x', callData: '0x', accountGasLimits: concatHex([toHex(1n, { size: 16 }), toHex(2n, { size: 16 })]),
       preVerificationGas: 5n, gasFees: concatHex([toHex(1n, { size: 16 }), toHex(2n, { size: 16 })]), paymasterAndData: '0x', signature: '0x' },
-    verificationGas: 1n, callGas: 2n, maxFee: 2n, gasLimit: 15n, maxCostWei: 30n, validUntil: Math.floor(Date.now() / 1000) + 300 };
+    verificationGas: 1n, callGas: 2n, maxFee: 2n, gasLimit: 15n, maxCostWei: 30n, validUntil: Math.floor(Date.now() / 1000) + 300,
+    budget: { executionKey: `test:paymaster:${id}:${sender}`, chainId, account: sender as `0x${string}`, purpose: 'ordinary',
+      gasLimit: 15n, maxFeePerGas: 2n, nativePrice: 60000000000n, priceSource: 'test:planning-oracle' } };
 }
 const denied = (error: unknown) => error instanceof AppError && error.code === 'PAYMASTER_QUOTA_EXCEEDED';
 async function clean() { await query('delete from paymaster_sponsorships where chain_id = $1', [chainId]); }
+
+test('#75 exit still sponsors when every ordinary account quota is zero', async () => {
+  const r = request(750001);
+  r.config = { ...r.config, accountDailyCount: 0n, accountDailyGas: 0n, accountDailyWei: 0n };
+  const exit: Reservation = { ...r, budget: { executionKey: 'exit-regression-75', chainId, account: r.op.sender,
+    purpose: 'exit', gasLimit: r.gasLimit, maxFeePerGas: r.maxFee,
+    nativePrice: 60000000000n, priceSource: 'test:planning-oracle' } };
+  try { await reserveSponsorship(exit); }
+  finally { await clean(); }
+});
+
+test('#75 self-funded and sponsored writers share one immutable charge; site rejection rolls both reservations back', async () => {
+  const r = request(750002);
+  await reserveGasBudget(r.budget);
+  try {
+    await reserveSponsorship(r);
+    assert.equal((await query<{ n: string }>('select count(*)::text as n from gas_budget_reservations where execution_key=$1', [r.budget.executionKey])).rows[0]?.n, '1');
+    const denied = request(750003);
+    denied.config.siteDailyGas = 0n;
+    await assert.rejects(reserveSponsorship(denied), (error: unknown) => error instanceof AppError && error.code === 'PAYMASTER_QUOTA_EXCEEDED');
+    assert.equal((await query('select execution_key from gas_budget_reservations where execution_key=$1', [denied.budget.executionKey])).rows.length, 0);
+    assert.equal((await query('select user_op_hash from paymaster_sponsorships where user_op_hash=$1', [denied.hash])).rows.length, 0);
+  } finally { await clean(); }
+});
 
 test('#66 Postgres exact account count/gas/wei and site gas/wei boundaries, zero blocks; every state counts', async () => {
   try {
@@ -86,6 +112,7 @@ test('#66 a new process cannot reset the durable daily allowance', async () => {
         for (const k of ['verificationGasLimit','postOpGasLimit','accountDailyCount','accountDailyGas','accountDailyWei','siteDailyGas','siteDailyWei','minDepositWei']) r.config[k] = BigInt(r.config[k]);
         for (const k of ['nonce','preVerificationGas']) r.op[k] = BigInt(r.op[k]);
         for (const k of ['verificationGas','callGas','maxFee','gasLimit','maxCostWei']) r[k] = BigInt(r[k]);
+        for (const k of ['gasLimit','maxFeePerGas','nativePrice']) r.budget[k] = BigInt(r.budget[k]);
         try { await reserveSponsorship(r); console.log('reserved'); }
         catch (error) { console.log(error instanceof Error && 'code' in error ? error.code : 'unexpected'); }
         finally { await closePool(); }
@@ -109,7 +136,7 @@ test('#66 UTC day is independent of DB timezone; yesterday frees current quota, 
     await reserveSponsorship(r, (fn) => withTransaction(async (client) => { await client.query("set local time zone 'Pacific/Kiritimati'"); return fn(client); }));
     const row = await query<{ matches: boolean }>("select utc_day = (transaction_timestamp() at time zone 'UTC')::date as matches from paymaster_sponsorships where user_op_hash=$1", [r.hash]);
     assert.equal(row.rows[0]?.matches, true);
-    await assert.rejects(reserveSponsorship({ ...r, maxFee: r.maxFee + 1n }), (error: unknown) => error instanceof AppError && error.code === 'PAYMASTER_RESERVATION_CONFLICT');
+    await assert.rejects(reserveSponsorship({ ...r, maxFee: r.maxFee + 1n }), (error: unknown) => error instanceof AppError && error.code === 'GAS_BUDGET_CONFLICT');
     await query("update paymaster_sponsorships set created_at=created_at-interval '1 day' where user_op_hash=$1", [r.hash]);
     await reserveSponsorship({ ...r, hash: request(662002).hash });
     assert.equal((await query<{ n: string }>('select count(*)::text as n from paymaster_sponsorships where chain_id=$1', [chainId])).rows[0]?.n, '2');

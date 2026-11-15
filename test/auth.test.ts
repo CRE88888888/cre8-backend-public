@@ -674,7 +674,7 @@ test('HTTP: POST /strategies/:id/versions without a token is 401, with a token i
       const session = await loginOverHttp(baseUrl, account);
       const authorized = await postJson(baseUrl, '/strategies/1/versions', PUBLISH_BODY, session.token);
       assert.equal(authorized.status, 201);
-      assert.deepEqual(await authorized.json(), published);
+      assert.deepEqual(await authorized.json(), { ...published, minDepositUsdtWei: '50000000000000000000' });
       assert.deepEqual(providers, [account.address.toLowerCase()]);
     },
     {

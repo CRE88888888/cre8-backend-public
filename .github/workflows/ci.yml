@@ -57,6 +57,10 @@ jobs:
           test/alerts.test.ts
           test/chain.enroll.test.ts
           test/drift.test.ts
+          test/deployment.test.ts
+          test/alto.test.ts
+          test/testnet-profile.test.ts
+          test/user-operation.test.ts
           test/funding.test.ts
           test/holdings-scan.test.ts
           test/kernel.test.ts

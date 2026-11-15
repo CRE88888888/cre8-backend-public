@@ -22,7 +22,7 @@ const selectors: Record<string, readonly string[]> = {
   paymaster: ['getDeposit()', 'verifyingSigner()'],
 };
 
-/** Hashes were captured from a clean git archive of contracts f7e5d52, never the main clone's WIP.
+/** Hashes were captured from a clean git archive of contracts 068d471, never the main clone's WIP.
  * Pin every read to one block. Missing code/hash/selector and RPC errors always fail closed.
  */
 export async function checkTestnetProfile(client: PublicClient, expected: Readonly<Record<string, string>> = hashes): Promise<Check[]> {

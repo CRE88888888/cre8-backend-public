@@ -7,6 +7,7 @@ FROM ghcr.io/pimlicolabs/alto:v1.2.5
 
 # 只加一層：把環境變數轉成 CLI 參數（Railway 上沒有地方放 config 檔）。
 COPY entrypoint.sh /entrypoint.sh
+COPY hold.cjs /hold.cjs
 RUN chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]

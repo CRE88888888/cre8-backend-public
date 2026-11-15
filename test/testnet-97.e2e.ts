@@ -1,9 +1,10 @@
 /** #69 opt-in acceptance. Run with bun run test/testnet-97.e2e.ts after the CLEAN
- * contracts f7e5d52 scripts/testnet/fork-e2e.sh on 8556. No automatic bun-test discovery.
+ * contracts 068d471 scripts/testnet/fork-e2e.sh on 8556. No automatic bun-test discovery.
  * Env only: CHAIN_ID=97, RPC_URL=http://127.0.0.1:8556, PORT=8092, DATABASE_URL
  * (cre8_x1b), MIGRATIONS_DIR, OPERATOR_PRIVATE_KEY, SESSION_KEY_MASTER_SEED,
  * PAYMASTER_SIGNER_PRIVATE_KEY, BUNDLER_EXECUTOR_PRIVATE_KEY, BUNDLER_UTILITY_PRIVATE_KEY,
- * ALTO_CLI_PATH (installed alto CLI), BUNDLER_URL=http://127.0.0.1:3056.
+ * ALTO_CLI_PATH (installed alto CLI), BUNDLER_URL=http://127.0.0.1:3056,
+ * TESTNET_ACCEPTANCE_GAS_PRICE_WEI (read-only public testnet gas quote).
  * Keys may be loaded into env by a local launcher; this file never reads key files.
  */
 import assert from 'node:assert/strict';
@@ -24,6 +25,8 @@ import { TESTNET_97 as P } from '../src/testnet-profile.js';
 import { countSwapExecuted, runSchedulerOnce } from '../src/scheduler.js';
 import { checkTestnetProfile } from '../src/testnet-preflight.js';
 import { buildRedeemPlan } from '../src/operator.js';
+import { EXECUTOR_ABI } from '../src/chain.js';
+import { schedulerPaymaster, estimationPaymaster } from '../src/paymaster.js';
 import { planPortfolio } from '../src/snapshot.js';
 const RPC = 'http://127.0.0.1:8556';
 const API = 'http://127.0.0.1:8092';
@@ -63,6 +66,10 @@ async function main() {
   // anvil_nodeInfo is intentionally unavailable on a public RPC.
   const info = await fetch(RPC, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'anvil_nodeInfo', params: [] }) }).then((r) => r.json());
   check(obj(info).result && await client.getChainId() === 97, 'local anvil chain 97');
+  // Local fee scenarios: EOA setup needs room for anvil's suggested 1 gwei tip.
+  // UserOps later use explicit fees and the actual testnet quote under the unchanged USD budget.
+  await local.setNextBlockBaseFeePerGas({ baseFeePerGas: 10_000_000_000n });
+  await local.mine({ blocks: 1 });
   check((await checkTestnetProfile(client)).every((c) => c.level === 'ok'), '157 pinned runtime hashes and selectors');
   mkdirSync('.bun-cache', { recursive: true });
   const log = openSync('.bun-cache/testnet-services-69.log', 'a', 0o600);
@@ -99,6 +106,10 @@ async function main() {
     const approveHash = await ownerClient.sendUserOperation({ calls: [{ to: P.contracts.usdt, data: encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [P.contracts.executor, (1n << 256n) - 1n] }) }], callGasLimit: 300000n });
     check((await ownerClient.waitForUserOperationReceipt({ hash: approveHash, timeout: 120000 })).success, 'owner-authorized approve through local alto');
     await local.setBalance({ address: account, value: 0n });
+    const publicFee = process.env.TESTNET_ACCEPTANCE_GAS_PRICE_WEI;
+    assert.ok(publicFee && /^[1-9][0-9]*$/.test(publicFee), 'supply a read-only public testnet gas quote');
+    await local.setNextBlockBaseFeePerGas({ baseFeePerGas: BigInt(publicFee) });
+    await local.mine({ blocks: 1 });
     const depositBefore = await client.readContract({ address: P.contracts.paymaster, abi: pmAbi, functionName: 'getDeposit' });
     // TWAP warm-up advances the local fork. Align ONLY this acceptance process's wall clock
     // to simulated time so the production signer still uses its normal 300-second expiry.
@@ -121,6 +132,27 @@ async function main() {
       check(JSON.stringify(status).includes('WBNB') && !JSON.stringify(status).includes('0x55d398'), 'status ticker uses profile');
       const redeem = await buildRedeemPlan({ portfolioId, plan: snapshot, account }, { close: true }, { publicClient: client, executor: P.contracts.executor, query });
       check(redeem.plan.kind === 'ready' && redeem.plan.steps.every((step) => step.tokenOut.toLowerCase() === P.contracts.usdt), 'redeem plan returns MockUSDT');
+      assert.equal(redeem.plan.kind, 'ready');
+      const hooks = schedulerPaymaster(account);
+      assert.ok(hooks);
+      const gaslessOwner = createKernelAccountClient({ account: kernel, paymaster: hooks, chain: bscTestnet, client, bundlerTransport: http(BUNDLER, { timeout: 120000 }),
+        userOperation: { estimateFeesPerGas: async () => { const price = await client.getGasPrice(); return { maxFeePerGas: price, maxPriorityFeePerGas: price }; } } });
+      const send = async (calls: { to: Address; data: `0x${string}` }[]) => {
+        const estimate = await gaslessOwner.estimateUserOperationGas({ calls, paymaster: estimationPaymaster(hooks) });
+        const hash = await gaslessOwner.sendUserOperation({ calls, callGasLimit: estimate.callGasLimit * 3n / 2n });
+        const receipt = await gaslessOwner.waitForUserOperationReceipt({ hash, timeout: 120000 });
+        assert.ok(receipt.success, 'owner withdrawal UserOp must succeed');
+        return receipt;
+      };
+      await send([{ to: P.assets.WBNB.token, data: encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [P.contracts.executor, (1n << 256n) - 1n] }) }]);
+      const closed = await send([{ to: P.contracts.executor, data: encodeFunctionData({ abi: EXECUTOR_ABI, functionName: 'executeRebalance', args: [account, redeem.plan.steps, BigInt(redeem.plan.deadline)] }) }]);
+      check(countSwapExecuted(closed.receipt.logs, P.contracts.executor) === redeem.plan.steps.length, 'full close actually sells assets through executor floors');
+      const cash = await client.readContract({ address: P.contracts.usdt, abi: erc20Abi, functionName: 'balanceOf', args: [account] });
+      const before = await client.readContract({ address: P.contracts.usdt, abi: erc20Abi, functionName: 'balanceOf', args: [owner.address] });
+      assert.ok(cash > 0n);
+      await send([{ to: P.contracts.usdt, data: encodeFunctionData({ abi: erc20Abi, functionName: 'transfer', args: [owner.address, cash] }) }]);
+      check(await client.readContract({ address: P.contracts.usdt, abi: erc20Abi, functionName: 'balanceOf', args: [account] }) === 0n &&
+        await client.readContract({ address: P.contracts.usdt, abi: erc20Abi, functionName: 'balanceOf', args: [owner.address] }) === before + cash, 'owner receives exact full MockUSDT withdrawal');
     } finally { Date.now = now; }
     check(await client.readContract({ address: P.contracts.paymaster, abi: pmAbi, functionName: 'getDeposit' }) < depositBefore, 'own paymaster paid scheduler gas');
     check(await client.getBalance({ address: account }) === 0n, 'scheduler required no account BNB');

@@ -9,6 +9,12 @@
 # 詳見 spike/alto/V125-VERDICT.md。
 set -eu
 
+case "${SERVICE_ENABLED:-1}" in
+  0) exec node "$(dirname "$0")/hold.cjs" ;;
+  1) ;;
+  *) echo '[alto] SERVICE_ENABLED must be 0 or 1' >&2; exit 1 ;;
+esac
+
 : "${RPC_URL:?RPC_URL is required}"
 : "${EXECUTOR_PRIVATE_KEY:?EXECUTOR_PRIVATE_KEY is required}"
 

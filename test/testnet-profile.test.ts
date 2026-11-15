@@ -5,6 +5,24 @@ import { kernelAddressesForChain } from '../src/addresses.js';
 import { listPriceableAssets } from '../src/assets.js';
 import { readMaxLegUsdE8 } from '../src/rebalance-plan.js';
 import { TESTNET_97, testnetAssets } from '../src/testnet-profile.js';
+import manifest from '../deploy/testnet-97.json' with { type: 'json' };
+
+test('#79 profile matches every address in contracts 068d471 manifest, retaining admission caps', () => {
+  assert.equal(TESTNET_97.sourceCommit, '068d471fc2c4592c12442ef35602ad1d1a7fe9c3');
+  assert.equal(TESTNET_97.gitCommit, manifest.gitCommit);
+  assert.deepEqual(TESTNET_97.roles, Object.fromEntries(Object.entries(manifest.roles).map(([k, v]) => [k, v.toLowerCase()])));
+  for (const [name, address] of Object.entries(manifest.contracts)) {
+    assert.equal(Reflect.get(TESTNET_97.contracts, name), address.toLowerCase(), name);
+  }
+  assert.equal(Object.keys(TESTNET_97.assets).length, Object.keys(manifest.assets).length);
+  for (const [symbol, asset] of Object.entries(manifest.assets)) {
+    const pinned: unknown = Reflect.get(TESTNET_97.assets, symbol);
+    assert.ok(typeof pinned === 'object' && pinned !== null);
+    for (const [field, address] of Object.entries(asset)) assert.equal(Reflect.get(pinned, field), address.toLowerCase(), symbol + '.' + field);
+    assert.ok(Number.isInteger(Reflect.get(pinned, 'decimals')));
+    assert.match(String(Reflect.get(pinned, 'maxLegUsdt')), /^[1-9][0-9]*$/);
+  }
+});
 
 test('#69 chain 97 resolves its manifest without mainnet env overrides', async () => {
   const env = { DATABASE_URL: 'unused', CHAIN_ID: '97' };

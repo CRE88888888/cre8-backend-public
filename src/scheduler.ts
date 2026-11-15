@@ -106,6 +106,7 @@ import { createBundlerClient, entryPoint07Abi, formatUserOperation, formatUserOp
 import type { GetUserOperationReturnType, UserOperationReceipt } from 'viem/account-abstraction';
 import { activeChain } from './chain-object.js';
 import { testnetAssets, TESTNET_97 } from './testnet-profile.js';
+import { signPreparedOperation } from './user-operation.js';
 import { KERNEL_V3_3_ADDRESSES } from './addresses.js';
 import { detectAlerts, detectRelayerLowGas, formatAlert, recordAlerts, resolveAlerts, PRICE_SOURCE_FAILURE_ROUNDS, priceSourceAlertAssets } from './alerts.js';
 import type { AlertFinding, AlertKind, PriceSourceTracker, RelayerGasChecks } from './alerts.js';
@@ -1440,7 +1441,8 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
         maxFeePerGas: prepared.maxFeePerGas });
     }
     args.onSending();
-    const userOpHash = await client.sendUserOperation(prepared);
+    const signed = await signPreparedOperation(prepared, (operation) => account.signUserOperation(operation));
+    const userOpHash = await client.sendUserOperation(signed);
     // alto 有 simulation：被拒的 op **不會**回 userOpHash。所以拿到 hash = 這一筆被接受了。
     await args.onSubmitted({ userOpHash });
     await settleGasBudget(budgetKey, 'submitted');

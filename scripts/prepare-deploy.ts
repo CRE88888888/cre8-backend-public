@@ -31,7 +31,7 @@
 import { cp, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const BACKEND = resolve(HERE, '..');
@@ -55,12 +55,13 @@ const EXCLUDE = new Set([
   // 容器啟動 ENOENT，但本地 docker build 完全正常）。
   '.gitignore',
 ]);
+const INCLUDE = ['src', 'scripts', 'deploy', 'alto', 'package.json', 'bun.lock', 'Dockerfile', 'docker-entrypoint.sh', 'railway.json'];
 
 async function copyDir(from: string, to: string): Promise<number> {
   let count = 0;
   await mkdir(to, { recursive: true });
   for (const entry of await readdir(from, { withFileTypes: true })) {
-    if (EXCLUDE.has(entry.name)) continue;
+    if (EXCLUDE.has(entry.name) || entry.name.startsWith('.env') || entry.name.endsWith('.log')) continue;
     const source = join(from, entry.name);
     const target = join(to, entry.name);
     if (entry.isDirectory()) {
@@ -73,29 +74,43 @@ async function copyDir(from: string, to: string): Promise<number> {
   return count;
 }
 
-async function main(): Promise<void> {
-  if (!existsSync(MIGRATIONS_SRC)) {
+export async function prepareDeploy(backend = BACKEND, migrationsSrc = process.env.MIGRATIONS_DIR || MIGRATIONS_SRC, deploy = DEPLOY, website?: string): Promise<void> {
+  if (!existsSync(migrationsSrc)) {
     throw new Error(
-      `找不到 migration 目錄：${MIGRATIONS_SRC}\n` +
+      `找不到 migration 目錄：${migrationsSrc}\n` +
         'db/ repo 必須 checkout 在 backend/ 旁邊（見 backend/README.md）',
     );
   }
 
-  await rm(DEPLOY, { recursive: true, force: true });
-  const copied = await copyDir(BACKEND, DEPLOY);
+  // Validate inputs before removing the old artifact. Only explicit runtime roots are uploaded.
+  if (website && !existsSync(join(website, 'index.html'))) throw new Error('website index.html missing');
+  await rm(deploy, { recursive: true, force: true });
+  await mkdir(deploy, { recursive: true });
+  let copied = 0;
+  for (const name of INCLUDE) {
+    const source = join(backend, name);
+    const info = await stat(source);
+    if (info.isDirectory()) copied += await copyDir(source, join(deploy, name));
+    else { await cp(source, join(deploy, name)); copied++; }
+  }
+  if (website) {
+    await copyDir(website, join(deploy, 'website'));
+    // Cloudflare's Worker is not this deployment's router and must not be served as a public file.
+    await rm(join(deploy, 'website', '_worker.js'), { force: true });
+  }
 
   // migration 放進 image 裡，路徑與 Dockerfile 的 MIGRATIONS_DIR 對應。
-  await cp(MIGRATIONS_SRC, join(DEPLOY, 'migrations'), { recursive: true });
-  const migrations = (await readdir(join(DEPLOY, 'migrations'))).filter((f) => f.endsWith('.sql'));
+  await cp(migrationsSrc, join(deploy, 'migrations'), { recursive: true });
+  const migrations = (await readdir(join(deploy, 'migrations'))).filter((f) => f.endsWith('.sql'));
 
   // 讓人一眼看出這是產物、不要手改。
   await writeFile(
-    join(DEPLOY, 'README-DEPLOY.txt'),
+    join(deploy, 'README-DEPLOY.txt'),
     [
       '這是 prepare-deploy.ts 產生的部署目錄，不要手改、不要進版控。',
       '',
-      `來源：${BACKEND}`,
-      `migration：${migrations.length} 個（來自 ${MIGRATIONS_SRC}）`,
+      `來源：${backend}`,
+      `migration：${migrations.length} 個（來自 ${migrationsSrc}）`,
       '',
       '部署：cd .deploy && railway up',
       '',
@@ -103,12 +118,12 @@ async function main(): Promise<void> {
     'utf8',
   );
 
-  const size = await stat(DEPLOY);
+  const size = await stat(deploy);
   console.log(
     JSON.stringify({
       level: 'info',
       msg: 'deploy dir ready',
-      dir: DEPLOY,
+      dir: deploy,
       files: copied,
       migrations: migrations.length,
       exists: size.isDirectory(),
@@ -116,7 +131,11 @@ async function main(): Promise<void> {
   );
 }
 
-main().catch((cause: unknown) => {
-  console.error(JSON.stringify({ level: 'error', msg: cause instanceof Error ? cause.message : String(cause) }));
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const args = process.argv.slice(2);
+  if (args.length !== 0 && (args.length !== 2 || args[0] !== '--website-dist')) throw new Error('usage: prepare-deploy [--website-dist PATH]');
+  prepareDeploy(BACKEND, process.env.MIGRATIONS_DIR || MIGRATIONS_SRC, DEPLOY, args[1]).catch(() => {
+    console.error('[prepare-deploy] failed; check source, migration and website directories');
+    process.exitCode = 1;
+  });
+}

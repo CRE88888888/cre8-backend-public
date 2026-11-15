@@ -14,18 +14,24 @@ export function testnetProfileTargets(): { name: string; address: Address }[] {
     ...Object.entries(TESTNET_97.assets).flatMap(([symbol, asset]) => Object.entries(asset)
       .flatMap(([field, value]) => typeof value === 'string' && isAddress(value)
         ? [{ name: `asset.${symbol}.${field}`, address: getAddress(value) }] : [])),
+    ...TESTNET_97.yieldMarkets.flatMap(market => [
+      { name: `yield.${market.marketId}.target`, address: market.target },
+      { name: `yield.${market.marketId}.receipt`, address: market.receipt },
+    ]),
   ];
 }
 
 const selectors: Record<string, readonly string[]> = {
   registry: ['enroll(address,uint256)', 'operator()', 'owner()', 'numeraire()'],
-  executor: ['executeRebalance(address,(address,address,uint256,uint256,address,bytes)[],uint256)', 'numeraire()', 'oracle()', 'venues(address)'],
+  executor: ['executeRebalance(address,(address,address,uint256,uint256,address,bytes)[],uint256)', 'numeraire()', 'oracle()', 'venues(address)',
+    'executeSupply(address,bytes32,uint256,uint256,uint256)', 'executeWithdraw(address,bytes32,uint256,uint256,uint256)', 'yieldRegistry()'],
+  yieldRegistry: ['quoteSupply(bytes32,address,uint256)', 'quoteWithdraw(bytes32,uint256)', 'market(bytes32)', 'setYieldPolicy(bytes32,uint256,bool)'],
   router: ['oracleOf(address)', 'previewSwap(address,address,uint256)'],
   usdt: ['claimFor(address,uint256)', 'claimable(address)', 'isFaucet(address)', 'welcomeFor(address)', 'decimals()'],
   paymaster: ['getDeposit()', 'verifyingSigner()'],
 };
 
-/** Hashes were captured from a clean worktree of contracts 71870a7, never the main clone's WIP.
+/** Runtime hashes and forge artifact verification provenance: deploy/testnet-97-codehashes.json.
  * Pin every read to one block. Missing code/hash/selector and RPC errors always fail closed.
  */
 export async function checkTestnetProfile(client: PublicClient, expected: Readonly<Record<string, string>> = hashes, options: ReadinessOptions = {}): Promise<Check[]> {

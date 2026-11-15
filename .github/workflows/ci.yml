@@ -63,6 +63,12 @@ jobs:
           test/price-keeper.test.ts
           test/price-keeper.rpc.test.ts
           test/user-operation.test.ts
+          test/yield-permissions.test.ts
+          test/yield-execution.test.ts
+          test/yield-paymaster.test.ts
+          test/yield-receipt.test.ts
+          test/yield-golden.test.ts
+          test/sync-testnet-profile.test.ts
           test/funding.test.ts
           test/faucet.test.ts
           test/paymaster.test.ts

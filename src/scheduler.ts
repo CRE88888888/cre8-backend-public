@@ -110,14 +110,14 @@ import type { GetUserOperationReturnType, UserOperationReceipt } from 'viem/acco
 import { activeChain } from './chain-object.js';
 import { testnetAssets, TESTNET_97 } from './testnet-profile.js';
 import { signPreparedOperation } from './user-operation.js';
-import { KERNEL_V3_3_ADDRESSES } from './addresses.js';
+import { KERNEL_V3_3_ADDRESSES, kernelAddressesForChain } from './addresses.js';
 import { detectAlerts, detectRelayerLowGas, formatAlert, recordAlerts, resolveAlerts, PRICE_SOURCE_FAILURE_ROUNDS, priceSourceAlertAssets } from './alerts.js';
 import type { AlertFinding, AlertKind, PriceSourceTracker, RelayerGasChecks } from './alerts.js';
 import { a10ErrorMessage, EXECUTOR_BUY_ABI, readGlobalPaused, decodePriceSourceError, describePriceSourceError, PriceSourceError, inspectPriceSources, oracleUnavailableTag } from './chain.js';
 import { getConfig, getSessionKeyConfig, requireSessionKeyConfig } from './config.js';
 import { errorMessage, query as dbQuery, withTransaction, withPortfolioLock } from './db.js';
 import { AppError } from './errors.js';
-import { buildSessionPermissions } from './permissions.js';
+import { buildSessionPermissions, yieldAuthorization } from './permissions.js';
 import { DEFAULT_DEADLINE_SECONDS as PLAN_DEFAULT_DEADLINE_SECONDS, planRebalance, readMaxLegUsdE8, refreshFloors, minimumDepositUsdtWei, checkTradeMinimums, checkBuyFeeReserve } from './rebalance-plan.js';
 import { writeSnapshot as writeSnapshotImpl } from './snapshot.js';
 import type { PlanPartial, PlannedStep, RebalancePlan, RefreshFloorsResult } from './rebalance-plan.js';
@@ -182,7 +182,7 @@ const EXPECTED_POLICY_COUNT = 3;
  * 自己寫一份（而不是從 `@zerodev/sdk` 拿 `KernelV3_3AccountAbi`）是為了讓「讀一欄」不必把整個
  * SDK 拉進這條路徑。欄位形狀照 SDK 的 ABI 逐字抄，`bytes22[]` 不是筆誤——PolicyData 是 packed 的。
  */
-const KERNEL_PERMISSION_ABI = [
+export const KERNEL_PERMISSION_ABI = [
   {
     type: 'function',
     name: 'permissionConfig',
@@ -460,6 +460,8 @@ export type PortfolioRunResult = {
 
 /** DB 的 session key（只存派生路徑，私鑰不落 DB）＋ 鏈上要用的三個欄位。 */
 export type SessionKeyRef = {
+  /** Present only on owner-installed yield upgrades; original account initConfig remains unchanged. */
+  yieldAccount?: Address;
   keyRef: `m/44'/60'/${string}`;
   permissionId: Hex;
   sessionKeyAddress: Address;
@@ -1129,6 +1131,7 @@ async function resolveSessionKey(
         sessionKeyAddress: sessionKeyAddress.toLowerCase() as Address,
         validUntil,
         owner,
+        ...(args.chainId === 97 && yieldAuthorization(row.permissions, args.account, TESTNET_97.contracts.executor).status === 'ready' ? { yieldAccount: args.account } : {}),
       },
     };
   }
@@ -1322,9 +1325,8 @@ async function runPrechecks(
  *     以 `gas = 那個值` 模擬一次執行。不通過就不簽名 —— 不花錢買 `success = false`。
  *   * **送出後**：`judgeRebalanceOutcome` 三層判定。`tx.status == 1` 單獨不足以叫成功。
  */
-async function rebalanceKernelAccount(args: Pick<ExecuteArgs, 'account' | 'sessionKey' | 'executor'>) {
+export async function sessionKernelAccount(args: Pick<ExecuteArgs, 'account' | 'sessionKey' | 'executor'>, publicClient = defaultPublicClient()) {
   const { masterSeed } = requireSessionKeyConfig();
-  const publicClient = defaultPublicClient();
 
   const keyAccount = hdKeyToAccount(HDKey.fromMasterSeed(hexToBytes(masterSeed)), { path: args.sessionKey.keyRef });
   if (!isAddressEqual(keyAccount.address, args.sessionKey.sessionKeyAddress)) {
@@ -1339,7 +1341,8 @@ async function rebalanceKernelAccount(args: Pick<ExecuteArgs, 'account' | 'sessi
     sessionKeyAddress: keyAccount.address,
     executorAddress: args.executor,
     validUntil: args.sessionKey.validUntil,
-    signer: await toECDSASigner({ signer: keyAccount }),
+    ...(args.sessionKey.yieldAccount === undefined ? {} : { yieldAccount: args.sessionKey.yieldAccount }),
+    signer: await toECDSASigner({ signer: keyAccount, ...(publicClient.chain?.id === 97 ? { signerContractAddress: getAddress(TESTNET_97.contracts.ecdsaSigner) } : {}) }),
   });
   if (permissions.permissionId.toLowerCase() !== args.sessionKey.permissionId.toLowerCase()) {
     throw new Error(
@@ -1356,6 +1359,7 @@ async function rebalanceKernelAccount(args: Pick<ExecuteArgs, 'account' | 'sessi
         signer: addressToEmptyAccount(args.sessionKey.owner),
         entryPoint: ENTRY_POINT,
         kernelVersion,
+        validatorAddress: kernelAddressesForChain(publicClient.chain?.id ?? await publicClient.getChainId()).ecdsaValidatorV31,
       }),
       regular: permissions.permissionValidator,
     },
@@ -1376,7 +1380,7 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
   let budgetKey: string | null = null;
   try {
     const network = activeChain();
-    const account = await rebalanceKernelAccount(args);
+    const account = await sessionKernelAccount(args);
     const data = encodeFunctionData({
       abi: EXECUTOR_ABI,
       functionName: 'executeRebalance',
@@ -1781,7 +1785,7 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
       (({ token, owner }: Erc20Args) =>
         defaultPublicClient().readContract({ address: token, abi: ERC20_ABI, functionName: 'balanceOf', args: [owner] })),
     readRebalanceNonce: provided.readRebalanceNonce ?? (async (input: Pick<ExecuteArgs, 'account' | 'sessionKey' | 'executor'>) =>
-      (await rebalanceKernelAccount(input)).getNonce()),
+      (await sessionKernelAccount(input)).getNonce()),
     readLatestBlockTimestamp: provided.readLatestBlockTimestamp ?? (async () => (await defaultPublicClient().getBlock({ blockTag: 'latest' })).timestamp),
     readEntryPointNonce: provided.readEntryPointNonce ?? (async ({ account, key }: { account: Address; key: bigint }) =>
       defaultPublicClient().readContract({ address: ENTRY_POINT.address, abi: entryPoint07Abi,

@@ -650,6 +650,7 @@ curl -s "$API/portfolios/3/renewal-params" -H "authorization: Bearer $TOKEN"
 - `accountAddress` 是 **DB `smart_accounts.address` 的權威值，不是重新推導**：已部署帳戶的位址取決於
   當初那組 `initConfig`，重算會落到另一個（沒部署過）的地址，見 `docs/pitfalls` §4.7。
 - `initConfig` 是兩筆 calldata，`to` 都是**帳戶自己**（帳戶內的 `msg.sender == self`）。
+- chain 97 的 owner 續期另加入限於此帳戶的生息存領 selector；原始 enrollment 的 initConfig／salt 不變。權限、golden、代付與 0036／BE-3 交接見 [BE-4 生息 UserOp 管線](docs/yield-userops.zh-TW.md)，環境交接見 [測試網部署](docs/testnet-deploy.zh-TW.md) 與 [alto 設定](alto/README.md)。
 - `validUntil` 是 `sessionValidUntil()` = now + 365 天（Unix 秒，uint48），`expiresAt` 是同一個瞬間的 ISO。
 - `policySnapshot` 前端不需要解，但**必須原樣回傳**給 `renewal-result`。
 - **新 key 的索引一定與既有那把不同**：`max(既有所有 key_ref 的索引, base) + 1`，其中

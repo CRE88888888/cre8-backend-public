@@ -65,8 +65,8 @@ fork 的 receipt 查詢留在本機區塊範圍。Docker image 維持 v1.2.5；�
 call gas、計入 paymaster 的簽署 gas 限制，並在送出前確認 prepared UserOp **總 gas ≤14M**。
 safe mode 保留；chain 56 沒有新增此 flag，沿用既有預設。
 
-backend 設 `CHAIN_ID=97` 後採用 `src/testnet-profile.ts` 的固定地址與 93 個資產（92 + MockUSDT），
-來源是 contracts main `71870a7` 的已提交 manifest；不要從 contracts 主 clone 的未提交工作樹複製部署輸入。
+backend 設 `CHAIN_ID=97` 後採用 `src/testnet-profile.ts` 匯出的固定地址、93 個資產（92 + MockUSDT）與 30 個生息市場，
+來源是 contracts PR #49 的 manifest（`gitCommit=2052c828b0c8afddfd8d98bd0b5fc6207268fc05`），目前 `mode=fork`。重產、380 項 runtime pins 與生息 UserOp 交接見 [BE-4 文件](../docs/yield-userops.zh-TW.md)；不要從 contracts 主 clone 的未提交工作樹複製部署輸入。
 registry／executor／paymaster 的 env 可以留空；顯式填入不同地址會拒絕啟動。97 不讀主網資產 seed、
 不呼叫 KyberSwap／OpenOcean，session GasPolicy 強制使用自己的 paymaster。
 
@@ -78,7 +78,7 @@ registry／executor／paymaster 的 env 可以留空；顯式填入不同地址�
 已用額度回 429。交易結果未知／程序中斷的紀錄必須人工對帳，不能刪列、逾時釋放或另取 nonce 重送。
 API 多實例與 enroll 共用 relayer session lock，忙碌時回 503。已保存 hash 但結果未知的 faucet 交易會擋住新的 97 relayer 工作，直到人工對帳完成；不能重新取 nonce 重送。
 
-本機驗收只用 8556／8092／3056 和 `cre8_x1b`：先以 `git archive f7e5d52` 取得乾淨 contracts 副本，
+以下為 #69 的歷史驗收方式；目前 #85 的固定來源、專用埠與驗收指令以 [BE-4 文件](../docs/yield-userops.zh-TW.md#本機驗收) 為準。#69 只用 8556／8092／3056 和 `cre8_x1b`：先以 `git archive f7e5d52` 取得乾淨 contracts 副本，
 跑 `scripts/testnet/deploy-97.sh fork`、TWAP 暖機與 `PushFeedsTestnet`，再依
 `test/testnet-97.e2e.ts` 檔頭設定 env 執行：
 
@@ -91,5 +91,5 @@ E2E 會起本機 alto／backend，走 SIWE → 發佈策略 → enroll → HTTP 
 scheduler 自有 paymaster 再平衡 → snapshot／status／redeem plan → strict preflight，並移除自己建立的 DB fixture。
 owner approve 仍由 owner 簽名並自付 gas（#66 白名單不代付 approve）；scheduler 的 smart account BNB 為 0。
 暖機會推進 fork 時間，因此 E2E 只在驗收行程中對齊模擬時鐘，沒有修改正式 signer 的短效期限。
-preflight 會核對 157 個地址的 codehash 與必要 selector；`EXECUTOR_DEPLOYMENT_BLOCK` 要填該次 fork
+#69 當時 preflight 核對 157 個地址；目前版本改核對 380 項 runtime pins 與必要 selector。`EXECUTOR_DEPLOYMENT_BLOCK` 要填該次 fork
 真正的 executor 建立區塊。整套驗收拒絕公開 RPC、其他埠或其他 DB。

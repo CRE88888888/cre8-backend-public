@@ -2,18 +2,18 @@ import { HDKey } from '@scure/bip32';
 import { signerToEcdsaValidator } from '@zerodev/ecdsa-validator';
 import { PolicyFlags, toInitConfig, toPermissionValidator } from '@zerodev/permissions';
 import type { ModularSigner, PermissionPlugin, Policy } from '@zerodev/permissions';
-import { CallPolicyVersion, toCallPolicy, toGasPolicy, toTimestampPolicy } from '@zerodev/permissions/policies';
+import { CallPolicyVersion, ParamCondition, toCallPolicy, toGasPolicy, toTimestampPolicy } from '@zerodev/permissions/policies';
 import { toEmptyECDSASigner } from '@zerodev/permissions/signers';
 import { addressToEmptyAccount } from '@zerodev/sdk';
 import { KERNEL_V3_3 } from '@zerodev/sdk/constants';
 import type { GetKernelVersion } from '@zerodev/sdk/types';
-import { encodePacked, hexToBytes, keccak256 } from 'viem';
+import { encodePacked, getAddress, hexToBytes, isAddressEqual, keccak256, pad, zeroAddress } from 'viem';
 import type { Address, Hex, PublicClient } from 'viem';
 import { hdKeyToAccount } from 'viem/accounts';
 import { KERNEL_VERSION_STRING, KERNEL_V3_3_ADDRESSES, kernelAddressesForChain } from './addresses.js';
 import { TESTNET_97, configuredChainId } from './testnet-profile.js';
 import { requireSessionKeyConfig } from './config.js';
-import { EXECUTOR_SELECTOR } from './chain.js';
+import { EXECUTOR_SELECTOR, YIELD_EXECUTION_SELECTORS } from './chain.js';
 export { EXECUTOR_SELECTOR } from './chain.js';
 
 /**
@@ -25,8 +25,8 @@ export { EXECUTOR_SELECTOR } from './chain.js';
  *    是**唯一**影響地址的東西。production 兩者都要給。
  * 2. GasPolicy 是一次性的 wei 預算，跨 userOp 累計、**永不重置**：用完權限就永久失效，所以額度是
  *    `1e18` wei 這種一次性預算，不是「每日重置」。
- * 3. CallPolicy 只驗 target + selector，**不驗參數**。也就是說 session key 一旦裝上，executor 的
- *    `executeRebalance` 任何參數都叫得動 —— 參數層的護欄要在別的地方做。
+ * 3. 原始 rebalance CallPolicy 只設 target + selector，**沒有參數規則**。也就是說 session key 一旦裝上，executor 的
+ *    `executeRebalance` 任何參數都叫得動；新增生息權限則另以參數規則鎖 account。
  *
  * 另一件影響 DB 設計的事：`permissionId` 只有 4 bytes，**不能當唯一鍵**。
  */
@@ -110,7 +110,7 @@ function sessionKeyIndex(portfolioId: bigint | number): bigint {
 
 function assertMasterSeed(seed: Hex): Hex {
   if (!/^0x[0-9a-fA-F]{64}$/.test(String(seed))) {
-    throw new Error(`Session key 派生失敗：master seed 必須是 0x + 64 hex（32 bytes），收到 "${String(seed)}"`);
+    throw new Error('Session key 派生失敗：master seed 必須是 0x + 64 hex（32 bytes）');
   }
   return seed;
 }
@@ -191,7 +191,7 @@ export type SessionGasPolicySnapshot = {
   allowedPaymaster: Address;
 };
 
-/** CallPolicy 的一條權限：只鎖 target + selector（不驗參數）。 */
+/** CallPolicy 權限：既有 rebalance 鎖 target／selector，生息另鎖 account 參數。 */
 export type SessionCallPermissionSnapshot = {
   callType: Hex;
   target: Address;
@@ -233,13 +233,50 @@ export type SessionPolicySnapshot = SessionPolicies & {
 /** 一次算好的三層 policy 物件；snapshot 與 validator 都從同一份長出來。 */
 type BuiltPolicies = { call: Policy; gas: Policy; timestamp: Policy };
 
-function buildPolicies(executorAddress: Address, validAfter: number, validUntil: number, chainId = configuredChainId()): BuiltPolicies {
+/** Default remains the original deployment policy: adding initConfig would move CREATE2 accounts.
+ * Yield is installed only by owner renewal, once the existing account address is known.
+ */
+export function sessionCallPermissions(executorAddress: Address, yieldAccount?: Address) {
+  return [
+    { target: executorAddress, selector: EXECUTOR_SELECTOR },
+    ...(yieldAccount === undefined ? [] : YIELD_EXECUTION_SELECTORS.map(selector => ({
+      target: executorAddress, selector,
+      rules: [{ condition: ParamCondition.EQUAL, offset: 0, params: [pad(yieldAccount)] }],
+    }))),
+  ];
+}
+
+export function yieldAuthorization(snapshot: unknown, account: Address, executor: Address):
+  { status: 'ready' } | { status: 'authorization_required'; code: 'SESSION_AUTHORIZATION_REQUIRED'; message: string } {
+  const required = { status: 'authorization_required', code: 'SESSION_AUTHORIZATION_REQUIRED',
+    message: '需要更新授權：請由帳戶 owner 透過 renewal 流程安裝生息存領權限' } as const;
+  if (!snapshot || typeof snapshot !== 'object') return required;
+  const call: unknown = Reflect.get(snapshot, 'call');
+  if (!call || typeof call !== 'object') return required;
+  const permissions: unknown = Reflect.get(call, 'permissions');
+  if (!Array.isArray(permissions)) return required;
+  for (const selector of YIELD_EXECUTION_SELECTORS) {
+    if (!permissions.some((permission: unknown) => {
+      if (!permission || typeof permission !== 'object') return false;
+      const rules: unknown = Reflect.get(permission, 'rules');
+      return String(Reflect.get(permission, 'target')).toLowerCase() === executor.toLowerCase() &&
+        Reflect.get(permission, 'selector') === selector && Reflect.get(permission, 'callType') === '0x00' &&
+        Reflect.get(permission, 'valueLimit') === '0' && Array.isArray(rules) && rules.length === 1 &&
+        rules[0]?.condition === ParamCondition.EQUAL && rules[0]?.offset === 0 &&
+        Array.isArray(rules[0]?.params) && rules[0].params.length === 1 && typeof rules[0].params[0] === 'string' &&
+        rules[0].params[0].toLowerCase() === pad(account).toLowerCase();
+    })) return required;
+  }
+  return { status: 'ready' };
+}
+
+function buildPolicies(executorAddress: Address, validAfter: number, validUntil: number, chainId = configuredChainId(), yieldAccount?: Address): BuiltPolicies {
   return {
-    // 只給 target + selector：CallPolicy 不驗參數，所以這裡沒得鎖更細。
+    // Initial deployment remains legacy; an owner upgrade also pins yield argument 0 to this account.
     call: toCallPolicy({
       ...(chainId === 97 ? { policyAddress: TESTNET_97.contracts.callPolicy } : {}),
       policyVersion: SESSION_CALL_POLICY_VERSION,
-      permissions: [{ target: executorAddress, selector: EXECUTOR_SELECTOR }],
+      permissions: sessionCallPermissions(executorAddress, yieldAccount),
     }),
     gas: toGasPolicy({ allowed: SESSION_GAS_ALLOWED_WEI, ...(chainId === 97 ? { policyAddress: TESTNET_97.contracts.gasPolicy, enforcePaymaster: true, allowedPaymaster: TESTNET_97.contracts.paymaster } : {}) }),
     timestamp: toTimestampPolicy({ validAfter, validUntil, ...(chainId === 97 ? { policyAddress: TESTNET_97.contracts.timestampPolicy } : {}) }),
@@ -247,12 +284,12 @@ function buildPolicies(executorAddress: Address, validAfter: number, validUntil:
 }
 
 /** 目前使用的三層 policy 參數（測試與 log 用）。`validUntil` 未給就用 `sessionValidUntil()`。 */
-export function describePolicies(args: { executorAddress: Address; validUntil?: number; chainId?: number }): SessionPolicies {
+export function describePolicies(args: { executorAddress: Address; validUntil?: number; chainId?: number; yieldAccount?: Address }): SessionPolicies {
   const executorAddress = assertAddressArg(args.executorAddress, 'executorAddress');
   const validUntil = args.validUntil ?? sessionValidUntil();
   assertValidUntil(validUntil);
 
-  const policies = buildPolicies(executorAddress, SESSION_VALID_AFTER, validUntil, args.chainId);
+  const policies = buildPolicies(executorAddress, SESSION_VALID_AFTER, validUntil, args.chainId, args.yieldAccount);
   return snapshotPolicies(policies);
 }
 
@@ -351,6 +388,8 @@ export async function sudoValidator(publicClient: PublicClient, owner: Address) 
 }
 
 export type BuildSessionPermissionsArgs = {
+  /** Owner upgrade only. Never supply this to counterfactual deployment / initial enrollment. */
+  yieldAccount?: Address;
   /** 推導地址要用：`toPermissionValidator` 讀 `client.chain.id`（或打 eth_chainId）。 */
   publicClient: PublicClient;
   /** session key 的地址（由 `deriveSessionKey` 得到）。本函式不需要它的私鑰。 */
@@ -392,13 +431,15 @@ export async function buildSessionPermissions(args: BuildSessionPermissionsArgs)
   }
 
   const chainId = args.publicClient.chain?.id ?? await args.publicClient.getChainId();
-  const policies = buildPolicies(executorAddress, SESSION_VALID_AFTER, validUntil, chainId);
+  const yieldAccount = args.yieldAccount === undefined ? undefined : assertAddressArg(args.yieldAccount, 'yieldAccount');
+  if (yieldAccount !== undefined && (chainId !== 97 || isAddressEqual(yieldAccount, zeroAddress))) throw new Error('生息升權只支援 chain 97 的既有帳戶');
+  const policies = buildPolicies(executorAddress, SESSION_VALID_AFTER, validUntil, chainId, yieldAccount);
 
   // 型別理由同 src/kernel.ts：SDK 把 kernelVersion 收窄成 GetKernelVersion<"0.7">。
   const kernelVersion: GetKernelVersion<'0.7'> = KERNEL_V3_3;
 
   const permissionValidator = await toPermissionValidator(args.publicClient, {
-    signer: args.signer ?? toEmptyECDSASigner(sessionKeyAddress, chainId === 97 ? TESTNET_97.contracts.ecdsaSigner : undefined),
+    signer: args.signer ?? toEmptyECDSASigner(sessionKeyAddress, chainId === 97 ? getAddress(TESTNET_97.contracts.ecdsaSigner) : undefined),
     // 順序會進 permissionId（toPolicyId 是對這個陣列做 abi.encode），所以固定在這裡排。
     policies: [policies.call, policies.gas, policies.timestamp],
     entryPoint: ENTRY_POINT,

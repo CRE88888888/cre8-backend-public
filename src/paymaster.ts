@@ -9,7 +9,7 @@ import { toEmptyECDSASigner, toSignerId } from '@zerodev/permissions/signers';
 import type { Address, Hex, PublicClient } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import type { GetPaymasterDataParameters, PaymasterActions } from 'viem/account-abstraction';
-import { EXECUTOR_ABI, EXECUTOR_SELECTOR, REGISTRY_ABI } from './chain.js';
+import { EXECUTOR_ABI, REGISTRY_ABI } from './chain.js';
 import { KERNEL_V3_3_ADDRESSES } from './addresses.js';
 import { loadPaymasterConfig, loadTradingConfig } from './config.js';
 import type { PaymasterConfig, TradingConfig } from './config.js';
@@ -17,7 +17,9 @@ import type { PoolClient } from 'pg';
 import { query, withTransaction } from './db.js';
 import { AppError } from './errors.js';
 import { TESTNET_97, testnetAssets } from './testnet-profile.js';
-import { SESSION_GAS_ALLOWED_WEI } from './permissions.js';
+import { SESSION_GAS_ALLOWED_WEI, sessionCallPermissions } from './permissions.js';
+import { YIELD_REGISTRY_ABI } from './yield-abi.js';
+import { MAX_USER_OP_GAS } from './execution-batch.js';
 
 export type PackedSponsorOperation = {
   sender: Address; nonce: bigint; initCode: Hex; callData: Hex; accountGasLimits: Hex;
@@ -96,7 +98,7 @@ export function parsePackedSponsorOperation(value: unknown): PackedSponsorOperat
 }
 
 /** Only canonical Kernel CALL / BATCH DEFAULT modes. Nested renewal delegation is checked separately. */
-function sponsoredCalls(op: PackedSponsorOperation) {
+function sponsoredCalls(op: Pick<PackedSponsorOperation, 'callData'>) {
   try {
     const data = op.callData.startsWith(EXECUTE_USER_OP_SELECTOR) ? slice(op.callData, 4) : op.callData;
     const decoded = decodeFunctionData({ abi: KERNEL_EXECUTE_ABI, data });
@@ -112,8 +114,11 @@ function sponsoredCalls(op: PackedSponsorOperation) {
   } catch { throw rejected('PAYMASTER_CALL_FORBIDDEN', 403); }
 }
 
+/** Shared canonical decoder for persisted execution reconciliation. */
+export function canonicalKernelCalls(callData: Hex) { return sponsoredCalls({ callData }); }
+
 /** Match the SDK's complete two-call toInitConfig, never a general-purpose self-call or delegatecall. */
-function validateRenewal(install: Hex, grant: Hex, c: PaymasterConfig): void {
+function validateRenewal(install: Hex, grant: Hex, c: PaymasterConfig, account: Address, yieldUpgrade = false): void {
   const decoded = decodeFunctionData({ abi: KernelV3_3AccountAbi, data: install });
   if (decoded.functionName !== 'installValidations') throw new Error('invalid install');
   const enableData = decoded.args[2][0];
@@ -128,7 +133,7 @@ function validateRenewal(install: Hex, grant: Hex, c: PaymasterConfig): void {
   if (validAfter !== 0 || validUntil === 0 || signerAddress.length !== 42 || isAddressEqual(signerAddress, zeroAddress)) throw new Error('invalid session');
   const p = TESTNET_97.contracts; // Canonical SDK policy/signer contracts, also pinned in the chain 97 profile.
   const policies = [
-    toCallPolicy({ policyVersion: CallPolicyVersion.V0_0_4, policyAddress: p.callPolicy, permissions: [{ target: c.executor, selector: EXECUTOR_SELECTOR }] }),
+    toCallPolicy({ policyVersion: CallPolicyVersion.V0_0_4, policyAddress: p.callPolicy, permissions: sessionCallPermissions(c.executor, yieldUpgrade ? account : undefined) }),
     toGasPolicy({ policyAddress: p.gasPolicy, allowed: SESSION_GAS_ALLOWED_WEI, enforcePaymaster: true, allowedPaymaster: c.address }),
     toTimestampPolicy({ policyAddress: p.timestampPolicy, validAfter, validUntil }),
   ];
@@ -161,16 +166,31 @@ export function validateSponsoredCalls(op: PackedSponsorOperation, c: PaymasterC
       if (isAddressEqual(call.target, op.sender)) {
         const next = calls[++index];
         if (next === undefined || next.value !== 0n || !isAddressEqual(next.target, op.sender)) throw new Error('incomplete renewal');
-        validateRenewal(call.callData, next.callData, c);
+        try { validateRenewal(call.callData, next.callData, c, op.sender); }
+        catch {
+          if (c.chainId !== 97) throw new Error('yield upgrade requires chain 97');
+          validateRenewal(call.callData, next.callData, c, op.sender, true);
+        }
       } else if (isAddressEqual(call.target, c.executor)) {
         const inner = decodeFunctionData({ abi: EXECUTOR_ABI, data: call.callData });
-        if (inner.functionName !== 'executeRebalance' || !isAddressEqual(inner.args[0], op.sender) || inner.args[1].length === 0 ||
+        if (inner.functionName === 'executeSupply' || inner.functionName === 'executeWithdraw') {
+          if (c.chainId !== 97 || !isAddressEqual(inner.args[0], op.sender) || inner.args[2] === 0n || inner.args[3] === 0n || inner.args[4] === 0n ||
+              !TESTNET_97.yieldMarkets.some(m => m.marketId === inner.args[1]) ||
+              encodeFunctionData({ abi: EXECUTOR_ABI, functionName: inner.functionName, args: inner.args }).toLowerCase() !== call.callData.toLowerCase()) throw new Error('invalid yield call');
+        } else if (inner.functionName !== 'executeRebalance' || !isAddressEqual(inner.args[0], op.sender) || inner.args[1].length === 0 ||
             encodeFunctionData({ abi: EXECUTOR_ABI, functionName: inner.functionName, args: inner.args }).toLowerCase() !== call.callData.toLowerCase()) throw new Error('invalid rebalance');
+      } else if (c.chainId === 97 && isAddressEqual(call.target, TESTNET_97.contracts.yieldRegistry)) {
+        const inner = decodeFunctionData({ abi: YIELD_REGISTRY_ABI, data: call.callData });
+        if (inner.functionName !== 'setYieldPolicy' && inner.functionName !== 'requestExit') throw new Error('invalid yield owner action');
+        if (!TESTNET_97.yieldMarkets.some(m => m.marketId === inner.args[0]) ||
+            inner.functionName === 'setYieldPolicy' && inner.args[2] && inner.args[1] === 0n ||
+            encodeFunctionData({ abi: YIELD_REGISTRY_ABI, functionName: inner.functionName, args: inner.args }).toLowerCase() !== call.callData.toLowerCase()) throw new Error('invalid yield owner calldata');
       } else if (isAddressEqual(call.target, c.registry)) {
         const inner = decodeFunctionData({ abi: REGISTRY_ABI, data: call.callData });
         if (inner.functionName !== 'enroll' || !isAddressEqual(inner.args[0], op.sender) || inner.args[1] === 0n ||
             encodeFunctionData({ abi: REGISTRY_ABI, functionName: inner.functionName, args: inner.args }).toLowerCase() !== call.callData.toLowerCase()) throw new Error('invalid enrollment');
-      } else if (assets.some((asset) => isAddressEqual(call.target, asset)) &&
+      } else if ((assets.some((asset) => isAddressEqual(call.target, asset)) ||
+          c.chainId === 97 && TESTNET_97.yieldMarkets.some(m => isAddressEqual(call.target, m.receipt)) && call.callData.startsWith(toFunctionSelector('approve(address,uint256)'))) &&
           TOKEN_ABI.some((fn) => call.callData.toLowerCase().startsWith(toFunctionSelector(fn)))) {
         const inner = decodeFunctionData({ abi: TOKEN_ABI, data: call.callData });
         if (encodeFunctionData({ abi: TOKEN_ABI, functionName: inner.functionName, args: inner.args }).toLowerCase() !== call.callData.toLowerCase()) throw new Error('noncanonical token call');
@@ -252,6 +272,7 @@ async function readBudgetContext(op: PackedSponsorOperation, c: PaymasterConfig)
   const client = rpc(c);
   const price = await readNativeBudgetPrice(client, c.executor, c.chainId);
   const calls = sponsoredCalls(op);
+  if (pureYieldWithdraw(op, c)) return { ...price, purpose: 'exit' };
   const setup = calls.every((call) => call.callData.startsWith(toFunctionSelector('approve(address,uint256)')) || isAddressEqual(call.target, c.registry));
   // Public requests get an exit exemption only when every strategy token balance is fully sold/transferred.
   // A capped close is authorized through the internal scheduler evidence below instead.
@@ -292,6 +313,16 @@ async function readBudgetContext(op: PackedSponsorOperation, c: PaymasterConfig)
     }
   }
   return { ...price, purpose };
+}
+
+/** Canonical final payload is the authority; partial withdrawals are also pure exits. */
+export function pureYieldWithdraw(op: PackedSponsorOperation, c: PaymasterConfig): boolean {
+  if (c.chainId !== 97) return false;
+  try {
+    validateSponsoredCalls(op, c);
+    return sponsoredCalls(op).every(call => isAddressEqual(call.target, c.executor) &&
+      decodeFunctionData({ abi: EXECUTOR_ABI, data: call.callData }).functionName === 'executeWithdraw');
+  } catch { return false; }
 }
 
 function decimalE8(value: bigint): string {
@@ -510,6 +541,7 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
       await bounded((deps.checkChain ?? checkChain)(op, c), c.timeoutMs);
       let signed = await authorization(op, c, validUntil);
       const context = await bounded((deps.readBudgetContext ?? readBudgetContext)(op, c), c.timeoutMs);
+      if (pureYieldWithdraw(op, c)) context.purpose = 'exit';
       if (deps.exitCallData !== undefined && deps.exitCallData.toLowerCase() === op.callData.toLowerCase()) {
         const executorCall = calls.length === 1 ? calls[0] : undefined;
         const decoded = executorCall !== undefined && isAddressEqual(executorCall.target, c.executor)
@@ -519,6 +551,7 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
         context.purpose = 'exit';
       }
       const cost = gasCost(op, c);
+      if (cost.gasLimit > MAX_USER_OP_GAS) throw rejected('PAYMASTER_USER_OP_CAPACITY', 400);
       const reservedUntil = await (deps.reserve ?? reserveSponsorship)({ hash: signed.userOpHash, op, config: c, validUntil, now: deps.now ?? (() => Math.floor(Date.now() / 1000)), ...cost,
         budget: { executionKey: gasExecutionKey(c.chainId, op), chainId: c.chainId, account: op.sender,
           gasLimit: cost.gasLimit, maxFeePerGas: cost.maxFee, ...context } });

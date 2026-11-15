@@ -4,8 +4,8 @@
 
 ## 來源與封裝
 
-- contracts：目前 repo 地址簿同步乾淨 main worktree `b767bf6b22bb697a0b86abf8ed683916fe81502d`（#87，92 市場）。`deploy/testnet-97.json` 是該版本的原始地址簿，供 keeper 讀取；其中 `gitCommit` 是產生 manifest 的程式版本，與地址簿提交版本分開記錄。#79 已部署的舊產物來源仍是乾淨 archive `068d471fc2c4592c12442ef35602ad1d1a7fe9c3`，本張沒有更新 Railway。
-- backend：`src/testnet-profile.ts` 同步 manifest 的每個地址與 decimals／fee tier；原 38 個 admission caps 不變，新增 54 個各 5,000 MockUSDT；`src/testnet-codehashes.ts` 記錄同一個本機區塊擷取的 319 項 runtime hash。不能從主 clone 的未提交檔案產生地址，不能跳過 hash／selector 檢查。
+- contracts：目前 repo 地址簿由 #85 完整同步 contracts PR #49，manifest `gitCommit=2052c828b0c8afddfd8d98bd0b5fc6207268fc05`，forge 驗收 checkout 為 `74d22927f7399da8f3f4d320a784e99379305084`（92 資產、30 個生息市場）。`deploy/testnet-97.json` 是原始地址簿，供 keeper 讀取；目前 `mode=fork`，不代表公開部署。#79 已部署的舊產物來源仍是乾淨 archive `068d471fc2c4592c12442ef35602ad1d1a7fe9c3`，#85 沒有更新 Railway。
+- backend：`scripts/sync-testnet-profile.ts` 重產 `src/testnet-profile-data.ts`，由 `src/testnet-profile.ts` 匯出；同步 manifest 的每個地址與 decimals／fee tier，原 38 個 admission caps 不變，其餘 54 個各 5,000 MockUSDT。`deploy/testnet-97-codehashes.json` 與 `src/testnet-codehashes.ts` 記錄同一個本機區塊擷取的 380 項 runtime hash，包含生息 target／receipt；重產與來源核對見 [BE-4 交接](yield-userops.zh-TW.md#部署與重產)。不能從主 clone 的未提交檔案產生地址，不能跳過 hash／selector 檢查。
 - app：唯讀使用 `f531ec639ee0d12402c4189b0089d922cbbc2027`（#76），在家目錄外由 archive 建置。chain、RPC、API base、Privy app ID 都是建置時設定；所有 `VITE_*` 都會出現在公開 bundle，禁止放 secret。
 - migration：來源仍是 db repo，這裡只封裝，不新增或修改 SQL。
 
@@ -113,7 +113,7 @@ scheduler 每輪先對帳 chain 97 relayer，不需要 operator key。預設 dry
 
 每日建基金／發版本／加入基金限額預設 10／50／20（C3 暫定），由 `RATE_LIMIT_STRATEGIES_PER_DAY`、`RATE_LIMIT_VERSIONS_PER_DAY`、`RATE_LIMIT_PORTFOLIOS_PER_DAY` 設定。依登入 owner／action／DB UTC 日原子記錄到 `daily_operation_counts`，重啟與多實例共用；等於上限允許，0 禁止，超過回 429 與 Retry-After。這是 action 前消耗的嘗試額度，body 或 action 失敗也計數；DB 錯誤／逾時／未知 commit 回 503，不自動重試扣額或 fallback。scheduler live 只清除七個完整 UTC 日以前的計數，未啟 live 時舊資料保留，不影響正確性。短窗口的登入／查詢限額仍使用記憶體。
 
-**contracts#48 與地址同步：** ABI／角色已對齊新合約；依 C3 分工，正式地址簿、319 項 codehash 與 DB 資產資料留待生息合約完成後跨 repo 一次同步。本 repo 現有地址簿仍是舊部署，strict selector 檢查會拒絕以舊 bytecode 上線。不得把本單 CI／本機測試視為可公開部署。`test/relayer-recovery.fork.ts` 在 localhost／anvil／chain guard 後只於隔離測試 process 綁定 contracts main manifest，驗原交易重播；不改 production profile 或其他 repo。
+**contracts#48／#49 與地址同步：** #85 已完整替換本 repo 的 chain 97 manifest、profile、ABI 與 380 項 runtime pins，含新 executor／yieldRegistry。DB 資產資料與 APP 仍須由各 lane 同步；生息須等 0036 adapter、BE-3 整合及 APP-3 驗收，沒有新增開關或 HTTP 路由。不得把本單 CI／本機測試視為可公開部署，公開啟用仍須下列清單。`test/relayer-recovery.fork.ts` 的隔離 manifest override 是既有驗收方式，不代表目前 repo 仍使用舊地址簿。
 
 keeper 不再查 USDT isMinter，也不 mint USDT；使用合約部署時預撥的 2,000,000 USDT，低於庫存門檻即停止並告警，需由營運補庫存後手動重啟。其他 mock 資產仍檢查 minter 並補庫存。1 小時最低費窗口的預留／釋放不在本單，另單對齊。
 
@@ -128,7 +128,7 @@ Railway 的 `X-Forwarded-For` 含額外代理 hop，不能取最右側當使用�
 - [ ] 使用者在 Privy 開啟 **Return user data in an identity token**。目前尚未開啟；後端 `/auth/privy` 驗的是 identity token。
 - [ ] 使用者將 Railway 網站臨時 origin 加入 Privy allowed origins，確認 email／Google／X 的回跳設定；由真使用者在手機走登入驗收。
 - [ ] C1 完成公開 chain 97 部署、角色 tBNB、paymaster deposit，交付 `mode: public` 地址簿與 executor 建立區塊。
-- [ ] 逐一核對公開 manifest 與這次 fork 的 CREATE2 地址；319 項 codehash／selector 全通過。任一不同即停，重走對應 lane 的同步流程。
+- [ ] 逐一核對公開 manifest 與目前 fork 的 CREATE2 地址；380 項 runtime pins 與必要 selector 全通過。任一不同即停，重走對應 lane 的同步流程。
 - [ ] 先啟 API、套用封裝 migration。API 的交易端點在此階段仍須限制外部使用；下列 alto／keeper 準備好後，再統一跑 chain 97 strict preflight，確認私網、DB、operator、paymaster、bundler、oracle 均正常。
 - [ ] **部署後第 30–60 分鐘啟動價格 keeper**，之後每池每小時至少一筆會動到 tick 的成交；超過 1 小時未成交 oracle 會停報價。secondary 維持 1 小時，AVAX 1 天；USDT feed 同樣必須續推。第一次啟用設定新的劇本起始時間，不能沿用 fork 時間。
 - [ ] 啟用 alto，確認 safe-mode、不同 executor／utility key 與 EntryPoint v0.7；啟用代付前核對額度與餘額。

@@ -100,6 +100,7 @@ export type RenewalKey = {
 };
 
 export type BuildRenewalKeyArgs = {
+  accountAddress?: Address;
   /** sudo owner（使用者的 EOA）。索引由 `(owner, strategyId)` 決定。 */
   owner: Address;
   strategyId: number;
@@ -125,11 +126,13 @@ export async function buildRenewalKey(args: BuildRenewalKeyArgs): Promise<Renewa
   const derived = deriveSessionKey(index, args.material);
   const validUntil = args.validUntil ?? sessionValidUntil();
 
+  const chainId = args.publicClient.chain?.id ?? await args.publicClient.getChainId();
   const session = await buildSessionPermissions({
     publicClient: args.publicClient,
     sessionKeyAddress: derived.address,
     executorAddress: args.executorAddress,
     validUntil,
+    ...(chainId === 97 && args.accountAddress !== undefined ? { yieldAccount: args.accountAddress } : {}),
   });
 
   return {
@@ -214,6 +217,7 @@ export async function buildRenewalParams(
   const validUntil = (deps.validUntil ?? sessionValidUntil)();
 
   const key = await (deps.buildRenewalKey ?? buildRenewalKey)({
+    accountAddress: portfolio.accountAddress as Address,
     owner: portfolio.ownerAddress as Address,
     strategyId: portfolio.strategyId,
     existingKeyRefs: portfolio.existingKeyRefs,

@@ -11,8 +11,8 @@ import hashes from '../src/testnet-codehashes.js';
 import { testnetProfileTargets } from '../src/testnet-preflight.js';
 import manifest from '../deploy/testnet-97.json' with { type: 'json' };
 
-test('#79 profile matches every address in contracts 71870a7 manifest, retaining admission caps', () => {
-  assert.equal(TESTNET_97.sourceCommit, '71870a7cb6231fb9d37f9ea6e319a7624287dcbc');
+test('#79 profile matches every address in contracts yield manifest, retaining admission caps', () => {
+  assert.equal(TESTNET_97.sourceCommit, manifest.gitCommit);
   assert.equal(TESTNET_97.gitCommit, manifest.gitCommit);
   assert.deepEqual(TESTNET_97.roles, Object.fromEntries(Object.entries(manifest.roles).map(([k, v]) => [k, v.toLowerCase()])));
   for (const [name, address] of Object.entries(manifest.contracts)) {
@@ -73,7 +73,7 @@ test('#69 profile preflight verifies every codehash and selector; wrong chain, e
   const { createPublicClient, custom, keccak256, toFunctionSelector } = await import('viem');
   const { checkTestnetProfile, testnetProfileTargets } = await import('../src/testnet-preflight.js');
   const signatures = ['enroll(address,uint256)', 'operator()', 'owner()', 'executeRebalance(address,(address,address,uint256,uint256,address,bytes)[],uint256)',
-    'numeraire()', 'oracle()', 'venues(address)', 'oracleOf(address)', 'previewSwap(address,address,uint256)', 'claimFor(address,uint256)', 'claimable(address)', 'isFaucet(address)', 'welcomeFor(address)', 'decimals()', 'getDeposit()', 'verifyingSigner()'];
+    'executeSupply(address,bytes32,uint256,uint256,uint256)', 'executeWithdraw(address,bytes32,uint256,uint256,uint256)', 'yieldRegistry()', 'quoteSupply(bytes32,address,uint256)', 'quoteWithdraw(bytes32,uint256)', 'market(bytes32)', 'setYieldPolicy(bytes32,uint256,bool)', 'numeraire()', 'oracle()', 'venues(address)', 'oracleOf(address)', 'previewSwap(address,address,uint256)', 'claimFor(address,uint256)', 'claimable(address)', 'isFaucet(address)', 'welcomeFor(address)', 'decimals()', 'getDeposit()', 'verifyingSigner()'];
   const code = `0x${signatures.map((s) => '63' + toFunctionSelector(s).slice(2)).join('')}` as const;
   const hashes = Object.fromEntries(testnetProfileTargets().map((t) => [t.name, keccak256(code)]));
   for (const mode of ['ok', 'chain', 'chain-rpc', 'block', 'code-rpc', 'empty', 'wrong-hash', 'missing-hash', 'selector']) {
@@ -90,7 +90,7 @@ test('#69 profile preflight verifies every codehash and selector; wrong chain, e
     const checks = await checkTestnetProfile(client, expected);
     assert.equal(checks.some((c) => c.level === 'fail'), mode !== 'ok', mode);
     assert.doesNotMatch(JSON.stringify(checks), /secret-rpc/);
-    if (mode === 'ok') assert.equal(checks.length, 319);
+    if (mode === 'ok') assert.equal(checks.length, 380);
   }
 });
 
@@ -157,7 +157,7 @@ test('#87 all 92 raw specs/caps align, original caps stay fixed and every runtim
   }
   assert.equal(extensions, 54);
   assert.deepEqual(Object.keys(hashes).sort(), testnetProfileTargets().map((t) => t.name).sort());
-  assert.equal(testnetProfileTargets().length, 319);
+  assert.equal(testnetProfileTargets().length, 380);
   assert.equal(TESTNET_97.assets.TONCOIN.decimals, 9);
   assert.ok(Object.hasOwn(TESTNET_97.assets, 'Cake'));
 });
@@ -181,7 +181,7 @@ test('#97 strict profile also verifies paymaster signing/deposit, minter and non
   const key = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
   const env = { CHAIN_ID: '97', RPC_URL: 'http://127.0.0.1:8577', PAYMASTER_SIGNER_PRIVATE_KEY: key };
   const signatures = ['enroll(address,uint256)', 'operator()', 'owner()', 'executeRebalance(address,(address,address,uint256,uint256,address,bytes)[],uint256)',
-    'numeraire()', 'oracle()', 'venues(address)', 'oracleOf(address)', 'previewSwap(address,address,uint256)', 'claimFor(address,uint256)', 'claimable(address)', 'isFaucet(address)', 'welcomeFor(address)', 'decimals()', 'getDeposit()', 'verifyingSigner()'];
+    'executeSupply(address,bytes32,uint256,uint256,uint256)', 'executeWithdraw(address,bytes32,uint256,uint256,uint256)', 'yieldRegistry()', 'quoteSupply(bytes32,address,uint256)', 'quoteWithdraw(bytes32,uint256)', 'market(bytes32)', 'setYieldPolicy(bytes32,uint256,bool)', 'numeraire()', 'oracle()', 'venues(address)', 'oracleOf(address)', 'previewSwap(address,address,uint256)', 'claimFor(address,uint256)', 'claimable(address)', 'isFaucet(address)', 'welcomeFor(address)', 'decimals()', 'getDeposit()', 'verifyingSigner()'];
   const code = `0x${signatures.map(s => '63' + toFunctionSelector(s).slice(2)).join('')}` as const;
   const expected = Object.fromEntries(testnetProfileTargets().map(t => [t.name, keccak256(code)]));
   for (const mode of ['ok', 'wrong-numeraire', 'missing-signer', 'wrong-signer', 'wrong-operator', 'deposit-zero', 'deposit-below', 'deposit-equal', 'minter', 'rpc', 'missing-data', 'timeout',

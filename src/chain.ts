@@ -22,6 +22,7 @@ import type { RebalanceSchedule } from './strategies.js';
 import type { CanonicalConfig, FundingSchedule } from './strategy-execution.js';
 import { numeraireFor } from './strategy-execution.js';
 import { AppError } from './errors.js';
+import { YIELD_EXECUTOR_ABI } from './yield-abi.js';
 
 /**
  * Chain integration: the backend relayer is the registry operator for enrollment and the provider
@@ -203,8 +204,14 @@ export const EXECUTOR_ABI = [
     { name: 'target', type: 'address', indexed: true }, { name: 'kind', type: 'uint8', indexed: false },
     { name: 'spender', type: 'address', indexed: false },
   ] },
+  ...YIELD_EXECUTOR_ABI,
 ] as const;
 export const EXECUTOR_SELECTOR = toFunctionSelector(EXECUTOR_ABI[3]);
+export const YIELD_EXECUTION_SELECTORS: readonly Hex[] = ['executeSupply', 'executeWithdraw'].map(name => {
+  const fn = YIELD_EXECUTOR_ABI.find(item => item.type === 'function' && item.name === name);
+  if (!fn || fn.type !== 'function') throw new Error('生息 executor ABI 缺少必要函式');
+  return toFunctionSelector(fn);
+});
 export const PLAN_HASH_ABI = [
   { name: 'steps', type: 'tuple[]', components: SWAP_STEP_COMPONENTS }, { name: 'deadline', type: 'uint256' },
 ] as const;

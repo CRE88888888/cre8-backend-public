@@ -10,17 +10,17 @@
 {
   "chainId": 97,
   "allocation": {"assets": [
-    {"address": "0x6de69565f250146c67d56be5aa15b6f181fce4d7", "weightBps": 5000},
-    {"address": "0xbd7d814e02c9f69af391a8ba4c1787769f2ddd4b", "weightBps": 5000}
+    {"address": "0xb9bb138ebe73b16d6b8134724e43cd02d8db395a", "weightBps": 5000},
+    {"address": "0x383bd2556f60c04edd1ede4f5a0874da3398f72a", "weightBps": 5000}
   ]},
   "execution": {
     "kind": "per_asset",
-    "numeraire": "0xbd7d814e02c9f69af391a8ba4c1787769f2ddd4b",
+    "numeraire": "0x383bd2556f60c04edd1ede4f5a0874da3398f72a",
     "rebalance": "none",
     "assets": [
-      {"asset": "0x6de69565f250146c67d56be5aa15b6f181fce4d7", "weightBps": 5000,
+      {"asset": "0xb9bb138ebe73b16d6b8134724e43cd02d8db395a", "weightBps": 5000,
        "execution": {"kind": "stack", "every": "weekly", "weekday": 1, "timeUtc": "01:00", "slices": 12}, "yield": null},
-      {"asset": "0xbd7d814e02c9f69af391a8ba4c1787769f2ddd4b", "weightBps": 5000, "yield": null}
+      {"asset": "0x383bd2556f60c04edd1ede4f5a0874da3398f72a", "weightBps": 5000, "yield": null}
     ]
   },
   "schedule": {"kind": "funding"},

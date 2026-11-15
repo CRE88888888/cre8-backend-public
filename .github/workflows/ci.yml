@@ -64,6 +64,9 @@ jobs:
           test/price-keeper.rpc.test.ts
           test/user-operation.test.ts
           test/funding.test.ts
+          test/faucet.test.ts
+          test/points.test.ts
+          test/welcome-grants.test.ts
           test/holdings-scan.test.ts
           test/kernel.test.ts
           test/notify.test.ts

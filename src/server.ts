@@ -387,7 +387,7 @@ async function route(
   const segments = url.pathname.split('/').filter((segment) => segment.length > 0);
   const [root] = segments;
 
-  if (root === 'portfolios' && segments.length === 3 && ['execution', 'funding-lots', 'execution-state'].includes(segments[2] ?? '')) {
+  if (root === 'portfolios' && segments.length === 3 && ['execution', 'funding-lots', 'buy-funding', 'execution-state'].includes(segments[2] ?? '')) {
     const action = segments[2];
     const expected = action === 'execution' ? 'GET' : 'POST';
     if (method !== expected) return methodNotAllowed(res, [expected]);
@@ -399,8 +399,9 @@ async function route(
     } else {
       const input = await readJsonBody(req);
       const result = action === 'funding-lots' ? await deps.portfolioStrategies.funding(id, wallet, input)
+        : action === 'buy-funding' ? await deps.portfolioStrategies.buyFunding(id, wallet, input)
         : await deps.portfolioStrategies.executionState(id, wallet, input);
-      sendJson(res, 200, result);
+      sendJson(res, 'state' in result && result.state === 'pending' ? 202 : 200, result);
     }
     return;
   }

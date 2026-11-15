@@ -300,6 +300,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     configuredAddress(env, 'PAYMASTER_MOCK_USDT_ADDRESS');
   }
   loadFaucetConfig(env);
+  loadWelcomeConfig(env);
   // API 與 scheduler 的啟動都走這裡；不要等第一則警示才發現只填了一半。
   loadTelegramConfig(env);
   loadRateLimitConfig(env);
@@ -512,6 +513,15 @@ function configuredAddress(env: NodeJS.ProcessEnv, name: string): Address | null
 }
 
 export type FaucetConfig = { chainId: 97; amountWei: bigint; siteDailyWei: bigint; timeoutMs: number };
+
+export const WELCOME_AMOUNT_WEI = 10_000n * 10n ** 18n;
+export type WelcomeConfig = { chainId: 97; siteDailyWei: bigint; timeoutMs: number };
+export function loadWelcomeConfig(env: NodeJS.ProcessEnv = process.env): WelcomeConfig | null {
+  if (parseInteger(env, 'CHAIN_ID', DEFAULT_CHAIN_ID, { min: 1 }) !== 97) return null;
+  const siteDailyWei = parseBigInt(env, 'WELCOME_USDT_SITE_DAILY_WEI', 5_000_000n * 10n ** 18n);
+  if (siteDailyWei >= 1n << 256n) throw new ConfigurationError('WELCOME_USDT_SITE_DAILY_WEI exceeds uint256');
+  return { chainId: 97, siteDailyWei, timeoutMs: 5_000 };
+}
 
 /** Fixed ONE claim per owner/UTC day. Only token amount and site cap are configurable (18 decimals). */
 export function loadFaucetConfig(env: NodeJS.ProcessEnv = process.env): FaucetConfig | null {

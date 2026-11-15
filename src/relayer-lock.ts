@@ -23,7 +23,8 @@ export async function withRelayerLock<T>(chainId: number, action: (assertHeld: (
     assertHeld();
     // A timed-out eth_sendRawTransaction may still be accepted later. Never acquire
     // another nonce until the durable hash is reconciled, even on a later UTC day.
-    const unresolved = await client.query("select id from faucet_claims where chain_id=97 and state in ('submitted','unknown') and tx_hash is not null limit 1")
+    const unresolved = await client.query(`select id from faucet_claims where chain_id=97 and state in ('submitted','unknown') and tx_hash is not null
+      union all select id from welcome_grants where chain_id=97 and state in ('submitted','unknown') and tx_hash is not null limit 1`)
       .catch(() => { throw unavailable(); });
     if (unresolved.rows.length > 0) throw unavailable();
     assertHeld();

@@ -1,5 +1,6 @@
-import { createPublicClient, custom, encodeAbiParameters, toFunctionSelector, toEventSelector, toHex } from 'viem';
+import { createPublicClient, custom, encodeAbiParameters, toFunctionSelector, toEventSelector, toHex, encodeFunctionData, zeroAddress } from 'viem';
 import type { Address, Hex } from 'viem';
+import { WELCOME_ABI } from '../../src/welcome-grants.js';
 import { TESTNET_97 } from '../../src/testnet-profile.js';
 import type { Allocation } from '../../src/strategies.js';
 
@@ -15,6 +16,7 @@ export function strategyRpc(allocation: Allocation, configHash: Hex, activeAt: D
     now: BigInt(activeAt.getTime() / 1000), configHash, activeAt: BigInt(activeAt.getTime() / 1000),
     weights: allocation.assets.map((asset) => asset.weightBps), version: 1, pinned: 1, strategyId: 82n,
     historicalPinned: 1, historicalNow: BigInt(activeAt.getTime() / 1000), latestBlockNumber: 130n,
+    mint: false, minter: true, transferFrom: zeroAddress as Address, txFrom: TESTNET_97.roles.operator as Address, txTo: TESTNET_97.contracts.usdt as Address, txValue: 0n, wrongInput: false, missingReceipt: false,
     blockReads: 0, reorgAtBlockRead: 0, cashRaw: TEST_AMOUNT, fail: '', reads: [] as string[] };
   const client = createPublicClient({ transport: custom({ request: async ({ method, params }) => {
     state.reads.push(method);
@@ -25,11 +27,17 @@ export function strategyRpc(allocation: Allocation, configHash: Hex, activeAt: D
       miner: TEST_OWNER, size: '0x1', extraData: '0x', parentHash: OTHER_HASH, transactions: [], difficulty: '0x0', totalDifficulty: '0x0',
       nonce: '0x0000000000000000', baseFeePerGas: '0x0', receiptsRoot: OTHER_HASH, stateRoot: OTHER_HASH, transactionsRoot: OTHER_HASH,
       logsBloom: `0x${'0'.repeat(512)}`, sha3Uncles: OTHER_HASH, uncles: [] }; }
+    if (method === 'eth_getTransactionByHash') return { hash: state.txHash, from: state.txFrom, to: state.txTo,
+      blockHash: state.receiptBlockHash, blockNumber: '0x82', transactionIndex: '0x0', value: toHex(state.txValue),
+      input: state.wrongInput ? '0x' : encodeFunctionData({ abi: WELCOME_ABI, functionName: 'mint', args: [state.to, state.amount] }),
+      nonce: '0x0', gas: '0x100000', gasPrice: '0x1', type: '0x0', v: '0x1b', r: OTHER_HASH, s: OTHER_HASH };
     if (method === 'eth_getTransactionReceipt') {
+      if (state.missingReceipt) return null;
       const log = { address: state.token, blockHash: state.receiptBlockHash, blockNumber: '0x82', transactionHash: state.txHash,
         transactionIndex: '0x0', logIndex: toHex(state.logIndex), removed: state.removed,
         data: state.malformed ? '0x' : encodeAbiParameters([{ type: 'uint256' }], [state.amount]),
-        topics: [toEventSelector('Claimed(address,uint256,address)'), encodeAbiParameters([{ type: 'address' }], [state.to]), encodeAbiParameters([{ type: 'address' }], [state.by])] };
+        topics: state.mint ? [toEventSelector('Transfer(address,address,uint256)'), encodeAbiParameters([{ type: 'address' }], [state.transferFrom]), encodeAbiParameters([{ type: 'address' }], [state.to])]
+          : [toEventSelector('Claimed(address,uint256,address)'), encodeAbiParameters([{ type: 'address' }], [state.to]), encodeAbiParameters([{ type: 'address' }], [state.by])] };
       return { transactionHash: state.txHash, transactionIndex: '0x0', blockHash: state.receiptBlockHash, blockNumber: '0x82',
         from: state.by, to: state.token, gasUsed: '0x100', cumulativeGasUsed: '0x100', effectiveGasPrice: '0x1', type: '0x2',
         status: state.success ? '0x1' : '0x0', contractAddress: null, logsBloom: `0x${'0'.repeat(512)}`,
@@ -39,6 +47,7 @@ export function strategyRpc(allocation: Allocation, configHash: Hex, activeAt: D
       if (!Array.isArray(params) || typeof params[0] !== 'object' || params[0] === null) throw new Error('missing call');
       const data: unknown = Reflect.get(params[0], 'data');
       if (typeof data !== 'string') throw new Error('missing calldata');
+      if (data.startsWith(toFunctionSelector('isMinter(address)'))) return encodeAbiParameters([{ type: 'bool' }], [state.minter]);
       if (data.startsWith(toFunctionSelector('balanceOf(address)'))) return encodeAbiParameters([{ type: 'uint256' }], [state.cashRaw]);
       if (data.startsWith(toFunctionSelector('version(uint256,uint16)'))) return encodeAbiParameters([
         { type: 'tuple', components: [{ name: 'assets', type: 'address[]' }, { name: 'weightsBps', type: 'uint16[]' }, { name: 'scheduleHash', type: 'bytes32' }, { name: 'activeAt', type: 'uint64' }] },

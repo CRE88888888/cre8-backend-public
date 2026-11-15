@@ -51,7 +51,8 @@ enroll、投入及執行均核對 pinned 版本、chain、allocation、scheduleH
 | 端點 | 契約 |
 | --- | --- |
 | GET `/portfolios/:id/execution` | pinned config/hash、enabled、automation、建議投入、cash／balances、最近 100 lots／jobs、lotAssets 與 slices 執行狀態 |
-| POST `/portfolios/:id/funding-lots` | `{source:{kind:"faucet_claim",claimId:"123"}}`；回永久事件、effectiveSlices、confirmedAt、fundingStatus、replayed |
+| POST `/portfolios/:id/buy-funding` | 首次買入先呼叫，body `{}`；chain 97 無 USDT 且未有迎新時自動發 10,000 並建 lot。回 `{state:"ready",funding,lot}`（200）或 `{state:"pending",grantId,txHash,lot:null,funding:"welcome_grant"}`（202）；pending 只重試同一請求，不可當成已投入 |
+| POST `/portfolios/:id/funding-lots` | `{source:{kind:"faucet_claim",claimId:"123"}}` 或 `{source:{kind:"welcome_grant",grantId:"123"}}`；回永久事件、effectiveSlices、confirmedAt、fundingStatus、replayed |
 | POST `/portfolios/:id/execution-state` | `{enabled:false}` 暫停新買入；true 恢復；漏期不追扣，未知先對帳 |
 
 `stack-instructions`／`stack-instruction-state` HTTP 路由已移除（404）；持有人不能覆寫創作者排程。舊 revision 仍供歷史稽核。
@@ -60,7 +61,15 @@ cash 讀同一區塊的 USDT，顯示未分類與短缺，不憑 balance 差造 
 
 ### 本金與合單
 
-唯一核准來源為 chain 97 本人請求的 faucet claim。服務端核對已保存 claim 的 owner／account／金額／txHash、canonical receipt 及唯一 `Claimed`、receipt 區塊的 enrollment 與前後 block hash。普通 Transfer、捐入、利息、領回款不能成為本金，可由 owner 原樣轉出。
+核准來源為 chain 97 本人請求的每日 `faucet_claim` 與首次買入的 `welcome_grant`。每日領取仍是一鍵 `POST /faucet/usdt {account}`，預設 1,000／owner／UTC 日，全站每日 1,000,000。服務端核對已保存 claim 的 owner／account／金額／txHash、canonical receipt 及唯一 `Claimed`、receipt 區塊的 enrollment 與前後 block hash。普通 Transfer、捐入、利息、領回款不能成為本金，可由 owner 原樣轉出。
+
+迎新固定 10,000（18 decimals），operator 用 manifest USDT 的 `mint`；不使用 `claimFor`，不占每日領取的額度或合約 rolling 24h 限額，同一天仍可另領每日 1,000。迎新全站每日上限預設 5,000,000（500 人），`WELCOME_USDT_SITE_DAILY_WEI` 可調，0 停止新預留、等號允許；與每日水龍頭分開。`POINTS_ENABLED` 未設或為 0 時，積分、任務、排行榜、邀請與相關 operator API 均回 503／`POINTS_DISABLED`，資料及程式保留。
+
+APP 在已完成 enrollment 的基金買入前呼叫 `buy-funding`。有原迎新交易時先驗證／恢復原 lot，再讀鏈上現金；未有迎新且鏈上現金為 0 才自動 mint。有既存轉入款則回 `funding:"existing_cash",lot:null`，不把餘額當成本金。迎新已指派另一檔基金、終態 failed，或同基金的迎新已用盡／提空，且現金為 0 時，回 409／`DAILY_FAUCET_REQUIRED`，畫面提供每日領取；原 lot 與終生鍵保留，不再次 mint。RPC／DB 不可用回 503；缺成功證據回 409／503，不重發。
+
+`welcome_grants` 需要 db 0033（per-asset 使用 0032／0034）。`(chain_id,owner)` 終生唯一包含 reserved／submitted／unknown／confirmed／failed，不能換基金、跨日或重啟再領；failed 只釋放原日站上額度。原日獨立日期鎖、READ COMMITTED 鎖後才讀額度；先確認 reservation commit，再準備簽名，先確認 submitted＋原 hash commit，再廣播一次。DB commit 回應未知時不廣播，重試讀原鍵；reserved 無 hash 也不推定可以再發，需營運對帳。submitted／unknown hash 會阻擋所有共用 relayer 新 nonce，直到原 portfolio 以 `buy-funding` 或明確來源 `funding-lots` 完成對帳。未知 hash 無 receipt 時保持未決，不自動重簽／重送／釋放。
+
+迎新入帳必須核對 chain 97、manifest token、原 operator 的精確 mint calldata、零 value、receipt-time minter、成功且 canonical 的 receipt，以及唯一 `Transfer(0x0,基金帳戶,10000e18)`。grant confirmed 後才以 portfolio／cash-row 鎖原子建立明示來源的 lot 和正確現金桶。grant 已確認但 lot commit 未知時重試沿用原來源；不再 mint、不重加現金。reorg／原證據搬動會凍結 lot 與新工作，保留終生鍵和原證據待對帳。
 
 投入全額是**本金與費用的總預算**。新 lot 按原權重一次固定逐資產預算；非現金 floor(total×bps/10000)，尾差歸 cash。hold／stack 分別進 unallocated_hold／stack_prefund，cash 立即 allocated 且完成，不再乘權重。純現金無費用、無空買單。永久鍵 `(chain,txHash,logIndex)`；重播保留原確認時間，不重加桶。重組保留原預留並停止新工作，不復活來源。
 

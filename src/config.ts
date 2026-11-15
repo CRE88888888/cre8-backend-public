@@ -63,6 +63,46 @@ export function loadPaymasterConfig(env: NodeJS.ProcessEnv = process.env): Payma
 /** 僅含變數名與格式診斷，不含 env 原值；可安全寫入 server log。 */
 export class ConfigurationError extends Error {}
 
+export const POINTS_TASKS = ['enroll', 'deposit', 'rebalance', 'create_fund', 'withdraw', 'invite_reward'] as const;
+export type PointsKind = typeof POINTS_TASKS[number];
+export type PointsRule = { points: bigint; dailyCount: bigint; dailyPoints: bigint };
+export type PointsConfig = {
+  chainId: number; rpcUrl: string; registry: Address; executor: Address; token: Address;
+  fromBlock: bigint; confirmations: bigint; delaySeconds: number; timeoutMs: number;
+  rules: Record<PointsKind, PointsRule>;
+};
+
+/** Test campaign only. The starting block must cover ALL campaign history, including retries. */
+export function loadPointsConfig(env: NodeJS.ProcessEnv = process.env): PointsConfig | null {
+  if (!env.POINTS_ENABLED?.trim() || env.POINTS_ENABLED.trim() === '0') return null;
+  if (env.POINTS_ENABLED.trim() !== '1') throw new ConfigurationError('POINTS_ENABLED must be 0 or 1');
+  const chainId = parseInteger(env, 'CHAIN_ID', DEFAULT_CHAIN_ID, { min: 1, max: Number.MAX_SAFE_INTEGER });
+  if (![97, 1337, 31337].includes(chainId)) throw new ConfigurationError('POINTS_ENABLED requires chain 97, 1337 or 31337');
+  const address = (name: string): Address => {
+    const value = configuredAddress(env, name);
+    if (!value || /^0x0{40}$/.test(value)) throw new ConfigurationError(name + ' must be a nonzero address');
+    return value;
+  };
+  if (!env.RPC_URL?.trim()) throw new ConfigurationError('RPC_URL is required for points');
+  try {
+    if (!['http:', 'https:'].includes(new URL(env.RPC_URL.trim()).protocol)) throw new Error();
+  } catch { throw new ConfigurationError('RPC_URL must be an HTTP(S) URL for points'); }
+  if (!env.POINTS_FROM_BLOCK?.trim()) throw new ConfigurationError('POINTS_FROM_BLOCK is required and must cover the campaign history');
+  const rule = (kind: PointsKind): PointsRule => {
+    const prefix = 'POINTS_' + kind.toUpperCase();
+    return { points: parseBigInt(env, prefix, 10n), dailyCount: parseBigInt(env, prefix + '_DAILY_COUNT', 10n),
+      dailyPoints: parseBigInt(env, prefix + '_DAILY_POINTS', 100n) };
+  };
+  const confirmations = parseBigInt(env, 'POINTS_CONFIRMATIONS', 12n);
+  if (confirmations === 0n) throw new ConfigurationError('POINTS_CONFIRMATIONS must be positive');
+  return { chainId, rpcUrl: env.RPC_URL.trim(), registry: address('REGISTRY_ADDRESS'), executor: address('EXECUTOR_ADDRESS'),
+    token: address('PAYMASTER_MOCK_USDT_ADDRESS'), fromBlock: parseBigInt(env, 'POINTS_FROM_BLOCK', 0n), confirmations,
+    delaySeconds: parseInteger(env, 'POINTS_DELAY_SECONDS', 86_400, { min: 0, max: 31_536_000 }),
+    timeoutMs: parseInteger(env, 'POINTS_TIMEOUT_MS', 5_000, { min: 1, max: 30_000 }),
+    rules: { enroll: rule('enroll'), deposit: rule('deposit'), rebalance: rule('rebalance'), create_fund: rule('create_fund'),
+      withdraw: rule('withdraw'), invite_reward: rule('invite_reward') } };
+}
+
 /** USD uses exact E8 integers; zero caps block positive usage. Exit has no account cap. */
 export type TradingConfig = {
   minStepUsdE8: bigint; minBatchUsdE8: bigint; minDepositUsdE8: bigint;
@@ -262,6 +302,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   loadRelayerGasConfig(env);
   loadPaymasterConfig(env);
   loadTradingConfig(env);
+  loadPointsConfig(env);
 
   return {
     databaseUrl,

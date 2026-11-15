@@ -13,6 +13,7 @@ import { authenticate, issueNonce, login, logout, parseLoginBody } from './auth.
 import { loginWithPrivy } from './privy.js';
 import { claimFaucetUsdt } from './faucet.js';
 import { sponsorUserOperation } from './paymaster.js';
+import { createPointsService } from './points.js';
 import { RateLimitError, RequestRateLimiter } from './ratelimit.js';
 import { getConfig, getSessionKeyConfig } from './config.js';
 import { createPlatformStatusReader } from './chain.js';
@@ -168,6 +169,7 @@ export const BUNDLER_TIMEOUT_MS = 30_000;
  * merged over the defaults, so a test can stub one dependency and leave the rest real.
  */
 export type ServerDeps = {
+  points: ReturnType<typeof createPointsService>;
   claimFaucetUsdt: typeof claimFaucetUsdt;
   sponsorUserOperation: typeof sponsorUserOperation;
   privyLogin: typeof loginWithPrivy;
@@ -288,6 +290,7 @@ async function defaultListAssets(): Promise<PriceableAsset[]> {
 }
 
 const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
+  points: createPointsService(),
   claimFaucetUsdt,
   sponsorUserOperation,
   privyLogin: loginWithPrivy,
@@ -381,6 +384,39 @@ async function route(
   const method = req.method ?? 'GET';
   const segments = url.pathname.split('/').filter((segment) => segment.length > 0);
   const [root] = segments;
+
+  // Points administration has no chain write capability and does not require enabling rebalance.
+  // Authorize here before the general operator guard, without changing existing operator routes.
+  if (root === 'operator' && segments[1] === 'points' && segments.length === 3) {
+    const action = segments[2];
+    const expected = action === 'metrics' ? 'GET' : action === 'freeze' || action === 'sync' ? 'POST' : null;
+    if (expected !== null) {
+      if (method !== expected) return methodNotAllowed(res, [expected]);
+      const wallet = await deps.auth.authenticate(req.headers.authorization);
+      const wallets = deps.operatorWallets ?? resolveOperatorWallets();
+      if (!wallets.some((allowed) => allowed.toLowerCase() === wallet.toLowerCase())) throw new AppError(403, 'OPERATOR_FORBIDDEN', 'wallet is not authorized to use operator endpoints');
+      await deps.rateLimiter.wallet('plan', wallet);
+      const result = action === 'freeze' ? await deps.points.freeze(await readJsonBody(req), wallet)
+        : action === 'sync' ? await deps.points.sync() : await deps.points.metrics();
+      sendJson(res, 200, result);
+      return;
+    }
+  }
+
+  if ((root === 'points' && segments.length === 2 && ['me', 'history', 'leaderboard', 'tasks'].includes(segments[1] ?? '')) ||
+    (root === 'invites' && segments.length === 2 && ['me', 'bind'].includes(segments[1] ?? ''))) {
+    const expected = root === 'invites' && segments[1] === 'bind' ? 'POST' : 'GET';
+    if (method !== expected) return methodNotAllowed(res, [expected]);
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    await deps.rateLimiter.wallet('plan', wallet);
+    const params = Object.fromEntries(url.searchParams);
+    const result = root === 'invites' ? segments[1] === 'bind' ? await deps.points.bind(await readJsonBody(req), wallet) : await deps.points.invites(wallet)
+      : segments[1] === 'me' ? await deps.points.balance(wallet)
+      : segments[1] === 'history' ? await deps.points.history(wallet, params)
+      : segments[1] === 'leaderboard' ? await deps.points.leaderboard(params) : deps.points.tasks();
+    sendJson(res, 200, result);
+    return;
+  }
 
   // 所有 /operator/* 共用同一道授權，不能只靠登入或鏈上的交易限制。
   // 先驗登入（401），再驗寫入開關（403，與 /portfolios/:id/rebalance 一致），最後驗身分。

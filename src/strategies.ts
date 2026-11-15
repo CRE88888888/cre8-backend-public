@@ -1,7 +1,11 @@
+import { withRelayerLock } from './relayer-lock.js';
 import { configuredChainId, TESTNET_97, testnetAssets } from './testnet-profile.js';
-import { isChainConfigured, publishVersionOnchain, registerStrategyOnchain } from './chain.js';
-import { isForeignKeyViolation, isUniqueViolation, query } from './db.js';
-import { ForbiddenError, NotFoundError, ValidationError } from './errors.js';
+import { assertVersionOnchain, getChain, isChainConfigured, publishVersionOnchain, registerStrategyOnchain } from './chain.js';
+import { isForeignKeyViolation, isUniqueViolation, query, withTransaction } from './db.js';
+import { AppError, ForbiddenError, NotFoundError, ValidationError } from './errors.js';
+import { canonicalConfigHash, exactKeys, minimumAllocationRaw, record, utcDate, validateExecution, validateFundingSchedule, validateIdleYield, numeraireFor } from './strategy-execution.js';
+import type { FundingSchedule, TypedExecution } from './strategy-execution.js';
+import type { Address, Hex } from 'viem';
 
 /** Basis-point denominator. On-chain AtpRegistry uses the same TOTAL_WEIGHT_BPS. */
 export const BPS_DENOMINATOR = 10_000;
@@ -51,7 +55,12 @@ export type StrategyVersion = {
   strategyId: number;
   version: number;
   allocation: Allocation;
-  schedule: RebalanceSchedule;
+  schedule: RebalanceSchedule | FundingSchedule;
+  executionSchemaVersion: 0 | 1;
+  execution: TypedExecution | { kind: 'target_weight' };
+  executionChainId: number | null;
+  configHash: Hex | null;
+  idleYield: { enabled: false };
   changeLog: string | null;
   activeAt: string | null;
   createdAt: string;
@@ -69,7 +78,10 @@ export type CreateStrategyInput = {
 
 export type PublishVersionInput = {
   allocation: unknown;
-  schedule: unknown;
+  schedule?: unknown;
+  execution?: unknown;
+  chainId?: unknown;
+  idleYield?: unknown;
   changeLog?: string | null;
   /** First instant the version may execute; defaults to now. Accepts ISO-8601 or Date. */
   activeAt?: string | Date | null;
@@ -91,7 +103,7 @@ export type StrategyPage = {
 
 const STRATEGY_COLUMNS = 'id, provider, name, description, is_public, swap_fee_bps, onchain_id, created_at';
 const VERSION_COLUMNS =
-  'strategy_id, version, allocation, schedule, change_log, active_at, created_at';
+  'strategy_id, version, allocation, schedule, change_log, active_at, created_at, execution_schema_version, execution, execution_chain_id, config_hash';
 
 type StrategyRow = {
   id: string;
@@ -113,7 +125,19 @@ type VersionRow = {
   change_log: string | null;
   active_at: Date | null;
   created_at: Date;
+  execution_schema_version: 0 | 1;
+  execution: TypedExecution | { kind: 'target_weight' };
+  execution_chain_id: string | null;
+  config_hash: Hex | null;
 };
+
+/** HTTP always uses this path. Untagged internal legacy writers retain their existing encoding. */
+export function typedVersionInput(input: unknown): PublishVersionInput {
+  if (!record(input)) throw new ValidationError('INVALID_VERSION', 'request body must be a JSON object');
+  exactKeys(input, ['allocation', 'schedule', 'execution', 'chainId', 'idleYield', 'changeLog', 'activeAt'], 'INVALID_VERSION');
+  return { ...input, allocation: input.allocation, execution: validateExecution(input.execution),
+    schedule: validateFundingSchedule(input.schedule), idleYield: validateIdleYield(input.idleYield) };
+}
 
 // ---------------------------------------------------------------------------
 // Pure validation (no DB) — also the contract the HTTP layer relies on.
@@ -275,6 +299,7 @@ export function validateCreateStrategyInput(
   if (!isRecord(input)) {
     throw new ValidationError('INVALID_STRATEGY', 'request body must be a JSON object');
   }
+  exactKeys(input, ['provider', 'name', 'description', 'isPublic', 'swapFeeBps'], 'INVALID_STRATEGY');
 
   const owner = requireString(provider, 'provider', MAX_PROVIDER_LENGTH).toLowerCase();
   const name = requireString(input.name, 'name', MAX_NAME_LENGTH);
@@ -433,11 +458,21 @@ export async function getStrategy(id: number): Promise<StrategyDetail> {
  * `provider` is the authenticated session wallet: publishing requires ownership, so a caller can
  * only append versions to its own strategies (403 FORBIDDEN otherwise).
  */
+export type TypedPublishDeps = {
+  isChainConfigured: typeof isChainConfigured;
+  validateChain: () => void;
+  publishOnchain: typeof publishVersionOnchain;
+  relayerLock: typeof withRelayerLock;
+};
+
 export async function publishVersion(
   strategyId: number,
   input: PublishVersionInput,
   provider: string,
+  deps: Partial<TypedPublishDeps> = {},
 ): Promise<StrategyVersion> {
+  exactKeys(input, ['allocation', 'schedule', 'execution', 'chainId', 'idleYield', 'changeLog', 'activeAt'], 'INVALID_VERSION');
+  if (input.execution !== undefined || input.chainId !== undefined || input.idleYield !== undefined || (record(input.schedule) && input.schedule.kind === 'funding')) return publishTypedVersion(strategyId, input, provider, deps);
   const allocation = validateAllocation(input.allocation);
   const schedule = validateSchedule(input.schedule);
   const changeLog = validateChangeLog(input.changeLog);
@@ -494,6 +529,98 @@ export async function publishVersion(
   throw new Error(`could not allocate a version for strategy ${strategyId} after ${attempts} attempts`);
 }
 
+async function publishTypedVersion(strategyId: number, raw: PublishVersionInput, provider: string, overrides: Partial<TypedPublishDeps>): Promise<StrategyVersion> {
+  const deps: TypedPublishDeps = { isChainConfigured, validateChain: () => { getChain(); }, publishOnchain: publishVersionOnchain, relayerLock: withRelayerLock, ...overrides };
+  const input = typedVersionInput(raw);
+  const chainId = input.chainId === undefined ? configuredChainId() : input.chainId;
+  if (chainId !== configuredChainId()) throw new ValidationError('CHAIN_MISMATCH', 'chainId must match this API deployment');
+  const execution = validateExecution(input.execution);
+  if (!record(input.allocation)) throw new ValidationError('INVALID_ALLOCATION', 'allocation must be an object');
+  exactKeys(input.allocation, ['assets'], 'INVALID_ALLOCATION');
+  if (Array.isArray(input.allocation.assets)) for (const asset of input.allocation.assets) {
+    if (record(asset)) exactKeys(asset, ['address', 'weightBps', 'symbol'], 'INVALID_ASSET');
+  }
+  const allocation = validateAllocation(input.allocation);
+  if (execution.kind === 'stack' && allocation.assets.every((asset) => asset.address === numeraireFor(chainId))) {
+    throw new ValidationError('STACK_CASH_ONLY', 'stack requires at least one non-cash asset; choose hold for pure cash');
+  }
+  const schedule = validateFundingSchedule(input.schedule);
+  const changeLog = validateChangeLog(input.changeLog);
+  const suppliedAt = input.activeAt === undefined || input.activeAt === null ? null :
+    input.activeAt instanceof Date ? input.activeAt : utcDate(input.activeAt, 'activeAt');
+  if (suppliedAt !== null && (!Number.isFinite(suppliedAt.getTime()) || suppliedAt.getTime() < 0 || suppliedAt.getTime() % 1000 !== 0)) {
+    throw new ValidationError('INVALID_ACTIVE_AT', 'activeAt must be a nonnegative whole-second timestamp');
+  }
+  try {
+    const preflight = (await query<{ provider: string; onchain_id: string | null }>('select provider,onchain_id from strategies where id=$1', [strategyId])).rows[0];
+    if (!preflight) throw new NotFoundError(`strategy ${strategyId} not found`);
+    assertProviderOwns(preflight.provider, provider);
+    if (preflight.onchain_id !== null) {
+      if (!deps.isChainConfigured()) throw new AppError(503, 'VERSION_UNAVAILABLE', 'chain mirror configuration unavailable; no new version stored');
+      deps.validateChain();
+    }
+    // Admit the shared signer before persisting a new immutable version. Busy is safely retryable.
+    const saveAndMirror = async (assertHeld: () => void) => {
+      assertHeld();
+      const written = await withTransaction(async (client) => {
+        await client.query("set local lock_timeout='5s'");
+        const owner = (await client.query<{ provider: string; onchain_id: string | null }>(
+          'select provider, onchain_id from strategies where id=$1 for update', [strategyId])).rows[0];
+        if (owner === undefined) throw new NotFoundError(`strategy ${strategyId} not found`);
+        assertProviderOwns(owner.provider, provider);
+        if (owner.onchain_id !== preflight.onchain_id) throw new AppError(409, 'STRATEGY_CHANGED', 'strategy chain identity changed; retry before publishing');
+        const previous = (await client.query<VersionRow>(`select ${VERSION_COLUMNS} from strategy_versions where strategy_id=$1 order by version desc limit 1`, [strategyId])).rows[0];
+        // Retry a failed/unknown mirror with the same immutable config, including its original default time.
+        const retryAt = previous?.active_at;
+        const retry = suppliedAt === null && retryAt !== undefined && retryAt !== null && previous?.config_hash ===
+          canonicalConfigHash({ chainId, execution, allocation, schedule, activeAt: retryAt });
+        const activeAt = suppliedAt ?? (retry && retryAt ? retryAt : new Date(Math.floor(Date.now() / 1000) * 1000));
+        const configHash = canonicalConfigHash({ chainId, execution, allocation, schedule, activeAt });
+        if (previous?.config_hash === configHash) return { row: previous, onchainId: owner.onchain_id, created: false };
+        const version = (previous?.version ?? 0) + 1;
+        if (version > 65535) throw new ValidationError('VERSION_LIMIT', 'strategy version exceeds uint16');
+        const row = (await client.query<VersionRow>(`insert into strategy_versions
+          (strategy_id,version,allocation,schedule,change_log,active_at,execution_schema_version,execution,execution_chain_id,config_hash)
+          values($1,$2,$3::jsonb,$4::jsonb,$5,$6,1,$7::jsonb,$8,$9) returning ${VERSION_COLUMNS}`,
+          [strategyId, version, JSON.stringify(allocation), JSON.stringify(schedule), changeLog, activeAt, JSON.stringify(execution), chainId, configHash])).rows[0];
+        if (!row) throw new Error('missing version');
+        return { row, onchainId: owner.onchain_id, created: true };
+      });
+      const version = mapVersion(written.row);
+      if (written.onchainId !== null) {
+        assertHeld();
+        await deps.publishOnchain(Number(written.onchainId), { assets: allocation.assets.map((asset) => asset.address as Address),
+          weightsBps: allocation.assets.map((asset) => asset.weightBps), schedule, activeAt: written.row.active_at ?? new Date(0),
+          configHash: written.row.config_hash ?? undefined, expectedVersion: version.version, allowPublish: written.created }, { lock: async (_chainId, action) => action(assertHeld) });
+      }
+      return version;
+    };
+    return preflight.onchain_id === null ? await saveAndMirror(() => {}) : await deps.relayerLock(chainId, saveAndMirror);
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw new AppError(503, 'VERSION_UNAVAILABLE', 'version storage or chain confirmation unavailable; retry the same config');
+  }
+}
+
+/** Pinned version only; latest DB version is never a substitute for chain enrollment. */
+export async function requireTypedVersion(strategyId: number, version: number, onchainId: number, account?: Address,
+  deps: { chainId?: number; assertOnchain?: typeof assertVersionOnchain; verifyChain?: boolean; blockNumber?: bigint; blockHash?: Hex } = {}): Promise<StrategyVersion> {
+  const detail = await getStrategy(strategyId);
+  const pinned = detail.versions.find((candidate) => candidate.version === version);
+  if (!pinned || pinned.executionSchemaVersion !== 1 || pinned.configHash === null || pinned.activeAt === null || pinned.executionChainId !== (deps.chainId ?? configuredChainId())) {
+    throw new AppError(409, 'EXECUTION_VERSION_MISMATCH', 'a typed version on this chain is required');
+  }
+  const config = { chainId: pinned.executionChainId, execution: validateExecution(pinned.execution), allocation: pinned.allocation,
+    schedule: validateFundingSchedule(pinned.schedule), activeAt: new Date(pinned.activeAt) };
+  if (canonicalConfigHash(config) !== pinned.configHash) throw new AppError(409, 'CONFIG_HASH_MISMATCH', 'stored config hash does not match the pinned version');
+  if (deps.verifyChain !== false) await (deps.assertOnchain ?? assertVersionOnchain)(onchainId, version, { ...config, configHash: pinned.configHash }, account, { blockNumber: deps.blockNumber, blockHash: deps.blockHash });
+  return pinned;
+}
+
+export function typedMinimumDeposit(version: StrategyVersion): string {
+  return minimumAllocationRaw(version.allocation, version.executionChainId ?? configuredChainId()).toString();
+}
+
 // ---------------------------------------------------------------------------
 // Mapping
 // ---------------------------------------------------------------------------
@@ -517,7 +644,12 @@ function mapVersion(row: VersionRow): StrategyVersion {
     version: row.version,
     // jsonb comes back already parsed; the DB shape check and validateAllocation guard the contents.
     allocation: row.allocation as Allocation,
-    schedule: row.schedule as RebalanceSchedule,
+    schedule: row.schedule as RebalanceSchedule | FundingSchedule,
+    executionSchemaVersion: row.execution_schema_version,
+    execution: row.execution,
+    executionChainId: row.execution_chain_id === null ? null : Number(row.execution_chain_id),
+    configHash: row.config_hash,
+    idleYield: { enabled: false },
     changeLog: row.change_log,
     activeAt: row.active_at ? row.active_at.toISOString() : null,
     createdAt: row.created_at.toISOString(),

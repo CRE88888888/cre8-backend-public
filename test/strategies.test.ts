@@ -329,7 +329,7 @@ const PUBLISH_BODY = {
       { address: ASSET_B, weightBps: 4000 },
     ],
   },
-  schedule: { kind: 'interval', intervalSeconds: 86_400 },
+  schedule: { kind: 'funding' },
   changeLog: 'rebalance',
 };
 
@@ -407,6 +407,7 @@ test('POST /strategies/:id/versions returns 201 with the created version record'
     changeLog: 'rebalance',
     activeAt: '2026-01-01T00:00:00.000Z',
     createdAt: '2026-01-01T00:00:00.000Z',
+    executionSchemaVersion: 0, execution: { kind: 'target_weight' }, executionChainId: null, configHash: null, idleYield: { enabled: false },
   };
   const calls: Array<{ id: number; input: PublishVersionInput; provider: string }> = [];
 
@@ -418,10 +419,10 @@ test('POST /strategies/:id/versions returns 201 with the created version record'
       assert.equal(response.status, 201);
       assert.match(response.headers.get('content-type') ?? '', /^application\/json/);
       assert.deepEqual(await response.json(), { ...published, minDepositUsdtWei: '50000000000000000000' });
-      // The route hands the parsed body to publishVersion untouched (id from the path), and the
+      // The route applies explicit execution/yield defaults (id from the path), and the
       // provider is the session wallet, never a body field.
       assert.deepEqual(calls, [
-        { id: 1, input: PUBLISH_BODY, provider: ROUTE_WALLET.address.toLowerCase() },
+        { id: 1, input: { ...PUBLISH_BODY, execution: { kind: 'hold' }, idleYield: { enabled: false } }, provider: ROUTE_WALLET.address.toLowerCase() },
       ]);
     },
     {

@@ -1,3 +1,4 @@
+import './strategy-execution.test.js';
 // Keep faucet HTTP coverage in the existing no-DB CI entry point.
 import './faucet.test.js';
 import './points.test.js';
@@ -666,7 +667,7 @@ for (const entry of budgetActions) {
       assert.equal(calls, 4);
     }, { rateLimiter: limiter,
       createStrategy: async (_body, provider) => { calls++; return { id: 1, provider, name: 'fund', description: '', isPublic: false, swapFeeBps: 0, onchainId: null, createdAt: new Date().toISOString() }; },
-      publishVersion: async () => { calls++; return { strategyId: 1, version: 1, allocation: { assets: [{ address: '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c', weightBps: 10000 }] }, schedule: { kind: 'interval', intervalSeconds: 60 }, changeLog: null, activeAt: null, createdAt: new Date().toISOString() }; },
+      publishVersion: async () => { calls++; return { strategyId: 1, version: 1, allocation: { assets: [{ address: '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c', weightBps: 10000 }] }, schedule: { kind: 'interval', intervalSeconds: 60 }, executionSchemaVersion: 0, execution: { kind: 'target_weight' }, executionChainId: null, configHash: null, idleYield: { enabled: false }, changeLog: null, activeAt: null, createdAt: new Date().toISOString() }; },
       enrollPortfolio: async (_id, userId) => { calls++; return { minDepositUsdtWei: '50000000000000000000', id: 1, userId, strategyId: 1, strategyName: 'fund', version: 1, scheduleState: 'active', createdAt: new Date().toISOString(), smartAccounts: [], gas: null }; },
       planPreview: async (portfolioId) => { calls++; return { portfolioId, outcome: 'noop', reason: 'aligned', steps: [], rationale: null }; },
       operatorRedeem: touch, operatorClose: touch, listAssets: async () => { calls++; return []; },

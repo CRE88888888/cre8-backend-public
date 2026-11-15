@@ -12,9 +12,11 @@ import { ForbiddenError, NotFoundError, ValidationError } from './errors.js';
 import { describeGasStatus } from './funding.js';
 import type { GasStatus } from './funding.js';
 import { buildSessionPermissions, deriveSessionKeyFor, sessionValidUntil, sudoValidator } from './permissions.js';
+import { requireTypedVersion } from './strategies.js';
 import type { Allocation } from './strategies.js';
 import { configuredChainId, TESTNET_97 } from './testnet-profile.js';
 import { minimumDepositUsdtWei } from './rebalance-plan.js';
+import { minimumAllocationRaw } from './strategy-execution.js';
 
 export function allocationMinimumDeposit(allocation: Allocation | null | undefined): string | null {
   if (allocation === null || allocation === undefined) return null;
@@ -22,8 +24,9 @@ export function allocationMinimumDeposit(allocation: Allocation | null | undefin
   return minimumDepositUsdtWei(allocation.assets.map((asset) => ({ asset: asset.address, weightBps: asset.weightBps })), cash).toString();
 }
 export async function strategyMinimumDeposit(strategyId: number): Promise<string | null> {
-  const result = await query<{ allocation: Allocation }>('select allocation from strategy_versions where strategy_id=$1 order by version desc limit 1', [strategyId]);
-  return allocationMinimumDeposit(result.rows[0]?.allocation);
+  const result = await query<{ allocation: Allocation; execution_schema_version: number; execution_chain_id: string | null }>('select allocation,execution_schema_version,execution_chain_id from strategy_versions where strategy_id=$1 order by version desc limit 1', [strategyId]);
+  const row = result.rows[0];
+  return row?.execution_schema_version === 1 ? minimumAllocationRaw(row.allocation, Number(row.execution_chain_id)).toString() : allocationMinimumDeposit(row?.allocation);
 }
 
 export type Portfolio = {
@@ -57,9 +60,11 @@ export type SmartAccount = {
   accountType: string;
 };
 
-type StrategyOnchainRow = { onchain_id: string | null; active_version: number | null };
+type StrategyOnchainRow = { onchain_id: string | null; active_version: number | null; execution_schema_version?: number; execution_chain_id?: string | null };
 type PortfolioRow = {
   allocation?: Allocation | null;
+  execution_schema_version?: number;
+  execution_chain_id?: string | null;
   id: string;
   user_id: string;
   strategy_id: string;
@@ -128,6 +133,7 @@ export type ResolveValidUntil = (userId: string, strategyId: bigint, chainId: bi
  * `enrollPortfolio(strategyId, wallet)`; unit tests inject fakes instead of a chain plus database.
  */
 export type EnrollDeps = {
+  requireTypedVersion: typeof requireTypedVersion;
   query: typeof query;
   withTransaction: typeof withTransaction;
   deploySmartAccount: typeof deploySmartAccount;
@@ -162,12 +168,13 @@ export type EnrollDeps = {
  * ending in a 23505 on smart_accounts(chain_id, address).
  */
 const ACTIVE_ENROLLMENT_SQL = `select p.id, p.user_id, p.strategy_id, p.version, p.schedule_state, p.created_at,
-          s.chain_id, s.address, s.owner, s.account_type, sv.allocation
+          s.chain_id, s.address, s.owner, s.account_type, sv.allocation, sv.execution_schema_version, sv.execution_chain_id
      from portfolios p
      join smart_accounts s on s.portfolio_id = p.id
      left join strategy_versions sv on sv.strategy_id = p.strategy_id and sv.version = p.version
-    where p.user_id = $1 and p.strategy_id = $2 and p.schedule_state = 'active'
-      and s.account_type = 'KERNEL'
+    where p.user_id = $1 and p.strategy_id = $2
+      and (p.schedule_state = 'active' or (p.schedule_state = 'paused' and sv.execution_schema_version = 1))
+      and s.account_type = 'KERNEL' and s.chain_id=$3
     order by p.id
     limit 1`;
 
@@ -238,7 +245,9 @@ export async function enrollPortfolio(
   };
 
   const strategy = await find<StrategyOnchainRow>(
-    `select s.onchain_id, coalesce(max(v.version), 0) as active_version
+    `select s.onchain_id, coalesce(max(v.version), 0) as active_version,
+       (select execution_schema_version from strategy_versions where strategy_id=s.id order by version desc limit 1) as execution_schema_version,
+       (select execution_chain_id from strategy_versions where strategy_id=s.id order by version desc limit 1) as execution_chain_id
        from strategies s
        left join strategy_versions v on v.strategy_id = s.id
       where s.id = $1
@@ -258,16 +267,27 @@ export async function enrollPortfolio(
 
   const onchainId = Number(row.onchain_id);
   const account = wallet.toLowerCase();
+  const chainId = deps.chainId ?? getConfig().chainId;
+  if (row.execution_schema_version === 1 && Number(row.execution_chain_id) !== chainId) {
+    throw new ValidationError('CHAIN_MISMATCH', 'typed strategy belongs to another chain');
+  }
 
   // Idempotency, before any on-chain action. A legacy 'EOA' enrollment is deliberately not
   // returned: the query above filters it out, so it keeps its row and this call creates the KERNEL
   // one alongside it. The account_type test is kept as a second line of defence for injected deps.
-  const existing = await find<EnrollmentRow>(ACTIVE_ENROLLMENT_SQL, [account, strategyId]);
+  const existing = await find<EnrollmentRow>(ACTIVE_ENROLLMENT_SQL, [account, strategyId, chainId]);
   const existingRow = existing.rows[0];
   if (existingRow !== undefined && existingRow.account_type === 'KERNEL') {
+    if (existingRow.execution_schema_version === 1 && (Number(existingRow.chain_id) !== chainId || existingRow.owner.toLowerCase() !== account)) {
+      throw new ForbiddenError('typed smart account does not match this owner and chain');
+    }
     // 已經 enroll 過也回 gas：這是「查我的帳戶現在能不能動」最自然的一次來回，而它同樣是唯讀查詢。
     const gas = await readGas(existingRow.address as Address);
     return toPortfolio(existingRow, [existingRow], gas);
+  }
+
+  if (row.execution_schema_version === 1) {
+    await (deps.requireTypedVersion ?? requireTypedVersion)(strategyId, version, onchainId);
   }
 
   // Session key: the config first, so a missing env fails with a message naming the variable
@@ -275,7 +295,6 @@ export async function enrollPortfolio(
   // and to know which contract the CallPolicy allows.
   const sessionKeyConfig = deps.sessionKeyConfig ?? requireSessionKeyConfig();
   const publicClient = deps.publicClient ?? getChain().publicClient;
-  const chainId = deps.chainId ?? getConfig().chainId;
 
   // 先讀既有 intent；沒有就寫入一個新的 validUntil，之後一律用同一個值。位置是刻意的：它必須在
   // deriveSessionKeyFor / buildSessionPermissions / deploy / enroll 全部之前，因為 validUntil 會
@@ -318,13 +337,18 @@ export async function enrollPortfolio(
   // DB row exists.
   // A retry may find an older pinned version on-chain. Publishing a version never upgrades it.
   const enrolledVersion = await enroll(smartAccount.address, onchainId);
+  if (row.execution_schema_version === 1) {
+    await (deps.requireTypedVersion ?? requireTypedVersion)(strategyId, enrolledVersion, onchainId, smartAccount.address);
+  }
 
   const written = await runInTransaction(async (client) => {
     const inserted = await client.query<PortfolioRow>(
       `insert into portfolios (user_id, strategy_id, version, schedule_state)
        values ($1, $2, $3, 'active')
        returning id, user_id, strategy_id, version, schedule_state, created_at,
-         (select allocation from strategy_versions sv where sv.strategy_id=portfolios.strategy_id and sv.version=portfolios.version) as allocation`,
+         (select allocation from strategy_versions sv where sv.strategy_id=portfolios.strategy_id and sv.version=portfolios.version) as allocation,
+         (select execution_schema_version from strategy_versions sv where sv.strategy_id=portfolios.strategy_id and sv.version=portfolios.version) as execution_schema_version,
+         (select execution_chain_id from strategy_versions sv where sv.strategy_id=portfolios.strategy_id and sv.version=portfolios.version) as execution_chain_id`,
       [account, strategyId, enrolledVersion],
     );
     const portfolioRow = inserted.rows[0];
@@ -423,7 +447,7 @@ export async function listPortfolios(
 
   const portfolios = await find<PortfolioListRow>(
     `select p.id, p.user_id, p.strategy_id, p.version, p.schedule_state, p.created_at,
-            st.name as strategy_name, sv.allocation,
+            st.name as strategy_name, sv.allocation, sv.execution_schema_version, sv.execution_chain_id,
             sa.chain_id, sa.address, sa.owner, sa.account_type
        from portfolios p
        left join strategies st on st.id = p.strategy_id
@@ -610,7 +634,7 @@ export async function requireOwnedPortfolio(
 /** Row shape → API shape. Shared by the idempotent return and the freshly written portfolio. */
 function toPortfolio(row: PortfolioRow, accounts: SmartAccountRow[], gas: GasStatus | null): Portfolio {
   return {
-    minDepositUsdtWei: allocationMinimumDeposit(row.allocation),
+    minDepositUsdtWei: row.execution_schema_version === 1 && row.allocation ? minimumAllocationRaw(row.allocation, Number(row.execution_chain_id)).toString() : allocationMinimumDeposit(row.allocation),
     id: Number(row.id),
     userId: row.user_id,
     strategyId: Number(row.strategy_id),

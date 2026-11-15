@@ -19,8 +19,8 @@ import { getConfig, getSessionKeyConfig } from './config.js';
 import { createPlatformStatusReader } from './chain.js';
 import { query } from './db.js';
 import { AppError, ValidationError } from './errors.js';
-import { createStrategy, getStrategy, listStrategies, publishVersion } from './strategies.js';
-import type { PublishVersionInput } from './strategies.js';
+import { createStrategy, getStrategy, listStrategies, publishVersion, typedVersionInput, typedMinimumDeposit } from './strategies.js';
+import { createPortfolioStrategyService } from './portfolio-strategies.js';
 import { listPortfolios, enrollPortfolio, allocationMinimumDeposit, strategyMinimumDeposit } from './portfolios.js';
 import { buildRenewalParams, recordRenewalResult, resolveBundlerUrl } from './renewal.js';
 import {
@@ -169,6 +169,7 @@ export const BUNDLER_TIMEOUT_MS = 30_000;
  * merged over the defaults, so a test can stub one dependency and leave the rest real.
  */
 export type ServerDeps = {
+  portfolioStrategies: ReturnType<typeof createPortfolioStrategyService>;
   points: ReturnType<typeof createPointsService>;
   claimFaucetUsdt: typeof claimFaucetUsdt;
   sponsorUserOperation: typeof sponsorUserOperation;
@@ -290,6 +291,7 @@ async function defaultListAssets(): Promise<PriceableAsset[]> {
 }
 
 const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
+  portfolioStrategies: createPortfolioStrategyService(),
   points: createPointsService(),
   claimFaucetUsdt,
   sponsorUserOperation,
@@ -384,6 +386,26 @@ async function route(
   const method = req.method ?? 'GET';
   const segments = url.pathname.split('/').filter((segment) => segment.length > 0);
   const [root] = segments;
+
+  if (root === 'portfolios' && segments.length === 3 && ['execution', 'funding-lots', 'stack-instructions', 'stack-instruction-state', 'execution-state'].includes(segments[2] ?? '')) {
+    const action = segments[2];
+    const expected = action === 'execution' ? 'GET' : 'POST';
+    if (method !== expected) return methodNotAllowed(res, [expected]);
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    await deps.rateLimiter.wallet('plan', wallet);
+    const id = parsePositiveInteger(segments[1] ?? '', 'portfolioId');
+    if (action === 'execution') {
+      sendJson(res, 200, await deps.portfolioStrategies.read(id, wallet));
+    } else {
+      const input = await readJsonBody(req);
+      const result = action === 'funding-lots' ? await deps.portfolioStrategies.funding(id, wallet, input)
+        : action === 'stack-instructions' ? await deps.portfolioStrategies.instruct(id, wallet, input)
+        : action === 'stack-instruction-state' ? await deps.portfolioStrategies.instructionState(id, wallet, input)
+        : await deps.portfolioStrategies.executionState(id, wallet, input);
+      sendJson(res, 200, result);
+    }
+    return;
+  }
 
   // Points administration has no chain write capability and does not require enabling rebalance.
   // Authorize here before the general operator guard, without changing existing operator routes.
@@ -688,7 +710,7 @@ async function listRoute(res: ServerResponse, url: URL): Promise<void> {
 /** GET /strategies/:id — metadata plus version history (newest first). */
 async function detailRoute(res: ServerResponse, id: number): Promise<void> {
   const strategy = await getStrategy(id);
-  const versions = strategy.versions.map((version) => ({ ...version, minDepositUsdtWei: allocationMinimumDeposit(version.allocation) }));
+  const versions = strategy.versions.map((version) => ({ ...version, minDepositUsdtWei: version.executionSchemaVersion === 1 ? typedMinimumDeposit(version) : allocationMinimumDeposit(version.allocation) }));
   sendJson(res, 200, { ...strategy, versions, minDepositUsdtWei: versions[0]?.minDepositUsdtWei ?? null });
 }
 
@@ -727,8 +749,8 @@ async function publishVersionRoute(
   if (typeof body !== 'object' || body === null || Array.isArray(body)) {
     throw new ValidationError('INVALID_VERSION', 'request body must be a JSON object');
   }
-  const version = await deps.publishVersion(id, body as PublishVersionInput, provider);
-  sendJson(res, 201, { ...version, minDepositUsdtWei: allocationMinimumDeposit(version.allocation) });
+  const version = await deps.publishVersion(id, typedVersionInput(body), provider);
+  sendJson(res, 201, { ...version, minDepositUsdtWei: version.executionSchemaVersion === 1 ? typedMinimumDeposit(version) : allocationMinimumDeposit(version.allocation) });
 }
 
 /**

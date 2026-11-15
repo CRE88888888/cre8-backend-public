@@ -42,7 +42,7 @@ const PUBLISH_BODY = {
       { address: ASSET_B, weightBps: 4000 },
     ],
   },
-  schedule: { kind: 'interval', intervalSeconds: 86_400 },
+  schedule: { kind: 'funding' },
   changeLog: 'rebalance',
 };
 
@@ -662,6 +662,7 @@ test('HTTP: POST /strategies/:id/versions without a token is 401, with a token i
     changeLog: 'rebalance',
     activeAt: '2026-01-01T00:00:00.000Z',
     createdAt: '2026-01-01T00:00:00.000Z',
+    executionSchemaVersion: 0, execution: { kind: 'target_weight' }, executionChainId: null, configHash: null, idleYield: { enabled: false },
   };
   const providers: string[] = [];
 

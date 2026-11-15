@@ -531,7 +531,8 @@ curl -s -X POST "$API/strategies/1/versions" -H "authorization: Bearer $TOKEN" -
     {"address": "0x00000000000000000000000000000000000000a1", "symbol": "AAPLB", "weightBps": 6000},
     {"address": "0x00000000000000000000000000000000000000b2", "weightBps": 4000}
   ]},
-  "schedule": {"kind": "interval", "intervalSeconds": 86400},
+  "execution": {"kind": "hold"},
+  "schedule": {"kind": "funding"},
   "changeLog": "initial weights"
 }'
 # {"strategyId":1,"version":1,"allocation":{...},"schedule":{...},"changeLog":"initial weights","activeAt":"...","createdAt":"..."}
@@ -539,7 +540,7 @@ curl -s -X POST "$API/strategies/1/versions" -H "authorization: Bearer $TOKEN" -
 
 `POST /strategies/:id/versions` 回傳的是**建立的版本紀錄本身**（`strategyId`、`version`、`allocation`、
 `schedule`、`changeLog`、`activeAt`、`createdAt`），不是 strategy detail。版本號由後端配置
-（`max(version)+1`，併發時靠唯一鍵重試），策略不存在回 404、allocation／schedule 校驗失敗回 400。
+（typed版以strategy列鎖配置，legacy內部writer以唯一鍵重試），策略不存在回 404、allocation／schedule 校驗失敗回 400。
 
 列表回傳 `{ items, total, limit, offset }`；`total` 是符合條件的總筆數，不是本頁筆數。
 
@@ -555,7 +556,7 @@ curl -s -X POST "$API/strategies/1/versions" -H "authorization: Bearer $TOKEN" -
 
 `POST /strategies/:id/versions`（`publishVersion()`）：
 
-- 請求 body 必須是物件；`allocation`、`schedule` 必填，`changeLog`、`activeAt` 選填。
+- 請求 body 必須是物件；`allocation` 必填。新HTTP API預設明示hold／funding／生息關閉；完整契約見 [BE-1策略API](docs/strategy-api.zh-TW.md)。
 - `allocation` 必須是 `{"assets":[{"address":"0x…","symbol"?:"  ≤32 字","weightBps":2500}]}`。
 - 1–16 個資產（`MAX_VERSION_ASSETS`，包含自動補入的 USDT）；address 必須是 0x + 40 hex，入庫前轉小寫。
 - 同一版本內資產不可重複（address 不分大小寫）。
@@ -565,8 +566,9 @@ curl -s -X POST "$API/strategies/1/versions" -H "authorization: Bearer $TOKEN" -
   回傳、DB 與鏈上 `version.assets` 都包含此列，讓存入的 USDT 能被核准並配置到目標資產。
   已提供 USDT 時保留其權重、不重複補列；16 個資產且缺 USDT 時回 400 `TOO_MANY_ASSETS`。
   建立基金的初版與後續版本皆走此發布規則；不修改既有版本或既有投組固定的版本。
-- `schedule` 是 `{"kind":"interval","intervalSeconds":>=60}` 或 `{"kind":"cron","cron":"…"}`。
-- `changeLog` 選填，≤ 2000 字；`activeAt` 選填，預設 `now()`。
+- 新HTTP `execution`僅hold／stack、`schedule`僅`{"kind":"funding"}`；省略時明示回預設值。舊schema0列及內部legacy writer保留interval／cron，讀回target_weight。
+- canonical config hash放既有Version.scheduleHash。BE-2接入前，typed版本的funding標記使舊漂移scheduler blocked；個人投入／指令與hash golden見 [API契約](docs/strategy-api.zh-TW.md)。
+- `changeLog` 選填，≤ 2000 字；typed `activeAt`為含時區的整秒時間，省略固定第一次發版時間。已存設定重試只核對原鏈上版本，不重送未知publish交易。
 - 必須帶 token，且該策略 DB 的 `provider` 必須等於 session 錢包（不分大小寫），否則 403 `FORBIDDEN`。
 
 錯誤碼：`INVALID_ALLOCATION`、`ALLOCATION_EMPTY`、`TOO_MANY_ASSETS`、`INVALID_ASSET`、

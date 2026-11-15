@@ -596,6 +596,51 @@ test('enrollPortfolio writes the KERNEL smart account lowercase with the EOA as 
 });
 
 
+test('#82 typed enrollment checks the selected and actual pinned version before storing success', async () => {
+  const run = fakeEnrollDeps([], '11', createIntentStore(), 2);
+  const originalQuery = run.deps.query;
+  assert.ok(originalQuery);
+  run.deps.query = async <T extends QueryResultRow = QueryResultRow>(sql: string, params: readonly unknown[] = []): Promise<QueryResult<T>> => {
+    const result = await originalQuery<T>(sql, params);
+    if (sql.includes('from strategies') && result.rows[0]) { Reflect.set(result.rows[0], 'execution_schema_version', 1); Reflect.set(result.rows[0], 'execution_chain_id', '31337'); }
+    return result;
+  };
+  const checked: Array<{ version: number; account: string | undefined }> = [];
+  run.deps.requireTypedVersion = async (_strategyId, version, _onchainId, account) => {
+    checked.push({ version, account });
+    return { strategyId: 3, version, allocation: { assets: [{ address: EXECUTOR, weightBps: 10000 }] },
+      executionSchemaVersion: 1, execution: { kind: 'hold' }, executionChainId: 31337, configHash: `0x${'82'.repeat(32)}`,
+      schedule: { kind: 'funding' }, idleYield: { enabled: false }, activeAt: '2026-01-01T00:00:00.000Z', createdAt: '2026-01-01T00:00:00.000Z', changeLog: null };
+  };
+  const result = await enrollPortfolio(3, ROUTE_WALLET.address, run.deps);
+  assert.equal(result.version, 1);
+  assert.deepEqual(checked, [{ version: 2, account: undefined }, { version: 1, account: KERNEL_CHECKSUMMED }]);
+});
+
+test('#82 future or mismatched typed version cannot report enrollment success', async () => {
+  for (const failAt of [1, 2]) {
+    const run = fakeEnrollDeps();
+    const originalQuery = run.deps.query;
+    assert.ok(originalQuery);
+    run.deps.query = async <T extends QueryResultRow = QueryResultRow>(sql: string, params: readonly unknown[] = []): Promise<QueryResult<T>> => {
+      const result = await originalQuery<T>(sql, params);
+      if (sql.includes('from strategies') && result.rows[0]) { Reflect.set(result.rows[0], 'execution_schema_version', 1); Reflect.set(result.rows[0], 'execution_chain_id', '31337'); }
+      return result;
+    };
+    let checked = 0;
+    run.deps.requireTypedVersion = async () => {
+      checked++;
+      if (checked === failAt) throw new Error('typed version could not be confirmed');
+      return { strategyId: 3, version: 1, allocation: { assets: [{ address: EXECUTOR, weightBps: 10000 }] },
+        executionSchemaVersion: 1, execution: { kind: 'hold' }, executionChainId: 31337, configHash: `0x${'82'.repeat(32)}`,
+        schedule: { kind: 'funding' }, idleYield: { enabled: false }, activeAt: '2026-01-01T00:00:00.000Z', createdAt: '2026-01-01T00:00:00.000Z', changeLog: null };
+    };
+    await assert.rejects(enrollPortfolio(3, ROUTE_WALLET.address, run.deps), /typed version could not be confirmed/);
+    assert.equal(run.calls.writes.length, 0);
+    if (failAt === 1) assert.equal(run.calls.deploy.length, 0);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // enrollPortfolio: the session key that enroll installs (injected fakes, no DB, no chain)
 // ---------------------------------------------------------------------------
@@ -1227,4 +1272,12 @@ test('enrollPortfolio mirrors to chain and writes portfolio + smart account', { 
 
 after(async () => {
   await closePool();
+});
+
+
+test('#82 typed existing enrollment cannot return a foreign-chain account', async () => {
+  const row = { ...enrollmentRow('11', 'KERNEL'), execution_schema_version: 1, chain_id: '97' };
+  const run = fakeEnrollDeps([row]);
+  await assert.rejects(enrollPortfolio(3, ROUTE_WALLET.address, run.deps), /does not match this owner and chain/);
+  assert.equal(run.calls.deploy.length, 0); assert.equal(run.calls.writes.length, 0);
 });

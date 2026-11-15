@@ -19,6 +19,8 @@ import { getAuthConfig, getConfig, loadSessionKeyConfig } from './config.js';
 import { assertKernelInfraDeployed, computeSalt, getKernelAccountParams } from './kernel.js';
 import type { KernelAccountOptions } from './kernel.js';
 import type { RebalanceSchedule } from './strategies.js';
+import type { CanonicalConfig, FundingSchedule } from './strategy-execution.js';
+import { numeraireFor } from './strategy-execution.js';
 import { AppError } from './errors.js';
 
 /**
@@ -107,6 +109,73 @@ export const REGISTRY_ABI = [
     ],
   },
 ] as const;
+
+export const REGISTRY_VERSION_ABI = [
+  { type: 'function', name: 'activeVersion', stateMutability: 'view', inputs: [{ type: 'uint256' }], outputs: [{ type: 'uint16' }] },
+  { type: 'function', name: 'version', stateMutability: 'view', inputs: [{ type: 'uint256' }, { type: 'uint16' }], outputs: [
+    { type: 'tuple', components: [{ name: 'assets', type: 'address[]' }, { name: 'weightsBps', type: 'uint16[]' },
+      { name: 'scheduleHash', type: 'bytes32' }, { name: 'activeAt', type: 'uint64' }] },
+  ] },
+] as const;
+
+export async function readAccountCash(chainId: number, account: Address, suppliedClient?: PublicClient) {
+  try {
+    const config = getConfig();
+    if (!suppliedClient && !config.rpcUrl) throw new Error('missing RPC');
+    const client = suppliedClient ?? createPublicClient({ transport: http(config.rpcUrl ?? undefined, { retryCount: 0, timeout: 5_000 }) });
+    if (await client.getChainId() !== chainId) throw new Error('wrong chain');
+    const block = await client.getBlock({ blockTag: 'latest' });
+    if (block.number === null || block.hash === null) throw new Error('missing block');
+    const amount = await client.readContract({ address: numeraireFor(chainId) as Address,
+      abi: [{ type: 'function', name: 'balanceOf', stateMutability: 'view', inputs: [{ type: 'address' }], outputs: [{ type: 'uint256' }] }],
+      functionName: 'balanceOf', args: [account], blockNumber: block.number });
+    const canonical = await client.getBlock({ blockNumber: block.number });
+    if (canonical.hash !== block.hash) throw new Error('block changed');
+    return { amountRaw: amount.toString(), blockNumber: block.number.toString(), blockHash: block.hash };
+  } catch {
+    throw new AppError(503, 'CASH_READ_UNAVAILABLE', 'account cash balance unavailable');
+  }
+}
+
+/** Read-only, bounded and pinned to one block. No operator key is needed. */
+export async function assertVersionOnchain(onchainId: number, version: number,
+  expected: Pick<CanonicalConfig, 'chainId' | 'allocation' | 'activeAt'> & { configHash: Hex }, account?: Address,
+  deps: { client?: PublicClient; registry?: Address; requireActive?: boolean; blockNumber?: bigint; blockHash?: Hex } = {}): Promise<void> {
+  try {
+    const config = getConfig();
+    const registry = deps.registry ?? config.registryAddress;
+    if (!registry || (!deps.client && !config.rpcUrl)) throw new Error('missing chain');
+    const client = deps.client ?? createPublicClient({ transport: http(config.rpcUrl ?? undefined, { retryCount: 0, timeout: 5_000 }) });
+    if (await client.getChainId() !== expected.chainId) throw new Error('wrong chain');
+    const block = await client.getBlock(deps.blockNumber === undefined ? { blockTag: 'latest' } : { blockNumber: deps.blockNumber });
+    if (block.number === null || block.hash === null || (deps.blockNumber !== undefined && block.number !== deps.blockNumber)) throw new Error('missing block');
+    if (deps.blockHash !== undefined && block.hash !== deps.blockHash) throw new AppError(409, 'FUNDING_REORGED', 'source block changed; reconciliation required');
+    const actual = await client.readContract({ address: registry as Address, abi: REGISTRY_VERSION_ABI, functionName: 'version', args: [BigInt(onchainId), version], blockNumber: block.number });
+    const pairs = (assets: readonly string[], weights: readonly number[]) => assets.map((asset, index) => `${asset.toLowerCase()}:${weights[index]}`).sort();
+    if (actual.scheduleHash.toLowerCase() !== expected.configHash || actual.activeAt !== BigInt(expected.activeAt.getTime() / 1000) ||
+        actual.assets.length !== actual.weightsBps.length || JSON.stringify(pairs(actual.assets, actual.weightsBps)) !==
+        JSON.stringify(pairs(expected.allocation.assets.map((asset) => asset.address), expected.allocation.assets.map((asset) => asset.weightBps)))) {
+      throw new AppError(409, 'CHAIN_CONFIG_MISMATCH', 'chain version does not match the committed config');
+    }
+    if (deps.requireActive !== false) {
+      if (block.timestamp < actual.activeAt) throw new AppError(409, 'VERSION_NOT_ACTIVE', 'version has not reached activeAt');
+      if (account === undefined) {
+        const active = await client.readContract({ address: registry as Address, abi: REGISTRY_VERSION_ABI, functionName: 'activeVersion', args: [BigInt(onchainId)], blockNumber: block.number });
+        if (active !== version) throw new AppError(409, 'CHAIN_VERSION_MISMATCH', 'new enrollment version differs from the selected version');
+      }
+    }
+    if (account !== undefined) {
+      const enrolled = await client.readContract({ address: registry as Address, abi: REGISTRY_ABI, functionName: 'isEnrolled', args: [account], blockNumber: block.number });
+      const [id, pinned] = await client.readContract({ address: registry as Address, abi: REGISTRY_ABI, functionName: 'enrollments', args: [account], blockNumber: block.number });
+      if (!enrolled || id !== BigInt(onchainId) || pinned !== version) throw new AppError(409, 'CHAIN_VERSION_MISMATCH', 'account is not pinned to the authorized version');
+    }
+    const canonical = await client.getBlock({ blockNumber: block.number });
+    if (canonical.hash !== block.hash) throw new AppError(409, 'FUNDING_REORGED', 'version block changed during verification; reconciliation required');
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw new AppError(503, 'VERSION_CHAIN_UNAVAILABLE', 'chain version confirmation unavailable');
+  }
+}
 
 export const EXECUTOR_PAUSE_ABI = [
   { type: 'function', name: 'globalPaused', stateMutability: 'view', inputs: [], outputs: [{ type: 'bool' }] },
@@ -377,11 +446,47 @@ export async function publishVersionOnchain(
   version: {
     assets: Address[];
     weightsBps: number[];
-    schedule: RebalanceSchedule;
+    schedule: RebalanceSchedule | FundingSchedule;
     activeAt: Date;
+    configHash?: Hex;
+    expectedVersion?: number;
+    /** False on a stored-config retry: unknown submissions must be reconciled, never re-broadcast. */
+    allowPublish?: boolean;
   },
+  deps: { chain?: ChainConfig; lock?: typeof withRelayerLock } = {},
 ): Promise<number> {
-  const { wallet, publicClient, registryAddress, account: operator } = getChain();
+  const chainConfig = deps.chain ?? getChain();
+  const { wallet, publicClient, registryAddress, account: operator } = chainConfig;
+
+  if (version.configHash !== undefined && version.expectedVersion !== undefined) {
+    const expectedVersion = version.expectedVersion;
+    const configHash = version.configHash;
+    return (deps.lock ?? withRelayerLock)(chainConfig.chainId, async (assertHeld) => {
+      try {
+        const latest = await publicClient.readContract({ address: registryAddress, abi: REGISTRY_VERSION_ABI, functionName: 'activeVersion', args: [BigInt(onchainId)] });
+        if (latest < expectedVersion) {
+          if (version.allowPublish === false) throw new AppError(503, 'VERSION_PENDING_RECONCILIATION', 'stored version is not confirmed on chain; no new publish transaction sent');
+          if (latest + 1 !== expectedVersion) throw new Error('version sequence mismatch');
+          assertHeld();
+          const hash = await wallet.writeContract({ account: operator, chain: activeChain(), address: registryAddress, abi: REGISTRY_ABI,
+            functionName: 'publishVersion', args: [BigInt(onchainId), version.assets, version.weightsBps, configHash, BigInt(version.activeAt.getTime() / 1000)] });
+          const receipt = await publicClient.waitForTransactionReceipt({ hash, timeout: 30_000 });
+          if (receipt.status !== 'success' || decodeReturnedId(receipt.logs, 'VersionPublished', 'version') !== expectedVersion) throw new Error('publish not confirmed');
+        }
+        // A retry after an unknown receipt verifies the original index instead of publishing again.
+        await assertVersionOnchain(onchainId, expectedVersion, { chainId: chainConfig.chainId,
+          allocation: { assets: version.assets.map((address, index) => ({ address, weightBps: version.weightsBps[index] ?? 0 })) },
+          activeAt: version.activeAt, configHash }, undefined,
+          { client: publicClient, registry: registryAddress, requireActive: false });
+        return expectedVersion;
+      } catch (error) {
+        if (error instanceof AppError) throw error;
+        throw new AppError(503, 'VERSION_PUBLISH_UNAVAILABLE', 'version mirror is not confirmed; retry the same config');
+      }
+    });
+  }
+  if (version.schedule.kind === 'funding') throw new AppError(400, 'CONFIG_HASH_REQUIRED', 'funding schedule requires a canonical config hash');
+  const scheduleHash = canonicalScheduleHash(version.schedule);
 
   const hash = await withRelayerLock(getConfig().chainId, () => wallet.writeContract({
     account: operator,
@@ -393,7 +498,7 @@ export async function publishVersionOnchain(
       BigInt(onchainId),
       version.assets,
       version.weightsBps,
-      canonicalScheduleHash(version.schedule),
+      scheduleHash,
       BigInt(Math.floor(version.activeAt.getTime() / 1000)),
     ],
   }));

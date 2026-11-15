@@ -120,6 +120,37 @@ export function faucetReceiptState(receipt: Pick<TransactionReceipt, 'status' | 
   return issued ? 'confirmed' : 'unknown';
 }
 
+export type FaucetFundingEvidence = { txHash: Hex; logIndex: number; blockNumber: bigint; blockHash: Hex; amountRaw: string };
+
+/** Funding evidence is stricter than a quota settlement: check canonical block and exact log identity. */
+export async function readFaucetFundingEvidence(claim: Pick<FaucetClaim, 'chainId' | 'account' | 'amountWei'> & { txHash: Hex },
+  suppliedClient?: PublicClient): Promise<FaucetFundingEvidence> {
+  try {
+    if (claim.chainId !== 97) throw new AppError(400, 'FUNDING_SOURCE_DISABLED', 'faucet funding is only available on chain 97');
+    const config = getConfig();
+    if (!suppliedClient && !config.rpcUrl) throw new Error('missing RPC');
+    const client = suppliedClient ?? createPublicClient({ transport: http(config.rpcUrl ?? undefined, { timeout: 5_000, retryCount: 0 }) });
+    if (await client.getChainId() !== 97) throw new Error('wrong RPC chain');
+    const receipt = await client.getTransactionReceipt({ hash: claim.txHash });
+    if (receipt.status !== 'success' || receipt.transactionHash.toLowerCase() !== claim.txHash || receipt.blockNumber < 0n || !/^0x[0-9a-f]{64}$/.test(receipt.blockHash)) {
+      throw new AppError(409, 'FUNDING_NOT_CONFIRMED', 'successful funding receipt is required');
+    }
+    const block = await client.getBlock({ blockNumber: receipt.blockNumber });
+    if (block.hash !== receipt.blockHash || block.number !== receipt.blockNumber) {
+      throw new AppError(409, 'FUNDING_REORGED', 'funding receipt is not on the canonical chain; reconciliation required');
+    }
+    const matches = receipt.logs.filter((log) => !log.removed && log.blockHash === receipt.blockHash && log.blockNumber === receipt.blockNumber &&
+      log.transactionHash?.toLowerCase() === claim.txHash && Number.isSafeInteger(log.logIndex) && log.logIndex !== null && log.logIndex >= 0 &&
+      faucetReceiptState({ status: 'success', logs: [log] }, claim, TESTNET_97.roles.operator) === 'confirmed');
+    const log = matches[0];
+    if (matches.length !== 1 || log === undefined || log.logIndex === null) throw new AppError(409, 'FUNDING_NOT_CONFIRMED', 'one exact canonical Claimed event is required');
+    return { txHash: claim.txHash, logIndex: log.logIndex, blockNumber: receipt.blockNumber, blockHash: receipt.blockHash, amountRaw: claim.amountWei.toString() };
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw new AppError(503, 'FUNDING_RPC_UNAVAILABLE', 'funding confirmation unavailable; no new lot credited');
+  }
+}
+
 async function bounded<T>(work: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try { return await Promise.race([work, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('faucet timeout')), ms); })]); }

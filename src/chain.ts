@@ -581,13 +581,17 @@ function decodeReturnedId(
 
 /** #52: shared router/push-feed ABI, including errors that bubble through executor/EntryPoint. */
 export const PRICE_SOURCE_ABI = [
+  { type: 'error', name: 'TwapUnavailable', inputs: [] },
   { type: 'error', name: 'FailedOpWithRevert', inputs: [{ name: 'opIndex', type: 'uint256' }, { name: 'reason', type: 'string' }, { name: 'inner', type: 'bytes' }] },
   { type: 'error', name: 'StaleFeed', inputs: [{ name: 'feed', type: 'address' }, { name: 'updatedAt', type: 'uint256' }] },
   { type: 'error', name: 'InvalidAnswer', inputs: [{ name: 'feed', type: 'address' }, { name: 'answer', type: 'int256' }] },
   { type: 'error', name: 'SourcesDisagree', inputs: [{ name: 'asset', type: 'address' }, { name: 'poolQuote', type: 'uint256' }, { name: 'secondaryQuote', type: 'uint256' }] },
   { type: 'function', name: 'secondaryOf', stateMutability: 'view', inputs: [{ name: 'asset', type: 'address' }], outputs: [{ name: 'source', type: 'address' }, { name: 'maxDeviationBps', type: 'uint16' }] },
-  ...(['assetFeed', 'numeraireFeed'] as const).map((name) => ({ type: 'function', name, stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] } as const)),
+  { type: 'function', name: 'assetFeed', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] },
+  { type: 'function', name: 'numeraireFeed', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] },
   { type: 'function', name: 'maxAge', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint32' }] },
+  { type: 'function', name: 'numeraireMaxAge', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint32' }] },
+  { type: 'function', name: 'symbol', stateMutability: 'view', inputs: [], outputs: [{ type: 'string' }] },
   { type: 'function', name: 'latestRoundData', stateMutability: 'view', inputs: [], outputs: [
     { type: 'uint80' }, { type: 'int256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint80' },
   ] },
@@ -596,10 +600,16 @@ export const PRICE_SOURCE_ABI = [
   { type: 'function', name: 'previewSwap', stateMutability: 'view', inputs: [{ type: 'address' }, { type: 'address' }, { type: 'uint256' }], outputs: [{ type: 'uint256' }, { type: 'uint256' }] },
 ] as const;
 
-export type PriceSourceFailure = { code: 'StaleFeed' | 'InvalidAnswer' | 'SourcesDisagree'; detail: string; asset?: Address; feed?: Address };
+export type PriceSourceFailure = { code: 'TwapUnavailable' | 'StaleFeed' | 'InvalidAnswer' | 'SourcesDisagree'; detail: string; asset?: Address; feed?: Address };
+
+/** Shared by ABI failures and the snapshot's typed TWAP pricing failure. Never log raw metadata. */
+export function oracleUnavailableTag(asset?: Address, symbol?: string): string {
+  const label = symbol !== undefined && /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(symbol) ? symbol : asset ?? 'UNKNOWN';
+  return `[ORACLE_UNAVAILABLE:${label}]`;
+}
 
 /** Only ABI data is trusted. Message text, URLs and arbitrary errorName strings never reach users. */
-export function decodePriceSourceError(error: unknown, context: { asset?: Address; timestamp?: bigint; maxAge?: number } = {}): PriceSourceFailure | null {
+export function decodePriceSourceError(error: unknown, context: { asset?: Address; symbol?: string; timestamp?: bigint; maxAge?: number } = {}): PriceSourceFailure | null {
   const seen = new Set<unknown>();
   const pending: unknown[] = [error];
   for (let depth = 0; depth < 128 && pending.length > 0; depth += 1) {
@@ -617,6 +627,10 @@ export function decodePriceSourceError(error: unknown, context: { asset?: Addres
       } catch { /* an unrelated revert */ }
     }
     if (name === 'FailedOpWithRevert' && Array.isArray(args) && typeof args[2] === 'string') pending.push({ data: args[2] });
+    if (name === 'TwapUnavailable' && (args === undefined || (Array.isArray(args) && args.length === 0))) {
+      return { code: name, ...(context.asset === undefined ? {} : { asset: context.asset }),
+        detail: `${oracleUnavailableTag(context.asset, context.symbol)} TwapUnavailable：池子閒置或觀測歷史不足，普通再平衡整批不送、下一輪重試；退出保留未售資產` };
+    }
     const uint = (value: unknown): value is bigint => typeof value === 'bigint' && value >= 0n && value < (1n << 256n);
     const address = (value: unknown): value is Address => typeof value === 'string' && /^0x[0-9a-fA-F]{40}$/.test(value);
     if (Array.isArray(args) && address(args[0])) {
@@ -655,6 +669,7 @@ export async function describePriceSourceError(error: unknown, client: PublicCli
   let asset = context.asset ?? decoded.asset;
   let timestamp: bigint | undefined;
   let maxAge: number | undefined;
+  let symbol: string | undefined;
   try {
     const block = await client.getBlock(context.blockNumber === undefined ? { blockTag: 'latest' } : { blockNumber: context.blockNumber });
     timestamp = block.timestamp;
@@ -664,43 +679,66 @@ export async function describePriceSourceError(error: unknown, client: PublicCli
       asset = context.tokenIn.toLowerCase() === numeraire.toLowerCase() ? context.tokenOut : context.tokenIn;
     }
     if (asset === undefined && context.assets !== undefined && blockNumber !== undefined) {
+      const numeraireForError = decoded.code === 'TwapUnavailable'
+        ? await client.readContract({ address: context.oracle, abi: PRICE_SOURCE_ABI, functionName: 'numeraire', blockNumber }) : undefined;
       for (const candidate of new Map(context.assets.map((value) => [value.toLowerCase(), value])).values()) {
+        if (candidate.toLowerCase() === numeraireForError?.toLowerCase()) continue;
         try {
-          const health = await readSecondaryHealth(client, context.oracle, candidate, { number: blockNumber, timestamp: block.timestamp });
-          if (health.feeds.some((feed) => feed.feed.toLowerCase() === decoded.feed?.toLowerCase())) { asset = candidate; break; }
-        } catch { /* another route asset is not this feed */ }
+          if (decoded.code === 'TwapUnavailable') {
+            const decimals = await client.readContract({ address: candidate, abi: PRICE_SOURCE_ABI, functionName: 'decimals', blockNumber });
+            if (decimals <= 36 && numeraireForError !== undefined) {
+              await client.readContract({ address: context.oracle, abi: PRICE_SOURCE_ABI, functionName: 'previewSwap', args: [candidate, numeraireForError, 10n ** BigInt(decimals)], blockNumber });
+            }
+          } else {
+            const health = await readSecondaryHealth(client, context.oracle, candidate, { number: blockNumber, timestamp: block.timestamp });
+            if (health.feeds.some((feed) => feed.feed.toLowerCase() === decoded.feed?.toLowerCase())) { asset = candidate; break; }
+          }
+        } catch (cause) {
+          if (decoded.code === 'TwapUnavailable' && decodePriceSourceError(cause)?.code === 'TwapUnavailable') { asset = candidate; break; }
+        }
       }
     }
     if (asset !== undefined) {
-      const [source] = await client.readContract({ address: context.oracle, abi: PRICE_SOURCE_ABI, functionName: 'secondaryOf', args: [asset], blockNumber });
-      if (source !== zeroAddress) maxAge = await client.readContract({ address: source, abi: PRICE_SOURCE_ABI, functionName: 'maxAge', blockNumber });
+      if (decoded.code === 'TwapUnavailable') {
+        symbol = await client.readContract({ address: asset, abi: PRICE_SOURCE_ABI, functionName: 'symbol', blockNumber });
+      } else if (decoded.code === 'StaleFeed') {
+        const [source] = await client.readContract({ address: context.oracle, abi: PRICE_SOURCE_ABI, functionName: 'secondaryOf', args: [asset], blockNumber });
+        if (source !== zeroAddress) {
+          const numeraireFeed = await client.readContract({ address: source, abi: PRICE_SOURCE_ABI, functionName: 'numeraireFeed', blockNumber });
+          const ageFunction = numeraireFeed.toLowerCase() === decoded.feed?.toLowerCase() ? 'numeraireMaxAge' : 'maxAge';
+          maxAge = await client.readContract({ address: source, abi: PRICE_SOURCE_ABI,
+            functionName: ageFunction, blockNumber });
+        }
+      }
     }
   } catch { /* keep the decoded cause; unavailable metadata is never invented */ }
   return decodePriceSourceError(error, { ...(asset === undefined ? {} : { asset }),
+    ...(symbol === undefined ? {} : { symbol }),
     ...(timestamp === undefined ? {} : { timestamp }), ...(maxAge === undefined ? {} : { maxAge }) });
 }
 
 export type SecondaryFeedHealth = { role: 'asset/USD' | 'numeraire/USD'; feed: Address; updatedAt: bigint; age: bigint; failure: PriceSourceFailure | null };
-export type SecondaryHealth = { asset: Address; source: Address; maxAge: number | null; maxDeviationBps: number; feeds: SecondaryFeedHealth[] };
+export type SecondaryHealth = { asset: Address; source: Address; maxAge: number | null; numeraireMaxAge: number | null; maxDeviationBps: number; feeds: SecondaryFeedHealth[] };
 
 /** Two feeds at one pinned block. Missing RPC/ABI data throws; it is never a healthy/absent source. */
 export async function readSecondaryHealth(client: PublicClient, oracle: Address, asset: Address, block: { number: bigint; timestamp: bigint }): Promise<SecondaryHealth> {
   const [source, maxDeviationBps] = await client.readContract({ address: oracle, abi: PRICE_SOURCE_ABI, functionName: 'secondaryOf', args: [asset], blockNumber: block.number });
-  if (source === zeroAddress) return { asset, source, maxAge: null, maxDeviationBps, feeds: [] };
-  const [assetFeed, numeraireFeed, maxAge] = await Promise.all([
+  if (source === zeroAddress) return { asset, source, maxAge: null, numeraireMaxAge: null, maxDeviationBps, feeds: [] };
+  const [assetFeed, numeraireFeed, maxAge, numeraireMaxAge] = await Promise.all([
     client.readContract({ address: source, abi: PRICE_SOURCE_ABI, functionName: 'assetFeed', blockNumber: block.number }),
     client.readContract({ address: source, abi: PRICE_SOURCE_ABI, functionName: 'numeraireFeed', blockNumber: block.number }),
     client.readContract({ address: source, abi: PRICE_SOURCE_ABI, functionName: 'maxAge', blockNumber: block.number }),
+    client.readContract({ address: source, abi: PRICE_SOURCE_ABI, functionName: 'numeraireMaxAge', blockNumber: block.number }),
   ]);
-  if (maxAge < 60 || maxAge > 86400 || assetFeed === zeroAddress || numeraireFeed === zeroAddress) throw new Error('secondary metadata invalid');
+  if (maxAge < 60 || maxAge > 86400 || numeraireMaxAge < 60 || numeraireMaxAge > 86400 || assetFeed === zeroAddress || numeraireFeed === zeroAddress) throw new Error('secondary metadata invalid');
   const feeds: SecondaryFeedHealth[] = [];
-  for (const [role, feed] of [['asset/USD', assetFeed], ['numeraire/USD', numeraireFeed]] as const) {
+  for (const [role, feed, feedMaxAge] of [['asset/USD', assetFeed, maxAge], ['numeraire/USD', numeraireFeed, numeraireMaxAge]] as const) {
     const [, answer, , updatedAt] = await client.readContract({ address: feed, abi: PRICE_SOURCE_ABI, functionName: 'latestRoundData', blockNumber: block.number });
-    const code = answer <= 0n ? 'InvalidAnswer' : updatedAt === 0n || updatedAt > block.timestamp || block.timestamp - updatedAt > BigInt(maxAge) ? 'StaleFeed' : null;
-    const failure = code === null ? null : decodePriceSourceError({ errorName: code, args: [feed, code === 'InvalidAnswer' ? answer : updatedAt] }, { asset, timestamp: block.timestamp, maxAge });
+    const code = answer <= 0n ? 'InvalidAnswer' : updatedAt === 0n || updatedAt > block.timestamp || block.timestamp - updatedAt > BigInt(feedMaxAge) ? 'StaleFeed' : null;
+    const failure = code === null ? null : decodePriceSourceError({ errorName: code, args: [feed, code === 'InvalidAnswer' ? answer : updatedAt] }, { asset, timestamp: block.timestamp, maxAge: feedMaxAge });
     feeds.push({ role, feed, updatedAt, age: block.timestamp - updatedAt, failure });
   }
-  return { asset, source, maxAge, maxDeviationBps, feeds };
+  return { asset, source, maxAge, numeraireMaxAge, maxDeviationBps, feeds };
 }
 
 export type PriceSourceObservation = { asset: Address; verified: boolean; failure: PriceSourceFailure | null };
@@ -714,19 +752,17 @@ export async function inspectPriceSources(client: PublicClient, oracle: Address,
   for (const asset of new Map(assets.map((value) => [value.toLowerCase(), value])).values()) {
     if (asset.toLowerCase() === numeraire.toLowerCase()) continue;
     try {
+      // TWAP freshness/cardinality applies even when no secondary feed is configured.
+      const decimals = await client.readContract({ address: asset, abi: PRICE_SOURCE_ABI, functionName: 'decimals', blockNumber });
+      if (decimals > 36) throw new Error('invalid asset decimals');
+      const [quoted, minimum] = await client.readContract({ address: oracle, abi: PRICE_SOURCE_ABI, functionName: 'previewSwap', args: [asset, numeraire, 10n ** BigInt(decimals)], blockNumber });
+      if (quoted <= 0n || minimum <= 0n) throw new Error('price source quote incomplete');
       const health = await readSecondaryHealth(client, oracle, asset, { number: blockNumber, timestamp: block.timestamp });
       const failure = health.feeds.find((feed) => feed.failure !== null)?.failure;
       if (failure) { observations.push({ asset, verified: true, failure }); continue; }
-      // No secondary is a valid configuration and must be visible in preflight.
-      if (health.source !== zeroAddress) {
-        const decimals = await client.readContract({ address: asset, abi: PRICE_SOURCE_ABI, functionName: 'decimals', blockNumber });
-        if (decimals > 36) throw new Error('invalid asset decimals');
-        const [quoted, minimum] = await client.readContract({ address: oracle, abi: PRICE_SOURCE_ABI, functionName: 'previewSwap', args: [asset, numeraire, 10n ** BigInt(decimals)], blockNumber });
-        if (quoted <= 0n || minimum <= 0n) throw new Error('price source quote incomplete');
-      }
       observations.push({ asset, verified: true, failure: null });
     } catch (error) {
-      const failure = decodePriceSourceError(error, { asset, timestamp: block.timestamp });
+      const failure = await describePriceSourceError(error, client, { oracle, asset, blockNumber });
       observations.push({ asset, verified: failure !== null, failure });
     }
   }

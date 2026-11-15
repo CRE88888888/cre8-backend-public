@@ -107,9 +107,9 @@ import type { GetUserOperationReturnType, UserOperationReceipt } from 'viem/acco
 import { activeChain } from './chain-object.js';
 import { testnetAssets, TESTNET_97 } from './testnet-profile.js';
 import { KERNEL_V3_3_ADDRESSES } from './addresses.js';
-import { detectAlerts, detectRelayerLowGas, formatAlert, recordAlerts, resolveAlerts, createPriceSourceTracker, priceSourceAlertAssets } from './alerts.js';
+import { detectAlerts, detectRelayerLowGas, formatAlert, recordAlerts, resolveAlerts, PRICE_SOURCE_FAILURE_ROUNDS, priceSourceAlertAssets } from './alerts.js';
 import type { AlertFinding, AlertKind, PriceSourceTracker, RelayerGasChecks } from './alerts.js';
-import { a10ErrorMessage, EXECUTOR_BUY_ABI, readGlobalPaused, decodePriceSourceError, describePriceSourceError, PriceSourceError, inspectPriceSources } from './chain.js';
+import { a10ErrorMessage, EXECUTOR_BUY_ABI, readGlobalPaused, decodePriceSourceError, describePriceSourceError, PriceSourceError, inspectPriceSources, oracleUnavailableTag } from './chain.js';
 import { getConfig, getSessionKeyConfig, requireSessionKeyConfig } from './config.js';
 import { errorMessage, query as dbQuery, withTransaction, withPortfolioLock } from './db.js';
 import { AppError } from './errors.js';
@@ -1532,6 +1532,48 @@ function oneLine(error: unknown): string {
 /** 把 run 的參數與外部注入的 deps 合成一組完整可用的依賴（缺的就補預設實作）。 */
 const priceSourceTrackers = new Map<string, PriceSourceTracker>();
 
+/** #76: pool outages default to six consecutive rounds; secondary feed alerts retain their threshold.
+ * Counters are per asset and failure family, so RPC gaps/recovery/restarts never invent continuity.
+ * Persisted critical alerts stay open until all affected assets have verified recovery.
+ */
+export function createSchedulerPriceSourceTracker(env: NodeJS.ProcessEnv = process.env): PriceSourceTracker {
+  const raw = env.ORACLE_UNAVAILABLE_ROUNDS?.trim() || '6';
+  const oracleRounds = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(oracleRounds) || oracleRounds < 1) {
+    throw new Error('ORACLE_UNAVAILABLE_ROUNDS 必須是正安全整數');
+  }
+  const counts = new Map<string, { family: 'twap' | 'secondary'; rounds: number }>();
+  return (observations, previous) => {
+    const unique = new Map(observations.map((observation) => [observation.asset.toLowerCase(), observation]));
+    const threshold = (failure: PriceSourceFailure) => failure.code === 'TwapUnavailable' ? oracleRounds : PRICE_SOURCE_FAILURE_ROUNDS;
+    let complete = true;
+    for (const [asset, observation] of unique) {
+      if (!observation.verified) complete = false;
+      if (!observation.verified || observation.failure === null) { counts.delete(asset); continue; }
+      const family = observation.failure.code === 'TwapUnavailable' ? 'twap' : 'secondary';
+      const old = counts.get(asset);
+      counts.set(asset, { family, rounds: Math.min(threshold(observation.failure), (old?.family === family ? old.rounds : 0) + 1) });
+    }
+    for (const asset of counts.keys()) if (!unique.has(asset)) counts.delete(asset);
+    const previousAssets = priceSourceAlertAssets(previous?.detail ?? '');
+    if (previous !== null && previousAssets.length === 0) return { finding: previous, complete: false };
+    if (previousAssets.some((asset) => !unique.has(asset.toLowerCase()))) complete = false;
+    const failures = [...unique.values()].filter((observation) => observation.verified && observation.failure !== null);
+    const critical = previous !== null || failures.some((observation) => observation.failure !== null &&
+      (counts.get(observation.asset.toLowerCase())?.rounds ?? 0) >= threshold(observation.failure));
+    const lines = failures.sort((a, b) => a.asset.toLowerCase().localeCompare(b.asset.toLowerCase())).map((observation) =>
+      `asset ${observation.asset.toLowerCase()}: ${observation.failure?.detail}（連續 ${counts.get(observation.asset.toLowerCase())?.rounds ?? 0}/${observation.failure === null ? oracleRounds : threshold(observation.failure)} 輪）`);
+    for (const line of previous?.detail.split('\n') ?? []) {
+      const [asset] = priceSourceAlertAssets(line);
+      if (asset !== undefined && unique.get(asset.toLowerCase())?.verified !== true) lines.push(line);
+    }
+    return { complete, finding: critical && lines.length > 0 ? {
+      kind: 'price_source_unavailable', severity: 'critical', portfolioId: null,
+      detail: '價格來源不可用；全部受影響資產確認恢復後才解除：\n' + lines.join('\n'),
+    } : null };
+  };
+}
+
 function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
   const query = provided.query ?? defaultQuery();
   const chainId = provided.chainId ?? getConfig().chainId;
@@ -1549,9 +1591,9 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
     withPortfolioLock: provided.withPortfolioLock ?? withPortfolioLock,
     chainId,
     priceSourceTracker: provided.priceSourceTracker ?? (() => {
-      const key = `${chainId}:${provided.executor?.toLowerCase() ?? process.env.EXECUTOR_ADDRESS?.trim().toLowerCase() ?? 'unconfigured'}`;
+      const key = `${chainId}:${provided.executor?.toLowerCase() ?? process.env.EXECUTOR_ADDRESS?.trim().toLowerCase() ?? 'unconfigured'}:${process.env.ORACLE_UNAVAILABLE_ROUNDS ?? '6'}`;
       let tracker = priceSourceTrackers.get(key);
-      if (tracker === undefined) { tracker = createPriceSourceTracker(); priceSourceTrackers.set(key, tracker); }
+      if (tracker === undefined) { tracker = createSchedulerPriceSourceTracker(); priceSourceTrackers.set(key, tracker); }
       return tracker;
     })(),
     priceSourceChecks: provided.priceSourceChecks ?? (async () => {
@@ -2158,10 +2200,12 @@ async function decideAndMaybeExecute(
   }
 
   if (plan.blocked.length > 0) {
+    const unavailable = plan.snapshot.unpriced.filter((asset) => asset.amountWei > 0n && asset.reason === 'pricing_failed:TWAP_UNAVAILABLE')
+      .map((asset) => oracleUnavailableTag(getAddress(asset.asset), asset.symbol));
     return {
       ...base,
       outcome: 'blocked',
-      reason: `planPortfolio 擋下（不執行）：${plan.blocked.map((block) => `[${block.code}] ${block.detail}`).join('；')}`,
+      reason: `${unavailable.length === 0 ? '' : `${unavailable.join(' ')} 整批不送，下一輪重試；`}planPortfolio 擋下（不執行）：${plan.blocked.map((block) => `[${block.code}] ${block.detail}`).join('；')}`,
     };
   }
   if (plan.pinnedVersion.paused) {

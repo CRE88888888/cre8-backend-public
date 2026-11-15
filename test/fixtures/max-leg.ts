@@ -17,6 +17,7 @@ const ABI = parseAbi([
   'function effectiveFeeBps(uint256) view returns(uint16)',
   'function previewSwap(address,address,uint256) view returns(uint256,uint256)',
   'function decimals() view returns(uint8)', 'function venues(address) view returns(uint8,address)',
+  'function symbol() view returns(string)',
   'function getPool(address,address,uint24) view returns(address)', 'function quoteExactInput(bytes,uint256) returns(uint256,uint160[])',
 ]);
 
@@ -55,6 +56,7 @@ export function sellFixture() {
       case 'fee': return encodeFunctionResult({ abi: ABI, functionName: 'fee', result: 10000 });
       case 'effectiveFeeBps': return encodeFunctionResult({ abi: ABI, functionName: 'effectiveFeeBps', result: 0 });
       case 'decimals': return encodeFunctionResult({ abi: ABI, functionName: 'decimals', result: 18 });
+      case 'symbol': return encodeFunctionResult({ abi: ABI, functionName: 'symbol', result: 'DOGE' });
       case 'previewSwap': {
         const error = state.quoteErrors.get(decoded.args[0].toLowerCase());
         if (error !== undefined) throw error;

@@ -3521,7 +3521,70 @@ test('#47 receipt reconciliation restores mixed venue/data steps and rejects eit
 });
 
 
-import { secondaryRevert } from './fixtures/secondary-price.js';
+import { secondaryRevert, twapRevert } from './fixtures/secondary-price.js';
+
+test('#76 unavailable TWAP during the holdings snapshot keeps the symbol and blocks before planning', async () => {
+  const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+  const chain = stubChain();
+  chain.plan = stubPlan({ blocked: [{ code: 'UNPRICED_HOLDINGS', detail: 'WBNB pricing_failed:TWAP_UNAVAILABLE' }] });
+  chain.plan.snapshot.unpriced.push({ asset: TOKEN_IN, symbol: 'WBNB', amountWei: 1n, decimals: 18, reason: 'pricing_failed:TWAP_UNAVAILABLE' });
+  const round = await runSchedulerOnce({ dryRun: false, now: NOW, skipAlerts: true }, deps(db, chain));
+  assert.equal(round.results[0]?.outcome, 'blocked'); assert.match(round.results[0]?.reason ?? '', /\[ORACLE_UNAVAILABLE:WBNB\]/);
+  assert.equal(chain.planRebalanceCalls, 0); assert.equal(chain.executeCalls.length, 0); assert.equal(db.operations.length, 0);
+});
+
+test('#76 planning or final refresh TWAP outage sends no batch or operation; the next interval retries', async () => {
+  for (const phase of ['planning', 'refresh'] as const) {
+    const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+    const chain = stubChain({ rebalance: readyPlan([step(), step({ tokenIn: TOKEN_OUT, tokenOut: TOKEN_IN })]) });
+    const outage = { active: true };
+    const extra: SchedulerDeps = phase === 'planning'
+      ? { planRebalance: async () => { if (outage.active) throw twapRevert(); return chain.rebalance; } }
+      : { refreshFloors: async () => outage.active ? { ok: false, kind: 'quote-failed', reason: '[ORACLE_UNAVAILABLE:WBNB] TwapUnavailable' }
+        : { ok: true, steps: chain.rebalance.kind === 'ready' ? chain.rebalance.steps : [], refreshes: [], note: 'recovered' } };
+    const first = await runSchedulerOnce({ dryRun: false, now: NOW, skipAlerts: true }, deps(db, chain, extra));
+    assert.equal(first.results[0]?.outcome, 'blocked'); assert.match(first.results[0]?.reason ?? '', /ORACLE_UNAVAILABLE/);
+    assert.equal(chain.executeCalls.length, 0); assert.equal(db.operations.length, 0);
+    outage.active = false;
+    const next = new Date(NOW.getTime() + ONE_DAY_SECONDS * 1000);
+    const second = await runSchedulerOnce({ dryRun: false, now: next, skipAlerts: true }, deps(db, chain, extra));
+    assert.equal(second.results[0]?.outcome, 'executed'); assert.equal(chain.executeCalls.length, 1);
+    assert.equal(chain.executeCalls[0]?.steps.length, 2);
+  }
+});
+
+test('#76 configurable TWAP alert threshold: default six, equality, per-asset reset and legacy secondary three', async () => {
+  const { createSchedulerPriceSourceTracker } = await import('../src/scheduler.js');
+  const { decodePriceSourceError } = await import('../src/chain.js');
+  const failure = { asset: TOKEN_IN, verified: true, failure: decodePriceSourceError(twapRevert(), { asset: TOKEN_IN }) };
+  const healthy = { ...failure, failure: null };
+  const track = createSchedulerPriceSourceTracker({});
+  for (let n = 1; n <= 6; n += 1) {
+    const result = track([failure, failure], null);
+    assert.equal(result.finding !== null, n === 6);
+    if (n === 6) assert.match(result.finding?.detail ?? '', /連續 6\/6 輪/);
+  }
+  track([healthy], null); assert.equal(track([failure], null).finding, null);
+  track([{ ...failure, verified: false }], null); assert.equal(track([failure], null).finding, null);
+  track([], null); assert.equal(track([failure], null).finding, null);
+  for (const rounds of [1, 2, 3, 7]) {
+    const custom = createSchedulerPriceSourceTracker({ ORACLE_UNAVAILABLE_ROUNDS: String(rounds) });
+    for (let n = 1; n <= rounds; n += 1) assert.equal(custom([failure], null).finding !== null, n === rounds);
+  }
+  for (const raw of ['0', '-1', '1.5', 'NaN', '9007199254740992', 'private-token']) {
+    assert.throws(() => createSchedulerPriceSourceTracker({ ORACLE_UNAVAILABLE_ROUNDS: raw }), /必須是正安全整數/);
+  }
+  assert.doesNotThrow(() => createSchedulerPriceSourceTracker({ ORACLE_UNAVAILABLE_ROUNDS: '9007199254740991' }));
+  const secondary = { ...failure, failure: decodePriceSourceError(secondaryRevert('StaleFeed'), { asset: TOKEN_IN }) };
+  const legacy = createSchedulerPriceSourceTracker({});
+  for (let n = 1; n <= 3; n += 1) assert.equal(legacy([secondary], null).finding !== null, n === 3);
+  assert.equal(legacy([failure], null).finding, null, 'secondary failure rounds cannot count toward a TWAP outage');
+  const perAsset = createSchedulerPriceSourceTracker({ ORACLE_UNAVAILABLE_ROUNDS: '2' });
+  const other = { ...failure, asset: TOKEN_OUT, failure: decodePriceSourceError(twapRevert(), { asset: TOKEN_OUT }) };
+  assert.equal(perAsset([failure], null).finding, null);
+  assert.equal(perAsset([other], null).finding, null, 'different assets do not share failure counts');
+  assert.match(perAsset([other], null).finding?.detail ?? '', /連續 2\/2 輪/);
+});
 for (const phase of ['planning', 'send', 'reconcile'] as const) {
   test(`#52 ${phase} preserves structured secondary failure without RPC text or resending`, async () => {
     const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });

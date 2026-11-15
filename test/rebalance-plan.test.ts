@@ -102,7 +102,7 @@ type StubChain = {
     token1: Address;
     quoted: bigint;
     minimum: bigint;
-    revert: string | null;
+    revert: string | Error | null;
     /**
      * 設了就是 `AtpMultiPoolOracle` 的形狀：`pool()`/`token0()`/`token1()` 一律 revert（真的 router
      * 沒有那三個函式），報價與 pool fee 走 `pairs` + `quotes`。
@@ -251,6 +251,7 @@ function stubClient(chain: StubChain): PublicClient {
           return chain.poolState.liquidity;
         }
         case 'previewSwap': {
+          if (chain.oracle.revert instanceof Error) throw chain.oracle.revert;
           if (chain.oracle.revert !== null) throw new Error(`execution reverted: ${chain.oracle.revert}()`);
           const byRate = quoteByRate(args.args?.[2] as bigint);
           return byRate ?? [chain.oracle.quoted, chain.oracle.minimum];
@@ -2566,7 +2567,51 @@ test('#47 Pancake comparison caps eth_call gas so a cold thin pool cannot consum
 });
 
 
-import { secondaryRevert } from './fixtures/secondary-price.js';
+import { secondaryRevert, twapRevert } from './fixtures/secondary-price.js';
+
+test('#76 unavailable hub buy or sell blocks the entire batch and a later healthy round replans', async () => {
+  for (const broken of [WBNB, TOKEN3]) {
+    const { holdings, targets } = threeAssetCase();
+    const chain = hubChain({ quotes: {
+      [`${WBNB}:${USDT}`]: { minimum: 198n * 10n ** 18n },
+      [`${USDT}:${TOKEN3}`]: { minimum: 99n * 10n ** 18n },
+    } });
+    const key = broken === WBNB ? `${WBNB}:${USDT}` : `${USDT}:${TOKEN3}`;
+    chain.oracle.errors = { [key]: twapRevert() };
+    const args = hubArgs(chain, { holdings, targets, thresholdBps: 100 });
+    const blocked = await planRebalance(args);
+    assert.equal(blocked.kind, 'blocked');
+    assert.match(blocked.reason, /\[ORACLE_UNAVAILABLE:/);
+    delete chain.oracle.errors[key];
+    assert.equal(expectReady(await planRebalance(args)).steps.length, 2);
+  }
+});
+
+test('#76 a TWAP failure while valuing buy allowance cannot preserve independent sells', async () => {
+  const { holdings, targets } = threeAssetCase();
+  const chain = hubChain({ quotes: { [`${WBNB}:${USDT}`]: { minimum: 198n * 10n ** 18n } } });
+  chain.buyAllowance = twapRevert();
+  const plan = await planRebalance(hubArgs(chain, { holdings, targets, thresholdBps: 100 }));
+  assert.equal(plan.kind, 'blocked'); assert.match(plan.reason, /ORACLE_UNAVAILABLE/);
+});
+
+test('#76 TWAP nominal-value failure under a max-leg cap blocks both hub and pinned plans', async () => {
+  for (const hub of [true, false]) {
+    const chain = hubChain();
+    chain.oracle.errors = { [`${WBNB}:${USDT}`]: twapRevert() };
+    const input = { holdings: [holding(WBNB, 10n ** 18n, 18, PRICE_1000_USD)], targets: targetsOf(WBNB, USDT, 0), thresholdBps: 100,
+      maxLegUsdE8: new Map([[WBNB, 150n * PRICE_1_USD]]) };
+    if (!hub) {
+      const pinned = baseChain();
+      pinned.oracle.revert = twapRevert();
+      const plan = await planRebalance(argsOf(pinned, input));
+      assert.equal(plan.kind, 'blocked'); assert.match(plan.reason, /ORACLE_UNAVAILABLE/);
+    } else {
+      const plan = await planRebalance(hubArgs(chain, input));
+      assert.equal(plan.kind, 'blocked'); assert.match(plan.reason, /ORACLE_UNAVAILABLE/);
+    }
+  }
+});
 for (const code of ['StaleFeed', 'InvalidAnswer', 'SourcesDisagree'] as const) {
   test(`#52 hub skips only ${code} asset and preserves a healthy buy`, async () => {
     const holdings = [holding(USDT, 200n * 10n ** 18n, 18, PRICE_1_USD)];

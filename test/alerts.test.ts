@@ -1324,6 +1324,42 @@ test('ALERT_STUCK_HOURS 可覆寫；格式錯誤要拋錯（不要靜默用預�
 
 
 import { createPriceSourceTracker } from '../src/alerts.js';
+import { createSchedulerPriceSourceTracker } from '../src/scheduler.js';
+import { twapRevert } from './fixtures/secondary-price.js';
+
+test('#76 DB six-round TWAP alert, Telegram dedupe, unknown RPC/DB, restart and verified recovery', dbGate, async () => {
+  await assert.rejects(() => withTransaction(async (client) => {
+    const q: QueryFn = (sql, params = []) => client.query(sql, [...params]);
+    await q('delete from scheduler_alerts');
+    const broken = { asset: ASSET, verified: true, failure: decodePriceSourceError(twapRevert(), { asset: ASSET }) };
+    let observations = [broken];
+    let tracker = createSchedulerPriceSourceTracker({});
+    const sent: string[] = [];
+    const run = (checks = async () => observations, query = q) => announceAlerts({ query, now: NOW, chainId: 999176,
+      executorPaused: false, log: () => {}, priceSourceChecks: checks, priceSourceTracker: tracker,
+      sendNotification: async (message) => { sent.push(message); }, gasChecks: { readGasPrice: async () => 0n, readNativeBalance: async () => 0n } });
+    const open = async () => (await listOpenAlerts(q)).filter((alert) => alert.kind === 'price_source_unavailable');
+    for (let n = 1; n <= 6; n += 1) { await run(); assert.equal((await open()).length, n < 6 ? 0 : 1); }
+    await run(); assert.equal(sent.length, 1); assert.equal((await open())[0]?.occurrences, 2);
+    tracker = createSchedulerPriceSourceTracker({});
+    await run(); assert.equal((await open()).length, 1);
+    await run(async () => { throw new Error('RPC timeout private-token'); });
+    await run(async () => observations, async (sql, params) => {
+      if (sql.startsWith('select detail')) throw new Error('DB private-token');
+      return q(sql, params);
+    });
+    observations = [{ ...broken, verified: false, failure: null }];
+    await run(); assert.equal((await open()).length, 1);
+    observations = [{ ...broken, failure: null }];
+    await run(); assert.equal((await open()).length, 0); assert.equal(sent.length, 2);
+    assert.match(sent[1] ?? '', /已解除/); assert.doesNotMatch(sent.join(''), /private-token/);
+    observations = [broken];
+    for (let n = 1; n <= 5; n += 1) await run();
+    await run(async () => { throw new Error('RPC timeout'); });
+    await run(); assert.equal((await open()).length, 0, 'unknown round breaks consecutiveness');
+    throw new Error('rollback #76');
+  }), /rollback #76/);
+});
 import type { PriceSourceObservation } from '../src/chain.js';
 import { ASSET, CASH, secondaryRevert } from './fixtures/secondary-price.js';
 import { decodePriceSourceError } from '../src/chain.js';

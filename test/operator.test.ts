@@ -1459,7 +1459,37 @@ test('#75 capped close is exit, partial redeem stays ordinary, full liquidation 
 });
 
 
-import { secondaryRevert } from './fixtures/secondary-price.js';
+import { secondaryRevert, twapRevert } from './fixtures/secondary-price.js';
+
+test('#76 full exit leaves unavailable holdings in place, keeps remaining value unknown, and sells after recovery', async () => {
+  const f = sellFixture(); f.state.limit = null;
+  const options = { ...f.deps, quoteAggregator: async () => null };
+  const plan = f.plan(samplePlan());
+  const broken = plan.snapshot.holdings[0]; assert.ok(broken);
+  const healthy = getAddress('0x0000000000000000000000000000000000001234');
+  plan.snapshot.holdings.push({ ...broken, asset: healthy, decimals: 18, amountWei: 100n * 10n ** 18n });
+  plan.targets.push({ asset: healthy, weightBps: 0, symbol: 'HEALTHY' });
+  plan.report = computeDrift(plan.snapshot.holdings, plan.targets, plan.thresholdBps);
+  f.state.extraLimits.push({ address: healthy, max_leg_usdt: null });
+  f.state.quoteErrors.set(broken.asset.toLowerCase(), twapRevert());
+  const input = { portfolioId: PORTFOLIO_ID, account: ACCOUNT, plan };
+  const exit = await buildRedeemPlan(input, { close: true }, options);
+  assert.equal(exit.plan.kind, 'ready');
+  assert.ok(exit.plan.kind === 'ready');
+  assert.equal(exit.plan.purpose, 'exit');
+  assert.equal(exit.plan.steps.length, 1); assert.equal(exit.plan.steps[0]?.tokenIn, healthy);
+  assert.equal(exit.requestedSellUsdE8, null);
+  assert.match(exit.plan.rationale, /ORACLE_UNAVAILABLE/);
+  assert.equal(broken.amountWei, 200n * 10n ** 8n);
+  f.state.quoteErrors.clear();
+  const recovered = await buildRedeemPlan(input, { close: true }, options);
+  assert.ok(recovered.plan.kind === 'ready'); assert.equal(recovered.plan.steps.length, 2);
+  assert.ok(recovered.requestedSellUsdE8 !== null);
+  f.state.quoteErrors.set(broken.asset.toLowerCase(), twapRevert());
+  plan.snapshot.holdings = [broken];
+  const allBlocked = await buildRedeemPlan(input, { close: true }, options);
+  assert.equal(allBlocked.plan.kind, 'blocked'); assert.equal(allBlocked.requestedSellUsdE8, null);
+});
 for (const request of ['first', 'continue', 'close'] as const) {
   test(`#52 ${request} redeem preserves secondary reason and never treats unpriced exit as complete`, async () => {
     const f = sellFixture();

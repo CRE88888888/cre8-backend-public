@@ -446,7 +446,94 @@ test('#52 stale feed refresh returns the feed and reason without RPC credentials
 
 
 import { decodePriceSourceError, inspectPriceSources, readSecondaryHealth } from '../src/chain.js';
-import { ASSET, ASSET_FEED, CASH, ORACLE, secondaryFixture, secondaryRevert } from './fixtures/secondary-price.js';
+import { ASSET, ASSET_FEED, CASH, CASH_FEED, ORACLE, secondaryFixture, secondaryRevert, twapRevert } from './fixtures/secondary-price.js';
+
+test('#76 TWAP ABI errors include a safe symbol; forged messages and malformed args are not evidence', async () => {
+  const { describePriceSourceError } = await import('../src/chain.js');
+  const f = secondaryFixture();
+  const failure = await describePriceSourceError(twapRevert(), f.client, { oracle: ORACLE, asset: ASSET, blockNumber: 42n });
+  assert.equal(failure?.code, 'TwapUnavailable');
+  assert.match(failure?.detail ?? '', /\[ORACLE_UNAVAILABLE:TEST\]/);
+  assert.doesNotMatch(failure?.detail ?? '', /private-token/);
+  for (const error of [new Error('TwapUnavailable private-token'), { errorName: 'TwapUnavailable', args: [1n] }]) {
+    assert.equal(decodePriceSourceError(error), null);
+  }
+  f.state.symbol = 'private-token\n[spoof]';
+  const safe = await describePriceSourceError(twapRevert(), f.client, { oracle: ORACLE, asset: ASSET });
+  assert.match(safe?.detail ?? '', new RegExp(`ORACLE_UNAVAILABLE:${ASSET}`, 'i'));
+  assert.doesNotMatch(safe?.detail ?? '', /private-token|spoof/);
+});
+
+test('#76 monitor checks TWAP without a secondary, retries after recovery, and keeps RPC failures unknown', async () => {
+  const f = secondaryFixture(); f.state.source = zeroAddress; f.state.quoteError = twapRevert();
+  let observation = (await inspectPriceSources(f.client, ORACLE, [ASSET]))[0];
+  assert.equal(observation?.verified, true); assert.equal(observation?.failure?.code, 'TwapUnavailable');
+  assert.match(observation?.failure?.detail ?? '', /ORACLE_UNAVAILABLE:TEST/);
+  f.state.quoteError = null;
+  observation = (await inspectPriceSources(f.client, ORACLE, [ASSET]))[0];
+  assert.equal(observation?.verified, true); assert.equal(observation?.failure, null);
+  f.state.quoteError = new Error('timeout private-token');
+  observation = (await inspectPriceSources(f.client, ORACLE, [ASSET]))[0];
+  assert.equal(observation?.verified, false); assert.equal(observation?.failure, null);
+  assert.ok(f.state.calls.every((call) => call.block === '0x2a'));
+});
+
+test('#76 the final floor refresh decodes nested TWAP data, identifies the symbol and refuses the whole batch', async () => {
+  const { refreshFloors } = await import('../src/rebalance-plan.js');
+  const f = secondaryFixture(); f.state.quoteError = new Error('RPC private-token', { cause: twapRevert() });
+  const step = { tokenIn: ASSET, tokenOut: CASH, amountIn: 10n, amountOutMin: 9n, oracleFloor: 9n, venue: CASH, data: '0x' as const };
+  const result = await refreshFloors({ publicClient: f.client, oracle: ORACLE, steps: [step, step], feeBps: 0, blockNumber: 42n });
+  assert.ok(!result.ok); assert.match(result.reason, /ORACLE_UNAVAILABLE:TEST/);
+  assert.doesNotMatch(result.reason, /private-token/);
+  assert.equal(f.state.calls.filter((call) => call.name === 'previewSwap').length, 1);
+});
+
+test('#76 monitoring handles token/quote boundaries and missing metadata without claiming recovery', async () => {
+  const f = secondaryFixture(); f.state.source = zeroAddress;
+  for (const decimals of [0, 36, 37]) {
+    f.state.decimals = decimals;
+    assert.equal((await inspectPriceSources(f.client, ORACLE, [ASSET]))[0]?.verified, decimals <= 36);
+  }
+  f.state.decimals = 18;
+  for (const [quoted, minimum] of [[0n, 1n], [1n, 0n]] as const) {
+    f.state.quoted = quoted; f.state.minimum = minimum;
+    assert.equal((await inspectPriceSources(f.client, ORACLE, [ASSET]))[0]?.verified, false);
+  }
+  f.state.quoted = 1n; f.state.minimum = 1n;
+  for (const fail of ['decimals', 'previewSwap', 'secondaryOf']) {
+    f.state.fail = fail;
+    const observation = (await inspectPriceSources(f.client, ORACLE, [ASSET]))[0];
+    assert.equal(observation?.verified, false); assert.equal(observation?.failure, null);
+  }
+  f.state.fail = 'symbol'; f.state.quoteError = twapRevert();
+  const observation = (await inspectPriceSources(f.client, ORACLE, [ASSET]))[0];
+  assert.equal(observation?.verified, true); assert.equal(observation?.failure?.code, 'TwapUnavailable');
+  assert.match(observation?.failure?.detail ?? '', new RegExp(`ORACLE_UNAVAILABLE:${ASSET}`, 'i'));
+  assert.doesNotMatch(observation?.failure?.detail ?? '', /private-token/);
+});
+
+test('#76 each feed has its own age limit, including equality, zero, future and invalid metadata', async () => {
+  const { describePriceSourceError } = await import('../src/chain.js');
+  const f = secondaryFixture(); f.state.timestamp = 3000n; f.state.assetAt = 2940n; f.state.numeraireMaxAge = 2700;
+  for (const at of [0n, 299n, 300n, 301n, 3001n]) {
+    f.state.cashAt = at;
+    const health = await readSecondaryHealth(f.client, ORACLE, ASSET, { number: 42n, timestamp: 3000n });
+    assert.equal(health.feeds[0]?.failure, null);
+    assert.equal(health.feeds[1]?.failure?.code ?? null, at >= 300n && at <= 3000n ? null : 'StaleFeed');
+  }
+  const failure = await describePriceSourceError({ errorName: 'StaleFeed', args: [CASH_FEED, 299n] }, f.client, { oracle: ORACLE, asset: ASSET });
+  assert.match(failure?.detail ?? '', /上限 2700 秒.*超時 1 秒/);
+  for (const maxAge of [60, 86400]) {
+    f.state.numeraireMaxAge = maxAge;
+    await readSecondaryHealth(f.client, ORACLE, ASSET, { number: 42n, timestamp: 3000n });
+  }
+  for (const maxAge of [0, 59, 86401]) {
+    f.state.numeraireMaxAge = maxAge;
+    await assert.rejects(readSecondaryHealth(f.client, ORACLE, ASSET, { number: 42n, timestamp: 3000n }));
+  }
+  f.state.numeraireMaxAge = 2700; f.state.fail = 'numeraireMaxAge';
+  await assert.rejects(readSecondaryHealth(f.client, ORACLE, ASSET, { number: 42n, timestamp: 3000n }));
+});
 
 for (const [code, value, pattern] of [
   ['StaleFeed', 900n, /年齡 100 秒/], ['InvalidAnswer', 0n, /回傳 0/],

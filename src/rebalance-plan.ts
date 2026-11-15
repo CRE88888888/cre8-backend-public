@@ -84,9 +84,8 @@
  *      超過就夾到剩餘預算，剩 0 就跳過。
  *   5. 每一步各自向 router 要 floor（`previewSwap(tokenIn, tokenOut, amountIn).minimum`），
  *      `minGross` 仍由 `minGrossFor` 逐字對齊合約。
- *   6. 某一步算不出（沒有註冊 oracle／沒有池／報不出價／`amountIn == 0`）→ **跳過那一步並記錄在
- *      rationale**，不是整份 `blocked`：一個沒有池的資產不該讓另外兩個資產的再平衡一起停擺。
- *      全部都被跳過 → `noop`（永不回空 steps，見上面 §8.1）。
+ *   6. `TwapUnavailable` → **整批 blocked，下一輪重新規劃**，不能只交易其他資產（#76）。
+ *      其餘既有不可執行步驟記在 rationale；全部被跳過 → `noop`（永不回空 steps）。
  *   7. 取整：目標 USD 取**上界**（`ceil`），所以「該賣的量」只會少不會多；`amountInFor` 再向下截斷一次。
  *
  * `targets` 不含 numeraire → `blocked`：執行器只換 `version.assets` 裡的代幣（AtpExecutor.sol:180-182
@@ -168,7 +167,7 @@ export async function checkTradeMinimums(client: PublicClient, executor: Address
       return raw;
     }));
     return tradeMinimumReason(nominal, purpose, loadTradingConfig(), decimals);
-  } catch { return '[TRADE_MINIMUM_UNAVAILABLE] 無法確認交易名義額，不送交易'; }
+  } catch (error) { return decodePriceSourceError(error)?.detail ?? '[TRADE_MINIMUM_UNAVAILABLE] 無法確認交易名義額，不送交易'; }
 }
 
 /** Final funding check uses refreshed swap payloads and one fresh block. Never resizes opaque data. */
@@ -412,7 +411,11 @@ export async function capAssetLeg(params: {
     const finalQuote = await nominalSellQuote(params.publicClient, params.oracle, params.tokenIn, params.numeraire, capped, params.blockNumber);
     if (finalQuote > rawCap) return { blocked: '[MAX_LEG_QUOTE_INVALID] 縮量後 oracle 名義額仍超限，不交易' };
     return { amountIn: capped, batched: true };
-  } catch (error) { return { blocked: decodePriceSourceError(error)?.detail ?? '[MAX_LEG_QUOTE_UNAVAILABLE] oracle 名義額報價失敗或為 0，不送交易' }; }
+  } catch (error) {
+    const failure = decodePriceSourceError(error);
+    if (failure?.code === 'TwapUnavailable') throw new PriceSourceError(failure);
+    return { blocked: failure?.detail ?? '[MAX_LEG_QUOTE_UNAVAILABLE] oracle 名義額報價失敗或為 0，不送交易' };
+  }
 }
 /** Permit2 的 allowance 是 uint160；合約對超過它的 amountIn 是 revert AmountTooLarge（不是截斷）。 */
 const UINT160_MAX = 2n ** 160n - 1n;
@@ -1429,6 +1432,8 @@ async function quoteHub(
     .catch((error: unknown) => ({ ok: false as const, error }));
   if (!quote.ok) {
     const secondary = await describePriceSourceError(quote.error, client, { oracle: router, tokenIn, tokenOut, blockNumber });
+    // Abort the whole ordinary plan, including any healthy legs already built.
+    if (secondary?.code === 'TwapUnavailable') throw new PriceSourceError(secondary);
     const name = secondary?.detail ?? revertNameOf(quote.error);
     return {
       skip:
@@ -1611,7 +1616,7 @@ async function capLegByImpact(params: {
 type BuyBudget = { cap: bigint; bought: bigint; windowEndsAt: bigint; remaining: bigint; note: string };
 
 /** Fail closed without copying RPC errors (which may contain credentials) into API/logs. */
-async function readBuyBudget(args: Pick<PlanRebalanceArgs, 'publicClient' | 'executor' | 'account' | 'oracle' | 'blockNumber'>): Promise<BuyBudget | Extract<RebalancePlan, { kind: 'blocked' }>> {
+async function readBuyBudget(args: Pick<PlanRebalanceArgs, 'publicClient' | 'executor' | 'account' | 'oracle' | 'blockNumber'> & { targets?: readonly TargetWeight[] }): Promise<BuyBudget | Extract<RebalancePlan, { kind: 'blocked' }>> {
   try {
     const result: unknown = await args.publicClient.readContract({
       address: args.executor, abi: EXECUTOR_BUY_ABI, functionName: 'buyAllowance',
@@ -1629,7 +1634,8 @@ async function readBuyBudget(args: Pick<PlanRebalanceArgs, 'publicClient' | 'exe
     if (remaining === 0n) return { kind: 'blocked', reason: `${note}；${windowEndsAt === 0n ? '沒有可等待的開啟窗口，沿用正常排程間隔' : '等待買入窗口結束'}`, buyWindowEndsAt: windowEndsAt };
     return { cap, bought, windowEndsAt, remaining, note };
   } catch (error) {
-    const secondary = await describePriceSourceError(error, args.publicClient, { oracle: args.oracle, blockNumber: args.blockNumber });
+    const secondary = await describePriceSourceError(error, args.publicClient, { oracle: args.oracle, blockNumber: args.blockNumber,
+      assets: (args.targets ?? []).map((target) => getAddress(target.asset)) });
     if (secondary !== null) return { kind: 'blocked', reason: secondary.detail };
     return { kind: 'blocked', reason: '[BUY_ALLOWANCE_UNAVAILABLE] buyAllowance 讀取失敗或資料缺漏，無法確認買入額度，不送交易' };
   }
@@ -2291,7 +2297,12 @@ export async function planRebalance(
   } catch { return { kind: 'blocked', reason: '[MAX_LEG_UNAVAILABLE] 資產單筆限額缺漏或無效，不送交易' }; }
   if (shape.kind === 'hub') {
     if (!isAddressEqual(numeraire, shape.numeraire)) return { kind: 'blocked', reason: 'NotNumeraireRoute：oracle 與 executor 的 numeraire 不一致，不送交易' };
-    return planHub(args, shape.numeraire, deps, deadlineSeconds, maxImpactBps);
+    try { return await planHub(args, shape.numeraire, deps, deadlineSeconds, maxImpactBps); }
+    catch (error) {
+      const failure = decodePriceSourceError(error);
+      if (failure !== null) return { kind: 'blocked', reason: failure.detail };
+      throw error;
+    }
   }
 
   // pinned：oracle 真的只釘一個 pool（D-23）。結構上做不到的事先講清楚，不要用「沒事可做」蓋過去：
@@ -2340,7 +2351,12 @@ export async function planRebalance(
   const asset = sameAsset(tokenIn, numeraire) ? tokenOut : tokenIn;
   const limit = limitOf(args.maxLegUsdE8, asset);
   const limited = await capAssetLeg({ publicClient, oracle, numeraire, tokenIn, tokenOut, amountIn, limitUsdE8: limit,
-    decimals: limit === null ? 18 : await numeraireDecimals(publicClient, numeraire, holdings, blockNumber), blockNumber });
+    decimals: limit === null ? 18 : await numeraireDecimals(publicClient, numeraire, holdings, blockNumber), blockNumber })
+    .catch((error: unknown) => {
+      const failure = decodePriceSourceError(error);
+      if (failure !== null) return { blocked: failure.detail };
+      throw error;
+    });
   if ('blocked' in limited) return { kind: 'blocked', reason: limited.blocked };
   amountIn = limited.amountIn;
   const maxLegBatched = limited.batched ||
@@ -2435,7 +2451,7 @@ export async function planRebalance(
   });
   if ('skip' in capped) {
     // 縮小救不回來 → 這一輪不送。**不是 blocked**：市場狀態，下一輪 TWAP 吸收衝擊後可能就好了。
-    return { kind: /StaleFeed|SourcesDisagree|InvalidAnswer/.test(capped.skip) ? 'blocked' : 'noop', reason: `${capped.skip}. Not sending empty steps.` };
+    return { kind: /ORACLE_UNAVAILABLE|StaleFeed|SourcesDisagree|InvalidAnswer/.test(capped.skip) ? 'blocked' : 'noop', reason: `${capped.skip}. Not sending empty steps.` };
   }
 
   const finalAmountIn = capped.amountIn;

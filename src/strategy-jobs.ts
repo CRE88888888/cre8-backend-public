@@ -14,7 +14,7 @@ export type FundingLot = { id: string; tx_hash: Hex; block_number: string; block
 type Instruction = { revision: string; amount_raw: string; start_at: Date; end_at: Date | null; period_seconds: number;
   next_slot_index: string; state: string };
 export type JobContext = { chainId: number; portfolioId: number; strategyId: number; version: number; kind: 'hold' | 'stack' | 'asset'; asset_started_at?:Date|null;
-  account: Address; allocation: Allocation; cash: Address; now: Date; reserve: bigint; caps: ReadonlyMap<string,bigint|null>;
+  batchStepLimit?: number; account: Address; allocation: Allocation; cash: Address; now: Date; reserve: bigint; caps: ReadonlyMap<string,bigint|null>;
   buyLimit: bigint; observedCash: bigint; enabled: boolean; marketOpen: boolean; execution?:AssetExecution; marketOpenFor?:(assets:readonly string[])=>boolean };
 export type BatchEvidence = { received: InputVector; fees: InputVector; feePaid: bigint; blockNumber: bigint; blockHash: Hex };
 const activeJob = "state in ('reserved','running','unknown','paused')";

@@ -103,3 +103,36 @@ test('#83 dust-aware shortening keeps a 99/1 basket executable instead of strand
   const execution=validateAssetConfig({kind:'per_asset',numeraire:cash,assets:allocation.assets.map(asset=>({asset:asset.address,weightBps:asset.weightBps,yield:null,...(asset.address===cash?{}:{execution:daily})}))},allocation,97);
   assert.deepEqual(planContribution(100n*U,execution,confirmed,R)?.effectiveSlices,{[a]:1,[b]:1},'deferred sub-1 inputs cannot count toward the executable 50-budget minimum');
 });
+
+test('#92 large basket reserves all child fees, preserves raw budgets and checks each child minimum',()=>{
+  const entries=Object.values(TESTNET_97.assets).map(a=>[a.token,(100n*U).toString()] as const);
+  const budgets=Object.fromEntries(entries),caps=new Map(entries.map(([a])=>[a,null]));
+  const result=assetBatchBudget(budgets,R,caps,UINT256_MAX,9);assert.ok(result);
+  assert.equal(result.fee,11n*R);
+  assert.equal(result.count,1n);
+  assert.equal(sumInputs(result.inputs)+result.fee,9200n*U);
+  assert.equal(assetBatchBudget(Object.fromEntries(entries.map(([a])=>[a,U.toString()])),R,caps,UINT256_MAX,9),null);
+  assert.throws(()=>assetBatchBudget(budgets,R,new Map(),UINT256_MAX,9));
+});
+
+test('#92 unequal weights split the large leg to fund every child without changing original budgets',()=>{
+  const addresses=Object.values(TESTNET_97.assets).slice(0,17).map(a=>a.token);
+  const budgets=Object.fromEntries(addresses.map((a,i)=>[a,((i===16?968n:2n)*U).toString()]));
+  const before={...budgets};
+  const planned=assetBatchBudget(budgets,R,new Map(addresses.map(a=>[a,null])),UINT256_MAX,16);
+  assert.ok(planned,'16 small legs plus one large leg have a feasible two-child execution');
+  assert.equal(planned.fee,2n*R);
+  assert.equal(sumInputs(planned.inputs)+planned.fee,1000n*U);
+  assert.deepEqual(budgets,before);
+  const allocation={assets:[...addresses.map((address,i)=>({address,weightBps:i===16?9680:20})),{address:cash,weightBps:0}]};
+  const execution=validateAssetConfig(undefined,allocation,97);
+  assert.ok(planContribution(1000n*U,execution,confirmed,R),'contribution validation uses the same feasible child budgets');
+});
+
+test('#92 two large positions reserve exactly two fees at the 100-USDT contribution boundary',()=>{
+  const addresses=Object.values(TESTNET_97.assets).slice(0,18).map(a=>a.token);
+  const budgets=Object.fromEntries(addresses.map((a,i)=>[a,((i<16?2n:34n)*U).toString()]));
+  const planned=assetBatchBudget(budgets,R,new Map(addresses.map(a=>[a,null])),UINT256_MAX,9);assert.ok(planned);
+  assert.equal(planned.fee,2n*R);assert.equal(planned.count,1n);assert.equal(sumInputs(planned.inputs)+planned.fee,100n*U);
+  for(const [asset,raw] of Object.entries(budgets))assert.equal(BigInt(planned.inputs[asset]??'0'),BigInt(raw)*9946n/10000n);
+});

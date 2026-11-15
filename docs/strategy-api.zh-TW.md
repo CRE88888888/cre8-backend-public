@@ -1,6 +1,6 @@
 # 逐資產策略 API、投入與排程契約
 
-對應 backend#82／#83、db 0031／0032，以及 [測試網參數總表](https://github.com/CRE8Finance/docs/blob/main/docs/TESTNET_PARAMETERS.zh-TW.md)。最新 C3 決定：每批 50 USDT 是**含費總預算**；每資產實際輸入至少 1 USDT。只在 chain 97 開新錢自動化；主網舊 target_weight 行為保留。資產數本張維持 16，解除另由 backend#92 處理。
+對應 backend#82／#83／#92、db 0031／0032／0034，以及 [測試網參數總表](https://github.com/CRE8Finance/docs/blob/main/docs/TESTNET_PARAMETERS.zh-TW.md)。每批 50 USDT 是**含費總預算**；每資產實際輸入至少 1 USDT。只在 chain 97 開新錢自動化；主網舊 target_weight 行為保留。版本不設資產數上限；單筆 UserOp 最多 16 步，依持有數縮小並驗總 gas ≤14M。保留完整原投入向量，僅按 confirmed 子批扣減；已配置現金與費用尾款不重算為新本金。
 
 ## 發版
 

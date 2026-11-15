@@ -255,9 +255,9 @@ test('#83 per-asset full configuration rejects cash execution, tampered weights,
   for(const extra of [{thresholdBps:500},{idleYield:{enabled:true}},{numeraire:TEST_ACCOUNT},{rebalance:'annual'}]) assert.throws(()=>validateAssetConfig({...normalized,...extra},allocation,97));
   for(const rebalance of ['none','monthly','drift'] as const) assert.equal(validateAssetConfig({...normalized,rebalance},allocation,97).rebalance,rebalance);
   const all=Array.from({length:15},(_,i)=>({address:`0x${(i+1).toString(16).padStart(40,'0')}`,weightBps:0}));
-  // 16 includes the required numeraire; more remains delegated to backend #92.
+  // #92: 16 and 17 entries retain exact correspondence with the allocation.
   const sized={assets:[...all.map((a,index)=>({...a,weightBps:index===0?676:666})),{address:'0x55d398326f99059ff775485246999027b3197955',weightBps:0}]};
   assert.equal(validateAssetConfig(undefined,sized,56).assets.length,16);
-  const overflow={assets:[...sized.assets,{address:'0x0000000000000000000000000000000000000010',weightBps:1}]};
-  assert.throws(()=>validateAssetConfig(undefined,overflow,56));
+  const larger={assets:[...sized.assets.map((a,i)=>({...a,weightBps:a.weightBps-(i===0?1:0)})),{address:'0x0000000000000000000000000000000000000010',weightBps:1}]};
+  assert.equal(validateAssetConfig(undefined,larger,56).assets.length,17);
 });

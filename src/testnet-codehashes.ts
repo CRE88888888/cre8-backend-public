@@ -1,10 +1,10 @@
-/** Captured at local chain 97 fork block 142846778, clean worktree of contracts
- * b767bf6b22bb697a0b86abf8ed683916fe81502d. No public-chain deployment is implied. */
+/** Captured at local chain 97 fork block 142896340, clean contracts main
+ * 71870a7cb6231fb9d37f9ea6e319a7624287dcbc. No public-chain deployment is implied. */
 export default {
   "ownedDeployer": "0x52e4634c18879a447590cd443b9b93d70301c4f0a23ad5ee1f173cce4ce496b8",
-  "registry": "0xfad76d0c4f854f96bb6145c4943b2747b1be05d6128d41fd9cd8a51906331eb6",
+  "registry": "0x8f2ee9c9fd4bcb91eb86d1a82a383e2f30be821e778ef394ebbdf625472b36db",
   "router": "0x40c614f6e329be1486d057abd1d8f55e1e5c54587fa3eee3171687df0685731d",
-  "executor": "0x95771aa39b9b7c1a526b9f8796dde4e885f6838177f591a42c3784c5ac9510ba",
+  "executor": "0xca5846e5baa0b3322824aae23092aa224c89d4962c84935c3bad1edfb77d4c41",
   "usdt": "0x0074ba157c9fd4c04ad45a7bfd19aa9e89f4044fa9386831a8218ad438c0f7dd",
   "feed.USDT/USD": "0x6d162011fd7b397de72f6875a3cf7c114548669930aef3cbaef43371d33baf89",
   "paymaster": "0x919e16bd41f96e5ea2fd9cfe1f15c3ab44d11d9fda0db76fc90aff2bebd4838e",

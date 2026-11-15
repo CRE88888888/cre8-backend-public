@@ -313,7 +313,8 @@ export function singleHopPath(tokenIn: Address, fee: number, tokenOut: Address):
  *
  *     impact = 1 − (out(amountIn) / amountIn) / (out(dust) / dust)
  *
- * 這個數字同時包含手續費與價格衝擊，也就是使用者真正付出的成本。
+ * 同一路徑的小額與大額都含相同 fee tier，比例相除後池費抵消，只量價格衝擊。
+ * 相對 oracle 的總成本（參考池費 + 價格衝擊預算）由規劃器另行檢查。
  * 交叉相乘避免定點除法（bigint 除法會截斷，小額時誤差很大）。
  */
 export async function routeImpactBps(

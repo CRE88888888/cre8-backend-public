@@ -25,7 +25,7 @@ const hash=():Hex=>`0x${randomBytes(32).toString('hex')}`;
 const cash=TESTNET_97.contracts.usdt,a=TESTNET_97.assets.WBNB.token,b=TESTNET_97.assets.ETH.token;
 const R=27n*U/100n,start=new Date('2026-11-15T13:00:00Z');
 const run:WithTransactionFn=fn=>withTransaction(client=>fn({query:(s,p)=>client.query(s,p===undefined?[]:[...p])}));
-async function fixture(kind:'hold'|'stack'='hold',cashWeight=0,slices=4,rebalance:'none'|'monthly'|'drift'='none',otherMode?:AssetMode,weights?:readonly [number,number]){
+async function fixture(kind:'hold'|'stack'='hold',cashWeight=0,slices=4,rebalance:'none'|'monthly'|'drift'='none',otherMode?:AssetMode,weights?:readonly number[],assetCount=2){
   await migrate();
   const owner=address(),account=address();
   const sid=(await query<{id:string}>("insert into strategies(provider,name) values($1,'be83-isolated') returning id",[owner])).rows[0]?.id;assert.ok(sid);
@@ -33,6 +33,12 @@ async function fixture(kind:'hold'|'stack'='hold',cashWeight=0,slices=4,rebalanc
   await query('update strategies set onchain_id=$2 where id=$1',[sid,strategyId+99000000]);
   const allocation:Allocation={assets:cashWeight===10000?[{address:cash,weightBps:10000}]:[
     {address:cash,weightBps:cashWeight},{address:a,weightBps:weights?.[0]??(10000-cashWeight)/2},{address:b,weightBps:weights?.[1]??(10000-cashWeight)/2}]};
+  if(assetCount!==2){
+    const tokens=Object.values(TESTNET_97.assets).slice(0,assetCount);
+    assert.equal(tokens.length,assetCount);
+    const base=Math.floor(10000/assetCount);
+    allocation.assets=[{address:cash,weightBps:0},...tokens.map((t,i)=>({address:t.token,weightBps:weights?.[i]??base+(i<10000-base*assetCount?1:0)}))];
+  }
   const activeAt=new Date('2026-11-14T00:00:00Z');
   const execution=validateAssetConfig({kind:'per_asset',numeraire:cash,rebalance,assets:allocation.assets.map(x=>({asset:x.address,weightBps:x.weightBps,yield:null,...(x.address===cash?{}:{execution:x.address===b&&otherMode?otherMode:kind==='hold'?{kind:'hold'}:{kind:'stack',every:'daily',weekday:null,timeUtc:'13:00',slices}})}))},allocation,97);
   const configHash=canonicalConfigHash({chainId:97,allocation,execution,schedule:{kind:'funding'},activeAt});
@@ -45,7 +51,7 @@ async function fixture(kind:'hold'|'stack'='hold',cashWeight=0,slices=4,rebalanc
   await query(`insert into session_keys(portfolio_id,key_ref,permissions,status,expires_at)
     values($1,$2,$3,'active','2030-01-01')`,[id,`m/44'/60'/0'/0/${id}`,JSON.stringify({permissionId:'0x12345678',sessionKeyAddress:owner,timestamp:{validUntil:1893456000}})]);
   const context:JobContext={chainId:97,portfolioId:id,strategyId,version:1,kind:'asset',execution,account,allocation,cash,now:new Date(start),reserve:R,
-    caps:new Map([[a,null],[b,null]]),buyLimit:UINT256_MAX,observedCash:1000000n*U,enabled:true,marketOpen:true};
+    caps:new Map(allocation.assets.filter(x=>x.address!==cash).map(x=>[x.address,null])),buyLimit:UINT256_MAX,observedCash:1000000n*U,enabled:true,marketOpen:true};
   async function fund(amount:bigint,confirmedAt=new Date(start.getTime()-60000),effectiveOverride?:Record<string,number>){
     const certificate=effectiveOverride?{minimum:50n*U,effectiveSlices:effectiveOverride}:planContribution(amount,execution,confirmedAt,R);assert.ok(certificate,'fixture contribution must meet the actual calendar minimum');
     return withTransaction(async client=>{
@@ -158,7 +164,7 @@ function scheduler(f:Fixture,extra:SchedulerDeps={}){
     readPermissionConfig:async()=>({signer:f.owner,policyCount:3}),deriveSessionKeyAddress:async()=>f.owner,readAllowance:async()=>UINT256_MAX,readBalance:async()=>UINT256_MAX,
     readRebalanceNonce:async()=>0n,checkTradingMinimums:async()=>null,hasBoughtBefore:async()=>true,refreshFloors:async i=>({ok:true,steps:[...i.steps],refreshes:[],note:'fresh'}),
     newMoney:{version:(sid,v,onchainId,account,options)=>requireTypedVersion(sid,v,onchainId,account,{...options,verifyChain:false}),
-      policy:async()=>({reserve:R,caps:new Map([[a,null],[b,null]]),buyLimit:UINT256_MAX,cash:10000n*U}),verifyLots:async()=>{},marketOpen:()=>true,
+      policy:async()=>({reserve:R,caps:new Map(f.context.caps),buyLimit:UINT256_MAX,cash:10000n*U}),verifyLots:async()=>{},marketOpen:()=>true,
       quote:async(_due,_plan,inputs,deadline)=>({kind:'ready',steps:Object.entries(inputs).map(([token,raw])=>({tokenIn:cash,tokenOut:token as Address,amountIn:BigInt(raw),amountOutMin:90n,oracleFloor:80n,venue:TESTNET_97.contracts.universalRouter,data:'0x'})),deadline,rationale:'test exact new money'})},
     executeRebalance:async args=>{sends.push(args);args.onSending();await args.onSubmitted({userOpHash:userHash});return {status,userOpHash:userHash,txHash:status==='unknown'?null:txHash,gasUsed:'100',error:status==='success'?null:'receipt timeout'};},
     reconcileRebalance:async input=>({kind:'found',outcome:{status:'success',userOpHash:userHash,txHash,gasUsed:'100',error:null,
@@ -527,4 +533,64 @@ test('#83 completed weekly installments stay out of policy reads until their nex
   assert.deepEqual(s.sends[1]?.steps.map(step=>step.tokenOut),[a]);
   const weekly=(await query<{slice_index:number}>('select s.slice_index from strategy_asset_slices s join strategy_funding_lots l on l.id=s.lot_id where l.portfolio_id=$1 and s.asset=$2',[f.id,b])).rows;
   assert.deepEqual(weekly,[{slice_index:0}],'neither the previous lot\'s next weekly installment nor the new lot\'s first weekly installment is due');
+});
+
+test('#92 93-asset DB job survives timeout/restart and buys each original input exactly once in <=16-step batches',async()=>{
+  const f=await fixture('hold',0,4,'none',undefined,undefined,92);
+  await f.fund(10000n*U);
+  let held=new Set<Address>();
+  const s=scheduler(f);
+  s.deps.planPortfolio=async()=>{
+    const current=plan(f);
+    for(const asset of held)current.snapshot.holdings.push({asset,amountWei:U,decimals:18,usdPriceE8:100000000n,priceSource:TWAP_PRICE_SOURCE});
+    return current;
+  };
+  s.setStatus('unknown');
+  assert.equal((await s.once()).results[0]?.outcome,'blocked');
+  const original=await job(f);assert.ok(original);assert.equal(Object.keys(original.original_input).length,92);
+  const attempts=(await query('select payload_hash,user_op_nonce from operations where portfolio_id=$1',[f.id])).rows;
+  assert.equal((await s.once()).results[0]?.outcome,'executed');assert.equal(s.sends.length,1,'unknown original must reconcile without sending a different subset');
+  assert.deepEqual((await query('select payload_hash,user_op_nonce from operations where portfolio_id=$1',[f.id])).rows,attempts);
+  s.setStatus('success');
+  for(let round=0;round<20&&await job(f);round++){
+    held=new Set(s.sends.flatMap(send=>send.steps.map(step=>step.tokenOut)));
+    assert.equal((await s.once(new Date(start.getTime()+(round+1)*60000))).results[0]?.outcome,'executed');
+  }
+  assert.equal(await job(f),null);
+  assert.ok(s.sends.length>1&&s.sends.every(send=>send.steps.length<=16));
+  assert.ok((s.sends.at(-1)?.steps.length??16)<16);
+  const spent:Record<string,bigint>={};
+  for(const send of s.sends)for(const step of send.steps)spent[step.tokenOut.toLowerCase()]=(spent[step.tokenOut.toLowerCase()]??0n)+step.amountIn;
+  assert.deepEqual(Object.fromEntries(Object.entries(spent).map(([a,n])=>[a,n.toString()])),original.original_input);
+  const saved=await balances(f);assert.equal(saved?.reserved_input_raw,'0');assert.equal(saved?.reserved_fee_raw,'0');
+  assert.equal((await query("select batch_index from strategy_job_batches where job_id=$1 and state='confirmed'",[original.id])).rows.length,s.sends.length);
+ });
+
+test('#92 unequal 17-asset job shares its whale across children and settles the exact frozen vector',async()=>{
+  const f=await fixture('hold',0,4,'none',undefined,[...Array.from({length:16},()=>20),9680],17);
+  await f.fund(1000n*U);
+  const s=scheduler(f);assert.equal((await s.once()).results[0]?.outcome,'executed');
+  const original=await job(f);assert.ok(original);assert.equal(BigInt(original.fee_reserve_raw),2n*R);
+  assert.equal((await s.once(new Date(start.getTime()+60000))).results[0]?.outcome,'executed');
+  assert.equal(await job(f),null);assert.equal(s.sends.length,2);
+  const spent:Record<string,bigint>={};
+  for(const send of s.sends){
+    assert.ok(send.steps.length<=16);
+    assert.ok(send.steps.reduce((n,step)=>n+step.amountIn,R)>=50n*U);
+    for(const step of send.steps){assert.ok(step.amountIn>=U);spent[step.tokenOut]=(spent[step.tokenOut]??0n)+step.amountIn;}
+  }
+  assert.deepEqual(Object.fromEntries(Object.entries(spent).map(([a,n])=>[a,n.toString()])),original.original_input);
+  assert.equal((await balances(f))?.reserved_input_raw,'0');assert.equal((await balances(f))?.reserved_fee_raw,'0');
+});
+
+test('#92 two large positions distribute across 18-asset DB batches at exact 1/50 thresholds',async()=>{
+  const f=await fixture('hold',0,4,'none',undefined,[...Array.from({length:16},()=>200),3400,3400],18);
+  await f.fund(100n*U);const s=scheduler(f);
+  assert.equal((await s.once()).results[0]?.outcome,'executed');
+  const original=await job(f);assert.ok(original);assert.equal(BigInt(original.fee_reserve_raw),2n*R);
+  assert.equal((await s.once(new Date(start.getTime()+60000))).results[0]?.outcome,'executed');assert.equal(await job(f),null);
+  const spent:Record<string,bigint>={};assert.equal(s.sends.length,2);
+  for(const send of s.sends){assert.equal(send.steps.length,9);assert.equal(send.steps.reduce((sum,step)=>sum+step.amountIn,R),50n*U);
+    for(const step of send.steps){assert.ok(step.amountIn>=U);spent[step.tokenOut]=(spent[step.tokenOut]??0n)+step.amountIn;}}
+  assert.deepEqual(Object.fromEntries(Object.entries(spent).map(([a,n])=>[a,n.toString()])),original.original_input);
 });

@@ -19,10 +19,10 @@ function reservation(): GasBudgetRequest {
     gasLimit: 10_000_000n, maxFeePerGas: 50_000_000n, nativePrice: 60000000000n, priceSource: 'test:planning-oracle' };
 }
 
-test('#89 chain 97 accepts high USD cost through exactly 10M gas, persists valuation and rejects one gas over', async () => {
-  for (const gasLimit of [0n, 9_999_999n, 10_000_000n, 10_000_001n]) {
+test('#89 chain 97 accepts high USD cost through exactly 100M gas, persists valuation and rejects one gas over', async () => {
+  for (const gasLimit of [0n, 99_999_999n, 100_000_000n, 100_000_001n]) {
     const r = { ...reservation(), chainId: 97, gasLimit, maxFeePerGas: 1_000_000_000n };
-    if (gasLimit > 10_000_000n) {
+    if (gasLimit > 100_000_000n) {
       await assert.rejects(reserveGasBudget(r), code('GAS_BUDGET_EXCEEDED'));
       assert.equal((await query('select execution_key from gas_budget_reservations where execution_key=$1', [r.executionKey])).rows.length, 0);
     } else {
@@ -30,17 +30,17 @@ test('#89 chain 97 accepts high USD cost through exactly 10M gas, persists valua
       await reserveGasBudget(r);
       const saved = await query<{ usd: string; n: string }>('select max(max_cost_usd)::text as usd,count(*)::text as n from gas_budget_reservations where execution_key=$1', [r.executionKey]);
       assert.equal(saved.rows[0]?.n, '1');
-      if (gasLimit === 10_000_000n) assert.equal(saved.rows[0]?.usd, '6.00000000');
+      if (gasLimit === 100_000_000n) assert.equal(saved.rows[0]?.usd, '60.00000000');
     }
   }
 });
 
 test('#89 chain 97 gas cap aggregates every state and remains isolated from chain 56 for the same account', async () => {
   for (const state of ['reserved', 'submitted', 'confirmed', 'failed', 'unknown']) {
-    const r = { ...reservation(), chainId: 97, gasLimit: 6_000_000n, maxFeePerGas: 1_000_000_000n };
+    const r = { ...reservation(), chainId: 97, gasLimit: 60_000_000n, maxFeePerGas: 1_000_000_000n };
     await reserveGasBudget(r);
     await query('update gas_budget_reservations set state=$2,updated_at=now() where execution_key=$1', [r.executionKey, state]);
-    await reserveGasBudget({ ...r, executionKey: randomUUID(), gasLimit: 4_000_000n });
+    await reserveGasBudget({ ...r, executionKey: randomUUID(), gasLimit: 40_000_000n });
     await assert.rejects(reserveGasBudget({ ...r, executionKey: randomUUID(), gasLimit: 1n }), code('GAS_BUDGET_EXCEEDED'));
     await reserveGasBudget({ ...r, executionKey: randomUUID(), chainId: 56, gasLimit: 500_000n });
     await assert.rejects(reserveGasBudget({ ...r, executionKey: randomUUID(), chainId: 56, gasLimit: 1n }), code('GAS_BUDGET_EXCEEDED'));
@@ -56,11 +56,11 @@ test('#89 chain 56 keeps the USD cap below 10M gas, including equality and one g
 });
 
 test('#89 concurrent chain 97 writers cannot exceed the gas cap when the USD cap is disabled', async () => {
-  const r = { ...reservation(), chainId: 97, gasLimit: 3_000_000n, maxFeePerGas: 1_000_000_000n };
+  const r = { ...reservation(), chainId: 97, gasLimit: 30_000_000n, maxFeePerGas: 1_000_000_000n };
   const results = await Promise.allSettled(Array.from({ length: 12 }, () => reserveGasBudget({ ...r, executionKey: randomUUID() })));
   assert.equal(results.filter((result) => result.status === 'fulfilled').length, 3);
   assert.equal(results.filter((result) => result.status === 'rejected' && code('GAS_BUDGET_EXCEEDED')(result.reason)).length, 9);
-  await reserveGasBudget({ ...r, executionKey: randomUUID(), gasLimit: 1_000_000n });
+  await reserveGasBudget({ ...r, executionKey: randomUUID(), gasLimit: 10_000_000n });
   await assert.rejects(reserveGasBudget({ ...r, executionKey: randomUUID(), gasLimit: 1n }), code('GAS_BUDGET_EXCEEDED'));
 });
 

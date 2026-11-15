@@ -17,7 +17,7 @@ function errorCode(code: string) { return (error: unknown) => error instanceof A
 test('#89 only chain 97 defaults to a gas-only daily budget; other chain defaults are unchanged', () => {
   for (const chainId of [undefined, '56', '97', '1337', '31337']) {
     const policy = loadTradingConfig({ CHAIN_ID: chainId });
-    assert.equal(policy.dailyGas, 10_000_000n);
+    assert.equal(policy.dailyGas, chainId === '97' ? 100_000_000n : 10_000_000n);
     assert.equal(policy.dailyUsdE8, chainId === '97' ? null : 30_000_000n);
   }
   assert.equal(loadTradingConfig({ CHAIN_ID: '97', ACCOUNT_DAILY_GAS_USD_E8: '  ' }).dailyUsdE8, null);
@@ -163,5 +163,25 @@ test('#69 estimation paymaster signature is recoverable for every hash, so v0.7 
     const recovered = await recoverMessageAddress({ message: { raw: toHex(value, { size: 32 }) }, signature: slice(stub.paymasterData, 64) });
     assert.match(recovered, /^0x[0-9a-fA-F]{40}$/);
     if (value !== 0n) assert.notEqual(recovered.toLowerCase(), OWNER);
+  }
+});
+
+test('#92 sponsorship gas default follows chain 97 100M while local defaults and explicit limits remain intact',()=>{
+  const local=loadPaymasterConfig(ENV);assert.ok(local);assert.equal(local.accountDailyGas,20_000_000n);
+  const testnet=loadPaymasterConfig({...ENV,CHAIN_ID:'97',REGISTRY_ADDRESS:undefined,EXECUTOR_ADDRESS:undefined,PAYMASTER_ADDRESS:undefined,PAYMASTER_MOCK_USDT_ADDRESS:undefined});assert.ok(testnet);
+  assert.equal(testnet.accountDailyGas,100_000_000n);
+  assert.equal(loadPaymasterConfig({...ENV,CHAIN_ID:'97',REGISTRY_ADDRESS:undefined,EXECUTOR_ADDRESS:undefined,PAYMASTER_ADDRESS:undefined,PAYMASTER_MOCK_USDT_ADDRESS:undefined,PAYMASTER_ACCOUNT_DAILY_GAS:'0'})?.accountDailyGas,0n);
+});
+
+test('#92 C3 chain 97 defaults disable only account wei and keep explicit overrides',()=>{
+  const base={...ENV,CHAIN_ID:'97',PAYMASTER_ADDRESS:undefined,EXECUTOR_ADDRESS:undefined,REGISTRY_ADDRESS:undefined,PAYMASTER_MOCK_USDT_ADDRESS:undefined};
+  assert.equal(config(base).accountDailyWei,null);
+  assert.equal(config(base).accountDailyCount,60n);
+  assert.equal(config(base).siteDailyWei,10n**17n);
+  assert.equal(config(ENV).accountDailyWei,10n**16n);
+  assert.equal(config(ENV).accountDailyCount,20n);
+  for(const raw of ['0','1','9007199254740993']){
+    assert.equal(config({...base,PAYMASTER_ACCOUNT_DAILY_WEI:raw}).accountDailyWei,BigInt(raw));
+    assert.equal(config({...base,PAYMASTER_ACCOUNT_DAILY_COUNT:raw}).accountDailyCount,BigInt(raw));
   }
 });

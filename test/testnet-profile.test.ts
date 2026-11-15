@@ -11,8 +11,8 @@ import hashes from '../src/testnet-codehashes.js';
 import { testnetProfileTargets } from '../src/testnet-preflight.js';
 import manifest from '../deploy/testnet-97.json' with { type: 'json' };
 
-test('#79 profile matches every address in contracts b767bf6 manifest, retaining admission caps', () => {
-  assert.equal(TESTNET_97.sourceCommit, 'b767bf6b22bb697a0b86abf8ed683916fe81502d');
+test('#79 profile matches every address in contracts 71870a7 manifest, retaining admission caps', () => {
+  assert.equal(TESTNET_97.sourceCommit, '71870a7cb6231fb9d37f9ea6e319a7624287dcbc');
   assert.equal(TESTNET_97.gitCommit, manifest.gitCommit);
   assert.deepEqual(TESTNET_97.roles, Object.fromEntries(Object.entries(manifest.roles).map(([k, v]) => [k, v.toLowerCase()])));
   for (const [name, address] of Object.entries(manifest.contracts)) {
@@ -58,7 +58,7 @@ test('#69 chain 97 session GasPolicy pins our paymaster; chain 56 keeps its exis
   assert.equal(describePolicies({ executorAddress: TESTNET_97.contracts.executor, validUntil: 1_800_000_000, chainId: 56 }).gas.enforcePaymaster, false);
 });
 
-test('#69 allocation inserts mock USDT, accepts zero cash weight, rejects foreign assets and counts the 16-slot limit', async () => {
+test('#69 allocation inserts mock USDT, accepts zero cash weight, rejects foreign assets and accepts more than 16 assets', async () => {
   const { validateAllocation } = await import('../src/strategies.js');
   const asset = { address: TESTNET_97.assets.WBNB.token, weightBps: 10000 };
   assert.equal(validateAllocation({ assets: [asset] }, 97).assets.at(-1)?.address, TESTNET_97.contracts.usdt);
@@ -66,7 +66,7 @@ test('#69 allocation inserts mock USDT, accepts zero cash weight, rejects foreig
   assert.throws(() => validateAllocation({ assets: [{ address: '0x55d398326f99059ff775485246999027b3197955', weightBps: 10000 }] }, 97), /chain 97/);
   const fifteen = Object.values(TESTNET_97.assets).slice(0, 15).map((a, i) => ({ address: a.token, weightBps: i === 0 ? 1250 : 625 }));
   assert.equal(validateAllocation({ assets: fifteen }, 97).assets.length, 16);
-  assert.throws(() => validateAllocation({ assets: Object.values(TESTNET_97.assets).slice(0, 16).map((a) => ({ address: a.token, weightBps: 625 })) }, 97), /16/);
+  assert.equal(validateAllocation({ assets: Object.values(TESTNET_97.assets).slice(0, 16).map((a) => ({ address: a.token, weightBps: 625 })) }, 97).assets.length, 17);
 });
 
 test('#69 profile preflight verifies every codehash and selector; wrong chain, empty code/hash, RPC and block errors fail closed', async () => {
@@ -160,4 +160,16 @@ test('#87 all 92 raw specs/caps align, original caps stay fixed and every runtim
   assert.equal(testnetProfileTargets().length, 319);
   assert.equal(TESTNET_97.assets.TONCOIN.decimals, 9);
   assert.ok(Object.hasOwn(TESTNET_97.assets, 'Cake'));
+});
+
+test('#92 all 92 admitted assets and automatic USDT validate as one immutable per-asset config', async () => {
+  const {validateAllocation}=await import('../src/strategies.js');
+  const {validateAssetConfig}=await import('../src/strategy-execution.js');
+  const assets=Object.values(TESTNET_97.assets).map((a,i)=>({address:a.token,weightBps:i===0?172:108}));
+  const allocation=validateAllocation({assets},97);
+  assert.equal(allocation.assets.length,93);
+  assert.equal(validateAssetConfig(undefined,allocation,97).assets.length,93);
+  const first=assets[0];assert.ok(first);
+  const duplicate=structuredClone(assets);duplicate[91]={...first,weightBps:108};
+  assert.throws(()=>validateAllocation({assets:duplicate},97),/duplicate/i);
 });

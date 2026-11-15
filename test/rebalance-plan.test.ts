@@ -155,7 +155,14 @@ function stubClient(chain: StubChain): PublicClient {
       // These legacy cases isolate oracle/fee/budget arithmetic. Supply an executable spot
       // quote 30 bps above the fee-adjusted floor; #58 cases below use independent spot prices.
       const gross = (floor * 10000n + BigInt(9999 - chain.registry.feeBps)) / BigInt(10000 - chain.registry.feeBps);
-      const output = gross + (gross * 30n + 9999n) / 10000n;
+      // Arithmetic fixtures model a deep execution route near the oracle price.
+      // The old floor-only mock could imply 1.7% loss even on a 5-bps pool,
+      // which is correctly rejected by #92's independent fee + impact budget.
+      const oracleQuote=quoteByRate(input)?.[0]??quote?.quoted??quote?.minimum??chain.oracle.quoted;
+      const routeFee=chain.oracle.pairs?.[key.split(':').find(a=>a!==USDT)??'']?.fee??chain.pool.fee;
+      const spot=oracleQuote*BigInt(1_000_000-routeFee)/1_000_000n;
+      const buffered=gross+(gross*30n+9999n)/10000n;
+      const output=spot>buffered?spot:buffered;
       return encodeFunctionResult({ abi, functionName: 'quoteExactInput', result: [output, []] });
     } }, { retryCount: 0 }) }).call,
     getBlock: async (args: { blockNumber?: bigint }) => {
@@ -825,7 +832,9 @@ test('R4 feeBps 從 registry.effectiveFeeBps(鏈上 strategyId) 讀，原樣傳�
   assert.equal(step.oracleFloor, 688_023_143_350_803_187_441n);
   // stub 的 quoted 是 7e20：取到 quoted 這條就會紅。合約要的是 minimum。
   assert.notEqual(step.oracleFloor, 700_000_000_000_000_000_000n);
-  assert.equal(step.amountOutMin, amountOutMinWithBuffer(minGrossFor(step.oracleFloor, 25)));
+  // #92: the independent 5 + 80 bps cost floor is tighter than this oracle floor.
+  assert.equal(step.amountOutMin, 696_485_263_157_894_736_843n);
+  assert.equal(step.costBudgetBps,85);
   assert.equal(decodeStepInput(step).amountOutMin, step.amountOutMin);
 });
 
@@ -1105,8 +1114,8 @@ test('大數字：金額走 bigint，超過 Number.MAX_SAFE_INTEGER 也不失真
   assert.equal(step.amountIn, 10n ** 29n * 10n ** 18n / 10n ** 11n);
   assert.equal(step.amountIn, 10n ** 36n);
   assert.ok(step.amountIn > BigInt(Number.MAX_SAFE_INTEGER));
-  // minGross 也不失真：floor × 10000 不會被截斷成 double。
-  assert.equal(step.amountOutMin, amountOutMinWithBuffer(minGrossFor(step.oracleFloor, 0)));
+  // The quote-bound minimum is 99.95% (pool fee) × 99.5% (route tolerance).
+  assert.equal(step.amountOutMin, 9_945_025n*10n**32n);
 });
 
 test('大數字：minGross 在 1e30 這個量級仍然精確（用 bigint 比較，不經 Number）', () => {
@@ -1684,7 +1693,8 @@ test('pinned：理想量超過預算 → step 被縮小、impact ≤ 預算、pa
 
   // 地板是**縮小後的量**重問回來的（同一批裡換一個量就是另一個地板）。
   assert.equal(step.oracleFloor, (step.amountIn * 9_900n + 9_999n) / 10_000n);
-  assert.equal(step.amountOutMin, amountOutMinWithBuffer(minGrossFor(step.oracleFloor, 0)));
+  assert.equal(step.amountOutMin, quoteBoundMinimum(amountOutMinWithBuffer((step.amountIn*9950n+9999n)/10000n),step.amountIn));
+  assert.equal(step.costBudgetBps,50);
   // 兩次報價：理想量一次、縮小後再一次。
   assert.equal(chain.calls.filter((call) => call.functionName === 'previewSwap').length, 2);
 
@@ -1694,7 +1704,7 @@ test('pinned：理想量超過預算 → step 被縮小、impact ≤ 預算、pa
   assert.match(plan.rationale, /exceeds the 50 bps budget/);
 });
 
-test('pinned：沒超過預算 → 與關掉上限（maxImpactBps: null）的結果完全相同（回歸）', async () => {
+test('pinned：沒超過預算 → 鏈上 calldata 相同，保留成本預算供送出前刷新', async () => {
   // 報價與 DB 價格一致（1 WBNB = $1000）：執行後的預估漂移才有意義（賣對了就收斂）。
   const deep = () =>
     impactChain({ liquidity: 10n ** 30n, sqrtPriceX96: SQRT_PRICE_WBNB_1000, rateE18: 1_000n * 10n ** 18n });
@@ -1706,7 +1716,7 @@ test('pinned：沒超過預算 → 與關掉上限（maxImpactBps: null）的結
       argsOf(deep(), { holdings: pinnedHoldings(), targets: targetsOf(WBNB, USDT), thresholdBps: 100 , maxImpactBps: null }),
     ),
   );
-  assert.deepEqual(on.steps, off.steps, '未超預算時 steps 要逐位相同');
+  assert.deepEqual(on.steps, off.steps.map(step=>({...step,costBudgetBps:80})), 'chain fields remain identical; enabled policy retains its budget');
   assert.equal(on.deadline, off.deadline);
   // 判準是結果：賣對了就收斂，所以沒有 partial（不是「沒被縮小」，那是舊定義）。
   assert.equal(on.partial, undefined, '執行後收斂就不該帶 partial');
@@ -2498,6 +2508,7 @@ test('#47 route comparison uses integer net receipts, keeps ties on Pancake, req
 test('#47 shared routing selects aggregator, falls back on failure, and blocks an unreadable Pancake whitelist', async () => {
   const chain = baseChain();
   chain.oracle.minimum = 100n;
+  chain.oracle.quoted = 100n;
   const client = stubClient(chain);
   const params = { publicClient: client, executor: EXECUTOR, tokenIn: WBNB, tokenOut: USDT, amountIn: 1n,
     oracleFloor: 100n, minGross: 100n, poolFee: 500, deadline: 2000000000n, feeBps: 0, blockNumber: 42n };
@@ -3108,4 +3119,70 @@ test('#83 new-money fee upper bound includes conservative depth capacity and zer
   assert.equal(await newMoneyDepthCap(client,ROUTER,USDT,WBNB,0n,chain.block.number),0n);
   const cap=await newMoneyDepthCap(client,ROUTER,USDT,WBNB,10000n*U,chain.block.number);
   assert.ok(cap>0n);assert.ok(cap<10000n*U);
+});
+
+test('#92 a 1% pool gets 80 bps of price impact in addition to its fee; oracle floor still caps capacity',async()=>{
+  const U=10n**18n,chain=hubChain({pairs:{[WBNB]:{oracle:ORACLE_WBNB_USDT,pool:WBNB_USDT_POOL,fee:10000}}});
+  chain.rate={rateE18:U,slippageBps:300};
+  chain.poolState={sqrtPriceX96:1n<<96n,liquidity:100000n*U,token0:USDT};
+  const client=stubClient(chain),upper=1000n*U;
+  const cap=await newMoneyDepthCap(client,ROUTER,USDT,WBNB,upper,chain.block.number);
+  assert.ok(cap>U,'1% fee alone must not reduce the cap below the 1-USDT minimum');
+  assert.ok(cap<upper,'large input must still shrink at fee + 80 bps');
+  const cost=estimateImpact({...chain.poolState,tokenInIsToken0:true,feeUnits:10000},cap,cap).impactBps;
+  assert.ok(cost<=180);
+  chain.rate.slippageBps=120;
+  const tighter=await newMoneyDepthCap(client,ROUTER,USDT,WBNB,upper,chain.block.number);
+  assert.ok(tighter<cap,'maxSlippageBps below fee + 80 must tighten capacity');
+  assert.ok(estimateImpact({...chain.poolState,tokenInIsToken0:true,feeUnits:10000},tighter,tighter).impactBps<=120);
+  chain.rate.slippageBps=50;
+  assert.ok(await newMoneyDepthCap(client,ROUTER,USDT,WBNB,upper,chain.block.number)<U,'fee above oracle tolerance must wait');
+});
+
+test('#92 actual buy/sell quotes obey fee + 80, the tighter oracle floor, and exact buffered boundaries',async()=>{
+  for(const poolFee of [0,500,2500,10000])for(const sell of [false,true]){
+    const f=minOutFixture(),budget=80+poolFee/100;
+    const policyFloor=10000n-BigInt(budget),minimum=amountOutMinWithBuffer(policyFloor);
+    const route={...f.route,poolFee,oracleQuoted:10000n,...(sell?{tokenIn:WBNB,tokenOut:USDT}:{})};
+    f.state.pancakeOut=minimum;
+    const step=await buildRoutedStep(route,{quoteAggregator:async()=>null});
+    assert.ok(step);assert.equal(step.amountOutMin,minimum);assert.equal(decodeStepInput(step).amountOutMin,minimum);
+    assert.equal(step.oracleFloor,9000n);assert.equal(step.costBudgetBps,budget);
+    f.state.pancakeOut--;
+    assert.equal(await buildRoutedStep(route,{quoteAggregator:async()=>null}),null,'one raw unit below policy must wait');
+    const tighter={...route,oracleFloor:9900n,minGross:9900n};
+    const tightMinimum=amountOutMinWithBuffer(poolFee<2500?policyFloor:9900n);
+    f.state.pancakeOut=tightMinimum;
+    assert.ok(await buildRoutedStep(tighter,{quoteAggregator:async()=>null}));
+    f.state.pancakeOut--;
+    assert.equal(await buildRoutedStep(tighter,{quoteAggregator:async()=>null}),null);
+  }
+  const f=minOutFixture();f.state.failure='quoteExactInput';
+  const params={...f.route,poolFee:10000,oracleQuoted:10000n};
+  const minimum=amountOutMinWithBuffer(9820n);
+  for(const output of [minimum-1n,minimum]){
+    const step=await buildRoutedStep(params,{quoteAggregator:async()=>({venue:REGISTRY,data:'0x12345678',amountOut:output})});
+    assert.equal(step!==null,output===minimum,'opaque aggregator must pass the same actual-quote cost floor');
+  }
+  for(const invalid of [0n,-1n])await assert.rejects(buildRoutedStep({...params,oracleQuoted:invalid},{quoteAggregator:async()=>null}));
+  await assert.rejects(buildRoutedStep({...params,poolFee:-1},{quoteAggregator:async()=>null}));
+});
+
+test('#92 fresh quotes and aggregator-to-Pancake fallback retain the cost bound; invalid data and RPC failure block',async()=>{
+  const f=minOutFixture();f.state.nominal=10000n;
+  const route={...f.route,poolFee:10000,oracleQuoted:10000n};
+  const initial=await buildRoutedStep(route,{quoteAggregator:async()=>null});assert.ok(initial);
+  const minimum=amountOutMinWithBuffer(9820n);
+  f.state.pancakeOut=minimum;
+  const fresh=await refreshFloors({...f.params,steps:[initial]});assert.ok(fresh.ok);
+  assert.equal(fresh.steps[0]?.costBudgetBps,180);assert.equal(fresh.steps[0]?.amountOutMin,minimum);
+  f.state.pancakeOut--;assert.equal((await refreshFloors({...f.params,steps:[initial]})).ok,false);
+  f.state.pancakeOut=minimum;
+  const opaque={...initial,venue:REGISTRY,data:'0x12345678' as const};
+  const fallback=await refreshFloors({...f.params,steps:[opaque],quoteAggregator:async()=>null});assert.ok(fallback.ok);
+  assert.equal(fallback.steps[0]?.costBudgetBps,180);assert.equal(fallback.steps[0]?.amountOutMin,minimum);
+  for(const failure of ['previewSwap','quoteExactInput']){
+    f.state.failure=failure;assert.equal((await refreshFloors({...f.params,steps:[initial]})).ok,false);
+  }
+  f.state.failure='';f.state.nominal=0n;assert.equal((await refreshFloors({...f.params,steps:[initial]})).ok,false);
 });

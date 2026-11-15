@@ -60,8 +60,13 @@ A 段只更新本機設定與文件；Railway 的實際金鑰輪替由使用者�
 fork 的 receipt 查詢留在本機區塊範圍。Docker image 維持 v1.2.5；本機 npm 安裝可用
 `ALTO_CLI_PATH` 指向 CLI（合約驗收用 `@pimlico/alto@0.0.18`）。
 
-backend 設 `CHAIN_ID=97` 後採用 `src/testnet-profile.ts` 的固定地址與 39 個資產（38 + MockUSDT），
-來源是 contracts `f7e5d52` 的已提交 manifest；不要從 contracts 主 clone 的未提交工作樹複製部署輸入。
+大檔基金（#92）在 97 將 `--simulation-call-gas-limit` 設為 14M：v1.2.5 預設的 10M
+會在持有大量資產時先讓估算模擬裸 `0x` revert。這只改模擬容量；backend 仍按實際估算分配
+call gas、計入 paymaster 的簽署 gas 限制，並在送出前確認 prepared UserOp **總 gas ≤14M**。
+safe mode 保留；chain 56 沒有新增此 flag，沿用既有預設。
+
+backend 設 `CHAIN_ID=97` 後採用 `src/testnet-profile.ts` 的固定地址與 93 個資產（92 + MockUSDT），
+來源是 contracts main `71870a7` 的已提交 manifest；不要從 contracts 主 clone 的未提交工作樹複製部署輸入。
 registry／executor／paymaster 的 env 可以留空；顯式填入不同地址會拒絕啟動。97 不讀主網資產 seed、
 不呼叫 KyberSwap／OpenOcean，session GasPolicy 強制使用自己的 paymaster。
 

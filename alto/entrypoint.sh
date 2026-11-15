@@ -45,7 +45,10 @@ set -- \
   --min-executor-balance "$MIN_EXECUTOR_BALANCE"
 
 if [ "${CHAIN_ID:-56}" = "97" ]; then
-  set -- "$@" --max-block-range "${MAX_BLOCK_RANGE:-100}"
+  # Alto v1.2.5 otherwise simulates with a 10M call cap and rejects large
+  # held-asset valuations before returning an estimate. This is simulation
+  # capacity only; backend checks the entire prepared UserOp against 14M.
+  set -- "$@" --max-block-range "${MAX_BLOCK_RANGE:-100}" --simulation-call-gas-limit 14000000
 fi
 
 if [ "$SAFE_MODE" = "true" ]; then

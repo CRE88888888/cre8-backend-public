@@ -97,7 +97,7 @@ export async function prepareAssetJob(run:WithTransactionFn,c:JobContext,config:
   due=due.filter(s=>!dust.has(s.asset));budgets={};for(const s of due)budgets=addInputs(budgets,{[s.asset]:s.budget.toString()});
   await completeAssetSchedules(query,c.portfolioId);
   if(!due.length)return {job:null,reason:'[DEFERRED_MIN_ASSET] 小於1 USDT，留至該資產下期'};
-  const budget=assetBatchBudget(budgets,c.reserve,c.caps,c.buyLimit);
+  const budget=assetBatchBudget(budgets,c.reserve,c.caps,c.buyLimit,c.batchStepLimit);
   if(!budget)return {job:null,reason:'[BASKET_WAITING] 完整合單門檻、容量或額度不足'};
   const end=due.reduce((a,b)=>a.end<b.end?a:b).end;
   const prior=await query("select id from strategy_jobs where chain_id=$1 and portfolio_id=$2 and kind='asset' and slot_at=$3",[c.chainId,c.portfolioId,slot]);

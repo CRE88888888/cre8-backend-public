@@ -1,7 +1,7 @@
 import type { Address } from 'viem';
 
 /** Generated from cre8-contracts deployments/testnet-97.json (manifest gitCommit below),
- * script/testnet/TestnetAssets.sol at b767bf6b22bb697a0b86abf8ed683916fe81502d.
+ * script/testnet/TestnetAssets.sol at 71870a7cb6231fb9d37f9ea6e319a7624287dcbc.
  * Kernel/policy: pinned backend SDK versions, verified on the chain 97 fork.
  * Quoter: https://developer.pancakeswap.finance/contracts/v3/addresses (BSC TESTNET).
  * maxLegUsdt: conservative existing admission caps, db 0024 at 3dd4302;
@@ -10,12 +10,12 @@ import type { Address } from 'viem';
  */
 export const TESTNET_97 = {
   "chainId": 97,
-  "sourceCommit": "b767bf6b22bb697a0b86abf8ed683916fe81502d",
+  "sourceCommit": "71870a7cb6231fb9d37f9ea6e319a7624287dcbc",
   "mode": "fork",
   "note": "fork = verified on a local anvil fork of chain 97; the public deployment lands on the same CREATE2 addresses",
-  "verifiedAtBlock": 142841703,
-  "generatedAt": "2026-11-15T08:27:14Z",
-  "gitCommit": "b8517cc4848c69a974553782a810dace31d82383",
+  "verifiedAtBlock": 142887977,
+  "generatedAt": "2026-11-15T14:16:43Z",
+  "gitCommit": "e95f312eca92f580cc9a83111a62d9558288d22c",
   "roles": {
     "deployer": "0x55662b4183fca1230694d5d57f56e4f2e0e3008a",
     "owner": "0x09bbb9a06a0c49ad24bddb18808944041783054e",
@@ -28,9 +28,9 @@ export const TESTNET_97 = {
   },
   "contracts": {
     "ownedDeployer": "0x35500b1dd850763fd67ed89a04abfe7a15c443a3",
-    "registry": "0x88e5d2d14985f34539ffd67210f3d06963f3cce1",
+    "registry": "0x7e6ede1c930b0e01e724b2cb37b6f46305b0902b",
     "router": "0x89652a2a95883a7939103364c7d32a5f1678307d",
-    "executor": "0x78e03637a033b3b08c0fc7ed7d8540d992d1b0b7",
+    "executor": "0x02dfce497b4ce5a4d53f7a02febbfb4fdea3f365",
     "usdt": "0xbd7d814e02c9f69af391a8ba4c1787769f2ddd4b",
     "feed.USDT/USD": "0x9612a567213d3ced8d8328b34fcaf6685c73af02",
     "paymaster": "0xa8ac1cc4846f72a32af0302ae5ae03b1a8dbaafa",

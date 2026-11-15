@@ -1,3 +1,4 @@
+import { executionBatchSize, executionInputGroups } from './execution-batch.js';
 import type { Allocation } from './strategies.js';
 import { minimumAssetContribution, numeraireFor, UINT256_MAX } from './strategy-execution.js';
 import type { AssetExecution, AssetMode } from './strategy-execution.js';
@@ -18,13 +19,15 @@ export function nextAssetSlot(at: Date, mode: Extract<AssetMode,{kind:'stack'}>)
 export function assetPeriod(mode: AssetMode): number { return mode.kind==='stack' ? (mode.every==='daily'?86400000:604800000) : 86400000; }
 export type ContributionPlan = { minimum:bigint; effectiveSlices:Record<string,number> };
 /** Evaluate actual merged timestamps, preserving signed N while shortening only this lot.
- * At most 16*52 count reductions; no search proportional to uint256 amounts.
+ * At most assets.length*52 count reductions; no search proportional to uint256 amounts.
  */
 export function planContribution(total:bigint,config:AssetExecution,confirmedAt:Date,reserve:bigint):ContributionPlan|null {
   if(total<=0n||total>UINT256_MAX||reserve<0n)throw new RangeError('invalid contribution');
   const assets=config.assets.filter(a=>a.asset!==config.numeraire);
   const counts=Object.fromEntries(assets.map(a=>[a.asset,a.execution?.kind==='stack'?a.execution.slices:1]));
   const minimum=minimumAssetContribution(config);
+  const stepLimit=executionBatchSize(assets.length);
+  if(stepLimit===0)return null;
   if(total<minimum)return null;
   for(;;){
     const slots=new Map<number,{budget:bigint;assets:string[];inputs:InputVector}>();
@@ -40,9 +43,11 @@ export function planContribution(total:bigint,config:AssetExecution,confirmedAt:
     }
     const failing=[...slots.values()].filter(s=>{
       if(s.budget<=reserve)return true;
-      // Dust stays outside the batch. It cannot be counted toward the 50 budget.
-      const usable=Object.values(s.inputs).map(BigInt).filter(n=>n-reserve*n/s.budget>=U).reduce((sum,n)=>sum+n,0n);
-      return usable<50n*U;
+      // Dust cannot count toward any child's minimum; it remains in its source.
+      const inputs=Object.fromEntries(Object.entries(s.inputs).filter(([,raw])=>{
+        const n=BigInt(raw);return n-reserve*n/s.budget>=U;
+      }));
+      return assetBatchBudget(inputs,reserve,new Map(Object.keys(inputs).map(a=>[a,null])),UINT256_MAX,stepLimit)===null;
     });
     if(failing.length===0)return {minimum,effectiveSlices:counts};
     const reducible=assets.filter(a=>failing.some(s=>s.assets.includes(a.asset))&&(counts[a.asset]??1)>1);
@@ -52,27 +57,38 @@ export function planContribution(total:bigint,config:AssetExecution,confirmedAt:
     for(const a of reducible)if(counts[a.asset]===largest)counts[a.asset]=largest-1;
   }
 }
-/** Original source budgets include fee. One k*R per merged batch, apportioned once. */
-export function assetBatchBudget(budgets:InputVector,reserve:bigint,caps:ReadonlyMap<string,bigint|null>,buyLimit:bigint):{inputs:InputVector;fee:bigint;count:bigint}|null{
-  const total=sumInputs(budgets);
-  if(total<50n*U||reserve<0n||buyLimit<=0n)return null;
-  let max=total/(50n*U);
-  for(const raw of Object.values(budgets)){const n=BigInt(raw)/U;if(n<max)max=n;}
-  if(max<1n)return null;
-  const at=(k:bigint)=>{
-    const fee=reserve*k;if(fee>=total)return null;
-    let left=fee;const entries=Object.entries(budgets);
-    const inputs:InputVector={};
-    for(const [i,[asset,raw]] of entries.entries()){
-      const part=i===entries.length-1?left:fee*BigInt(raw)/total;left-=part;
-      inputs[asset]=(BigInt(raw)-part).toString();
-    }
-    return {inputs,fee,count:k};
-  };
-  const capacity=(k:bigint)=>{const b=at(k);if(!b)return false;const largest=basketBatch(b.inputs,k);
-    return sumInputs(largest)<=buyLimit&&Object.entries(largest).every(([a,v])=>{if(!caps.has(a))throw new Error('missing capacity');const cap=caps.get(a);return cap===null||(cap!==undefined&&BigInt(v)<=cap);});};
-  if(!capacity(max))return null;
-  let low=1n,high=max;while(low<high){const mid=(low+high)/2n;if(capacity(mid))high=mid;else low=mid+1n;}
-  const result=at(low);if(!result||Object.values(result.inputs).some(v=>BigInt(v)/low<U))return null;
-  return result;
+/** Original source budgets include fee. Reserve every child once, then freeze
+ * the complete input vector; execution only subtracts confirmed child inputs.
+ */
+export function assetBatchBudget(budgets:InputVector,reserve:bigint,caps:ReadonlyMap<string,bigint|null>,buyLimit:bigint,stepLimit=16):{inputs:InputVector;fee:bigint;count:bigint}|null{
+  const total=sumInputs(budgets),entries=Object.entries(budgets);
+  // Validate the step limit even on empty or otherwise unexecutable inputs.
+  executionInputGroups({},stepLimit,reserve);
+  if(total<50n*U||buyLimit<=0n||!entries.length)return null;
+  const minimumGroups=Math.ceil(entries.length/stepLimit);
+  const maximumGroups=stepLimit===1?minimumGroups:Math.ceil((entries.length-1)/(stepLimit-1));
+  for(let groups=minimumGroups;groups<=Math.max(minimumGroups,maximumGroups);groups++){
+    const groupCount=BigInt(groups);
+    let maximum=total/(50n*U*groupCount);
+    for(const [,raw] of entries){const n=BigInt(raw)/U;if(n<maximum)maximum=n;}
+    if(maximum<1n)continue;
+    const at=(count:bigint)=>{
+      const fee=reserve*count*groupCount;if(fee>=total)return null;
+      let left=fee;const inputs:InputVector={};
+      for(const [i,[asset,raw]] of entries.entries()){
+        const part=i===entries.length-1?left:fee*BigInt(raw)/total;left-=part;
+        inputs[asset]=(BigInt(raw)-part).toString();
+      }
+      return {inputs,fee,count};
+    };
+    const capacity=(count:bigint)=>{const b=at(count);if(!b)return false;const largest=basketBatch(b.inputs,count);
+      return sumInputs(largest)<=buyLimit&&Object.entries(largest).every(([a,v])=>{if(!caps.has(a))throw new Error('missing capacity');const cap=caps.get(a);return cap===null||(cap!==undefined&&BigInt(v)<=cap);});};
+    if(!capacity(maximum))continue;
+    let low=1n,high=maximum;while(low<high){const mid=(low+high)/2n;if(capacity(mid))high=mid;else low=mid+1n;}
+    const result=at(low);if(!result)continue;
+    const smallest=Object.fromEntries(Object.entries(result.inputs).map(([a,v])=>[a,(BigInt(v)/low).toString()]));
+    const children=executionInputGroups(smallest,stepLimit,reserve);
+    if(children&&children.length<=groups)return result;
+  }
+  return null;
 }

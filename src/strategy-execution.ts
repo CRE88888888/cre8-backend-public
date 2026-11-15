@@ -134,7 +134,7 @@ export function validateAssetConfig(value: unknown, allocation: Allocation, chai
   if (value === undefined) value = { kind: 'per_asset', numeraire: cash, assets: allocation.assets.map(a => ({ asset: a.address, weightBps: a.weightBps, ...(a.address === cash ? {} : { execution: { kind: 'hold' } }), yield: null })) };
   if (!record(value) || value.kind !== 'per_asset') throw new ValidationError('INVALID_EXECUTION', 'execution must use per_asset creator parameters');
   exactKeys(value, ['kind','numeraire','rebalance','assets'], 'INVALID_EXECUTION');
-  if (value.numeraire !== cash || !Array.isArray(value.assets) || value.assets.length < 1 || value.assets.length !== allocation.assets.length || value.assets.length > 16) throw new ValidationError('INVALID_EXECUTION', 'execution must match the chain numeraire and complete allocation');
+  if (value.numeraire !== cash || !Array.isArray(value.assets) || value.assets.length < 1 || value.assets.length !== allocation.assets.length) throw new ValidationError('INVALID_EXECUTION', 'execution must match the chain numeraire and complete allocation');
   const rebalance = value.rebalance === undefined ? 'none' : value.rebalance;
   if (rebalance !== 'none' && rebalance !== 'monthly' && rebalance !== 'drift') throw new ValidationError('INVALID_EXECUTION', 'rebalance must be none, monthly or drift');
   const seen = new Set<string>();

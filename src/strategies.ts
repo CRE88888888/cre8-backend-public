@@ -9,8 +9,6 @@ import type { Address, Hex } from 'viem';
 
 /** Basis-point denominator. On-chain AtpRegistry uses the same TOTAL_WEIGHT_BPS. */
 export const BPS_DENOMINATOR = 10_000;
-/** Max assets per version, mirrors AtpRegistry.MAX_VERSION_ASSETS. */
-export const MAX_VERSION_ASSETS = 16;
 /** Max output-side swap fee, mirrors AtpRegistry.MAX_SWAP_FEE_BPS (3%). */
 export const MAX_SWAP_FEE_BPS = 300;
 /** Minimum rebalance interval accepted by validation: anything faster is a keeper/gas footgun. */
@@ -152,7 +150,7 @@ export function typedVersionInput(input: unknown): PublishVersionInput {
 /**
  * Validate and normalise an allocation:
  *   - exactly the shape { assets: [{ address, symbol?, weightBps }] }
- *   - 1..16 assets including USDT, addresses unique (case-insensitive), stored lowercase
+ *   - one or more assets including USDT, addresses unique (case-insensitive), stored lowercase
  *   - integer weights in 1..10000 (USDT may be 0) summing to exactly 10000
  *   - append USDT at weight 0 if absent, so deposits can be spent by the executor
  */
@@ -169,12 +167,6 @@ export function validateAllocation(input: unknown, chainId = configuredChainId()
   }
   if (assets.length === 0) {
     throw new ValidationError('ALLOCATION_EMPTY', 'allocation.assets must contain at least one asset');
-  }
-  if (assets.length > MAX_VERSION_ASSETS) {
-    throw new ValidationError(
-      'TOO_MANY_ASSETS',
-      `allocation.assets must contain at most ${MAX_VERSION_ASSETS} assets, got ${assets.length}`,
-    );
   }
 
   const seen = new Set<string>();
@@ -240,12 +232,6 @@ export function validateAllocation(input: unknown, chainId = configuredChainId()
   }
 
   if (!seen.has(numeraire)) {
-    if (normalised.length === MAX_VERSION_ASSETS) {
-      throw new ValidationError(
-        'TOO_MANY_ASSETS',
-        `allocation.assets must contain at most ${MAX_VERSION_ASSETS} assets including USDT; leave one slot for the automatic USDT row`,
-      );
-    }
     normalised.push({ address: numeraire, symbol: 'USDT', weightBps: 0 });
   }
 

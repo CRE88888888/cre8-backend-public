@@ -104,12 +104,12 @@ test('validateAllocation preserves an explicit USDT weight and is idempotent wit
   assert.deepEqual(validateAllocation(allocation), allocation);
 });
 
-test('validateAllocation counts the automatic USDT row toward the 16-asset ceiling', () => {
+test('validateAllocation accepts an automatic USDT row beyond the former 16-asset ceiling', () => {
   const assets = Array.from({ length: 16 }, (_, index) => ({
     address: `0x${(index + 1).toString(16).padStart(40, '0')}`,
     weightBps: 625,
   }));
-  expectValidationError(() => validateAllocation({ assets }), 'TOO_MANY_ASSETS');
+  assert.equal(validateAllocation({ assets }).assets.length,17);
   const fifteen = assets.slice(0, 15).map((asset, index) => ({
     ...asset, weightBps: index === 0 ? 1250 : 625,
   }));
@@ -169,12 +169,12 @@ test('validateAllocation rejects a duplicate asset regardless of address casing'
   );
 });
 
-test('validateAllocation enforces the 16-asset ceiling', () => {
+test('validateAllocation still enforces weight totals beyond the former 16-asset ceiling', () => {
   const assets = Array.from({ length: 17 }, (_, index) => ({
     address: `0x${index.toString(16).padStart(40, '0')}`,
     weightBps: 1,
   }));
-  expectValidationError(() => validateAllocation({ assets }), 'TOO_MANY_ASSETS');
+  expectValidationError(() => validateAllocation({ assets }), 'WEIGHT_SUM');
 });
 
 test('validateAllocation rejects malformed addresses and non-object payloads', () => {

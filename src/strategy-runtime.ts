@@ -1,3 +1,4 @@
+import { executionBatchSize, executionInputGroups } from './execution-batch.js';
 import type { Address, PublicClient } from 'viem';
 import { EXECUTOR_ABI } from './chain.js';
 import { requireTypedVersion } from './strategies.js';
@@ -34,7 +35,8 @@ export function defaultNewMoneyDeps(client:()=>PublicClient,executor:()=>Address
       const limits=await readMaxLegUsdE8(assets,query,chainId);
       const holding=plan.snapshot.holdings.find(h=>h.asset.toLowerCase()===numeraireFor(chainId));
       const reserve=await minimumFeeReserve(publicClient,executor(),BigInt(plan.pinnedVersion.onchainStrategyId),blockNumber);
-      const buyLimit='kind' in buy?0n:buy.remaining*10n**10n;
+      // Executor buyAllowance is already in numeraire raw units (18 decimals).
+      const buyLimit='kind' in buy?0n:buy.remaining;
       const caps=new Map<string,bigint|null>();
       for(const asset of assets){
         const limit=limits.get(asset.toLowerCase());
@@ -91,7 +93,9 @@ export async function prepareNewMoney(args:{due:DuePortfolio;plan:PortfolioPlan;
   }
   const policy=assets.length===0?{reserve:0n,caps:new Map<string,bigint|null>(),buyLimit:0n,
     cash:plan.snapshot.holdings.find(h=>h.asset.toLowerCase()===cash)?.amountWei??0n}:await deps.policy(due,plan,assets);
-  const context:JobContext={chainId,portfolioId:due.portfolioId,strategyId:due.strategyId,version:due.version,kind:version.execution.kind==='per_asset'?'asset':version.execution.kind,
+  const batchStepLimit=executionBatchSize(version.allocation.assets.filter(a=>a.address!==cash).length);
+  if(batchStepLimit===0)throw new Error('[USER_OP_CAPACITY] 無可行買入批次');
+  const context:JobContext={batchStepLimit,chainId,portfolioId:due.portfolioId,strategyId:due.strategyId,version:due.version,kind:version.execution.kind==='per_asset'?'asset':version.execution.kind,
     ...(version.execution.kind==='per_asset'?{execution:version.execution,marketOpenFor:(selected:readonly string[])=>deps.marketOpen({...version,allocation:{assets:version.allocation.assets.filter(a=>selected.includes(a.address))}},now)}:{}),
     account:due.account,allocation:version.allocation,cash,now,reserve:policy.reserve,caps:policy.caps,buyLimit:policy.buyLimit,
     observedCash:policy.cash,enabled:due.scheduleState!=='paused',marketOpen:deps.marketOpen(version,now)};
@@ -119,11 +123,17 @@ export async function prepareNewMoney(args:{due:DuePortfolio;plan:PortfolioPlan;
   const deadline=BigInt(Math.floor(now.getTime()/1000))+1800n;
   const feeBatches=policy.reserve===0n?sumInputs(job.remaining_input)/(50n*10n**18n):BigInt(job.remaining_fee_raw)/policy.reserve;
   const newMode=job.kind==='asset';
-  const maximum=newMode?feeBatches:maxBasketBatches(job.remaining_input,feeBatches);
-  let count=newMode?newRemainingCount(job.remaining_input,policy.caps,policy.buyLimit,BigInt(job.remaining_fee_raw),policy.reserve):batchCountFor(job.remaining_input,policy.caps,policy.buyLimit,feeBatches);
+  const remaining=Object.fromEntries(Object.entries(job.remaining_input).filter(([,n])=>BigInt(n)>0n));
+  const held=plan.snapshot.holdings.filter(h=>h.amountWei>0n&&h.asset.toLowerCase()!==cash&&version.allocation.assets.some(a=>a.address===h.asset.toLowerCase())).length;
+  const stepLimit=executionBatchSize(held);
+  if(stepLimit===0)return {job,context,rebalance:{kind:'blocked',reason:'[USER_OP_CAPACITY] 估值已超過單筆容量'}};
+  const maximum=newMode?maximumRemainingBatches(remaining,BigInt(job.remaining_fee_raw),policy.reserve,stepLimit):maxBasketBatches(job.remaining_input,feeBatches);
+  let count=newMode?newRemainingCount(remaining,policy.caps,policy.buyLimit,BigInt(job.remaining_fee_raw),policy.reserve,stepLimit):batchCountFor(job.remaining_input,policy.caps,policy.buyLimit,feeBatches);
   if(count===null)return {job,context,rebalance:{kind:'blocked',reason:'[BASKET_WAITING] 原向量無可行完整批次或費用預留'}};
   for (;;) {
-    const inputs=basketBatch(job.remaining_input,count);
+    const vector=basketBatch(newMode?remaining:job.remaining_input,count);
+    const inputs=newMode?executionInputGroups(vector,stepLimit,policy.reserve)?.[0]??{}:vector;
+    if(newMode&&sumInputs(inputs)+policy.reserve<50n*10n**18n)return {job,context,rebalance:{kind:'blocked',reason:'[BASKET_WAITING] 子批不足50 USDT'}};
     const rebalance=await deps.quote(due,plan,inputs,deadline);
     if(rebalance.kind==='ready')return {job,context,rebalance};
     if(rebalance.kind!=='blocked'||!rebalance.reason.includes('[BASKET_DEPTH]')||count===maximum)return {job,context,rebalance};
@@ -132,14 +142,22 @@ export async function prepareNewMoney(args:{due:DuePortfolio;plan:PortfolioPlan;
 }
 
 /** Resume the frozen vector; fee leftovers never become new principal. */
-function newRemainingCount(inputs:InputVector,caps:ReadonlyMap<string,bigint|null>,buyLimit:bigint,fee:bigint,reserve:bigint):bigint|null{
-  const total=sumInputs(inputs),U=10n**18n;
-  let maximum=(total+fee)/(50n*U);
-  if(reserve>0n&&fee/reserve<maximum)maximum=fee/reserve;
-  for(const v of Object.values(inputs)){if(BigInt(v)/U<maximum)maximum=BigInt(v)/U;}
+function newRemainingCount(inputs:InputVector,caps:ReadonlyMap<string,bigint|null>,buyLimit:bigint,fee:bigint,reserve:bigint,stepLimit:number):bigint|null{
+  const maximum=maximumRemainingBatches(inputs,fee,reserve,stepLimit);
   if(maximum<1n||buyLimit<=0n)return null;
   const fits=(k:bigint)=>{const batch=basketBatch(inputs,k);return sumInputs(batch)<=buyLimit&&Object.entries(batch).every(([a,v])=>{if(!caps.has(a))throw new Error('missing capacity');const cap=caps.get(a);return cap===null||(cap!==undefined&&BigInt(v)<=cap);});};
   if(!fits(maximum))return null;
   let low=1n,high=maximum;while(low<high){const mid=(low+high)/2n;if(fits(mid))high=mid;else low=mid+1n;}
   return low;
+}
+
+function maximumRemainingBatches(inputs:InputVector,fee:bigint,reserve:bigint,stepLimit:number):bigint{
+  const total=sumInputs(inputs),U=10n**18n;
+  let maximum=(total+fee)/(50n*U);
+  const groups=executionInputGroups(inputs,stepLimit,reserve);
+  if(!groups)return 0n;
+  const groupReserve=reserve*BigInt(groups.length);
+  if(groupReserve>0n&&fee/groupReserve<maximum)maximum=fee/groupReserve;
+  for(const value of Object.values(inputs)){const n=BigInt(value)/U;if(n<maximum)maximum=n;}
+  return maximum;
 }

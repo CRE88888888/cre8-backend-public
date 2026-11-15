@@ -31,8 +31,9 @@ async function clean() { await query('delete from paymaster_sponsorships where c
 test('#89 sponsorship uses the request chain budget and shares the 97 gas cap with self-funded operations', async () => {
   const r = request(890001, bytesToHex(randomBytes(20)));
   r.hash = keccak256(concatHex([r.hash, r.op.sender]));
-  r.config.chainId = 97;
-  r.gasLimit = 10_000_000n;
+  const defaults=loadPaymasterConfig({PAYMASTER_SIGNER_PRIVATE_KEY:key,CHAIN_ID:'97',RPC_URL:'http://127.0.0.1:8562'});assert.ok(defaults);
+  r.config = {...defaults,verificationGasLimit:r.config.verificationGasLimit,postOpGasLimit:r.config.postOpGasLimit};
+  r.gasLimit = 100_000_000n;
   r.callGas = r.gasLimit - r.verificationGas - r.op.preVerificationGas - r.config.verificationGasLimit - r.config.postOpGasLimit;
   r.op.accountGasLimits = concatHex([toHex(r.verificationGas, { size: 16 }), toHex(r.callGas, { size: 16 })]);
   r.maxFee = 1_000_000_000n;
@@ -44,7 +45,7 @@ test('#89 sponsorship uses the request chain budget and shares the 97 gas cap wi
     await reserveGasBudget(r.budget);
     await reserveSponsorship(r);
     const saved = await query<{ usd: string; n: string }>('select max(max_cost_usd)::text as usd,count(*)::text as n from gas_budget_reservations where execution_key=$1', [r.budget.executionKey]);
-    assert.deepEqual(saved.rows[0], { usd: '6.00000000', n: '1' });
+    assert.deepEqual(saved.rows[0], { usd: '60.00000000', n: '1' });
     await assert.rejects(reserveGasBudget({ ...r.budget, executionKey: randomUUID(), gasLimit: 1n }),
       (error: unknown) => error instanceof AppError && error.code === 'GAS_BUDGET_EXCEEDED');
     const mainnet: Reservation = { ...r, hash: keccak256(concatHex([r.hash, '0x01'])), config: { ...r.config, chainId: 56 },
@@ -143,7 +144,7 @@ test('#66 a new process cannot reset the durable daily allowance', async () => {
         import { reserveSponsorship } from ${JSON.stringify(new URL('../src/paymaster.ts', import.meta.url).href)};
         import { closePool } from ${JSON.stringify(new URL('../src/db.ts', import.meta.url).href)};
         const r = JSON.parse(process.env.PAYMASTER_TEST_RESERVATION);
-        for (const k of ['verificationGasLimit','postOpGasLimit','accountDailyCount','accountDailyGas','accountDailyWei','siteDailyGas','siteDailyWei','minDepositWei']) r.config[k] = BigInt(r.config[k]);
+        for (const k of ['verificationGasLimit','postOpGasLimit','accountDailyCount','accountDailyGas','accountDailyWei','siteDailyGas','siteDailyWei','minDepositWei']) if(r.config[k]!==null) r.config[k] = BigInt(r.config[k]);
         for (const k of ['nonce','preVerificationGas']) r.op[k] = BigInt(r.op[k]);
         for (const k of ['verificationGas','callGas','maxFee','gasLimit','maxCostWei']) r[k] = BigInt(r[k]);
         for (const k of ['gasLimit','maxFeePerGas','nativePrice']) r.budget[k] = BigInt(r.budget[k]);
@@ -194,4 +195,29 @@ test('#66 lock timeout and transaction/commit failure refuse authorization; unkn
     await reserveSponsorship(r);
     assert.equal((await query<{ n: string }>('select count(*)::text as n from paymaster_sponsorships where chain_id=$1', [chainId])).rows[0]?.n, '1');
   } finally { await blocker.query('rollback'); await blocker.end(); await clean(); }
+});
+
+test('#92 chain 97 default count accepts 60, rejects 61, and explicit wei zero still blocks atomically',async()=>{
+  const defaults=loadPaymasterConfig({PAYMASTER_SIGNER_PRIVATE_KEY:key,CHAIN_ID:'97',RPC_URL:'http://127.0.0.1:8562'});assert.ok(defaults);
+  const sender=bytesToHex(randomBytes(20));
+  const hashes:string[]=[];
+  try{
+    for(let index=0;index<=60;index++){
+      const r=request(920000+index,sender);
+      r.hash=keccak256(concatHex([r.hash,sender]));
+      r.config={...defaults,verificationGasLimit:r.config.verificationGasLimit,postOpGasLimit:r.config.postOpGasLimit};
+      r.budget={...r.budget,chainId:97,executionKey:randomUUID()};
+      if(index===60){
+        await assert.rejects(reserveSponsorship(r),denied);
+        assert.equal((await query('select execution_key from gas_budget_reservations where execution_key=$1',[r.budget.executionKey])).rows.length,0);
+      }else{await reserveSponsorship(r);hashes.push(r.hash);}
+    }
+    const r=request(920100,bytesToHex(randomBytes(20)));
+    r.config={...defaults,verificationGasLimit:r.config.verificationGasLimit,postOpGasLimit:r.config.postOpGasLimit,accountDailyWei:0n};
+    r.budget={...r.budget,chainId:97,executionKey:randomUUID()};
+    await assert.rejects(reserveSponsorship(r),denied);
+    assert.equal((await query('select execution_key from gas_budget_reservations where execution_key=$1',[r.budget.executionKey])).rows.length,0);
+    const site={...r,config:{...r.config,accountDailyWei:null,siteDailyWei:0n}};
+    await assert.rejects(reserveSponsorship(site),denied);
+  }finally{await query('delete from paymaster_sponsorships where user_op_hash=any($1::text[])',[hashes]);}
 });

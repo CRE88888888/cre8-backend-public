@@ -9,7 +9,7 @@ import {
 } from '../src/drift.js';
 import type { AssetDrift, DriftReport, Holding, TargetWeight } from '../src/drift.js';
 
-test('#34 上游整數 bps 案例守恆；自動零權重 USDT、1..16 資產與錯誤總和', () => {
+test('#34 上游整數 bps 案例守恆；自動零權重 USDT、超過16資產與錯誤總和', () => {
   // 上游 strategy-v3-risk.ts cappedWeights 的 bps 輸出；ATP 只驗證既有整數介面，不新增市值轉權重。
   // 20% cap 後剩 4000 bps，按 10:7:6:4 分配；largest remainder 補給餘數最大的第 7、6 成分。
   const vectors = [[3334, 3333, 3333], [2000, 2000, 2000, 1481, 1037, 889, 593], [1, 9999], [10000]];
@@ -31,12 +31,12 @@ test('#34 上游整數 bps 案例守恆；自動零權重 USDT、1..16 資產與
     }
   }
   const sixteen = Array.from({ length: 16 }, (_, i) => ({ address: address(i), weightBps: 625 }));
-  assert.throws(() => validateAllocation({ assets: sixteen }), /including USDT/);
+  assert.equal(validateAllocation({ assets: sixteen }).assets.length,17);
   sixteen[15] = { address: '0x55d398326f99059ff775485246999027b3197955', weightBps: 625 };
   const max = validateAllocation({ assets: sixteen });
   assert.equal(max.assets.length, 16);
   assert.equal(max.assets.reduce((sum, a) => sum + a.weightBps, 0), 10000);
-  assert.throws(() => validateAllocation({ assets: [...sixteen, { address: address(17), weightBps: 1 }] }), /at most 16/);
+  assert.throws(() => validateAllocation({ assets: [...sixteen, { address: address(17), weightBps: 1 }] }), /sum to 10000/);
   for (const weightBps of [0, 0.5, -1, 10001, Number.NaN, Number.POSITIVE_INFINITY]) {
     assert.throws(() => validateAllocation({ assets: [{ address: address(0), weightBps }] }));
   }

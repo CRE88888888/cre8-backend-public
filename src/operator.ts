@@ -1,3 +1,4 @@
+import { MAX_USER_OP_STEPS } from './execution-batch.js';
 import { configuredChainId, TESTNET_97, testnetAssets } from './testnet-profile.js';
 import type { AggregatorQuoter } from './aggregator.js';
 /**
@@ -1426,6 +1427,7 @@ export async function buildRedeemPlan(input: RebalancePlanningInput, request: Se
     const steps: PlannedStep[] = [];
     let soldRaw = 0n;
     for (const holding of availableHoldings) {
+      if (steps.length === MAX_USER_OP_STEPS) break;
       let amountIn = first ? holding.amountWei * request / totalE8 : holding.amountWei * budget * scale / (nonCashRaw * 100_000_000n);
       if (typeof request === 'object' && 'close' in request) amountIn = holding.amountWei;
       if (amountIn > holding.amountWei) amountIn = holding.amountWei;
@@ -1448,7 +1450,7 @@ export async function buildRedeemPlan(input: RebalancePlanningInput, request: Se
       if (nextRaw * 100_000_000n > wanted * scale) { notes.push(`${holding.asset}: oracle 名義額超過剩餘待賣量`); continue; }
       if (limit !== null && quotedOut * 100_000_000n > limit * scale) { notes.push(`${holding.asset}: oracle 名義額超過單筆上限`); continue; }
       const poolFee = await readPoolFee(client, router, holding.asset as Address, blockNumber);
-      const step = await buildRoutedStep({ publicClient: client, executor, tokenIn: holding.asset as Address, tokenOut: numeraire, amountIn, oracleFloor: floor, minGross: minGrossFor(floor, feeBps), poolFee, feeBps, deadline, blockNumber }, deps);
+      const step = await buildRoutedStep({ publicClient: client, executor, tokenIn: holding.asset as Address, tokenOut: numeraire, amountIn, oracleFloor: floor, oracleQuoted: quotedOut, minGross: minGrossFor(floor, feeBps), poolFee, feeBps, deadline, blockNumber }, deps);
       if (step === null) { notes.push(`${holding.asset}: 沒有符合地板的白名單路徑`); continue; }
       steps.push(step);
       soldRaw = nextRaw;

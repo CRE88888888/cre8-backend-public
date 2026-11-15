@@ -1530,3 +1530,27 @@ test('#59 rebalance, preview, redeem and close all explicitly skip global alerts
   assert.deepEqual(seen.map((args) => args.skipAlerts), [true, true, true, true]);
   assert.deepEqual(seen.map((args) => args.dryRun), [false, true, false, false]);
 });
+
+test('#92 close plans at most 16 sell steps and resumes remaining holdings, including the exact boundary',async()=>{
+  for(const count of [0,16,17,92]){
+    const f=sellFixture();f.state.limit=null;
+    const plan=f.plan(samplePlan());
+    const cash=plan.snapshot.holdings.find(h=>h.asset.toLowerCase()===CASH.toLowerCase());assert.ok(cash);
+    const holdings:PortfolioPlan['snapshot']['holdings']=Array.from({length:count},(_,i)=>({asset:getAddress(`0x${(0x9200+i).toString(16).padStart(40,'0')}`),amountWei:100n*10n**18n,decimals:18,usdPriceE8:100000000n,priceSource:TWAP_PRICE_SOURCE}));
+    f.state.extraLimits=holdings.map(h=>({address:h.asset,max_leg_usdt:null}));
+    plan.snapshot.holdings=[cash,...holdings];
+    plan.targets=[{asset:CASH,weightBps:10000,symbol:'USDT'},...holdings.map(h=>({asset:h.asset,weightBps:0,symbol:'TEST'}))];
+    plan.report=computeDrift(plan.snapshot.holdings,plan.targets,100);
+    const options={...f.deps,quoteAggregator:async()=>null};
+    const built=await buildRedeemPlan({portfolioId:PORTFOLIO_ID,account:ACCOUNT,plan},{close:true},options);
+    if(count===0){assert.equal(built.plan.kind,'noop');continue;}
+    assert.ok(built.plan.kind==='ready');assert.equal(built.plan.steps.length,Math.min(16,count));assert.equal(built.plan.purpose,'exit');
+    assert.equal(built.plannedSellUsdE8,BigInt(Math.min(16,count))*100n*100000000n);
+    const sold=new Set(built.plan.steps.map(s=>s.tokenIn.toLowerCase()));
+    plan.snapshot.holdings=plan.snapshot.holdings.filter(h=>!sold.has(h.asset.toLowerCase()));
+    plan.report=computeDrift(plan.snapshot.holdings,plan.targets,100);
+    const next=await buildRedeemPlan({portfolioId:PORTFOLIO_ID,account:ACCOUNT,plan},{close:true},options);
+    if(count<=16)assert.equal(next.plan.kind,'noop');
+    else {assert.ok(next.plan.kind==='ready');assert.equal(next.plan.steps.length,Math.min(16,count-16));assert.ok(next.plan.steps.every(s=>!sold.has(s.tokenIn.toLowerCase())));}
+  }
+});

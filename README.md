@@ -558,20 +558,22 @@ curl -s -X POST "$API/strategies/1/versions" -H "authorization: Bearer $TOKEN" -
 
 - 請求 body 必須是物件；`allocation` 必填。新HTTP API預設明示hold／funding／生息關閉；完整契約見 [BE-1策略API](docs/strategy-api.zh-TW.md)。
 - `allocation` 必須是 `{"assets":[{"address":"0x…","symbol"?:"  ≤32 字","weightBps":2500}]}`。
-- 1–16 個資產（`MAX_VERSION_ASSETS`，包含自動補入的 USDT）；address 必須是 0x + 40 hex，入庫前轉小寫。
+- 至少 1 個資產，不設項數上限（包含自動補入的 USDT）；address 必須是 0x + 40 hex，入庫前轉小寫。
 - 同一版本內資產不可重複（address 不分大小寫）。
 - `weightBps` 必須是 1–10000 的整數，USDT 另允許 0；總和**必須剛好 10000**。
 - 未提供 BSC USDT（`0x55d398326f99059fF775485246999027B3197955`）時，自動在最後補上
   `{ address: "0x55d398326f99059ff775485246999027b3197955", symbol: "USDT", weightBps: 0 }`，不調整原有權重。
   回傳、DB 與鏈上 `version.assets` 都包含此列，讓存入的 USDT 能被核准並配置到目標資產。
-  已提供 USDT 時保留其權重、不重複補列；16 個資產且缺 USDT 時回 400 `TOO_MANY_ASSETS`。
+  已提供 USDT 時保留其權重、不重複補列。單筆 UserOp 最多 16 步，買入依已持有資產數縮小；送出前驗 prepared UserOp 總 gas ≤14M。chain 97 的額外 gas 餘裕以此容量為限，預留 50k 給最終 preparation，絕不低於 bundler 原始估算，仍用實際 gas 上限模擬再送。大檔基金保留原投入向量、分批對帳，建立 job 時一次預留各子批費用，子批仍須滿足 1／50 USDT 門檻。
+- chain 97 每帳戶每日 gas 預設 100M、無預設美元上限；主網維持 10M gas 與 0.30 USD，環境變數覆寫仍有效。chain 97 代付預設每帳戶每日 60 次、100M gas、無每帳戶 wei 上限；全站每日仍限制 0.1 tBNB。顯式 `PAYMASTER_ACCOUNT_DAILY_WEI`（含 0）仍套用。
   建立基金的初版與後續版本皆走此發布規則；不修改既有版本或既有投組固定的版本。
+- 買賣的預設 80 bps 只計價格衝擊、不含已知 oracle 參考池費；總成本上限為池費 + 80 bps，若超過該資產 `maxSlippageBps`，以原 oracle floor 的較嚴限制為準。實際路由報價、平台費、buffer 與送出前刷新仍必須通過。此規則也影響主網：DOGE 的 1% 池費不再單獨耗盡原 80 bps 預算；不修改鏈上滑價參數。`buyAllowance` 已是 USDT raw 單位，不再乘上 USD-E8 的換算倍率。
 - 新HTTP `execution`僅hold／stack、`schedule`僅`{"kind":"funding"}`；省略時明示回預設值。舊schema0列及內部legacy writer保留interval／cron，讀回target_weight。
 - canonical config hash放既有Version.scheduleHash。BE-2接入前，typed版本的funding標記使舊漂移scheduler blocked；個人投入／指令與hash golden見 [API契約](docs/strategy-api.zh-TW.md)。
 - `changeLog` 選填，≤ 2000 字；typed `activeAt`為含時區的整秒時間，省略固定第一次發版時間。已存設定重試只核對原鏈上版本，不重送未知publish交易。
 - 必須帶 token，且該策略 DB 的 `provider` 必須等於 session 錢包（不分大小寫），否則 403 `FORBIDDEN`。
 
-錯誤碼：`INVALID_ALLOCATION`、`ALLOCATION_EMPTY`、`TOO_MANY_ASSETS`、`INVALID_ASSET`、
+錯誤碼：`INVALID_ALLOCATION`、`ALLOCATION_EMPTY`、`INVALID_ASSET`、
 `DUPLICATE_ASSET`、`WEIGHT_OUT_OF_RANGE`、`WEIGHT_SUM`、`INVALID_SCHEDULE`、`INVALID_VERSION`、
 `INVALID_STRATEGY`、`INVALID_SWAP_FEE`、`INVALID_ID`、`INVALID_QUERY`、`INVALID_JSON`、`NOT_FOUND`、
 `METHOD_NOT_ALLOWED`、`PAYLOAD_TOO_LARGE`、`DB_UNAVAILABLE`、`INTERNAL`、`UNAUTHORIZED`、

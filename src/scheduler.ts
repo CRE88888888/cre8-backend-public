@@ -1,3 +1,4 @@
+import { assertUserOpCapacity, boundedCallGasLimit, executionBatchSize, MAX_USER_OP_STEPS, userOpGasOverhead } from './execution-batch.js';
 import { EXECUTOR_ABI, EXECUTOR_SELECTOR, PLAN_HASH_ABI } from './chain.js';
 /**
  * 排程器迴圈（S3）：讓前幾刀做好的零件自己動起來。
@@ -1424,7 +1425,14 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
     } catch { throw new Error('[NUMERAIRE_UNAVAILABLE] 送出前讀不到 executor.numeraire，不送交易'); }
     const hasBuy = args.steps.some((step) => !isAddressEqual(step.tokenOut, numeraire));
     const valuationAssetCount = hasBuy ? new Set(args.valuationAssets.filter((asset) => !isAddressEqual(asset, numeraire)).map((asset) => asset.toLowerCase())).size : 0;
-    const callGasLimit = rebalanceCallGasLimit(estimate.callGasLimit, valuationAssetCount);
+    // On 97 the actual estimate already includes the valuation loop. Adding it a
+    // second time makes a fully held 92-asset account impossible to execute.
+    const desiredCallGas = rebalanceCallGasLimit(estimate.callGasLimit, network.id === 97 ? 0 : valuationAssetCount);
+    const sponsorLimits = network.id === 97 ? await paymaster?.getPaymasterStubData?.({sender:args.account,chainId:network.id,
+      entryPointAddress:ENTRY_POINT.address,nonce:args.nonce,callData:await account.encodeCalls(calls)}) : undefined;
+    const estimatedOverhead = userOpGasOverhead(estimate,sponsorLimits);
+    const callGasLimit = network.id === 97 ? boundedCallGasLimit(desiredCallGas, estimate.callGasLimit, estimatedOverhead) : desiredCallGas;
+    assertUserOpCapacity(args.steps.length, callGasLimit + estimatedOverhead);
     if (hasBuy) {
       if (args.strategyId === undefined) throw new Error('[MIN_FEE_RESERVE] 缺少策略，不送買入');
       await checkBuyFeeReserve({ client: publicClient, executor: args.executor, account: args.account,
@@ -1459,6 +1467,8 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
     const prepared = await client.prepareUserOperation({ calls, callGasLimit, nonce: args.nonce,
       verificationGasLimit: estimate.verificationGasLimit, preVerificationGas: estimate.preVerificationGas,
       ...(paymaster === undefined ? {} : { paymaster }) });
+    assertUserOpCapacity(args.steps.length, prepared.callGasLimit + prepared.verificationGasLimit + prepared.preVerificationGas +
+      (prepared.paymasterVerificationGasLimit ?? 0n) + (prepared.paymasterPostOpGasLimit ?? 0n));
     budgetKey = gasExecutionKey(network.id, { sender: args.account, nonce: args.nonce, initCode: '0x', callData: prepared.callData });
     if (paymaster === undefined) {
       const op = { sender: args.account, nonce: args.nonce, initCode: '0x' as const, callData: prepared.callData };
@@ -2283,7 +2293,7 @@ async function decideAndMaybeExecute(
 
   const money = due.executionKind === undefined || ctx.forcePlan === true ? null : await prepareNewMoney({due,plan,query:ctx.deps.query,
     run:ctx.deps.withTransaction,chainId:ctx.deps.chainId,now:ctx.now,dryRun:ctx.dryRun,deps:ctx.deps.newMoney});
-  const rebalance = (money?.useTargetWeights?null:money?.rebalance) ?? await ctx.deps.planRebalance({ portfolioId: due.portfolioId, account: due.account, plan });
+  let rebalance = (money?.useTargetWeights?null:money?.rebalance) ?? await ctx.deps.planRebalance({ portfolioId: due.portfolioId, account: due.account, plan });
   if (rebalance.kind === 'noop') {
     return { ...base, outcome: 'noop', reason: `Planner returned noop: ${rebalance.reason}` };
   }
@@ -2313,6 +2323,13 @@ async function decideAndMaybeExecute(
     };
   }
 
+  const batchCash = ctx.deps.chainId === 97 ? TESTNET_97.contracts.usdt : '0x55d398326f99059ff775485246999027b3197955';
+  const buys = rebalance.steps.some(step => !isAddressEqual(step.tokenOut,batchCash));
+  const heldCount = plan.snapshot.holdings.filter(h=>h.amountWei>0n&&!isAddressEqual(getAddress(h.asset),batchCash)&&plan.targets.some(t=>t.asset.toLowerCase()===h.asset.toLowerCase())).length;
+  const limit = executionBatchSize(heldCount,buys);
+  if(limit===0)return {...base,outcome:'blocked',reason:'[USER_OP_CAPACITY] 無可行的安全批次'};
+  if(rebalance.steps.length>limit)rebalance={...rebalance,steps:rebalance.steps.slice(0,limit),
+    partial:{...rebalance.partial,remainingDriftBps:null,shrunk:rebalance.partial?.shrunk??[],maxLegBatched:true},rationale:rebalance.rationale+'；交易容量分批，剩餘依下一輪持倉續作'};
   const gasPurpose = rebalance.purpose ?? 'ordinary';
   const cash = ctx.deps.chainId === 97 ? TESTNET_97.contracts.usdt : '0x55d398326f99059ff775485246999027b3197955';
   const hasBuy = rebalance.steps.some((step) => !isAddressEqual(step.tokenOut, cash));
@@ -2849,7 +2866,8 @@ async function beginStrategyOperation(query:SchedulerQueryFn,c:JobContext,j:Stra
   if(!current||current.id!==j.id||!['reserved','running'].includes(current.state))return {proceed:false,outcome:'blocked',reason:'原工作已停止或改變'};
   const inputs=Object.fromEntries(steps.map(s=>[s.tokenOut.toLowerCase(),s.amountIn.toString()]));
   if(steps.some(s=>!isAddressEqual(s.tokenIn,c.cash))||Object.keys(inputs).length!==steps.length||
-    Object.keys(current.remaining_input).filter(a=>BigInt(current.remaining_input[a]??'0')>0n).length!==steps.length||
+    (current.kind!=='asset'&&Object.keys(current.remaining_input).filter(a=>BigInt(current.remaining_input[a]??'0')>0n).length!==steps.length)||
+    steps.length===0||steps.length>MAX_USER_OP_STEPS||
     Object.entries(inputs).some(([a,v])=>BigInt(v)>BigInt(current.remaining_input[a]??'0')))throw new Error('basket identity changed');
   await query("update strategy_job_batches set state='cancelled',updated_at=clock_timestamp() where job_id=$1 and state='planned'",[j.id]);
   const indexRow=(await query('select coalesce(max(batch_index)+1,0) as n from strategy_job_batches where job_id=$1',[j.id])).rows[0] as {n:number}|undefined;

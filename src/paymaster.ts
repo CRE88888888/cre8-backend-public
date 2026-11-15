@@ -393,7 +393,8 @@ export async function reserveSponsorship(r: Reservation, transaction: typeof wit
       const u = usage.rows[0];
       if (!u) throw new Error('missing usage');
       const accountBudgets: (readonly [bigint, bigint, bigint])[] = r.budget.purpose !== 'ordinary' ? [] :
-        [[BigInt(u.account_count), 1n, c.accountDailyCount], [BigInt(u.account_gas), r.gasLimit, c.accountDailyGas], [BigInt(u.account_wei), r.maxCostWei, c.accountDailyWei]];
+        [[BigInt(u.account_count), 1n, c.accountDailyCount], [BigInt(u.account_gas), r.gasLimit, c.accountDailyGas],
+          ...(c.accountDailyWei === null ? [] : [[BigInt(u.account_wei), r.maxCostWei, c.accountDailyWei] as const])];
       const budgets: (readonly [bigint, bigint, bigint])[] = [...accountBudgets, [BigInt(u.gas), r.gasLimit, c.siteDailyGas], [BigInt(u.wei), r.maxCostWei, c.siteDailyWei]];
       if (budgets.some(([used, amount, cap]) => cap === 0n || used + amount > cap)) throw rejected('PAYMASTER_QUOTA_EXCEEDED', 429);
       await client.query(`insert into paymaster_sponsorships (user_op_hash,chain_id,paymaster,sender,verification_gas_limit,call_gas_limit,

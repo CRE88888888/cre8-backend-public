@@ -224,6 +224,8 @@ export type PlannedStep = {
   amountOutMin: bigint;
   /** `previewSwap` 的 `minimum`，留作稽核（minGross 是它放大後的結果，看得到原值才對得起來）。 */
   oracleFloor: bigint;
+  /** Oracle reference pool fee + price-impact budget. Retained for fresh quotes before signing. */
+  costBudgetBps?: number;
   venue: Address;
   data: Hex;
 };
@@ -317,20 +319,12 @@ export type PlanRebalanceArgs = {
    */
   numeraire?: Address;
   /**
-   * 每一步的價格衝擊上限（bps，量法是 `(TWAP 報價 − 估算到手)/TWAP 報價`，
-   * 與合約 `maxSlippageBps` 同一個空間）。預設 `DEFAULT_MAX_IMPACT_BPS` = 80。
-   *
-   * 為什麼是 80 而不是 50：50 在「現貨偏離 TWAP 60–80 bps」這種很常見的盤況下會讓**每一輪都做不了事**
-   * （baseline 就吃掉全部預算），投組於是長期停在漂移裡（D-25 說「等市場」，但沒有終點保證）。
-   * 80 仍然**嚴格小於** per-pair oracle 的 `maxSlippageBps`（100），所以合約的 `BelowFloor` 仍然是最後
-   * 一道、且**永遠比我們寬鬆** —— 我們不會送出一個必定 revert 的計畫。
-   *
-   * ⚠ 這個值不是「越大越能動」：真正的上限是 oracle 的 100，而 baseline 是市場決定的。
-   *   實測某輪 baseline 92 bps 時，即使把這裡調到 80 也一樣做不了事 —— 那種情況要動的是 oracle 的
-   *   `maxSlippageBps`（換 per-pair oracle），不是這裡。
-   *
-   *   * `undefined` → 用預設值 50（**預設就是開的**）。
-   *   * `null`      → 關掉：不讀池子狀態、一步都不縮（既有行為的完全等價開關）。
+   * 每一步的價格衝擊預算，不含 oracle 參考池的已知手續費。預設 80 bps。
+   * 總成本預算 = 池費 + 此值；仍須通過原 oracle floor（含該資產
+   * maxSlippageBps／近期價格保護）、平台費與 buffer，以及實際路由報價。
+   * 買入、賣出與送出前刷新採同一條規則，不限 chain 97。
+   *   * `undefined` → 用預設值 80。
+   *   * `null`      → 關掉價格衝擊預算，仍驗 oracle 地板與實際報價。
    *   * 超標的 step 會被**縮小**而不是丟掉，剩餘由下一輪處理（跨輪次，不是同一批切小 ——
    *     切在同一批裡沒有用，floor 來自 TWAP，不會因為這一筆而移動）。
    */
@@ -448,13 +442,29 @@ export const DEFAULT_DEADLINE_SECONDS = 1800;
 /** `UniversalRouterCommands.V3_SWAP_EXACT_IN`：一個 byte，packed。不是 bytes[]。 */
 export const V3_SWAP_EXACT_IN: Hex = '0x00';
 /**
- * 每一步的預設價格衝擊上限：**半個滑價預算**。
- *
- * `PancakeV3TwapOracle` 給的地板是 TWAP 報價打折 1%（`maxSlippageBps = 100`）。那 1% 要同時裝下
- * 池子手續費（2500 → 25 bps）、現貨相對 TWAP 的既有偏差、以及這一筆自己的衝擊。留一半給衝擊，
- * 剩下的才是給 fee 與雜訊的 —— 50 bps 的衝擊在 2500 的池子上剛好留 25 bps 的餘裕。
+ * 價格衝擊的預設預算，不含已知池費；總成本仍受原 oracle 地板約束。
  */
 export const DEFAULT_MAX_IMPACT_BPS = 80;
+
+/** #92: the 80-bps price budget excludes the known reference pool fee.
+ * The original oracle floor (including maxSlippageBps and recent-window guard)
+ * always remains binding. Round the policy floor up, never the loss allowance.
+ */
+function costBudgetBps(poolFeeUnits: number, impactBps: number): number {
+  if (!Number.isInteger(poolFeeUnits) || poolFeeUnits < 0 || poolFeeUnits >= 1_000_000 ||
+      !Number.isInteger(impactBps) || impactBps < 1 || impactBps >= 10000) throw new Error('invalid swap cost budget');
+  return Math.min(9999, Math.floor(poolFeeUnits / 100) + impactBps);
+}
+function costFloor(quoted: bigint, oracleFloor: bigint, budgetBps: number): bigint {
+  if (quoted <= 0n || oracleFloor <= 0n || !Number.isInteger(budgetBps) || budgetBps < 1 || budgetBps >= 10000) throw new Error('invalid swap cost floor');
+  const policyFloor = ceilDiv(quoted * BigInt(10000 - budgetBps), 10000n);
+  return policyFloor > oracleFloor ? policyFloor : oracleFloor;
+}
+function cappedCostBudget(quoted: bigint, floor: bigint, poolFee: number, impact: number): number {
+  const budget = costBudgetBps(poolFee, impact);
+  if (quoted <= 0n || floor <= 0n) throw new Error('invalid oracle quote');
+  return floor >= quoted ? 0 : Math.min(budget, Number((quoted - floor) * 10000n / quoted));
+}
 /**
  * 縮小之後如果連理想量的 **1 bp**（萬分之一）都不到，就當成 dust 跳過。
  * 理由：那種量對漂移的貢獻等於 0，卻要付一次完整的 swap gas 與一次 `BelowFloor` 的風險。
@@ -830,10 +840,14 @@ async function quotePancake(params: {
 /** Exact amount is already capped by the caller. Never resize calldata after quoting. */
 export async function buildRoutedStep(params: Parameters<typeof buildStep>[0] & {
   publicClient: PublicClient; deadline: bigint; feeBps: number; blockNumber: bigint;
+  oracleQuoted?: bigint; maxImpactBps?: number | null;
 }, deps: { quoteAggregator?: AggregatorQuoter } = {}): Promise<PlannedStep | null> {
   const { publicClient, tokenIn, tokenOut, amountIn, executor, blockNumber } = params;
   const PANCAKE_UR = pancakeRouterForChain(publicClient.chain?.id);
-  const minimum = amountOutMinWithBuffer(params.minGross);
+  const budget = params.oracleQuoted === undefined || params.maxImpactBps === null ? undefined : costBudgetBps(params.poolFee, params.maxImpactBps ?? DEFAULT_MAX_IMPACT_BPS);
+  const minimumGross = budget === undefined || params.oracleQuoted === undefined ? params.minGross :
+    minGrossFor(costFloor(params.oracleQuoted, params.oracleFloor, budget), params.feeBps);
+  const minimum = amountOutMinWithBuffer(minimumGross);
   const [pancake, allowed] = await Promise.all([
     quotePancake(params),
     publicClient.readContract({ address: executor, abi: EXECUTOR_ABI, functionName: 'venues', args: [PANCAKE_UR], blockNumber })
@@ -845,11 +859,11 @@ export async function buildRoutedStep(params: Parameters<typeof buildStep>[0] & 
     amountIn, minimum, pancakeOut, deadline: params.deadline, blockNumber }).catch(() => null);
   if (aggregatorWins(aggregator, allowed ? pancake?.amountOut ?? null : null, minimum, params.feeBps) && aggregator !== null) {
     return { tokenIn, tokenOut, amountIn, amountOutMin: quoteBoundMinimum(minimum, aggregator.amountOut, pancakeOut), oracleFloor: params.oracleFloor,
-      venue: aggregator.venue, data: aggregator.data };
+      venue: aggregator.venue, data: aggregator.data, ...(budget === undefined ? {} : {costBudgetBps:budget}) };
   }
   if (!allowed || pancake === null || pancake.amountOut < minimum) return null;
-  return buildStep({ ...params, chainId: publicClient.chain?.id, quotedAmountOut: pancake.amountOut, ...(pancake.kind === 'v3' ? { path: pancake.path } :
-    { v2Tokens: pancake.tokens }) });
+  return {...buildStep({ ...params, minGross: minimumGross, chainId: publicClient.chain?.id, quotedAmountOut: pancake.amountOut, ...(pancake.kind === 'v3' ? { path: pancake.path } :
+    { v2Tokens: pancake.tokens }) }), ...(budget === undefined ? {} : {costBudgetBps:budget})};
 }
 
 // ---------------------------------------------------------------------------
@@ -1055,7 +1069,7 @@ export async function refreshFloors(params: {
           '——沒有新鮮的地板就不送（舊值等於一個已經過期的下限）',
       };
     }
-    const [, minimum] = quote.result;
+    const [quoted, minimum] = quote.result;
     // 合約對 `minimum === 0` 是 revert NoFloor：不是「地板是 0」，是「沒有地板」。
     if (minimum === 0n) {
       return {
@@ -1065,7 +1079,9 @@ export async function refreshFloors(params: {
       };
     }
 
-    const freshAmountOutMin = minGrossFor(minimum, feeBps);
+    let freshAmountOutMin: bigint;
+    try { freshAmountOutMin = minGrossFor(step.costBudgetBps === undefined ? minimum : costFloor(quoted, minimum, step.costBudgetBps), feeBps); }
+    catch { return {ok:false,kind:'quote-failed',reason:'送出前成本預算或報價無效，不送交易'}; }
     const deltaBps = floorDeltaBps(step.oracleFloor, minimum);
     refreshes.push({
       index,
@@ -1114,7 +1130,7 @@ export async function refreshFloors(params: {
       return { ok: false, kind: 'quote-failed', reason: `送出前重問地板失敗：step#${index} 沒有符合地板的原路徑報價，不送交易` };
     }
     rebuilt.push(
-      buildStep({
+      {...buildStep({
         chainId: publicClient.chain?.id,
         executor: identity.recipient,
         tokenIn: step.tokenIn,
@@ -1126,7 +1142,7 @@ export async function refreshFloors(params: {
         poolFee: identity.poolFee,
         // 逐字保留原本的路徑（V3 可能多跳；V2 是 address[]）。
         ...(identity.v2Tokens === null ? { path: identity.path } : { v2Tokens: identity.v2Tokens }),
-      }),
+      }), ...(step.costBudgetBps === undefined ? {} : {costBudgetBps:step.costBudgetBps})},
     );
   }
 
@@ -1155,9 +1171,10 @@ async function pancakeFallback(params: {
           args: [pancakeRouterForChain(params.publicClient.chain?.id)], ...(params.blockNumber === undefined ? {} : { blockNumber: params.blockNumber }) });
       if (venue[0] !== 1 || !isAddressEqual(venue[1], pancakeRouterForChain(params.publicClient.chain?.id)) || route === null ||
           route.amountOut < amountOutMinWithBuffer(params.minGross)) return null;
-      return buildStep({ ...params.step, chainId: params.publicClient.chain?.id, executor: params.executor, oracleFloor: params.minimum,
+      return {...buildStep({ ...params.step, chainId: params.publicClient.chain?.id, executor: params.executor, oracleFloor: params.minimum,
         minGross: params.minGross, quotedAmountOut: route.amountOut, poolFee: 0,
-        ...(route.kind === 'v3' ? { path: route.path } : { v2Tokens: route.tokens }) });
+        ...(route.kind === 'v3' ? { path: route.path } : { v2Tokens: route.tokens }) }),
+        ...(params.step.costBudgetBps === undefined ? {} : {costBudgetBps:params.step.costBudgetBps})};
     })().catch(() => null), new Promise<null>((resolve) => {
       timer = setTimeout(() => resolve(null), PANCAKE_QUOTE_TIMEOUT_MS);
     })]);
@@ -1312,7 +1329,7 @@ function describePostDrift(pre: DriftReport, post: DriftReport | null, partial: 
 }
 
 /**
- * `maxImpactBps` 的三態解析：`undefined` → 預設 50（**預設是開的**）、`null` → 關掉、整數 → 用它。
+ * `maxImpactBps` 的三態解析：`undefined` → 預設 80、`null` → 關掉、整數 → 用它。
  * 放在 `planRebalance` 的最前面驗一次，兩條路徑（hub / pinned）共用同一個值。
  */
 export function resolveMaxImpactBps(value: number | null | undefined): number | null {
@@ -1592,13 +1609,15 @@ async function capLegByImpact(params: {
     return { ...unchanged, note: `${label}：${short(pool)} 估不出衝擊（${problem}），照原量送出（上限未套用）` };
   }
 
-  const cap = capAmountInForImpact({ state, idealAmountIn: amountIn, idealQuoted: quoted, maxImpactBps });
+  const totalBudget = cappedCostBudget(quoted, floor, params.poolFeeUnits, maxImpactBps);
+  if (totalBudget < 1) return {skip:`${label}: oracle floor leaves no cost budget`};
+  const cap = capAmountInForImpact({ state, idealAmountIn: amountIn, idealQuoted: quoted, maxImpactBps:totalBudget });
   if (!cap.shrunk) return unchanged;
 
   if (cap.amountIn === 0n || cap.amountIn * BPS_BIG < amountIn * BigInt(MIN_STEP_BPS_OF_IDEAL)) {
     return {
       skip:
-        `${label}: estimated impact ${cap.idealEstimate.impactBps} bps exceeds the ${maxImpactBps} bps budget; ` +
+        `${label}: estimated cost ${cap.idealEstimate.impactBps} bps exceeds the ${totalBudget} bps budget (pool fee + ${maxImpactBps} bps price impact, bounded by oracle); ` +
         `shrinking leaves ${cap.amountIn} (ideal ${amountIn}), ` +
         (cap.noSizeFits
           ? `even one minimal unit is over budget: the existing spot-vs-TWAP gap plus pool fee is already ${cap.idealEstimate.baselineBps} bps, ` +
@@ -1619,8 +1638,8 @@ async function capLegByImpact(params: {
     floor: requoted.floor,
     shrunk: {
       idealAmountIn: amountIn,
-      idealImpactBps: cap.idealEstimate.impactBps,
-      impactBps: finalEstimate.impactBps,
+      idealImpactBps: Math.max(0,cap.idealEstimate.impactBps-Math.floor(params.poolFeeUnits/100)),
+      impactBps: Math.max(0,finalEstimate.impactBps-Math.floor(params.poolFeeUnits/100)),
     },
     note: null,
   };
@@ -1673,7 +1692,7 @@ export async function quoteNewMoney(args: Pick<PlanRebalanceArgs,'publicClient'|
       if('skip' in quote)return {kind:'blocked',reason:'[BASKET_QUOTE_UNAVAILABLE] 任一成分缺價，整籃子等待'};
       const deviation=await twapSpotDeviationBps({client:publicClient,pool:pair.pool,tokenIn:args.cash,amountIn,quoted:quote.quoted,blockNumber});
       if(deviation===null||deviation>Number(MAX_TWAP_SPOT_DEVIATION_BPS))return {kind:'blocked',reason:'[BASKET_DEPTH] TWAP 與現價無法確認，整籃子等待'};
-      const step=await buildRoutedStep({publicClient,executor,tokenIn:args.cash,tokenOut,amountIn,oracleFloor:quote.floor,
+      const step=await buildRoutedStep({publicClient,executor,tokenIn:args.cash,tokenOut,amountIn,oracleFloor:quote.floor,oracleQuoted:quote.quoted,
         minGross:minGrossFor(quote.floor,feeBps),poolFee:pair.poolFee,blockNumber,feeBps,deadline:args.deadline},deps);
       if(step===null)return {kind:'blocked',reason:'[BASKET_QUOTE_UNAVAILABLE] 整籃子沒有符合地板的路徑'};
       if(isAddressEqual(step.venue,pancakeRouterForChain(publicClient.chain?.id))) {
@@ -1702,7 +1721,8 @@ export async function newMoneyDepthCap(client:PublicClient,oracle:Address,cash:A
   if(state===null)throw new Error('new money depth unavailable');
   const full={...state,feeUnits:pair.poolFee};
   if(impactStateProblem(full)!==null)throw new Error('new money depth invalid');
-  return capAmountInForImpact({state:full,idealAmountIn:upper,idealQuoted:quote.quoted,maxImpactBps:DEFAULT_MAX_IMPACT_BPS}).amountIn;
+  const budget=cappedCostBudget(quote.quoted,quote.floor,pair.poolFee,DEFAULT_MAX_IMPACT_BPS);
+  return budget<1?0n:capAmountInForImpact({state:full,idealAmountIn:upper,idealQuoted:quote.quoted,maxImpactBps:budget}).amountIn;
 }
 
 async function executorNumeraire(args: PlanRebalanceArgs): Promise<Address | null> {
@@ -1847,8 +1867,11 @@ async function planHub(
     if (identity !== null && 'problem' in identity) return { skip: identity.problem };
     const path = identity?.path ?? singleHopPath(params.tokenIn, pair.poolFee, params.tokenOut);
     const routeTokens = identity?.v2Tokens ?? null;
-    if (identity === null) return { amountIn: params.amountIn, quoted: first.quoted, floor: first.floor,
-      shrunk: null, note: `KyberSwap venue ${routed.venue}`, poolFee: pair.poolFee, path, v2Tokens: null, routed };
+    if (identity === null) {
+      const bounded=await buildRoutedStep({...routeParams,oracleQuoted:first.quoted,maxImpactBps},deps);
+      return bounded===null?{skip:'白名單報價超過池費加價格衝擊預算'}:{amountIn:params.amountIn,quoted:first.quoted,floor:first.floor,
+        shrunk:null,note:`KyberSwap venue ${bounded.venue}`,poolFee:pair.poolFee,path,v2Tokens:null,routed:bounded};
+    }
     const routeImpact = identity.path === null ? null : await routeImpactBps(publicClient, {
       path, amountIn: params.amountIn, blockNumber });
 
@@ -1861,13 +1884,15 @@ async function planHub(
             `— the pool cannot absorb this size without moving the price`,
         };
       }
+      const bounded=await buildRoutedStep({...routeParams,oracleQuoted:first.quoted,maxImpactBps},deps);
+      if(bounded===null)return {skip:'白名單報價超過池費加價格衝擊預算'};
       return {
         amountIn: params.amountIn,
         quoted: first.quoted,
         floor: first.floor,
         shrunk: null,
         note: 'Pancake 路徑通過衝擊檢查',
-        routed,
+        routed:bounded,
         poolFee: pair.poolFee,
         path,
         v2Tokens: routeTokens,
@@ -1898,7 +1923,7 @@ async function planHub(
       },
     });
     if ('skip' in capped) return capped;
-    const resized = capped.amountIn === params.amountIn ? routed : await buildRoutedStep({ ...routeParams,
+    const resized = await buildRoutedStep({ ...routeParams,oracleQuoted:capped.quoted,maxImpactBps,
       amountIn: capped.amountIn, oracleFloor: capped.floor, minGross: minGrossFor(capped.floor, headResult.feeBps) }, deps);
     if (resized === null) return { skip: '縮量後沒有符合地板的白名單路徑' };
     return { ...capped, poolFee: pair.poolFee, path, v2Tokens: null, routed: resized };
@@ -2532,7 +2557,7 @@ export async function planRebalance(
     );
   }
 
-  const step = finalAmountIn === amountIn ? routed : await buildRoutedStep({ ...routeParams,
+  const step = await buildRoutedStep({ ...routeParams,oracleQuoted:capped.quoted,maxImpactBps,
     amountIn: finalAmountIn, oracleFloor: finalFloor, minGross }, deps);
   if (step === null) return { kind: 'blocked', reason: '縮量後沒有符合地板的白名單路徑' };
 

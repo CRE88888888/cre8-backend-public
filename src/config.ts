@@ -16,7 +16,7 @@ export type PaymasterConfig = {
   postOpGasLimit: bigint;
   accountDailyCount: bigint;
   accountDailyGas: bigint;
-  accountDailyWei: bigint;
+  accountDailyWei: bigint | null;
   siteDailyGas: bigint;
   siteDailyWei: bigint;
   minDepositWei: bigint;
@@ -50,9 +50,10 @@ export function loadPaymasterConfig(env: NodeJS.ProcessEnv = process.env): Payma
     signerPrivateKey, address: requiredAddress('PAYMASTER_ADDRESS'), executor: requiredAddress('EXECUTOR_ADDRESS'),
     registry: requiredAddress('REGISTRY_ADDRESS'), mockUsdt: configuredAddress(env, 'PAYMASTER_MOCK_USDT_ADDRESS'), rpcUrl, chainId,
     verificationGasLimit, postOpGasLimit,
-    accountDailyCount: parseBigInt(env, 'PAYMASTER_ACCOUNT_DAILY_COUNT', 20n),
-    accountDailyGas: parseBigInt(env, 'PAYMASTER_ACCOUNT_DAILY_GAS', 20_000_000n),
-    accountDailyWei: parseBigInt(env, 'PAYMASTER_ACCOUNT_DAILY_WEI', 10n ** 16n),
+    accountDailyCount: parseBigInt(env, 'PAYMASTER_ACCOUNT_DAILY_COUNT', chainId === 97 ? 60n : 20n),
+    accountDailyGas: parseBigInt(env, 'PAYMASTER_ACCOUNT_DAILY_GAS', chainId === 97 ? 100_000_000n : 20_000_000n),
+    accountDailyWei: chainId === 97 && !env.PAYMASTER_ACCOUNT_DAILY_WEI?.trim()
+      ? null : parseBigInt(env, 'PAYMASTER_ACCOUNT_DAILY_WEI', 10n ** 16n),
     siteDailyGas: parseBigInt(env, 'PAYMASTER_SITE_DAILY_GAS', 200_000_000n),
     siteDailyWei: parseBigInt(env, 'PAYMASTER_SITE_DAILY_WEI', 10n ** 17n),
     minDepositWei: parseBigInt(env, 'PAYMASTER_MIN_DEPOSIT_WEI', 10n ** 16n),
@@ -115,7 +116,7 @@ export function loadTradingConfig(env: NodeJS.ProcessEnv = process.env,
     minStepUsdE8: parseBigInt(env, 'MIN_STEP_USD_E8', 500_000_000n),
     minBatchUsdE8: parseBigInt(env, 'MIN_BATCH_USD_E8', 5_000_000_000n),
     minDepositUsdE8: parseBigInt(env, 'MIN_DEPOSIT_USD_E8', 5_000_000_000n),
-    dailyGas: parseBigInt(env, 'ACCOUNT_DAILY_GAS', 10_000_000n),
+    dailyGas: parseBigInt(env, 'ACCOUNT_DAILY_GAS', chainId === 97 ? 100_000_000n : 10_000_000n),
     // tBNB has no USD value. An explicit env cap (including zero) re-enables the USD check on 97.
     dailyUsdE8: chainId === 97 && !env.ACCOUNT_DAILY_GAS_USD_E8?.trim()
       ? null : parseBigInt(env, 'ACCOUNT_DAILY_GAS_USD_E8', 30_000_000n),

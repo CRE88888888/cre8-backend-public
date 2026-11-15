@@ -103,18 +103,22 @@ export function loadPointsConfig(env: NodeJS.ProcessEnv = process.env): PointsCo
       withdraw: rule('withdraw'), invite_reward: rule('invite_reward') } };
 }
 
-/** USD uses exact E8 integers; zero caps block positive usage. Exit has no account cap. */
+/** USD uses exact E8 integers; null disables only the USD cap. Zero caps block positive usage. Exit has no account cap. */
 export type TradingConfig = {
   minStepUsdE8: bigint; minBatchUsdE8: bigint; minDepositUsdE8: bigint;
-  dailyGas: bigint; dailyUsdE8: bigint; timeoutMs: number;
+  dailyGas: bigint; dailyUsdE8: bigint | null; timeoutMs: number;
 };
-export function loadTradingConfig(env: NodeJS.ProcessEnv = process.env): TradingConfig {
+/** Reservations pass their actual chain id, independently of the process's default chain. */
+export function loadTradingConfig(env: NodeJS.ProcessEnv = process.env,
+  chainId = parseInteger(env, 'CHAIN_ID', DEFAULT_CHAIN_ID, { min: 1, max: Number.MAX_SAFE_INTEGER })): TradingConfig {
   return {
     minStepUsdE8: parseBigInt(env, 'MIN_STEP_USD_E8', 500_000_000n),
     minBatchUsdE8: parseBigInt(env, 'MIN_BATCH_USD_E8', 5_000_000_000n),
     minDepositUsdE8: parseBigInt(env, 'MIN_DEPOSIT_USD_E8', 5_000_000_000n),
     dailyGas: parseBigInt(env, 'ACCOUNT_DAILY_GAS', 10_000_000n),
-    dailyUsdE8: parseBigInt(env, 'ACCOUNT_DAILY_GAS_USD_E8', 30_000_000n),
+    // tBNB has no USD value. An explicit env cap (including zero) re-enables the USD check on 97.
+    dailyUsdE8: chainId === 97 && !env.ACCOUNT_DAILY_GAS_USD_E8?.trim()
+      ? null : parseBigInt(env, 'ACCOUNT_DAILY_GAS_USD_E8', 30_000_000n),
     timeoutMs: parseInteger(env, 'GAS_BUDGET_TIMEOUT_MS', 5_000, { min: 1, max: 30_000 }),
   };
 }

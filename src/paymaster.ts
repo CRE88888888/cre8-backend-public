@@ -319,10 +319,10 @@ async function reserveBudgetOnClient(r: GasBudgetRequest, client: BudgetClient, 
   }
   if (r.purpose === 'ordinary') {
     const usage = await client.query<{ allowed: boolean }>(`select coalesce(sum(gas_limit),0)+$4::numeric <= $5::numeric and
-      coalesce(sum(max_cost_usd),0)+$6::numeric <= $7::numeric as allowed from gas_budget_reservations
+      ($7::numeric is null or coalesce(sum(max_cost_usd),0)+$6::numeric <= $7::numeric) as allowed from gas_budget_reservations
       where chain_id=$1 and account=$2 and utc_day=$3::date and purpose='ordinary'`,
       [r.chainId, r.account, day, r.gasLimit.toString(), policy.dailyGas.toString(),
-        decimalE8((r.gasLimit * r.maxFeePerGas * r.nativePrice * 100000000n + 10n ** BigInt(18 + (r.priceDecimals ?? 8)) - 1n) / 10n ** BigInt(18 + (r.priceDecimals ?? 8))), decimalE8(policy.dailyUsdE8)]);
+        decimalE8((r.gasLimit * r.maxFeePerGas * r.nativePrice * 100000000n + 10n ** BigInt(18 + (r.priceDecimals ?? 8)) - 1n) / 10n ** BigInt(18 + (r.priceDecimals ?? 8))), policy.dailyUsdE8 === null ? null : decimalE8(policy.dailyUsdE8)]);
     const allowed = usage.rows[0]?.allowed;
     if (typeof allowed !== 'boolean') throw rejected('GAS_BUDGET_STORAGE_UNAVAILABLE', 503);
     if (!allowed) throw new GasBudgetExceededError(day);
@@ -331,7 +331,7 @@ async function reserveBudgetOnClient(r: GasBudgetRequest, client: BudgetClient, 
     values($1,$2,$3,$4,$5,$6,$7,$8)`, params);
 }
 
-export async function reserveGasBudget(r: GasBudgetRequest, transaction: typeof withTransaction = withTransaction, policy = loadTradingConfig()): Promise<void> {
+export async function reserveGasBudget(r: GasBudgetRequest, transaction: typeof withTransaction = withTransaction, policy = loadTradingConfig(process.env, r.chainId)): Promise<void> {
   try {
     await transaction(async (client) => {
       await client.query('set transaction isolation level read committed');
@@ -375,7 +375,7 @@ export async function reserveSponsorship(r: Reservation, transaction: typeof wit
       if (!day) throw new Error('missing UTC day');
       await client.query("select pg_advisory_xact_lock(hashtextextended('paymaster_sponsorships:' || $1::bigint::text || ':' || to_char($2::date, 'YYYY-MM-DD'), 0))", [c.chainId, day]);
       if (r.budget.chainId !== c.chainId || !isAddressEqual(r.budget.account, r.op.sender) || r.budget.gasLimit !== r.gasLimit || r.budget.maxFeePerGas !== r.maxFee) throw rejected('GAS_BUDGET_CONFLICT', 409);
-      await reserveBudgetOnClient(r.budget, client, day, loadTradingConfig());
+      await reserveBudgetOnClient(r.budget, client, day, loadTradingConfig(process.env, c.chainId));
       const previous = await client.query<{ matches: boolean }>(`select (chain_id = $2 and paymaster = $3 and sender = $4 and
         verification_gas_limit = $5::numeric and call_gas_limit = $6::numeric and pre_verification_gas = $7::numeric and
         paymaster_verification_gas_limit = $8::numeric and paymaster_post_op_gas_limit = $9::numeric and max_fee_per_gas = $10::numeric and

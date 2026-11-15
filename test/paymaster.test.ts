@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { concatHex, encodeAbiParameters, encodeFunctionData, keccak256, parseAbi, recoverMessageAddress, toHex, zeroAddress } from 'viem';
 import type { Hex } from 'viem';
-import { loadPaymasterConfig } from '../src/config.js';
+import { loadPaymasterConfig, loadTradingConfig } from '../src/config.js';
 import { AppError } from '../src/errors.js';
 import { createPaymasterService, KERNEL_EXECUTE_ABI, verifyingPaymasterHash, validateSponsoredCalls } from '../src/paymaster.js';
 import type { PackedSponsorOperation, Reservation } from '../src/paymaster.js';
@@ -13,6 +13,31 @@ import { assertNoSecretSlices } from './fixtures/secret-output.js';
 import { TEST_SIGNER, PM, EXECUTOR, REGISTRY, USDT, SENDER, OWNER, ENV, NOW, CLAIM_ABI, claim, kernelCall, operation, config } from './fixtures/paymaster.js';
 
 function errorCode(code: string) { return (error: unknown) => error instanceof AppError && error.code === code; }
+
+test('#89 only chain 97 defaults to a gas-only daily budget; other chain defaults are unchanged', () => {
+  for (const chainId of [undefined, '56', '97', '1337', '31337']) {
+    const policy = loadTradingConfig({ CHAIN_ID: chainId });
+    assert.equal(policy.dailyGas, 10_000_000n);
+    assert.equal(policy.dailyUsdE8, chainId === '97' ? null : 30_000_000n);
+  }
+  assert.equal(loadTradingConfig({ CHAIN_ID: '97', ACCOUNT_DAILY_GAS_USD_E8: '  ' }).dailyUsdE8, null);
+});
+
+test('#89 daily caps can be overridden on 97 and 56; zero blocks and malformed values never echo input', () => {
+  for (const chainId of ['97', '56']) {
+    for (const cap of ['0', '1', '9007199254740993']) {
+      const policy = loadTradingConfig({ CHAIN_ID: chainId, ACCOUNT_DAILY_GAS: cap, ACCOUNT_DAILY_GAS_USD_E8: cap });
+      assert.equal(policy.dailyGas, BigInt(cap));
+      assert.equal(policy.dailyUsdE8, BigInt(cap));
+    }
+    for (const name of ['ACCOUNT_DAILY_GAS', 'ACCOUNT_DAILY_GAS_USD_E8']) {
+      for (const value of ['-1', '1.5', 'secret-setting']) {
+        assert.throws(() => loadTradingConfig({ CHAIN_ID: chainId, [name]: value }),
+          (error: unknown) => error instanceof Error && error.message.includes(name) && !error.message.includes(value));
+      }
+    }
+  }
+});
 
 test('#66 config disabled without signer; decimal quotas, zero and malformed config fail closed without echo', () => {
   assert.equal(loadPaymasterConfig({ PAYMASTER_ADDRESS: 'secret' }), null);

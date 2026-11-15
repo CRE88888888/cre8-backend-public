@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { after, test } from 'node:test';
 import { execFileSync } from 'node:child_process';
 import pg from 'pg';
-import { concatHex, keccak256, toHex } from 'viem';
+import { bytesToHex, concatHex, keccak256, toHex } from 'viem';
 import { closePool, query, withTransaction } from '../src/db.js';
 import { reserveSponsorship, reserveGasBudget } from '../src/paymaster.js';
 import type { Reservation } from '../src/paymaster.js';
@@ -26,6 +27,39 @@ function request(id: number, sender = '0x100000000000000000000000000000000000000
 }
 const denied = (error: unknown) => error instanceof AppError && error.code === 'PAYMASTER_QUOTA_EXCEEDED';
 async function clean() { await query('delete from paymaster_sponsorships where chain_id = $1', [chainId]); }
+
+test('#89 sponsorship uses the request chain budget and shares the 97 gas cap with self-funded operations', async () => {
+  const r = request(890001, bytesToHex(randomBytes(20)));
+  r.hash = keccak256(concatHex([r.hash, r.op.sender]));
+  r.config.chainId = 97;
+  r.gasLimit = 10_000_000n;
+  r.callGas = r.gasLimit - r.verificationGas - r.op.preVerificationGas - r.config.verificationGasLimit - r.config.postOpGasLimit;
+  r.op.accountGasLimits = concatHex([toHex(r.verificationGas, { size: 16 }), toHex(r.callGas, { size: 16 })]);
+  r.maxFee = 1_000_000_000n;
+  r.op.gasFees = concatHex([toHex(r.maxFee, { size: 16 }), toHex(r.maxFee, { size: 16 })]);
+  r.maxCostWei = r.gasLimit * r.maxFee;
+  r.budget = { ...r.budget, executionKey: randomUUID(), chainId: 97, gasLimit: r.gasLimit, maxFeePerGas: r.maxFee };
+  try {
+    await reserveSponsorship(r);
+    await reserveGasBudget(r.budget);
+    await reserveSponsorship(r);
+    const saved = await query<{ usd: string; n: string }>('select max(max_cost_usd)::text as usd,count(*)::text as n from gas_budget_reservations where execution_key=$1', [r.budget.executionKey]);
+    assert.deepEqual(saved.rows[0], { usd: '6.00000000', n: '1' });
+    await assert.rejects(reserveGasBudget({ ...r.budget, executionKey: randomUUID(), gasLimit: 1n }),
+      (error: unknown) => error instanceof AppError && error.code === 'GAS_BUDGET_EXCEEDED');
+    const mainnet: Reservation = { ...r, hash: keccak256(concatHex([r.hash, '0x01'])), config: { ...r.config, chainId: 56 },
+      budget: { ...r.budget, chainId: 56, executionKey: randomUUID() } };
+    await assert.rejects(reserveSponsorship(mainnet), (error: unknown) => error instanceof AppError && error.code === 'GAS_BUDGET_EXCEEDED');
+    assert.equal((await query('select execution_key from gas_budget_reservations where execution_key=$1', [mainnet.budget.executionKey])).rows.length, 0);
+    assert.equal((await query('select user_op_hash from paymaster_sponsorships where user_op_hash=$1', [mainnet.hash])).rows.length, 0);
+    const other = bytesToHex(randomBytes(20));
+    const blocked: Reservation = { ...r, hash: keccak256(concatHex([r.hash, other])), op: { ...r.op, sender: other },
+      config: { ...r.config, siteDailyGas: 0n }, budget: { ...r.budget, account: other, executionKey: randomUUID() } };
+    await assert.rejects(reserveSponsorship(blocked), denied);
+    assert.equal((await query('select execution_key from gas_budget_reservations where execution_key=$1', [blocked.budget.executionKey])).rows.length, 0);
+    assert.equal((await query('select user_op_hash from paymaster_sponsorships where user_op_hash=$1', [blocked.hash])).rows.length, 0);
+  } finally { await query('delete from paymaster_sponsorships where user_op_hash=$1', [r.hash]); }
+});
 
 test('#75 exit still sponsors when every ordinary account quota is zero', async () => {
   const r = request(750001);

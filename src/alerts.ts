@@ -1,3 +1,4 @@
+import { createPublicClient, http } from 'viem';
 import type { Address, Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import type { PriceSourceObservation } from './chain.js';
@@ -67,17 +68,28 @@ export async function detectRelayerLowGas(args: RelayerGasChecks = {}): Promise<
 }> {
   const env = args.env ?? process.env;
   const rawKey = env.OPERATOR_PRIVATE_KEY?.trim();
-  if (!rawKey) return { complete: false, finding: null };
+  const publicAddress = env.OPERATOR_ADDRESS?.trim();
+  if (!rawKey && !publicAddress) return { complete: false, finding: null };
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const minimum = loadRelayerGasConfig(env).minRelayerGasWei;
-    const key = rawKey.startsWith('0x') ? rawKey : '0x' + rawKey;
-    if (!/^0x[0-9a-fA-F]{64}$/.test(key)) throw new Error('invalid signing configuration');
-    const address = privateKeyToAccount(key as Hex).address;
+    if (publicAddress && (!/^0x[0-9a-fA-F]{40}$/.test(publicAddress) || /^0x0{40}$/i.test(publicAddress))) throw new Error('invalid operator address');
+    const key = rawKey ? (rawKey.startsWith('0x') ? rawKey : '0x' + rawKey) : undefined;
+    if (key && !/^0x[0-9a-fA-F]{64}$/.test(key)) throw new Error('invalid signing configuration');
+    const signer = key ? privateKeyToAccount(key as Hex).address : undefined;
+    if (signer && publicAddress && signer.toLowerCase() !== publicAddress.toLowerCase()) throw new Error('operator address mismatch');
+    const address = (publicAddress ?? signer) as Address;
     const timeoutMs = args.timeoutMs ?? 10_000;
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new Error('invalid balance timeout');
     const balance = await Promise.race([
-      (args.readNativeBalance ?? getAccountGasBalance)(address),
+      (args.readNativeBalance ?? (async (address: Address) => {
+        const url = env.RPC_URL?.trim();
+        if (!url) throw new Error('missing RPC');
+        const client = createPublicClient({ transport: http(url, { timeout: timeoutMs, retryCount: 0 }) });
+        const expectedChain = Number(env.CHAIN_ID ?? DEFAULT_CHAIN_ID);
+        if (!Number.isSafeInteger(expectedChain) || expectedChain < 1 || await client.getChainId() !== expectedChain) throw new Error('RPC chain mismatch');
+        return client.getBalance({ address });
+      }))(address),
       new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('balance timeout')), timeoutMs); }),
     ]);
     if (typeof balance !== 'bigint' || balance < 0n) throw new Error('invalid balance');

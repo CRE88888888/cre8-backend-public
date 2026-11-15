@@ -153,7 +153,6 @@ export function createKeeperChain(rpcUrl: string, account: Account, manifest: Ma
           await client.readContract({ address: source, abi: KEEPER_ABI, functionName: 'maxAge' }) !== market.maxFeedAge) throw new Error('feed configuration mismatch');
       }
     }
-    if (!await client.readContract({ address: manifest.usdt, abi: KEEPER_ABI, functionName: 'isMinter', args: [account.address] })) throw new Error('numeraire minter mismatch');
     for (const feed of [manifest.cashFeed, ...manifest.markets.flatMap((m) => m.feed ? [m.feed] : [])]) {
       if (!same(await client.readContract({ address: feed, abi: KEEPER_ABI, functionName: 'keeper' }), account.address) ||
         await client.readContract({ address: feed, abi: KEEPER_ABI, functionName: 'decimals' }) !== 8) throw new Error('feed keeper mismatch');
@@ -190,7 +189,11 @@ export function createKeeperChain(rpcUrl: string, account: Account, manifest: Ma
       return result;
     },
     balance: (token) => client.readContract({ address: token, abi: KEEPER_ABI, functionName: 'balanceOf', args: [account.address] }),
-    mint: (token, amount) => landed(() => wallet.writeContract({ address: token, abi: KEEPER_ABI, functionName: 'mint', args: [account.address, amount] }), 'mint'),
+    async mint(token, amount) {
+      await head();
+      if (same(token, manifest.usdt)) throw new Error('USDT inventory must be prefunded');
+      await landed(() => wallet.writeContract({ address: token, abi: KEEPER_ABI, functionName: 'mint', args: [account.address, amount] }), 'mint');
+    },
     push: (feed, answer) => landed(() => wallet.writeContract({ address: feed, abi: KEEPER_ABI, functionName: 'push', args: [answer] }), 'feed'),
     async swap(observation, targetE18, budgetUsdtE18) {
       const market = observation.market;

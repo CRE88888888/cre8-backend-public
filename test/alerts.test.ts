@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
+import { createServer } from 'node:http';
 import { closePool, query as dbQuery, withTransaction } from '../src/db.js';
 import {
   DEFAULT_ALERT_THRESHOLDS,
@@ -1446,6 +1447,47 @@ test('#52 an unrelated unknown asset cannot hide three verified failures or eras
 const RELAYER_TEST_KEY = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
 const RELAYER_TEST_ADDRESS = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266';
 const RELAYER_TEST_ENV = { OPERATOR_PRIVATE_KEY: RELAYER_TEST_KEY, MIN_RELAYER_GAS_WEI: '100' };
+
+test('#97 relayer monitor reads a public operator address without a signing key', async () => {
+  for (const balance of [0n, 99n, 100n, 101n]) {
+    let reads = 0;
+    const result = await detectRelayerLowGas({ env: { OPERATOR_ADDRESS: RELAYER_TEST_ADDRESS, MIN_RELAYER_GAS_WEI: '100' },
+      readNativeBalance: async address => { reads++; assert.equal(address.toLowerCase(), RELAYER_TEST_ADDRESS.toLowerCase()); return balance; } });
+    assert.equal(reads, 1);
+    assert.equal(result.complete, true);
+    assert.equal(result.finding !== null, balance < 100n);
+  }
+  for (const fail of ['invalid', 'rpc', 'timeout']) await assert.rejects(detectRelayerLowGas({
+    env: { OPERATOR_ADDRESS: fail === 'invalid' ? 'SECRET' : RELAYER_TEST_ADDRESS }, timeoutMs: 5,
+    readNativeBalance: async () => { if (fail === 'timeout') return new Promise<never>(() => {}); throw new Error('SECRET'); },
+  }), (e: unknown) => e instanceof Error && !e.message.includes('SECRET'));
+});
+
+test('#97 production relayer balance reader uses only readonly RPC and checks the chain', async () => {
+  let mode = 'ok';
+  let balances = 0;
+  const server = createServer(async (req, res) => {
+    let raw = ''; for await (const chunk of req) raw += String(chunk);
+    const body: unknown = JSON.parse(raw);
+    assert.ok(body && typeof body === 'object');
+    const method: unknown = Reflect.get(body, 'method');
+    assert.ok(method === 'eth_chainId' || method === 'eth_getBalance');
+    if (method === 'eth_getBalance') balances++;
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ jsonrpc: '2.0', id: Reflect.get(body, 'id'), result: method === 'eth_chainId' ? (mode === 'wrong-chain' ? '0x61' : '0x38') : '0x0' }));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  const env = { CHAIN_ID: '56', RPC_URL: `http://127.0.0.1:${address.port}`, OPERATOR_ADDRESS: RELAYER_TEST_ADDRESS };
+  try {
+    const low = await detectRelayerLowGas({ env });
+    assert.equal(low.finding?.kind, 'gas_low'); assert.equal(balances, 1);
+    mode = 'wrong-chain';
+    await assert.rejects(detectRelayerLowGas({ env }), /本輪保留/);
+    assert.equal(balances, 1);
+    await assert.rejects(detectRelayerLowGas({ env: { ...env, ...RELAYER_TEST_ENV, OPERATOR_ADDRESS: '0x1000000000000000000000000000000000000001' } }), /本輪保留/);
+  } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+});
 
 test('#59 relayer gas: 0, below, equal, above, zero threshold, missing config and invalid balances', async () => {
   for (const balance of [0n, 99n, 100n, 101n]) {

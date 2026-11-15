@@ -27,7 +27,7 @@ function harness(extra: WelcomeDeps = {}) {
   const service = createWelcomeService({ config: c, find: async () => null,
     lock: async (_chain, run) => run(() => {}), reserve: async () => { events.push('reserve-commit'); return { grant, created: true }; },
     settle: async (_grant, state) => { events.push(state); },
-    prepare: async () => { events.push('prepare'); return { hash: OTHER_HASH, broadcast: async () => { events.push('send'); sends++; }, wait: async () => {} }; }, ...extra });
+    prepare: async () => { events.push('prepare'); return { hash: OTHER_HASH, raw: '0x01', broadcast: async () => { events.push('send'); sends++; }, wait: async () => {} }; }, ...extra });
   return { service, events, sends: () => sends };
 }
 
@@ -78,7 +78,7 @@ test('#91 pre-broadcast RPC failure or timeout fails the lifetime record; late p
     const h = harness({ prepare: async () => {
       if (!timeout) throw new Error('SECRET_RPC');
       await new Promise(resolve => setTimeout(resolve, 40));
-      return { hash: OTHER_HASH, broadcast: async () => { throw new Error('must never send'); }, wait: async () => {} };
+      return { hash: OTHER_HASH, raw: '0x01', broadcast: async () => { throw new Error('must never send'); }, wait: async () => {} };
     } });
     await assert.rejects(h.service.issue(grant), denied('WELCOME_PREPARE_UNAVAILABLE'));
     await new Promise(resolve => setTimeout(resolve, 45));
@@ -88,7 +88,7 @@ test('#91 pre-broadcast RPC failure or timeout fails the lifetime record; late p
 
 test('#91 ambiguous broadcast/receipt error and timeout retain hash as unknown', async () => {
   for (const stage of ['broadcast-error', 'broadcast-timeout', 'receipt-error', 'receipt-timeout']) {
-    const h = harness({ prepare: async () => ({ hash: OTHER_HASH,
+    const h = harness({ prepare: async () => ({ hash: OTHER_HASH, raw: '0x01',
       broadcast: async () => { if (stage === 'broadcast-error') throw new Error('SECRET'); if (stage === 'broadcast-timeout') await new Promise(() => {}); },
       wait: async () => { if (stage === 'receipt-error') throw new Error('SECRET'); if (stage === 'receipt-timeout') await new Promise(() => {}); } }) });
     const result = await h.service.issue(grant);

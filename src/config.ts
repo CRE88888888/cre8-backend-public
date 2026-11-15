@@ -529,8 +529,8 @@ export function loadFaucetConfig(env: NodeJS.ProcessEnv = process.env): FaucetCo
   if (parseInteger(env, 'CHAIN_ID', DEFAULT_CHAIN_ID, { min: 1 }) !== 97) return null;
   const amountWei = parseBigInt(env, 'FAUCET_USDT_AMOUNT_WEI', 1_000n * 10n ** 18n);
   const siteDailyWei = parseBigInt(env, 'FAUCET_USDT_SITE_DAILY_WEI', 1_000_000n * 10n ** 18n);
-  if (amountWei > 10_000n * 10n ** 18n || siteDailyWei >= 1n << 256n) {
-    throw new ConfigurationError('FAUCET_USDT_AMOUNT_WEI exceeds the 10,000 USDT contract cap or FAUCET_USDT_SITE_DAILY_WEI exceeds uint256');
+  if (amountWei > 1_000n * 10n ** 18n || siteDailyWei >= 1n << 256n) {
+    throw new ConfigurationError('FAUCET_USDT_AMOUNT_WEI exceeds the 1,000 USDT contract cap or FAUCET_USDT_SITE_DAILY_WEI exceeds uint256');
   }
   return { chainId: 97, amountWei, siteDailyWei, timeoutMs: 5_000 };
 }

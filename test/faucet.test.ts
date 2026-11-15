@@ -1,7 +1,8 @@
 import type { Address, Hex, TransactionReceipt } from 'viem';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createFaucetService } from '../src/faucet.js';
+import { createFaucetService, readFaucetSettlementState } from '../src/faucet.js';
+import { strategyRpc, TEST_ACCOUNT, TEST_AMOUNT, OTHER_HASH } from './fixtures/strategy-rpc.js';
 import type { FaucetClaim, FaucetDeps, PreparedClaim } from '../src/faucet.js';
 import { loadFaucetConfig } from '../src/config.js';
 import { AppError, UnauthorizedError } from '../src/errors.js';
@@ -18,12 +19,26 @@ assert.ok(config);
 const c = config;
 const denied = (code: string) => (error: unknown) => error instanceof AppError && error.code === code;
 
+test('#97 first-broadcast faucet settlement requires canonical identity too; RPC failure/reorg never refunds', async () => {
+  const { TESTNET_97 } = await import('../src/testnet-profile.js');
+  for (const mode of ['success','reverted','reorg','missing','rpc','logs']) {
+    const f = strategyRpc({ assets: [] }, OTHER_HASH, new Date('2026-11-15T00:00:00Z'));
+    if (mode === 'reverted' || mode === 'reorg') f.state.success = false;
+    if (mode === 'reorg') f.state.blockHash = `0x${'00'.repeat(32)}`;
+    if (mode === 'missing') f.state.missingReceipt = true;
+    if (mode === 'rpc') f.state.fail = 'eth_getBlockByNumber';
+    if (mode === 'logs') f.state.duplicateLog = true;
+    assert.equal(await readFaucetSettlementState(f.client, { account: TEST_ACCOUNT, amountWei: TEST_AMOUNT }, OTHER_HASH, TESTNET_97.roles.operator),
+      mode === 'success' ? 'confirmed' : mode === 'reverted' ? 'failed' : 'unknown');
+  }
+});
+
 function harness(extra: FaucetDeps = {}) {
   const events: string[] = [];
   let sends = 0;
   const claim: FaucetClaim = { id: '69', chainId: 97, day: '2026-11-14', owner, account, amountWei: c.amountWei };
-  const prepared: PreparedClaim = { hash, broadcast: async () => { sends++; events.push('broadcast'); }, receipt: async () => 'confirmed' };
-  const deps: FaucetDeps = { lock: async (_chainId, action) => action(() => {}), config: c, query: async () => ({ rows: [{ owner, user_id: owner }] }),
+  const prepared: PreparedClaim = { hash, raw: '0x01', broadcast: async () => { sends++; events.push('broadcast'); }, receipt: async () => 'confirmed' };
+  const deps: FaucetDeps = { find: async () => null, lock: async (_chainId, action) => action(() => {}), config: c, query: async () => ({ rows: [{ owner, user_id: owner }] }),
     reserve: async () => { events.push('committed'); return claim; },
     settle: async (_claim, from, to) => { events.push(from + '->' + to); },
     prepare: async () => prepared, ...extra };
@@ -34,8 +49,8 @@ test('#69 faucet config defaults, exact contract cap, zero pause, uint256 and ma
   assert.equal(c.amountWei, 1_000n * 10n ** 18n);
   assert.equal(c.siteDailyWei, 1_000_000n * 10n ** 18n);
   assert.equal(loadFaucetConfig({ CHAIN_ID: '56' }), null);
-  for (const amount of ['0', String(10_000n * 10n ** 18n)]) assert.equal(loadFaucetConfig({ CHAIN_ID: '97', FAUCET_USDT_AMOUNT_WEI: amount })?.amountWei, BigInt(amount));
-  for (const amount of ['-1', '0.1', 'NaN', String(10_000n * 10n ** 18n + 1n)]) {
+  for (const amount of ['0', String(1_000n * 10n ** 18n)]) assert.equal(loadFaucetConfig({ CHAIN_ID: '97', FAUCET_USDT_AMOUNT_WEI: amount })?.amountWei, BigInt(amount));
+  for (const amount of ['-1', '0.1', 'NaN', String(1_000n * 10n ** 18n + 1n)]) {
     assert.throws(() => loadFaucetConfig({ CHAIN_ID: '97', FAUCET_USDT_AMOUNT_WEI: amount }));
   }
   assert.throws(() => loadFaucetConfig({ CHAIN_ID: '97', FAUCET_USDT_SITE_DAILY_WEI: String(1n << 256n) }));
@@ -93,7 +108,7 @@ test('#69 pre-broadcast failure or timeout releases quota; late preparation neve
 
 test('#69 broadcast ambiguity, receipt failure/timeout/missing event preserve quota; only reverted receipt refunds', async () => {
   for (const stage of ['broadcast', 'receipt', 'receipt-timeout', 'unknown', 'failed']) {
-    const h = harness({ config: { ...c, timeoutMs: 10 }, prepare: async () => ({ hash,
+    const h = harness({ config: { ...c, timeoutMs: 10 }, prepare: async () => ({ hash, raw: '0x01',
       broadcast: async () => { if (stage === 'broadcast') throw new Error('SECRET_RPC_URL'); },
       receipt: async () => {
         if (stage === 'receipt') throw new Error('SECRET_RPC_URL');
@@ -158,7 +173,7 @@ test('#69 real RPC decoder: chain/minter/recipient limit at 0, cap-1 and exact c
       assert.ok(Array.isArray(payload));
       const call: unknown = payload[0]; assert.ok(typeof call === 'object' && call !== null);
       if (mode === 'missing') return '0x';
-      return Reflect.get(call, 'data').startsWith(toFunctionSelector('isMinter(address)'))
+      return Reflect.get(call, 'data').startsWith(toFunctionSelector('isFaucet(address)'))
         ? encodeAbiParameters([{ type: 'bool' }], [mode !== 'minter'])
         : encodeAbiParameters([{ type: 'uint256' }, { type: 'uint256' }], [mode === 'zero' ? 0n : mode === 'below' ? c.amountWei - 1n : c.amountWei, 0n]);
     } }, { retryCount: 0 }) });
@@ -186,4 +201,54 @@ test('#69 receipt needs the exact token, recipient, amount and operator; revert 
   for (const changed of changedLogs) {
     assert.equal(faucetReceiptState({ status: 'success', logs: [changed] }, claim, TESTNET_97.roles.operator), 'unknown');
   }
+});
+
+test('#97 same owner/account/day faucet replay returns every original state without lock, preparation or new quota', async () => {
+  for (const state of ['reserved', 'submitted', 'unknown', 'confirmed', 'failed'] as const) {
+    const original = { claimId: '69', state, amountWei: c.amountWei.toString(), txHash: state === 'reserved' ? null : hash, replayed: true as const };
+    const h = harness({ find: async () => original,
+      lock: async () => { throw new Error('replay must not need relayer availability'); } });
+    assert.deepEqual(await h.service.claim({ account }, owner), original);
+    assert.equal(h.sends(), 0); assert.deepEqual(h.events, []);
+  }
+  for (const timeout of [false, true]) {
+    const h = harness({ config: { ...c, timeoutMs: 5 }, find: async () => { if (timeout) return new Promise<never>(() => {}); throw new Error('SECRET'); } });
+    await assert.rejects(h.service.claim({ account }, owner), denied('FAUCET_STORAGE_UNAVAILABLE'));
+    assert.equal(h.sends(), 0);
+  }
+});
+
+test('#97 replayed faucet responses are HTTP 200, including pending and failed original claims', async () => {
+  let state: 'unknown' | 'failed' = 'unknown';
+  const server = createServer({ auth: { authenticate: async () => owner, issueNonce: () => { throw new Error('unexpected'); },
+    login: async () => { throw new Error('unexpected'); }, logout: async () => {} },
+    claimFaucetUsdt: async () => ({ claimId: '69', state, amountWei: c.amountWei.toString(), txHash: hash, replayed: true }),
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  try {
+    for (const next of ['unknown', 'failed'] as const) {
+      state = next;
+      const response = await fetch(`http://127.0.0.1:${address.port}/faucet/usdt`, { method: 'POST', body: JSON.stringify({ account }) });
+      assert.equal(response.status, 200);
+      assert.deepEqual(await response.json(), { claimId: '69', state, amountWei: c.amountWei.toString(), txHash: hash, replayed: true });
+    }
+  } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+});
+
+test('#97 faucet rechecks persisted replay after lock and quota races without preparing twice', async () => {
+  const original = { claimId: '69', state: 'unknown' as const, amountWei: c.amountWei.toString(), txHash: hash, replayed: true as const };
+  for (const stage of ['lock', 'busy', 'quota']) {
+    let reads = 0;
+    const h = harness({ find: async () => ++reads < (stage === 'quota' ? 3 : 2) ? null : original,
+      ...(stage === 'busy' ? { lock: async () => { throw new AppError(503, 'RELAYER_BUSY', 'busy'); } } : {}),
+      reserve: async () => { throw new AppError(429, 'FAUCET_QUOTA_EXCEEDED', 'quota'); },
+    });
+    assert.deepEqual(await h.service.claim({ account }, owner), original);
+    assert.equal(h.sends(), 0);
+    assert.deepEqual(h.events, []);
+  }
+  const foreign = harness({ find: async () => { throw new AppError(429, 'FAUCET_QUOTA_EXCEEDED', 'another recipient'); } });
+  await assert.rejects(foreign.service.claim({ account }, owner), denied('FAUCET_QUOTA_EXCEEDED'));
+  assert.equal(foreign.sends(), 0);
 });

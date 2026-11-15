@@ -464,7 +464,7 @@ async function route(
     const wallet = await deps.auth.authenticate(req.headers.authorization);
     await deps.rateLimiter.wallet('plan', wallet);
     const result = await deps.claimFaucetUsdt(await readJsonBody(req), wallet);
-    sendJson(res, result.state === 'unknown' ? 202 : result.state === 'failed' ? 502 : 200, result);
+    sendJson(res, result.replayed ? 200 : result.state === 'unknown' ? 202 : result.state === 'failed' ? 502 : 200, result);
     return;
   }
 
@@ -1000,15 +1000,8 @@ async function bundlerRelayRoute(
       body: raw,
       signal: AbortSignal.timeout(BUNDLER_TIMEOUT_MS),
     });
-  } catch (err) {
-    throw new AppError(
-      502,
-      'BUNDLER_UNAVAILABLE',
-      `bundler ${redactUrl(upstream)} 無法連上（${method}，timeout ${BUNDLER_TIMEOUT_MS}ms）：${
-        err instanceof Error ? err.message : String(err)
-      }`,
-      { cause: err },
-    );
+  } catch {
+    throw new AppError(502, 'BUNDLER_UNAVAILABLE', 'bundler unavailable; retry later');
   }
 
   const payload = await upstreamRes.text();
@@ -1025,21 +1018,6 @@ function jsonRpcMethod(request: unknown): string {
   if (typeof request !== 'object' || request === null) return '';
   const method = (request as { method?: unknown }).method;
   return typeof method === 'string' ? method : '';
-}
-
-/**
- * 錯誤訊息要帶上游位址（不然一個「502」等於什麼都沒說），但 URL 的 userinfo 可能就是 bundler 的
- * API key：印出去就等於把它寫進 log 與瀏覽器畫面。只保留 scheme://host:port/path。
- */
-function redactUrl(raw: string): string {
-  try {
-    const url = new URL(raw);
-    url.username = '';
-    url.password = '';
-    return url.toString();
-  } catch {
-    return raw;
-  }
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
@@ -1148,7 +1126,7 @@ function sendError(res: ServerResponse, err: unknown): void {
     JSON.stringify({
       level: 'error',
       msg: 'unhandled request error',
-      error: err instanceof Error ? (err.stack ?? err.message) : String(err),
+      error: 'unexpected dependency or application failure',
     }),
   );
   sendJson(res, 500, { error: { code: 'INTERNAL', message: 'internal server error' } });

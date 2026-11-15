@@ -35,24 +35,87 @@ API 的 Railway pre-deploy command 另行執行 `bun src/migrate.ts`，只更新
 
 每個服務單一副本。先壓低 CPU／記憶體上限，不設定自動擴容或付費外掛；正式啟用 alto／keeper 後需觀察資源與錯誤率，再由 C3 決定調整。Telegram 保持停用。
 
-## 變數清單（只列名稱）
+## 變數清單（只列名稱與非秘密值）
 
 | 服務 | 名稱 |
 | --- | --- |
 | 共通應用 | `CHAIN_ID`、`PORT`、`SERVICE_ROLE`、`SERVICE_ENABLED`、`NODE_ENV` |
 | Postgres | `POSTGRES_USER`、`POSTGRES_PASSWORD`、`POSTGRES_DB`、`PGDATA`、`DATABASE_URL` |
-| api | `DATABASE_URL`、`MIGRATIONS_DIR`、`RPC_URL`、`REGISTRY_ADDRESS`、`EXECUTOR_ADDRESS`、`OPERATOR_PRIVATE_KEY`、`SESSION_KEY_MASTER_SEED`、`BUNDLER_URL`、`PAYMASTER_ADDRESS`、`PAYMASTER_MOCK_USDT_ADDRESS`、`PAYMASTER_SIGNER_PRIVATE_KEY`、`AUTH_DOMAIN`、`AUTH_URI`、`PRIVY_APP_ID`、`PRIVY_VERIFICATION_KEY`、`CORS_ALLOWED_ORIGINS`、`WEBSITE_PROXY_HOST`、`RATE_LIMIT_TRUSTED_PROXY_IPS`、`ENABLE_OPERATOR_REBALANCE`、`POINTS_ENABLED` |
-| scheduler | `DATABASE_URL`、`MIGRATIONS_DIR`、`RPC_URL`、`REGISTRY_ADDRESS`、`EXECUTOR_ADDRESS`、`SESSION_KEY_MASTER_SEED`、`BUNDLER_URL`、`PAYMASTER_ADDRESS`、`PAYMASTER_MOCK_USDT_ADDRESS`、`PAYMASTER_SIGNER_PRIVATE_KEY`、`SCHEDULER_LIVE`、`SCHEDULER_INTERVAL`、`SCHEDULER_LIMIT`、`SCHEDULER_THRESHOLD_BPS` |
+| api | `DATABASE_URL`、`MIGRATIONS_DIR`、`RPC_URL`、`REGISTRY_ADDRESS`、`EXECUTOR_ADDRESS`、`OPERATOR_PRIVATE_KEY`、`SESSION_KEY_MASTER_SEED`、`BUNDLER_URL`、`PAYMASTER_ADDRESS`、`PAYMASTER_MOCK_USDT_ADDRESS`、`PAYMASTER_SIGNER_PRIVATE_KEY`、`AUTH_DOMAIN`、`AUTH_URI`、`PRIVY_APP_ID`、`PRIVY_VERIFICATION_KEY`、`CORS_ALLOWED_ORIGINS`、`WEBSITE_PROXY_HOST`、`RATE_LIMIT_TRUSTED_PROXY_IPS`、`OPERATOR_WALLETS`、`ENABLE_OPERATOR_REBALANCE`、`POINTS_ENABLED` |
+| scheduler | `DATABASE_URL`、`MIGRATIONS_DIR`、`RPC_URL`、`REGISTRY_ADDRESS`、`EXECUTOR_ADDRESS`、`SESSION_KEY_MASTER_SEED`、`BUNDLER_URL`、`PAYMASTER_ADDRESS`、`PAYMASTER_MOCK_USDT_ADDRESS`、`PAYMASTER_SIGNER_PRIVATE_KEY`、`SCHEDULER_LIVE`、`SCHEDULER_INTERVAL`、`SCHEDULER_LIMIT`、`SCHEDULER_THRESHOLD_BPS`、`OPERATOR_ADDRESS`、`MIN_RELAYER_GAS_WEI` |
 | alto | `SERVICE_ENABLED`、`CHAIN_ID`、`PORT`、`RPC_URL`、`EXECUTOR_PRIVATE_KEY`、`UTILITY_PRIVATE_KEY`、`ENTRYPOINTS`、`SAFE_MODE`、`MIN_EXECUTOR_BALANCE`、`MAX_BLOCK_RANGE` |
 | price-keeper | `PRICE_KEEPER_ENABLED`、`PRICE_KEEPER_RPC_URL`、`PRICE_KEEPER_PRIVATE_KEY`、`PRICE_KEEPER_MANIFEST`、`PRICE_KEEPER_SCENARIO`、`PRICE_KEEPER_START_TIMESTAMP`、`PRICE_KEEPER_MIN_INVENTORY_E18`、`PRICE_KEEPER_INVENTORY_E18`、`PRICE_KEEPER_SWAP_BUDGET_E18` |
 | points-sync | `DATABASE_URL`、`MIGRATIONS_DIR`、`RPC_URL`、`REGISTRY_ADDRESS`、`EXECUTOR_ADDRESS`、`PAYMASTER_ADDRESS`、`PAYMASTER_MOCK_USDT_ADDRESS`、`POINTS_ENABLED`、`POINTS_FROM_BLOCK`、`POINTS_CONFIRMATIONS`、`POINTS_DELAY_SECONDS`、`POINTS_SYNC_INTERVAL` |
 | website | `API_INTERNAL_URL`、`WEBSITE_DIST` |
 | app 建置 | `VITE_CHAIN_ID`、`VITE_RPC_URL`、`VITE_API_BASE`、`VITE_PRIVY_APP_ID`、`VITE_WALLETCONNECT_PROJECT_ID`、`VITE_LIVE_FUNDS` |
-| 唯讀 preflight | `DEPLOYER_ADDRESS`、`BUNDLER_EXECUTOR_ADDRESS`、`ATP_SAFE`、`EXECUTOR_DEPLOYMENT_BLOCK` |
+| 唯讀 preflight／選配警示 | `DEPLOYER_ADDRESS`、`BUNDLER_EXECUTOR_ADDRESS`、`ATP_SAFE`、`EXECUTOR_DEPLOYMENT_BLOCK`、`TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID` |
 
-RPC 使用公開 BSC testnet HTTP 端點。現有 API 與 keeper 各收單一 URL，故障時停下並明確替換端點；不宣稱有自動多 RPC 備援。所有角色必須使用測試網專用金鑰，不把 deployer／owner key 放進任何服務。scheduler 不需要 operator key，points-sync 與 website 不持有任何簽名金鑰。
+RPC 使用公開 BSC testnet HTTP 端點。現有 API 與 keeper 各收單一 URL，故障時停下並明確替換端點；不宣稱有自動多 RPC 備援。所有角色必須使用測試網專用金鑰，不把 deployer／owner key 放進任何服務。scheduler 不需要 operator key；relayer 監控設定公開 `OPERATOR_ADDRESS`（chain 97 profile 的 operator）及 `RPC_URL`，以唯讀 client 查餘額。points-sync 與 website 不持有任何簽名金鑰。Telegram 兩個變數必須成對設定或全部留空。
 
 `SESSION_KEY_MASTER_SEED` 新建於 `~/.cre8-testnet/session-seed.txt`，權限 600；重部署沿用，不能無意輪替。角色金鑰只從 `~/.cre8-testnet/` 讀入程式記憶體，再經 stdin／GraphQL 變數送進服務設定；禁止貼在 CLI 參數、終端輸出或 PR。Privy 只放 app ID 與 verification public key，App Secret 不進 Railway。不要執行會印出 raw variables 的 CLI 查詢。
+
+## chain 97 額度與安全開關（backend#97）
+
+API 與 scheduler 核對下列相同值；設定只在 C3 授權的部署步驟套用，本次沒有更動 Railway。
+`ACCOUNT_DAILY_GAS_USD_E8`、`PAYMASTER_ACCOUNT_DAILY_WEI` 必須留空；填 `0` 會阻擋正成本普通操作。
+
+```dotenv
+CHAIN_ID=97
+NODE_ENV=production
+MIGRATIONS_DIR=/app/migrations
+ACCOUNT_DAILY_GAS=100000000
+ACCOUNT_DAILY_GAS_USD_E8=
+PAYMASTER_ACCOUNT_DAILY_COUNT=60
+PAYMASTER_ACCOUNT_DAILY_GAS=100000000
+PAYMASTER_ACCOUNT_DAILY_WEI=
+PAYMASTER_SITE_DAILY_GAS=200000000
+PAYMASTER_SITE_DAILY_WEI=100000000000000000
+PAYMASTER_MIN_DEPOSIT_WEI=10000000000000000
+FAUCET_USDT_AMOUNT_WEI=1000000000000000000000
+FAUCET_USDT_SITE_DAILY_WEI=1000000000000000000000000
+WELCOME_USDT_SITE_DAILY_WEI=5000000000000000000000000
+MIN_STEP_USD_E8=100000000
+MIN_BATCH_USD_E8=5000000000
+MIN_DEPOSIT_USD_E8=5000000000
+POINTS_ENABLED=0
+SCHEDULER_LIVE=0
+ENABLE_OPERATOR_REBALANCE=0
+RATE_LIMIT_STRATEGIES_PER_DAY=10
+RATE_LIMIT_VERSIONS_PER_DAY=50
+RATE_LIMIT_PORTFOLIOS_PER_DAY=20
+```
+
+`SERVICE_ROLE`、`PORT` 依服務設定；未完成啟用驗收前 `SERVICE_ENABLED=0`。
+代付 signer 仍由 API／scheduler 的秘密變數提供；不能把 signer 私鑰換成公開地址。
+strict preflight 除 codehash 外還查 signer／EntryPoint、deposit 低水位、operator isFaucet、registry numeraire 與非零額度；缺資料或 RPC 失敗都拒絕通過。
+執行 `bun scripts/preflight.ts --chain 97 --strict` 只查詢、不送交易。
+
+代付授權有效 5 分鐘。同一筆 nonce、initCode、calldata 與 gas／fee 欄位的重試，
+在原有效期內重建原授權並回原 UserOp hash；API 重啟、跨秒或 UTC 日期切換都不新增保留額。
+client 重送的 validUntil 不會延長原授權。到期續簽新增一次 paymaster 帳戶次數／gas／全站保留額，
+原保留額不退款；execution gas budget 仍維持同一筆。低水位警示由 scheduler 既有 gas_low 路徑送出。
+
+本機 opt-in 驗收 `test/welcome-grants.fork.ts`、`test/testnet-97.e2e.ts` 必須明設
+`CHAIN_ID=97`、`RPC_URL`、`PORT`、`DATABASE_URL`、`TEST_DATABASE_NAME`（須與 DB 名稱一致）。
+E2E 另需 `BUNDLER_URL`；三個服務埠必須互異，RPC／bundler／DB 都限 localhost。
+腳本仍驗 `anvil_nodeInfo` 與 RPC chain 97 後才操作；只使用分配給本 worktree 的埠與 DB。
+worktree 的 `MIGRATIONS_DIR` 指向共用 db 的絕對路徑，不修改 db repo。
+
+`POST /faucet/usdt` 先驗登入與帳戶擁有者。同一 owner／同一帳戶／同一 UTC 日重送時，
+回 HTTP 200、`replayed=true` 及原 claimId／txHash／state／amountWei；reserved、submitted、unknown、confirmed、failed 都不另準備交易。
+reserved／unknown 等狀態仍代表未完成，200 只表示成功讀回原紀錄。首次新送單結果 unknown 仍回 202，首次 definitive failed 仍回 502。
+當天有非 failed claim 卻換另一個帳戶時回 429。failed 釋放的額度只允許新的領取語意（另一個帳戶）；同帳戶同日仍回原 failed，不自動再 mint。
+全站 cap／當日一次額度只限制新 reservation；DB 讀取失敗不 fallback 或發新交易。
+
+**0037 部署前置：** 本單需先套用 db#41 的 0037，再啟動新版 writer；舊 writer 的 submitted/hash 更新會被 guard 拒絕。原始已簽交易與 submitted/hash 在同一個短交易內提交，commit 回應遺失時不廣播。outbox 是可廣播授權資料，部署帳號僅授予後端所需 SELECT／INSERT；不得暴露到 HTTP、通用查詢、log 或 DB statement／parameter logging。稽核資料永久保留，不清除或替換原交易。
+
+scheduler 每輪先對帳 chain 97 relayer，不需要 operator key。預設 dry-run 只查原交易的 canonical receipt 並結算已知結果；只有明確 `--live`／`SCHEDULER_LIVE=1` 才重播 DB 保存的同一筆 signed bytes。hash、簽章、chain、nonce、token、recipient、calldata、amount 或 receipt 證據不符時保留未決；RPC／DB 失敗、逾時、舊 hash-only 資料也不解鎖、不退款、不準備替代交易。失敗輪次下輪再試。迎新走 `welcomeFor(account)`，operator 須有 `isFaucet`，無 USDT minter 權限；每日走 `claimFor(account, amount)`，上限 1,000。
+
+每日建基金／發版本／加入基金限額預設 10／50／20（C3 暫定），由 `RATE_LIMIT_STRATEGIES_PER_DAY`、`RATE_LIMIT_VERSIONS_PER_DAY`、`RATE_LIMIT_PORTFOLIOS_PER_DAY` 設定。依登入 owner／action／DB UTC 日原子記錄到 `daily_operation_counts`，重啟與多實例共用；等於上限允許，0 禁止，超過回 429 與 Retry-After。這是 action 前消耗的嘗試額度，body 或 action 失敗也計數；DB 錯誤／逾時／未知 commit 回 503，不自動重試扣額或 fallback。scheduler live 只清除七個完整 UTC 日以前的計數，未啟 live 時舊資料保留，不影響正確性。短窗口的登入／查詢限額仍使用記憶體。
+
+**contracts#48 與地址同步：** ABI／角色已對齊新合約；依 C3 分工，正式地址簿、319 項 codehash 與 DB 資產資料留待生息合約完成後跨 repo 一次同步。本 repo 現有地址簿仍是舊部署，strict selector 檢查會拒絕以舊 bytecode 上線。不得把本單 CI／本機測試視為可公開部署。`test/relayer-recovery.fork.ts` 在 localhost／anvil／chain guard 後只於隔離測試 process 綁定 contracts main manifest，驗原交易重播；不改 production profile 或其他 repo。
+
+keeper 不再查 USDT isMinter，也不 mint USDT；使用合約部署時預撥的 2,000,000 USDT，低於庫存門檻即停止並告警，需由營運補庫存後手動重啟。其他 mock 資產仍檢查 minter 並補庫存。1 小時最低費窗口的預留／釋放不在本單，另單對齊。
 
 ## 私網代理與限流
 
@@ -70,7 +133,7 @@ Railway 的 `X-Forwarded-For` 含額外代理 hop，不能取最右側當使用�
 - [ ] **部署後第 30–60 分鐘啟動價格 keeper**，之後每池每小時至少一筆會動到 tick 的成交；超過 1 小時未成交 oracle 會停報價。secondary 維持 1 小時，AVAX 1 天；USDT feed 同樣必須續推。第一次啟用設定新的劇本起始時間，不能沿用 fork 時間。
 - [ ] 啟用 alto，確認 safe-mode、不同 executor／utility key 與 EntryPoint v0.7；啟用代付前核對額度與餘額。
 - [ ] scheduler 先觀察 dry-run，再由 C3 決定 live；operator rebalance 預設關閉不變。
-- [ ] 設定積分掃描起點為活動真正起點，啟用 points 與 points-sync；不需要給 worker operator bearer 或私鑰。
+- [ ] 維持 `POINTS_ENABLED=0`、points-sync 停用；測試網不做積分、任務與邀請碼。
 - [ ] 驗證 XFF 防偽與多使用者限流，再走真網站登入 → 加入基金 → 領幣 → 自動買入 → 提領。手機與 Privy 真登入不以 SIWE 本機測試替代。
 
 ## 重部署、回滾與停機
@@ -83,7 +146,7 @@ Railway 的 `X-Forwarded-For` 含額外代理 hop，不能取最右側當使用�
 railway up .deploy --path-as-root --no-gitignore --detach --service api --project "$TESTNET_PROJECT_ID"
 ```
 
-其他 backend 角色使用相同產物；alto 的 context 是 `alto/`，不可誤傳到 Postgres。每次部署記錄 backend commit、app commit、manifest commit、migration 版本及 deployment ID。等待 Railway deployment 成功與 `/health` 的內容，不能只看 upload 成功。啟用的 scheduler／keeper／points-sync 沒有 HTTP health endpoint，要移除該服務的 HTTP healthcheck，改看成功輪次、scheduler heartbeat 與故障退出；停用階段則保留 readiness healthcheck。
+其他 backend 角色使用相同產物；alto 的 context 是 `alto/`，不可誤傳到 Postgres。每次部署記錄 backend commit、app commit、manifest commit、migration 版本及 deployment ID。等待 Railway deployment 成功與 `/health` 的內容，不能只看 upload 成功。啟用的 scheduler／keeper 沒有 HTTP health endpoint（points-sync 維持停用），要移除該服務的 HTTP healthcheck，改看成功輪次、scheduler heartbeat 與故障退出；停用階段則保留 readiness healthcheck。
 
 回滾前先停用 scheduler、keeper、alto、points-sync 與 API 的交易能力；保留 DB volume 與 session seed，再回到已記錄的相容 deployment／封裝版本。只把 scheduler 切回 dry-run 不足以停掉其他角色。migration 有 checksum，**不修改已套用 SQL、不刪 DB、不自動降 schema**；舊版不相容時維持停用，由 C3 協調 db lane。不能靠回滾應用撤銷鏈上交易。keep-alive／進程狀態與舊 DNS 必須重驗。
 

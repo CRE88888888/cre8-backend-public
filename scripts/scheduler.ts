@@ -20,6 +20,8 @@ import { closePool, query } from '../src/db.js';
 import { getConfig, getSessionKeyConfig } from '../src/config.js';
 import { DEFAULT_ROUND_LIMIT, runSchedulerOnce } from '../src/scheduler.js';
 import { writeHeartbeat } from '../src/scheduler-status.js';
+import { reconcileRelayerTransactions } from '../src/relayer-reconciliation.js';
+import { pruneDailyOperationCounts } from '../src/ratelimit.js';
 import { DEFAULT_THRESHOLD_BPS } from '../src/snapshot.js';
 import type { PortfolioOutcome, SchedulerRound } from '../src/scheduler.js';
 
@@ -195,12 +197,20 @@ async function main(): Promise<number> {
   describeEnvironment(args);
 
   const startedAt = new Date();
-  const runRound = (): Promise<SchedulerRound> =>
-    runSchedulerOnce({
+  const runRound = async (): Promise<SchedulerRound> => {
+    if (getConfig().chainId === 97) {
+      try {
+        const result = await reconcileRelayerTransactions({ replay: args.live });
+        console.log(`[scheduler] relayer 對帳 confirmed=${result.confirmed} failed=${result.failed} replayed=${result.replayed} unresolved=${result.unresolved}`);
+      } catch { console.error('[scheduler] relayer 對帳暫時不可用，保留原交易與額度；下輪重試'); }
+    }
+    if (args.live) await pruneDailyOperationCounts().catch(() => console.error('[scheduler] 每日限額舊資料清理失敗；本日額度保留'));
+    return runSchedulerOnce({
       dryRun: !args.live,
       limit: args.limit,
       thresholdBps: args.thresholdBps,
     });
+  };
 
   /**
    * 跑一輪並寫心跳。

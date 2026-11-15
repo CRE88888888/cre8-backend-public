@@ -306,7 +306,7 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
         }
         const cash = await deps.cash(p.chainId, p.accountAddress as Address);
         if (!/^\d+$/.test(cash.amountRaw)) throw storageUnavailable();
-        if (BigInt(cash.amountRaw) > 0n) return { state: 'ready' as const, lot: null, funding: 'existing_cash' as const };
+        if (grant && BigInt(cash.amountRaw) > 0n) return { state: 'ready' as const, lot: null, funding: 'existing_cash' as const };
         if (!grant) grant = await deps.welcome.issue({ chainId: 97, owner: p.ownerAddress as Address, portfolioId: id, account: p.accountAddress as Address });
         if (grant.portfolioId !== id || grant.state === 'failed') {
           throw new AppError(409, 'DAILY_FAUCET_REQUIRED', 'welcome already assigned; claim daily 1000 test USDT via POST /faucet/usdt for this account');

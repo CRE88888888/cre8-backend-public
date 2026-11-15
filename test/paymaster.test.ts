@@ -51,7 +51,8 @@ test('#66 config disabled without signer; decimal quotas, zero and malformed con
 test('#66 whitelist decodes every Kernel batch item, rejects value, delegatecall, mode extensions, unknown/truncated/trailing calls', () => {
   const c = config();
   validateSponsoredCalls(operation(), c);
-  const tuple: { target: Hex; value: bigint; callData: Hex }[] = [{ target: USDT, value: 0n, callData: claim }, { target: USDT, value: 0n, callData: claim }];
+  const enroll = encodeFunctionData({ abi: parseAbi(['function enroll(address,uint256)']), functionName: 'enroll', args: [SENDER, 1n] });
+  const tuple: { target: Hex; value: bigint; callData: Hex }[] = [{ target: REGISTRY, value: 0n, callData: enroll }, { target: REGISTRY, value: 0n, callData: enroll }];
   const batchAbi = [{ type: 'tuple[]', components: [{ type: 'address', name: 'target' }, { type: 'uint256', name: 'value' }, { type: 'bytes', name: 'callData' }] }] as const;
   const batch = (items: typeof tuple) => encodeFunctionData({ abi: KERNEL_EXECUTE_ABI, functionName: 'execute', args: [toHex(1n << 248n, { size: 32 }), encodeAbiParameters(batchAbi, [items])] });
   validateSponsoredCalls(operation({ callData: batch(tuple) }), c);
@@ -62,7 +63,7 @@ test('#66 whitelist decodes every Kernel batch item, rejects value, delegatecall
   }
 });
 
-test('#66 executor account and registry enrollment account must equal sender; faucet only claim, not mint/claimFor', () => {
+test('#66 executor account and registry enrollment account must equal sender; direct faucet calls forbidden', () => {
   const rebalance = (account: Hex) => encodeFunctionData({ abi: EXECUTOR_ABI, functionName: 'executeRebalance', args: [account, [{ tokenIn: USDT, tokenOut: REGISTRY, amountIn: 1n, amountOutMin: 1n, venue: REGISTRY, data: '0x' }], 2_000_000_000n] });
   validateSponsoredCalls(operation({ callData: kernelCall(rebalance(SENDER), EXECUTOR) }), config());
   const enrollAbi = parseAbi(['function enroll(address account,uint256 id)']);
@@ -116,7 +117,7 @@ test('#66 disabled, unknown sender, DB/RPC failures and RPC timeout never reserv
 test('#66 all signed request fields affect hash, signature itself does not; official v0.7 preimage layout', () => {
   const c = config();
   const header = concatHex([PM, toHex(c.verificationGasLimit, { size: 16 }), toHex(c.postOpGasLimit, { size: 16 })]);
-  const op = operation({ paymasterAndData: header });
+  const op = operation({ paymasterAndData: header, callData: kernelCall() });
   const hash = verifyingPaymasterHash(op, c, NOW + 300, 0);
   const independent = keccak256(encodeAbiParameters(
     [{ type: 'address' }, { type: 'uint256' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'bytes32' }, { type: 'uint256' }, { type: 'address' }, { type: 'uint48' }, { type: 'uint48' }],

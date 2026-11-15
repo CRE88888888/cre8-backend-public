@@ -36,6 +36,7 @@ import { AppError } from './errors.js';
 /** Minimal AtpRegistry ABI: the three write paths this slice drives, plus the events used to read
  *  return values (registerStrategy → id, publishVersion → version) from the receipt. */
 export const REGISTRY_ABI = [
+  { type: 'function', name: 'numeraire', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] },
   {
     type: 'function',
     name: 'registerStrategy',

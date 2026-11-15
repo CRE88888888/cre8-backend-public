@@ -8,6 +8,7 @@ import { createPortfolioStrategyService } from '../src/portfolio-strategies.js';
 import { createWelcomeService, findWelcomeGrant, reserveWelcomeGrant, settleWelcomeGrant } from '../src/welcome-grants.js';
 import { withRelayerLock } from '../src/relayer-lock.js';
 import { reserveFaucetClaim, settleFaucetClaim } from '../src/faucet.js';
+import { signedFundingTx } from './fixtures/relayer.js';
 import { address, hash, welcomeConfig, welcomeFixture } from './fixtures/welcome.js';
 
 const denied = (code: string) => (e: unknown) => e instanceof AppError && e.code === code && !e.message.includes('SECRET');
@@ -30,6 +31,44 @@ afterEach(async () => {
   }
 });
 after(closePool);
+
+test('#97 a newly submitted welcome atomically retains its original raw transaction outside the public grant', async () => {
+  const f = await fixture();
+  const g = await f.deps.welcome?.issue(f.recipient); assert.ok(g?.txHash);
+  const outbox = (await query<{ tx_hash: string; signed_raw_tx: string }>('select tx_hash,signed_raw_tx from relayer_transaction_outbox where welcome_grant_id=$1', [g.id])).rows;
+  assert.equal(outbox.length, 1); assert.equal(outbox[0]?.tx_hash, g.txHash);
+  assert.equal(typeof outbox[0]?.signed_raw_tx, 'string');
+  assert.ok(!Object.keys(g).some(k => k.includes('raw')));
+});
+
+test('#97 outbox insertion rolls back with the source; missing/invalid original bytes cannot authorize broadcast', async () => {
+  const f = await fixture();
+  const { grant } = await reserveWelcomeGrant(f.recipient, welcomeConfig);
+  const rollback: typeof withTransaction = fn => withTransaction(async client => { await fn(client); throw new Error('SECRET rollback'); });
+  await assert.rejects(f.settle(grant, 'submitted', f.signed.hash, undefined, rollback, f.signed), denied('WELCOME_STORAGE_UNAVAILABLE'));
+  assert.equal((await query('select tx_hash from relayer_transaction_outbox where welcome_grant_id=$1', [grant.id])).rows.length, 0);
+  assert.equal((await findWelcomeGrant(97, f.owner))?.state, 'reserved');
+  for (const submission of [undefined, { ...f.signed, raw: '0x01' as const }, { ...f.signed, operator: f.owner }]) {
+    await assert.rejects(settleWelcomeGrant(grant, 'submitted', f.signed.hash, undefined, withTransaction, submission), denied('WELCOME_STORAGE_UNAVAILABLE'));
+  }
+  assert.equal((await query('select tx_hash from relayer_transaction_outbox where welcome_grant_id=$1', [grant.id])).rows.length, 0);
+});
+
+test('#97 first purchase grants welcome despite dust or an earlier daily claim; existing owners never mint twice', async () => {
+  for (const balance of [1n, 1000n * 10n ** 18n, WELCOME_AMOUNT_WEI]) {
+    const f = await fixture();
+    f.rpc.state.cashRaw = balance;
+    const result = await f.service.buyFunding(f.id, f.owner, {});
+    assert.equal(f.sends(), 1);
+    assert.equal(result.funding, 'welcome_grant');
+    assert.equal(result.lot?.amountRaw, WELCOME_AMOUNT_WEI.toString());
+    assert.equal(f.rpc.state.cashRaw, balance + WELCOME_AMOUNT_WEI);
+    const other = await fixture(f.owner);
+    other.rpc.state.cashRaw = 1n;
+    assert.equal((await other.service.buyFunding(other.id, other.owner, {})).funding, 'existing_cash');
+    assert.equal(other.sends(), 0);
+  }
+});
 
 test('#91 DB first buy credits 10000 once with explicit origin and BE-2 hold/stack/cash budgets; restart and second fund cannot mint', async () => {
   for (const kind of ['hold', 'stack'] as const) {
@@ -85,9 +124,13 @@ test('#91 DB cap zero, one raw below, equality and +1; all unresolved states cha
     const before = await used(); const { grant } = await reserveWelcomeGrant(f.recipient, welcomeConfig);
     if (state !== 'reserved') {
       if (state === 'confirmed') {
-        const txHash = hash(); await settleWelcomeGrant(grant, 'submitted', txHash);
+        const signed = await signedFundingTx('welcome', grant.account, grant.amountWei); const txHash = signed.hash; await settleWelcomeGrant(grant, 'submitted', txHash, undefined, withTransaction, signed);
         await settleWelcomeGrant({ ...grant, state: 'submitted', txHash }, 'confirmed', txHash, { txHash, logIndex: 0, blockNumber: 0n, blockHash: hash(), amountRaw: grant.amountWei.toString(), confirmedAt: new Date(0) });
-      } else await settleWelcomeGrant(grant, state, state === 'submitted' || state === 'unknown' ? hash() : null);
+      } else if (state === 'submitted' || state === 'unknown') {
+        const signed = await signedFundingTx('welcome', grant.account, grant.amountWei);
+        await settleWelcomeGrant(grant, 'submitted', signed.hash, undefined, withTransaction, signed);
+        if (state === 'unknown') await settleWelcomeGrant({ ...grant, state: 'submitted', txHash: signed.hash }, 'unknown', signed.hash);
+      } else await settleWelcomeGrant(grant, state, null);
     }
     assert.equal((await reserveWelcomeGrant(f.recipient, { ...welcomeConfig, siteDailyWei: 0n })).created, false, 'zero never blocks original lifetime lookup');
     const cap = before + WELCOME_AMOUNT_WEI;
@@ -111,10 +154,10 @@ test('#91 DB settlement keeps the original UTC day across midnight/timezones; st
   await query(`insert into welcome_grants(chain_id,owner,portfolio_id,account,amount_wei,created_at,updated_at)
     values(97,$1,$2,$3,$4,'2000-01-01T23:59:59Z','2000-01-01T23:59:59Z')`, [f.owner, f.id, f.account, WELCOME_AMOUNT_WEI.toString()]);
   const g = await findWelcomeGrant(97, f.owner); assert.ok(g); assert.equal(g.day, '2000-01-01');
-  const txHash = hash();
+  const signed = await signedFundingTx('welcome', g.account, g.amountWei); const txHash = signed.hash;
   await assert.rejects(settleWelcomeGrant({ ...g, account: address() }, 'submitted', txHash), denied('WELCOME_STORAGE_UNAVAILABLE'));
   const lost: typeof withTransaction = async fn => { await withTransaction(async client => { await client.query("set local time zone 'Pacific/Kiritimati'"); return fn(client); }); throw new Error('SECRET_COMMIT'); };
-  await assert.rejects(settleWelcomeGrant(g, 'submitted', txHash, undefined, lost), denied('WELCOME_STORAGE_UNAVAILABLE'));
+  await assert.rejects(settleWelcomeGrant(g, 'submitted', txHash, undefined, lost, signed), denied('WELCOME_STORAGE_UNAVAILABLE'));
   const committed = await findWelcomeGrant(97, f.owner); assert.ok(committed);
   assert.equal(committed.state, 'submitted'); assert.equal(committed.day, '2000-01-01'); assert.equal(committed.txHash, txHash);
   await assert.rejects(settleWelcomeGrant(g, 'failed', null), denied('WELCOME_STORAGE_UNAVAILABLE'));
@@ -141,8 +184,8 @@ test('#91 DB reservation rollback/unknown commit, statement failure and date-loc
 
 test('#91 DB unknown hash commit does not broadcast; durable submitted/unknown hash blocks every relayer nonce until reconciliation', async () => {
   const f = await fixture(); let sends = 0;
-  const service = createWelcomeService({ config: welcomeConfig, prepare: async () => ({ hash: f.rpc.state.txHash, broadcast: async () => { sends++; }, wait: async () => {} }),
-    settle: async (g, state, hash, evidence) => { await settleWelcomeGrant(g, state, hash, evidence); throw new AppError(503, 'WELCOME_STORAGE_UNAVAILABLE', 'unknown commit'); } });
+  const service = createWelcomeService({ config: welcomeConfig, prepare: async () => ({ ...f.signed, broadcast: async () => { sends++; }, wait: async () => {} }),
+    settle: async (g, state, hash, evidence, transaction, signed) => { await f.settle(g, state, hash, evidence, transaction, signed); throw new AppError(503, 'WELCOME_STORAGE_UNAVAILABLE', 'unknown commit'); } });
   await assert.rejects(service.issue(f.recipient), denied('WELCOME_STORAGE_UNAVAILABLE')); assert.equal(sends, 0);
   let g = await findWelcomeGrant(97, f.owner); assert.equal(g?.state, 'submitted'); assert.ok(g);
   for (const state of ['submitted', 'unknown'] as const) {
@@ -219,7 +262,7 @@ test('#91 DB same-day daily 1000 is independent from welcome and each explicit s
   const f = await fixture(); await f.service.buyFunding(f.id, f.owner, {});
   const amountWei = 1000n * 10n ** 18n;
   const daily = await reserveFaucetClaim({ owner: f.owner, account: f.account, config: { chainId: 97, amountWei, siteDailyWei: 1_000_000n * 10n ** 18n, timeoutMs: 5000 } });
-  const txHash = hash(); await settleFaucetClaim(daily, 'reserved', 'submitted', txHash);
+  const signed = await signedFundingTx('faucet', daily.account, daily.amountWei); const txHash = signed.hash; await settleFaucetClaim(daily, 'reserved', 'submitted', txHash, withTransaction, signed);
   f.rpc.state.mint = false; f.rpc.state.txHash = txHash; f.rpc.state.amount = amountWei; f.rpc.state.cashRaw += amountWei;
   try {
     const source = { source: { kind: 'faucet_claim', claimId: daily.id } };
@@ -229,7 +272,7 @@ test('#91 DB same-day daily 1000 is independent from welcome and each explicit s
     assert.deepEqual(rows, { total: (WELCOME_AMOUNT_WEI + amountWei).toString(), n: '2' });
   } finally {
     // Keep the FK/audit source, but move this isolated daily fixture out of other tests' current-day cap.
-    await query("update faucet_claims set created_at='2000-01-01T00:00:00Z' where id=$1", [daily.id]);
+    // Immutable outbox/source rows stay in their original UTC day for audit.
   }
 });
 
@@ -240,6 +283,8 @@ test('#91 DB buy rejects malformed/foreign/mainnet/RPC-error requests; existing 
   await assert.rejects(createPortfolioStrategyService({ ...f.deps, chainId: () => 56 }).buyFunding(f.id, f.owner, {}), denied('FUNDING_SOURCE_DISABLED'));
   f.rpc.state.fail = 'eth_call'; await assert.rejects(f.service.buyFunding(f.id, f.owner, {})); f.rpc.state.fail = '';
   f.rpc.state.cashRaw = 1n;
-  assert.equal((await f.service.buyFunding(f.id, f.owner, {})).funding, 'existing_cash');
-  assert.equal(await findWelcomeGrant(97, f.owner), null); assert.equal(await cash(f.id), undefined); assert.equal(f.sends(), 0);
+  const result = await f.service.buyFunding(f.id, f.owner, {});
+  assert.equal(result.funding, 'welcome_grant');
+  assert.equal(result.lot?.amountRaw, WELCOME_AMOUNT_WEI.toString(), 'transferred dust is not credited to the product lot');
+  assert.ok(await findWelcomeGrant(97, f.owner)); assert.equal(f.sends(), 1);
 });

@@ -6,13 +6,16 @@ import type { Abi, Address, Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { entryPoint07Abi } from 'viem/account-abstraction';
 import { closePool, query } from '../src/db.js';
-import { createPaymasterService, verifyingPaymasterHash } from '../src/paymaster.js';
+import { createPaymasterService, gasExecutionKey, settleGasBudget, verifyingPaymasterHash } from '../src/paymaster.js';
 import { KERNEL_V3_3_ADDRESSES as K } from '../src/addresses.js';
-import { TEST_SIGNER, OWNER, PM, USDT, SENDER, operation, config } from './fixtures/paymaster.js';
+import { TEST_SIGNER, OWNER, PM, USDT, SENDER, REGISTRY, kernelCall, operation, config } from './fixtures/paymaster.js';
 import golden from './fixtures/paymaster-golden.json' with { type: 'json' };
 
 after(closePool);
-const rpcUrl = 'http://127.0.0.1:8557';
+const rpcUrl = process.env.ANVIL_RPC_URL;
+assert.ok(rpcUrl, 'set ANVIL_RPC_URL to the assigned local anvil');
+const rpcLocation = new URL(rpcUrl);
+assert.ok(['localhost', '127.0.0.1'].includes(rpcLocation.hostname));
 const chain = defineChain({ id: 1337, name: 'paymaster local anvil', nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 }, rpcUrls: { default: { http: [rpcUrl] } } });
 const publicClient = createPublicClient({ chain, transport: http(rpcUrl, { retryCount: 0 }) });
 const local = createTestClient({ chain, mode: 'anvil', transport: http(rpcUrl) });
@@ -44,6 +47,7 @@ test('#66 actual v0.7 EntryPoint + VerifyingPaymaster accept golden and handleOp
   const snapshot = await local.snapshot();
   let strategyId: string | undefined;
   const hashes: Hex[] = [];
+  const budgetKeys: string[] = [];
   try {
     const ep = await deploy('EntryPoint', []);
     await copyCode(ep, K.entryPointV07);
@@ -54,7 +58,7 @@ test('#66 actual v0.7 EntryPoint + VerifyingPaymaster accept golden and handleOp
     await copyCode(account, SENDER);
     // Only the harness uses this storage stand-in. Production code never writes account storage.
     await local.setStorageAt({ address: SENDER, index: '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc', value: encodeAbiParameters([{ type: 'address' }], [K.kernelImplV33]) });
-    await copyCode(await deploy('PaymasterClaimTarget', [], [], 'PaymasterAccount'), USDT);
+    await copyCode(await deploy('PaymasterClaimTarget', [], [], 'PaymasterAccount'), REGISTRY);
     const depositTx = await wallet.writeContract({ address: K.entryPointV07, abi: entryPoint07Abi, functionName: 'depositTo', args: [PM], value: 10n ** 16n });
     await publicClient.waitForTransactionReceipt({ hash: depositTx });
     strategyId = (await query<{ id: string }>("insert into strategies(provider,name) values($1,'paymaster-66-local') returning id", [OWNER])).rows[0]?.id;
@@ -65,14 +69,16 @@ test('#66 actual v0.7 EntryPoint + VerifyingPaymaster accept golden and handleOp
     await query("insert into smart_accounts(portfolio_id,chain_id,address,owner,account_type) values($1,1337,$2,$3,'KERNEL')", [portfolio, SENDER, OWNER]);
     const now = Math.floor(Date.now() / 1000);
     const validUntil = now + 300;
-    const service = createPaymasterService({ config: config(), now: () => now });
+    const service = createPaymasterService({ config: { ...config(), rpcUrl }, now: () => now,
+      readBudgetContext: async op => ({ purpose: op.nonce === 0n ? 'setup' : 'ordinary', nativePrice: 60000000000n, priceSource: 'fixture:oracle' }) });
     const sponsored = await service.sponsor({ userOperation: operation(), validUntil }, OWNER);
     hashes.push(sponsored.userOpHash);
+    budgetKeys.push(gasExecutionKey(1337, operation()));
     const op = { ...operation(), paymasterAndData: sponsored.paymasterAndData };
     const onchainHash = await publicClient.readContract({ address: PM, abi: pmAbi, functionName: 'getHash', args: [op, sponsored.validUntil, 0] });
     assert.equal(onchainHash, verifyingPaymasterHash(op, config(), validUntil, 0));
     // Hash-vector timestamps stay fixed; the issued DB reservation uses the real current clock.
-    const goldenHash = await publicClient.readContract({ address: PM, abi: pmAbi, functionName: 'getHash', args: [op, golden.validUntil, golden.validAfter] });
+    const goldenHash = await publicClient.readContract({ address: PM, abi: pmAbi, functionName: 'getHash', args: [{ ...op, callData: kernelCall() }, golden.validUntil, golden.validAfter] });
     assert.equal(goldenHash, golden.hash);
     assert.equal(await signer.signMessage({ message: { raw: goldenHash } }), golden.signature);
     const actualHash = await publicClient.readContract({ address: K.entryPointV07, abi: entryPoint07Abi, functionName: 'getUserOpHash', args: [op] });
@@ -86,11 +92,12 @@ test('#66 actual v0.7 EntryPoint + VerifyingPaymaster accept golden and handleOp
     const tx = await wallet.writeContract({ address: K.entryPointV07, abi: entryPoint07Abi, functionName: 'handleOps', args: [[op], signer.address], gas: 2_000_000n });
     const receipt = await publicClient.waitForTransactionReceipt({ hash: tx });
     assert.equal(receipt.status, 'success');
-    assert.equal(await publicClient.readContract({ address: USDT, abi: parseAbi(['function claimed(address) view returns(uint256)']), functionName: 'claimed', args: [SENDER] }), 1n);
+    assert.equal(await publicClient.readContract({ address: REGISTRY, abi: parseAbi(['function claimed(address) view returns(uint256)']), functionName: 'claimed', args: [SENDER] }), 1n);
     assert.equal(await publicClient.getBalance({ address: SENDER }), before);
     assert.ok(await publicClient.readContract({ address: K.entryPointV07, abi: entryPoint07Abi, functionName: 'balanceOf', args: [PM] }) < balanceBefore);
     const expired = await service.sponsor({ userOperation: operation({ nonce: 1n }), validUntil }, OWNER);
     hashes.push(expired.userOpHash);
+    budgetKeys.push(gasExecutionKey(1337, operation({ nonce: 1n })));
     const expiredOp = { ...operation({ nonce: 1n }), paymasterAndData: expired.paymasterAndData,
       signature: await signer.signMessage({ message: { raw: expired.userOpHash } }) };
     await local.setNextBlockTimestamp({ timestamp: BigInt(validUntil + 1) });
@@ -103,5 +110,7 @@ test('#66 actual v0.7 EntryPoint + VerifyingPaymaster accept golden and handleOp
       await query('delete from strategies where id=$1', [strategyId]);
     }
     await local.revert({ id: snapshot });
+    // The snapshot removed the harness executions; retain their audit costs without occupying the setup slot.
+    for (const executionKey of budgetKeys) await settleGasBudget(executionKey, 'failed');
   }
 });

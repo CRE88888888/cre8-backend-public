@@ -33,7 +33,18 @@ const MIGRATION_LOCK_ID = 8_121_956_001;
 let pool: PgPool | null = null;
 // All DB work inside a portfolio lock reuses its client, including short transactions.
 // Reserving a lock client while borrowing other pool clients can exhaust the pool.
-const portfolioClient = new AsyncLocalStorage<PoolClient>();
+const portfolioClient = new AsyncLocalStorage<{ client: PoolClient; reusable: boolean }>();
+
+/** Nested session locks and transactions share one connection; unsafe cleanup discards it once. */
+export async function withConnection<T>(fn: (client: PoolClient, discard: () => void) => Promise<T>, options: { reuse?: boolean } = {}): Promise<T> {
+  const existing = options.reuse === false ? undefined : portfolioClient.getStore();
+  const scope = existing ?? { client: await getPool().connect().catch(() => { throw new Error('database connection unavailable'); }), reusable: true };
+  try {
+    return await portfolioClient.run(scope, () => fn(scope.client, () => { scope.reusable = false; }));
+  } finally {
+    if (existing === undefined) scope.client.release(!scope.reusable);
+  }
+}
 
 function timeoutMillis(name: string, fallback: number): number {
   const raw = process.env[name]?.trim();
@@ -70,12 +81,12 @@ export function query<T extends QueryResultRow = QueryResultRow>(
   text: string,
   params: readonly unknown[] = [],
 ): Promise<QueryResult<T>> {
-  return (portfolioClient.getStore() ?? getPool()).query<T>(text, [...params]);
+  return (portfolioClient.getStore()?.client ?? getPool()).query<T>(text, [...params]);
 }
 
 /** Run `fn` inside BEGIN/COMMIT; rolls back on any throw. */
 export async function withTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
-  const scoped = portfolioClient.getStore();
+  const scoped = portfolioClient.getStore()?.client;
   const client = scoped ?? await getPool().connect();
   try {
     await client.query('begin');
@@ -97,32 +108,27 @@ export async function withPortfolioLock<T>(portfolioId: number, fn: () => Promis
   if (!Number.isSafeInteger(portfolioId) || portfolioId <= 0) throw new RangeError('invalid portfolio id');
   // Negative bigint keys keep portfolio locks separate from the positive migration lock.
   const key = (-BigInt(portfolioId)).toString();
-  const client = await getPool().connect().catch(() => { throw new Error('portfolio lock connection unavailable'); });
-  let acquired = false;
-  let reusable = false;
-  const disconnected = () => { reusable = false; };
-  client.on('error', disconnected);
-  try {
-    acquired = (await client.query<{ acquired: boolean }>(
-      'select pg_try_advisory_lock($1::bigint) as acquired', [key],
-    ).catch(() => { throw new Error('portfolio lock acquisition failed'); })).rows[0]?.acquired === true;
-    reusable = true;
-    if (!acquired) return null;
-    return await portfolioClient.run(client, fn);
-  } finally {
-    if (acquired) {
-      try {
-        reusable = (await client.query<{ unlocked: boolean }>(
-          'select pg_advisory_unlock($1::bigint) as unlocked', [key],
-        )).rows[0]?.unlocked === true;
-      } catch {
-        reusable = false;
+  return withConnection(async (client, discard) => {
+    let acquired = false;
+    const disconnected = () => { discard(); };
+    client.on('error', disconnected);
+    try {
+      acquired = (await client.query<{ acquired: boolean }>(
+        'select pg_try_advisory_lock($1::bigint) as acquired', [key],
+      ).catch(() => { discard(); throw new Error('portfolio lock acquisition failed'); })).rows[0]?.acquired === true;
+      if (!acquired) return null;
+      return await fn();
+    } finally {
+      if (acquired) {
+        try {
+          if ((await client.query<{ unlocked: boolean }>(
+            'select pg_advisory_unlock($1::bigint) as unlocked', [key],
+          )).rows[0]?.unlocked !== true) discard();
+        } catch { discard(); }
       }
+      client.removeListener('error', disconnected);
     }
-    // Acquisition/cleanup errors may leave a session lock behind. Never recycle that session.
-    client.release(!reusable);
-    client.removeListener('error', disconnected);
-  }
+  }, { reuse: false });
 }
 
 export type MigrationResult = {
@@ -141,7 +147,11 @@ export async function migrate(): Promise<MigrationResult> {
   const files = await listMigrationFiles();
   const client = await getPool().connect();
 
+  let reusable = true;
+  let previousLockTimeout: string | undefined;
   try {
+    previousLockTimeout = (await client.query<{ lock_timeout: string }>('show lock_timeout')).rows[0]?.lock_timeout;
+    await client.query("set lock_timeout = '5s'");
     await client.query('select pg_advisory_lock($1)', [MIGRATION_LOCK_ID]);
     try {
       await client.query(`
@@ -190,10 +200,22 @@ export async function migrate(): Promise<MigrationResult> {
 
       return { applied: ran };
     } finally {
-      await client.query('select pg_advisory_unlock($1)', [MIGRATION_LOCK_ID]).catch(() => {});
+      try {
+        if ((await client.query<{ unlocked: boolean }>('select pg_advisory_unlock($1) as unlocked', [MIGRATION_LOCK_ID])).rows[0]?.unlocked !== true) reusable = false;
+      } catch { reusable = false; }
     }
+  } catch (error) {
+    const cause = error instanceof Error ? error.cause : undefined;
+    if (errorCode(error) === '55P03' || errorCode(cause) === '55P03') {
+      throw new Error('migration lock timeout (5000ms); release the blocking transaction and retry startup');
+    }
+    throw error;
   } finally {
-    client.release();
+    try {
+      if (previousLockTimeout === undefined) reusable = false;
+      else await client.query("select set_config('lock_timeout',$1,false)", [previousLockTimeout]);
+    } catch { reusable = false; }
+    client.release(!reusable);
   }
 }
 

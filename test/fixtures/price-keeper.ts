@@ -40,7 +40,7 @@ export function keeperChainFixture() {
       case 'symbol': return result(state.bad === name ? 'wrong' : market.symbol);
       case 'decimals': return result(state.bad === name ? 19 : to === manifest.usdt.toLowerCase() ? 18 :
         to === manifest.cashFeed.toLowerCase() || to === market.feed?.toLowerCase() ? 8 : market.decimals);
-      case 'isMinter': return result(state.bad !== name);
+      case 'isMinter': return result(to !== manifest.usdt.toLowerCase() && state.bad !== name);
       case 'keeper': return result(state.bad === name ? zeroAddress : manifest.keeper);
       case 'getPool': case 'oracleOf': case 'secondaryOf': {
         const matched = manifest.markets.find((m) => m.token.toLowerCase() === String(args?.[0]).toLowerCase()); assert.ok(matched);

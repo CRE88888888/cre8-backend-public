@@ -1,9 +1,8 @@
 /** #87 opt-in acceptance. Run with bun run test/testnet-97.e2e.ts after the CLEAN
- * contracts b767bf6 deploy-97.sh fork on 8562 and a 30-minute warm-up. No automatic bun-test discovery.
- * Env only: CHAIN_ID=97, RPC_URL=http://127.0.0.1:8562, PORT=3062, DATABASE_URL
- * (cre8_be87), MIGRATIONS_DIR, OPERATOR_PRIVATE_KEY, SESSION_KEY_MASTER_SEED,
+ * contracts b767bf6 deploy-97.sh on the lane-selected local fork and a 30-minute warm-up. No automatic bun-test discovery.
+ * Env only: CHAIN_ID=97, RPC_URL, PORT, DATABASE_URL, TEST_DATABASE_NAME, MIGRATIONS_DIR, OPERATOR_PRIVATE_KEY, SESSION_KEY_MASTER_SEED,
  * PAYMASTER_SIGNER_PRIVATE_KEY, BUNDLER_EXECUTOR_PRIVATE_KEY, BUNDLER_UTILITY_PRIVATE_KEY,
- * ALTO_CLI_PATH (installed alto CLI), BUNDLER_URL=http://127.0.0.1:3162,
+ * ALTO_CLI_PATH (installed alto CLI), BUNDLER_URL (distinct localhost port),
  * EXECUTOR_DEPLOYMENT_BLOCK (actual fork deployment receipt block),
  * TESTNET_ACCEPTANCE_GAS_PRICE_WEI (explicit local fork base-fee scenario; never a public-chain claim).
  * Keys may be loaded into env by a local launcher; this file never reads key files.
@@ -30,9 +29,11 @@ import { EXECUTOR_ABI } from '../src/chain.js';
 import { schedulerPaymaster, estimationPaymaster } from '../src/paymaster.js';
 import { planPortfolio } from '../src/snapshot.js';
 import { publishVersion } from '../src/strategies.js';
-const RPC = 'http://127.0.0.1:8562';
-const API = 'http://127.0.0.1:3062';
-const BUNDLER = 'http://127.0.0.1:3162';
+import { localAcceptanceEnv } from './fixtures/local-acceptance.js';
+const endpoints = localAcceptanceEnv(process.env, true);
+assert.ok(endpoints.bundler);
+const RPC = endpoints.rpcUrl, API = endpoints.apiUrl, BUNDLER = endpoints.bundler.url;
+const bundlerPort = endpoints.bundler.port;
 const client = createPublicClient({ chain: bscTestnet, transport: http(RPC, { timeout: 120000, retryCount: 0 }), cacheTime: 0 });
 const local = createTestClient({ chain: bscTestnet, mode: 'anvil', transport: http(RPC) });
 const owner = mnemonicToAccount('test test test test test test test test test test test junk', { addressIndex: 7 });
@@ -63,7 +64,7 @@ async function ready(url: string, rpc: boolean) {
 }
 async function main() {
   const config = getConfig();
-  check(config.chainId === 97 && config.rpcUrl === RPC && config.port === 3062 && new URL(config.databaseUrl).pathname === '/cre8_be87', 'dedicated chain/ports/DB guard');
+  check(config.chainId === 97 && config.rpcUrl === RPC && config.port === endpoints.backendPort && new URL(config.databaseUrl).pathname === '/' + endpoints.databaseName, 'dedicated chain/ports/DB guard');
   check(process.env.BUNDLER_URL === BUNDLER && process.env.ALTO_CLI_PATH && process.env.PAYMASTER_SIGNER_PRIVATE_KEY && process.env.BUNDLER_EXECUTOR_PRIVATE_KEY && process.env.BUNDLER_UTILITY_PRIVATE_KEY, 'required env only');
   // anvil_nodeInfo is intentionally unavailable on a public RPC.
   const info = await fetch(RPC, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'anvil_nodeInfo', params: [] }) }).then((r) => r.json());
@@ -75,13 +76,13 @@ async function main() {
   check((await checkTestnetProfile(client)).every((c) => c.level === 'ok'), '319 pinned runtime hashes and selectors');
   mkdirSync('.bun-cache', { recursive: true });
   const log = openSync('.bun-cache/testnet-services-87.log', 'a', 0o600);
-  const alto = spawn('sh', ['alto/entrypoint.sh'], { stdio: ['ignore', log, log], env: { ...process.env, CHAIN_ID: '97', PORT: '3162', RPC_URL: RPC,
+  const alto = spawn('sh', ['alto/entrypoint.sh'], { stdio: ['ignore', log, log], env: { ...process.env, CHAIN_ID: '97', PORT: String(bundlerPort), RPC_URL: RPC,
     EXECUTOR_PRIVATE_KEY: process.env.BUNDLER_EXECUTOR_PRIVATE_KEY, UTILITY_PRIVATE_KEY: process.env.BUNDLER_UTILITY_PRIVATE_KEY } });
   const backend = spawn(process.execPath, ['src/index.ts'], { stdio: ['ignore', log, log], env: process.env });
   let strategyId: number | undefined;
   try {
     await ready(BUNDLER, true); await ready(API + '/health', false);
-    check((await request('/health')).chainId === 97, 'backend starts on 3062 with chain 97');
+    check((await request('/health')).chainId === 97, 'backend starts on the selected local port with chain 97');
     const challenge = await request('/auth/nonce', 'POST');
     const message = createSiweMessage({ address: owner.address, chainId: 97, domain: str(challenge.domain), uri: str(challenge.uri), nonce: str(challenge.nonce), statement: str(challenge.statement), version: '1', issuedAt: new Date(str(challenge.issuedAt)) });
     token = str((await request('/auth/login', 'POST', { message, signature: await owner.signMessage({ message }) })).token);
@@ -99,8 +100,8 @@ async function main() {
     const account = addr(obj(portfolio.smartAccounts[0]).address);
     const claimed = await request('/faucet/usdt', 'POST', { account });
     check(claimed.state === 'confirmed' && claimed.amountWei === String(1000n * 10n ** 18n), 'HTTP faucet receipt and exact 1000 MockUSDT');
-    const repeat = await request('/faucet/usdt', 'POST', { account }, 429);
-    check(obj(repeat.error).code === 'FAUCET_QUOTA_EXCEEDED', 'repeat owner claim rejected durably');
+    const repeat = await request('/faucet/usdt', 'POST', { account });
+    check(repeat.replayed === true && repeat.claimId === claimed.claimId && repeat.txHash === claimed.txHash && repeat.state === claimed.state, 'same-recipient retry returns the original durable claim');
     // Approval is owner-authorized and self-funded; #66 intentionally does not sponsor approve.
     await local.setBalance({ address: account, value: 10n ** 16n });
     const entryPoint = { address: P.contracts.entryPoint, version: '0.7' } as const;
@@ -187,4 +188,4 @@ async function main() {
     await closePool();
   }
 }
-main().catch((error: unknown) => { console.error('TESTNET_97_ACCEPTANCE failed: ' + (error instanceof Error ? error.message.split('\n')[0] : 'unknown')); process.exitCode = 1; });
+main().catch(() => { console.error('TESTNET_97_ACCEPTANCE failed (local assertion or dependency unavailable)'); process.exitCode = 1; });

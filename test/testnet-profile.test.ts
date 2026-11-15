@@ -73,7 +73,7 @@ test('#69 profile preflight verifies every codehash and selector; wrong chain, e
   const { createPublicClient, custom, keccak256, toFunctionSelector } = await import('viem');
   const { checkTestnetProfile, testnetProfileTargets } = await import('../src/testnet-preflight.js');
   const signatures = ['enroll(address,uint256)', 'operator()', 'owner()', 'executeRebalance(address,(address,address,uint256,uint256,address,bytes)[],uint256)',
-    'numeraire()', 'oracle()', 'venues(address)', 'oracleOf(address)', 'previewSwap(address,address,uint256)', 'claimFor(address,uint256)', 'claimable(address)', 'isMinter(address)', 'decimals()', 'getDeposit()', 'verifyingSigner()'];
+    'numeraire()', 'oracle()', 'venues(address)', 'oracleOf(address)', 'previewSwap(address,address,uint256)', 'claimFor(address,uint256)', 'claimable(address)', 'isFaucet(address)', 'welcomeFor(address)', 'decimals()', 'getDeposit()', 'verifyingSigner()'];
   const code = `0x${signatures.map((s) => '63' + toFunctionSelector(s).slice(2)).join('')}` as const;
   const hashes = Object.fromEntries(testnetProfileTargets().map((t) => [t.name, keccak256(code)]));
   for (const mode of ['ok', 'chain', 'chain-rpc', 'block', 'code-rpc', 'empty', 'wrong-hash', 'missing-hash', 'selector']) {
@@ -172,4 +172,43 @@ test('#92 all 92 admitted assets and automatic USDT validate as one immutable pe
   const first=assets[0];assert.ok(first);
   const duplicate=structuredClone(assets);duplicate[91]={...first,weightBps:108};
   assert.throws(()=>validateAllocation({assets:duplicate},97),/duplicate/i);
+});
+
+test('#97 strict profile also verifies paymaster signing/deposit, minter and nonzero feature budgets', async () => {
+  const { createPublicClient, custom, encodeAbiParameters, keccak256, toFunctionSelector } = await import('viem');
+  const { privateKeyToAccount } = await import('viem/accounts');
+  const { checkTestnetProfile, testnetProfileTargets } = await import('../src/testnet-preflight.js');
+  const key = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
+  const env = { CHAIN_ID: '97', RPC_URL: 'http://127.0.0.1:8577', PAYMASTER_SIGNER_PRIVATE_KEY: key };
+  const signatures = ['enroll(address,uint256)', 'operator()', 'owner()', 'executeRebalance(address,(address,address,uint256,uint256,address,bytes)[],uint256)',
+    'numeraire()', 'oracle()', 'venues(address)', 'oracleOf(address)', 'previewSwap(address,address,uint256)', 'claimFor(address,uint256)', 'claimable(address)', 'isFaucet(address)', 'welcomeFor(address)', 'decimals()', 'getDeposit()', 'verifyingSigner()'];
+  const code = `0x${signatures.map(s => '63' + toFunctionSelector(s).slice(2)).join('')}` as const;
+  const expected = Object.fromEntries(testnetProfileTargets().map(t => [t.name, keccak256(code)]));
+  for (const mode of ['ok', 'wrong-numeraire', 'missing-signer', 'wrong-signer', 'wrong-operator', 'deposit-zero', 'deposit-below', 'deposit-equal', 'minter', 'rpc', 'missing-data', 'timeout',
+    'PAYMASTER_ACCOUNT_DAILY_COUNT', 'PAYMASTER_ACCOUNT_DAILY_GAS', 'PAYMASTER_ACCOUNT_DAILY_WEI', 'PAYMASTER_SITE_DAILY_GAS', 'PAYMASTER_SITE_DAILY_WEI',
+    'ACCOUNT_DAILY_GAS', 'ACCOUNT_DAILY_GAS_USD_E8', 'FAUCET_USDT_AMOUNT_WEI', 'FAUCET_USDT_SITE_DAILY_WEI', 'WELCOME_USDT_SITE_DAILY_WEI']) {
+    const client = createPublicClient({ transport: custom({ request: async ({ method, params }) => {
+      if (method === 'eth_chainId') return '0x61';
+      if (method === 'eth_blockNumber') return '0x69';
+      if (method === 'eth_getCode') return code;
+      if (method === 'eth_call') {
+        if (mode === 'rpc') throw new Error('SECRET_RPC');
+        if (mode === 'missing-data') return '0x';
+        if (mode === 'timeout') return new Promise<never>(() => {});
+        const call = params?.[0]; assert.ok(call && typeof call === 'object' && 'data' in call);
+        assert.equal(params?.[1], '0x69');
+        const selector = String(call.data).slice(0, 10);
+        if (selector === toFunctionSelector('verifyingSigner()')) return encodeAbiParameters([{ type: 'address' }], [mode === 'wrong-signer' ? TESTNET_97.roles.owner : privateKeyToAccount(key).address]);
+        if (selector === toFunctionSelector('entryPoint()')) return encodeAbiParameters([{ type: 'address' }], [TESTNET_97.contracts.entryPoint]);
+        if (selector === toFunctionSelector('numeraire()')) return encodeAbiParameters([{ type: 'address' }], [mode === 'wrong-numeraire' ? TESTNET_97.roles.owner : TESTNET_97.contracts.usdt]);
+        if (selector === toFunctionSelector('getDeposit()')) return encodeAbiParameters([{ type: 'uint256' }], [mode === 'deposit-zero' ? 0n : mode === 'deposit-below' ? 10n ** 16n - 1n : 10n ** 16n]);
+        if (selector === toFunctionSelector('isFaucet(address)')) return encodeAbiParameters([{ type: 'bool' }], [mode !== 'minter']);
+      }
+      throw new Error('unexpected RPC');
+    } }, { retryCount: 0 }) });
+    const checks = await checkTestnetProfile(client, expected, { strict: true, timeoutMs: 5,
+      env: { ...env, ...(mode === 'missing-signer' ? { PAYMASTER_SIGNER_PRIVATE_KEY: '' } : mode === 'wrong-operator' ? { OPERATOR_PRIVATE_KEY: key } : mode.includes('_') ? { [mode]: '0' } : {}) } });
+    assert.equal(checks.some(c => c.level === 'fail'), !['ok', 'deposit-equal'].includes(mode), mode);
+    assert.doesNotMatch(JSON.stringify(checks), /SECRET_RPC|ac0974be/);
+  }
 });

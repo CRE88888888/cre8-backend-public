@@ -69,7 +69,7 @@ export class PriceKeeper {
           const maintenance = target.price * (spotE18 >= target.price ? 9999n : 10001n) / 10_000n;
           bounded = boundedTarget(spotE18, maintenance, this.scenario.maxStepBps);
         }
-        // All markets share cash inventory. Refill between trades, including a near-empty late round.
+        // All markets share cash inventory. Check between trades, including a near-empty late round.
         if (bounded > spotE18) await this.inventory(this.usdt, 'USDT', 18, 10n ** 18n);
         await this.io.swap(observation, bounded, this.settings.swapBudgetUsdtE18);
         this.log(`[price-keeper] swap ${market.symbol} targetE18=${bounded}`);
@@ -121,6 +121,7 @@ export class PriceKeeper {
     const balance = await this.io.balance(token);
     if (balance < 0n) throw new Error('invalid inventory');
     if (balance < minimum) {
+      if (token.toLowerCase() === this.usdt.toLowerCase()) throw new Error('prefunded USDT inventory below minimum');
       const amount = target - balance;
       await this.io.mint(token, amount);
       if (await this.io.balance(token) !== target) throw new Error('mint balance mismatch');

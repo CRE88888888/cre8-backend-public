@@ -120,3 +120,41 @@ test('#79 all staged service roles and alto hold without DB, RPC or keys; invali
     }
   }
 });
+
+test('#97 current deployment checklist keeps campaign features off and records required budgets', async () => {
+  const text = await readFile(new URL('../docs/testnet-deploy.zh-TW.md', import.meta.url), 'utf8');
+  const current = text.split('## #79 驗收紀錄')[0] ?? '';
+  assert.match(current, /POINTS_ENABLED=0/);
+  assert.doesNotMatch(current, /啟用 points 與 points-sync/);
+  for (const name of ['OPERATOR_ADDRESS', 'OPERATOR_WALLETS', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID', 'PAYMASTER_MIN_DEPOSIT_WEI',
+    'ACCOUNT_DAILY_GAS=100000000', 'PAYMASTER_ACCOUNT_DAILY_COUNT=60', 'PAYMASTER_SITE_DAILY_WEI=100000000000000000',
+    'FAUCET_USDT_SITE_DAILY_WEI=1000000000000000000000000', 'WELCOME_USDT_SITE_DAILY_WEI=5000000000000000000000000']) assert.ok(current.includes(name), name);
+});
+
+test('#97 opt-in acceptance reaches only its environment-selected local anvil and database', async () => {
+  const { runScript } = await import('./fixtures/secret-output.js');
+  for (const path of ['test/welcome-grants.fork.ts', 'test/testnet-97.e2e.ts']) {
+    const result = await runScript(path, { CHAIN_ID: '97', RPC_URL: 'http://127.0.0.1:8577', PORT: '3077',
+      DATABASE_URL: 'postgres://localhost/cre8_be97', TEST_DATABASE_NAME: 'cre8_be97', BUNDLER_URL: 'http://127.0.0.1:3177',
+      ALTO_CLI_PATH: 'local-fixture', PAYMASTER_SIGNER_PRIVATE_KEY: '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80', BUNDLER_EXECUTOR_PRIVATE_KEY: 'local-fixture', BUNDLER_UTILITY_PRIVATE_KEY: 'local-fixture',
+    }, `globalThis.fetch = async (url, init) => {
+      if (String(url) !== 'http://127.0.0.1:8577') throw new Error('wrong endpoint');
+      console.log('ANVIL_ENV_CHECKPOINT'); throw new Error('stop before chain actions');
+    };`);
+    assert.equal(result.code, 1);
+    assert.match(result.output, /ANVIL_ENV_CHECKPOINT/, path);
+  }
+});
+
+test('#97 acceptance env rejects missing/foreign endpoints, mismatched databases, colliding and invalid ports', async () => {
+  const { localAcceptanceEnv } = await import('./fixtures/local-acceptance.js');
+  const env = { CHAIN_ID: '97', RPC_URL: 'http://127.0.0.1:8577', PORT: '3077', DATABASE_URL: 'postgres://localhost/cre8_be97', TEST_DATABASE_NAME: 'cre8_be97', BUNDLER_URL: 'http://127.0.0.1:3177' };
+  assert.equal(localAcceptanceEnv(env, true).backendPort, 3077);
+  for (const PORT of ['1024', '65535']) assert.equal(localAcceptanceEnv({ ...env, PORT }).backendPort, Number(PORT));
+  for (const bad of [{ CHAIN_ID: '56' }, { RPC_URL: '' }, { RPC_URL: 'https://public.example:8577' }, { RPC_URL: 'http://localhost:8577/secret' },
+    { RPC_URL: 'http://user:password@localhost:8577' }, { BUNDLER_URL: 'http://public.example:3177' }, { BUNDLER_URL: env.RPC_URL },
+    { DATABASE_URL: 'postgres://public.example/cre8_be97' }, { TEST_DATABASE_NAME: '' }, { TEST_DATABASE_NAME: 'cre8_other' },
+    ...['0', '1023', '65536', '3077.1', 'SECRET', '8577'].map(PORT => ({ PORT }))]) {
+    assert.throws(() => localAcceptanceEnv({ ...env, ...bad }, true), (e: unknown) => e instanceof Error && !e.message.includes('SECRET') && !e.message.includes('password'));
+  }
+});

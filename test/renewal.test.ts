@@ -101,6 +101,32 @@ function ownedPortfolio(overrides: Partial<OwnedPortfolio> = {}): OwnedPortfolio
   };
 }
 
+test('#97 renewal rejects another chain before deriving any key or reading signer configuration', async () => {
+  for (const chainId of [56, 97]) {
+    let builds = 0;
+    const { buildRenewalParams: build } = realRenewalParams(ownedPortfolio({ chainId }), {
+      chainId: chainId === 56 ? 97 : 56,
+      sessionKeyConfig: () => { builds++; return SESSION_KEY_CONFIG; },
+    });
+    await assert.rejects(build(PORTFOLIO_ID, WALLET_LOWER), (e: unknown) =>
+      e instanceof Error && 'code' in e && e.code === 'PORTFOLIO_CHAIN_MISMATCH');
+    assert.equal(builds, 0);
+  }
+});
+
+test('#97 ownership requires an account on this deployment chain, including mixed-chain portfolios', async () => {
+  for (const available of [[], [97], [56, 97]]) {
+    const db = asQuery(sql => ({ rows: sql.includes('from portfolios') ? [{ id: '3', user_id: WALLET_LOWER,
+      strategy_id: '11', version: 1, schedule_state: 'active', created_at: new Date() }]
+      : sql.includes('from smart_accounts') ? available.map(chain_id => ({ chain_id: String(chain_id),
+        address: SMART_ACCOUNT.address, owner: WALLET_LOWER, account_type: 'KERNEL' })) : [] }));
+    const result = requireOwnedPortfolio(PORTFOLIO_ID, WALLET_LOWER, { query: db.query, chainId: 56 });
+    if (available.includes(56)) assert.equal((await result).chainId, 56);
+    else await assert.rejects(result, (e: unknown) => e instanceof Error && 'code' in e &&
+      e.code === (available.length ? 'PORTFOLIO_CHAIN_MISMATCH' : 'NOT_FOUND'));
+  }
+});
+
 function samplePortfolio(id = PORTFOLIO_ID): Portfolio {
   return {
     minDepositUsdtWei: '50000000000000000000',
@@ -1404,7 +1430,7 @@ test('POST /bundler without a bearer token is 401 and never calls the upstream',
   );
 });
 
-test('POST /bundler reports an unreachable upstream as 502 with the bundler URL in the message', async () => {
+test('POST /bundler reports an unreachable upstream as a fixed safe 502', async () => {
   const upstream = fakeUpstream(new TypeError('fetch failed: ECONNREFUSED'));
 
   await withServer(
@@ -1415,8 +1441,7 @@ test('POST /bundler reports an unreachable upstream as 502 with the bundler URL 
       assert.equal(res.status, 502);
       const body = (await res.json()) as { error: { code: string; message: string } };
       assert.equal(body.error.code, 'BUNDLER_UNAVAILABLE');
-      assert.match(body.error.message, /http:\/\/127\.0\.0\.1:3001/, '訊息要指出是哪個 bundler');
-      assert.match(body.error.message, /ECONNREFUSED/, '上游的原因也要留著');
+      assert.equal(body.error.message, 'bundler unavailable; retry later');
       // 不洩漏私鑰：這支 relay 沒有任何金鑰，回應裡也不該出現 0x + 64 hex 這種東西。
       assert.doesNotMatch(body.error.message, /0x[0-9a-fA-F]{64}/);
     },

@@ -9,10 +9,12 @@ import { AppError } from './errors.js';
 import { withRelayerLock } from './relayer-lock.js';
 import { TESTNET_97 } from './testnet-profile.js';
 import type { FaucetFundingEvidence } from './faucet.js';
+import { saveRelayerTransaction } from './relayer-outbox.js';
+import type { SignedSubmission } from './relayer-outbox.js';
 
 export const WELCOME_ABI = parseAbi([
-  'function mint(address to,uint256 amount)',
-  'function isMinter(address account) view returns(bool)',
+  'function welcomeFor(address to)',
+  'function isFaucet(address account) view returns(bool)',
   'event Transfer(address indexed from,address indexed to,uint256 value)',
 ]);
 export type WelcomeState = 'reserved' | 'submitted' | 'unknown' | 'confirmed' | 'failed';
@@ -64,7 +66,7 @@ export async function reserveWelcomeGrant(recipient: Recipient, c: WelcomeConfig
 
 /** Every update locks the original reservation day, then reads FOR UPDATE and applies a state/hash CAS. */
 export async function settleWelcomeGrant(grant: WelcomeGrant, state: WelcomeState, hash: Hex | null,
-  evidence?: FaucetFundingEvidence, transaction = withTransaction): Promise<void> {
+  evidence?: FaucetFundingEvidence, transaction = withTransaction, signed?: SignedSubmission): Promise<void> {
   try {
     await transaction(async client => {
       await client.query('set transaction isolation level read committed');
@@ -74,6 +76,10 @@ export async function settleWelcomeGrant(grant: WelcomeGrant, state: WelcomeStat
       const old = (await client.query<GrantRow>(`select ${columns} from welcome_grants where id=$1 for update`, [grant.id])).rows[0];
       if (!old || old.state !== grant.state || old.tx_hash !== grant.txHash || old.day !== grant.day || old.owner !== grant.owner ||
           old.account !== grant.account || Number(old.portfolio_id) !== grant.portfolioId || old.chain_id !== '97' || BigInt(old.amount_wei) !== grant.amountWei) throw storage();
+      if (state === 'submitted') {
+        if (!hash || !signed || grant.state !== 'reserved' || grant.txHash !== null) throw storage();
+        await saveRelayerTransaction(client, { ...grant, kind: 'welcome' }, hash, signed);
+      }
       const result = await client.query(`update welcome_grants set state=$2,tx_hash=coalesce(tx_hash,$3),log_index=$4,block_number=$5,block_hash=$6,updated_at=clock_timestamp()
         where id=$1 and state=$7 returning id`, [grant.id, state, hash, evidence?.logIndex ?? null, evidence?.blockNumber.toString() ?? null, evidence?.blockHash ?? null, grant.state]);
       if (result.rows.length !== 1) throw storage();
@@ -82,7 +88,7 @@ export async function settleWelcomeGrant(grant: WelcomeGrant, state: WelcomeStat
 }
 
 /** Do not infer funding from balances. Verify the original operator mint and one canonical zero-origin event. */
-export async function readWelcomeFundingEvidence(grant: { chainId: number; account: Address; amountWei: bigint; txHash: Hex }, suppliedClient?: PublicClient): Promise<FaucetFundingEvidence> {
+export async function readWelcomeFundingEvidence(grant: { chainId: number; account: Address; amountWei: bigint; txHash: Hex }, suppliedClient?: PublicClient, operator: Address = TESTNET_97.roles.operator): Promise<FaucetFundingEvidence> {
   try {
     if (grant.chainId !== 97 || grant.amountWei !== WELCOME_AMOUNT_WEI) throw new AppError(400, 'FUNDING_SOURCE_DISABLED', 'welcome requires chain 97 and exactly 10000 test USDT');
     const client = suppliedClient ?? createPublicClient({ transport: http(getConfig().rpcUrl ?? undefined, { timeout: 5_000, retryCount: 0 }) });
@@ -92,14 +98,14 @@ export async function readWelcomeFundingEvidence(grant: { chainId: number; accou
         receipt.blockNumber < 0n || !/^0x[0-9a-f]{64}$/.test(receipt.blockHash)) throw new Error('missing receipt identity');
     const block = await client.getBlock({ blockNumber: receipt.blockNumber });
     if (block.hash !== receipt.blockHash || block.number !== receipt.blockNumber) throw new AppError(409, 'FUNDING_REORGED', 'welcome receipt is not canonical; reconciliation required');
-    if (tx.blockHash !== receipt.blockHash || tx.blockNumber !== receipt.blockNumber || tx.from.toLowerCase() !== TESTNET_97.roles.operator ||
+    if (tx.blockHash !== receipt.blockHash || tx.blockNumber !== receipt.blockNumber || tx.from.toLowerCase() !== operator.toLowerCase() ||
         tx.to?.toLowerCase() !== TESTNET_97.contracts.usdt || tx.value !== 0n ||
-        tx.input.toLowerCase() !== encodeFunctionData({ abi: WELCOME_ABI, functionName: 'mint', args: [grant.account, WELCOME_AMOUNT_WEI] }).toLowerCase()) {
+        tx.input.toLowerCase() !== encodeFunctionData({ abi: WELCOME_ABI, functionName: 'welcomeFor', args: [grant.account] }).toLowerCase()) {
       throw new AppError(409, 'FUNDING_NOT_CONFIRMED', 'original authorized operator mint is required');
     }
     if (receipt.status === 'reverted') throw new AppError(409, 'WELCOME_REVERTED', 'welcome mint reverted; use the daily faucet');
-    if (receipt.status !== 'success' || !await client.readContract({ address: TESTNET_97.contracts.usdt, abi: WELCOME_ABI, functionName: 'isMinter',
-      args: [TESTNET_97.roles.operator], blockNumber: receipt.blockNumber })) throw new AppError(409, 'FUNDING_NOT_CONFIRMED', 'authorized successful mint is required');
+    if (receipt.status !== 'success' || !await client.readContract({ address: TESTNET_97.contracts.usdt, abi: WELCOME_ABI, functionName: 'isFaucet',
+      args: [operator], blockNumber: receipt.blockNumber })) throw new AppError(409, 'FUNDING_NOT_CONFIRMED', 'authorized successful mint is required');
     const matches = receipt.logs.filter(log => {
       if (log.address.toLowerCase() !== TESTNET_97.contracts.usdt || log.removed || log.transactionHash?.toLowerCase() !== grant.txHash ||
           log.blockHash !== receipt.blockHash || log.blockNumber !== receipt.blockNumber || log.logIndex === null || !Number.isSafeInteger(log.logIndex) || log.logIndex < 0) return false;
@@ -119,7 +125,7 @@ export async function readWelcomeFundingEvidence(grant: { chainId: number; accou
   }
 }
 
-export type PreparedWelcome = { hash: Hex; broadcast: () => Promise<void>; wait: () => Promise<void> };
+export type PreparedWelcome = { hash: Hex; raw: Hex; broadcast: () => Promise<void>; wait: () => Promise<void> };
 async function prepareWelcome(grant: WelcomeGrant, c: WelcomeConfig): Promise<PreparedWelcome> {
   const config = getConfig();
   if (!config.rpcUrl || !config.operatorPrivateKey || !/^0x[0-9a-fA-F]{64}$/.test(config.operatorPrivateKey)) throw new Error('operator unavailable');
@@ -127,12 +133,12 @@ async function prepareWelcome(grant: WelcomeGrant, c: WelcomeConfig): Promise<Pr
   if (operator.address.toLowerCase() !== TESTNET_97.roles.operator) throw new Error('operator mismatch');
   const transport = http(config.rpcUrl, { retryCount: 0, timeout: c.timeoutMs });
   const client = createPublicClient({ chain: bscTestnet, transport });
-  if (await client.getChainId() !== 97 || !await client.readContract({ address: TESTNET_97.contracts.usdt, abi: WELCOME_ABI, functionName: 'isMinter', args: [operator.address] })) throw new Error('operator not authorized');
+  if (await client.getChainId() !== 97 || !await client.readContract({ address: TESTNET_97.contracts.usdt, abi: WELCOME_ABI, functionName: 'isFaucet', args: [operator.address] })) throw new Error('operator not authorized');
   const wallet = createWalletClient({ account: operator, chain: bscTestnet, transport });
   const signed = await wallet.signTransaction(await wallet.prepareTransactionRequest({ to: TESTNET_97.contracts.usdt,
-    data: encodeFunctionData({ abi: WELCOME_ABI, functionName: 'mint', args: [grant.account, WELCOME_AMOUNT_WEI] }) }));
+    data: encodeFunctionData({ abi: WELCOME_ABI, functionName: 'welcomeFor', args: [grant.account] }) }));
   const hash = keccak256(signed);
-  return { hash, broadcast: async () => { if (await client.sendRawTransaction({ serializedTransaction: signed }) !== hash) throw new Error('unexpected hash'); },
+  return { hash, raw: signed, broadcast: async () => { if (await client.sendRawTransaction({ serializedTransaction: signed }) !== hash) throw new Error('unexpected hash'); },
     wait: async () => { await client.waitForTransactionReceipt({ hash, timeout: c.timeoutMs, confirmations: 1 }); } };
 }
 async function bounded<T>(work: Promise<T>, ms: number): Promise<T> {
@@ -159,7 +165,7 @@ export function createWelcomeService(deps: WelcomeDeps = {}) {
         await settle(grant, 'failed', null);
         throw new AppError(503, 'WELCOME_PREPARE_UNAVAILABLE', 'welcome preparation unavailable; no transaction sent; use daily faucet');
       }
-      await settle(grant, 'submitted', prepared.hash); // unknown commit: no broadcast
+      await settle(grant, 'submitted', prepared.hash, undefined, withTransaction, { raw: prepared.raw }); // unknown commit: no broadcast
       const submitted: WelcomeGrant = { ...grant, state: 'submitted', txHash: prepared.hash };
       try { assertHeld(); await bounded(prepared.broadcast(), c.timeoutMs); await bounded(prepared.wait(), c.timeoutMs); }
       catch { await settle(submitted, 'unknown', prepared.hash); return { ...submitted, state: 'unknown' }; }

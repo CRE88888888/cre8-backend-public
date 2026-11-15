@@ -27,6 +27,7 @@ export type Reservation = {
   hash: Hex; op: PackedSponsorOperation; config: PaymasterConfig; validUntil: number;
   verificationGas: bigint; callGas: bigint; maxFee: bigint; gasLimit: bigint; maxCostWei: bigint;
   budget: GasBudgetRequest;
+  now?: () => number;
 };
 export type GasPurpose = 'ordinary' | 'setup' | 'exit';
 export type GasBudgetRequest = {
@@ -49,13 +50,12 @@ export type PaymasterDeps = {
   now?: () => number;
   query?: Query;
   checkChain?: (op: PackedSponsorOperation, config: PaymasterConfig) => Promise<void>;
-  reserve?: (request: Reservation) => Promise<void>;
+  reserve?: (request: Reservation) => Promise<number | void>;
   readBudgetContext?: (op: PackedSponsorOperation, config: PaymasterConfig) => Promise<BudgetContext>;
   /** Internal scheduler evidence, bound to the exact canonical Kernel calldata. Never request input. */
   exitCallData?: Hex;
 };
 export const KERNEL_EXECUTE_ABI = parseAbi(['function execute(bytes32 execMode,bytes executionCalldata) payable']);
-const CLAIM_ABI = parseAbi(['function claim(uint256 amount)']);
 const TOKEN_ABI = parseAbi(['function approve(address spender,uint256 amount)', 'function transfer(address recipient,uint256 amount)']);
 const BYTES_ARRAY_ABI = [{ type: 'bytes[]' }] as const;
 const META_FACTORY_ABI = parseAbi(['function deployWithFactory(address factory,bytes createData,bytes32 salt) returns(address)']);
@@ -177,9 +177,6 @@ export function validateSponsoredCalls(op: PackedSponsorOperation, c: PaymasterC
         if (inner.functionName === 'approve') {
           if (!isAddressEqual(inner.args[0], c.executor)) throw new Error('invalid spender');
         } else if (context.owner === undefined || !isAddressEqual(inner.args[0], context.owner) || inner.args[1] === 0n) throw new Error('invalid withdrawal');
-      } else if (c.mockUsdt !== null && isAddressEqual(call.target, c.mockUsdt)) {
-        const inner = decodeFunctionData({ abi: CLAIM_ABI, data: call.callData });
-        if (inner.args[0] === 0n || encodeFunctionData({ abi: CLAIM_ABI, functionName: inner.functionName, args: inner.args }).toLowerCase() !== call.callData.toLowerCase()) throw new Error('invalid claim');
       } else throw new Error('unknown target');
     }
   } catch { throw rejected('PAYMASTER_CALL_FORBIDDEN', 403); }
@@ -364,25 +361,40 @@ export async function settleGasBudget(executionKey: string, state: 'submitted' |
 }
 
 /** Every state counts. Separate chain/day lock statement precedes the fresh aggregate snapshot (db 0027). */
-export async function reserveSponsorship(r: Reservation, transaction: typeof withTransaction = withTransaction): Promise<void> {
+export async function reserveSponsorship(r: Reservation, transaction: typeof withTransaction = withTransaction): Promise<number> {
   const c = r.config;
   try {
-    await transaction(async (client) => {
+    return await transaction(async (client) => {
       await client.query('set transaction isolation level read committed');
       await client.query("select set_config('statement_timeout', $1, true), set_config('lock_timeout', $1, true)", [String(c.timeoutMs)]);
+      // Execution lock spans UTC midnight; day locks still govern all site/account writers.
+      await client.query("select pg_advisory_xact_lock(hashtextextended('paymaster_execution:' || $1::text,0))", [gasExecutionKey(c.chainId, r.op)]);
       const pinned = await client.query<{ day: string }>("select to_char(transaction_timestamp() at time zone 'UTC', 'YYYY-MM-DD') as day");
       const day = pinned.rows[0]?.day;
       if (!day) throw new Error('missing UTC day');
       await client.query("select pg_advisory_xact_lock(hashtextextended('paymaster_sponsorships:' || $1::bigint::text || ':' || to_char($2::date, 'YYYY-MM-DD'), 0))", [c.chainId, day]);
       if (r.budget.chainId !== c.chainId || !isAddressEqual(r.budget.account, r.op.sender) || r.budget.gasLimit !== r.gasLimit || r.budget.maxFeePerGas !== r.maxFee) throw rejected('GAS_BUDGET_CONFLICT', 409);
       await reserveBudgetOnClient(r.budget, client, day, loadTradingConfig(process.env, c.chainId));
+      // A request that arrived earlier may acquire the execution lock later. Refresh after waiting.
+      const now = (r.now ?? (() => Math.floor(Date.now() / 1000)))();
+      const candidates = await client.query<{ user_op_hash: Hex; valid_until: Date }>(`select user_op_hash,valid_until
+        from paymaster_sponsorships where chain_id=$1 and paymaster=$2 and sender=$3
+        and valid_until>to_timestamp($4::double precision) order by valid_until`,
+        [c.chainId, c.address.toLowerCase(), r.op.sender.toLowerCase(), now]);
+      for (const candidate of candidates.rows) {
+        const until = candidate.valid_until.getTime() / 1000;
+        // Matching the complete EntryPoint hash binds nonce/calldata/initCode, gas, fees and signer.
+        // Rebuild locally; never persist keys or signatures and never perform RPC in the transaction.
+        if (Number.isSafeInteger(until) &&
+            (await authorization(r.op, c, until)).userOpHash === candidate.user_op_hash) return until;
+      }
       const previous = await client.query<{ matches: boolean }>(`select (chain_id = $2 and paymaster = $3 and sender = $4 and
         verification_gas_limit = $5::numeric and call_gas_limit = $6::numeric and pre_verification_gas = $7::numeric and
         paymaster_verification_gas_limit = $8::numeric and paymaster_post_op_gas_limit = $9::numeric and max_fee_per_gas = $10::numeric and
         valid_until = to_timestamp($11::double precision)) as matches from paymaster_sponsorships where user_op_hash = $1`, reservationParams(r));
       if (previous.rows.length > 0) {
         if (previous.rows[0]?.matches !== true) throw rejected('PAYMASTER_RESERVATION_CONFLICT', 409);
-        return;
+        return r.validUntil;
       }
       const usage = await client.query<{ count: string; gas: string; wei: string; account_count: string; account_gas: string; account_wei: string }>(`
         select count(*)::text as count, coalesce(sum(gas_limit),0)::text as gas, coalesce(sum(max_cost_wei),0)::text as wei,
@@ -400,6 +412,7 @@ export async function reserveSponsorship(r: Reservation, transaction: typeof wit
       await client.query(`insert into paymaster_sponsorships (user_op_hash,chain_id,paymaster,sender,verification_gas_limit,call_gas_limit,
         pre_verification_gas,paymaster_verification_gas_limit,paymaster_post_op_gas_limit,max_fee_per_gas,valid_until)
         values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,to_timestamp($11::double precision))`, reservationParams(r));
+      return r.validUntil;
     });
   } catch (error) {
     if (error instanceof AppError) throw error;
@@ -449,6 +462,21 @@ async function checkChain(op: PackedSponsorOperation, c: PaymasterConfig): Promi
   }
 }
 
+async function authorization(op: PackedSponsorOperation, c: PaymasterConfig, validUntil: number) {
+  const signedOp = { ...op, paymasterAndData: header(c) };
+  const hash = verifyingPaymasterHash(signedOp, c, validUntil, 0);
+  const signature = await privateKeyToAccount(c.signerPrivateKey).signMessage({ message: { raw: hash } });
+  const paymasterData = concatHex([encodeAbiParameters([{ type: 'uint48' }, { type: 'uint48' }], [validUntil, 0]), signature]);
+  const paymasterAndData = concatHex([header(c), paymasterData]);
+  // Actual EntryPoint v0.7 UserOp hash, including the final paymaster authorization, excluding account signature.
+  const packedHash = keccak256(encodeAbiParameters(
+    [{ type: 'address' }, { type: 'uint256' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'uint256' }, { type: 'bytes32' }, { type: 'bytes32' }],
+    [op.sender, op.nonce, keccak256(op.initCode), keccak256(op.callData), op.accountGasLimits, op.preVerificationGas, op.gasFees, keccak256(paymasterAndData)]));
+  const userOpHash = keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'address' }, { type: 'uint256' }], [packedHash, KERNEL_V3_3_ADDRESSES.entryPointV07, BigInt(c.chainId)]));
+  return { paymasterAndData, paymaster: c.address, paymasterData, paymasterVerificationGasLimit: c.verificationGasLimit,
+    paymasterPostOpGasLimit: c.postOpGasLimit, validUntil, validAfter: 0, userOpHash };
+}
+
 export function createPaymasterService(deps: PaymasterDeps = {}) {
   return { async sponsor(input: unknown, wallet: string) {
     try {
@@ -458,8 +486,9 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
       if (Object.keys(request).some((key) => !['userOperation', 'validUntil'].includes(key))) throw rejected('PAYMASTER_INVALID_OPERATION');
       const op = parsePackedSponsorOperation(request.userOperation);
       const now = (deps.now ?? (() => Math.floor(Date.now() / 1000)))();
-      const validUntil = request.validUntil ?? now + 300;
-      if (typeof validUntil !== 'number' || !Number.isSafeInteger(validUntil) || validUntil <= now || validUntil > now + 300) throw rejected('PAYMASTER_EXPIRED');
+      const requestedUntil = request.validUntil ?? now + 300;
+      if (typeof requestedUntil !== 'number' || !Number.isSafeInteger(requestedUntil) || requestedUntil <= now || requestedUntil > now + 300) throw rejected('PAYMASTER_EXPIRED');
+      let validUntil = requestedUntil;
       if (op.paymasterAndData !== '0x') throw rejected('PAYMASTER_INVALID_OPERATION');
       const calls = sponsoredCalls(op);
       const known = await bounded((deps.query ?? query)(`select s.owner, p.user_id from smart_accounts s join portfolios p on p.id = s.portfolio_id
@@ -479,16 +508,7 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
       }
       validateSponsoredCalls(op, c, { owner: hex(owner.owner, 20), assets });
       await bounded((deps.checkChain ?? checkChain)(op, c), c.timeoutMs);
-      const signedOp = { ...op, paymasterAndData: header(c) };
-      const hash = verifyingPaymasterHash(signedOp, c, validUntil, 0);
-      const signature = await privateKeyToAccount(c.signerPrivateKey).signMessage({ message: { raw: hash } });
-      const paymasterData = concatHex([encodeAbiParameters([{ type: 'uint48' }, { type: 'uint48' }], [validUntil, 0]), signature]);
-      const paymasterAndData = concatHex([header(c), paymasterData]);
-      // Actual EntryPoint v0.7 UserOp hash, including the final paymaster authorization, excluding account signature.
-      const packedHash = keccak256(encodeAbiParameters(
-        [{ type: 'address' }, { type: 'uint256' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'uint256' }, { type: 'bytes32' }, { type: 'bytes32' }],
-        [op.sender, op.nonce, keccak256(op.initCode), keccak256(op.callData), op.accountGasLimits, op.preVerificationGas, op.gasFees, keccak256(paymasterAndData)]));
-      const userOpHash = keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'address' }, { type: 'uint256' }], [packedHash, KERNEL_V3_3_ADDRESSES.entryPointV07, BigInt(c.chainId)]));
+      let signed = await authorization(op, c, validUntil);
       const context = await bounded((deps.readBudgetContext ?? readBudgetContext)(op, c), c.timeoutMs);
       if (deps.exitCallData !== undefined && deps.exitCallData.toLowerCase() === op.callData.toLowerCase()) {
         const executorCall = calls.length === 1 ? calls[0] : undefined;
@@ -499,12 +519,15 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
         context.purpose = 'exit';
       }
       const cost = gasCost(op, c);
-      await (deps.reserve ?? reserveSponsorship)({ hash: userOpHash, op, config: c, validUntil, ...cost,
+      const reservedUntil = await (deps.reserve ?? reserveSponsorship)({ hash: signed.userOpHash, op, config: c, validUntil, now: deps.now ?? (() => Math.floor(Date.now() / 1000)), ...cost,
         budget: { executionKey: gasExecutionKey(c.chainId, op), chainId: c.chainId, account: op.sender,
           gasLimit: cost.gasLimit, maxFeePerGas: cost.maxFee, ...context } });
+      if (reservedUntil !== undefined && reservedUntil !== validUntil) {
+        validUntil = reservedUntil;
+        signed = await authorization(op, c, validUntil);
+      }
       if ((deps.now ?? (() => Math.floor(Date.now() / 1000)))() >= validUntil) throw rejected('PAYMASTER_EXPIRED');
-      return { paymasterAndData, paymaster: c.address, paymasterData, paymasterVerificationGasLimit: c.verificationGasLimit,
-        paymasterPostOpGasLimit: c.postOpGasLimit, validUntil, validAfter: 0, userOpHash };
+      return signed;
     } catch (error) {
       const safe = error instanceof AppError ? error : rejected('PAYMASTER_DEPENDENCY_UNAVAILABLE', 503);
       // Never print request bytes, signatures, keys, RPC/DB exception text or connection strings.

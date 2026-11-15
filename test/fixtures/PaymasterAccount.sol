@@ -31,4 +31,5 @@ contract PaymasterAccount is IAccount {
 contract PaymasterClaimTarget {
     mapping(address => uint256) public claimed;
     function claim(uint256 amount) external { claimed[msg.sender] += amount; }
+    function enroll(address account, uint256 id) external { require(account == msg.sender); claimed[account] = id; }
 }

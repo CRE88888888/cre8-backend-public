@@ -2,13 +2,14 @@ import { isIP } from 'node:net';
 import { AppError } from './errors.js';
 import { ConfigurationError, loadRateLimitConfig } from './config.js';
 import type { RateLimitConfig } from './config.js';
+import { withTransaction } from './db.js';
 
 const MINUTE_MS = 60_000;
 const DAY_MS = 86_400_000;
 
 export type RateLimitPolicy = { limit: number; windowMs: number };
 export type RateLimitDecision = { allowed: boolean; retryAfterSeconds: number };
-/** consume must atomically check and increment. A shared Postgres implementation can replace this store. */
+/** consume must atomically check and increment; daily production budgets are persisted in Postgres. */
 export interface RateLimitStore {
   consume(key: string, policy: RateLimitPolicy, now: number): Promise<RateLimitDecision>;
 }
@@ -56,11 +57,48 @@ export class MemoryRateLimitStore implements RateLimitStore {
 
 export type WalletAction = 'strategies' | 'versions' | 'portfolios' | 'plan' | 'redeem' | 'close' | 'assets';
 
+/** Daily attempted-request budgets use the database UTC clock and one atomic UPSERT.
+ * Never retry an ambiguous commit or fall back to process memory.
+ */
+export class PersistentRateLimitStore implements RateLimitStore {
+  readonly #shortWindows = new MemoryRateLimitStore();
+  constructor(readonly transaction = withTransaction) {}
+  async consume(key: string, policy: RateLimitPolicy, now: number): Promise<RateLimitDecision> {
+    const match = /^wallet:(0x[0-9a-f]{40}):(strategies|versions|portfolios)$/.exec(key);
+    if (policy.windowMs !== DAY_MS) return this.#shortWindows.consume(key, policy, now);
+    if (!match || !match[1] || /^0x0{40}$/.test(match[1]) || !Number.isSafeInteger(policy.limit) || policy.limit < 0) throw new RangeError('invalid daily request budget');
+    const actions: Record<string, string> = { strategies: 'create_strategy', versions: 'publish_version', portfolios: 'join' };
+    const action = actions[match[2] ?? ''];
+    if (!action) throw new RangeError('invalid daily request action');
+    return this.transaction(async client => {
+      await client.query("set local statement_timeout='5s'");
+      await client.query("set local lock_timeout='5s'");
+      const clock = (await client.query<{ retry: number }>(`select greatest(1,ceil(extract(epoch from
+        (date_trunc('day',transaction_timestamp() at time zone 'UTC')+interval '1 day'-(transaction_timestamp() at time zone 'UTC')))))::int as retry`)).rows[0];
+      if (!clock || !Number.isSafeInteger(clock.retry) || clock.retry < 1) throw new Error('budget clock unavailable');
+      const consumed = await client.query(`insert into daily_operation_counts(owner,action,utc_day,count)
+        select $1,$2,(transaction_timestamp() at time zone 'UTC')::date,1 where $3::bigint>0
+        on conflict(owner,action,utc_day) do update set count=daily_operation_counts.count+1,updated_at=clock_timestamp()
+        where daily_operation_counts.count<$3::bigint returning count`, [match[1], action, policy.limit]);
+      return { allowed: consumed.rows.length === 1, retryAfterSeconds: consumed.rows.length === 1 ? 0 : clock.retry };
+    });
+  }
+}
+
+/** Retain seven completed UTC days; active-day counters are never reset. */
+export async function pruneDailyOperationCounts(): Promise<void> {
+  await withTransaction(async client => {
+    await client.query("set local statement_timeout='5s'");
+    await client.query("set local lock_timeout='5s'");
+    await client.query("delete from daily_operation_counts where utc_day<(transaction_timestamp() at time zone 'UTC')::date-7");
+  });
+}
+
 export class RequestRateLimiter {
   readonly #trustedProxies: Set<string>;
   constructor(
     readonly config: RateLimitConfig = loadRateLimitConfig(),
-    readonly store: RateLimitStore = new MemoryRateLimitStore(),
+    readonly store: RateLimitStore = new PersistentRateLimitStore(),
     readonly now: () => number = Date.now,
   ) {
     this.#trustedProxies = new Set(config.trustedProxyIps.map((ip) => {

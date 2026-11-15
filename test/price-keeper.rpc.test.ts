@@ -24,7 +24,7 @@ test('keeper manifest: rejects wrong chain, missing/zero/duplicate contracts and
 
 test('keeper chain verifies all pools, minters, keeper permissions and oracle/feed wiring before writes', async () => {
   const { chain, state } = keeperChainFixture(); await chain.verify(); assert.equal(state.sends, 0);
-  assert.equal(state.calls.filter((c) => c.name === 'isMinter').length, 93);
+  assert.equal(state.calls.filter((c) => c.name === 'isMinter').length, 92);
   assert.equal(state.calls.filter((c) => c.name === 'keeper').length, 12);
   for (const bad of ['missing code', 'factory', 'numeraire', 'symbol', 'decimals', 'isMinter', 'keeper', 'getPool',
     'oracleOf', 'pool', 'twapWindow', 'RECENT_WINDOW', 'secondaryOf', 'assetFeed', 'numeraireFeed', 'maxAge']) {
@@ -35,10 +35,17 @@ test('keeper chain verifies all pools, minters, keeper permissions and oracle/fe
 test('keeper wrong chain is rejected before reads and before every possible write', async () => {
   for (const chainId of [1, 56, 1337]) {
     const { state, chain, manifest } = keeperChainFixture(); state.chainId = chainId;
+    const market = manifest.markets[0]; assert.ok(market);
     await assert.rejects(chain.verify(), /97/); await assert.rejects(chain.io.head(), /97/);
-    await assert.rejects(chain.io.mint(manifest.usdt, 1n), /97/); await assert.rejects(chain.io.push(manifest.cashFeed, 1n), /97/);
+    await assert.rejects(chain.io.mint(market.token, 1n), /97/); await assert.rejects(chain.io.push(manifest.cashFeed, 1n), /97/);
     assert.equal(state.sends, 0); assert.equal(state.calls.length, 0);
   }
+});
+
+test('#97 keeper chain refuses every USDT mint without a write, including zero and uint256 maximum', async () => {
+  const { state, chain, manifest } = keeperChainFixture();
+  for (const amount of [0n, 1n, (1n << 256n) - 1n]) await assert.rejects(chain.io.mint(manifest.usdt, amount), /prefunded/);
+  assert.equal(state.sends, 0);
 });
 
 test('keeper inspects 92 markets and both oracle directions at one pinned block', async () => {
@@ -86,6 +93,7 @@ test('keeper HTTP RPC timeout is bounded and never retried', async () => {
 test('keeper writes require a successful canonical receipt and never rebroadcast an unknown result', async () => {
   for (const fault of ['', 'broadcast', 'reverted', 'replaced', 'reorg', 'receipt RPC']) {
     const manifest = parseManifest(manifestInput());
+    const market = manifest.markets[0]; assert.ok(market);
     const hash = `0x${'ab'.repeat(32)}`;
     const blockHash = `0x${'cd'.repeat(32)}`;
     let sends = 0;
@@ -111,9 +119,9 @@ test('keeper writes require a successful canonical receipt and never rebroadcast
       }
     } }, { retryCount: 0 });
     const chain = createKeeperChain('http://127.0.0.1:1', { address: manifest.keeper, type: 'json-rpc' }, manifest, (line) => logs.push(line), transport);
-    if (fault === 'receipt RPC') await assert.rejects(chain.io.mint(manifest.usdt, 1n), /secret credential in receipt RPC/);
-    else if (fault) await assert.rejects(chain.io.mint(manifest.usdt, 1n));
-    else await chain.io.mint(manifest.usdt, 1n);
+    if (fault === 'receipt RPC') await assert.rejects(chain.io.mint(market.token, 1n), /secret credential in receipt RPC/);
+    else if (fault) await assert.rejects(chain.io.mint(market.token, 1n));
+    else await chain.io.mint(market.token, 1n);
     assert.equal(sends, 1);
     assert.equal(logs.filter((line) => line.includes('confirmed')).length, fault ? 0 : 1);
     assert.doesNotMatch(logs.join('\n'), /secret|credential/);

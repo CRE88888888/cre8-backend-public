@@ -65,8 +65,12 @@ jobs:
           test/user-operation.test.ts
           test/funding.test.ts
           test/faucet.test.ts
+          test/paymaster.test.ts
+          test/paymaster-allowlist.test.ts
+          test/paymaster.rpc.test.ts
           test/points.test.ts
           test/welcome-grants.test.ts
+          test/relayer-outbox.test.ts
           test/holdings-scan.test.ts
           test/kernel.test.ts
           test/notify.test.ts

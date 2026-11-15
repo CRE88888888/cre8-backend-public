@@ -20,7 +20,7 @@ function rawScenario() {
 function fixture() {
   const scenario = parseScenario(rawScenario());
   const state = { head: { number: 100n, timestamp: 1060n }, now: 1_060_000, fail: '', refreshMissing: false, inspections: 0,
-    swaps: [] as string[], targets: [] as bigint[], pushes: [] as bigint[], mints: [] as string[], logs: [] as string[], alerts: [] as string[], balances: new Map<string, bigint>() };
+    swaps: [] as string[], targets: [] as bigint[], pushes: [] as bigint[], mints: [] as string[], logs: [] as string[], alerts: [] as string[], balances: new Map<string, bigint>([[addr(1), 2_000_000n * unit]]) };
   const observations: Observation[] = TESTNET_ASSETS.map((spec, index) => ({
     market: { symbol: spec.symbol, token: addr(index + 10), pool: addr(index + 1000), oracle: addr(index + 2000),
       fee: spec.fee, decimals: spec.decimals, maxFeedAge: spec.maxFeedAge,
@@ -107,12 +107,23 @@ test('keeper bounds and frequency: exact thresholds, zero movement, dust and del
   assert.throws(() => canSwap(999n, 1000n, 60)); assert.throws(() => canSwap(1000n, 0n, 60));
 });
 
-test('keeper tops up USDT between swaps and never exceeds one swap per asset per round', async () => {
-  const { state, keeper } = fixture(); state.balances.set(addr(1), 15_000n * unit);
+test('keeper uses prefunded USDT and never exceeds one swap per asset per round', async () => {
+  const { state, keeper } = fixture(); state.balances.set(addr(1), 2_000_000n * unit);
   await keeper.round();
   assert.equal(state.swaps.length, 92); assert.equal(new Set(state.swaps).size, 92);
   assert.ok(state.mints.length >= 4); assert.equal(state.pushes.length, 12);
+  assert.ok(!state.mints.includes(addr(1)));
   await keeper.round(); assert.equal(state.swaps.length, 92); assert.equal(state.pushes.length, 12);
+});
+
+test('#97 keeper never mints USDT: zero and below minimum halt; equality covers the next swap', async () => {
+  for (const balance of [0n, 10_000n * unit - 1n, 10_000n * unit]) {
+    const f = fixture(); f.state.balances.set(addr(1), balance);
+    await assert.rejects(f.keeper.round(), /halted/);
+    assert.ok(!f.state.mints.includes(addr(1)));
+    assert.equal(f.state.swaps.length, balance === 10_000n * unit ? 1 : 0);
+    assert.equal(f.state.alerts.length, 1);
+  }
 });
 
 test('keeper refuses incomplete refreshed observations instead of publishing a partial feed set', async () => {
@@ -141,7 +152,7 @@ test('keeper inventory only mints below threshold; threshold equality and exact 
 
 test('keeper RPC/read/write failures halt permanently, alert once and redact upstream errors', async () => {
   for (const failure of ['head', 'inspect', 'balance', 'mint', 'swap', 'push']) {
-    const { state, keeper } = fixture(); state.fail = failure; state.balances.set(addr(1), 0n);
+    const { state, keeper } = fixture(); state.fail = failure;
     await assert.rejects(keeper.round(), /halted/);
     assert.equal(state.alerts.length, 1); assert.doesNotMatch(state.logs.join('\n') + state.alerts.join('\n'), /secret|credential/);
     await assert.rejects(keeper.round(), /stopped/); assert.equal(state.alerts.length, 1);

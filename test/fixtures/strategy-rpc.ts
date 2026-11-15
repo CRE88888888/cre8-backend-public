@@ -1,4 +1,4 @@
-import { createPublicClient, custom, encodeAbiParameters, toFunctionSelector, toEventSelector, toHex, encodeFunctionData, zeroAddress } from 'viem';
+import { createPublicClient, custom, keccak256, encodeAbiParameters, toFunctionSelector, toEventSelector, toHex, encodeFunctionData, parseAbi, zeroAddress } from 'viem';
 import type { Address, Hex } from 'viem';
 import { WELCOME_ABI } from '../../src/welcome-grants.js';
 import { TESTNET_97 } from '../../src/testnet-profile.js';
@@ -17,7 +17,7 @@ export function strategyRpc(allocation: Allocation, configHash: Hex, activeAt: D
     weights: allocation.assets.map((asset) => asset.weightBps), version: 1, pinned: 1, strategyId: 82n,
     historicalPinned: 1, historicalNow: BigInt(activeAt.getTime() / 1000), latestBlockNumber: 130n,
     mint: false, minter: true, transferFrom: zeroAddress as Address, txFrom: TESTNET_97.roles.operator as Address, txTo: TESTNET_97.contracts.usdt as Address, txValue: 0n, wrongInput: false, missingReceipt: false,
-    blockReads: 0, reorgAtBlockRead: 0, cashRaw: TEST_AMOUNT, fail: '', reads: [] as string[] };
+    txNonce: 0, receiptDelayMs: 0, broadcasts: [] as Hex[], blockReads: 0, reorgAtBlockRead: 0, cashRaw: TEST_AMOUNT, fail: '', reads: [] as string[] };
   const client = createPublicClient({ transport: custom({ request: async ({ method, params }) => {
     state.reads.push(method);
     if (state.fail === method || state.fail === '*') throw new Error('SECRET_RPC_CREDENTIAL');
@@ -29,9 +29,14 @@ export function strategyRpc(allocation: Allocation, configHash: Hex, activeAt: D
       logsBloom: `0x${'0'.repeat(512)}`, sha3Uncles: OTHER_HASH, uncles: [] }; }
     if (method === 'eth_getTransactionByHash') return { hash: state.txHash, from: state.txFrom, to: state.txTo,
       blockHash: state.receiptBlockHash, blockNumber: '0x82', transactionIndex: '0x0', value: toHex(state.txValue),
-      input: state.wrongInput ? '0x' : encodeFunctionData({ abi: WELCOME_ABI, functionName: 'mint', args: [state.to, state.amount] }),
-      nonce: '0x0', gas: '0x100000', gasPrice: '0x1', type: '0x0', v: '0x1b', r: OTHER_HASH, s: OTHER_HASH };
+      input: state.wrongInput ? '0x' : state.mint ? encodeFunctionData({ abi: parseAbi(['function welcomeFor(address to)']), functionName: 'welcomeFor', args: [state.to] }) : encodeFunctionData({ abi: parseAbi(['function claimFor(address,uint256)']), functionName: 'claimFor', args: [state.to, state.amount] }),
+      nonce: toHex(state.txNonce), gas: '0x100000', gasPrice: '0x1', type: '0x0', v: '0x1b', r: OTHER_HASH, s: OTHER_HASH };
+    if (method === 'eth_sendRawTransaction') {
+      const raw = params?.[0]; if (typeof raw !== 'string' || !raw.startsWith('0x')) throw new Error('missing raw');
+      const serialized: Hex = `0x${raw.slice(2)}`; state.broadcasts.push(serialized); return keccak256(serialized);
+    }
     if (method === 'eth_getTransactionReceipt') {
+      if (state.receiptDelayMs > 0) await new Promise(resolve => setTimeout(resolve, state.receiptDelayMs));
       if (state.missingReceipt) return null;
       const log = { address: state.token, blockHash: state.receiptBlockHash, blockNumber: '0x82', transactionHash: state.txHash,
         transactionIndex: '0x0', logIndex: toHex(state.logIndex), removed: state.removed,
@@ -47,7 +52,7 @@ export function strategyRpc(allocation: Allocation, configHash: Hex, activeAt: D
       if (!Array.isArray(params) || typeof params[0] !== 'object' || params[0] === null) throw new Error('missing call');
       const data: unknown = Reflect.get(params[0], 'data');
       if (typeof data !== 'string') throw new Error('missing calldata');
-      if (data.startsWith(toFunctionSelector('isMinter(address)'))) return encodeAbiParameters([{ type: 'bool' }], [state.minter]);
+      if (data.startsWith(toFunctionSelector('isFaucet(address)'))) return encodeAbiParameters([{ type: 'bool' }], [state.minter]);
       if (data.startsWith(toFunctionSelector('balanceOf(address)'))) return encodeAbiParameters([{ type: 'uint256' }], [state.cashRaw]);
       if (data.startsWith(toFunctionSelector('version(uint256,uint16)'))) return encodeAbiParameters([
         { type: 'tuple', components: [{ name: 'assets', type: 'address[]' }, { name: 'weightsBps', type: 'uint16[]' }, { name: 'scheduleHash', type: 'bytes32' }, { name: 'activeAt', type: 'uint64' }] },

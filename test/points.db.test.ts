@@ -156,7 +156,13 @@ test('#67 invite code uniqueness, case sensitivity, collision retry, one binding
   const attempts = await Promise.allSettled([bindInvite(original, address(3), c), bindInvite(second, address(3), c)]);
   assert.equal(attempts.filter((r) => r.status === 'fulfilled').length, 1);
   assert.equal(attempts.filter((r) => r.status === 'rejected' && errorCode('INVITE_INELIGIBLE')(r.reason)).length, 1);
-  const stats = await inviteStats(OWNER, c); assert.equal(stats.invited, '2'); assert.equal(stats.qualified, '0');
+  const stats = await inviteStats(OWNER, c);
+  // Either transaction may win: compare each inviter against the committed relation.
+  assert.equal(stats.invited, attempts[0]?.status === 'fulfilled' ? '2' : '1');
+  const otherStats = await inviteStats(address(2), c);
+  assert.equal(otherStats.invited, attempts[1]?.status === 'fulfilled' ? '1' : '0');
+  assert.equal(BigInt(stats.invited) + BigInt(otherStats.invited), 2n);
+  assert.equal(stats.qualified, '0');
 });
 
 test('#67 concurrent inverse invitation edges cannot both commit a cycle', async () => {

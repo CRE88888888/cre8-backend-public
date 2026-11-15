@@ -33,8 +33,36 @@ import { AppError } from '../src/errors.js';
 import { createPrivyLogin, MAX_PRIVY_TOKEN_LENGTH } from '../src/privy.js';
 import { privyFixture, privyMemory } from './fixtures/privy.js';
 
+test('#97 bundler errors and strategy RPC failures never expose upstream credentials in HTTP or logs', async () => {
+  const logs: string[] = [];
+  const bodies: string[] = [];
+  const original = console.error;
+  console.error = (...values: unknown[]) => { logs.push(values.map(String).join(' ')); };
+  const server = createServer({
+    auth: { authenticate: async () => '0x1000000000000000000000000000000000000001',
+      issueNonce: () => { throw new Error('unexpected'); }, login: async () => { throw new Error('unexpected'); }, logout: async () => {} },
+    rateLimiter: new RequestRateLimiter(loadRateLimitConfig({}), new MemoryRateLimitStore()),
+    bundlerUrl: 'https://SECRETKEY.example/path/SECRETKEY?apiKey=SECRETKEY',
+    bundlerFetch: async () => { throw new Error('network failure https://SECRETKEY.example/SECRETKEY'); },
+    createStrategy: async () => { throw new Error('RPC stack https://rpc.example/SECRETKEY'); },
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address(); assert.ok(address && typeof address !== 'string');
+    for (const [path, body, status] of [['/bundler', { method: 'eth_chainId', id: 1, jsonrpc: '2.0', params: [] }, 502],
+      ['/strategies', { name: 'fund' }, 500]] as const) {
+      const response = await fetch(`http://127.0.0.1:${address.port}${path}`, { method: 'POST', body: JSON.stringify(body) });
+      assert.equal(response.status, status);
+      bodies.push(await response.text());
+    }
+    assert.match(logs.join('\n'), /unhandled request error/);
+    assert.doesNotMatch(logs.join('\n'), /SECRETKEY|https:|RPC stack/);
+    assert.doesNotMatch(bodies.join('\n'), /SECRETKEY|https:/);
+  } finally { console.error = original; server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+});
+
 test('#59 nonce flood stops at the IP allowance', async () => {
-  const server = createServer({ rateLimiter: new RequestRateLimiter(loadRateLimitConfig({}), undefined, () => 1_000) });
+  const server = createServer({ rateLimiter: new RequestRateLimiter(loadRateLimitConfig({}), new MemoryRateLimitStore(), () => 1_000) });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   try {
     const { port } = server.address() as AddressInfo;
@@ -575,7 +603,7 @@ test('#59 memory budget is atomic at zero, limit, limit+1, UTC boundary and capa
 test('#59 wallet, operation and IP budgets are independent; casing and new tokens cannot reset wallets', async () => {
   let now = 0;
   const config = loadRateLimitConfig({ RATE_LIMIT_STRATEGIES_PER_DAY: '1', RATE_LIMIT_AUTH_PER_MINUTE: '1' });
-  const limiter = new RequestRateLimiter(config, undefined, () => now);
+  const limiter = new RequestRateLimiter(config, new MemoryRateLimitStore(), () => now);
   await limiter.wallet('strategies', '0xAB');
   await assert.rejects(limiter.wallet('strategies', '0xab'), RateLimitError);
   await limiter.wallet('strategies', '0xcd');
@@ -644,7 +672,7 @@ for (const entry of budgetActions) {
     let calls = 0;
     const touch = async () => { calls++; return {}; };
     const limiter = new RequestRateLimiter({ ...loadRateLimitConfig({}), strategiesPerDay: 2, versionsPerDay: 2,
-      portfoliosPerDay: 2, planPerMinute: 2, redeemPerMinute: 2, closePerMinute: 2, assetsPerMinute: 2 }, undefined, () => now);
+      portfoliosPerDay: 2, planPerMinute: 2, redeemPerMinute: 2, closePerMinute: 2, assetsPerMinute: 2 }, new MemoryRateLimitStore(), () => now);
     await withBudgetServer(async (base) => {
       const account = privateKeyToAccount(generatePrivateKey());
       const firstToken = await budgetToken(base, account);
@@ -676,7 +704,7 @@ for (const entry of budgetActions) {
 }
 
 test('#59 HTTP: auth IP limits apply to login/nonce/logout; preflight is free and fake XFF cannot bypass', async () => {
-  const limiter = new RequestRateLimiter({ ...loadRateLimitConfig({}), authPerMinute: 2 }, undefined, () => 1_000);
+  const limiter = new RequestRateLimiter({ ...loadRateLimitConfig({}), authPerMinute: 2 }, new MemoryRateLimitStore(), () => 1_000);
   await withBudgetServer(async (base) => {
     const options = await fetch(base + '/auth/nonce', { method: 'OPTIONS' });
     assert.equal(options.status, 204);
@@ -689,7 +717,7 @@ test('#59 HTTP: auth IP limits apply to login/nonce/logout; preflight is free an
 });
 
 test('#59 HTTP: trusted proxy users get separate auth budgets and logout revokes only its token', async () => {
-  const limiter = new RequestRateLimiter({ ...loadRateLimitConfig({}), authPerMinute: 1, trustedProxyIps: ['127.0.0.1'] }, undefined, () => 1_000);
+  const limiter = new RequestRateLimiter({ ...loadRateLimitConfig({}), authPerMinute: 1, trustedProxyIps: ['127.0.0.1'] }, new MemoryRateLimitStore(), () => 1_000);
   await withBudgetServer(async (base) => {
     for (const ip of ['192.0.2.1', '192.0.2.2']) {
       assert.equal((await fetch(base + '/auth/nonce', { method: 'POST', headers: { 'x-forwarded-for': ip } })).status, 200);
@@ -718,7 +746,7 @@ test('#59 HTTP: failed dependencies consume attempts and unavailable budget stor
     assert.equal((await request()).status, 503);
     assert.equal((await request()).status, 429);
     assert.equal(calls, 1);
-  }, { rateLimiter: new RequestRateLimiter({ ...loadRateLimitConfig({}), planPerMinute: 1 }, undefined, () => 1_000),
+  }, { rateLimiter: new RequestRateLimiter({ ...loadRateLimitConfig({}), planPerMinute: 1 }, new MemoryRateLimitStore(), () => 1_000),
     planPreview: async () => { calls++; throw Object.assign(new Error('database unavailable'), { code: 'ECONNREFUSED' }); } });
   const store: RateLimitStore = { consume: async () => { throw new Error('sensitive database connection'); } };
   await withBudgetServer(async (base) => {
@@ -746,7 +774,7 @@ test('#59 operator plan/close budgets cannot bypass the wallet limits, while una
     }
     assert.equal(calls, 2);
   }, { operatorWallets: [account.address], operatorRebalanceEnabled: () => true,
-    rateLimiter: new RequestRateLimiter({ ...loadRateLimitConfig({}), planPerMinute: 1, closePerMinute: 1 }, undefined, () => 1_000),
+    rateLimiter: new RequestRateLimiter({ ...loadRateLimitConfig({}), planPerMinute: 1, closePerMinute: 1 }, new MemoryRateLimitStore(), () => 1_000),
     operatorPlanPreview: async (portfolioId) => { calls++; return { portfolioId, outcome: 'noop', reason: 'aligned', steps: [], rationale: null }; },
     operatorForceClose: async () => { calls++; return {}; },
   });
@@ -963,7 +991,7 @@ test('#63 HTTP Privy shares auth IP limits with SIWE, rejects methods and malfor
   const server = createServer({ privyLogin: login, auth: {
     issueNonce: () => auth.issueNonce(), login: (m, s) => auth.login(m, s),
     authenticate: (header) => auth.authenticate(header), logout: (header) => auth.logout(header),
-  }, rateLimiter: new RequestRateLimiter({ ...loadRateLimitConfig({}), authPerMinute: 5 }, undefined, () => 1000) });
+  }, rateLimiter: new RequestRateLimiter({ ...loadRateLimitConfig({}), authPerMinute: 5 }, new MemoryRateLimitStore(), () => 1000) });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   assert.ok(address !== null && typeof address !== 'string');

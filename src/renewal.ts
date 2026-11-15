@@ -204,7 +204,9 @@ export async function buildRenewalParams(
   deps: Partial<RenewalParamsDeps> = {},
 ): Promise<RenewalParams> {
   const find = deps.requireOwnedPortfolio ?? requireOwnedPortfolio;
-  const portfolio = await find(portfolioId, wallet);
+  const chainId = deps.chainId ?? getConfig().chainId;
+  const portfolio = await find(portfolioId, wallet, { chainId });
+  if (portfolio.chainId !== chainId) throw new AppError(409, 'PORTFOLIO_CHAIN_MISMATCH', 'portfolio has no smart account on the configured chain');
 
   // 設定診斷只留在 server log；HTTP 使用固定訊息，避免 env 或底層例外外洩。
   const sessionKeyConfig = resolveSessionKeyConfigOrFail(deps.sessionKeyConfig);
@@ -220,19 +222,6 @@ export async function buildRenewalParams(
     publicClient,
     validUntil,
   });
-
-  const chainId = deps.chainId ?? getConfig().chainId;
-  if (portfolio.chainId !== chainId) {
-    console.warn(
-      JSON.stringify({
-        level: 'warn',
-        msg: 'renewal targets a different chain than the configured CHAIN_ID',
-        portfolioId,
-        portfolioChainId: portfolio.chainId,
-        configuredChainId: chainId,
-      }),
-    );
-  }
 
   return {
     portfolioId: portfolio.id,

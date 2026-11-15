@@ -5,7 +5,7 @@ import { CallPolicyVersion, CallType, toCallPolicy, toGasPolicy, toTimestampPoli
 import { toEmptyECDSASigner } from '@zerodev/permissions/signers';
 import { encodeCallDataEpV07, KernelV3_3AccountAbi } from '@zerodev/sdk';
 import { KERNEL_V3_3 } from '@zerodev/sdk/constants';
-import { concatHex, createPublicClient, decodeFunctionData, defineChain, encodeFunctionData, erc20Abi, http, slice, toHex, zeroAddress } from 'viem';
+import { concatHex, createPublicClient, decodeFunctionData, defineChain, encodeFunctionData, erc20Abi, http, parseAbi, slice, toHex, zeroAddress } from 'viem';
 import type { Address, Hex } from 'viem';
 import { EXECUTOR_SELECTOR } from '../src/chain.js';
 import { AppError } from '../src/errors.js';
@@ -23,6 +23,19 @@ const call = (data: Hex, to: Address = asset, value = 0n): Call => ({ to, data, 
 const approve = (spender: Address = C.executor, amount = max) => encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [spender, amount] });
 const transfer = (recipient: Address = OWNER as Address, amount = 1n) => encodeFunctionData({ abi: erc20Abi, functionName: 'transfer', args: [recipient, amount] });
 const forbidden = (error: unknown) => error instanceof AppError && error.code === 'PAYMASTER_CALL_FORBIDDEN';
+
+test('#97 direct MockUSDT claims, alone or hidden in a batch, never receive sponsorship or quota reservations', async () => {
+  let reservations = 0;
+  for (const amount of [0n, 1n, 10_000n * 10n ** 18n, max]) {
+    const data = encodeFunctionData({ abi: parseAbi(['function claim(uint256 amount)']), functionName: 'claim', args: [amount] });
+    for (const calls of [[call(data, C.usdt)], [call(approve()), call(data, C.usdt)]]) {
+      await assert.rejects(service({ reserve: async () => { reservations++; } }).sponsor({
+        userOperation: operation({ callData: await encodeCallDataEpV07(calls) }),
+      }, OWNER), forbidden);
+    }
+  }
+  assert.equal(reservations, 0);
+});
 const client = createPublicClient({ chain: defineChain({ id: 97, name: 'local fixture', nativeCurrency: { name: 'tBNB', symbol: 'tBNB', decimals: 18 },
   rpcUrls: { default: { http: ['http://127.0.0.1:8558'] } } }), transport: http('http://127.0.0.1:8558') });
 

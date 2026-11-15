@@ -9,7 +9,7 @@ import {
 } from './chain.js';
 import { getConfig, getGasConfig, requireSessionKeyConfig } from './config.js';
 import { query, withTransaction } from './db.js';
-import { ForbiddenError, NotFoundError, ValidationError } from './errors.js';
+import { AppError, ForbiddenError, NotFoundError, ValidationError } from './errors.js';
 import { describeGasStatus } from './funding.js';
 import type { GasStatus } from './funding.js';
 import { buildSessionPermissions, deriveSessionKeyFor, sessionValidUntil, sudoValidator } from './permissions.js';
@@ -569,7 +569,7 @@ export type OwnedPortfolio = {
 
 export type OwnedPortfolioDeps = {
   query: typeof query;
-  /** 有多個 chain 的帳戶時優先挑這一個（production = `getConfig().chainId`）。 */
+  /** 只允許這個部署 chain 的帳戶（production = `getConfig().chainId`）。 */
   chainId: number;
 };
 
@@ -610,8 +610,8 @@ export async function requireOwnedPortfolio(
     throw new NotFoundError(`portfolio ${portfolioId} has no smart account to renew`);
   }
   const chainId = deps.chainId ?? getConfig().chainId;
-  const account = accounts.rows.find((candidate) => Number(candidate.chain_id) === chainId) ?? accounts.rows[0];
-  if (account === undefined) throw new NotFoundError(`portfolio ${portfolioId} has no smart account to renew`);
+  const account = accounts.rows.find((candidate) => Number(candidate.chain_id) === chainId);
+  if (account === undefined) throw new AppError(409, 'PORTFOLIO_CHAIN_MISMATCH', 'portfolio has no smart account on the configured chain');
 
   const keys = await find<{ key_ref: string }>(
     'select key_ref from session_keys where portfolio_id = $1 order by key_ref',

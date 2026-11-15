@@ -486,7 +486,7 @@ async function main(): Promise<number> {
     return 1;
   }
 
-  if (config.chainId === 97) (await checkTestnetProfile(client)).forEach(record);
+  if (config.chainId === 97) (await checkTestnetProfile(client, undefined, { strict: args.strict })).forEach(record);
 
   // --- 5. 合約上真的有 code ---------------------------------------------
   for (const [label, address] of [

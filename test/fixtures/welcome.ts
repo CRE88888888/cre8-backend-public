@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
+import { parseTransaction } from 'viem';
 import type { Address, Hex } from 'viem';
 import { query, migrate } from '../../src/db.js';
 import { createPortfolioStrategyService } from '../../src/portfolio-strategies.js';
@@ -9,10 +10,11 @@ import { requireTypedVersion, validateAllocation } from '../../src/strategies.js
 import { canonicalConfigHash } from '../../src/strategy-execution.js';
 import type { AssetExecution, AssetSetting } from '../../src/strategy-execution.js';
 import { assertVersionOnchain, readAccountCash } from '../../src/chain.js';
-import { createWelcomeService, readWelcomeFundingEvidence } from '../../src/welcome-grants.js';
+import { createWelcomeService, readWelcomeFundingEvidence, settleWelcomeGrant } from '../../src/welcome-grants.js';
 import { readFaucetFundingEvidence } from '../../src/faucet.js';
 import { TESTNET_97 } from '../../src/testnet-profile.js';
 import { WELCOME_AMOUNT_WEI } from '../../src/config.js';
+import { signedFundingTx } from './relayer.js';
 import { strategyRpc } from './strategy-rpc.js';
 
 export const address = (): Address => `0x${randomBytes(20).toString('hex')}`;
@@ -42,14 +44,17 @@ export async function welcomeFixture(owner = address(), kind: 'hold' | 'stack' =
   const rpc = strategyRpc(allocation, configHash, activeAt, hash());
   rpc.state.to = account; rpc.state.mint = true; rpc.state.amount = WELCOME_AMOUNT_WEI; rpc.state.cashRaw = 0n; rpc.state.strategyId = BigInt(onchainId);
   let sends = 0;
-  const welcome = createWelcomeService({ config: welcomeConfig, prepare: async () => ({ hash: rpc.state.txHash,
+  const signed = await signedFundingTx('welcome', account, WELCOME_AMOUNT_WEI); rpc.state.txHash = signed.hash; rpc.state.txFrom = signed.operator; rpc.state.txNonce = parseTransaction(signed.raw).nonce ?? 0;
+  const settle: typeof settleWelcomeGrant = (g, state, hash, evidence, transaction, submission) =>
+    settleWelcomeGrant(g, state, hash, evidence, transaction, submission ? { ...submission, operator: signed.operator } : undefined);
+  const welcome = createWelcomeService({ config: welcomeConfig, settle, prepare: async () => ({ ...signed,
     broadcast: async () => { sends++; rpc.state.cashRaw += WELCOME_AMOUNT_WEI; }, wait: async () => {} }) });
   const deps: Partial<PortfolioStrategyDeps> = { chainId: () => 97, welcome, feeReserve: async () => 27n * 10n ** 16n,
     owned: (id, wallet) => requireOwnedPortfolio(id, wallet, { chainId: 97 }),
     version: (sid, v, chainSid, acct, options) => requireTypedVersion(sid, v, chainSid, acct, { ...options, chainId: 97,
       assertOnchain: (sid, v, expected, account, opts) => assertVersionOnchain(sid, v, expected, account, { ...opts, client: rpc.client, registry: TESTNET_97.contracts.registry }) }),
-    welcomeEvidence: g => readWelcomeFundingEvidence(g, rpc.client), evidence: g => readFaucetFundingEvidence(g, rpc.client),
+    welcomeEvidence: g => readWelcomeFundingEvidence(g, rpc.client, signed.operator), evidence: g => readFaucetFundingEvidence(g, rpc.client),
     cash: (chain, account) => readAccountCash(chain, account, rpc.client) };
   return { id, owner, account, strategyId, rpc, deps, service: createPortfolioStrategyService(deps), sends: () => sends,
-    recipient: { chainId: 97 as const, owner, account, portfolioId: id } };
+    signed, settle, recipient: { chainId: 97 as const, owner, account, portfolioId: id } };
 }

@@ -5,12 +5,56 @@ import { execFileSync } from 'node:child_process';
 import pg from 'pg';
 import { bytesToHex, concatHex, keccak256, toHex } from 'viem';
 import { closePool, query, withTransaction } from '../src/db.js';
-import { reserveSponsorship, reserveGasBudget } from '../src/paymaster.js';
+import { createPaymasterService, gasExecutionKey, reserveSponsorship, reserveGasBudget } from '../src/paymaster.js';
 import type { Reservation } from '../src/paymaster.js';
 import { loadPaymasterConfig } from '../src/config.js';
 import { AppError } from '../src/errors.js';
+import { config as sponsorConfig, operation, OWNER, REGISTRY, kernelCall } from './fixtures/paymaster.js';
+import { encodeFunctionData, parseAbi } from 'viem';
 
 after(closePool);
+
+test('#97 identical sponsorship retries across seconds and service instances reuse one durable authorization', async () => {
+  let clock = Math.floor(Date.now() / 1000);
+  const originalClock = clock;
+  const sender = bytesToHex(randomBytes(20));
+  const op = operation({ sender, callData: kernelCall(encodeFunctionData({ abi: parseAbi(['function enroll(address,uint256)']), functionName: 'enroll', args: [sender, 1n] }), REGISTRY) });
+  const c = { ...sponsorConfig(), accountDailyCount: 2n };
+  const make = () => createPaymasterService({ config: c, now: () => clock,
+    query: async () => ({ rows: [{ owner: OWNER, user_id: OWNER }] }), checkChain: async () => {},
+    readBudgetContext: async () => ({ purpose: 'ordinary', nativePrice: 60000000000n, priceSource: 'fixture:oracle' }),
+  });
+  const initial = await Promise.all(Array.from({ length: 10 }, () => {
+    clock++;
+    return make().sponsor({ userOperation: op }, OWNER);
+  }));
+  const first = initial[0]; assert.ok(first);
+  for (const result of initial) assert.deepEqual(result, first);
+  try {
+    for (let index = 0; index < 61; index++) {
+      clock++;
+      assert.deepEqual(await make().sponsor({ userOperation: op }, OWNER), first);
+    }
+    clock++;
+    const concurrent = await Promise.all(Array.from({ length: 10 }, () => make().sponsor({ userOperation: op }, OWNER)));
+    for (const result of concurrent) assert.deepEqual(result, first);
+    assert.equal((await query<{ n: string }>('select count(*)::text as n from paymaster_sponsorships where sender=$1', [sender])).rows[0]?.n, '1');
+    clock = first.validUntil;
+    const renewed = await make().sponsor({ userOperation: op }, OWNER);
+    assert.notEqual(renewed.userOpHash, first.userOpHash);
+    assert.equal(renewed.validUntil, clock + 300);
+    assert.ok(first.validUntil - originalClock <= 600);
+    assert.equal((await query<{ n: string }>('select count(*)::text as n from paymaster_sponsorships where sender=$1', [sender])).rows[0]?.n, '2');
+    assert.equal((await query<{ n: string }>('select count(*)::text as n from gas_budget_reservations where execution_key=$1', [gasExecutionKey(c.chainId, op)])).rows[0]?.n, '1');
+    await assert.rejects(make().sponsor({ userOperation: { ...op, preVerificationGas: op.preVerificationGas + 1n } }, OWNER), (e: unknown) => e instanceof AppError && e.code === 'GAS_BUDGET_CONFLICT');
+    await assert.rejects(make().sponsor({ userOperation: { ...op, nonce: op.nonce + 1n } }, OWNER), (e: unknown) => e instanceof AppError && e.code === 'PAYMASTER_QUOTA_EXCEEDED');
+    await query("update paymaster_sponsorships set created_at=created_at-interval '1 day' where sender=$1", [sender]);
+    assert.deepEqual(await make().sponsor({ userOperation: op }, OWNER), renewed, 'UTC day changes must not reset a live authorization');
+    assert.equal((await query<{ n: string }>('select count(*)::text as n from paymaster_sponsorships where sender=$1', [sender])).rows[0]?.n, '2');
+  } finally {
+    await query('delete from paymaster_sponsorships where sender=$1', [sender]);
+  }
+});
 const key = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
 const chainId = 991166;
 function request(id: number, sender = '0x1000000000000000000000000000000000000005'): Reservation {

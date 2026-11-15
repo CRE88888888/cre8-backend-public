@@ -1,6 +1,6 @@
 /** Explicit local acceptance, not discovered by bun test. Run after clean contracts main
- * deploy-97.sh fork on 8566. Env: CHAIN_ID=97, RPC_URL=http://127.0.0.1:8566,
- * PORT=3066, DATABASE_URL (cre8_be91), MIGRATIONS_DIR, OPERATOR_PRIVATE_KEY,
+ * deploy-97.sh on the lane-selected local fork. Env: CHAIN_ID=97, RPC_URL,
+ * PORT, DATABASE_URL, TEST_DATABASE_NAME, MIGRATIONS_DIR, OPERATOR_PRIVATE_KEY,
  * TESTNET_MANIFEST (the generated contracts manifest). Never use a public RPC.
  * Current-main registry is an explicit fixture dependency; profile refresh is outside #91.
  */
@@ -24,7 +24,9 @@ import { minimumFeeReserve } from '../src/rebalance-plan.js';
 import { TESTNET_97 as P } from '../src/testnet-profile.js';
 import { welcomeFixture } from './fixtures/welcome.js';
 
-const RPC = 'http://127.0.0.1:8566', API = 'http://127.0.0.1:3066';
+import { localAcceptanceEnv } from './fixtures/local-acceptance.js';
+const endpoints = localAcceptanceEnv(process.env);
+const RPC = endpoints.rpcUrl, API = endpoints.apiUrl;
 const client = createPublicClient({ chain: bscTestnet, transport: http(RPC, { retryCount: 0, timeout: 120000 }), cacheTime: 0 });
 const local = createTestClient({ chain: bscTestnet, mode: 'anvil', transport: http(RPC) });
 const operator = createWalletClient({ account: P.roles.operator, chain: bscTestnet, transport: http(RPC) });
@@ -41,7 +43,7 @@ async function request(path: string, method = 'GET', body?: unknown, expected = 
 }
 async function main() {
   const c = getConfig();
-  check(c.chainId === 97 && c.rpcUrl === RPC && c.port === 3066 && new URL(c.databaseUrl).pathname === '/cre8_be91', 'dedicated local ports, chain and DB');
+  check(c.chainId === 97 && c.rpcUrl === RPC && c.port === endpoints.backendPort && new URL(c.databaseUrl).pathname === '/' + endpoints.databaseName, 'dedicated local ports, chain and DB');
   const info = await fetch(RPC, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'anvil_nodeInfo', params: [] }) }).then(r => r.json());
   check(obj(info).result && await client.getChainId() === 97, 'anvil chain 97 guard');
   assert.ok(process.env.TESTNET_MANIFEST);
@@ -75,7 +77,7 @@ async function main() {
       assertOnchain: (sid, version, expected, account, opts) => assertVersionOnchain(sid, version, expected, account, { ...opts, client, registry }) }),
     cash: (chain, account) => readAccountCash(chain, account, client), welcomeEvidence: g => readWelcomeFundingEvidence(g, client), evidence: g => readFaucetFundingEvidence(g, client) });
   const server = createServer({ portfolioStrategies: service });
-  await new Promise<void>(resolve => server.listen(3066, '127.0.0.1', resolve));
+  await new Promise<void>(resolve => server.listen(endpoints.backendPort, '127.0.0.1', resolve));
   try {
     const challenge = await request('/auth/nonce', 'POST');
     const message = createSiweMessage({ address: owner.address, chainId: 97, domain: str(challenge.domain), uri: str(challenge.uri), nonce: str(challenge.nonce), statement: str(challenge.statement), version: '1', issuedAt: new Date(str(challenge.issuedAt)) });
@@ -117,8 +119,8 @@ async function main() {
     const rows = (await query<{ total: string; n: string }>('select sum(amount_raw)::text as total,count(*)::text as n from strategy_funding_lots where portfolio_id=$1', [f.id])).rows[0];
     check(rows?.total === (11000n * 10n ** 18n).toString() && rows.n === '2', '2 lots, exactly 11000 total approved input');
     check(await client.readContract({ address: P.contracts.usdt, abi: erc20Abi, functionName: 'balanceOf', args: [kernel.address] }) === 11000n * 10n ** 18n, 'real account balance equals 11000');
-    const repeat = await request('/faucet/usdt', 'POST', { account: kernel.address }, 429);
-    check(obj(repeat.error).code === 'FAUCET_QUOTA_EXCEEDED', 'daily owner limit still enforced');
+    const repeat = await request('/faucet/usdt', 'POST', { account: kernel.address });
+    check(repeat.replayed === true && repeat.claimId === daily.claimId && repeat.txHash === daily.txHash && repeat.state === daily.state, 'daily retry returns the original claim without minting');
     const disabled = await request('/points/tasks', 'GET', undefined, 503);
     check(obj(disabled.error).code === 'POINTS_DISABLED', 'testnet points remain disabled');
     console.log(`WELCOME_91_FORK: ${passes} pass / 0 skip / 0 fail`);

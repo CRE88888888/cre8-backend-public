@@ -1,10 +1,61 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import pg from 'pg';
-import { closePool, getPool, query, withPortfolioLock, withTransaction } from '../src/db.js';
+import { closePool, getPool, migrate, query, withPortfolioLock, withTransaction } from '../src/db.js';
+import { withRelayerLock } from '../src/relayer-lock.js';
+import { AppError } from '../src/errors.js';
 
 after(closePool);
+
+test('#97 migration table locks time out in five seconds with a safe actionable error', { timeout: 12000 }, async () => {
+  await migrate();
+  const blocker = await getPool().connect();
+  try {
+    await blocker.query('begin');
+    await blocker.query('lock table schema_migrations in access exclusive mode');
+    const child = spawn(process.execPath, ['--no-env-file', '--eval', `
+      import {migrate,closePool} from './src/db.ts';
+      try {await migrate(); console.log('unexpected success');}
+      catch(e) {console.log(e instanceof Error ? e.message : 'unknown');}
+      finally {await closePool();}`], { env: { ...process.env, DB_STATEMENT_TIMEOUT_MS: '7000' }, stdio: ['ignore','pipe','pipe'] });
+    let output = '';
+    child.stdout.on('data', chunk => { output += String(chunk); });
+    child.stderr.on('data', chunk => { output += String(chunk); });
+    await new Promise<void>((resolve, reject) => { child.on('close', () => resolve()); child.on('error', reject); });
+    assert.match(output, /migration lock timeout \(5000ms\)/);
+    assert.doesNotMatch(output, /postgres:|DATABASE_URL/);
+  } finally { await blocker.query('rollback'); blocker.release(); }
+  await migrate();
+  assert.equal((await query('show lock_timeout')).rows[0]?.lock_timeout, '0');
+});
+
+test('#97 ten portfolio holders can attempt the relayer without borrowing a second connection', { timeout: 12000 }, async () => {
+  await migrate();
+  let entered = 0;
+  let ready = () => {};
+  const barrier = new Promise<void>(resolve => { ready = resolve; });
+  let actions = 0;
+  const results = await Promise.allSettled(Array.from({ length: 10 }, (_, index) =>
+    withPortfolioLock(1_000_000_200 + index, async () => {
+      if (++entered === 10) ready();
+      await barrier;
+      const pid = (await query<{ pid: number }>('select pg_backend_pid() as pid')).rows[0]?.pid;
+      return withRelayerLock(97, async assertHeld => {
+        assertHeld();
+        await withTransaction(async client => {
+          assert.equal((await client.query<{ pid: number }>('select pg_backend_pid() as pid')).rows[0]?.pid, pid);
+        });
+        actions++;
+      });
+    })));
+  assert.ok(actions > 0, 'at least one relayer action must run with a saturated pool');
+  for (const r of results) if (r.status === 'rejected') assert.ok(r.reason instanceof AppError && r.reason.code === 'RELAYER_BUSY');
+  assert.equal(getPool().waitingCount, 0);
+  await assert.rejects(withRelayerLock(97, async () => { throw new Error('callback failure'); }), /callback failure/);
+  await withRelayerLock(97, async assertHeld => { assertHeld(); });
+  await withRelayerLock(56, async assertHeld => { assertHeld(); });
+});
 
 test('#57 database timeouts apply to real PostgreSQL sessions', async () => {
   assert.equal(getPool().options.statement_timeout, 15_000);
@@ -30,6 +81,7 @@ test('#57 lock holds across commits on one session, excludes independent clients
         });
         const held = await observer.query<{ acquired: boolean }>('select pg_try_advisory_lock($1::bigint) as acquired', [-BigInt(id)]);
         assert.equal(held.rows[0]?.acquired, false, 'COMMIT must not release the planning lock');
+        assert.equal(await withPortfolioLock(id, async () => assert.fail('nested work cannot reenter the portfolio lock')), null);
         if (failure === 'callback') throw new Error('callback failed');
         if (failure === 'rollback') await withTransaction(async (client) => { await client.query('select 1 / 0'); });
         if (failure === 'timeout') await withTransaction(async (client) => {

@@ -546,6 +546,8 @@ function stubChain(overrides: Partial<StubChain> = {}): StubChain {
 
 function deps(db: StubDb, chain: StubChain, extra: SchedulerDeps = {}): SchedulerDeps {
   return {
+    withDexLock: async (_chain,fn) => fn(),
+    dexGate: async () => null,
     ...stubPortfolioLock(db),
     checkTradingMinimums: async () => null,
     hasBoughtBefore: async () => true,
@@ -2418,9 +2420,7 @@ async function seedPortfolio(args: {
   // 這支測試要一個 strategy 只是為了 portfolio 的外鍵。**不要借別的測試留下的資料**：
   // 在乾淨的資料庫上（例如 CI 開一個新的）「select … limit 1」會回空，測試就變成
   // 「只有在別人的資料還在的時候才會過」—— 那不是測試，那是巧合。
-  const strategy =
-    (await query<{ id: string }>('select id from strategies order by id limit 1')).rows[0] ??
-    (
+  const strategy = (
       await query<{ id: string }>(
         `insert into strategies (provider, name) values ($1, $2) returning id`,
         ['0xscheduler-test', 'scheduler test fixture'],
@@ -2546,6 +2546,7 @@ test('認領（真的 Postgres）：paused／idle／未到期不被認領，NULL
   let sends = 0;
   const keys = stubQuery(stubDb({ sessionKeys: [sessionKey({ portfolioId: due.id })] }));
   const options: SchedulerDeps = {
+    dexGate:async()=>null,
     checkTradingMinimums: async () => null,
     withTransaction: singlePortfolioClaim(due.id),
     readRebalanceNonce: async () => (1n << 256n) - 1n,
@@ -3654,5 +3655,29 @@ test('#59 HTTP scheduler skips all global monitoring; background defaults keep i
     assert.equal(chain.executeCalls.length, 0, 'skipping monitoring never bypasses global pause');
     assert.equal(alerts.some((line) => line.startsWith('[ALERT]')), skipAlerts !== true);
     assert.equal(db.statements.some((entry) => entry.sql.includes('scheduler_alerts')), skipAlerts !== true);
+  }
+});
+
+test('#83 canonical business receipt verifies exact inputs, actual receipts and fee transfers before spending a job',async()=>{
+  const U=10n**18n;
+  const steps=[step({tokenIn:TOKEN_OUT,tokenOut:TOKEN_IN,amountIn:50n*U,amountOutMin:100n})];
+  const f=receiptFixture(steps),base=f.receipt.logs[0];assert.ok(base);
+  const indexed=(address:Address)=>encodeAbiParameters([{type:'address'}],[address]);
+  const swap:UserOperationReceipt['logs'][number]={...base,topics:[keccak256(toBytes('SwapExecuted(address,address,address,uint256,uint256,uint256,uint256,uint256)')),indexed(ACCOUNT)],
+    data:encodeAbiParameters([{type:'address'},{type:'address'},{type:'uint256'},{type:'uint256'},{type:'uint256'},{type:'uint256'},{type:'uint256'}],
+      [TOKEN_OUT,TOKEN_IN,50n*U,110n,10n,100n,90n])};
+  const fee:UserOperationReceipt['logs'][number]={...base,logIndex:1,topics:[keccak256(toBytes('MinFeeCharged(address,uint256,uint256,uint256)')),indexed(ACCOUNT)],
+    data:encodeAbiParameters([{type:'uint256'},{type:'uint256'},{type:'uint256'}],[50n*U,U/4n,U/4n])};
+  const transfer=(token:Address,from:Address,to:Address,value:bigint,logIndex:number):UserOperationReceipt['logs'][number]=>({...base,address:token,logIndex,
+    topics:[keccak256(toBytes('Transfer(address,address,uint256)')),indexed(from),indexed(to)],data:encodeAbiParameters([{type:'uint256'}],[value])});
+  const logs=[swap,fee,transfer(TOKEN_OUT,ACCOUNT,EXECUTOR,50n*U,2),transfer(TOKEN_OUT,ACCOUNT,OWNER,U/4n,3),transfer(TOKEN_IN,EXECUTOR,ACCOUNT,100n,4)];
+  f.receipt.logs=logs;
+  f.input.expectedInputs={[TOKEN_IN]:(50n*U).toString()};f.input.cash=TOKEN_OUT;
+  const result=await readRebalanceReceipt(f.input,f.reader);assert.equal(result.kind,'found');
+  if(result.kind==='found')assert.deepEqual(result.outcome.batchEvidence?.received,{[TOKEN_IN]:'100'});
+  for(const bad of [logs.slice(0,-1),logs.filter(log=>log!==fee),[{...swap,removed:true},...logs.slice(1)],
+    [{...swap,data:encodeAbiParameters([{type:'address'},{type:'address'},{type:'uint256'},{type:'uint256'},{type:'uint256'},{type:'uint256'},{type:'uint256'}],
+      [TOKEN_OUT,TOKEN_IN,50n*U+1n,110n,10n,100n,90n])},...logs.slice(1)]]){
+    f.receipt.logs=bad;await assert.rejects(readRebalanceReceipt(f.input,f.reader));
   }
 });

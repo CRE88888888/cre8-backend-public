@@ -1,10 +1,10 @@
-# BE-1 策略 API 與投入／個人指令契約
+# 逐資產策略 API、投入與排程契約
 
-對應 backend#82、db migration 0031，以及 C3 的 [G0](https://github.com/CRE8Finance/docs/pull/57#issuecomment-6891241586)／[投入來源決定](https://github.com/CRE8Finance/cre8-backend/issues/82#issuecomment-6891564697)。本文是 APP-1／BE-2 的實作契約；BE-1 不送出 hold／stack 買單，`automation` 回 `awaiting_be2`。生息仍關閉。
+對應 backend#82／#83、db 0031／0032，以及 [測試網參數總表](https://github.com/CRE8Finance/docs/blob/main/docs/TESTNET_PARAMETERS.zh-TW.md)。最新 C3 決定：每批 50 USDT 是**含費總預算**；每資產實際輸入至少 1 USDT。只在 chain 97 開新錢自動化；主網舊 target_weight 行為保留。資產數本張維持 16，解除另由 backend#92 處理。
 
-## 發版與舊格式
+## 發版
 
-`POST /strategies` 仍只建立 metadata；設定放在 `POST /strategies/:id/versions`：
+`POST /strategies` 建立 metadata。`POST /strategies/:id/versions` 接受：
 
 ```json
 {
@@ -13,74 +13,71 @@
     {"address": "0x6de69565f250146c67d56be5aa15b6f181fce4d7", "weightBps": 5000},
     {"address": "0xbd7d814e02c9f69af391a8ba4c1787769f2ddd4b", "weightBps": 5000}
   ]},
-  "execution": {"kind": "stack"},
+  "execution": {
+    "kind": "per_asset",
+    "numeraire": "0xbd7d814e02c9f69af391a8ba4c1787769f2ddd4b",
+    "rebalance": "none",
+    "assets": [
+      {"asset": "0x6de69565f250146c67d56be5aa15b6f181fce4d7", "weightBps": 5000,
+       "execution": {"kind": "stack", "every": "weekly", "weekday": 1, "timeUtc": "01:00", "slices": 12}, "yield": null},
+      {"asset": "0xbd7d814e02c9f69af391a8ba4c1787769f2ddd4b", "weightBps": 5000, "yield": null}
+    ]
+  },
   "schedule": {"kind": "funding"},
   "idleYield": {"enabled": false}
 }
 ```
 
-省略 execution 明示補 `{kind:hold}`；schedule 補 `{kind:funding}`；idleYield 補 `{enabled:false}`，三者都存回／回傳。chainId 預設本 API 的 chain，提供時必須完全相同。funding 表示依投入／個人期次觸發，**不是扣款週期或漂移檢查間隔**。舊 scheduler 不認此標記，會 blocked，直到 BE-2 接入；依賴同一scheduler的redeem／close也會blocked，owner直接原樣token轉出仍可；不能把 interval／cron 塞進 typed 版本啟用舊 planner。
+地址須符合該鏈 manifest；以上為 profile 範例，部署時以 manifest 為準。allocation 與 execution 必須完整對應、bps 總和 10000。USDT 項**不能有 execution**；其餘每項是 hold 或完整 stack。省略 execution 時明示展開各資產 hold；省略資產模式、yield、rebalance 分別明示套用 hold、null、none，再雜湊。省略 schedule／idleYield 補 funding／disabled。舊 bare `{kind:hold|stack}` 新發版拒絕；未支援功能、多餘欄位及個人金額不能默默丟棄。
 
-額外欄位（含逐資產 play、reinvest、stopLoss、個人金額）、混合／custom／dips／range／trend／lp／carry、target_weight 新 HTTP 發版、生息啟用均回 400。stack 拒絕純 USDT；hold 可純 USDT。allocation 維持最多16項、bps總和10000、chain97白名單及自動補0權重USDT。不改已發布的設定；發新版本也不替既有 enrollment 升版。
+stack 由創作者指定 daily／weekly、UTC 整分時刻、實際原設定 2–52 期。daily 的 weekday 為 null；weekly 為 0–6（週日為 0）。UI 先展示創作者當地預設每週一 09:00、12 期，再換成 UTC 送入；API 不猜時區。固定 UTC 後跨 DST 的當地時刻可能改變。買的人只決定投入總額。
 
-讀回新增 `executionSchemaVersion`、`execution`、`executionChainId`、`configHash`、`idleYield`。0031以前的列回 schema0、`{kind:target_weight}`、chain/hash皆null，不捏造舊hash。內部未帶typed欄位的舊 `publishVersion` 呼叫保留原interval／cron編碼，供既有腳本與舊策略測試使用；HTTP一律走typed預設，不以省略欄位降級。
+rebalance 僅全非現金資產皆 hold 可選 none／monthly／drift；預設 none。drift 是任一資產偏離目標**超過 500 bps**，等於不觸發；monthly 跨 UTC 月後才再執行。再平衡沿用既有 target_weight quote／refresh／operation／gas 管線。尚有新錢未配置或在途時先處理原工作；再平衡的 USDT 實收付與 operation 同交易更新 allocated_cash，避免再次分類或虛假現金短缺。
 
-`activeAt` 須為含時區、整秒的RFC3339；省略為第一次發版時的UTC整秒。同設定重試讀回原版本／原activeAt；不覆寫原欄位。先檢查簽名設定並取得relayer admission，再保存不可變設定，成功mirror才回成功；有onchainId但RPC／mirror失敗回503。未知提交的重試只核對原鏈上版本，**不再送新的publish交易**；尚未入塊回 `VERSION_PENDING_RECONCILIATION`。完全未送出但已有DB列，也保持待對帳，由營運核對後修復，不自行刪列或跨過版本序號。onchainId為null的離線策略只保存設定，不能enroll或投入。
+yield 可為 null 或 `{market:"平台市場ID"}`；發新版本時須查 `strategy_asset_yield_markets` 同鏈／資產 enabled。初始無市場。市場退休不重寫舊 hash；本張僅保存設定，生息存領由 BE-3／BE-4 接入。
 
-## Canonical config v1
+## Canonical config
 
-檔案 `src/strategy-execution.ts` 與可共享的 [golden vectors](../test/fixtures/strategy-config-golden.json) 定義格式。golden 的JSON以Python產生、hash以Foundry `cast keccak`獨立計算；測試另核對既有publishVersion Solidity ABI的bytes32欄位。
+schema 2 外層固定鍵順序：domain、schemaVersion、chainId、execution、allocation、schedule、idleYield、activeAt。domain 為 `cre8.strategy.execution`；UTF-8 JSON、無空白／換行；activeAt 為整秒 Unix 十進位字串。execution 固定 kind、numeraire、rebalance、assets，各資產固定 asset、weightBps、execution（非現金）、yield；stack 固定 kind、every、weekday、timeUtc、slices。兩組 assets 都按小寫地址排序；展示 symbol 不參與 hash。
 
-固定鍵順序、UTF-8、無空白、無尾端換行：
+`configHash=keccak256(UTF8(canonical))`，交既有 `Version.scheduleHash`，不改合約驗證或 ABI。[schema 2 goldens](../test/fixtures/strategy-config-v2-golden.json) 以 Python JSON＋`cast keccak` 獨立產生。schema 1 舊 canonical 與 [goldens](../test/fixtures/strategy-config-golden.json) 保留；舊 stack 指令與工作只允許歷史讀取／未知結果對帳，不能新增。
 
-```text
-{"domain":"cre8.strategy.execution","schemaVersion":1,"chainId":97,"execution":{"kind":"stack"},"allocation":{"assets":[{"address":"0x6de69565f250146c67d56be5aa15b6f181fce4d7","weightBps":5000},{"address":"0xbd7d814e02c9f69af391a8ba4c1787769f2ddd4b","weightBps":5000}]},"schedule":{"kind":"funding"},"idleYield":{"enabled":false},"activeAt":"1794700800"}
-```
-
-地址小寫、按地址字典序排序，保留自動USDT列；只承諾address／weightBps，不含展示symbol。chainId／bps是JSON整數，activeAt是Unix秒的十進位字串。`configHash=keccak256(UTF8(canonical))`，直接放入既有 `Version.scheduleHash`，不改合約ABI。個人金額／週期／起訖不屬創作者設定，不放進此hash。
-
-enroll前核對選定版本，enroll後核對真正pinned版本；投入／啟用個人指令再核對DB config hash、chain、鏈上同一區塊的allocation／scheduleHash／activeAt／enrollment。`block.timestamp == activeAt`可；未生效版本拒絕，不用最新DB版本替代pinned。RPC／缺資料回503，設定或版本衝突回409。暫停／停止只需本人與已存設定核驗，RPC不可用也能停止未來授權。
+enroll、投入及執行均核對 pinned 版本、chain、allocation、scheduleHash、生效時間；不使用 latest 取代 pinned。新版本不能改舊設定。相同 publish 重試保留原版本與原 activeAt；未知 mirror 不重送 publish。DB 或 RPC 不完整回 503，衝突回 409。schema 0 target_weight 與內部舊 writer 保留。
 
 ## 個人端點
 
-以下全部要求原有bearer session；portfolio.user與smart account.owner都須是本人，創作者不能指定別人的portfolio。沿用portfolio advisory lock與0031的cash-row鎖順序。寫入以短READ COMMITTED交易提交，RPC不放在DB交易中；忙碌回409，DB／lock timeout／未知commit回503，原請求可重試。
+全部沿用 bearer 本人認證、portfolio 與 smart account owner 比對、跨程序帳戶鎖及短 READ COMMITTED cash-row 鎖。RPC 不在記帳交易內。忙碌 409、DB／commit 未知 503，重試同一來源即可。
 
-| Method／路徑 | body／回應 |
+| 端點 | 契約 |
 | --- | --- |
-| GET `/portfolios/:id/execution` | pinned execution/hash、enabled、automation、建議金額、現金分類、最近100筆lot與revision |
-| POST `/portfolios/:id/funding-lots` | `{source:{kind:"faucet_claim",claimId:"123"}}`；回lot永久事件身分、source及replayed |
-| POST `/portfolios/:id/stack-instructions` | 下方新revision；回保存的完整個人指令 |
-| POST `/portfolios/:id/stack-instruction-state` | `{revision:"1",state:"paused"}`或`stopped`；不能傳active恢復 |
-| POST `/portfolios/:id/execution-state` | hold專用 `{enabled:false}`暫停新買入，true恢復；不阻擋owner原樣領出 |
+| GET `/portfolios/:id/execution` | pinned config/hash、enabled、automation、建議投入、cash／balances、最近 100 lots／jobs、lotAssets 與 slices 執行狀態 |
+| POST `/portfolios/:id/funding-lots` | `{source:{kind:"faucet_claim",claimId:"123"}}`；回永久事件、effectiveSlices、confirmedAt、fundingStatus、replayed |
+| POST `/portfolios/:id/execution-state` | `{enabled:false}` 暫停新買入；true 恢復；漏期不追扣，未知先對帳 |
 
-`GET execution` 的 `balances` 是0031分類帳，沒有列時為null。`cash`是同區塊實讀USDT（含區塊hash／number）：`unclassifiedRaw=鏈上現金−已分類本金／預留／現金／收益`，只顯示、不憑此造lot；若為負則unclassifiedRaw=null、deficitRaw為短缺量，需對帳。RPC失敗回503，不把未知餘額回0。新增的lot.id／claimId／revision／slotIndex／blockNumber與所有raw均為十進位字串；portfolioId／strategyId／version沿用既有number。
+`stack-instructions`／`stack-instruction-state` HTTP 路由已移除（404）；持有人不能覆寫創作者排程。舊 revision 仍供歷史稽核。
 
-### 投入來源
+cash 讀同一區塊的 USDT，顯示未分類與短缺，不憑 balance 差造 lot。所有 raw 為 USDT 原生 18 decimals 字串；token received／fee 向量用該 token 自己 decimals。ID／block 等大整數用字串。
 
-目前唯一核准來源為**chain97本人請求的faucet claim**。後端從faucet_claims讀原owner、account、amount、已保存txHash（submitted／unknown／confirmed），再核對TestnetUSDT成功receipt、canonical區塊、該receipt區塊的enrollment／版本／activeAt及前後區塊hash、唯一且未removed的`Claimed(to,amount,by)`，收款方須為該基金帳戶、by須為核准operator。client不能自報本金、receipt、區塊或普通Transfer。
+### 本金與合單
 
-lot保存實轉全額（包含之後配置本金及費用備款）；hold只加unallocated_hold_raw，stack只加stack_prefund_raw，不在備款時買入。永久鍵 `(chain,txHash,logIndex)`；同一交易內插入、重讀比較完整來源、新lot才加桶。重播／重啟／未知commit不重加；成功證據亦透過原UTC-day lock／CAS將submitted／unknown faucet claim確認，保留配額並解除該來源對relayer的阻擋；receipt重組或同一claim的事件移動時，舊lot標reorged、保留原桶與工作供對帳，拒絕新授權，不復活、不自動釋放。
+唯一核准來源為 chain 97 本人請求的 faucet claim。服務端核對已保存 claim 的 owner／account／金額／txHash、canonical receipt 及唯一 `Claimed`、receipt 區塊的 enrollment 與前後 block hash。普通 Transfer、捐入、利息、領回款不能成為本金，可由 owner 原樣轉出。
 
-主網56不開此來源。一般owner轉帳、第三方捐入、利息或領回款不算lot，可沿用owner原樣領出。未來現金帳戶入口新增一種 `source.kind` 與其服務端驗證／來源讀回映射；永久鏈上事件鍵和lot API不變。本批沒有把一般Transfer或balance差額當備援來源。
+投入全額是**本金與費用的總預算**。新 lot 按原權重一次固定逐資產預算；非現金 floor(total×bps/10000)，尾差歸 cash。hold／stack 分別進 unallocated_hold／stack_prefund，cash 立即 allocated 且完成，不再乘權重。純現金無費用、無空買單。永久鍵 `(chain,txHash,logIndex)`；重播保留原確認時間，不重加桶。重組保留原預留並停止新工作，不復活來源。
 
-### Stack revision
+最低認購 50（含費）；現金權重不算換幣批次，因此 50% 現金至少投入 100。依實際各資產時點合單縮減該 lot 的期數，原版本 N／hash 不變。單資產 N12：50→M1、100→M2、600→M12。縮成一期的 stack 仍嚴格等確認後的下一指定點，等號等下次。
 
-```json
-{
-  "expectedRevision": "0",
-  "enabled": true,
-  "amountUsdt": "100",
-  "periodSeconds": 604800,
-  "startAt": "2027-03-13T09:00:00-05:00",
-  "endAt": null,
-  "fundingSource": "prefunded_fund_account"
-}
-```
+每個 lot 不獨立要求達到一整批 50：不同時點的小來源可保存一期計畫，`fundingStatus=waiting_for_merged_budget`，等同帳戶同版本同時點其他 lot 合單。這代表記帳成功，未承諾立即可成交。重播回 recorded。若目前窗口仍不達門檻就等待；過期略過、不把該期 base 補扣到下一期。
 
-第一次expectedRevision="0"，之後填最後revision以防覆寫別人的新確認。完全相同請求重播回原revision；修改／恢復必須新revision、新未來startAt，舊active／paused轉superseded，終態不回頭。enabled必填boolean，本人明示確認；省略amountUsdt則回傳A_min向上到分，periodSeconds預設每週604800，只另允許每日86400。fundingSource只允許prefunded_fund_account；外部錢包／銀行／自動現金扣款拒絕。
+## 執行、零碎額與未知狀態
 
-startAt要求含時區RFC3339且嚴格晚於建立時間，等號拒絕；前端先以使用者當地時區顯示下一個09:00並取得確認，再傳UTC／offset，不由server猜時區。endAt省略為null，提供時須嚴格晚於startAt；BE-2依排除式截止處理slotAt>=endAt。nextSlotAt由DB固定start+n×period生成，跨DST不改錨點；next_run_at不是期次。
+同帳戶同 slot 所有到期資產／lot 先收齊成一個 asset job，window 取來源最早截止；一次估 k×R 並分攤所有來源。保留現金不進工作。每資產合單後實際輸入 <1 則 deferred_min_asset，無預留；下期攜帶前筆未掛 job 的零碎預算。略過只保留更早的 carry，不補扣該期 base；已掛 job／未知的預留永不再次 carry。最後剩餘零碎額仍可領出。
 
-金額只收正十進位字串，最多18位小數、不得超uint256；不四捨五入、不收number／指數。逐成分floor(A×bps/10000)須>=5、非現金總和>=50，A至少50；50%現金最少A=100、1%成分最少A=500，純現金不除0。API金額A不含最低費補差R；例如10bps／0.30設定下A=50需另備至多0.27。BE-2送出前仍須重讀費率、現金、allowance、容量與gas，不因保存指令就宣稱可執行。
+子批同比例分各成分，實際最小輸入 1、含費總預算 50；50 投入可輸入 49.73＋R0.27。k 批預留 k×R，未使用費用回已配置現金，實際收費依 receipt，不重複收。逐來源 raw 尾差後重查全部 cap／buyAllowance。任一成分缺報價、oracle、深度或休市，整個子批等候，不跳掉資產。舊 target_weight 維持原最低步／實際名目額口徑。
 
-任何種類的未決operation或舊job阻止新revision；pause／stop保留原未知attempt，不把它當成未送出或刪除。BE-2負責取消未送子批、釋放已證實可釋放的剩餘預留、略過漏期及後續對帳；本API不建立slot／job／買單，也不追扣過去期次。
+股票使用 [NYSE 2026–2028 官方日曆](https://ir.theice.com/press/news-details/2025/NYSE-Group-Announces-2026-2027-and-2028-Holiday-and-Early-Closings-Calendar/default.aspx) 與 America/New_York DST，開盤含等號、收盤不含；未知年份不買股票。加密資產無股票日曆限制。跨基金共用每鏈保守 DEX 隊列：未知 operation 持久占位，成交後等下一區塊再取新報價。
+
+所有 gates 後以即時 clock 驗 `[slot,window_end)`，同交易寫 actual start、batch、operation payload／nonce／deadline；commit 成功才簽名廣播。receipt 成功需交易狀態、UserOp success、預期 swap／費用事件及實際 token transfers 全部吻合；operation、batch、remaining 向量、來源終態、cash buckets 同 commit。
+
+來源不足記 skipped_insufficient_funds，跨期停機記 skipped_window，在途跨期記 skipped_previous_inflight；GET slices 提供持久原因供畫面通知。補款不追扣。確定失敗按 1／5／30 分鐘退避，連續 3 次暫停原 job；gas 額度不足不算交易失敗。本人暫停可釋放尚未開始的預留，已送未知先對帳；剩餘向量不消失。
+
+hashless 或 receipt 查無的 typed 操作保持未決：nonce 前進與 deadline 過期不能證明**過去沒有成交**，不能釋放重送。同一帳戶只一個未決 attempt。DB commit 回應遺失與重啟都回原鍵對帳；無法取得原成交證據時需營運對帳，不能用新鍵避開。

@@ -422,7 +422,7 @@ test('POST /strategies/:id/versions returns 201 with the created version record'
       // The route applies explicit execution/yield defaults (id from the path), and the
       // provider is the session wallet, never a body field.
       assert.deepEqual(calls, [
-        { id: 1, input: { ...PUBLISH_BODY, execution: { kind: 'hold' }, idleYield: { enabled: false } }, provider: ROUTE_WALLET.address.toLowerCase() },
+        { id: 1, input: { ...PUBLISH_BODY, allocation: validateAllocation(PUBLISH_BODY.allocation), execution: { kind:'per_asset', numeraire:'0x55d398326f99059ff775485246999027b3197955', rebalance:'none', assets:validateAllocation(PUBLISH_BODY.allocation).assets.map(a=>({asset:a.address,weightBps:a.weightBps,...(a.address==='0x55d398326f99059ff775485246999027b3197955'?{}:{execution:{kind:'hold'}}),yield:null})).sort((a,b)=>a.asset.localeCompare(b.asset)) }, idleYield: { enabled: false } }, provider: ROUTE_WALLET.address.toLowerCase() },
       ]);
     },
     {

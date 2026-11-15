@@ -387,7 +387,7 @@ async function route(
   const segments = url.pathname.split('/').filter((segment) => segment.length > 0);
   const [root] = segments;
 
-  if (root === 'portfolios' && segments.length === 3 && ['execution', 'funding-lots', 'stack-instructions', 'stack-instruction-state', 'execution-state'].includes(segments[2] ?? '')) {
+  if (root === 'portfolios' && segments.length === 3 && ['execution', 'funding-lots', 'execution-state'].includes(segments[2] ?? '')) {
     const action = segments[2];
     const expected = action === 'execution' ? 'GET' : 'POST';
     if (method !== expected) return methodNotAllowed(res, [expected]);
@@ -399,8 +399,6 @@ async function route(
     } else {
       const input = await readJsonBody(req);
       const result = action === 'funding-lots' ? await deps.portfolioStrategies.funding(id, wallet, input)
-        : action === 'stack-instructions' ? await deps.portfolioStrategies.instruct(id, wallet, input)
-        : action === 'stack-instruction-state' ? await deps.portfolioStrategies.instructionState(id, wallet, input)
         : await deps.portfolioStrategies.executionState(id, wallet, input);
       sendJson(res, 200, result);
     }
@@ -710,7 +708,7 @@ async function listRoute(res: ServerResponse, url: URL): Promise<void> {
 /** GET /strategies/:id — metadata plus version history (newest first). */
 async function detailRoute(res: ServerResponse, id: number): Promise<void> {
   const strategy = await getStrategy(id);
-  const versions = strategy.versions.map((version) => ({ ...version, minDepositUsdtWei: version.executionSchemaVersion === 1 ? typedMinimumDeposit(version) : allocationMinimumDeposit(version.allocation) }));
+  const versions = strategy.versions.map((version) => ({ ...version, minDepositUsdtWei: version.executionSchemaVersion !== 0 ? typedMinimumDeposit(version) : allocationMinimumDeposit(version.allocation) }));
   sendJson(res, 200, { ...strategy, versions, minDepositUsdtWei: versions[0]?.minDepositUsdtWei ?? null });
 }
 
@@ -750,7 +748,7 @@ async function publishVersionRoute(
     throw new ValidationError('INVALID_VERSION', 'request body must be a JSON object');
   }
   const version = await deps.publishVersion(id, typedVersionInput(body), provider);
-  sendJson(res, 201, { ...version, minDepositUsdtWei: version.executionSchemaVersion === 1 ? typedMinimumDeposit(version) : allocationMinimumDeposit(version.allocation) });
+  sendJson(res, 201, { ...version, minDepositUsdtWei: version.executionSchemaVersion !== 0 ? typedMinimumDeposit(version) : allocationMinimumDeposit(version.allocation) });
 }
 
 /**

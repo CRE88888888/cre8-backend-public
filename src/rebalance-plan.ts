@@ -136,6 +136,13 @@ export function tradeMinimumReason(nominal: readonly bigint[], purpose: 'ordinar
   return null;
 }
 
+/** C3 #83: only new per-asset purchases use 1 USDT input and 50 USDT including reserved fees. */
+export function assetTradeMinimumReason(inputs:readonly bigint[],budgetRaw:bigint):string|null{
+  if(inputs.length===0||inputs.some(n=>n<0n)||budgetRaw<inputs.reduce((s,n)=>s+n,0n))throw new Error('invalid new money budget');
+  if(inputs.some(n=>n<10n**18n))return '[BELOW_MIN_STEP] 每資產不足1 USDT，等待下期';
+  return budgetRaw<50n*10n**18n?'[BELOW_MIN_BATCH] 含費批次不足50 USDT':null;
+}
+
 const MIN_FEE_ABI = [
   { type: 'function', name: 'minBatchFee', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint256' }] },
   { type: 'function', name: 'minFeeTopUp', stateMutability: 'view', inputs: [{ type: 'uint256' }, { type: 'uint256' }], outputs: [{ type: 'uint256' }] },
@@ -155,7 +162,7 @@ export async function minimumFeeReserve(client: PublicClient, executor: Address,
   } catch { throw new Error('[MIN_FEE_UNAVAILABLE] 無法確認最低費預留，不買入'); }
 }
 
-export async function checkTradeMinimums(client: PublicClient, executor: Address, steps: readonly PlannedStep[], purpose: 'ordinary' | 'exit', blockNumber: bigint): Promise<string | null> {
+export async function checkTradeMinimums(client: PublicClient, executor: Address, steps: readonly PlannedStep[], purpose: 'ordinary' | 'exit', blockNumber: bigint, assetBudgetRaw?: bigint): Promise<string | null> {
   if (purpose === 'exit') return null;
   try {
     const numeraire = await client.readContract({ address: executor, abi: ORACLE_ABI, functionName: 'numeraire', blockNumber });
@@ -166,12 +173,17 @@ export async function checkTradeMinimums(client: PublicClient, executor: Address
         await nominalSellQuote(client, oracle, step.tokenIn, numeraire, step.amountIn, blockNumber);
       return raw;
     }));
+    if(assetBudgetRaw!==undefined){
+      if(decimals!==18||steps.some(s=>!sameAsset(s.tokenIn,numeraire))||assetBudgetRaw<nominal.reduce((a,b)=>a+b,0n))return '[TRADE_MINIMUM_UNAVAILABLE] 新錢預算或單位不符';
+      return assetTradeMinimumReason(nominal,assetBudgetRaw);
+    }
     return tradeMinimumReason(nominal, purpose, loadTradingConfig(), decimals);
   } catch (error) { return decodePriceSourceError(error)?.detail ?? '[TRADE_MINIMUM_UNAVAILABLE] 無法確認交易名義額，不送交易'; }
 }
 
 /** Final funding check uses refreshed swap payloads and one fresh block. Never resizes opaque data. */
 export async function checkBuyFeeReserve(params: {
+  maximumReserve?: bigint;
   client: PublicClient; executor: Address; account: Address; strategyId: bigint; registry: Address;
   steps: readonly PlannedStep[]; numeraire: Address; blockNumber: bigint;
 }): Promise<void> {
@@ -189,6 +201,7 @@ export async function checkBuyFeeReserve(params: {
       client.readContract({ address: registry, abi: REGISTRY_ABI, functionName: 'effectiveFeeBps', args: [strategyId], blockNumber }),
     ]);
     if (!Number.isInteger(fee) || fee < 0 || fee >= 10000) throw new Error('invalid fee');
+    if(params.maximumReserve!==undefined&&reserve>params.maximumReserve)throw new Error('original fee budget insufficient');
     let cash = balance;
     let spent = 0n;
     for (const step of steps) {
@@ -1616,7 +1629,7 @@ async function capLegByImpact(params: {
 type BuyBudget = { cap: bigint; bought: bigint; windowEndsAt: bigint; remaining: bigint; note: string };
 
 /** Fail closed without copying RPC errors (which may contain credentials) into API/logs. */
-async function readBuyBudget(args: Pick<PlanRebalanceArgs, 'publicClient' | 'executor' | 'account' | 'oracle' | 'blockNumber'> & { targets?: readonly TargetWeight[] }): Promise<BuyBudget | Extract<RebalancePlan, { kind: 'blocked' }>> {
+export async function readBuyBudget(args: Pick<PlanRebalanceArgs, 'publicClient' | 'executor' | 'account' | 'oracle' | 'blockNumber'> & { targets?: readonly TargetWeight[] }): Promise<BuyBudget | Extract<RebalancePlan, { kind: 'blocked' }>> {
   try {
     const result: unknown = await args.publicClient.readContract({
       address: args.executor, abi: EXECUTOR_BUY_ABI, functionName: 'buyAllowance',
@@ -1639,6 +1652,57 @@ async function readBuyBudget(args: Pick<PlanRebalanceArgs, 'publicClient' | 'exe
     if (secondary !== null) return { kind: 'blocked', reason: secondary.detail };
     return { kind: 'blocked', reason: '[BUY_ALLOWANCE_UNAVAILABLE] buyAllowance 讀取失敗或資料缺漏，無法確認買入額度，不送交易' };
   }
+}
+
+/** Exact-input new money: every component succeeds at its original size or the whole basket waits.
+ * Uses the same oracle, route competition, slippage and depth checks as ordinary rebalances.
+ */
+export async function quoteNewMoney(args: Pick<PlanRebalanceArgs,'publicClient'|'executor'|'oracle'|'registry'|'strategyId'|'blockNumber'> & {
+  cash: Address; inputs: Readonly<Record<string,string>>; deadline: bigint;
+}, deps: PlanRebalanceDeps = {}): Promise<RebalancePlan> {
+  try {
+    const {publicClient,oracle,executor,blockNumber}=args;
+    const feeBps=Number(await publicClient.readContract({address:args.registry,abi:REGISTRY_ABI,functionName:'effectiveFeeBps',args:[args.strategyId],blockNumber}));
+    if(!Number.isInteger(feeBps)||feeBps<0||feeBps>=10000)throw new Error('invalid fee');
+    const steps:PlannedStep[]=[];
+    for(const [asset,raw] of Object.entries(args.inputs)) {
+      const tokenOut=getAddress(asset),amountIn=BigInt(raw);
+      const pair=await resolveHubPair(publicClient,{router:oracle,asset:tokenOut,blockNumber});
+      if('skip' in pair)return {kind:'blocked',reason:'[BASKET_QUOTE_UNAVAILABLE] 整籃子等待池子資料'};
+      const quote=await quoteHub(publicClient,{router:oracle,tokenIn:args.cash,tokenOut,amountIn,blockNumber});
+      if('skip' in quote)return {kind:'blocked',reason:'[BASKET_QUOTE_UNAVAILABLE] 任一成分缺價，整籃子等待'};
+      const deviation=await twapSpotDeviationBps({client:publicClient,pool:pair.pool,tokenIn:args.cash,amountIn,quoted:quote.quoted,blockNumber});
+      if(deviation===null||deviation>Number(MAX_TWAP_SPOT_DEVIATION_BPS))return {kind:'blocked',reason:'[BASKET_DEPTH] TWAP 與現價無法確認，整籃子等待'};
+      const step=await buildRoutedStep({publicClient,executor,tokenIn:args.cash,tokenOut,amountIn,oracleFloor:quote.floor,
+        minGross:minGrossFor(quote.floor,feeBps),poolFee:pair.poolFee,blockNumber,feeBps,deadline:args.deadline},deps);
+      if(step===null)return {kind:'blocked',reason:'[BASKET_QUOTE_UNAVAILABLE] 整籃子沒有符合地板的路徑'};
+      if(isAddressEqual(step.venue,pancakeRouterForChain(publicClient.chain?.id))) {
+        const identity=decodeStepIdentity(step);
+        if('problem' in identity||identity.path===null)return {kind:'blocked',reason:'[BASKET_DEPTH] 無法確認路徑深度'};
+        const impact=await routeImpactBps(publicClient,{path:identity.path,amountIn,blockNumber});
+        if(impact===null||impact>DEFAULT_MAX_IMPACT_BPS)return {kind:'blocked',reason:'[BASKET_DEPTH] 整籃子等待可用深度'};
+      }
+      steps.push(step);
+    }
+    if(steps.length===0)return {kind:'noop',reason:'沒有新買單'};
+    return {kind:'ready',steps,deadline:args.deadline,rationale:'僅配置已授權新錢；各成分 exact-input，不賣舊倉'};
+  } catch {return {kind:'blocked',reason:'[BASKET_QUOTE_UNAVAILABLE] RPC／報價資料不可用，整籃子等待'};}
+}
+
+/** Conservative per-pool capacity used to reserve the *whole* job's fee upper bound before starting.
+ * The final route quote still has to pass independently; missing depth never becomes unlimited.
+ */
+export async function newMoneyDepthCap(client:PublicClient,oracle:Address,cash:Address,asset:Address,upper:bigint,blockNumber:bigint):Promise<bigint>{
+  if(upper<=0n)return 0n;
+  const pair=await resolveHubPair(client,{router:oracle,asset,blockNumber});
+  if('skip' in pair)throw new Error('new money pool unavailable');
+  const quote=await quoteHub(client,{router:oracle,tokenIn:cash,tokenOut:asset,amountIn:upper,blockNumber});
+  if('skip' in quote)throw new Error('new money oracle unavailable');
+  const state=await readPoolImpactState(client,pair.pool,cash,blockNumber);
+  if(state===null)throw new Error('new money depth unavailable');
+  const full={...state,feeUnits:pair.poolFee};
+  if(impactStateProblem(full)!==null)throw new Error('new money depth invalid');
+  return capAmountInForImpact({state:full,idealAmountIn:upper,idealQuoted:quote.quoted,maxImpactBps:DEFAULT_MAX_IMPACT_BPS}).amountIn;
 }
 
 async function executorNumeraire(args: PlanRebalanceArgs): Promise<Address | null> {

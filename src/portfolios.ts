@@ -1,3 +1,4 @@
+import { minimumAssetContributionFromAllocation } from './asset-plan.js';
 import type { Address, PublicClient } from 'viem';
 import {
   deploySmartAccount,
@@ -26,7 +27,7 @@ export function allocationMinimumDeposit(allocation: Allocation | null | undefin
 export async function strategyMinimumDeposit(strategyId: number): Promise<string | null> {
   const result = await query<{ allocation: Allocation; execution_schema_version: number; execution_chain_id: string | null }>('select allocation,execution_schema_version,execution_chain_id from strategy_versions where strategy_id=$1 order by version desc limit 1', [strategyId]);
   const row = result.rows[0];
-  return row?.execution_schema_version === 1 ? minimumAllocationRaw(row.allocation, Number(row.execution_chain_id)).toString() : allocationMinimumDeposit(row?.allocation);
+  return row?.execution_schema_version === 2 ? minimumAssetContributionFromAllocation(row.allocation, Number(row.execution_chain_id)).toString() : row?.execution_schema_version === 1 ? minimumAllocationRaw(row.allocation, Number(row.execution_chain_id)).toString() : allocationMinimumDeposit(row?.allocation);
 }
 
 export type Portfolio = {
@@ -173,7 +174,7 @@ const ACTIVE_ENROLLMENT_SQL = `select p.id, p.user_id, p.strategy_id, p.version,
      join smart_accounts s on s.portfolio_id = p.id
      left join strategy_versions sv on sv.strategy_id = p.strategy_id and sv.version = p.version
     where p.user_id = $1 and p.strategy_id = $2
-      and (p.schedule_state = 'active' or (p.schedule_state = 'paused' and sv.execution_schema_version = 1))
+      and (p.schedule_state = 'active' or (p.schedule_state = 'paused' and sv.execution_schema_version in (1,2)))
       and s.account_type = 'KERNEL' and s.chain_id=$3
     order by p.id
     limit 1`;
@@ -268,7 +269,7 @@ export async function enrollPortfolio(
   const onchainId = Number(row.onchain_id);
   const account = wallet.toLowerCase();
   const chainId = deps.chainId ?? getConfig().chainId;
-  if (row.execution_schema_version === 1 && Number(row.execution_chain_id) !== chainId) {
+  if ((row.execution_schema_version === 1 || row.execution_schema_version === 2) && Number(row.execution_chain_id) !== chainId) {
     throw new ValidationError('CHAIN_MISMATCH', 'typed strategy belongs to another chain');
   }
 
@@ -278,7 +279,7 @@ export async function enrollPortfolio(
   const existing = await find<EnrollmentRow>(ACTIVE_ENROLLMENT_SQL, [account, strategyId, chainId]);
   const existingRow = existing.rows[0];
   if (existingRow !== undefined && existingRow.account_type === 'KERNEL') {
-    if (existingRow.execution_schema_version === 1 && (Number(existingRow.chain_id) !== chainId || existingRow.owner.toLowerCase() !== account)) {
+    if ((existingRow.execution_schema_version === 1 || existingRow.execution_schema_version === 2) && (Number(existingRow.chain_id) !== chainId || existingRow.owner.toLowerCase() !== account)) {
       throw new ForbiddenError('typed smart account does not match this owner and chain');
     }
     // 已經 enroll 過也回 gas：這是「查我的帳戶現在能不能動」最自然的一次來回，而它同樣是唯讀查詢。
@@ -286,7 +287,7 @@ export async function enrollPortfolio(
     return toPortfolio(existingRow, [existingRow], gas);
   }
 
-  if (row.execution_schema_version === 1) {
+  if ((row.execution_schema_version === 1 || row.execution_schema_version === 2)) {
     await (deps.requireTypedVersion ?? requireTypedVersion)(strategyId, version, onchainId);
   }
 
@@ -337,7 +338,7 @@ export async function enrollPortfolio(
   // DB row exists.
   // A retry may find an older pinned version on-chain. Publishing a version never upgrades it.
   const enrolledVersion = await enroll(smartAccount.address, onchainId);
-  if (row.execution_schema_version === 1) {
+  if ((row.execution_schema_version === 1 || row.execution_schema_version === 2)) {
     await (deps.requireTypedVersion ?? requireTypedVersion)(strategyId, enrolledVersion, onchainId, smartAccount.address);
   }
 
@@ -634,7 +635,7 @@ export async function requireOwnedPortfolio(
 /** Row shape → API shape. Shared by the idempotent return and the freshly written portfolio. */
 function toPortfolio(row: PortfolioRow, accounts: SmartAccountRow[], gas: GasStatus | null): Portfolio {
   return {
-    minDepositUsdtWei: row.execution_schema_version === 1 && row.allocation ? minimumAllocationRaw(row.allocation, Number(row.execution_chain_id)).toString() : allocationMinimumDeposit(row.allocation),
+    minDepositUsdtWei: row.execution_schema_version === 2 && row.allocation ? minimumAssetContributionFromAllocation(row.allocation, Number(row.execution_chain_id)).toString() : row.execution_schema_version === 1 && row.allocation ? minimumAllocationRaw(row.allocation, Number(row.execution_chain_id)).toString() : allocationMinimumDeposit(row.allocation),
     id: Number(row.id),
     userId: row.user_id,
     strategyId: Number(row.strategy_id),

@@ -5,10 +5,11 @@ import { createPublicClient, createWalletClient, custom, decodeFunctionData, enc
 import { toAccount } from 'viem/accounts';
 import type { Hex } from 'viem';
 import golden from './fixtures/strategy-config-golden.json' with { type: 'json' };
-import { canonicalConfig, canonicalConfigHash, defaultAmountUsdt, minimumAllocationRaw, UINT256_MAX, usdtRaw, utcDate, validateExecution } from '../src/strategy-execution.js';
+import v2Golden from './fixtures/strategy-config-v2-golden.json' with { type: 'json' };
+import { canonicalConfig, canonicalConfigHash, defaultAmountUsdt, minimumAllocationRaw, UINT256_MAX, usdtRaw, utcDate, validateExecution, validateAssetConfig, minimumAssetContribution } from '../src/strategy-execution.js';
 import { typedVersionInput, validateAllocation } from '../src/strategies.js';
 import type { StrategyVersion } from '../src/strategies.js';
-import { validateStackInstruction, createPortfolioStrategyService } from '../src/portfolio-strategies.js';
+import { createPortfolioStrategyService } from '../src/portfolio-strategies.js';
 import { assertVersionOnchain, publishVersionOnchain, REGISTRY_ABI } from '../src/chain.js';
 import { kernelAddressesForChain } from '../src/addresses.js';
 import { readFaucetFundingEvidence } from '../src/faucet.js';
@@ -27,21 +28,24 @@ const version: StrategyVersion = { strategyId: 82, version: 1, ...config, active
   executionSchemaVersion: 1, executionChainId: 97, configHash: hash, idleYield: { enabled: false } };
 const denied = (code: string) => (error: unknown) => error instanceof AppError && error.code === code;
 
-test('#82 typed HTTP defaults explicitly preserve hold, funding schedule and disabled yield', () => {
-  const input = typedVersionInput({ allocation });
-  assert.deepEqual(input, { allocation, execution: { kind: 'hold' }, schedule: { kind: 'funding' }, idleYield: { enabled: false } });
-  assert.equal(parseSchedule(input.schedule).kind, 'unsupported', 'legacy drift scheduler must not execute this version before BE-2');
-  for (const execution of [{ kind: 'target_weight' }, { kind: 'custom' }, { kind: 'dips' }, { kind: 'range' }, { kind: 'trend' }, { kind: 'lp' }, { kind: 'carry' }, { kind: 'hold', stopLoss: 10 }, null, []]) {
-    assert.throws(() => typedVersionInput({ allocation, execution }), denied('INVALID_EXECUTION'));
+test('#83 typed HTTP defaults explicitly preserve per-asset hold, funding schedule and disabled yield', () => {
+  const input = typedVersionInput({ allocation, chainId: 97 });
+  assert.deepEqual(input, { allocation, chainId: 97, execution: { kind: 'per_asset', numeraire: cash, rebalance: 'none',
+    assets: allocation.assets.map(({address,weightBps}) => address === cash
+      ? {asset:address,weightBps,yield:null} : {asset:address,weightBps,execution:{kind:'hold'},yield:null}).sort((a,b)=>a.asset.localeCompare(b.asset)) },
+    schedule: { kind: 'funding' }, idleYield: { enabled: false } });
+  assert.equal(parseSchedule(input.schedule).kind, 'unsupported', 'funding must not silently become a legacy drift interval');
+  for (const execution of [{kind:'hold'}, {kind:'stack'}, {kind:'target_weight'}, {kind:'custom'}, {kind:'dips'}, {kind:'range'}, {kind:'trend'}, {kind:'lp'}, {kind:'carry'}, null, []]) {
+    assert.throws(() => typedVersionInput({allocation, chainId:97, execution}), denied('INVALID_EXECUTION'));
   }
-  for (const extra of [{ plays: ['hold', 'stack'] }, { amountUsdt: '100' }, { stackInstruction: {} }, { unknown: true }]) {
-    assert.throws(() => typedVersionInput({ allocation, ...extra }), denied('INVALID_VERSION'));
+  for (const extra of [{plays:['hold','stack']}, {amountUsdt:'100'}, {stackInstruction:{}}, {unknown:true}]) {
+    assert.throws(() => typedVersionInput({allocation, chainId:97, ...extra}), denied('INVALID_VERSION'));
   }
-  for (const schedule of [{ kind: 'interval', intervalSeconds: 604800 }, { kind: 'cron', cron: '*' }, { kind: 'funding', periodSeconds: 86400 }]) {
-    assert.throws(() => typedVersionInput({ allocation, schedule }), denied('INVALID_SCHEDULE'));
+  for (const schedule of [{kind:'interval',intervalSeconds:604800}, {kind:'cron',cron:'*'}, {kind:'funding',periodSeconds:86400}]) {
+    assert.throws(() => typedVersionInput({allocation, chainId:97, schedule}), denied('INVALID_SCHEDULE'));
   }
-  for (const idleYield of [{ enabled: true }, { enabled: false, marketId: 'venus' }, null]) {
-    assert.throws(() => typedVersionInput({ allocation, idleYield }), denied('YIELD_UNAVAILABLE'));
+  for (const idleYield of [{enabled:true}, {enabled:false,marketId:'venus'}, null]) {
+    assert.throws(() => typedVersionInput({allocation, chainId:97, idleYield}), denied('YIELD_UNAVAILABLE'));
   }
 });
 
@@ -75,33 +79,40 @@ test('#82 amounts reject zero, negatives, exponents, >18 decimals and uint256 ov
   }
 });
 
-test('#82 allocation minimum includes the total batch, cash share and every small component', () => {
-  for (const [cashWeight, noncash, expected] of [[0, [5000,5000], '50'], [5000, [2500,2500], '100'], [0, [9900,100], '500'], [10000, [], '50']] as const) {
-    const assets = noncash.map((weightBps, index) => ({ address: index === 0 ? risky : TESTNET_97.assets.AMZNB.token, weightBps }));
-    const basket = { assets: [...assets, { address: cash, weightBps: cashWeight }] };
-    assert.equal(minimumAllocationRaw(basket, 97), usdtRaw(expected));
-    assert.equal(defaultAmountUsdt(basket, 97), expected);
+test('#83 contribution minimum keeps new 50 inclusive fee without changing legacy basket limits', () => {
+  for (const [cashWeight,noncash,expected] of [[0,[5000,5000],'50'],[5000,[2500,2500],'100'],[0,[9900,100],'500'],[10000,[],'50']] as const) {
+    const assets=noncash.map((weightBps,index)=>({address:index===0?risky:TESTNET_97.assets.AMZNB.token,weightBps}));
+    const basket={assets:[...assets,{address:cash,weightBps:cashWeight}]};
+    assert.equal(minimumAllocationRaw(basket,97),usdtRaw(expected));
+    assert.equal(defaultAmountUsdt(basket,97),expected);
+    const execution=validateAssetConfig(undefined,basket,97);
+    assert.equal(minimumAssetContribution(execution),usdtRaw(cashWeight===5000?'100':'50'));
   }
-  const startAt = '2026-11-16T09:00:00+08:00';
-  assert.equal(validateStackInstruction({ expectedRevision: '0', enabled: true, startAt }, version).amountRaw, usdtRaw('100').toString());
-  for (const amountUsdt of ['49.999999999999999999','50','99.999999999999999999']) {
-    assert.throws(() => validateStackInstruction({ expectedRevision:'0', enabled:true, startAt, amountUsdt }, version), denied('BELOW_MINIMUM_ALLOCATION'));
-  }
-  for (const amountUsdt of ['100', formatUnits(UINT256_MAX,18)]) assert.equal(validateStackInstruction({ expectedRevision:'0', enabled:true, startAt, amountUsdt }, version).amountRaw, usdtRaw(amountUsdt).toString());
 });
 
-test('#82 personal instructions require authorization, UTC anchor, future revision input and internal prefunding', () => {
-  const base = { expectedRevision: '0', startAt:'2026-11-16T09:00:00+08:00', enabled:true };
-  const parsed = validateStackInstruction(base, version);
-  assert.equal(parsed.startAt.toISOString(), '2026-11-16T01:00:00.000Z');
-  assert.equal(parsed.periodSeconds,604800);
-  for (const periodSeconds of [86400,604800]) assert.equal(validateStackInstruction({ ...base,periodSeconds },version).periodSeconds,periodSeconds);
-  for (const periodSeconds of [0,60,86399,604801,'86400']) assert.throws(() => validateStackInstruction({ ...base,periodSeconds },version), denied('INVALID_PERIOD'));
-  for (const fundingSource of ['external_wallet','bank','cash_account']) assert.throws(() => validateStackInstruction({ ...base,fundingSource },version), denied('INVALID_FUNDING_SOURCE'));
-  for (const enabled of [undefined,1,'true']) assert.throws(() => validateStackInstruction({ ...base,enabled },version), denied('AUTHORIZATION_REQUIRED'));
-  assert.throws(() => validateStackInstruction({ ...base,amountRaw:'100' },version), denied('INVALID_INSTRUCTION'));
-  for (const endAt of [base.startAt,'2026-11-15T00:00:00Z']) assert.throws(() => validateStackInstruction({ ...base,endAt },version), denied('INVALID_TIME'));
-  for (const value of ['2026-02-30T09:00:00Z','2026-11-16T09:00:00','2026-11-16','2026-11-16T24:00:00Z','infinity']) assert.throws(() => utcDate(value,'startAt'));
+test('#83 per-asset creator calendars validate daily/weekly bounds and reject holder instruction writes', async () => {
+  const base={kind:'per_asset',numeraire:cash,rebalance:'none',assets:[
+    {asset:risky,weightBps:5000,execution:{kind:'stack',every:'weekly',weekday:1,timeUtc:'01:00',slices:12},yield:null},
+    {asset:cash,weightBps:5000,yield:null}]};
+  for (const slices of [2,52]) {
+    const value={...base,assets:[{...base.assets[0],execution:{kind:'stack',every:'daily',weekday:null,timeUtc:'23:59',slices}},base.assets[1]]};
+    assert.equal(validateAssetConfig(value,allocation,97).kind,'per_asset');
+  }
+  assert.equal(validateAssetConfig(base,allocation,97).kind,'per_asset');
+  for (const execution of [
+    {kind:'stack',every:'daily',weekday:1,timeUtc:'09:00',slices:12},
+    {kind:'stack',every:'weekly',weekday:null,timeUtc:'09:00',slices:12},
+    ...[0,1,53,2.5,'12'].map(slices=>({kind:'stack',every:'weekly',weekday:1,timeUtc:'09:00',slices})),
+    ...[-1,7,1.5,'1'].map(weekday=>({kind:'stack',every:'weekly',weekday,timeUtc:'09:00',slices:12})),
+    ...['9:00','24:00','09:60','09:00:00'].map(timeUtc=>({kind:'stack',every:'weekly',weekday:1,timeUtc,slices:12})),
+    {kind:'stack',every:'monthly',weekday:1,timeUtc:'09:00',slices:12}, {kind:'stack'}, {kind:'dips'}, {kind:'hold',stopLoss:1}]) {
+    assert.throws(()=>validateAssetConfig({...base,assets:[{...base.assets[0],execution},base.assets[1]]},allocation,97));
+  }
+  for (const rebalance of ['monthly','drift']) assert.throws(()=>validateAssetConfig({...base,rebalance},allocation,97));
+  for (const value of ['2026-02-30T09:00:00Z','2026-11-16T09:00:00','2026-11-16','2026-11-16T24:00:00Z','infinity']) assert.throws(()=>utcDate(value,'startAt'));
+  const service=createPortfolioStrategyService();
+  await assert.rejects(service.instruct(82,TEST_OWNER,{expectedRevision:'0',enabled:true}),denied('STACK_INSTRUCTIONS_RETIRED'));
+  await assert.rejects(service.instructionState(82,TEST_OWNER,{revision:'1',state:'stopped'}),denied('STACK_INSTRUCTIONS_RETIRED'));
 });
 
 test('#82 chain version checks hash, basket, chain, activeAt equality and pinned enrollment', async () => {
@@ -189,11 +200,12 @@ test('#82 new portfolio HTTP routes authenticate before body parsing and return 
   try{
     const address=server.address();assert.ok(address && typeof address!=='string');
     const base=`http://127.0.0.1:${address.port}/portfolios/82`;
-    for(const action of ['execution','funding-lots','stack-instructions','stack-instruction-state','execution-state']){
+    for(const action of ['execution','funding-lots','execution-state']){
       const method=action==='execution'?'GET':'POST';
       assert.equal((await fetch(`${base}/${action}`,{method,...(method==='POST'?{body:'invalid'}:{})})).status,401);
       assert.equal((await fetch(`${base}/${action}`,{method:'PUT'})).status,405);
     }
+    for(const action of ['stack-instructions','stack-instruction-state']) assert.equal((await fetch(`${base}/${action}`,{method:'POST',body:'invalid'})).status,404);
     assert.deepEqual(calls,[]);
     authenticated=true;
     assert.equal((await fetch(base+'/execution')).status,403);
@@ -210,4 +222,42 @@ test('#82 source hash and canonical block after version reads must still match t
   const after = strategyRpc(allocation, hash, activeAt); after.state.reorgAtBlockRead = 2;
   await assert.rejects(assertVersionOnchain(82, 1, expected, TEST_ACCOUNT,
     { client: after.client, registry: TESTNET_97.contracts.registry, blockNumber: 130n, blockHash: BLOCK_HASH }), denied('FUNDING_REORGED'));
+});
+
+// Python JSON + Foundry cast keccak generated independently from the TypeScript encoder.
+test('#83 schema 2 canonical goldens bind every creator execution/yield/rebalance field and preserve schema 1', () => {
+  for (const vector of v2Golden) {
+    const execution=validateAssetConfig(vector.config.execution,vector.config.allocation,vector.config.chainId);
+    const value={chainId:vector.config.chainId,execution,allocation:vector.config.allocation,schedule:{kind:'funding' as const},activeAt:new Date(Number(vector.config.activeAt)*1000)};
+    assert.equal(canonicalConfig(value),vector.canonical);assert.equal(canonicalConfigHash(value),vector.hash);
+    assert.equal(canonicalConfigHash({...value,execution:{...execution,assets:[...execution.assets].reverse()},allocation:{assets:[...value.allocation.assets].reverse()}}),vector.hash);
+    const changed={...execution,rebalance:execution.rebalance==='none'?'monthly' as const:'none' as const};
+    if (!execution.assets.some(a=>a.execution?.kind==='stack')) assert.notEqual(canonicalConfigHash({...value,execution:changed}),vector.hash);
+    const yielded={...execution,assets:execution.assets.map((a,index)=>index===0?{...a,yield:{market:'venus_mock'}}:a)};
+    assert.notEqual(canonicalConfigHash({...value,execution:yielded}),vector.hash);
+    assert.notEqual(canonicalConfigHash({...value,activeAt:new Date(value.activeAt.getTime()+1000)}),vector.hash);
+    assert.notEqual(canonicalConfigHash({...value,chainId:1337}),vector.hash);
+  }
+});
+
+test('#83 per-asset full configuration rejects cash execution, tampered weights, duplicate/missing assets and unknown fields', () => {
+  const normalized=validateAssetConfig(undefined,allocation,97);
+  const cashEntry=normalized.assets.find(a=>a.asset===cash);const riskyEntry=normalized.assets.find(a=>a.asset===risky);
+  assert.ok(cashEntry);assert.ok(riskyEntry);
+  for(const assets of [
+    [{...cashEntry,execution:null},riskyEntry],[{...cashEntry,execution:{kind:'hold'}},riskyEntry],
+    [cashEntry,{...riskyEntry,weightBps:4999}],[cashEntry,cashEntry],
+    [cashEntry],[cashEntry,riskyEntry,{...riskyEntry,asset:TESTNET_97.assets.AMZNB.token}],
+    [cashEntry,{...riskyEntry,thresholdBps:500}],
+    [cashEntry,{...riskyEntry,yield:{market:'venus',target:TEST_ACCOUNT}}],
+    [cashEntry,{...riskyEntry,yield:{market:'https://untrusted.invalid'}}],
+  ]) assert.throws(()=>validateAssetConfig({...normalized,assets},allocation,97));
+  for(const extra of [{thresholdBps:500},{idleYield:{enabled:true}},{numeraire:TEST_ACCOUNT},{rebalance:'annual'}]) assert.throws(()=>validateAssetConfig({...normalized,...extra},allocation,97));
+  for(const rebalance of ['none','monthly','drift'] as const) assert.equal(validateAssetConfig({...normalized,rebalance},allocation,97).rebalance,rebalance);
+  const all=Array.from({length:15},(_,i)=>({address:`0x${(i+1).toString(16).padStart(40,'0')}`,weightBps:0}));
+  // 16 includes the required numeraire; more remains delegated to backend #92.
+  const sized={assets:[...all.map((a,index)=>({...a,weightBps:index===0?676:666})),{address:'0x55d398326f99059ff775485246999027b3197955',weightBps:0}]};
+  assert.equal(validateAssetConfig(undefined,sized,56).assets.length,16);
+  const overflow={assets:[...sized.assets,{address:'0x0000000000000000000000000000000000000010',weightBps:1}]};
+  assert.throws(()=>validateAssetConfig(undefined,overflow,56));
 });

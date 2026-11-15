@@ -73,6 +73,9 @@ jobs:
           test/pricing.test.ts
           test/pricing.crosscheck.test.ts
           test/rebalance-plan.test.ts
+          test/asset-plan.test.ts
+          test/new-money-plan.test.ts
+          test/trading-calendar.test.ts
           test/scheduler.test.ts
           test/server.test.ts
           test/snapshot.integration.test.ts

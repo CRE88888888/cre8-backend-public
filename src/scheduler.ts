@@ -88,6 +88,7 @@ import type { GetKernelVersion } from '@zerodev/sdk/types';
 import {
   createPublicClient,
   decodeFunctionData,
+  decodeEventLog,
   encodeAbiParameters,
   encodeFunctionData,
   hexToBytes,
@@ -121,6 +122,13 @@ import type { PlanPartial, PlannedStep, RebalancePlan, RefreshFloorsResult } fro
 import { DEFAULT_THRESHOLD_BPS, planPortfolio } from './snapshot.js';
 import type { PortfolioPlan } from './snapshot.js';
 import { MIN_INTERVAL_SECONDS } from './strategies.js';
+import { defaultNewMoneyDeps, prepareNewMoney } from './strategy-runtime.js';
+import type { NewMoneyDeps } from './strategy-runtime.js';
+import { lockCash, readJob, settleStrategyBatch, recordInflightSlots } from './strategy-jobs.js';
+import type { BatchEvidence, JobContext, StrategyJob } from './strategy-jobs.js';
+import { sumInputs } from './new-money-plan.js';
+import type { InputVector } from './new-money-plan.js';
+import { withDexLock, assertDexLock, createDexGate } from './dex-queue.js';
 
 // ---------------------------------------------------------------------------
 // 常數
@@ -352,6 +360,9 @@ export type WithTransactionFn = <T>(fn: (client: { query: SchedulerQueryFn }) =>
  * 那種 portfolio 一定會帶著 `unsupportedReason` 回來，不可能被執行。
  */
 export type DuePortfolio = {
+  executionKind?: 'hold' | 'stack' | 'per_asset';
+  version?: number;
+  scheduleState?: string;
   portfolioId: number;
   strategyId: number;
   account: Address;
@@ -462,6 +473,7 @@ export type PermissionInstallation = { signer: Address; policyCount: number };
 export type Erc20Args = { token: Address; owner: Address; spender?: Address };
 
 export type ExecuteArgs = {
+  feeBudget?: bigint;
   gasPurpose?: 'ordinary' | 'exit';
   strategyId?: bigint;
   portfolioId: number;
@@ -493,6 +505,8 @@ export type ExecuteArgs = {
  *             **沒有證據說它上鏈了**，所以要記成 failed 而不是 reverted —— 後者會讓人以為鏈上那一筆失敗了。
  */
 export type ExecutionOutcome = {
+  cashDeltaRaw?:string;
+  batchEvidence?: BatchEvidence;
   errorCode?: string;
   budgetResetAt?: string;
   priceSourceFailure?: PriceSourceFailure;
@@ -518,7 +532,11 @@ export type FloorRefreshInput = {
 };
 
 export type SchedulerDeps = {
-  checkTradingMinimums?: (steps: readonly PlannedStep[], purpose: 'ordinary' | 'exit', blockNumber: bigint) => Promise<string | null>;
+  clock?:()=>Date;
+  withDexLock?: typeof withDexLock;
+  dexGate?: (chainId:number,portfolioId:number)=>Promise<string|null>;
+  newMoney?: Partial<NewMoneyDeps>;
+  checkTradingMinimums?: (steps: readonly PlannedStep[], purpose: 'ordinary' | 'exit', blockNumber: bigint, assetBudgetRaw?:bigint) => Promise<string | null>;
   hasBoughtBefore?: (account: Address, executor: Address, blockNumber: bigint) => Promise<boolean>;
   /** Must hold exclusion from the first snapshot through settlement. null means busy. */
   withPortfolioLock?: typeof withPortfolioLock;
@@ -680,12 +698,14 @@ export function idempotencyKeyFor(portfolioId: number, planHash: Hex): string {
  * 被鎖住的列，而不是等它。鎖在 transaction 結束時釋放，而 `next_run_at` 已經在**commit 之前**
  * 推進，所以「認領」與「已經排到下一輪」是同一個原子事件。
  */
+export const SCHEDULER_ACTIVE_PREDICATE = `where (p.schedule_state = 'active' or (sv.execution_schema_version in (1,2) and p.schedule_state = 'paused'
+     and exists(select 1 from strategy_jobs j where j.portfolio_id=p.id and j.state in ('reserved','running','unknown','paused'))))`;
 const SQL_CLAIM_DUE = `
   select p.id as portfolio_id,
          p.strategy_id,
          sa.address,
          sa.account_type,
-         sv.schedule
+         sv.schedule, sv.execution, sv.execution_schema_version, p.version, p.schedule_state
     from portfolios p
     join smart_accounts sa
       on sa.portfolio_id = p.id
@@ -693,7 +713,7 @@ const SQL_CLAIM_DUE = `
     left join strategy_versions sv
       on sv.strategy_id = p.strategy_id
      and sv.version = p.version
-   where p.schedule_state = 'active'
+   ${SCHEDULER_ACTIVE_PREDICATE}
      and (p.next_run_at is null or p.next_run_at <= $1)
    order by p.next_run_at asc nulls first, p.id asc
    limit $3
@@ -789,22 +809,25 @@ export async function claimDuePortfolios(
         address?: unknown;
         account_type?: unknown;
         schedule?: unknown;
+        execution?: {kind?:unknown}; execution_schema_version?:unknown; version?:unknown; schedule_state?:unknown;
       };
       const portfolioId = toInteger(typed.portfolio_id, 'portfolios.id');
       const strategyId = toInteger(typed.strategy_id, 'portfolios.strategy_id');
       const account = asAddress(typed.address, 'smart_accounts.address');
       const accountType = asAccountType(typed.account_type);
-      const schedule = parseSchedule(typed.schedule);
+      const executionKind = typed.execution_schema_version === 2 && typed.execution?.kind==='per_asset' ? 'per_asset' : typed.execution_schema_version === 1 && (typed.execution?.kind === 'hold'||typed.execution?.kind === 'stack') ? typed.execution.kind : undefined;
+      const schedule = executionKind ? { kind: 'interval' as const, intervalSeconds: 60 } : parseSchedule(typed.schedule);
       const intervalSeconds =
         schedule.kind === 'interval' ? schedule.intervalSeconds : UNSUPPORTED_SCHEDULE_BACKOFF_SECONDS;
 
       claimed.push({
+        ...(executionKind === undefined ? {} : { executionKind, version: toInteger(typed.version,'portfolios.version'), scheduleState: String(typed.schedule_state) }),
         portfolioId,
         strategyId,
         account,
         accountType,
         intervalSeconds,
-        unsupportedReason: schedule.kind === 'unsupported' ? schedule.reason : null,
+        unsupportedReason: typed.execution_schema_version===1&&typed.execution?.kind==='stack'?'legacy stack is reconciliation-only':schedule.kind === 'unsupported' ? schedule.reason : null,
         // 與 SQL_ADVANCE_CLAIMED 寫下去的值逐位相同：回傳值不是另外算的，是同一份資料。
         // advance = false（dry-run）時這個值**不會**被寫入：DB 的 next_run_at 一位都不動。
         nextRunAt: new Date(now.getTime() + intervalSeconds * 1_000),
@@ -850,15 +873,16 @@ const SQL_GET_OPERATION = 'select state, attempts from operations where idempote
 
 // 不依賴 planHash（deadline／價格變了仍擋）。也保護舊版將已送出操作誤寫成 failed 的列。
 const SQL_UNRESOLVED_OPERATIONS = `
-  select idempotency_key, payload_hash, state, user_op_hash, tx_hash, deadline, user_op_nonce
+  select idempotency_key, payload_hash, state, user_op_hash, tx_hash, deadline, user_op_nonce, strategy_job_id, strategy_batch_index
     from operations
-   where portfolio_id = $1 and type = 'rebalance'
+   where portfolio_id = $1
      and (state in ('pending', 'submitted')
           or (state = 'failed' and (user_op_hash is not null or tx_hash is not null)))
    order by id
 `;
 
 type UnresolvedOperation = {
+  strategy_job_id?: string | null; strategy_batch_index?: number | null;
   idempotency_key: string;
   payload_hash: Hex;
   state: string;
@@ -874,6 +898,9 @@ export type ReconcileResult =
   | { kind: 'incomplete'; reason: string };
 
 export type ReconcileInput = {
+  trackCash?:Address;
+  expectedInputs?: InputVector;
+  cash?: Address;
   account: Address;
   executor: Address;
   chainId: number;
@@ -936,7 +963,7 @@ const SQL_SETTLE_OPERATION = `
  *     不是「不需要動」。
  */
 type OperationGate =
-  | { proceed: true; attempts: number }
+  | { proceed: true; attempts: number; operationKey?: string }
   | { proceed: false; outcome: 'noop' | 'blocked'; reason: string };
 
 /**
@@ -1402,6 +1429,7 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
       if (args.strategyId === undefined) throw new Error('[MIN_FEE_RESERVE] 缺少策略，不送買入');
       await checkBuyFeeReserve({ client: publicClient, executor: args.executor, account: args.account,
         strategyId: args.strategyId, registry: registryAddress(), steps: args.steps, numeraire,
+        ...(args.feeBudget===undefined?{}:{maximumReserve:args.feeBudget}),
         blockNumber: await publicClient.getBlockNumber({ cacheTime: 0 }) });
     }
 
@@ -1440,6 +1468,7 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
         gasLimit: prepared.callGasLimit + prepared.verificationGasLimit + prepared.preVerificationGas,
         maxFeePerGas: prepared.maxFeePerGas });
     }
+    await assertDexLock();
     args.onSending();
     const signed = await signPreparedOperation(prepared, (operation) => account.signUserOperation(operation));
     const userOpHash = await client.sendUserOperation(signed);
@@ -1454,7 +1483,7 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
     return judgeRebalanceOutcome({
       txStatus: receipt.receipt.status,
       userOpSuccess: typeof receipt.success === 'boolean' ? receipt.success : null,
-      swapExecuted: countSwapExecuted(receipt.receipt.logs, args.executor),
+      swapExecuted: countSwapExecuted(receipt.logs, args.executor),
       expectedSwaps: args.steps.length,
       txHash: receipt.receipt.transactionHash,
       userOpHash,
@@ -1583,8 +1612,15 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
 
   return {
     query,
-    checkTradingMinimums: provided.checkTradingMinimums ?? ((steps: readonly PlannedStep[], purpose: 'ordinary' | 'exit', blockNumber: bigint) =>
-      checkTradeMinimums(defaultPublicClient(), provided.executor ?? executorAddress(), steps, purpose, blockNumber)),
+    clock:provided.clock??(()=>new Date()),
+    withDexLock: provided.withDexLock ?? withDexLock,
+    dexGate: provided.dexGate ?? createDexGate(query, {
+      transactionBlock: async (hash) => (await defaultPublicClient().getTransactionReceipt({hash})).blockNumber,
+      blockNumber: () => defaultPublicClient().getBlockNumber({cacheTime:0}),
+    }),
+    newMoney: { ...defaultNewMoneyDeps(defaultPublicClient, () => provided.executor ?? executorAddress(), registryAddress, query, chainId), ...provided.newMoney },
+    checkTradingMinimums: provided.checkTradingMinimums ?? ((steps: readonly PlannedStep[], purpose: 'ordinary' | 'exit', blockNumber: bigint, assetBudgetRaw?:bigint) =>
+      checkTradeMinimums(defaultPublicClient(), provided.executor ?? executorAddress(), steps, purpose, blockNumber, assetBudgetRaw)),
     hasBoughtBefore: provided.hasBoughtBefore ?? (async (account: Address, executor: Address, blockNumber: bigint) => {
       const [start] = await defaultPublicClient().readContract({ address: executor,
         abi: parseAbi(['function buyWindowOf(address) view returns(uint64 start,uint192 bought)']), functionName: 'buyWindowOf', args: [account], blockNumber });
@@ -1789,7 +1825,7 @@ export async function runSchedulerOnce(
   const now = args.now ?? new Date();
   const limit = assertLimit(args.limit ?? DEFAULT_ROUND_LIMIT);
   const thresholdBps = args.thresholdBps ?? DEFAULT_THRESHOLD_BPS;
-  const resolved = resolveDeps({ thresholdBps }, deps);
+  const resolved = resolveDeps({ thresholdBps }, {...deps,clock:deps.clock??(args.now?()=>new Date(now):()=>new Date())});
 
   let executorPaused: boolean | null = null;
   try {
@@ -2056,13 +2092,17 @@ async function runOne(
     } else if (ctx.dryRun) {
       result = await decideAndMaybeExecute(due, ctx, base);
     } else {
-      result = await ctx.deps.withPortfolioLock(due.portfolioId, () => decideAndMaybeExecute(due, ctx, base))
+      result = await ctx.deps.withPortfolioLock(due.portfolioId, async () =>
+        await ctx.deps.withDexLock(ctx.deps.chainId, () => decideAndMaybeExecute(due, ctx, base))
+          ?? { ...base, outcome: 'blocked' as const, reason: '[DEX_QUEUED] 共用市場正處理另一基金，稍後重報價' })
         ?? { ...base, outcome: 'blocked', reason: '[PORTFOLIO_LOCK_BUSY] 投組已被另一輪鎖定，這一輪不規劃、不送交易' };
     }
   } catch (error) {
     // 一個 portfolio 的例外不該讓整輪停擺（RPC 抖動、某個帳戶的資料不一致）。它會被記成 blocked
     // 並在下一輪重試；next_run_at 已經推進過了，所以不會變成熱迴圈。
-    result = { ...base, outcome: 'blocked', reason: `處理時拋錯，這一輪不執行：${oneLine(error)}` };
+    result = { ...base, outcome: 'blocked', reason: due.executionKind === undefined
+      ? `處理時拋錯，這一輪不執行：${oneLine(error)}`
+      : '[STRATEGY_UNAVAILABLE] 讀鏈／DB／鎖資料不完整，保留原預算與原交易身分，先對帳' };
   }
 
   // ---- 部分執行 → 把 next_run_at 拉近（只拉近，不延後；只在真的做了一部分之後）----
@@ -2103,7 +2143,7 @@ async function runOne(
   try {
     await ctx.deps.query(SQL_MARK_CHECKED, [due.portfolioId, ctx.now.toISOString(), result.outcome === 'executed']);
   } catch (error) {
-    ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} 的 last_checked_at 寫不進去：${oneLine(error)}`);
+    ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} 的 last_checked_at 寫不進去：${due.executionKind===undefined?oneLine(error):'DB unavailable'}`);
   }
   return result;
 }
@@ -2113,9 +2153,6 @@ async function decideAndMaybeExecute(
   ctx: { dryRun: boolean; now: Date; thresholdBps: number; deps: ResolvedDeps; forcePlan?: boolean },
   base: Omit<PortfolioRunResult, 'outcome' | 'reason'>,
 ): Promise<PortfolioRunResult> {
-  if (due.unsupportedReason !== null) {
-    return { ...base, outcome: 'blocked', reason: `排程不支援，不執行：${due.unsupportedReason}` };
-  }
 
   // 帳戶型別：只有 KERNEL 能被 session key 簽 UserOp。EOA（帳戶就是 owner 本人）身上沒有
   // permission validator、`session_keys` 也不會有它的列，所以它**永遠不可能**成功 —— 這種
@@ -2135,10 +2172,12 @@ async function decideAndMaybeExecute(
   if (unresolved.length > 0) {
     // dry-run 只能報在途，不能因預演而改 operations 或假稱 ready。
     const op = unresolved[0]!;
+    if (op.strategy_job_id != null) return reconcileStrategyOperation(due,ctx,base,op);
     if (ctx.dryRun || unresolved.length > 1) {
       return { ...base, outcome: 'blocked', reason: `portfolio 還在 ${op.state}（${unresolved.length} 筆未決操作），結果未知，先對帳，不重送` };
     }
     if (op.user_op_hash === null) {
+      if(due.executionKind==='per_asset')return {...base,outcome:'blocked',reason:'[PREVIOUS_INFLIGHT] 原收據缺hash；不能證明過去未成交，保留現金帳與原操作待對帳'};
       if (op.state === 'pending') {
         const released = await releaseUnresolvedOperation(due, ctx.deps, op, base);
         return released.outcome === 'blocked'
@@ -2151,11 +2190,13 @@ async function decideAndMaybeExecute(
       reconciliation = await ctx.deps.reconcileRebalance({
         account: due.account, executor: ctx.deps.executor ?? executorAddress(), chainId: ctx.deps.chainId,
         userOpHash: op.user_op_hash, txHash: op.tx_hash, payloadHash: op.payload_hash,
+        ...(due.executionKind==='per_asset'?{trackCash:(ctx.deps.chainId===97?TESTNET_97.contracts.usdt:'0x55d398326f99059ff775485246999027b3197955') as Address}:{}),
       });
     } catch (error) {
       return { ...base, outcome: 'blocked', reason: decodePriceSourceError(error)?.detail ?? '先對帳：RPC 失敗或證據不符，保留在途，不重送' };
     }
     if (reconciliation.kind === 'not_found') {
+      if(due.executionKind==='per_asset')return {...base,outcome:'blocked',reason:'[PREVIOUS_INFLIGHT] 原收據查無；保留現金帳與原操作待對帳'};
       return releaseUnresolvedOperation(due, ctx.deps, op, base);
     }
     if (reconciliation.kind !== 'found' ||
@@ -2163,6 +2204,10 @@ async function decideAndMaybeExecute(
       return { ...base, outcome: 'blocked', reason: '先對帳：receipt 尚未取得或證據不完整，保留在途，不重送' };
     }
     const execution = reconciliation.outcome;
+    if(due.executionKind==='per_asset'&&execution.status==='success'){
+      await settleAllocatedCash(ctx.deps,due.portfolioId,op.idempotency_key,execution);
+      return {...base,outcome:'executed',execution,reason:'原再平衡收據與已配置現金已原子對帳，本輪無重送'};
+    }
     const settled = await ctx.deps.query(SQL_SETTLE_OPERATION, [op.idempotency_key,
       execution.status === 'success' ? 'confirmed' : 'reverted', execution.txHash, execution.userOpHash, execution.error]);
     if (settled.rows.length !== 1) {
@@ -2180,6 +2225,11 @@ async function decideAndMaybeExecute(
       reason: `先對帳完成：${execution.status === 'success' ? 'confirmed' : 'reverted'}，這一輪沒有重送交易` };
   }
 
+  if (due.unsupportedReason !== null) {
+    return { ...base, outcome: 'blocked', reason: `排程不支援，不執行：${due.unsupportedReason}` };
+  }
+
+  if(!ctx.dryRun){const queued=await ctx.deps.dexGate(ctx.deps.chainId,due.portfolioId);if(queued!==null)return {...base,outcome:'blocked',reason:queued};}
   const plan = await ctx.deps.planPortfolio(due.portfolioId);
 
   // 把「鏈上釘住的版本」同步回 DB。
@@ -2193,10 +2243,12 @@ async function decideAndMaybeExecute(
   //
   // 失敗不影響這一輪：版本標籤不是交易的前置條件。
   try {
+    if (due.executionKind === undefined) {
     await ctx.deps.query('update portfolios set version = $1 where id = $2 and version <> $1', [
       plan.pinnedVersion.version,
       due.portfolioId,
     ]);
+    }
   } catch (error) {
     ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} 的 version 同步失敗：${oneLine(error)}`);
   }
@@ -2219,7 +2271,7 @@ async function decideAndMaybeExecute(
   }
   // `forcePlan`：呼叫端要用**同一條送出管線**做別的事（例如 redeem 按比例賣成 numeraire）。
   // 那種動作不會讓漂移變大，所以「不需要再平衡」不代表「什麼都不用做」。
-  if (!plan.report.needsRebalance && ctx.forcePlan !== true) {
+  if (due.executionKind === undefined && !plan.report.needsRebalance && ctx.forcePlan !== true) {
     return {
       ...base,
       outcome: 'noop',
@@ -2229,7 +2281,9 @@ async function decideAndMaybeExecute(
     };
   }
 
-  const rebalance = await ctx.deps.planRebalance({ portfolioId: due.portfolioId, account: due.account, plan });
+  const money = due.executionKind === undefined || ctx.forcePlan === true ? null : await prepareNewMoney({due,plan,query:ctx.deps.query,
+    run:ctx.deps.withTransaction,chainId:ctx.deps.chainId,now:ctx.now,dryRun:ctx.dryRun,deps:ctx.deps.newMoney});
+  const rebalance = (money?.useTargetWeights?null:money?.rebalance) ?? await ctx.deps.planRebalance({ portfolioId: due.portfolioId, account: due.account, plan });
   if (rebalance.kind === 'noop') {
     return { ...base, outcome: 'noop', reason: `Planner returned noop: ${rebalance.reason}` };
   }
@@ -2263,7 +2317,7 @@ async function decideAndMaybeExecute(
   const cash = ctx.deps.chainId === 97 ? TESTNET_97.contracts.usdt : '0x55d398326f99059ff775485246999027b3197955';
   const hasBuy = rebalance.steps.some((step) => !isAddressEqual(step.tokenOut, cash));
   if (gasPurpose === 'exit' && hasBuy) return { ...base, outcome: 'blocked', reason: '[INVALID_EXIT] 退出計畫包含買入，不送交易' };
-  if (hasBuy) {
+  if (hasBuy && money?.job?.kind!=='asset') {
     try {
       const minimum = minimumDepositUsdtWei(plan.targets, cash);
       if (plan.report.totalUsdE8 * 10n ** 10n < minimum &&
@@ -2272,7 +2326,7 @@ async function decideAndMaybeExecute(
       }
     } catch { return { ...base, outcome: 'blocked', reason: '[MIN_DEPOSIT_UNAVAILABLE] 無法確認首次買入與最低入金，不送交易' }; }
   }
-  const minimumReason = await ctx.deps.checkTradingMinimums(rebalance.steps, gasPurpose, plan.snapshot.block);
+  const minimumReason = await ctx.deps.checkTradingMinimums(rebalance.steps, gasPurpose, plan.snapshot.block, money?.job?.kind==='asset'?rebalance.steps.reduce((s,step)=>s+step.amountIn,0n)+money.context.reserve:undefined);
   if (minimumReason !== null) return { ...base, outcome: 'blocked', reason: minimumReason };
 
   // ---- ⑤ 送出前重問地板：`rebalance.steps` 的 `amountOutMin` 是**規劃當時**的地板 --------------
@@ -2306,7 +2360,7 @@ async function decideAndMaybeExecute(
   ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} 送出前重問地板：${refresh.note}`);
 
   const planHash = planHashFor(steps, rebalance.deadline);
-  const idempotencyKey = idempotencyKeyFor(due.portfolioId, planHash);
+  let idempotencyKey = idempotencyKeyFor(due.portfolioId, planHash);
   const summary: PlannedSummary = {
     steps: steps.map((step) => ({
       tokenIn: step.tokenIn,
@@ -2357,7 +2411,7 @@ async function decideAndMaybeExecute(
           ? 'Pre-checks failed (dry-run blocks it too: `--live` would not send either, so this is not reported as ready)'
           : 'Pre-checks failed (not sending a transaction that is certain to fail)') +
         '：' +
-        prechecks.failures.map((failure) => `[${failure.code}] ${failure.detail}`).join('；'),
+        prechecks.failures.map((failure) => `[${failure.code}] ${due.executionKind===undefined?failure.detail:'前置條件不足，未送交易'}`).join('；'),
     };
   }
   const sessionKey = prechecks.sessionKey;
@@ -2398,6 +2452,7 @@ async function decideAndMaybeExecute(
   let gate: OperationGate;
   try {
     gate = await ctx.deps.withTransaction(async (client) => {
+      if (money?.job) return beginStrategyOperation(client.query,{...money.context,now:ctx.deps.clock()},money.job,steps,{idempotencyKey,payloadHash:planHash,deadline,nonce,clock:ctx.deps.clock});
       await client.query('select id from portfolios where id = $1 for update', [due.portfolioId]);
       return beginOperation(client.query, { portfolioId: due.portfolioId, idempotencyKey, payloadHash: planHash, deadline, nonce });
     });
@@ -2407,9 +2462,11 @@ async function decideAndMaybeExecute(
   if (!gate.proceed) {
     return { ...withPlan, outcome: gate.outcome, reason: `operations 閘門擋下：${gate.reason}` };
   }
+  if (gate.operationKey !== undefined) { idempotencyKey=gate.operationKey; summary.idempotencyKey=idempotencyKey; }
 
   // 稽核軌跡：送出前先記一張（用剛剛算好的觀測，不額外讀鏈）。
   await recordAuditSnapshot({
+    safeErrors: due.executionKind!==undefined,
     deps: ctx.deps,
     portfolioId: due.portfolioId,
     phase: 'before',
@@ -2430,6 +2487,8 @@ async function decideAndMaybeExecute(
     nonce,
     valuationAssets,
     idempotencyKey,
+    trackAllocatedCash:due.executionKind==='per_asset',
+    ...(money?.job ? { strategy: { context: money.context, job: money.job } } : {}),
   });
   if (execution.errorCode === 'GAS_BUDGET_EXCEEDED') {
     const nextDay = execution.budgetResetAt === undefined ? new Date(ctx.now) : new Date(execution.budgetResetAt);
@@ -2448,6 +2507,7 @@ async function decideAndMaybeExecute(
     try {
       const afterPlan = await ctx.deps.planPortfolio(due.portfolioId);
       await recordAuditSnapshot({
+        safeErrors: due.executionKind!==undefined,
         deps: ctx.deps,
         portfolioId: due.portfolioId,
         phase: 'after',
@@ -2456,7 +2516,7 @@ async function decideAndMaybeExecute(
         thresholdBps: ctx.thresholdBps,
       });
     } catch (error) {
-      ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} 的 after 快照讀鏈失敗：${oneLine(error)}（這一輪照常）`);
+      ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} 的 after 快照讀鏈失敗：${due.executionKind===undefined?oneLine(error):'RPC unavailable'}（這一輪照常）`);
     }
   }
   if (execution.status === 'success') {
@@ -2502,6 +2562,7 @@ async function decideAndMaybeExecute(
  * 反過來（為了一張快照讓一筆已經規劃好的再平衡失敗）才是真正不可接受的。
  */
 async function recordAuditSnapshot(args: {
+  safeErrors?:boolean;
   deps: ResolvedDeps;
   portfolioId: number;
   phase: 'before' | 'after';
@@ -2529,7 +2590,7 @@ async function recordAuditSnapshot(args: {
     );
   } catch (error) {
     args.deps.log(
-      `[scheduler] portfolio ${args.portfolioId} 的 ${args.phase} 快照沒寫成：${oneLine(error)}（這一輪照常）`,
+      `[scheduler] portfolio ${args.portfolioId} 的 ${args.phase} 快照沒寫成：${args.safeErrors?'storage unavailable':oneLine(error)}（這一輪照常）`,
     );
   }
 }
@@ -2583,18 +2644,87 @@ export async function readRebalanceReceipt(input: ReconcileInput, reader: {
   if (swaps !== (receipt.success ? steps.length : 0)) {
     return { kind: 'incomplete', reason: 'SwapExecuted 數量與原計畫不符' };
   }
-  return { kind: 'found', outcome: judgeRebalanceOutcome({ txStatus: receipt.receipt.status,
+  const outcome = judgeRebalanceOutcome({ txStatus: receipt.receipt.status,
     userOpSuccess: typeof receipt.success === 'boolean' ? receipt.success : null,
     // getUserOperationReceipt.logs 僅限該 UserOp；receipt.logs 可能含同 tx 的其他 UserOp。
     swapExecuted: swaps, expectedSwaps: steps.length,
     txHash: receipt.receipt.transactionHash, userOpHash: input.userOpHash,
-    gasUsed: receipt.actualGasUsed.toString(), ...(receipt.reason === undefined ? {} : { revertReason: receipt.reason }) }) };
+    gasUsed: receipt.actualGasUsed.toString(), ...(receipt.reason === undefined ? {} : { revertReason: receipt.reason }) });
+  if(input.trackCash!==undefined&&outcome.status==='success')outcome.cashDeltaRaw=receiptCashDelta(receipt,input.account,input.trackCash).toString();
+  if(input.expectedInputs!==undefined&&outcome.status==='success') {
+    if(input.cash===undefined)throw new Error('missing cash identity');
+    outcome.batchEvidence = strategyReceiptEvidence(receipt,steps,input.expectedInputs,input.account,input.executor,input.cash);
+  }
+  return {kind:'found',outcome};
+}
+
+/** The bundler's scoped logs belong to exactly this UserOp (not sibling operations). */
+export function receiptCashDelta(receipt:UserOperationReceipt,account:Address,cash:Address):bigint{
+  const abi=parseAbi(['event Transfer(address indexed from,address indexed to,uint256 value)']);let delta=0n;
+  for(const log of receipt.logs){
+    if(log.address.toLowerCase()!==cash.toLowerCase()||log.topics[0]!==keccak256(toBytes('Transfer(address,address,uint256)')))continue;
+    if(log.removed)throw new Error('removed cash transfer');
+    const event=decodeEventLog({abi,data:log.data,topics:log.topics});
+    if(event.args.from.toLowerCase()===account.toLowerCase())delta-=event.args.value;
+    if(event.args.to.toLowerCase()===account.toLowerCase())delta+=event.args.value;
+  }
+  return delta;
+}
+async function settleAllocatedCash(deps:ResolvedDeps,portfolioId:number,key:string,outcome:ExecutionOutcome):Promise<void>{
+  if(outcome.cashDeltaRaw===undefined||!/^(-?)(0|[1-9][0-9]*)$/.test(outcome.cashDeltaRaw))throw new Error('missing cash evidence');
+  await deps.withTransaction(async({query})=>{
+    await lockCash(query,{chainId:deps.chainId,portfolioId});
+    const op=(await query('select state from operations where idempotency_key=$1 for update',[key])).rows[0] as {state:string}|undefined;
+    if(op?.state==='confirmed')return;
+    if(!op||!['pending','submitted'].includes(op.state))throw new Error('cash attempt is not pending');
+    const result=await query(SQL_SETTLE_OPERATION,[key,'confirmed',outcome.txHash,outcome.userOpHash,null]);
+    if(result.rows.length!==1)throw new Error('operation changed');
+    await query(`update strategy_cash_balances set allocated_cash_raw=allocated_cash_raw+$3::numeric,updated_at=clock_timestamp() where chain_id=$1 and portfolio_id=$2`,[deps.chainId,portfolioId,outcome.cashDeltaRaw]);
+  });
+}
+
+/** Exact business evidence from this UserOp's canonical logs, including actual token transfers. */
+export function strategyReceiptEvidence(receipt:UserOperationReceipt,steps:readonly {tokenIn:Address;tokenOut:Address;amountIn:bigint;amountOutMin:bigint}[],
+  expected:InputVector,account:Address,executor:Address,cash:Address):BatchEvidence {
+  const abi=parseAbi(['event SwapExecuted(address indexed account,address tokenIn,address tokenOut,uint256 amountIn,uint256 gross,uint256 fee,uint256 net,uint256 oracleFloor)',
+    'event MinFeeCharged(address indexed account,uint256 notional,uint256 due,uint256 charged)','event Transfer(address indexed from,address indexed to,uint256 value)']);
+  const received:InputVector={},fees:InputVector={},inputs:InputVector={},transfers:InputVector={};
+  let feePaid=0n,feeEvents=0,cashOut=0n;
+  for(const log of receipt.logs){
+    if(log.removed)throw new Error('removed receipt event');
+    const emitter=log.address.toLowerCase();
+    const topic=log.topics[0]?.toLowerCase();
+    if(emitter===executor.toLowerCase()&&(topic===SWAP_EXECUTED_TOPIC||topic===keccak256(toBytes('MinFeeCharged(address,uint256,uint256,uint256)')))){
+      const event=decodeEventLog({abi,data:log.data,topics:log.topics});
+      if(event.eventName==='SwapExecuted'){
+        const a=event.args,key=a.tokenOut.toLowerCase(),step=steps.find(s=>s.tokenOut.toLowerCase()===key);
+        if(a.account.toLowerCase()!==account.toLowerCase()||a.tokenIn.toLowerCase()!==cash.toLowerCase()||!step||inputs[key]!==undefined||
+          expected[key]!==a.amountIn.toString()||step.amountIn!==a.amountIn||a.gross<step.amountOutMin||a.gross-a.fee!==a.net||a.net<=0n)throw new Error('swap evidence mismatch');
+        inputs[key]=a.amountIn.toString();received[key]=a.net.toString();fees[key]=a.fee.toString();
+      }else if(event.eventName==='MinFeeCharged'){
+        const a=event.args;
+        if(a.account.toLowerCase()!==account.toLowerCase()||a.notional!==sumInputs(expected)||a.charged>a.due||++feeEvents>1)throw new Error('fee evidence mismatch');
+        feePaid=a.charged;
+      }
+    } else if(topic===keccak256(toBytes('Transfer(address,address,uint256)'))&&(emitter===cash.toLowerCase()||expected[emitter]!==undefined)){
+      const event=decodeEventLog({abi,data:log.data,topics:log.topics});
+      if(event.eventName==='Transfer'){
+        if(emitter===cash.toLowerCase()&&event.args.from.toLowerCase()===account.toLowerCase())cashOut+=event.args.value;
+        if(event.args.to.toLowerCase()===account.toLowerCase())transfers[emitter]=(BigInt(transfers[emitter]??'0')+event.args.value).toString();
+      }
+    }
+  }
+  if(Object.keys(inputs).length!==Object.keys(expected).length||Object.entries(received).some(([a,v])=>transfers[a]!==v)||
+    cashOut!==sumInputs(expected)+feePaid)throw new Error('receipt token differences mismatch');
+  return {received,fees,feePaid,blockNumber:receipt.receipt.blockNumber,blockHash:receipt.receipt.blockHash};
 }
 
 /** 送出 → 標 submitted → 等 receipt；任何送出後例外都保留在途，不降成可重試的 failed。 */
 async function executeAndSettle(
   deps: ResolvedDeps,
   args: {
+    strategy?: {context:JobContext;job:StrategyJob};
+    trackAllocatedCash?:boolean;
     gasPurpose: 'ordinary' | 'exit';
     strategyId: bigint;
     portfolioId: number;
@@ -2608,7 +2738,34 @@ async function executeAndSettle(
     idempotencyKey: string;
   },
 ): Promise<ExecutionOutcome> {
+  const typed=args.strategy!==undefined||args.trackAllocatedCash===true;
   const settle = async (state: 'confirmed' | 'reverted' | 'failed', outcome: ExecutionOutcome, error: string | null) => {
+    if (args.strategy) {
+      await deps.query(SQL_MARK_SUBMITTED,[args.idempotencyKey,outcome.userOpHash,outcome.txHash]);
+      if(state==='confirmed'||state==='reverted') {
+        if(outcome.userOpHash===null||outcome.txHash===null)throw new Error('missing confirmed hashes');
+        const verified=await deps.reconcileRebalance({account:args.account,executor:args.executor,chainId:deps.chainId,userOpHash:outcome.userOpHash,
+          txHash:outcome.txHash,payloadHash:planHashFor(args.steps,args.deadline),cash:args.strategy.context.cash,
+          expectedInputs:Object.fromEntries(args.steps.map(s=>[s.tokenOut.toLowerCase(),s.amountIn.toString()]))});
+        if(verified.kind!=='found')throw new Error('business receipt incomplete');
+        if(verified.outcome.status==='success'&&verified.outcome.batchEvidence){
+          const op=(await deps.query('select id from operations where idempotency_key=$1',[args.idempotencyKey])).rows[0] as {id:string}|undefined;
+          if(!op)throw new Error('attempt missing');
+          await settleStrategyBatch(deps.withTransaction,args.strategy.context,op.id,verified.outcome.batchEvidence);
+        }else if(verified.outcome.status==='reverted'){
+          await failStrategyAttempt(deps,args.strategy.context,args.idempotencyKey,'reverted',verified.outcome);
+        }else throw new Error('business receipt incomplete');
+        Object.assign(outcome,verified.outcome);
+      } else await failStrategyAttempt(deps,args.strategy.context,args.idempotencyKey,state,outcome);
+      return;
+    }
+    if(args.trackAllocatedCash&&state==='confirmed'){
+      if(!outcome.userOpHash)throw new Error('missing UserOp');
+      const cash=(deps.chainId===97?TESTNET_97.contracts.usdt:'0x55d398326f99059ff775485246999027b3197955') as Address;
+      const verified=await deps.reconcileRebalance({account:args.account,executor:args.executor,chainId:deps.chainId,userOpHash:outcome.userOpHash,txHash:outcome.txHash,payloadHash:planHashFor(args.steps,args.deadline),trackCash:cash});
+      if(verified.kind!=='found'||verified.outcome.status!=='success')throw new Error('cash receipt incomplete');
+      await settleAllocatedCash(deps,args.portfolioId,args.idempotencyKey,verified.outcome);Object.assign(outcome,verified.outcome);return;
+    }
     const result = await deps.query(SQL_SETTLE_OPERATION, [args.idempotencyKey, state, outcome.txHash, outcome.userOpHash, error]);
     if (result.rows.length !== 1) throw new Error('操作已安全釋放或不存在，不覆寫 expired');
   };
@@ -2619,6 +2776,7 @@ async function executeAndSettle(
 
   try {
     const outcome = await deps.executeRebalance({
+      ...(args.strategy?{feeBudget:BigInt(args.strategy.job.remaining_fee_raw)}:{}),
       gasPurpose: args.gasPurpose,
       strategyId: args.strategyId,
       portfolioId: args.portfolioId,
@@ -2636,6 +2794,7 @@ async function executeAndSettle(
         await deps.query(SQL_MARK_SUBMITTED, [args.idempotencyKey, ids.userOpHash ?? null, ids.txHash ?? null]);
       },
     });
+    if(typed && outcome.error!==null)outcome.error='[STRATEGY_EXECUTION_UNAVAILABLE] 交易尚未完成，保留原身分及預算待對帳';
     received = outcome;
     if (outcome.status === 'unknown' || (outcome.status === 'error' &&
         (sending || outcome.userOpHash !== null || outcome.txHash !== null))) {
@@ -2658,7 +2817,7 @@ async function executeAndSettle(
     return outcome;
   } catch (error) {
     const failure = decodePriceSourceError(error);
-    const message = oneLine(error);
+    const message = typed ? '[STRATEGY_EXECUTION_UNAVAILABLE] 無法確認執行結果，保留原身分待對帳' : oneLine(error);
     const unknown = sending || (received !== null && received.status !== 'error');
     const outcome: ExecutionOutcome = { status: unknown ? 'unknown' : 'error',
       ...(error instanceof AppError ? { errorCode: error.code } : {}),
@@ -2676,10 +2835,80 @@ async function executeAndSettle(
         await settle('failed', outcome, message);
       }
     } catch (dbError) {
-      deps.log(`[scheduler] operations 的 ${unknown ? '在途狀態' : 'failed'} 寫不進去（${oneLine(dbError)}）：原始錯誤是 ${message}`);
+      deps.log(`[scheduler] operations 的 ${unknown ? '在途狀態' : 'failed'} 寫不進去（${typed?'DB unavailable':oneLine(dbError)}）：原始錯誤是 ${message}`);
     }
     return outcome;
   }
+}
+
+async function beginStrategyOperation(query:SchedulerQueryFn,c:JobContext,j:StrategyJob,steps:readonly PlannedStep[],
+  a:{idempotencyKey:string;payloadHash:Hex;deadline:string;nonce:bigint;clock?:()=>Date}):Promise<OperationGate>{
+  await lockCash(query,c);
+  if((await unresolvedOperations(query,c.portfolioId)).length)return {proceed:false,outcome:'blocked',reason:'未知操作先對帳'};
+  const current=await readJob(query,c);
+  if(!current||current.id!==j.id||!['reserved','running'].includes(current.state))return {proceed:false,outcome:'blocked',reason:'原工作已停止或改變'};
+  const inputs=Object.fromEntries(steps.map(s=>[s.tokenOut.toLowerCase(),s.amountIn.toString()]));
+  if(steps.some(s=>!isAddressEqual(s.tokenIn,c.cash))||Object.keys(inputs).length!==steps.length||
+    Object.keys(current.remaining_input).filter(a=>BigInt(current.remaining_input[a]??'0')>0n).length!==steps.length||
+    Object.entries(inputs).some(([a,v])=>BigInt(v)>BigInt(current.remaining_input[a]??'0')))throw new Error('basket identity changed');
+  await query("update strategy_job_batches set state='cancelled',updated_at=clock_timestamp() where job_id=$1 and state='planned'",[j.id]);
+  const indexRow=(await query('select coalesce(max(batch_index)+1,0) as n from strategy_job_batches where job_id=$1',[j.id])).rows[0] as {n:number}|undefined;
+  const index=indexRow?.n??-1;
+  if(!Number.isSafeInteger(index)||index<0)throw new Error('invalid batch index');
+  if(current.kind==='asset'&&current.asset_started_at==null){
+    const startedAt=a.clock?.()??c.now;
+    const started=await query("update strategy_jobs set asset_started_at=$2,state='running',updated_at=clock_timestamp() where id=$1 and asset_started_at is null and slot_at<=$2 and window_end_at>$2 returning id",[j.id,startedAt]);
+    if(started.rows.length!==1)return {proceed:false,outcome:'blocked',reason:'期次窗口已過，不開始舊期次'};
+  }
+  await query('insert into strategy_job_batches(job_id,batch_index,input_raw) values($1,$2,$3)',[j.id,index,JSON.stringify(inputs)]);
+  const key=`${a.idempotencyKey}:job:${j.id}:batch:${index}`;
+  const inserted=await query(`insert into operations(portfolio_id,type,state,idempotency_key,payload_hash,attempts,deadline,user_op_nonce,strategy_job_id,strategy_batch_index)
+    values($1,'rebalance','pending',$2,$3,1,$4,$5,$6,$7) returning id`,[c.portfolioId,key,a.payloadHash,a.deadline,a.nonce.toString(),j.id,index]);
+  if(inserted.rows.length!==1)throw new Error('attempt identity not saved');
+  await query("update strategy_jobs set state='running',updated_at=clock_timestamp() where id=$1",[j.id]);
+  return {proceed:true,attempts:1,operationKey:key};
+}
+
+async function failStrategyAttempt(deps:ResolvedDeps,c:Pick<JobContext,'chainId'|'portfolioId'>,key:string,state:'failed'|'reverted',outcome:ExecutionOutcome){
+  await deps.withTransaction(async({query})=>{
+    await lockCash(query,c);
+    const op=(await query('select * from operations where idempotency_key=$1 for update',[key])).rows[0] as {strategy_job_id:string;strategy_batch_index:number}|undefined;
+    if(!op)throw new Error('attempt missing');
+    await query(SQL_SETTLE_OPERATION,[key,state,outcome.txHash,outcome.userOpHash,outcome.error]);
+    await query("update strategy_job_batches set state='failed',updated_at=clock_timestamp() where job_id=$1 and batch_index=$2",[op.strategy_job_id,op.strategy_batch_index]);
+    const budget=outcome.errorCode==='GAS_BUDGET_EXCEEDED';
+    await query(`update strategy_jobs set failure_count=least(3,failure_count+$2),state=case when failure_count+$2>=3 then 'paused' else 'running' end,
+      next_check_at=case when $3::timestamptz is not null then $3 else clock_timestamp()+case failure_count when 0 then interval '1 minute'
+        when 1 then interval '5 minutes' else interval '30 minutes' end end,updated_at=clock_timestamp() where id=$1`,
+      [op.strategy_job_id,budget?0:1,budget?outcome.budgetResetAt??new Date(Date.now()+86400000).toISOString():null]);
+  });
+}
+
+async function reconcileStrategyOperation(due:DuePortfolio,ctx:{dryRun:boolean;now:Date;deps:ResolvedDeps},base:Omit<PortfolioRunResult,'outcome'|'reason'>,op:UnresolvedOperation):Promise<PortfolioRunResult>{
+  const blocked=(reason:string):PortfolioRunResult=>({...base,outcome:'blocked',reason});
+  if(ctx.dryRun)return blocked('[PREVIOUS_INFLIGHT] 未知操作保留原身分，先對帳');
+  await recordInflightSlots(ctx.deps.withTransaction,{chainId:ctx.deps.chainId,portfolioId:due.portfolioId,now:ctx.now});
+  if(!op.user_op_hash)return blocked('[PREVIOUS_INFLIGHT] 原業務收據缺少hash；nonce前進不證明過去未成交，保留預算待對帳');
+  const b=(await ctx.deps.query('select input_raw from strategy_job_batches where job_id=$1 and batch_index=$2',[op.strategy_job_id,op.strategy_batch_index])).rows[0] as {input_raw:InputVector}|undefined;
+  if(!b)return blocked('原子批缺漏，先對帳');
+  const cash=(ctx.deps.chainId===97?TESTNET_97.contracts.usdt:'0x55d398326f99059ff775485246999027b3197955') as Address;
+  const result=await ctx.deps.reconcileRebalance({account:due.account,executor:ctx.deps.executor??executorAddress(),chainId:ctx.deps.chainId,
+    userOpHash:op.user_op_hash,txHash:op.tx_hash,payloadHash:op.payload_hash,expectedInputs:b.input_raw,cash});
+  if(result.kind==='not_found')return blocked('[PREVIOUS_INFLIGHT] 原業務收據查無；不能排除過去成交，保留預算待對帳');
+  if(result.kind!=='found')return blocked('receipt／原 UserOp 證據缺漏，保留在途');
+  const outcome=result.outcome,c={chainId:ctx.deps.chainId,portfolioId:due.portfolioId};
+  if(outcome.status==='success'&&outcome.batchEvidence){
+    await ctx.deps.query(SQL_MARK_SUBMITTED,[op.idempotency_key,outcome.userOpHash,outcome.txHash]);
+    const row=(await ctx.deps.query('select id from operations where idempotency_key=$1',[op.idempotency_key])).rows[0] as {id:string}|undefined;
+    if(!row)throw new Error('attempt missing');
+    await settleStrategyBatch(ctx.deps.withTransaction,c,row.id,outcome.batchEvidence);
+    return {...base,outcome:'executed',execution:outcome,reason:'已從原 receipt 恢復剩餘向量；本輪沒有重送'};
+  }
+  if(outcome.status==='reverted'){
+    await failStrategyAttempt(ctx.deps,c,op.idempotency_key,'reverted',outcome);
+    return {...base,outcome:'failed',execution:outcome,reason:'原操作已確認失敗；保留原預算，下一輪依退避重試'};
+  }
+  return blocked('業務成交證據缺漏，保留原預算及在途身分');
 }
 
 /** 一行摘要（CLI 與 log 都用它）。 */

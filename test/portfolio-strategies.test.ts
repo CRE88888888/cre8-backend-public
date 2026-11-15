@@ -10,6 +10,7 @@ import { assertVersionOnchain, readAccountCash } from '../src/chain.js';
 import { enrollPortfolio, requireOwnedPortfolio, strategyMinimumDeposit } from '../src/portfolios.js';
 import { readFaucetFundingEvidence } from '../src/faucet.js';
 import { canonicalConfigHash, usdtRaw } from '../src/strategy-execution.js';
+import type { AssetExecution, AssetSetting } from '../src/strategy-execution.js';
 import { AppError } from '../src/errors.js';
 import { TESTNET_97 } from '../src/testnet-profile.js';
 import { strategyRpc, TEST_AMOUNT, OTHER_HASH } from './fixtures/strategy-rpc.js';
@@ -22,32 +23,49 @@ const fixtureClaimIds: string[] = [];
 const activeAt = new Date('2026-11-15T00:00:00Z');
 const allocation = validateAllocation({ assets: [{ address: TESTNET_97.assets.AAPLB.token, weightBps:5000 },{address:TESTNET_97.contracts.usdt,weightBps:5000}] },97);
 
-async function fixture(kind: 'hold' | 'stack' = 'stack') {
+function assetConfig(kind:'hold'|'stack',basket=allocation,chainId=97):AssetExecution {
+  const numeraire=chainId===97?TESTNET_97.contracts.usdt:'0x55d398326f99059ff775485246999027b3197955';
+  return {kind:'per_asset',numeraire,rebalance:'none',assets:basket.assets.map<AssetSetting>(({address,weightBps})=>address===numeraire
+    ? {asset:address,weightBps,yield:null} : {asset:address,weightBps,yield:null,execution:kind==='hold'?{kind:'hold'}:
+      {kind:'stack',every:'daily',weekday:null,timeUtc:'14:00',slices:12}}).sort((a,b)=>a.asset.localeCompare(b.asset))};
+}
+async function fixture(kind: 'hold' | 'stack' = 'stack', cashWeight=5000, amount=TEST_AMOUNT, configured?:AssetExecution) {
   await migrate();
+  const allocation=validateAllocation({assets:configured?configured.assets.map(a=>({address:a.asset,weightBps:a.weightBps})):[{address:TESTNET_97.assets.AAPLB.token,weightBps:10000-cashWeight},{address:TESTNET_97.contracts.usdt,weightBps:cashWeight}]},97);
   const owner=address(); const account=address();
   const strategy=(await query<{id:string}>("insert into strategies(provider,name) values($1,'be82-isolated') returning id",[owner])).rows[0];
   assert.ok(strategy);
   const strategyId=Number(strategy.id);
   const onchainId=strategyId+90_000_000;
   await query('update strategies set onchain_id=$2 where id=$1',[strategyId,onchainId]);
-  const configHash=canonicalConfigHash({chainId:97,execution:{kind},allocation,schedule:{kind:'funding'},activeAt});
+  const execution=configured??assetConfig(kind,allocation);
+  const configHash=canonicalConfigHash({chainId:97,execution,allocation,schedule:{kind:'funding'},activeAt});
   await query(`insert into strategy_versions(strategy_id,version,allocation,schedule,active_at,execution_schema_version,execution,execution_chain_id,config_hash)
-    values($1,1,$2::jsonb,'{"kind":"funding"}',$3,1,$4::jsonb,97,$5)`,[strategyId,JSON.stringify(allocation),activeAt,JSON.stringify({kind}),configHash]);
+    values($1,1,$2::jsonb,'{"kind":"funding"}',$3,2,$4::jsonb,97,$5)`,[strategyId,JSON.stringify(allocation),activeAt,JSON.stringify(execution),configHash]);
   const p=(await query<{id:string}>("insert into portfolios(user_id,strategy_id,version,schedule_state) values($1,$2,1,'paused') returning id",[owner,strategyId])).rows[0];
   assert.ok(p);const id=Number(p.id);
   await query("insert into smart_accounts(portfolio_id,chain_id,address,owner,account_type) values($1,97,$2,$3,'KERNEL')",[id,account,owner]);
   const hash=txHash();
-  const claim=(await query<{id:string}>("insert into faucet_claims(chain_id,owner,account,amount_wei,tx_hash,state,created_at) values(97,$1,$2,$3,$4,'unknown','2000-01-01T00:00:00Z') returning id",[owner,account,TEST_AMOUNT.toString(),hash])).rows[0];
+  const claim=(await query<{id:string}>("insert into faucet_claims(chain_id,owner,account,amount_wei,tx_hash,state,created_at) values(97,$1,$2,$3,$4,'unknown','2000-01-01T00:00:00Z') returning id",[owner,account,amount.toString(),hash])).rows[0];
   assert.ok(claim); fixtureClaimIds.push(claim.id);
   const rpc=strategyRpc(allocation,configHash,activeAt,hash);
-  rpc.state.to=account;rpc.state.strategyId=BigInt(onchainId);
-  const deps: Partial<PortfolioStrategyDeps>={chainId:()=>97,
+  rpc.state.to=account;rpc.state.strategyId=BigInt(onchainId);rpc.state.amount=amount;rpc.state.cashRaw=amount;
+  const deps: Partial<PortfolioStrategyDeps>={chainId:()=>97,feeReserve:async()=>27n*10n**16n,
     owned:(portfolioId,wallet)=>requireOwnedPortfolio(portfolioId,wallet,{chainId:97}),
     version:(sid,v,chainSid,acct,options)=>requireTypedVersion(sid,v,chainSid,acct,{...options,chainId:97,
       assertOnchain:(onchainId,index,expected,account,readOptions)=>assertVersionOnchain(onchainId,index,expected,account,{...readOptions,client:rpc.client,registry:TESTNET_97.contracts.registry})}),
     evidence:(c)=>readFaucetFundingEvidence(c,rpc.client),cash:(chainId,account)=>readAccountCash(chainId,account,rpc.client)};
   const service=createPortfolioStrategyService(deps);
-  return {owner,account,strategyId,onchainId,id,hash,claimId:claim.id,rpc,deps,service,source:{source:{kind:'faucet_claim',claimId:claim.id}}};
+  let nextDay=2;
+  async function secondClaim(nextAmount=amount) {
+    const hash=txHash();
+    const createdAt=`2000-01-${String(nextDay++).padStart(2,'0')}T00:00:00Z`;
+    const row=(await query<{id:string}>("insert into faucet_claims(chain_id,owner,account,amount_wei,tx_hash,state,created_at) values(97,$1,$2,$3,$4,'unknown',$5) returning id",[owner,account,nextAmount.toString(),hash,createdAt])).rows[0];
+    assert.ok(row);fixtureClaimIds.push(row.id);
+    rpc.state.txHash=hash;rpc.state.amount=nextAmount;rpc.state.cashRaw+=nextAmount;
+    return {source:{kind:'faucet_claim',claimId:row.id}};
+  }
+  return {owner,account,strategyId,onchainId,id,hash,claimId:claim.id,rpc,deps,service,execution,allocation,secondClaim,source:{source:{kind:'faucet_claim',claimId:claim.id}}};
 }
 async function bucket(id:number,key:'stack_prefund_raw'|'unallocated_hold_raw'){
   const row=(await query<{amount:string}>(`select ${key}::text as amount from strategy_cash_balances where chain_id=97 and portfolio_id=$1`,[id])).rows[0];
@@ -59,17 +77,18 @@ test('#82 DB typed publish round-trip/default/retry is immutable; internal legac
   await migrate();
   const owner=address();
   const strategy=await createStrategy({name:'be82-typed-roundtrip'},owner);
-  const input={execution:{kind:'hold'},allocation:{assets:[{address:'0x55d398326f99059ff775485246999027b3197955',weightBps:10000}]}};
+  const basket={assets:[{address:'0x55d398326f99059ff775485246999027b3197955',weightBps:10000}]};
+  const input={execution:assetConfig('hold',basket,56),allocation:basket};
   const versions=await Promise.all(Array.from({length:3},()=>publishVersion(strategy.id,input,owner)));
   assert.equal(new Set(versions.map(v=>v.version)).size,1);
   const first=versions[0];assert.ok(first);
-  assert.deepEqual(first.execution,{kind:'hold'});assert.equal(first.executionSchemaVersion,1);assert.equal(first.executionChainId,56);
+  assert.deepEqual(first.execution,input.execution);assert.equal(first.executionSchemaVersion,2);assert.equal(first.executionChainId,56);
   assert.deepEqual(first.schedule,{kind:'funding'});assert.ok(first.configHash);
   assert.deepEqual((await getStrategy(strategy.id)).versions,[first]);
   await assert.rejects(query("update strategy_versions set schedule='{}' where strategy_id=$1",[strategy.id]),(error:unknown)=>typeof error==='object'&&error!==null&&Reflect.get(error,'code')==='23514');
   await assert.rejects(publishVersion(strategy.id,input,address()),denied('FORBIDDEN'));
   await assert.rejects(publishVersion(strategy.id,{...input,chainId:97},owner),denied('CHAIN_MISMATCH'));
-  await assert.rejects(publishVersion(strategy.id,{...input,execution:{kind:'stack'}},owner),denied('STACK_CASH_ONLY'));
+  await assert.rejects(publishVersion(strategy.id,{...input,execution:{kind:'stack'}},owner),denied('INVALID_EXECUTION'));
   await assert.rejects(publishVersion(strategy.id,{...input,allocation:{...input.allocation,play:'dips'}},owner),denied('INVALID_ALLOCATION'));
   await assert.rejects(publishVersion(strategy.id,{...input,activeAt:'2026-11-15T00:00:00.001Z'},owner),denied('INVALID_ACTIVE_AT'));
   const legacy=await createStrategy({name:'be82-legacy'},owner);
@@ -91,7 +110,8 @@ test('#82 DB exact faucet source credits each hold/stack account once across res
     for(const result of calls)if(result.status==='rejected')assert.ok(result.reason instanceof AppError&&result.reason.code==='PORTFOLIO_BUSY');
     const replay=await createPortfolioStrategyService(f.deps).funding(f.id,f.owner,f.source);
     assert.equal(replay.replayed,true);assert.equal(replay.amountRaw,TEST_AMOUNT.toString());assert.equal(replay.version,1);
-    assert.equal(await bucket(f.id,kind==='hold'?'unallocated_hold_raw':'stack_prefund_raw'),TEST_AMOUNT.toString());
+    assert.equal(await bucket(f.id,kind==='hold'?'unallocated_hold_raw':'stack_prefund_raw'),(TEST_AMOUNT/2n).toString());
+    assert.equal((await query<{amount:string}>('select allocated_cash_raw::text as amount from strategy_cash_balances where portfolio_id=$1',[f.id])).rows[0]?.amount,(TEST_AMOUNT/2n).toString());
     const rows=await query('select id from strategy_funding_lots where portfolio_id=$1',[f.id]);assert.equal(rows.rows.length,1);
     await assert.rejects(f.service.funding(f.id,address(),f.source),denied('FORBIDDEN'));
     assert.equal(await strategyMinimumDeposit(f.strategyId),usdtRaw('100').toString());
@@ -118,7 +138,7 @@ test('#82 DB rollback and lost commit acknowledgement never report success or do
   const unknown:typeof withTransaction=async fn=>{await withTransaction(fn);throw new Error('SECRET_COMMIT_ACK');};
   await assert.rejects(createPortfolioStrategyService({...f.deps,transaction:unknown}).funding(f.id,f.owner,f.source),denied('EXECUTION_STORAGE_UNAVAILABLE'));
   assert.equal((await f.service.funding(f.id,f.owner,f.source)).replayed,true);
-  assert.equal(await bucket(f.id,'unallocated_hold_raw'),TEST_AMOUNT.toString());
+  assert.equal(await bucket(f.id,'unallocated_hold_raw'),(TEST_AMOUNT/2n).toString());
 });
 
 test('#82 DB reorg and moved log index freeze original lot without releasing funds or resurrecting it',async()=>{
@@ -127,53 +147,54 @@ test('#82 DB reorg and moved log index freeze original lot without releasing fun
     if(scenario==='canonical-block')f.rpc.state.blockHash=OTHER_HASH;else f.rpc.state.logIndex++;
     await assert.rejects(f.service.funding(f.id,f.owner,f.source),denied('FUNDING_REORGED'));
     const rows=(await query<{state:string}>('select state from strategy_funding_lots where portfolio_id=$1',[f.id])).rows;
-    assert.deepEqual(rows,[{state:'reorged'}]);assert.equal(await bucket(f.id,'unallocated_hold_raw'),TEST_AMOUNT.toString());
+    assert.deepEqual(rows,[{state:'reorged'}]);assert.equal(await bucket(f.id,'unallocated_hold_raw'),(TEST_AMOUNT/2n).toString());
     await assert.rejects(f.service.executionState(f.id,f.owner,{enabled:true}),denied('FUNDING_REORGED'));
   }
 });
 
-test('#82 DB individual stack amounts, defaults, future/DST anchors, replay and revision CAS are isolated per follower',async()=>{
+test('#83 DB creator stack calendars and effective slices are isolated per contribution; holder instructions are retired',async()=>{
   const f=await fixture();
-  const startAt=future();const input={expectedRevision:'0',enabled:true,startAt};
-  const first=await f.service.instruct(f.id,f.owner,input);
-  assert.equal(first.revision,'1');assert.equal(first.amountUsdt,'100');assert.equal(first.periodSeconds,604800);assert.equal(first.nextSlotIndex,'0');assert.equal(first.nextSlotAt,startAt);
-  assert.deepEqual(await createPortfolioStrategyService(f.deps).instruct(f.id,f.owner,input),first);
-  assert.equal((await f.service.read(f.id,f.owner)).instructions.length,1);
-  await assert.rejects(f.service.instruct(f.id,address(),input),denied('FORBIDDEN'));
-  await assert.rejects(f.service.instruct(f.id,f.owner,{...input,amountUsdt:'101'}),denied('REVISION_CONFLICT'));
-  await f.service.instructionState(f.id,f.owner,{revision:'1',state:'paused'});
-  await assert.rejects(f.service.instructionState(f.id,f.owner,{revision:'1',state:'active'}),denied('INVALID_INSTRUCTION_STATE'));
-  const second=await f.service.instruct(f.id,f.owner,{...input,expectedRevision:'1',amountUsdt:'101',periodSeconds:86400});
-  assert.equal(second.revision,'2');assert.equal(second.amountUsdt,'101');
-  assert.deepEqual((await f.service.read(f.id,f.owner)).instructions.map(i=>i.state),['active','superseded']);
-  await f.service.instructionState(f.id,f.owner,{revision:'2',state:'stopped'});
-  await assert.rejects(f.service.instruct(f.id,f.owner,{...input,expectedRevision:'2',startAt:new Date(Date.now()-1000).toISOString()}),denied('START_NOT_FUTURE'));
-  // Fixed UTC seconds preserve the revision anchor across the US spring DST transition.
-  const clock=new Date('2027-03-12T00:00:00Z');
-  const dstService=createPortfolioStrategyService({...f.deps,now:()=>clock});
-  const dst=await dstService.instruct(f.id,f.owner,{expectedRevision:'2',enabled:false,startAt:'2027-03-13T09:00:00-05:00',periodSeconds:86400,endAt:'2027-03-16T14:00:00Z'});
-  await query('update stack_instructions set next_slot_index=1 where chain_id=97 and portfolio_id=$1 and revision=$2',[f.id,dst.revision]);
-  assert.equal((await f.service.read(f.id,f.owner)).instructions[0]?.nextSlotAt,'2027-03-14T14:00:00.000Z');
-  const other=await fixture();
-  const own=await other.service.instruct(other.id,other.owner,{...input,amountUsdt:'200'});assert.equal(own.amountUsdt,'200');assert.equal(own.revision,'1');
+  const clock=new Date('2027-03-13T14:00:00Z');
+  const service=createPortfolioStrategyService({...f.deps,now:()=>clock});
+  const first=await service.funding(f.id,f.owner,f.source);
+  assert.equal(first.kind,'asset');
+  const rows=(await query<{asset:string;budget_raw:string;effective_slices:number;first_slot_at:Date|null}>(
+    'select asset,budget_raw::text,effective_slices,first_slot_at from strategy_lot_assets where lot_id=$1 order by asset',[first.id])).rows;
+  assert.equal(rows.length,2);
+  const stock=rows.find(r=>r.asset===TESTNET_97.assets.AAPLB.token);assert.ok(stock);
+  assert.equal(stock.budget_raw,(TEST_AMOUNT/2n).toString());assert.equal(stock.effective_slices,10);
+  assert.equal(stock.first_slot_at?.toISOString(),'2027-03-14T14:00:00.000Z','one-period UTC anchor stays 14:00 across DST and equality waits until tomorrow');
+  assert.equal(rows.find(r=>r.asset===TESTNET_97.contracts.usdt)?.effective_slices,0);
+  await assert.rejects(service.instruct(f.id,f.owner,{expectedRevision:'0',enabled:true,startAt:future(),amountUsdt:'101'}),denied('STACK_INSTRUCTIONS_RETIRED'));
+  await assert.rejects(service.instructionState(f.id,f.owner,{revision:'1',state:'paused'}),denied('STACK_INSTRUCTIONS_RETIRED'));
+  assert.equal((await query('select revision from stack_instructions where portfolio_id=$1',[f.id])).rows.length,0);
+  const other=await fixture('stack',5000,TEST_AMOUNT*2n);
+  const second=await other.service.funding(other.id,other.owner,other.source);
+  assert.notEqual(second.id,first.id);
+  const otherStock=(await query<{budget_raw:string;effective_slices:number}>('select budget_raw::text,effective_slices from strategy_lot_assets where lot_id=$1 and asset=$2',[second.id,TESTNET_97.assets.AAPLB.token])).rows[0];
+  assert.equal(otherStock?.budget_raw,TEST_AMOUNT.toString());assert.equal(otherStock?.effective_slices,12);
+  assert.deepEqual((await getStrategy(f.strategyId)).versions[0]?.execution,f.execution,'shortening changes contribution plan only, never signed creator N');
 });
 
-test('#82 DB unknown work prevents new revisions; pause/stop works during RPC outage and preserves original attempt',async()=>{
-  const f=await fixture();const input={expectedRevision:'0',enabled:true,startAt:future()};
-  await f.service.instruct(f.id,f.owner,input);
+test('#83 DB unknown work rejects holder revisions; fund pause works during RPC outage and preserves original attempt',async()=>{
+  const f=await fixture();
   const op=(await query<{id:string}>("insert into operations(portfolio_id,type,state,idempotency_key,user_op_hash) values($1,'withdraw','submitted',$2,$3) returning id",[f.id,txHash(),f.hash])).rows[0];assert.ok(op);
-  await assert.rejects(f.service.instruct(f.id,f.owner,{...input,expectedRevision:'1'}),denied('PREVIOUS_INFLIGHT'));
+  await assert.rejects(f.service.instruct(f.id,f.owner,{expectedRevision:'0',enabled:true,startAt:future()}),denied('STACK_INSTRUCTIONS_RETIRED'));
   f.rpc.state.fail='*';
-  const stopped=await f.service.instructionState(f.id,f.owner,{revision:'1',state:'stopped'});assert.equal(stopped.state,'stopped');
+  assert.deepEqual(await f.service.executionState(f.id,f.owner,{enabled:false}),{portfolioId:f.id,enabled:false});
   assert.deepEqual((await query('select state,user_op_hash from operations where id=$1',[op.id])).rows,[{state:'submitted',user_op_hash:f.hash}]);
 });
 
-test('#82 DB hold pause is immediate during RPC outage and cannot turn a stack version into hold',async()=>{
-  const f=await fixture('hold');f.rpc.state.fail='*';
-  assert.deepEqual(await f.service.executionState(f.id,f.owner,{enabled:false}),{portfolioId:f.id,enabled:false});
-  await assert.rejects(f.service.executionState(f.id,f.owner,{enabled:true}),denied('VERSION_CHAIN_UNAVAILABLE'));
-  const stack=await fixture();await assert.rejects(stack.service.executionState(stack.id,stack.owner,{enabled:true}),denied('NOT_HOLD'));
-  await assert.rejects(f.service.instruct(f.id,f.owner,{expectedRevision:'0',enabled:true,startAt:future()}),denied('VERSION_CHAIN_UNAVAILABLE'));
+test('#83 DB both hold and creator-stack can pause immediately during RPC outage without changing version mode',async()=>{
+  for(const kind of ['hold','stack'] as const){
+    const f=await fixture(kind);f.rpc.state.fail='*';
+    assert.deepEqual(await f.service.executionState(f.id,f.owner,{enabled:false}),{portfolioId:f.id,enabled:false});
+    await assert.rejects(f.service.executionState(f.id,f.owner,{enabled:true}),denied('VERSION_CHAIN_UNAVAILABLE'));
+    await assert.rejects(f.service.instruct(f.id,f.owner,{expectedRevision:'0',enabled:true,startAt:future()}),denied('STACK_INSTRUCTIONS_RETIRED'));
+    assert.deepEqual((await getStrategy(f.strategyId)).versions[0]?.execution,f.execution);
+    f.rpc.state.fail='';
+    assert.deepEqual(await f.service.executionState(f.id,f.owner,{enabled:true}),{portfolioId:f.id,enabled:true});
+  }
 });
 
 test('#82 DB cash row lock timeout rolls back the whole source reservation',async()=>{
@@ -183,15 +204,16 @@ test('#82 DB cash row lock timeout rolls back the whole source reservation',asyn
     await blocker.query('begin');await blocker.query('select * from strategy_cash_balances where portfolio_id=$1 for update',[f.id]);
     await assert.rejects(f.service.funding(f.id,f.owner,f.source),denied('EXECUTION_STORAGE_UNAVAILABLE'));
   }finally{await blocker.query('rollback');blocker.release();}
-  assert.equal(await bucket(f.id,'unallocated_hold_raw'),TEST_AMOUNT.toString());
+  assert.equal(await bucket(f.id,'unallocated_hold_raw'),(TEST_AMOUNT/2n).toString());
 });
 
-test('#82 DB old scheduler refuses funding schedules before reading holdings or executing a drift plan',async()=>{
+test('#83 DB scheduler recognizes typed funding schedules without converting them to legacy drift intervals',async()=>{
   const f=await fixture('hold');
   await withTransaction(async client=>{
     await client.query("update portfolios set schedule_state='active',next_run_at=null where id=$1",[f.id]);
     const due=await claimDuePortfolios(100000,new Date(),{chainId:97,advance:false,withTransaction:async run=>run(client)});
-    const claimed=due.find(row=>row.portfolioId===f.id);assert.ok(claimed);assert.ok(claimed.unsupportedReason);
+    const claimed=due.find(row=>row.portfolioId===f.id);assert.ok(claimed);assert.equal(claimed.unsupportedReason,null);
+    assert.equal(claimed.executionKind,'per_asset');assert.equal(claimed.version,1);assert.equal(claimed.intervalSeconds,60);
     await client.query("update portfolios set schedule_state='paused' where id=$1",[f.id]);
   });
 });
@@ -254,13 +276,14 @@ test('#82 DB verified unknown faucet source settles its original UTC day; failed
   const claim = (await query<{ state: string; original_day: boolean }>("select state,utc_day=(current_timestamp at time zone 'UTC')::date-1 as original_day from faucet_claims where id=$1", [f.claimId])).rows[0];
   assert.deepEqual(claim, { state: 'confirmed', original_day: true });
   assert.equal((await query("select id from faucet_claims where id=$1 and state in ('submitted','unknown') and tx_hash is not null", [f.claimId])).rows.length, 0, 'this source no longer blocks the shared relayer');
-  assert.equal(await bucket(f.id, 'unallocated_hold_raw'), TEST_AMOUNT.toString());
+  assert.equal(await bucket(f.id, 'unallocated_hold_raw'), (TEST_AMOUNT/2n).toString());
 });
 
 test('#82 DB typed publish admits the relayer before storing a version and safely retries a busy signer', async () => {
   const owner = address(); const strategy = await createStrategy({ name: 'be82-publish-admission' }, owner);
   await query('update strategies set onchain_id=$2 where id=$1', [strategy.id, strategy.id + 90_000_000]);
-  const input = { execution: { kind: 'hold' }, allocation: { assets: [{ address: '0x55d398326f99059ff775485246999027b3197955', weightBps: 10000 }] } };
+  const basket={assets:[{address:'0x55d398326f99059ff775485246999027b3197955',weightBps:10000}]};
+  const input={execution:assetConfig('hold',basket,56),allocation:basket};
   let busy = true; let sends = 0;
   const deps = { isChainConfigured: () => true, validateChain: () => {},
     relayerLock: async <T,>(_chainId: number, run: (assertHeld: () => void) => Promise<T>) => { if (busy) throw new AppError(503, 'RELAYER_BUSY', 'busy'); return run(() => {}); },
@@ -279,7 +302,7 @@ test('#82 DB typed publish admits the relayer before storing a version and safel
   assert.equal(sends, 1);
 });
 
-test('#82 DB new personal HTTP endpoints retain amounts, source and revision fields through a full round-trip', async () => {
+test('#83 DB HTTP retains per-asset lot plan and removes personal instruction endpoints', async () => {
   const { createServer } = await import('../src/server.js');
   const f = await fixture();
   const server = createServer({ portfolioStrategies: f.service, auth: { authenticate: async () => f.owner,
@@ -292,13 +315,106 @@ test('#82 DB new personal HTTP endpoints retain amounts, source and revision fie
     const funded = await post('/funding-lots', f.source); assert.equal(funded.status, 200);
     const lot: unknown = await funded.json(); assert.ok(lot && typeof lot === 'object');
     assert.deepEqual(Reflect.get(lot, 'source'), f.source.source);
-    const input = { expectedRevision: '0', amountUsdt: '100.000000000000000001', enabled: true, startAt: future(), periodSeconds: 86400 };
-    const created = await post('/stack-instructions', input); assert.equal(created.status, 200);
-    const instruction: unknown = await created.json(); assert.ok(instruction && typeof instruction === 'object');
-    assert.equal(Reflect.get(instruction, 'amountRaw'), usdtRaw(input.amountUsdt).toString());
-    const read = await fetch(base + '/execution'); assert.equal(read.status, 200);
-    const saved: unknown = await read.json(); assert.ok(saved && typeof saved === 'object');
-    assert.deepEqual(Reflect.get(saved, 'instructions'), [instruction]);
-    assert.equal((await post('/stack-instruction-state', { revision: '1', state: 'stopped' })).status, 200);
+    assert.equal(Reflect.get(lot,'kind'),'asset');
+    assert.ok(Reflect.get(lot,'effectiveSlices'));
+    const input={expectedRevision:'0',amountUsdt:'100.000000000000000001',enabled:true,startAt:future(),periodSeconds:86400};
+    assert.equal((await post('/stack-instructions',input)).status,404);
+    assert.equal((await post('/stack-instruction-state',{revision:'1',state:'stopped'})).status,404);
+    const read=await fetch(base+'/execution');assert.equal(read.status,200);
+    const saved:unknown=await read.json();assert.ok(saved&&typeof saved==='object');
+    assert.deepEqual(Reflect.get(saved,'execution'),f.execution);
+    const lots:unknown=Reflect.get(saved,'lots');assert.ok(Array.isArray(lots));assert.equal(lots.length,1);
+    assert.deepEqual(lots[0]?.effectiveSlices,Reflect.get(lot,'effectiveSlices'));
+    assert.ok(Array.isArray(Reflect.get(saved,'lotAssets')));
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+});
+
+test('#83 DB 50 inclusive contribution shrinks creator N12 to one, 100 to two, and one raw below minimum rolls back',async()=>{
+  for(const [amount,slices] of [[usdtRaw('50'),1],[usdtRaw('100'),2],[usdtRaw('50')-1n,0]] as const){
+    const f=await fixture('stack',0,amount);
+    if(slices===0){
+      await assert.rejects(f.service.funding(f.id,f.owner,f.source),(error:unknown)=>error instanceof AppError&&error.status===400);
+      assert.equal((await query('select id from strategy_funding_lots where portfolio_id=$1',[f.id])).rows.length,0);
+      assert.equal(await bucket(f.id,'stack_prefund_raw'),'0');
+    }else{
+      const lot=await f.service.funding(f.id,f.owner,f.source);
+      assert.equal(lot.kind,'asset');
+      const plan=(await query<{effective_slices:number;budget_raw:string}>('select effective_slices,budget_raw::text from strategy_lot_assets where lot_id=$1 and asset=$2',[lot.id,TESTNET_97.assets.AAPLB.token])).rows[0];
+      assert.deepEqual(plan,{effective_slices:slices,budget_raw:amount.toString()});
+      assert.equal(await bucket(f.id,'stack_prefund_raw'),amount.toString());
+      assert.equal((await f.service.funding(f.id,f.owner,f.source)).id,lot.id);
+    }
+  }
+});
+
+test('#83 DB yield publication requires the exact enabled chain/asset/market and preserves retired signed selections',async()=>{
+  const owner=address();const strategy=await createStrategy({name:'be83-yield-allowlist'},owner);
+  const basket={assets:[{address:'0x55d398326f99059ff775485246999027b3197955',weightBps:10000}]};
+  const execution=assetConfig('hold',basket,56);
+  const market=`fixture_${randomBytes(8).toString('hex')}`;
+  const selected={...execution,assets:execution.assets.map(a=>({...a,yield:{market}}))};
+  const input={allocation:basket,execution:selected};
+  await assert.rejects(publishVersion(strategy.id,input,owner),denied('YIELD_UNAVAILABLE'));
+  await query('insert into strategy_asset_yield_markets(chain_id,asset,market_id,enabled) values(56,$1,$2,false)',[basket.assets[0]?.address,market]);
+  await assert.rejects(publishVersion(strategy.id,input,owner),denied('YIELD_UNAVAILABLE'));
+  await query('update strategy_asset_yield_markets set enabled=true where chain_id=56 and asset=$1 and market_id=$2',[basket.assets[0]?.address,market]);
+  const published=await publishVersion(strategy.id,input,owner);assert.equal(published.executionSchemaVersion,2);assert.deepEqual(published.execution,selected);
+  await query('update strategy_asset_yield_markets set enabled=false,updated_at=clock_timestamp() where chain_id=56 and asset=$1 and market_id=$2',[basket.assets[0]?.address,market]);
+  assert.deepEqual((await getStrategy(strategy.id)).versions[0]?.execution,selected);
+  await assert.rejects(publishVersion(strategy.id,{...input,activeAt:'2026-11-16T00:00:00Z'},owner),denied('YIELD_UNAVAILABLE'));
+  assert.equal((await getStrategy(strategy.id)).versions.length,1);
+});
+
+test('#83 DB two 50 contributions retain distinct sources and merge budgets at each creator timestamp',async()=>{
+  const cash=TESTNET_97.contracts.usdt,a=TESTNET_97.assets.AAPLB.token,b=TESTNET_97.assets.AMZNB.token;
+  const assets:AssetSetting[]=[
+    {asset:a,weightBps:5000,execution:{kind:'stack',every:'daily',weekday:null,timeUtc:'09:00',slices:12},yield:null},
+    {asset:b,weightBps:5000,execution:{kind:'stack',every:'daily',weekday:null,timeUtc:'10:00',slices:12},yield:null},
+    {asset:cash,weightBps:0,yield:null}];
+  const execution:AssetExecution={kind:'per_asset',numeraire:cash,rebalance:'none',assets:assets.sort((left,right)=>left.asset.localeCompare(right.asset))};
+  const f=await fixture('stack',0,usdtRaw('50'),execution);
+  const clock=new Date('2026-11-16T08:00:00Z');
+  const service=createPortfolioStrategyService({...f.deps,now:()=>clock});
+  const first=await service.funding(f.id,f.owner,f.source);
+  assert.equal(first.fundingStatus,'waiting_for_merged_budget','25 at each timestamp may await a second approved product source');
+  assert.deepEqual(first.effectiveSlices,{[a]:1,[b]:1});
+  assert.equal((await query('select id from strategy_jobs where portfolio_id=$1',[f.id])).rows.length,0,'funding never broadcasts or reserves a premature subminimum batch');
+  const secondSource=await f.secondClaim();
+  const second=await service.funding(f.id,f.owner,secondSource);
+  assert.notEqual(second.id,first.id);assert.deepEqual(second.effectiveSlices,first.effectiveSlices);
+  assert.equal(await bucket(f.id,'stack_prefund_raw'),usdtRaw('100').toString());
+  const merged=(await query<{at:string;budget:string;count:number}>(`select to_char(a.first_slot_at at time zone 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') as at,
+      sum(a.budget_raw)::text as budget,count(*)::int as count from strategy_lot_assets a join strategy_funding_lots l on l.id=a.lot_id
+      where l.portfolio_id=$1 and a.effective_slices>0 group by a.first_slot_at order by a.first_slot_at`,[f.id])).rows;
+  assert.deepEqual(merged,[{at:'2026-11-16T09:00:00Z',budget:usdtRaw('50').toString(),count:2},{at:'2026-11-16T10:00:00Z',budget:usdtRaw('50').toString(),count:2}]);
+  const replay=await service.funding(f.id,f.owner,secondSource);assert.equal(replay.id,second.id);assert.equal(replay.replayed,true);
+  assert.equal(await bucket(f.id,'stack_prefund_raw'),usdtRaw('100').toString());
+});
+
+test('#83 DB per-asset read suggests the new inclusive minimum without resurrecting legacy five-dollar legs',async()=>{
+  const cash=TESTNET_97.contracts.usdt;
+  const assets:AssetSetting[]=[
+    {asset:TESTNET_97.assets.AAPLB.token,weightBps:9900,execution:{kind:'hold'},yield:null},
+    {asset:TESTNET_97.assets.AMZNB.token,weightBps:100,execution:{kind:'hold'},yield:null},
+    {asset:cash,weightBps:0,yield:null}];
+  const execution:AssetExecution={kind:'per_asset',numeraire:cash,rebalance:'none',assets:assets.sort((a,b)=>a.asset.localeCompare(b.asset))};
+  const f=await fixture('hold',0,TEST_AMOUNT,execution);
+  assert.equal((await f.service.read(f.id,f.owner)).defaultAmountUsdt,'50');
+  assert.equal(await strategyMinimumDeposit(f.strategyId),usdtRaw('50').toString());
+});
+
+test('#83 DB pure cash funding completes allocation without fee policy reads or empty execution jobs',async()=>{
+  const cash=TESTNET_97.contracts.usdt;
+  const execution:AssetExecution={kind:'per_asset',numeraire:cash,rebalance:'none',assets:[{asset:cash,weightBps:10000,yield:null}]};
+  const f=await fixture('hold',10000,TEST_AMOUNT,execution);
+  const service=createPortfolioStrategyService({...f.deps,feeReserve:async()=>{throw new Error('a pure cash contribution must not query swap fee policy');}});
+  const lot=await service.funding(f.id,f.owner,f.source);
+  assert.equal(lot.kind,'asset');assert.deepEqual(lot.effectiveSlices,{});
+  const read=await service.read(f.id,f.owner);
+  assert.equal(read.balances?.allocated_cash_raw,TEST_AMOUNT.toString());
+  assert.equal(read.balances?.unallocated_hold_raw,'0');assert.equal(read.balances?.stack_prefund_raw,'0');
+  assert.equal(read.jobs.length,0);
+  assert.equal((await query('select id from operations where portfolio_id=$1',[f.id])).rows.length,0);
+  const plans=(await query<{state:string;effective_slices:number}>('select state,effective_slices from strategy_lot_assets where lot_id=$1',[lot.id])).rows;
+  assert.deepEqual(plans,[{state:'completed',effective_slices:0}]);
 });

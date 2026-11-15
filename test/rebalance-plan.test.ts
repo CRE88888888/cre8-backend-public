@@ -24,6 +24,7 @@ import {
   readMaxLegUsdE8,
   minimumDepositUsdtWei, tradeMinimumReason, checkBuyFeeReserve, checkTradeMinimums,
   amountOutMinWithBuffer,} from '../src/rebalance-plan.js';
+import { quoteNewMoney, newMoneyDepthCap } from '../src/rebalance-plan.js';
 import type { PlanRebalanceArgs, PlannedStep, RebalancePlan } from '../src/rebalance-plan.js';
 import { DEFAULT_MAX_IMPACT_BPS, resolveMaxImpactBps } from '../src/rebalance-plan.js';
 import { capAmountInForImpact, estimateImpact } from '../src/impact.js';
@@ -88,6 +89,7 @@ type StubQuote = { minimum: bigint; quoted?: bigint };
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000' as Address;
 
 type StubChain = {
+  routeQuotes?: boolean;
   minBatchFee?: bigint;
   buyAllowance?: unknown;
   executorNumeraire?: unknown;
@@ -233,6 +235,11 @@ function stubClient(chain: StubChain): PublicClient {
         }
       }
       switch (args.functionName) {
+        case 'quoteExactInput': {
+          if(chain.routeQuotes!==true)throw new Error('route quote not configured');
+          const amount=args.args?.[1];if(typeof amount!=='bigint')throw new Error('invalid route amount');
+          return [amount*99n/100n,[]];
+        }
         case 'pool':
           return chain.oracle.pool;
         case 'token0':
@@ -3074,4 +3081,31 @@ test('#75 ordinary oracle minimum validation fails closed; exit dust bypasses th
   const reads = f.state.calls;
   assert.equal(await checkTradeMinimums(f.client, getAddress(THRESHOLD_CASH), [{ ...f.step, amountIn: 1n }], 'exit', 123n), null);
   assert.equal(f.state.calls, reads);
+});
+
+test('#83 new-money quote preserves every exact-input component; missing price/depth blocks the whole basket', async () => {
+  const U=10n**18n;
+  const chain=hubChain();
+  chain.routeQuotes=true;
+  chain.rate={rateE18:U,slippageBps:100};
+  chain.poolState={sqrtPriceX96:1n<<96n,liquidity:10n**30n,token0:USDT};
+  const params={publicClient:stubClient(chain),executor:EXECUTOR_MULTI,oracle:ROUTER,registry:REGISTRY,strategyId:1n,
+    blockNumber:chain.block.number,cash:USDT,inputs:{[WBNB.toLowerCase()]:(25n*U).toString(),[TOKEN3.toLowerCase()]:(25n*U).toString()},deadline:1900000000n};
+  const plan=await quoteNewMoney(params,{quoteAggregator:async()=>null});
+  assert.equal(plan.kind,'ready',plan.kind==='blocked'?plan.reason:'expected non-empty buy basket');
+  if(plan.kind==='ready')assert.deepEqual(plan.steps.map(s=>s.amountIn),[25n*U,25n*U]);
+  chain.oracle.pairs={ [WBNB.toLowerCase()]:{oracle:ORACLE_WBNB_USDT,pool:WBNB_USDT_POOL,fee:500} };
+  const missing=await quoteNewMoney(params,{quoteAggregator:async()=>null});assert.equal(missing.kind,'blocked');
+  chain.poolState=undefined;
+  assert.equal((await quoteNewMoney({...params,inputs:{[WBNB.toLowerCase()]:(50n*U).toString()}},{quoteAggregator:async()=>null})).kind,'blocked');
+  await assert.rejects(newMoneyDepthCap(params.publicClient,ROUTER,USDT,WBNB,50n*U,chain.block.number));
+});
+
+test('#83 new-money fee upper bound includes conservative depth capacity and zero cap',async()=>{
+  const U=10n**18n,chain=hubChain();chain.rate={rateE18:U,slippageBps:100};
+  chain.poolState={sqrtPriceX96:1n<<96n,liquidity:100000n*U,token0:USDT};
+  const client=stubClient(chain);
+  assert.equal(await newMoneyDepthCap(client,ROUTER,USDT,WBNB,0n,chain.block.number),0n);
+  const cap=await newMoneyDepthCap(client,ROUTER,USDT,WBNB,10000n*U,chain.block.number);
+  assert.ok(cap>0n);assert.ok(cap<10000n*U);
 });

@@ -3,7 +3,7 @@ import { configuredChainId, TESTNET_97, testnetAssets } from './testnet-profile.
 import { assertVersionOnchain, getChain, isChainConfigured, publishVersionOnchain, registerStrategyOnchain } from './chain.js';
 import { isForeignKeyViolation, isUniqueViolation, query, withTransaction } from './db.js';
 import { AppError, ForbiddenError, NotFoundError, ValidationError } from './errors.js';
-import { canonicalConfigHash, exactKeys, minimumAllocationRaw, record, utcDate, validateExecution, validateFundingSchedule, validateIdleYield, numeraireFor } from './strategy-execution.js';
+import { canonicalConfigHash, exactKeys, minimumAllocationRaw, record, utcDate, validateExecution, validateFundingSchedule, validateIdleYield, numeraireFor, validateAssetConfig, minimumAssetContribution } from './strategy-execution.js';
 import type { FundingSchedule, TypedExecution } from './strategy-execution.js';
 import type { Address, Hex } from 'viem';
 
@@ -56,7 +56,7 @@ export type StrategyVersion = {
   version: number;
   allocation: Allocation;
   schedule: RebalanceSchedule | FundingSchedule;
-  executionSchemaVersion: 0 | 1;
+  executionSchemaVersion: 0 | 1 | 2;
   execution: TypedExecution | { kind: 'target_weight' };
   executionChainId: number | null;
   configHash: Hex | null;
@@ -125,7 +125,7 @@ type VersionRow = {
   change_log: string | null;
   active_at: Date | null;
   created_at: Date;
-  execution_schema_version: 0 | 1;
+  execution_schema_version: 0 | 1 | 2;
   execution: TypedExecution | { kind: 'target_weight' };
   execution_chain_id: string | null;
   config_hash: Hex | null;
@@ -135,7 +135,13 @@ type VersionRow = {
 export function typedVersionInput(input: unknown): PublishVersionInput {
   if (!record(input)) throw new ValidationError('INVALID_VERSION', 'request body must be a JSON object');
   exactKeys(input, ['allocation', 'schedule', 'execution', 'chainId', 'idleYield', 'changeLog', 'activeAt'], 'INVALID_VERSION');
-  return { ...input, allocation: input.allocation, execution: validateExecution(input.execution),
+  const chainId = input.chainId === undefined ? configuredChainId() : input.chainId;
+  if (typeof chainId !== 'number' || !Number.isSafeInteger(chainId) || chainId <= 0) throw new ValidationError('CHAIN_MISMATCH', 'invalid chainId');
+  if(!record(input.allocation))throw new ValidationError('INVALID_ALLOCATION','allocation must be an object');
+  exactKeys(input.allocation,['assets'],'INVALID_ALLOCATION');
+  if(Array.isArray(input.allocation.assets))for(const a of input.allocation.assets)if(record(a))exactKeys(a,['address','weightBps','symbol'],'INVALID_ASSET');
+  const allocation = validateAllocation(input.allocation, chainId);
+  return { ...input, allocation, execution: validateAssetConfig(input.execution, allocation, chainId),
     schedule: validateFundingSchedule(input.schedule), idleYield: validateIdleYield(input.idleYield) };
 }
 
@@ -531,17 +537,18 @@ export async function publishVersion(
 
 async function publishTypedVersion(strategyId: number, raw: PublishVersionInput, provider: string, overrides: Partial<TypedPublishDeps>): Promise<StrategyVersion> {
   const deps: TypedPublishDeps = { isChainConfigured, validateChain: () => { getChain(); }, publishOnchain: publishVersionOnchain, relayerLock: withRelayerLock, ...overrides };
+  if(raw.chainId!==undefined&&raw.chainId!==configuredChainId())throw new ValidationError('CHAIN_MISMATCH','chainId must match this API deployment');
   const input = typedVersionInput(raw);
   const chainId = input.chainId === undefined ? configuredChainId() : input.chainId;
   if (chainId !== configuredChainId()) throw new ValidationError('CHAIN_MISMATCH', 'chainId must match this API deployment');
-  const execution = validateExecution(input.execution);
+  const execution = validateAssetConfig(input.execution, validateAllocation(input.allocation, chainId), chainId);
   if (!record(input.allocation)) throw new ValidationError('INVALID_ALLOCATION', 'allocation must be an object');
   exactKeys(input.allocation, ['assets'], 'INVALID_ALLOCATION');
   if (Array.isArray(input.allocation.assets)) for (const asset of input.allocation.assets) {
     if (record(asset)) exactKeys(asset, ['address', 'weightBps', 'symbol'], 'INVALID_ASSET');
   }
   const allocation = validateAllocation(input.allocation);
-  if (execution.kind === 'stack' && allocation.assets.every((asset) => asset.address === numeraireFor(chainId))) {
+  if (execution.assets.some(a => a.execution?.kind === 'stack') && allocation.assets.every((asset) => asset.address === numeraireFor(chainId))) {
     throw new ValidationError('STACK_CASH_ONLY', 'stack requires at least one non-cash asset; choose hold for pure cash');
   }
   const schedule = validateFundingSchedule(input.schedule);
@@ -558,6 +565,10 @@ async function publishTypedVersion(strategyId: number, raw: PublishVersionInput,
     if (preflight.onchain_id !== null) {
       if (!deps.isChainConfigured()) throw new AppError(503, 'VERSION_UNAVAILABLE', 'chain mirror configuration unavailable; no new version stored');
       deps.validateChain();
+    }
+    for (const asset of execution.assets) if (asset.yield !== null) {
+      const market = await query('select 1 from strategy_asset_yield_markets where chain_id=$1 and asset=$2 and market_id=$3 and enabled', [chainId,asset.asset,asset.yield.market]);
+      if (!market.rows.length) throw new ValidationError('YIELD_UNAVAILABLE', 'market is not enabled for this chain and asset');
     }
     // Admit the shared signer before persisting a new immutable version. Busy is safely retryable.
     const saveAndMirror = async (assertHeld: () => void) => {
@@ -581,7 +592,7 @@ async function publishTypedVersion(strategyId: number, raw: PublishVersionInput,
         if (version > 65535) throw new ValidationError('VERSION_LIMIT', 'strategy version exceeds uint16');
         const row = (await client.query<VersionRow>(`insert into strategy_versions
           (strategy_id,version,allocation,schedule,change_log,active_at,execution_schema_version,execution,execution_chain_id,config_hash)
-          values($1,$2,$3::jsonb,$4::jsonb,$5,$6,1,$7::jsonb,$8,$9) returning ${VERSION_COLUMNS}`,
+          values($1,$2,$3::jsonb,$4::jsonb,$5,$6,2,$7::jsonb,$8,$9) returning ${VERSION_COLUMNS}`,
           [strategyId, version, JSON.stringify(allocation), JSON.stringify(schedule), changeLog, activeAt, JSON.stringify(execution), chainId, configHash])).rows[0];
         if (!row) throw new Error('missing version');
         return { row, onchainId: owner.onchain_id, created: true };
@@ -607,10 +618,10 @@ export async function requireTypedVersion(strategyId: number, version: number, o
   deps: { chainId?: number; assertOnchain?: typeof assertVersionOnchain; verifyChain?: boolean; blockNumber?: bigint; blockHash?: Hex } = {}): Promise<StrategyVersion> {
   const detail = await getStrategy(strategyId);
   const pinned = detail.versions.find((candidate) => candidate.version === version);
-  if (!pinned || pinned.executionSchemaVersion !== 1 || pinned.configHash === null || pinned.activeAt === null || pinned.executionChainId !== (deps.chainId ?? configuredChainId())) {
+  if (!pinned || ![1,2].includes(pinned.executionSchemaVersion) || pinned.configHash === null || pinned.activeAt === null || pinned.executionChainId !== (deps.chainId ?? configuredChainId())) {
     throw new AppError(409, 'EXECUTION_VERSION_MISMATCH', 'a typed version on this chain is required');
   }
-  const config = { chainId: pinned.executionChainId, execution: validateExecution(pinned.execution), allocation: pinned.allocation,
+  const config = { chainId: pinned.executionChainId, execution: pinned.execution.kind === 'per_asset' ? validateAssetConfig(pinned.execution,pinned.allocation,pinned.executionChainId) : validateExecution(pinned.execution), allocation: pinned.allocation,
     schedule: validateFundingSchedule(pinned.schedule), activeAt: new Date(pinned.activeAt) };
   if (canonicalConfigHash(config) !== pinned.configHash) throw new AppError(409, 'CONFIG_HASH_MISMATCH', 'stored config hash does not match the pinned version');
   if (deps.verifyChain !== false) await (deps.assertOnchain ?? assertVersionOnchain)(onchainId, version, { ...config, configHash: pinned.configHash }, account, { blockNumber: deps.blockNumber, blockHash: deps.blockHash });
@@ -618,6 +629,7 @@ export async function requireTypedVersion(strategyId: number, version: number, o
 }
 
 export function typedMinimumDeposit(version: StrategyVersion): string {
+  if (version.execution.kind === 'per_asset') return minimumAssetContribution(version.execution).toString();
   return minimumAllocationRaw(version.allocation, version.executionChainId ?? configuredChainId()).toString();
 }
 

@@ -13,6 +13,7 @@ import type { PriceableAsset, TradableProbe } from './assets.js';
 import { authenticate, issueNonce, login, logout, parseLoginBody } from './auth.js';
 import { loginWithPrivy } from './privy.js';
 import { createWaitlistService } from './waitlist.js';
+import { createWaitlistInviteService } from './waitlist-invites.js';
 import { claimFaucetUsdt } from './faucet.js';
 import { sponsorUserOperation } from './paymaster.js';
 import { createPointsService } from './points.js';
@@ -180,6 +181,7 @@ export type ServerDeps = {
   sponsorUserOperation: typeof sponsorUserOperation;
   privyLogin: typeof loginWithPrivy;
   waitlist: ReturnType<typeof createWaitlistService>;
+  waitlistInvites: ReturnType<typeof createWaitlistInviteService>;
   rateLimiter: RequestRateLimiter;
   auth: { authenticate: typeof authenticate; issueNonce: typeof issueNonce; login: typeof login; logout: typeof logout };
   /** Public platform snapshot, with a process-wide TTL cache and no wallet/DB reads. */
@@ -305,6 +307,7 @@ const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
   sponsorUserOperation,
   privyLogin: loginWithPrivy,
   waitlist: createWaitlistService(),
+  waitlistInvites: createWaitlistInviteService(),
   auth: { authenticate, issueNonce, login, logout },
   platformStatus: createPlatformStatusReader(),
   createStrategy,
@@ -473,6 +476,24 @@ async function route(
       throw new AppError(403, 'OPERATOR_FORBIDDEN', 'wallet is not authorized to use operator endpoints');
     }
     if (segments[1] === 'waitlist') {
+      if (segments[2] === 'invites') {
+        if (segments.length === 3) {
+          if (method === 'POST') sendJson(res, 200, await deps.waitlistInvites.issue(await readJsonBody(req), wallet));
+          else if (method === 'GET') sendJson(res, 200, await deps.waitlistInvites.list(url.searchParams));
+          else return methodNotAllowed(res, ['GET', 'POST']);
+          return;
+        }
+        if (segments.length === 4 && segments[3] === 'summary') {
+          if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+          sendJson(res, 200, await deps.waitlistInvites.summary(url.searchParams));
+          return;
+        }
+        if (segments.length === 5 && segments[4] === 'revoke') {
+          if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+          sendJson(res, 200, await deps.waitlistInvites.revoke(segments[3] ?? '', wallet));
+          return;
+        }
+      }
       if (segments.length === 2) {
         if (method !== 'GET') return methodNotAllowed(res, ['GET']);
         sendJson(res, 200, await deps.waitlist.list(url.searchParams));
@@ -529,6 +550,13 @@ async function route(
     const wallet = await deps.auth.authenticate(req.headers.authorization);
     await deps.rateLimiter.wallet('assets', wallet);
     sendJson(res, 200, { assets: await deps.listAssets() });
+    return;
+  }
+
+  if (root === 'waitlist' && segments.length === 2 && segments[1] === 'redeem') {
+    if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+    await deps.waitlistInvites.checkIp(deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
+    sendJson(res, 200, await deps.waitlistInvites.redeem(await readJsonBody(req)));
     return;
   }
 

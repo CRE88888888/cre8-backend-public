@@ -41,3 +41,47 @@ id 必須是正的 Postgres bigint 字串，最大 `9223372036854775807`，錯�
 ## 驗證
 
 `test/waitlist.test.ts` 覆蓋 token、輸入／邊界、HTTP、授權、限流及錯誤去敏，已由既有 no-DB CI 入口 `test/server.test.ts` 載入。`test/waitlist.db.test.ts` 在已套 0046 的可拋棄 Postgres 驗證並行 join／衝突、核准／撤銷、狀態冪等、微秒／bigint 分頁及真實 row-lock timeout。因表禁止刪除，DB 測試使用獨立身分並保留測試名單；只對專用可拋棄資料庫執行。
+
+## 邀請碼（backend#131）
+
+前置為 db#62 的 `0048_waitlist_invites.sql`（依賴 0046）。與積分系統的 `/invites/me`、`/invites/bind` 分開。
+
+`POST /waitlist/redeem`：JSON `{ "identityToken": "<Privy identity token>", "code": "ABCDEFGH23" }`。
+驗 token 與唯一 `twitter_oauth` 的規則與 join 相同，只採用簽章內的 Privy ID／X ID／handle，不需錢包或 CRE8 session。
+成功回 200，格式同 join：`{ "status": "approved", "xHandle": "alice", "joinedAt": "2026-11-16T00:00:00.000001Z" }`。
+可直接建立 waiting 名單後在同交易核准，或核准既有 waiting；保留原 joinedAt，更新 handle，`approved_by` 記 `invite:<id>`。
+依 0048 契約，revoked 名單須由營運重新核准，不可用邀請碼復權（409 `INVALID_WAITLIST_TRANSITION`）。
+
+輸入 code 去除首尾空白並轉大寫，接受 8–10 字元英數碼，排除 `0`、`1`、`I`、`L`、`O`；本版產生 10 字元。
+每字元取加密安全亂數，約 49 位元熵；只存正規化 code 的 SHA-256（64 位大寫 hex，0048 的 `code` 欄位），不存明碼、可還原加密值或尾碼。
+
+兌換獨立限額為每個 IP 每分鐘 10 次、每個驗證成功的 Privy user 每分鐘 5 次（錯碼／無 X 也計次）。
+IP 在讀 body 前計次，採既有 trusted-proxy 規則；更換來源 IP 不會重設 user 限額。超限回 429 `RATE_LIMITED` 與 `Retry-After`。
+限額採與既有 auth 短窗同類的程序內記憶體、UTC 固定分鐘窗與有界容量；重啟會重算，多個 API instance 各自計次，並非跨 instance 的持久化配額。
+限額儲存失敗／容量不足時拒絕請求並回 503 `RATE_LIMIT_UNAVAILABLE`。
+
+| 兌換結果 | HTTP／code |
+| --- | --- |
+| 碼格式錯誤或查無雜湊 | 404 `INVITE_INVALID` |
+| 已使用 | 409 `INVITE_USED` |
+| 已作廢或到期（期限相等即到期） | 410 `INVITE_EXPIRED` |
+| 對應名單已 approved（不消耗新碼） | 409 `ALREADY_APPROVED` |
+| revoked 名單 | 409 `INVALID_WAITLIST_TRANSITION` |
+| X 未綁／衝突 | 409 `X_REQUIRED`／`X_ALREADY_JOINED` |
+| DB 失敗／缺表／逾時 | 503 `INVITES_UNAVAILABLE` |
+
+其餘 token／JSON 錯誤同 join。錯誤只有固定訊息，不回碼、雜湊、收件人、兌換者、SQL 或底層錯誤；名單已 approved 的檢查先於已用／到期檢查。
+交易先鎖邀請碼、再鎖名單，0048 trigger 在取得兩個鎖後以 DB 時鐘再次驗期限，並在同交易寫入使用與核准證據。
+失敗整筆回滾，不會留下新名單或半次消耗；同一碼並行只有一次成功，同一人用不同碼競爭只消耗一碼。
+寫入交易的 lock／statement timeout 各 5 秒，不做 DB 失敗後的自動重試。
+
+### 營運邀請碼
+
+沿用 `/operator/*` 的 CRE8 session 與 `OPERATOR_WALLETS` 白名單，未登入 401、非白名單 403，不受再平衡開關影響。所有回應 `Cache-Control: no-store`。
+
+- `POST /operator/waitlist/invites`：JSON `{ "count": 2, "issuedTo": "@alice", "batchNote": "launch", "expiresAt": "2026-12-01T00:00:00.000Z" }`。count 必須為整數 1–500；issuedTo／batchNote 可省略、null 或空白（存 null），非空最多 256 字元。expiresAt 可省略／null，否則為未來 UTC ISO 日期（秒或三位毫秒）。錯誤回 400 `INVALID_INVITE_INPUT`。整批原子寫入，回 200 `{ "batchId": "<UUID>", "issuedTo": "@alice", "batchNote": "launch", "expiresAt": "2026-12-01T00:00:00.000Z", "items": [{ "id": "1", "code": "ABCDEFGH23" }, ...] }`。**明碼只在這一次回應出現，營運須當次保存／發送，無法再次取回。** 重送 POST 會建立另一批。
+- `GET /operator/waitlist/invites?status=unused&batch=<UUID>&cursor=<nextCursor>&limit=50`：回 `{ "items": [...], "nextCursor": "..." }`。每筆為字串 id、固定 `codeMasked: "**********"`、batchId、batchNote、issuedTo、status、createdBy、createdAt、expiresAt、usedByWaitlistId、xHandle、usedAt、revokedAt、revokedBy。尚未使用者的 use 欄位為 null，不回 code 或雜湊。status 可省略或為 unused／used／revoked／expired；expired 是 DB unused 且期限已到的查詢投影。batch 可省略。limit 預設 50、範圍 1–100，按 `(created_at,id)` 由舊到新分頁，cursor 保留微秒／bigint 並綁定 status 與 batch，錯誤回 400 `INVALID_QUERY`。分頁為即時資料位置，不是狀態快照。
+- `GET /operator/waitlist/invites/summary?batch=<UUID>`：按 issuedTo 彙總，可選 batch；回 `{ "items": [{ "issuedTo": "@alice", "issued": "2", "used": "1" }] }`。未填收件人的一組 issuedTo 為 null，計數為完整精度十進位字串。issued 包含 used／revoked／已到期，used 只計已成功使用。
+- `POST /operator/waitlist/invites/:id/revoke`：回 `{ "id": "1", "status": "revoked" }`。unused（含已到期）可作廢，DB 記已登入營運錢包小寫與 revokedAt；已 revoked 重試不改原紀錄，used 回 409 `INVITE_USED`。id 必須為正 bigint（最大 `9223372036854775807`），錯誤為 400 `INVALID_ID`，不存在為 404 `INVITE_INVALID`。此端點不撤銷使用者資格，既有名單撤銷端點仍獨立運作。
+
+`test/waitlist-invites.test.ts` 由既有 no-DB CI 的 server 測試入口載入；`test/waitlist-invites.db.test.ts` 用已套 0048 的專用可拋棄 Postgres 驗證並行兌換、回滾、過期跨鎖等待、作廢、彙總、微秒／bigint 分頁及真實鎖逾時。測試保留所有邀請與名單，不刪除受保護的資料。

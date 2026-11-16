@@ -14,6 +14,8 @@ import type { PriceableAsset, TradableProbe } from './assets.js';
 import { authenticate, issueNonce, login, logout, parseLoginBody } from './auth.js';
 import { loginWithPrivy } from './privy.js';
 import { createWaitlistService } from './waitlist.js';
+import { resolveOperatorWallets } from './waitlist-access.js';
+export { resolveOperatorWallets } from './waitlist-access.js';
 import { createWaitlistInviteService } from './waitlist-invites.js';
 import { claimFaucetUsdt } from './faucet.js';
 import { sponsorUserOperation } from './paymaster.js';
@@ -90,17 +92,6 @@ export function resolveCorsConfig(env: NodeJS.ProcessEnv = process.env): CorsCon
           .map((origin) => origin.trim())
           .filter((origin) => origin !== '');
   return { allowedOrigins: origins.map((origin) => origin.toLowerCase()) };
-}
-
-/** 營運 SIWE 登入錢包；空值拒絕所有人，任一項格式錯誤也不放行部分清單。 */
-export function resolveOperatorWallets(env: NodeJS.ProcessEnv = process.env): readonly string[] {
-  const raw = env.OPERATOR_WALLETS?.trim() ?? '';
-  if (raw === '') return [];
-  const wallets = raw.split(',').map((wallet) => wallet.trim().toLowerCase());
-  if (wallets.some((wallet) => !/^0x[0-9a-f]{40}$/.test(wallet) || /^0x0{40}$/.test(wallet))) {
-    throw new AppError(503, 'INVALID_OPERATOR_WALLETS', 'OPERATOR_WALLETS must be comma-separated nonzero EVM addresses');
-  }
-  return wallets;
 }
 
 /**

@@ -4,6 +4,8 @@ import type { SessionCredentials } from './auth.js';
 import { getPrivyConfig } from './config.js';
 import type { PrivyConfig } from './config.js';
 import { query } from './db.js';
+import { requireWaitlistAccess } from './waitlist-access.js';
+import type { WaitlistAccess } from './waitlist-access.js';
 import { AppError, UnauthorizedError, ValidationError } from './errors.js';
 
 /** Identity tokens contain linked accounts; plain access tokens cannot establish a new owner. */
@@ -39,6 +41,7 @@ type PrivyLoginOptions = {
   config?: () => PrivyConfig | null;
   users?: PrivyUserRepository;
   issueSession?: typeof issueSession;
+  access?: WaitlistAccess;
   now?: () => number;
 };
 
@@ -59,6 +62,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export function createPrivyLogin(options: PrivyLoginOptions = {}): (body: unknown) => Promise<SessionCredentials> {
   const users = options.users ?? new PostgresPrivyUserRepository();
   const mint = options.issueSession ?? issueSession;
+  const access = options.access ?? requireWaitlistAccess;
   const now = options.now ?? Date.now;
   return async (body) => {
     const config = (options.config ?? getPrivyConfig)();
@@ -83,7 +87,7 @@ export function createPrivyLogin(options: PrivyLoginOptions = {}): (body: unknow
         algorithms: ['ES256'], issuer: 'privy.io', audience: config.appId,
         requiredClaims: ['sub', 'iat', 'exp', 'linked_accounts'], currentDate: new Date(seconds * 1000),
       });
-      if (typeof payload.sub !== 'string' || !/^did:privy:[^\s]+$/.test(payload.sub) ||
+      if (typeof payload.sub !== 'string' || payload.sub.length > 256 || !/^did:privy:[^\s]+$/.test(payload.sub) ||
           payload.aud !== config.appId || !Number.isSafeInteger(payload.iat) ||
           payload.iat === undefined || payload.iat < 0 || payload.iat > seconds ||
           !Number.isSafeInteger(payload.exp) || payload.exp === undefined || payload.exp <= payload.iat ||
@@ -98,25 +102,33 @@ export function createPrivyLogin(options: PrivyLoginOptions = {}): (body: unknow
 
     let owner: string | null;
     try { owner = await users.find(userId); } catch { throw unavailable(); }
+    // Establish the candidate from signed claims without persisting an unapproved registration.
+    // Existing owner mappings remain immutable, including after linked wallets change.
+    if (owner !== null && (!/^0x[0-9a-f]{40}$/.test(owner) || /^0x0{40}$/.test(owner))) throw unavailable();
+    const wallets = new Set<string>();
     if (owner === null) {
-      // Registration happens at the first CRE8 login (backend#63, C3 option 1).
-      // Only signed wallet accounts count; neither frontend owner nor login method is trusted.
-      const wallets = new Set<string>();
       for (const account of accounts) {
         if (isRecord(account) && account.type === 'wallet' && account.chain_type === 'ethereum' &&
             typeof account.address === 'string' && /^0x[0-9a-fA-F]{40}$/.test(account.address) &&
             !/^0x0{40}$/.test(account.address)) wallets.add(account.address.toLowerCase());
       }
-      const [candidate] = wallets;
+    }
+    const [candidate] = wallets;
+    await access(owner ?? (wallets.size === 1 ? candidate ?? '' : ''), userId);
+    if (owner === null) {
       if (wallets.size !== 1 || candidate === undefined) {
         throw new AppError(409, wallets.size === 0 ? 'PRIVY_NO_WALLET' : 'PRIVY_OWNER_AMBIGUOUS',
           'Complete your first CRE8 login with exactly one valid nonzero EVM wallet before linking additional wallets');
       }
       try { owner = await users.create(userId, candidate); } catch { throw unavailable(); }
     }
-    // Refuse corrupt persisted data rather than issuing a session with an invalid owner.
+    // A concurrent registration may have won; validate its persisted owner before minting.
     if (!/^0x[0-9a-f]{40}$/.test(owner) || /^0x0{40}$/.test(owner)) throw unavailable();
-    try { return await mint(owner); } catch { throw unavailable(); }
+    try { return await mint(owner, userId); }
+    catch (error) {
+      if (error instanceof AppError && ['WAITLIST_PENDING', 'WAITLIST_UNAVAILABLE', 'INVALID_OPERATOR_WALLETS'].includes(error.code)) throw error;
+      throw unavailable();
+    }
   };
 }
 

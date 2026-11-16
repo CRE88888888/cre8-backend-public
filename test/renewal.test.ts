@@ -1,3 +1,4 @@
+import { loginTestWallet, testPrivyLogin } from './fixtures/waitlist-access.js';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { QueryResultRow } from 'pg';
@@ -5,7 +6,6 @@ import { getAddress, toHex } from 'viem';
 import type { Address, Hex, PublicClient } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { bsc } from 'viem/chains';
-import { createSiweMessage } from 'viem/siwe';
 import { requireSessionKeyConfig } from '../src/config.js';
 import { query } from '../src/db.js';
 import { NotFoundError } from '../src/errors.js';
@@ -257,7 +257,7 @@ function realRenewalParams(
 // ---------------------------------------------------------------------------
 
 async function withServer<T>(run: (baseUrl: string) => Promise<T>, deps?: Partial<ServerDeps>): Promise<T> {
-  const server = createServer(deps);
+  const server = createServer({ privyLogin: testPrivyLogin, ...deps });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('test server did not bind');
@@ -282,33 +282,7 @@ function getJson(baseUrl: string, path: string, token?: string): Promise<Respons
 }
 
 async function loginToken(baseUrl: string): Promise<string> {
-  const nonceResponse = await fetch(`${baseUrl}/auth/nonce`, { method: 'POST' });
-  assert.equal(nonceResponse.status, 200);
-  const challenge = (await nonceResponse.json()) as {
-    nonce: string;
-    domain: string;
-    chainId: number;
-    uri: string;
-    statement: string;
-    issuedAt: string;
-  };
-  const message = createSiweMessage({
-    address: WALLET.address,
-    chainId: challenge.chainId,
-    domain: challenge.domain,
-    uri: challenge.uri,
-    statement: challenge.statement,
-    version: '1',
-    nonce: challenge.nonce,
-    issuedAt: new Date(challenge.issuedAt),
-  });
-  const loginResponse = await postJson(baseUrl, '/auth/login', {
-    message,
-    signature: await WALLET.signMessage({ message }),
-  });
-  assert.equal(loginResponse.status, 200);
-  const { token } = (await loginResponse.json()) as { token: string };
-  return token;
+  return (await loginTestWallet(baseUrl, WALLET.address)).token;
 }
 
 // ---------------------------------------------------------------------------

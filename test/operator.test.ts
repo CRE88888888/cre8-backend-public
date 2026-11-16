@@ -1,3 +1,4 @@
+import { loginTestWallet, testPrivyLogin } from './fixtures/waitlist-access.js';
 import { TESTNET_97 } from '../src/testnet-profile.js';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -5,7 +6,6 @@ import { getAddress, keccak256, toBytes } from 'viem';
 import type { Hex, PublicClient } from 'viem';
 import { generatePrivateKey, mnemonicToAccount, privateKeyToAccount } from 'viem/accounts';
 import type { PrivateKeyAccount } from 'viem/accounts';
-import { createSiweMessage } from 'viem/siwe';
 
 import { ForbiddenError } from '../src/errors.js';
 import { query } from '../src/db.js';
@@ -566,7 +566,7 @@ test('#40 a price change on continuation uses current oracle nominal rather than
 // ---------------------------------------------------------------------------
 
 async function withServer<T>(run: (baseUrl: string) => Promise<T>, deps: Partial<ServerDeps> = {}): Promise<T> {
-  const server = createServer(deps);
+  const server = createServer({ privyLogin: testPrivyLogin, ...deps });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('test server did not bind');
@@ -594,34 +594,9 @@ async function responseErrorCode(response: Response): Promise<string> {
   return ((await response.json()) as { error: { code: string } }).error.code;
 }
 
-/** 真的走一次 SIWE：路由要驗的是「有 token 才進得去」，那就簽一張真的 token。 */
+/** 以已核准的 Privy 身分取得真實 Postgres session，再驗證營運路由權限。 */
 async function loginToken(baseUrl: string, wallet: Pick<PrivateKeyAccount, 'address' | 'signMessage'> = WALLET): Promise<string> {
-  const nonceResponse = await fetch(`${baseUrl}/auth/nonce`, { method: 'POST' });
-  assert.equal(nonceResponse.status, 200);
-  const challenge = (await nonceResponse.json()) as {
-    nonce: string;
-    domain: string;
-    chainId: number;
-    uri: string;
-    statement: string;
-    issuedAt: string;
-  };
-  const message = createSiweMessage({
-    address: wallet.address,
-    chainId: challenge.chainId,
-    domain: challenge.domain,
-    uri: challenge.uri,
-    statement: challenge.statement,
-    version: '1',
-    nonce: challenge.nonce,
-    issuedAt: new Date(challenge.issuedAt),
-  });
-  const login = await postJson(baseUrl, '/auth/login', {
-    message,
-    signature: await wallet.signMessage({ message }),
-  });
-  assert.equal(login.status, 200);
-  return ((await login.json()) as { token: string }).token;
+  return (await loginTestWallet(baseUrl, wallet.address)).token;
 }
 
 const SAMPLE_STATUS: PortfolioStatus = {

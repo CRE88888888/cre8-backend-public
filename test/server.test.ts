@@ -1,4 +1,6 @@
+import { approvedTestAccess } from './fixtures/waitlist-access.js';
 import './waitlist.test.js';
+import './waitlist-access.test.js';
 import './waitlist-invites.test.js';
 import './strategy-execution.test.js';
 import './contribution-preview.test.js';
@@ -543,9 +545,9 @@ test('default public reader handles a down DB, unused signing configuration, mis
 
 // #59: all of these route tests use real SIWE recovery with an isolated session repository.
 async function withBudgetServer(run: (base: string) => Promise<void>, overrides: Partial<ServerDeps> = {}) {
-  const rows = new Map<string, { wallet: string; expiresAt: Date }>();
-  const auth = new AuthStore({ auth: { authDomain: 'localhost', authUri: 'http://localhost', chainId: 1337 }, sessions: {
-    save: async (hash, wallet, expiresAt) => { rows.set(hash, { wallet, expiresAt }); },
+  const rows = new Map<string, { wallet: string; expiresAt: Date; privyUserId: string | null }>();
+  const auth = new AuthStore({ access: approvedTestAccess, auth: { authDomain: 'localhost', authUri: 'http://localhost', chainId: 1337 }, sessions: {
+    save: async (hash, wallet, expiresAt, privyUserId = null) => { rows.set(hash, { wallet, expiresAt, privyUserId }); },
     find: async (hash) => rows.get(hash) ?? null,
     remove: async (hash) => { rows.delete(hash); },
     prune: async () => {},
@@ -796,9 +798,9 @@ function privyHarness() {
   const fixture = privyFixture();
   const memory = privyMemory();
   let clock = fixture.now;
-  const auth = new AuthStore({ sessions: memory.sessions, now: () => clock });
-  const login = createPrivyLogin({ config: () => fixture.config, users: memory.users,
-    issueSession: (owner) => auth.issueSession(owner), now: () => clock });
+  const auth = new AuthStore({ access: approvedTestAccess, sessions: memory.sessions, now: () => clock });
+  const login = createPrivyLogin({ access: approvedTestAccess, config: () => fixture.config, users: memory.users,
+    issueSession: (owner, userId) => auth.issueSession(owner, userId), now: () => clock });
   return { fixture, memory, auth, login, setClock: (value: number) => { clock = value; } };
 }
 
@@ -913,8 +915,8 @@ test('#63 first login rejects zero or multiple valid EVM wallets and never write
 test('#63 existing owner survives added/removed wallets and social-only login across fresh login handlers', async () => {
   const { fixture: f, memory, auth, login } = privyHarness();
   await login({ identityToken: await f.sign() });
-  const fresh = createPrivyLogin({ config: () => f.config, users: memory.users,
-    issueSession: (owner) => auth.issueSession(owner), now: () => f.now });
+  const fresh = createPrivyLogin({ access: approvedTestAccess, config: () => f.config, users: memory.users,
+    issueSession: (owner, userId) => auth.issueSession(owner, userId), now: () => f.now });
   for (const accounts of [[], [{ type: 'google_oauth' }], [{ ...f.wallet, address: f.other }],
     [f.wallet, { ...f.wallet, address: f.other }]]) {
     const session = await fresh({ identityToken: await f.sign({ linked_accounts: JSON.stringify(accounts) }), owner: f.other });
@@ -930,14 +932,14 @@ test('#63 disabled/bad verification key returns 503 without touching persistence
   const f = privyFixture();
   for (const config of [null, { ...f.config, verificationKey: 'misplaced-secret-value' }]) {
     let persistenceCalls = 0;
-    const login = createPrivyLogin({ config: () => config, users: {
+    const login = createPrivyLogin({ access: approvedTestAccess, config: () => config, users: {
       find: async () => { persistenceCalls++; return null; },
       create: async () => { persistenceCalls++; return f.owner; },
     } });
     await assert.rejects(login({ identityToken: await f.sign() }), privyError(503, 'PRIVY_UNAVAILABLE'));
     assert.equal(persistenceCalls, 0, 'disabled or invalid key must not touch persistence');
   }
-  const auth = new AuthStore({ sessions: privyMemory().sessions });
+  const auth = new AuthStore({ access: approvedTestAccess, sessions: privyMemory().sessions });
   const account = privateKeyToAccount(generatePrivateKey());
   const challenge = auth.issueNonce();
   const message = createSiweMessage({ ...challenge, address: account.address, version: '1', issuedAt: new Date(challenge.issuedAt) });
@@ -952,11 +954,11 @@ test('#63 mapping lookup/insert and session DB failure/timeout fail closed witho
     for (const code of ['ECONNREFUSED', '57014', 'ETIMEDOUT']) {
       const memory = privyMemory();
       const fail = async (): Promise<never> => { throw Object.assign(new Error('secret-token-database-url'), { code }); };
-      const auth = new AuthStore({ sessions: { ...memory.sessions, save: stage === 'session' ? fail : memory.sessions.save } });
-      const login = createPrivyLogin({ config: () => f.config, users: {
+      const auth = new AuthStore({ access: approvedTestAccess, sessions: { ...memory.sessions, save: stage === 'session' ? fail : memory.sessions.save } });
+      const login = createPrivyLogin({ access: approvedTestAccess, config: () => f.config, users: {
         find: stage === 'find' ? fail : memory.users.find,
         create: stage === 'create' ? fail : memory.users.create,
-      }, issueSession: (owner) => auth.issueSession(owner), now: () => f.now });
+      }, issueSession: (owner, userId) => auth.issueSession(owner, userId), now: () => f.now });
       await assert.rejects(login({ identityToken }), (error: unknown) => {
         assert.ok(error instanceof AppError);
         assert.equal(error.status, 503);
@@ -967,9 +969,9 @@ test('#63 mapping lookup/insert and session DB failure/timeout fail closed witho
       assert.equal(memory.rows.size, 0);
       assert.equal(memory.mappings.size, stage === 'session' ? 1 : 0);
       if (stage === 'session') {
-        const recovered = new AuthStore({ sessions: memory.sessions });
-        const retry = createPrivyLogin({ config: () => f.config, users: memory.users,
-          issueSession: (owner) => recovered.issueSession(owner) });
+        const recovered = new AuthStore({ access: approvedTestAccess, sessions: memory.sessions });
+        const retry = createPrivyLogin({ access: approvedTestAccess, config: () => f.config, users: memory.users,
+          issueSession: (owner, userId) => recovered.issueSession(owner, userId) });
         const session = await retry({ identityToken: await f.sign({
           linked_accounts: JSON.stringify([{ ...f.wallet, address: f.other }]),
         }) });
@@ -980,7 +982,7 @@ test('#63 mapping lookup/insert and session DB failure/timeout fail closed witho
   for (const owner of ['', '0x123', '0x' + '0'.repeat(40)]) {
     let insertCalls = 0;
     let mintCalls = 0;
-    const login = createPrivyLogin({ config: () => f.config, users: { find: async () => owner,
+    const login = createPrivyLogin({ access: approvedTestAccess, config: () => f.config, users: { find: async () => owner,
       create: async () => { insertCalls++; return f.owner; } },
     issueSession: async () => { mintCalls++; throw new Error('invalid owner'); } });
     await assert.rejects(login({ identityToken }), privyError(503, 'PRIVY_UNAVAILABLE'));
@@ -1033,8 +1035,8 @@ test('#63 HTTP Privy shares auth IP limits with SIWE, rejects methods and malfor
 test('#63 HTTP maps owner conflicts to 409, disabled login and DB failure to 503 without issuing sessions', async () => {
   const h = privyHarness();
   const f = h.fixture;
-  const disabled = createPrivyLogin({ config: () => null });
-  const failing = createPrivyLogin({ config: () => f.config, users: {
+  const disabled = createPrivyLogin({ access: approvedTestAccess, config: () => null });
+  const failing = createPrivyLogin({ access: approvedTestAccess, config: () => f.config, users: {
     find: async () => { throw new Error('secret-db-connection'); }, create: async () => assert.fail('must not insert'),
   } });
   for (const entry of [

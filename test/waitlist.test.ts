@@ -1,9 +1,9 @@
+import { createWaitlistAccess } from '../src/waitlist-access.js';
+import { createPrivyLogin } from '../src/privy.js';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { JWTPayload } from 'jose';
 import { SignJWT } from 'jose';
-import { mnemonicToAccount } from 'viem/accounts';
-import { createSiweMessage } from 'viem/siwe';
 import { AuthStore } from '../src/auth.js';
 import { AppError, UnauthorizedError } from '../src/errors.js';
 import { MAX_PRIVY_TOKEN_LENGTH } from '../src/privy.js';
@@ -217,15 +217,15 @@ test('#127 waitlist uses the shared 401/403 whitelist guard independently of the
   assert.equal(calls, 6, 'only whitelisted calls reach storage, with either switch value');
 });
 
-test('#127 a signed-in non-whitelisted SIWE wallet gets 403 for waitlist list/approve/revoke with either rebalance switch value', async () => {
-  // Public anvil account only; signing is local and sends no chain transaction.
-  const outsider = mnemonicToAccount('test test test test test test test test test test test junk', { addressIndex: 7 });
-  const store = new AuthStore({ sessions: privyMemory().sessions,
-    auth: { authDomain: 'localhost', authUri: 'http://localhost', chainId: 1337 } });
-  const challenge = store.issueNonce();
-  const message = createSiweMessage({ ...challenge, address: outsider.address, issuedAt: new Date(challenge.issuedAt) });
-  const { token } = await store.login(message, await outsider.signMessage({ message }));
-  assert.equal(await store.authenticate('Bearer ' + token), outsider.address.toLowerCase());
+test('#127 an approved Privy session with a non-whitelisted wallet gets 403 for waitlist list/approve/revoke with either rebalance switch value', async () => {
+  const f = privyFixture();
+  const memory = privyMemory();
+  const access = createWaitlistAccess({ operatorWallets: () => [], lookup: async id => id === f.userId });
+  const store = new AuthStore({ access, sessions: memory.sessions });
+  const login = createPrivyLogin({ config: () => f.config, users: memory.users, access,
+    issueSession: (owner, id) => store.issueSession(owner, id) });
+  const { token } = await login({ identityToken: await f.sign({ linked_accounts: JSON.stringify([{ ...f.wallet, address: f.other }]) }) });
+  assert.equal(await store.authenticate('Bearer ' + token), f.other);
   const fail = async (): Promise<never> => { assert.fail('non-whitelisted wallet reached waitlist storage'); };
   const h = harness({ list: fail, transition: fail });
   for (const enabled of [false, true]) {

@@ -4,6 +4,8 @@ import { recoverMessageAddress } from 'viem';
 import { parseSiweMessage } from 'viem/siwe';
 import { getAuthConfig, loadRateLimitConfig } from './config.js';
 import { RateLimitError } from './ratelimit.js';
+import { requireWaitlistAccess } from './waitlist-access.js';
+import type { WaitlistAccess } from './waitlist-access.js';
 import type { AuthConfig } from './config.js';
 import {
   InvalidNonceError,
@@ -77,9 +79,9 @@ export type LoginCredentials = {
 
 /** Where sessions are persisted. Injected so unit tests need no database. */
 export type SessionRepository = {
-  save(tokenHash: string, wallet: string, expiresAt: Date): Promise<void>;
+  save(tokenHash: string, wallet: string, expiresAt: Date, privyUserId?: string | null): Promise<void>;
   /** `null` = unknown or expired. The caller treats both the same (401). */
-  find(tokenHash: string): Promise<{ wallet: string; expiresAt: Date } | null>;
+  find(tokenHash: string): Promise<{ wallet: string; expiresAt: Date; privyUserId: string | null } | null>;
   remove(tokenHash: string): Promise<void>;
   /** Best-effort cleanup of expired rows. Never throws into the request path. */
   prune(now: Date): Promise<void>;
@@ -93,6 +95,8 @@ export type AuthStoreOptions = {
   auth?: AuthConfig;
   /** Session persistence. Defaults to Postgres; tests pass an in-memory fake. */
   sessions?: SessionRepository;
+  /** Shared waitlist gate, checked before issuance and on every authenticated request. */
+  access?: WaitlistAccess;
 };
 
 type NonceEntry = { expiresAt: number };
@@ -137,22 +141,23 @@ export function sha256Hex(token: string): string {
  * 使用者不會在 A 還能用、在 B 不能用。
  */
 export class PostgresSessionRepository implements SessionRepository {
-  async save(tokenHash: string, wallet: string, expiresAt: Date): Promise<void> {
+  async save(tokenHash: string, wallet: string, expiresAt: Date, privyUserId: string | null = null): Promise<void> {
     await query(
-      `insert into auth_sessions (token_hash, wallet, expires_at)
-       values ($1, $2, $3)
-       on conflict (token_hash) do update set wallet = excluded.wallet, expires_at = excluded.expires_at`,
-      [tokenHash, wallet.toLowerCase(), expiresAt],
+      `insert into auth_sessions (token_hash, wallet, expires_at, privy_user_id)
+       values ($1, $2, $3, $4)
+       on conflict (token_hash) do update set wallet = excluded.wallet, expires_at = excluded.expires_at,
+         privy_user_id = excluded.privy_user_id`,
+      [tokenHash, wallet.toLowerCase(), expiresAt, privyUserId],
     );
   }
 
-  async find(tokenHash: string): Promise<{ wallet: string; expiresAt: Date } | null> {
-    const result = await query<{ wallet: string; expires_at: Date }>(
-      'select wallet, expires_at from auth_sessions where token_hash = $1 and expires_at > now()',
+  async find(tokenHash: string): Promise<{ wallet: string; expiresAt: Date; privyUserId: string | null } | null> {
+    const result = await query<{ wallet: string; expires_at: Date; privy_user_id: string | null }>(
+      'select wallet, expires_at, privy_user_id from auth_sessions where token_hash = $1 and expires_at > now()',
       [tokenHash],
     );
     const row = result.rows[0];
-    return row === undefined ? null : { wallet: row.wallet, expiresAt: row.expires_at };
+    return row === undefined ? null : { wallet: row.wallet, expiresAt: row.expires_at, privyUserId: row.privy_user_id };
   }
 
   async remove(tokenHash: string): Promise<void> {
@@ -170,12 +175,14 @@ export class AuthStore {
   readonly #auth: AuthConfig;
   readonly #nonces = new Map<string, NonceEntry>();
   readonly #sessions: SessionRepository;
+  readonly #access: WaitlistAccess;
   readonly #maxNonces: number;
 
   constructor(options: AuthStoreOptions = {}) {
     this.#now = options.now ?? Date.now;
     this.#auth = options.auth ?? getAuthConfig();
     this.#sessions = options.sessions ?? new PostgresSessionRepository();
+    this.#access = options.access ?? requireWaitlistAccess;
     this.#maxNonces = options.maxNonces ?? loadRateLimitConfig().maxNonces;
     if (!Number.isSafeInteger(this.#maxNonces) || this.#maxNonces < 1) throw new RangeError('maxNonces must be a positive integer');
   }
@@ -277,21 +284,22 @@ export class AuthStore {
   }
 
   /** Internal entry point: call only after SIWE or Privy has established the trusted owner. */
-  async issueSession(owner: string): Promise<SessionCredentials> {
+  async issueSession(owner: string, privyUserId?: string): Promise<SessionCredentials> {
     const wallet = owner.toLowerCase();
     if (!ADDRESS_PATTERN.test(wallet)) throw new Error('invalid verified session owner');
+    await this.#access(wallet, privyUserId);
     const now = this.#now();
     const token = randomToken();
     const expiresAt = now + SESSION_TTL_MS;
     // 先把過期列清掉：這是唯一的寫入路徑，順手做就不需要一個背景排程。
     await this.#sessions.prune(new Date(now)).catch(() => undefined);
-    await this.#sessions.save(sha256Hex(token), wallet, new Date(expiresAt));
+    await this.#sessions.save(sha256Hex(token), wallet, new Date(expiresAt), privyUserId ?? null);
     return { token, expiresAt: new Date(expiresAt).toISOString() };
   }
 
   /**
    * Resolve `Authorization: Bearer <token>` to the session wallet (lowercase).
-   * Every failure — missing header, wrong scheme, unknown or expired token — is 401 UNAUTHORIZED.
+   * Invalid/expired credentials are 401; valid sessions without approval are 403 WAITLIST_PENDING.
    */
   async authenticate(authHeader: string | null | undefined): Promise<string> {
     const token = parseBearerToken(authHeader);
@@ -305,6 +313,7 @@ export class AuthStore {
       throw unauthorized('session token has expired');
     }
 
+    await this.#access(session.wallet, session.privyUserId ?? undefined);
     return session.wallet;
   }
 
@@ -471,8 +480,8 @@ export function login(message: string, signature: string): Promise<SessionCreden
 }
 
 /** Internal session issuance shared by the two verified login paths. */
-export function issueSession(owner: string): Promise<SessionCredentials> {
-  return store().issueSession(owner);
+export function issueSession(owner: string, privyUserId?: string): Promise<SessionCredentials> {
+  return store().issueSession(owner, privyUserId);
 }
 
 export function authenticate(authHeader: string | null | undefined): Promise<string> {

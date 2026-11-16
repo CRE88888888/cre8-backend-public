@@ -458,7 +458,13 @@ curl -s "$API/platform/status"
 
 ### Auth（SIWE／EIP-4361 + session token）
 
-沒有密碼、沒有第三方服務。流程是「拿 SIWE 欄位 → 前端用 viem 組 EIP-4361 訊息 → 錢包簽 → 換 token →
+登入與每次 CRE8 session 驗證都檢查 waitlist：只有 `approved` 可通過，未加入／waiting／revoked 統一回
+403 `WAITLIST_PENDING`；查詢失敗／逾時回 503 `WAITLIST_UNAVAILABLE`。`OPERATOR_WALLETS` 與營運端點
+共用白名單並豁免此檢查。一般使用者須用 X 的 Privy 登入；純 SIWE 只允許 operator，核准錢包也不能借用資格。
+Privy 核准前不寫 owner 綁定；session 保存已驗證的 Privy ID，撤銷會在下一個受保護請求生效。
+`/waitlist/*` 與原本公開的端點不受影響。完整規則、舊 session 與多身分行為見 [Waitlist API](docs/waitlist-api.zh-TW.md)。
+
+以下為 operator 的 SIWE 流程：「拿 SIWE 欄位 → 前端用 viem 組 EIP-4361 訊息 → 錢包簽 → 換 token →
 帶 token 打寫入路由」。訊息綁住 **domain + chainId + nonce + issuedAt**，被釣到別的站台或別的鏈都簽不出可用的
 訊息。
 
@@ -507,15 +513,17 @@ curl -s "$API/platform/status"
      否則 400 `SIWE_EXPIRED`／`INVALID_SIWE_MESSAGE`。
    - `recoverMessageAddress({ message, signature })` 解出的地址必須等於**訊息內**的地址，
      否則 401 `INVALID_SIGNATURE`。
-   - 通過後立即刪除 nonce（重放 → 400 `INVALID_NONCE`），簽發 TTL 24 小時的 token。
+   - nonce 在非同步驗簽前消耗（驗簽或 waitlist 閘門失敗也不能重放）；確認目前仍為 operator 後，
+     簽發 TTL 24 小時的 token。
 4. 寫入路由帶 `Authorization: Bearer <token>`；伺服器把 token 換回錢包地址，**provider 一律由 session 推導**，
    body 裡的 `provider` 會被忽略。不是策略 owner 卻發布版本 → 403 `FORBIDDEN`。
 
 驗簽只用 `recoverMessageAddress`（EOA），**不支援 EIP-1271 合約錢包**：那需要 RPC 去問合約。
 要支援就得把 `verifySiweMessage`（viem，帶 `publicClient`）接上 `RPC_URL`，屬於下一刀。
 
-nonce 與 session 目前是**單一 process 的 in-memory Map**：重啟即失效，也只能跑單實例。水平擴展前必須換成
-Redis 或其它共享 store（見 TODO）。
+nonce 是單一 process 的 in-memory Map；session 的 token hash、錢包、Privy ID 與到期時間保存在 Postgres
+`auth_sessions`（需 db 0049），跨實例與重啟可用。operator SIWE 的 Privy ID 為 NULL；舊的 NULL session
+只允許目前仍在白名單的 operator 使用，一般使用者需重新以 Privy 登入。每次使用有效 Privy session 都只查該身分的 waitlist 核准狀態。
 
 ```bash
 curl -s "$API/health"

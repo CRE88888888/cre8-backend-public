@@ -1,3 +1,4 @@
+import { loginTestWallet, testPrivyLogin } from './fixtures/waitlist-access.js';
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import type { PoolClient, QueryResult, QueryResultRow } from 'pg';
@@ -16,10 +17,8 @@ import type { Address, Hex, PublicClient, WalletClient } from 'viem';
 import { entryPoint07Abi } from 'viem/account-abstraction';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { bsc } from 'viem/chains';
-import { createSiweMessage } from 'viem/siwe';
 import type { PermissionPlugin } from '@zerodev/permissions';
 import { KERNEL_V3_3_ADDRESSES } from '../src/addresses.js';
-import type { SiweChallenge } from '../src/auth.js';
 import { canonicalScheduleHash, deploySmartAccount, REGISTRY_ABI } from '../src/chain.js';
 import { AppError } from '../src/errors.js';
 import { FOLLOW_VERSIONS_TERMS, FOLLOW_VERSIONS_TEXT } from '../src/registry-versioning.js';
@@ -70,7 +69,7 @@ const ROUTE_WALLET = privateKeyToAccount(generatePrivateKey());
 // ---------------------------------------------------------------------------
 
 async function withServer<T>(run: (baseUrl: string) => Promise<T>, deps?: Partial<ServerDeps>): Promise<T> {
-  const server = createServer(deps);
+  const server = createServer({ privyLogin: testPrivyLogin, ...deps });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('test server did not bind');
@@ -89,26 +88,7 @@ function postJson(baseUrl: string, path: string, body: unknown, token?: string):
 }
 
 async function loginToken(baseUrl: string): Promise<string> {
-  const nonceResponse = await fetch(`${baseUrl}/auth/nonce`, { method: 'POST' });
-  assert.equal(nonceResponse.status, 200);
-  const challenge = (await nonceResponse.json()) as SiweChallenge;
-  const message = createSiweMessage({
-    address: ROUTE_WALLET.address,
-    chainId: challenge.chainId,
-    domain: challenge.domain,
-    uri: challenge.uri,
-    statement: challenge.statement,
-    version: '1',
-    nonce: challenge.nonce,
-    issuedAt: new Date(challenge.issuedAt),
-  });
-  const loginResponse = await postJson(baseUrl, '/auth/login', {
-    message,
-    signature: await ROUTE_WALLET.signMessage({ message }),
-  });
-  assert.equal(loginResponse.status, 200);
-  const { token } = (await loginResponse.json()) as { token: string };
-  return token;
+  return (await loginTestWallet(baseUrl, ROUTE_WALLET.address)).token;
 }
 
 function samplePortfolio(id = 1): Portfolio {

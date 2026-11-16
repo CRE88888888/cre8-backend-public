@@ -1,6 +1,22 @@
-# Waitlist API（backend#127）
+# Waitlist API 與登入閘門（backend#127、#133）
 
-前置：先套用 db#58 的 migration `0046_waitlist.sql`。名單獨立於 `privy_users`，加入不需錢包、SIWE 或 CRE8 session。這一版只管理名單，**未加入／未 approved 不會阻擋其他既有 API**，也不檢查是否已追蹤 @CRE8Finance。
+前置：先套用 db#58 的 `0046_waitlist.sql` 與 `0049_auth_session_privy_identity.sql`（`auth_sessions.privy_user_id`）。名單獨立於 `privy_users`，加入不需錢包、SIWE 或 CRE8 session。發 session 與所有需要 CRE8 session 的請求皆須通過下述閘門；不檢查是否已追蹤 @CRE8Finance。
+
+## 登入與 session 閘門
+
+`POST /auth/privy` 離線驗證 identity token 後，只使用已驗證的 `sub`（Privy user ID，最多 256 字元）查 `waitlist.privy_user_id` 唯一鍵；不採信 body 的 user ID、X ID、handle、owner 或 status。首次登入先查核准，再建立唯一有效 EVM 錢包的 owner mapping；未核准不寫任何 owner 綁定或 session。已存在的 owner 綁定仍保留首次登入的錢包，不因後續 linked wallets 改變。
+
+一般錢包的純 SIWE `POST /auth/login` 一律拒絕，即使該錢包曾綁到已核准身分也不能借用資格。須改用 X 的 Privy 登入。未加入、`waiting`、`revoked`、缺少 session 身分與一般 SIWE 統一回 **403 `WAITLIST_PENDING`**，訊息為 `waitlist approval is required; sign in with X`，不透露名單狀態。其他既有的輸入／驗簽錯誤碼保持不變；operator SIWE 例外見下文。
+
+Privy session 持久保存已驗證的 `privy_user_id`；每次驗證有效且未過期的 CRE8 session，只查該身分目前的放行狀態，沒有核准快取、不掃 `privy_users.owner_address`。同錢包的其他身分或歷史綁定不影響此 session。撤銷後，跨實例與重啟前已發出的 session，下一個受保護請求即回 403；重新核准後，尚未過期的 session 可再次使用。
+
+0049 保留舊 session 的 `privy_user_id = NULL`，不從錢包回填身分；只有目前仍在 operator 白名單的錢包能使用 NULL session。一般舊 session 必須重新經 Privy 登入，防止把其他人的核准附加到既有錢包 session。
+
+`OPERATOR_WALLETS` 與 `/operator/*` 共用同一解析函式，每次檢查讀取目前設定。白名單錢包可經 SIWE 或 Privy 登入，並使用既有 session，不需 waitlist；SIWE 不需 Privy 綁定，Privy 本身的 token／owner 驗證與綁定流程仍適用。白名單缺省／空白不豁免任何人；整份有無效項目時回既有 503 `INVALID_OPERATOR_WALLETS`，不部分放行。
+
+閘門內的名單查詢失敗、statement timeout 或缺表，一律拒絕並回 **503 `WAITLIST_UNAVAILABLE`**，不回傳底層 SQL、連線資訊或 token。Privy 的 owner 查詢或核准後綁定建立失敗仍回既有 `PRIVY_UNAVAILABLE`。operator 的名單豁免不會略過 session DB 自身的讀寫要求。
+
+`/waitlist/*` 仍使用 Privy identity token，不受 CRE8 session 閘門影響；`/health`、基金列表／詳情、公開預覽與其他原本公開的唯讀端點維持公開。`/auth/nonce` 與 `/auth/logout` 也不要求 waitlist 核准。邀請碼 #131 只需把該筆名單設為 `approved`，本閘門無須依賴邀請碼實作。
 
 ## 使用者
 
@@ -11,7 +27,7 @@
 
 `me` 只讀 header，**前端不要把 token 放 query string**。所有回應 `Cache-Control: no-store`。join／me 與 `/auth/*` 共用既有的 auth IP 每分鐘限額及 trusted-proxy 規則，超限回 429 `RATE_LIMITED` 與 `Retry-After`。
 
-驗證沿用 `/auth/privy` 的離線 ES256、公鑰、issuer `privy.io`、精確 audience、sub／iat／exp／linked_accounts 規則；設定仍為 `PRIVY_APP_ID`／`PRIVY_VERIFICATION_KEY`，不需要外部 RPC 或 Privy API。為避免變更既有登入行為，本模組保留相同驗證政策，沒有修改 `src/privy.ts`；另限制 sub 不超過 DB 的 256 字元。
+驗證沿用 `/auth/privy` 的離線 ES256、公鑰、issuer `privy.io`、精確 audience、sub／iat／exp／linked_accounts 規則；設定仍為 `PRIVY_APP_ID`／`PRIVY_VERIFICATION_KEY`，不需要外部 RPC 或 Privy API。本模組保留相同驗證政策，另限制 sub 不超過 DB 的 256 字元。
 
 X 身分只取已驗證 `linked_accounts` JSON 字串內唯一的 `twitter_oauth`：`subject` → X ID、`username` → handle（不含 `@`）。欄位對應依 [Privy 官方 SDK](https://github.com/privy-io/node-sdk/blob/main/src/lib/identity-token.ts)。必須有完整且唯一的 X 帳號；ID 為 1–20 位正整數字串，handle 為 1–15 位英數或底線。前端傳入的 X ID／handle／Privy user ID 一律不採用。
 
@@ -41,6 +57,8 @@ id 必須是正的 Postgres bigint 字串，最大 `9223372036854775807`，錯�
 ## 驗證
 
 `test/waitlist.test.ts` 覆蓋 token、輸入／邊界、HTTP、授權、限流及錯誤去敏，已由既有 no-DB CI 入口 `test/server.test.ts` 載入。`test/waitlist.db.test.ts` 在已套 0046 的可拋棄 Postgres 驗證並行 join／衝突、核准／撤銷、狀態冪等、微秒／bigint 分頁及真實 row-lock timeout。因表禁止刪除，DB 測試使用獨立身分並保留測試名單；只對專用可拋棄資料庫執行。
+
+`test/waitlist-access.test.ts` 由同一 no-DB CI 入口載入，驗證登入狀態矩陣、operator 例外、撤銷／過期邊界、錯誤去敏與公開端點。`test/waitlist-access.db.test.ts` 用真實 Postgres 驗證實際邀請碼兌換 → Privy 登入、借用核准錢包的 SIWE 拒絕、未核准登入不寫綁定／不影響核准者、session 身分持久化與 NULL 舊 session、跨實例撤銷，以及真實 table-lock 造成的 statement timeout。其他既有 HTTP 測試以離線簽署的 Privy token 與已核准測試名單取得真實 session；SIWE 專用測試明確使用 operator 例外。
 
 ## 邀請碼（backend#131）
 

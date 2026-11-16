@@ -31,6 +31,8 @@ import { createPrivyLogin, PostgresPrivyUserRepository } from '../src/privy.js';
 import { privyFixture } from './fixtures/privy.js';
 import { runScript } from './fixtures/secret-output.js';
 import { getPool } from '../src/db.js';
+import { AppError } from '../src/errors.js';
+import { approvedTestAccess, approveTestUser, loginTestWallet, testPrivyLogin, withTestOperator } from './fixtures/waitlist-access.js';
 
 const ASSET_A = '0x00000000000000000000000000000000000000a1';
 const ASSET_B = '0x00000000000000000000000000000000000000b2';
@@ -92,12 +94,12 @@ function newAccount(): PrivateKeyAccount {
  * 單元測試不該為了「登入」而需要 Postgres：`AuthStore` 吃的是一個 `SessionRepository` 介面，
  * 這裡給它一個 Map 就夠了。真正打 DB 的那一份由 `auth_sessions` 的整合測試與 HTTP 測試覆蓋。
  */
-function memorySessions(): SessionRepository & { readonly rows: Map<string, { wallet: string; expiresAt: Date }> } {
-  const rows = new Map<string, { wallet: string; expiresAt: Date }>();
+function memorySessions(): SessionRepository & { readonly rows: Map<string, { wallet: string; expiresAt: Date; privyUserId: string | null }> } {
+  const rows = new Map<string, { wallet: string; expiresAt: Date; privyUserId: string | null }>();
   return {
     rows,
-    save: async (tokenHash, wallet, expiresAt) => {
-      rows.set(tokenHash, { wallet, expiresAt });
+    save: async (tokenHash, wallet, expiresAt, privyUserId = null) => {
+      rows.set(tokenHash, { wallet, expiresAt, privyUserId });
     },
     find: async (tokenHash) => rows.get(tokenHash) ?? null,
     remove: async (tokenHash) => {
@@ -110,8 +112,17 @@ function memorySessions(): SessionRepository & { readonly rows: Map<string, { wa
 }
 
 function newStore(options: { now?: () => number } = {}): AuthStore {
-  return new AuthStore({ ...options, auth: { ...TEST_AUTH }, sessions: memorySessions() });
+  return new AuthStore({ ...options, auth: { ...TEST_AUTH }, access: approvedTestAccess, sessions: memorySessions() });
 }
+
+test('#133 session issuance checks waitlist before saving a token', async () => {
+  const sessions = memorySessions();
+  const store = new AuthStore({ auth: TEST_AUTH, sessions, access: async () => {
+    throw new AppError(403, 'WAITLIST_PENDING', 'waitlist approval is required');
+  } });
+  await assert.rejects(store.issueSession(newAccount().address), error => isAppError(error, 403, 'WAITLIST_PENDING'));
+  assert.equal(sessions.rows.size, 0);
+});
 
 type SiweOverrides = Partial<Omit<SiweMessage, 'address'>>;
 
@@ -482,15 +493,17 @@ test('authenticate rejects missing, malformed and unknown bearer tokens with 401
 
 test('the module-level store shares sessions between issueNonce, login and authenticate', async () => {
   const account = newAccount();
-  const challenge = issueNonce();
-  const signed = await signChallenge(account, challenge);
-  const session = await login(signed.message, signed.signature);
+  await withTestOperator(account.address, async () => {
+    const challenge = issueNonce();
+    const signed = await signChallenge(account, challenge);
+    const session = await login(signed.message, signed.signature);
 
-  assert.equal(await authenticate(`Bearer ${session.token}`), account.address.toLowerCase());
-  await assert.rejects(
-    () => authenticate('Bearer not-a-session'),
-    (err: unknown) => err instanceof UnauthorizedError && err.code === 'UNAUTHORIZED',
-  );
+    assert.equal(await authenticate(`Bearer ${session.token}`), account.address.toLowerCase());
+    await assert.rejects(
+      () => authenticate('Bearer not-a-session'),
+      (err: unknown) => err instanceof UnauthorizedError && err.code === 'UNAUTHORIZED',
+    );
+  });
 });
 
 test('parseLoginBody requires message and signature strings, reporting 400 INVALID_AUTH', () => {
@@ -537,7 +550,7 @@ test('assertProviderOwns accepts the owner (any casing) and rejects another wall
 type TestDeps = Partial<ServerDeps>;
 
 async function withServer<T>(run: (baseUrl: string) => Promise<T>, deps: TestDeps = {}): Promise<T> {
-  const server = createServer(deps);
+  const server = createServer({ privyLogin: testPrivyLogin, ...deps });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
 
   const address = server.address();
@@ -579,14 +592,10 @@ async function loginOverHttp(
   baseUrl: string,
   account: PrivateKeyAccount,
 ): Promise<SessionCredentials> {
-  const challenge = await requestNonce(baseUrl);
-  const signed = await signChallenge(account, challenge);
-  const response = await postJson(baseUrl, '/auth/login', signed);
-  assert.equal(response.status, 200);
-  return (await response.json()) as SessionCredentials;
+  return loginTestWallet(baseUrl, account.address);
 }
 
-test('HTTP: nonce → login → POST /strategies creates a strategy owned by the wallet', async () => {
+test('HTTP: approved Privy login → POST /strategies creates a strategy owned by the wallet', async () => {
   const account = newAccount();
   const calls: Array<{ provider: string; body: unknown }> = [];
 
@@ -722,8 +731,8 @@ test('HTTP: a SIWE message for another domain is 400 INVALID_SIWE_MESSAGE', asyn
 });
 
 test('HTTP: replaying a used nonce is 400 INVALID_NONCE', async () => {
-  await withServer(async (baseUrl) => {
-    const account = newAccount();
+  const account = newAccount();
+  await withTestOperator(account.address, () => withServer(async (baseUrl) => {
     const challenge = await requestNonce(baseUrl);
     const body = await signChallenge(account, challenge);
 
@@ -734,7 +743,7 @@ test('HTTP: replaying a used nonce is 400 INVALID_NONCE', async () => {
     assert.equal(replay.status, 400);
     const payload = (await replay.json()) as { error: { code: string } };
     assert.equal(payload.error.code, 'INVALID_NONCE');
-  });
+  }));
 });
 
 test('HTTP: an authenticated non-owner publishing a version is 403 FORBIDDEN', async () => {
@@ -820,7 +829,7 @@ test('DB: provider ownership is enforced end to end over HTTP', { skip: skipDbCh
 
 test('#59 nonce capacity rejects excess without evicting live challenges, reclaims at exact TTL', async () => {
   let now = 1_700_000_000_000;
-  const store = new AuthStore({ auth: TEST_AUTH, sessions: memorySessions(), maxNonces: 2, now: () => now });
+  const store = new AuthStore({ auth: TEST_AUTH, access: approvedTestAccess, sessions: memorySessions(), maxNonces: 2, now: () => now });
   const account = newAccount();
   const first = store.issueNonce();
   store.issueNonce();
@@ -840,7 +849,7 @@ test('#59 nonce capacity rejects excess without evicting live challenges, reclai
 test('#59 session save failure cannot reuse nonce; prune failure permits valid login', async () => {
   for (const failSave of [false, true]) {
     const sessions = memorySessions();
-    const store = new AuthStore({ auth: TEST_AUTH, sessions: { ...sessions,
+    const store = new AuthStore({ auth: TEST_AUTH, access: approvedTestAccess, sessions: { ...sessions,
       prune: async () => { throw new Error('cleanup unavailable'); },
       save: failSave ? async () => { throw new Error('save unavailable'); } : sessions.save,
     } });
@@ -855,7 +864,7 @@ test('#59 logout propagates DB failure, hashes token and leaves other sessions i
   const sessions = memorySessions();
   let down = false;
   let removed: string | undefined;
-  const store = new AuthStore({ auth: TEST_AUTH, sessions: { ...sessions, remove: async (hash) => {
+  const store = new AuthStore({ auth: TEST_AUTH, access: approvedTestAccess, sessions: { ...sessions, remove: async (hash) => {
     removed = hash;
     if (down) throw new Error('remove unavailable');
     await sessions.remove(hash);
@@ -899,6 +908,7 @@ test('#59 HTTP logout removes the real Postgres session and a fresh repository r
 test('#63 Postgres Privy HTTP session survives a fresh instance, keeps owner after linking and supports logout', async () => {
   await migrate();
   const f = privyFixture();
+  await approveTestUser(f.userId);
   const hashes: string[] = [];
   const login = createPrivyLogin({ config: () => f.config });
   const observed: string[] = [];
@@ -940,6 +950,7 @@ test('#63 Postgres Privy HTTP session survives a fresh instance, keeps owner aft
 test('#63 concurrent first Privy logins with different wallets all use the one Postgres winner', async () => {
   await migrate();
   const f = privyFixture();
+  await approveTestUser(f.userId);
   const tokens = await Promise.all(Array.from({ length: 8 }, (_, index) => f.sign({
     linked_accounts: JSON.stringify([{ ...f.wallet, address: index % 2 === 0 ? f.owner : f.other }]),
   })));
@@ -978,6 +989,7 @@ test('#63 concurrent first Privy logins with different wallets all use the one P
 test('#63 real Postgres conflict wait timeout returns sanitized 503 with no session or owner overwrite', async () => {
   await migrate();
   const f = privyFixture();
+  await approveTestUser(f.userId);
   const client = await getPool().connect();
   try {
     await client.query('begin');

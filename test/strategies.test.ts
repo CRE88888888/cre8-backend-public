@@ -1,10 +1,9 @@
+import { loginTestWallet, testPrivyLogin } from './fixtures/waitlist-access.js';
 import { TESTNET_97 } from '../src/testnet-profile.js';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, test } from 'node:test';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
-import { createSiweMessage } from 'viem/siwe';
-import type { SiweChallenge } from '../src/auth.js';
 import { loadConfig } from '../src/config.js';
 import { closePool, migrate, query } from '../src/db.js';
 import { ForbiddenError, NotFoundError, ValidationError } from '../src/errors.js';
@@ -340,7 +339,7 @@ async function withServer<T>(
   run: (baseUrl: string) => Promise<T>,
   deps?: Partial<ServerDeps>,
 ): Promise<T> {
-  const server = createServer(deps);
+  const server = createServer({ privyLogin: testPrivyLogin, ...deps });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
 
   const address = server.address();
@@ -375,29 +374,7 @@ function postJson(
 const ROUTE_WALLET = privateKeyToAccount(generatePrivateKey());
 
 async function loginToken(baseUrl: string): Promise<string> {
-  const nonceResponse = await fetch(`${baseUrl}/auth/nonce`, { method: 'POST' });
-  assert.equal(nonceResponse.status, 200);
-  const challenge = (await nonceResponse.json()) as SiweChallenge;
-
-  // The client composes the EIP-4361 message from the challenge fields and signs that exact text.
-  const message = createSiweMessage({
-    address: ROUTE_WALLET.address,
-    chainId: challenge.chainId,
-    domain: challenge.domain,
-    uri: challenge.uri,
-    statement: challenge.statement,
-    version: '1',
-    nonce: challenge.nonce,
-    issuedAt: new Date(challenge.issuedAt),
-  });
-
-  const loginResponse = await postJson(baseUrl, '/auth/login', {
-    message,
-    signature: await ROUTE_WALLET.signMessage({ message }),
-  });
-  assert.equal(loginResponse.status, 200);
-  const { token } = (await loginResponse.json()) as { token: string };
-  return token;
+  return (await loginTestWallet(baseUrl, ROUTE_WALLET.address)).token;
 }
 
 test('POST /strategies/:id/versions returns 201 with the created version record', async () => {

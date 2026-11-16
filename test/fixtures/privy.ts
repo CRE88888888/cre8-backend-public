@@ -28,7 +28,7 @@ export function privyFixture() {
 
 export function privyMemory() {
   const mappings = new Map<string, string>();
-  const rows = new Map<string, { wallet: string; expiresAt: Date }>();
+  const rows = new Map<string, { wallet: string; expiresAt: Date; privyUserId: string | null }>();
   const users: PrivyUserRepository = {
     find: async (id) => mappings.get(id) ?? null,
     create: async (id, owner) => {
@@ -37,7 +37,7 @@ export function privyMemory() {
     },
   };
   const sessions: SessionRepository = {
-    save: async (hash, wallet, expiresAt) => { rows.set(hash, { wallet, expiresAt }); },
+    save: async (hash, wallet, expiresAt, privyUserId = null) => { rows.set(hash, { wallet, expiresAt, privyUserId }); },
     find: async (hash) => rows.get(hash) ?? null,
     remove: async (hash) => { rows.delete(hash); },
     prune: async (now) => { for (const [hash, row] of rows) if (row.expiresAt <= now) rows.delete(hash); },

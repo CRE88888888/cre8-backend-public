@@ -1,5 +1,5 @@
 import { reconcileCashWithdrawals } from './cash-reconciliation.js';
-import { record as isRecord } from './strategy-execution.js';
+import { MIN_ASSET_BATCH_RAW, maxAssetSlices, record as isRecord } from './strategy-execution.js';
 import type { AssetExecution, AssetMode } from './strategy-execution.js';
 import type { FundingLot, JobContext, StrategyJob } from './strategy-jobs.js';
 import { lockCash, readJob, unresolvedSql, cancelJob } from './strategy-jobs.js';
@@ -69,11 +69,13 @@ async function recordInsufficient(query:SchedulerQueryFn,c:JobContext,due:readon
     }
   }
 }
-/** Record bounded (<=52 per asset) missed windows. Never turn skipped base into a later debit. */
+/** Record bounded (<=365 daily / <=52 weekly per asset) missed windows. Never turn skipped base into a later debit. */
 async function collect(query:SchedulerQueryFn,c:JobContext,inflight:boolean):Promise<Due[]>{
   const result:Due[]=[];
   for(const source of await sources(query,c)){
     let s=source;
+    if(!Number.isInteger(s.effective_slices)||s.effective_slices<1||s.effective_slices>(s.mode.kind==='stack'?maxAssetSlices(s.mode.every):1)||
+      !Number.isInteger(s.index)||s.index<0||s.index>s.effective_slices)throw new Error('invalid persisted source calendar');
     // Hold has no next period: an older in-flight job must not consume a new contribution.
     if(inflight&&s.mode.kind==='hold')continue;
     for(;;){
@@ -142,7 +144,7 @@ export async function prepareAssetJob(run:WithTransactionFn,c:JobContext,config:
     if(s.mode.kind==='hold')hold+=s.budget;else stack+=s.budget;
   }
   const largest=basketBatch(inputs,budget.count);
-  const capacity=c.chainId===97?windowCapacityFits(inputs,budget.count,c.reserve,c.caps,c.buyLimit):sumInputs(largest)<=c.buyLimit&&
+  const capacity=c.chainId===97?windowCapacityFits(inputs,budget.count,c.reserve,c.caps,c.buyLimit,MIN_ASSET_BATCH_RAW):sumInputs(largest)<=c.buyLimit&&
     Object.entries(largest).every(([a,v])=>{const cap=c.caps.get(a);return cap===null||(cap!==undefined&&BigInt(v)<=cap);});
   if(Object.entries(inputs).some(([asset,v])=>BigInt(v)/budget.count<(finalAssets.has(asset)?1n:U))||sumInputs(largest)>c.buyLimit||
     !capacity){

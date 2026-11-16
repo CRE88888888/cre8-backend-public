@@ -13,6 +13,12 @@ export type TypedExecution = LegacyExecution | AssetExecution;
 export type FundingSchedule = { kind: 'funding' };
 export const UINT256_MAX = (1n << 256n) - 1n;
 const UNIT = 10n ** 18n;
+/** Schema 2 purchases only. Legacy baskets and yield supply retain their own 50 minimum. */
+export const MIN_BATCH_USDT = 10n;
+export const MIN_ASSET_BATCH_RAW = MIN_BATCH_USDT * UNIT;
+/** Account-free admission/preview bound; execution still queries the actual top-up. */
+export const CONTRIBUTION_FEE_RESERVE_RAW = 3n * UNIT / 10n;
+export function maxAssetSlices(every: 'daily' | 'weekly'): number { return every === 'daily' ? 365 : 52; }
 const CENT = UNIT / 100n;
 
 export function record(value: unknown): value is Record<string, unknown> {
@@ -157,7 +163,7 @@ export function validateAssetConfig(value: unknown, allocation: Allocation, chai
     else if (mode.kind === 'stack') {
       exactKeys(mode, ['kind','every','weekday','timeUtc','slices'], 'INVALID_EXECUTION');
       // UTC is mandatory: the UI converts the creator's displayed local defaults before signing.
-      if ((mode.every !== 'daily' && mode.every !== 'weekly') || typeof mode.timeUtc !== 'string' || !/^([01][0-9]|2[0-3]):[0-5][0-9]$/.test(mode.timeUtc) || !Number.isInteger(mode.slices) || Number(mode.slices) < 2 || Number(mode.slices) > 52 || (mode.every === 'daily' ? mode.weekday !== null : !Number.isInteger(mode.weekday) || Number(mode.weekday) < 0 || Number(mode.weekday) > 6)) throw new ValidationError('INVALID_EXECUTION', 'stack requires daily/weekly, UTC time, weekday and 2..52 slices');
+      if ((mode.every !== 'daily' && mode.every !== 'weekly') || typeof mode.timeUtc !== 'string' || !/^([01][0-9]|2[0-3]):[0-5][0-9]$/.test(mode.timeUtc) || !Number.isInteger(mode.slices) || Number(mode.slices) < 2 || Number(mode.slices) > maxAssetSlices(mode.every === 'daily' ? 'daily' : 'weekly') || (mode.every === 'daily' ? mode.weekday !== null : !Number.isInteger(mode.weekday) || Number(mode.weekday) < 0 || Number(mode.weekday) > 6)) throw new ValidationError('INVALID_EXECUTION', 'stack requires daily/weekly, UTC time, weekday; daily 2..365 or weekly 2..52 slices');
       execution = { kind: 'stack', every: mode.every, weekday: mode.weekday === null ? null : Number(mode.weekday), timeUtc: mode.timeUtc, slices: Number(mode.slices) };
     } else throw new ValidationError('INVALID_EXECUTION', 'only hold and stack are available');
     if (rebalance !== 'none' && execution.kind !== 'hold') throw new ValidationError('INVALID_EXECUTION', 'rebalancing requires every noncash asset to use hold');
@@ -167,5 +173,8 @@ export function validateAssetConfig(value: unknown, allocation: Allocation, chai
 }
 
 export function minimumAssetContribution(config: AssetExecution): bigint {
-  return 50n * UNIT;
+  const risky = config.assets.filter(a => a.asset !== config.numeraire).reduce((n,a) => n + BigInt(a.weightBps),0n);
+  if (risky === 0n) return 50n * UNIT;
+  const wholeUsdt = (MIN_BATCH_USDT * 10000n + risky - 1n) / risky;
+  return (wholeUsdt > 50n ? wholeUsdt : 50n) * UNIT;
 }

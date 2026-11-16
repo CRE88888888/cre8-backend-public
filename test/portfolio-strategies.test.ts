@@ -5,7 +5,7 @@ import type { Address, Hex } from 'viem';
 import { closePool, getPool, migrate, query, withTransaction } from '../src/db.js';
 import { createPortfolioStrategyService } from '../src/portfolio-strategies.js';
 import type { PortfolioStrategyDeps } from '../src/portfolio-strategies.js';
-import { createStrategy, getStrategy, publishVersion, requireTypedVersion, validateAllocation } from '../src/strategies.js';
+import { createStrategy, getStrategy, publishVersion, requireTypedVersion, validateAllocation, previewContribution } from '../src/strategies.js';
 import { assertVersionOnchain, readAccountCash } from '../src/chain.js';
 import { enrollPortfolio, requireOwnedPortfolio, strategyMinimumDeposit } from '../src/portfolios.js';
 import { readFaucetFundingEvidence } from '../src/faucet.js';
@@ -15,6 +15,7 @@ import { AppError } from '../src/errors.js';
 import { TESTNET_97 } from '../src/testnet-profile.js';
 import { strategyRpc, TEST_AMOUNT, OTHER_HASH } from './fixtures/strategy-rpc.js';
 import { claimDuePortfolios } from '../src/scheduler.js';
+import { previewContributionAsync } from '../src/contribution-preview.js';
 
 const address = (): Address => `0x${randomBytes(20).toString('hex')}`;
 const txHash = (): Hex => `0x${randomBytes(32).toString('hex')}`;
@@ -76,6 +77,40 @@ async function onTestnet<T>(fn:()=>Promise<T>):Promise<T>{
   try{return await fn();}finally{if(previous===undefined)delete process.env.CHAIN_ID;else process.env.CHAIN_ID=previous;}
 }
 const future=()=>new Date(Date.now()+86400_000).toISOString();
+
+test('#118 preview and persisted contribution share effective slices, receipt time, minimum and conservative fee bound',async()=>{
+  const at=new Date('2026-11-16T13:59:00Z'),cash=TESTNET_97.contracts.usdt,asset=TESTNET_97.assets.AAPLB.token;
+  for(const [amount,slices,cashWeight] of [[100n,12,0],[3650n,365,0],[50n,12,5000],[1000n,12,9900],[10_000_000n,365,0]] as const){
+    const basket=validateAllocation({assets:[{address:asset,weightBps:10000-cashWeight},{address:cash,weightBps:cashWeight}]},97);
+    const execution=assetConfig('stack',basket);
+    for(const a of execution.assets)if(a.execution?.kind==='stack')a.execution.slices=slices;
+    const raw=usdtRaw(amount.toString()),f=await fixture('stack',cashWeight,raw,execution);
+    f.rpc.state.now=BigInt(+at/1000);
+    const preview=previewContribution({chainId:97,execution,amountRaw:raw.toString()},at);
+    assert.deepEqual(await previewContributionAsync({chainId:97,execution,amountRaw:raw.toString()},at),preview);
+    const lot=await f.service.funding(f.id,f.owner,f.source);
+    assert.deepEqual(lot.effectiveSlices,preview.effectiveSlices);assert.equal(lot.confirmedAt,at.toISOString());
+    const stored=(await query<{effective_slices:Record<string,number>;minimum:string}>('select effective_slices,minimum_contribution_raw::text as minimum from strategy_funding_lots where id=$1',[lot.id])).rows[0];assert.ok(stored);
+    assert.deepEqual(stored.effective_slices,preview.effectiveSlices);assert.equal(stored.minimum,preview.minimumRaw);
+    assert.equal(await strategyMinimumDeposit(f.strategyId),preview.minimumRaw);
+    assert.equal(preview.slots[0]?.at,'2026-11-16T14:00:00.000Z');
+  }
+});
+test('#118 contribution fee bound fails closed on RPC errors or unsupported reserve without saving a lot',async()=>{
+  for(const reserve of [-1n,usdtRaw('0.30')+1n,null]){
+    const f=await fixture('hold');
+    const service=createPortfolioStrategyService({...f.deps,feeReserve:async()=>{if(reserve===null)throw new Error('private upstream URL');return reserve;}});
+    await assert.rejects(service.funding(f.id,f.owner,f.source),(error:unknown)=>error instanceof AppError&&error.status===503&&!error.message.includes('private'));
+    assert.equal((await query('select id from strategy_funding_lots where portfolio_id=$1',[f.id])).rows.length,0);
+    assert.equal(await bucket(f.id,'unallocated_hold_raw'),'0');
+  }
+});
+
+test('#123 preview ceiling does not cap real contribution admission',async()=>{
+  const f=await fixture('stack',0,usdtRaw('10000001'));
+  const lot=await f.service.funding(f.id,f.owner,f.source);
+  assert.deepEqual(lot.effectiveSlices,{[TESTNET_97.assets.AAPLB.token]:12});
+});
 
 test('#82 DB typed publish round-trip/default/retry is immutable; internal legacy rows retain schema 0 and null hash',async()=>onTestnet(async()=>{
   await migrate();
@@ -167,7 +202,7 @@ test('#83 DB creator stack calendars and effective slices are isolated per contr
     'select asset,budget_raw::text,effective_slices,first_slot_at from strategy_lot_assets where lot_id=$1 order by asset',[first.id])).rows;
   assert.equal(rows.length,2);
   const stock=rows.find(r=>r.asset===TESTNET_97.assets.AAPLB.token);assert.ok(stock);
-  assert.equal(stock.budget_raw,(TEST_AMOUNT/2n).toString());assert.equal(stock.effective_slices,10);
+  assert.equal(stock.budget_raw,(TEST_AMOUNT/2n).toString());assert.equal(stock.effective_slices,12);
   assert.equal(stock.first_slot_at?.toISOString(),'2027-03-14T14:00:00.000Z','one-period UTC anchor stays 14:00 across DST and equality waits until tomorrow');
   assert.equal(rows.find(r=>r.asset===TESTNET_97.contracts.usdt)?.effective_slices,0);
   await assert.rejects(service.instruct(f.id,f.owner,{expectedRevision:'0',enabled:true,startAt:future(),amountUsdt:'101'}),denied('STACK_INSTRUCTIONS_RETIRED'));
@@ -334,8 +369,8 @@ test('#83 DB HTTP retains per-asset lot plan and removes personal instruction en
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
 });
 
-test('#83 DB 50 inclusive contribution shrinks creator N12 to one, 100 to two, and one raw below minimum rolls back',async()=>{
-  for(const [amount,slices] of [[usdtRaw('50'),1],[usdtRaw('100'),2],[usdtRaw('50')-1n,0]] as const){
+test('#83 DB 50 inclusive contribution shrinks creator N12 to five, 100 to ten, and one raw below minimum rolls back',async()=>{
+  for(const [amount,slices] of [[usdtRaw('50'),5],[usdtRaw('100'),10],[usdtRaw('50')-1n,0]] as const){
     const f=await fixture('stack',0,amount);
     if(slices===0){
       await assert.rejects(f.service.funding(f.id,f.owner,f.source),(error:unknown)=>error instanceof AppError&&error.status===400);
@@ -385,8 +420,8 @@ test('#83 DB two 50 contributions retain distinct sources and merge budgets at e
   f.rpc.state.now=BigInt(clock.getTime()/1000);
   const service=createPortfolioStrategyService({...f.deps,now:()=>clock});
   const first=await service.funding(f.id,f.owner,f.source);
-  assert.equal(first.fundingStatus,'waiting_for_merged_budget','25 at each timestamp may await a second approved product source');
-  assert.deepEqual(first.effectiveSlices,{[a]:1,[b]:1});
+  assert.equal(first.fundingStatus,'scheduled','25 at each timestamp can fund two ten-USDT installments');
+  assert.deepEqual(first.effectiveSlices,{[a]:2,[b]:2});
   assert.equal((await query('select id from strategy_jobs where portfolio_id=$1',[f.id])).rows.length,0,'funding never broadcasts or reserves a premature subminimum batch');
   const secondSource=await f.secondClaim();
   const second=await service.funding(f.id,f.owner,secondSource);

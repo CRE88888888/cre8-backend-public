@@ -1,3 +1,4 @@
+import { maxAssetSlices } from './strategy-execution.js';
 import { keccak256, toHex } from 'viem';
 import { fresh, object, raw, unavailable, UINT256_MAX } from './yield-domain.js';
 import type { YieldStateQuery } from './yield-runtime-state.js';
@@ -28,7 +29,7 @@ export async function stackLiquidityReserve(db: YieldStateQuery, chainId: number
       if (mode.kind === 'hold') continue;
       if (mode.kind !== 'stack' || (mode.every !== 'daily' && mode.every !== 'weekly') ||
           !(row.first_slot_at instanceof Date) || !Number.isFinite(+row.first_slot_at) ||
-          typeof row.effective_slices !== 'number' || !Number.isInteger(row.effective_slices) || row.effective_slices < 1 || row.effective_slices > 52 ||
+          typeof row.effective_slices !== 'number' || !Number.isInteger(row.effective_slices) || row.effective_slices < 1 || row.effective_slices > maxAssetSlices(mode.every) ||
           typeof row.next_index !== 'number' || !Number.isInteger(row.next_index) || row.next_index < 0 || row.next_index > row.effective_slices) return null;
       const period = mode.every === 'daily' ? 86400000 : 604800000;
       // Expired unrecorded windows will be skipped by the normal job planner, never caught up.

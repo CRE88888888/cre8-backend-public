@@ -3,13 +3,13 @@ import { test } from 'node:test';
 import { assertUserOpCapacity, boundedCallGasLimit, estimatedBatchGas, executionBatchSize, executionGroups, executionInputGroups, MAX_USER_OP_GAS, userOpGasOverhead } from '../src/execution-batch.js';
 import { loadTradingConfig } from '../src/config.js';
 
-test('#100 only first technical child can count the window top-up toward 50 USDT',()=>{
+test('#100 only first technical child can count the window top-up toward 10 USDT',()=>{
   const U=10n**18n,R=27n*U/100n;
-  const inputs={a:(49n*U+865n*U/1000n).toString(),b:(49n*U+865n*U/1000n).toString()};
+  const inputs={a:(9n*U+865n*U/1000n).toString(),b:(9n*U+865n*U/1000n).toString()};
   const children=executionInputGroups(inputs,2,R,new Set(),true);assert.ok(children);
-  assert.equal(executionInputGroups(inputs,1,R,new Set(),true),null,'two sub-50 children cannot both claim the same reserve');
-  assert.ok(executionInputGroups({a:(50n*U-R).toString(),b:(50n*U).toString()},1,R,new Set(),true));
-  assert.equal(executionInputGroups({a:(50n*U-R).toString(),b:(50n*U-1n).toString()},1,R,new Set(),true),null);
+  assert.equal(executionInputGroups(inputs,1,R,new Set(),true),null,'two sub-10 children cannot both claim the same reserve');
+  assert.ok(executionInputGroups({a:(10n*U-R).toString(),b:(10n*U).toString()},1,R,new Set(),true));
+  assert.equal(executionInputGroups({a:(10n*U-R).toString(),b:(10n*U-1n).toString()},1,R,new Set(),true),null);
 });
 
 test('#92 batch size is <=16, shrinks with held assets and never authorizes over 14M', () => {
@@ -48,7 +48,7 @@ test('#92 chain-specific default daily budgets preserve overrides, zero and main
   for(const cap of ['0','1','99999999'])assert.equal(loadTradingConfig({ACCOUNT_DAILY_GAS:cap},97).dailyGas,BigInt(cap));
 });
 
-test('#92 budget groups conserve every raw input, split whales and reject dust and sub-50 tails',()=>{
+test('#92 budget groups conserve every raw input, split whales and reject dust and sub-10 tails',()=>{
   const U=10n**18n,R=27n*U/100n;
   for(const size of [1,16,17,32,93])for(const limit of [1,9,16]){
     const inputs=Object.fromEntries(Array.from({length:size},(_,i)=>[String(i),(100n*U).toString()]));
@@ -57,28 +57,29 @@ test('#92 budget groups conserve every raw input, split whales and reject dust a
     const sums:Record<string,bigint>={};
     for(const c of children){
       assert.ok(Object.values(c).every(raw=>BigInt(raw)>=U));
-      assert.ok(Object.values(c).reduce((n,raw)=>n+BigInt(raw),R)>=50n*U);
+      assert.ok(Object.values(c).reduce((n,raw)=>n+BigInt(raw),R)>=10n*U);
       for(const [a,raw] of Object.entries(c))sums[a]=(sums[a]??0n)+BigInt(raw);
     }
     assert.deepEqual(Object.fromEntries(Object.entries(sums).map(([a,n])=>[a,n.toString()])),inputs);assert.deepEqual(inputs,before);
   }
-  const uneven=Object.fromEntries(Array.from({length:17},(_,i)=>[String(i),((i===16?968n:2n)*U).toString()]));
+  const uneven=Object.fromEntries(Array.from({length:17},(_,i)=>[String(i),(i===16?968n*U:101n*U/100n).toString()]));
   const children=executionInputGroups(uneven,16,R);assert.ok(children);assert.equal(children.length,2);
-  assert.ok(children.every(c=>'16' in c));
-  assert.equal(executionInputGroups({a:(50n*U-R).toString()},16,R)?.length,1);
-  assert.equal(executionInputGroups({a:(50n*U-R-1n).toString()},16,R),null);
+  const narrow=executionInputGroups(uneven,9,R);assert.ok(narrow);assert.equal(narrow.length,2);
+  assert.ok(narrow.every(c=>'16' in c));
+  assert.equal(executionInputGroups({a:(10n*U-R).toString()},16,R)?.length,1);
+  assert.equal(executionInputGroups({a:(10n*U-R-1n).toString()},16,R),null);
   assert.equal(executionInputGroups({a:(U-1n).toString(),b:(100n*U).toString()},16,R),null);
   assert.equal(executionInputGroups({},16,R),null);
   assert.throws(()=>executionInputGroups({},0,R));assert.throws(()=>executionInputGroups({},16,-1n));
 });
 
-test('#92 two large positions can each fund a nine-step batch at the exact 50-USDT threshold',()=>{
+test('#92 two large positions can each fund a nine-step batch at the exact 10-USDT threshold',()=>{
   const U=10n**18n,R=27n*U/100n;
-  const inputs=Object.fromEntries(Array.from({length:18},(_,i)=>[String(i),((i<16?2n:34n)*U*9946n/10000n).toString()]));
+  const inputs=Object.fromEntries(Array.from({length:18},(_,i)=>[String(i),(i<16?U:173n*U/100n).toString()]));
   const groups=executionInputGroups(inputs,9,R);assert.ok(groups);assert.equal(groups.length,2);
   for(const group of groups){
     assert.equal(Object.keys(group).length,9);
-    assert.equal(Object.values(group).reduce((sum,raw)=>sum+BigInt(raw),R),50n*U);
+    assert.equal(Object.values(group).reduce((sum,raw)=>sum+BigInt(raw),R),10n*U);
     assert.ok(Object.values(group).every(raw=>BigInt(raw)>=U));
   }
   assert.deepEqual(Object.fromEntries(groups.flatMap(group=>Object.entries(group)).sort(([a],[b])=>a.localeCompare(b))),Object.fromEntries(Object.entries(inputs).sort(([a],[b])=>a.localeCompare(b))));

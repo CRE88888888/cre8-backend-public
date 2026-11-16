@@ -1,3 +1,4 @@
+import { MIN_ASSET_BATCH_RAW } from './strategy-execution.js';
 /**
  * 漂移 → 可執行的 `SwapStep[]`。**這一層是純決策 + 讀鏈，不送交易。**
  *
@@ -136,11 +137,11 @@ export function tradeMinimumReason(nominal: readonly bigint[], purpose: 'ordinar
   return null;
 }
 
-/** Per-asset purchases and all-hold rebalances use 1 USDT and 50 USDT including fees. */
-export function assetTradeMinimumReason(inputs:readonly bigint[],budgetRaw:bigint,finalIndexes:ReadonlySet<number>=new Set()):string|null{
+/** Per-asset purchases use 1/10 including fees; all-hold rebalances retain 1/50. */
+export function assetTradeMinimumReason(inputs:readonly bigint[],budgetRaw:bigint,finalIndexes:ReadonlySet<number>=new Set(),minimumRaw=50n*10n**18n):string|null{
   if(inputs.length===0||inputs.some(n=>n<0n)||budgetRaw<inputs.reduce((s,n)=>s+n,0n))throw new Error('invalid new money budget');
   if(inputs.some((n,index)=>n===0n||(n<10n**18n&&!finalIndexes.has(index))))return '[BELOW_MIN_STEP] 每資產不足1 USDT，等待下期';
-  return budgetRaw<50n*10n**18n?'[BELOW_MIN_BATCH] 含費批次不足50 USDT':null;
+  return budgetRaw<minimumRaw?`[BELOW_MIN_BATCH] 含費批次不足${minimumRaw/10n**18n} USDT`:null;
 }
 
 const MIN_FEE_ABI = [
@@ -193,7 +194,7 @@ export async function checkTradeMinimums(client: PublicClient, executor: Address
     }
     if(assetBudgetRaw!==undefined){
       if(decimals!==18||steps.some(s=>!sameAsset(s.tokenIn,numeraire))||assetBudgetRaw<nominal.reduce((a,b)=>a+b,0n))return '[TRADE_MINIMUM_UNAVAILABLE] 新錢預算或單位不符';
-      return assetTradeMinimumReason(nominal,assetBudgetRaw,new Set(steps.flatMap((step,index)=>sameAsset(step.tokenIn,numeraire)&&finalAssets.has(step.tokenOut.toLowerCase())?[index]:[])));
+      return assetTradeMinimumReason(nominal,assetBudgetRaw,new Set(steps.flatMap((step,index)=>sameAsset(step.tokenIn,numeraire)&&finalAssets.has(step.tokenOut.toLowerCase())?[index]:[])),MIN_ASSET_BATCH_RAW);
     }
     return tradeMinimumReason(nominal, purpose, loadTradingConfig(), decimals);
   } catch (error) { return decodePriceSourceError(error)?.detail ?? '[TRADE_MINIMUM_UNAVAILABLE] 無法確認交易名義額，不送交易'; }

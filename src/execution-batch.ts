@@ -1,3 +1,4 @@
+import { MIN_ASSET_BATCH_RAW } from './strategy-execution.js';
 /** #92: transaction capacity, independent of the number of assets in a version.
  * Local chain 97 measurements (contracts docs/testnet-97 §8): ~260k/swap,
  * ~66k/held asset in buy valuation. Allow 50% plus 500k for Kernel validation.
@@ -36,7 +37,7 @@ export function executionBatchSize(heldAssets: number, buys = true): number {
   while (steps > 0 && estimatedBatchGas(steps, heldAssets, buys) > MAX_USER_OP_GAS) steps--;
   return steps;
 }
-/** Balance the final short group, so a one-asset tail does not strand a <50 budget. */
+/** Balance the final short group, so a one-asset tail does not strand a <10 budget. */
 export function executionGroups<T>(entries: readonly T[], limit: number): T[][] {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_USER_OP_STEPS) throw new RangeError('invalid execution group limit');
   const groups: T[][] = [];
@@ -54,13 +55,13 @@ export function assertUserOpCapacity(steps: number, gas: bigint): void {
   }
 }
 
-/** Keep small legs together; if a group is below 50, split the largest leg across
+/** Keep small legs together; if a group is below 10, split the largest leg across
  * those groups. Every raw unit stays in the original asset's budget. No new
  * principal is created. Only final installments may include a positive sub-1 remainder.
  */
 export function executionInputGroups(inputs: Record<string,string>, limit: number, reserve: bigint, finalAssets: ReadonlySet<string> = new Set(), feeWindow=false): Record<string,string>[] | null {
   const unit = 10n ** 18n;
-  const minimum=(index:number)=>50n*unit-(!feeWindow||index===0?reserve:0n);
+  const minimum=(index:number)=>MIN_ASSET_BATCH_RAW-(!feeWindow||index===0?reserve:0n);
   if (reserve < 0n) throw new RangeError('invalid fee reserve');
   const entries = Object.entries(inputs).filter(([,raw])=>BigInt(raw)>0n);
   const groups = executionGroups(entries,limit).map(group=>Object.fromEntries(group));

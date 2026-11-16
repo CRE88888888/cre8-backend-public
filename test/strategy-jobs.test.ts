@@ -91,10 +91,20 @@ test('#100 DB 100-USDT capacity split spends one reserve, resumes at zero reserv
   s.deps.reconcileRebalance=async input=>{const result=await reconcile(input);if(result.kind==='found'&&result.outcome.batchEvidence)result.outcome.batchEvidence.feePaid=s.sends.length===1?R-1n:0n;return result;};
   assert.equal((await s.once()).results[0]?.outcome,'executed');
   const first=await job(f);assert.ok(first);assert.equal(first.fee_reserve_raw,R.toString());
-  assert.equal(sumInputs(first.remaining_input),50n*U);assert.equal(first.remaining_fee_raw,'1');
+  assert.equal(sumInputs(first.remaining_input),50n*U-R/2n);assert.equal(first.remaining_fee_raw,'1');
   assert.equal((await s.once(new Date(start.getTime()+60000))).results[0]?.outcome,'executed');
   assert.equal(await job(f),null);const saved=await balances(f);assert.equal(saved?.reserved_fee_raw,'0');assert.equal(saved?.allocated_cash_raw,'1');
   assert.equal((await s.once(new Date(start.getTime()+120000))).results[0]?.outcome,'noop');assert.equal(s.sends.length,2);
+});
+test('#118 DB scheduler executes 100 over ten daily ten-USDT windows and preserves every source budget',async()=>{
+  const f=await fixture('stack',0,12);await f.fund(100n*U);const s=scheduler(f);
+  for(let index=0;index<10;index++){
+    assert.equal((await s.once(new Date(+start+index*86400000))).results[0]?.outcome,'executed');
+    const send=s.sends.at(-1);assert.ok(send);assert.equal(sumInputs(Object.fromEntries(send.steps.map(step=>[step.tokenOut,step.amountIn.toString()])))+R,10n*U);
+  }
+  assert.equal(s.sends.length,10);assert.equal(await job(f),null);
+  assert.equal((await balances(f))?.stack_prefund_raw,'0');assert.equal((await balances(f))?.reserved_input_raw,'0');
+  assert.equal((await s.once(new Date(+start+10*86400000))).results[0]?.outcome,'noop');assert.equal(s.sends.length,10);
 });
 test('#100 DB fee release rolls back atomically and duplicate confirmation releases only once',async()=>{
   const f=await fixture();await f.fund(200n*U);
@@ -157,6 +167,25 @@ test('#83 DB long downtime records every finite missed slice; exclusive end crea
   const rows=(await query<{slice_index:number;state:string}>('select s.slice_index,s.state from strategy_asset_slices s join strategy_funding_lots l on l.id=s.lot_id where l.portfolio_id=$1 order by s.asset,s.slice_index',[f.id])).rows;
   assert.equal(rows.length,104);assert.ok(rows.every(r=>r.state==='skipped_window'));assert.equal(Math.max(...rows.map(r=>r.slice_index)),51);
   assert.equal((await query('select id from operations where portfolio_id=$1',[f.id])).rows.length,0);
+});
+test('#118 DB daily 365 executes first/middle/final remainder and bounds skipped windows at 365 per asset',async()=>{
+  const f=await fixture('stack',0,365),amount=3650n*U+12345n;
+  const lot=await f.fund(amount),perAsset=amount/2n,base=perAsset/365n;
+  for(const index of [0,182,364]){
+    const current=(await f.reserve({...f.context,now:new Date(+start+index*86400000)}))?.job;assert.ok(current);
+    assert.equal(sumInputs(current.original_input)+BigInt(current.fee_reserve_raw),2n*(index===364?perAsset-base*364n:base));
+    const slices=(await query<{slice_index:number}>('select slice_index from strategy_asset_slices where job_id=$1',[current.id])).rows;
+    assert.deepEqual(slices.map(s=>s.slice_index),[index,index]);
+    await complete(f,current,current.remaining_input,R);
+  }
+  assert.equal((await f.reserve({...f.context,now:new Date(+start+5000*86400000)}))?.job,null);
+  const slices=(await query<{slice_index:number;state:string}>('select slice_index,state from strategy_asset_slices where lot_id=$1',[lot])).rows;
+  assert.equal(slices.length,730);assert.equal(slices.filter(s=>s.state==='skipped_window').length,724);
+  assert.equal(Math.max(...slices.map(s=>s.slice_index)),364);
+  assert.equal((await query('select id from operations where portfolio_id=$1',[f.id])).rows.length,3);
+  const untouched=await fixture('stack',0,365);await untouched.fund(3650n*U);
+  await untouched.reserve({...untouched.context,now:new Date(+start+5000*86400000)});
+  assert.equal((await query('select s.slice_index from strategy_asset_slices s join strategy_funding_lots l on l.id=s.lot_id where l.portfolio_id=$1',[untouched.id])).rows.length,730);
 });
 test('#83 DB two workers reserve one business key; lost commit response never reserves twice',async()=>{
   const f=await fixture();await f.fund(200n*U);const lots=await fundingLots(query,f.context);
@@ -531,13 +560,18 @@ test('#96 monthly partial execution resumes after restart and new money never ma
   assert.equal((await next().once(new Date(at.getTime()+120000))).results[0]?.outcome,'noop');assert.equal(planned,2);
 });
 
-test('#83 dust-aware shortened 99/1 funding buys the final remainder with its executable batch',async()=>{
+test('#118 dust-aware shortened 99/1 funding defers small inputs then buys the final remainder',async()=>{
   const f=await fixture('stack',0,12,'none',undefined,[9900,100]);const lot=await f.fund(100n*U);
-  const result=(await f.reserve())?.job;assert.ok(result,'shortening must avoid leaving the large asset in two 49.5-budget slices');
-  assert.deepEqual(new Set(Object.keys(result.original_input)),new Set([a,b]));assert.equal(result.fee_reserve_raw,R.toString());
-  assert.equal(sumInputs(result.original_input)+R,100n*U);
-  const small=(await query<{state:string;job_id:string|null}>('select state,job_id from strategy_asset_slices where lot_id=$1 and asset=$2',[lot,b])).rows[0];assert.ok(small);assert.equal(small.state,'reserved');assert.equal(small.job_id,result.id);
-  await complete(f,result,result.remaining_input,R);
+  let spent=0n;
+  for(let index=0;index<9;index++){
+    const result=(await f.reserve({...f.context,now:new Date(+start+index*86400000)}))?.job;assert.ok(result);
+    assert.deepEqual(new Set(Object.keys(result.original_input)),new Set(index===8?[a,b]:[a]));
+    assert.equal(result.fee_reserve_raw,R.toString());spent+=sumInputs(result.original_input)+R;
+    const small=(await query<{state:string;job_id:string|null}>('select state,job_id from strategy_asset_slices where lot_id=$1 and asset=$2 and slice_index=$3',[lot,b,index])).rows[0];assert.ok(small);
+    assert.equal(small.state,index===8?'reserved':'deferred_min_asset');assert.equal(small.job_id,index===8?result.id:null);
+    await complete(f,result,result.remaining_input,R);
+  }
+  assert.equal(spent,100n*U);
   assert.equal((await balances(f))?.stack_prefund_raw,'0');assert.equal((await balances(f))?.reserved_input_raw,'0');
 });
 
@@ -667,7 +701,7 @@ test('#92 93-asset DB job survives timeout/restart and buys each original input 
   assert.equal((await query("select batch_index from strategy_job_batches where job_id=$1 and state='confirmed'",[original.id])).rows.length,s.sends.length);
  });
 
-test('#92 unequal 17-asset job shares its whale across children and settles the exact frozen vector',async()=>{
+test('#92 unequal 17-asset job groups children and settles the exact frozen vector',async()=>{
   const marketAt=new Date('2026-11-16T15:00:00Z');
   const f=await fixture('hold',0,4,'none',undefined,[...Array.from({length:16},()=>20),9680],17);
   await f.fund(1000n*U);
@@ -678,14 +712,14 @@ test('#92 unequal 17-asset job shares its whale across children and settles the 
   const spent:Record<string,bigint>={};
   for(const send of s.sends){
     assert.ok(send.steps.length<=16);
-    assert.ok(send.steps.reduce((n,step)=>n+step.amountIn,R)>=50n*U);
+    assert.ok(send.steps.reduce((n,step)=>n+step.amountIn,R)>=10n*U);
     for(const step of send.steps){assert.ok(step.amountIn>=U);spent[step.tokenOut]=(spent[step.tokenOut]??0n)+step.amountIn;}
   }
   assert.deepEqual(Object.fromEntries(Object.entries(spent).map(([a,n])=>[a,n.toString()])),original.original_input);
   assert.equal((await balances(f))?.reserved_input_raw,'0');assert.equal((await balances(f))?.reserved_fee_raw,'0');
 });
 
-test('#92 two large positions distribute across 18-asset DB batches at exact 1/50 thresholds',async()=>{
+test('#92 two large positions distribute across 18-asset DB batches with 1/10 thresholds',async()=>{
   const marketAt=new Date('2026-11-16T15:00:00Z');
   const f=await fixture('hold',0,4,'none',undefined,[...Array.from({length:16},()=>200),3400,3400],18);
   await f.fund(100n*U);const s=scheduler(f);
@@ -693,7 +727,7 @@ test('#92 two large positions distribute across 18-asset DB batches at exact 1/5
   const original=await job(f);assert.ok(original);assert.equal(BigInt(original.fee_reserve_raw),R);
   assert.equal((await s.once(new Date(marketAt.getTime()+60000))).results[0]?.outcome,'executed');assert.equal(await job(f),null);
   const spent:Record<string,bigint>={};assert.equal(s.sends.length,2);
-  for(const [index,send] of s.sends.entries()){assert.ok(send.steps.length<=16);assert.equal(send.steps.reduce((sum,step)=>sum+step.amountIn,index===0?R:0n),50n*U);
+  for(const [index,send] of s.sends.entries()){assert.ok(send.steps.length<=16);assert.ok(send.steps.reduce((sum,step)=>sum+step.amountIn,index===0?R:0n)>=10n*U);
     for(const step of send.steps){assert.ok(step.amountIn>=U);spent[step.tokenOut]=(spent[step.tokenOut]??0n)+step.amountIn;}}
   assert.deepEqual(Object.fromEntries(Object.entries(spent).map(([a,n])=>[a,n.toString()])),original.original_input);
 });
@@ -736,11 +770,11 @@ test('#96 withdrawal cannot debit reserved/unknown money; reorg and failed cash 
   assert.deepEqual(await balances(f),reconciled,'unresolved operations protect every original bucket');
 });
 
-test('#96 accepted high-cash subscriptions wait and merge without enlarging their original budgets',async()=>{
+test('#118 accepted high-cash subscriptions wait for capacity and merge without enlarging their original budgets',async()=>{
   const f=await fixture('hold',9900);
   for(let n=0;n<5;n++){
     await f.fund(1000n*U,new Date(start.getTime()-60000),{[a]:1,[b]:1});
-    const prepared=(await f.reserve())?.job;
+    const prepared=(await f.reserve({...f.context,buyLimit:n<4?0n:UINT256_MAX}))?.job;
     if(n<4)assert.equal(prepared,null);
     else {assert.ok(prepared);assert.equal(BigInt(prepared.amount_raw)+BigInt(prepared.fee_reserve_raw),50n*U);await complete(f,prepared,prepared.remaining_input,R);}
   }

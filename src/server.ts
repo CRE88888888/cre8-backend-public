@@ -21,6 +21,7 @@ import { createPlatformStatusReader } from './chain.js';
 import { query } from './db.js';
 import { AppError, ValidationError } from './errors.js';
 import { createStrategy, getStrategy, listStrategies, publishVersion, typedVersionInput, typedMinimumDeposit } from './strategies.js';
+import { previewContributionAsync } from './contribution-preview.js';
 import { createPortfolioStrategyService } from './portfolio-strategies.js';
 import { listPortfolios, enrollPortfolio, allocationMinimumDeposit, strategyMinimumDeposit } from './portfolios.js';
 import { buildRenewalParams, recordRenewalResult, resolveBundlerUrl } from './renewal.js';
@@ -170,6 +171,7 @@ export const BUNDLER_TIMEOUT_MS = 30_000;
  * merged over the defaults, so a test can stub one dependency and leave the rest real.
  */
 export type ServerDeps = {
+  previewContribution: typeof previewContributionAsync;
   yieldService: ReturnType<typeof createYieldService>;
   portfolioStrategies: ReturnType<typeof createPortfolioStrategyService>;
   points: ReturnType<typeof createPointsService>;
@@ -293,6 +295,7 @@ async function defaultListAssets(): Promise<PriceableAsset[]> {
 }
 
 const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
+  previewContribution: previewContributionAsync,
   yieldService: createYieldService(),
   portfolioStrategies: createPortfolioStrategyService(),
   points: createPointsService(),
@@ -539,6 +542,12 @@ async function route(
   }
 
   if (root === 'strategies') {
+    if(segments.length===2&&segments[1]==='preview-contribution'){
+      if(method!=='POST')return methodNotAllowed(res,['POST']);
+      await deps.rateLimiter.auth(deps.rateLimiter.clientIp(req.socket.remoteAddress,req.headers['x-forwarded-for']));
+      sendJson(res,200,await deps.previewContribution(await readJsonBody(req)));
+      return;
+    }
     if (segments.length === 1) {
       if (method === 'GET') return listRoute(res, url);
       if (method === 'POST') return createRoute(req, res, deps);

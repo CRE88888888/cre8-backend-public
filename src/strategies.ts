@@ -3,7 +3,9 @@ import { configuredChainId, TESTNET_97, testnetAssets } from './testnet-profile.
 import { assertVersionOnchain, getChain, isChainConfigured, publishVersionOnchain, registerStrategyOnchain } from './chain.js';
 import { isForeignKeyViolation, isUniqueViolation, query, withTransaction } from './db.js';
 import { AppError, ForbiddenError, NotFoundError, ValidationError } from './errors.js';
-import { canonicalConfigHash, exactKeys, minimumAllocationRaw, record, utcDate, validateExecution, validateFundingSchedule, validateIdleYield, numeraireFor, validateAssetConfig, minimumAssetContribution } from './strategy-execution.js';
+import { canonicalConfigHash, exactKeys, minimumAllocationRaw, record, utcDate, validateExecution, validateFundingSchedule, validateIdleYield, numeraireFor, validateAssetConfig, minimumAssetContribution, UINT256_MAX } from './strategy-execution.js';
+import { previewFundingContribution } from './asset-plan.js';
+import type { ContributionPreviewInput } from './asset-plan.js';
 import type { FundingSchedule, TypedExecution } from './strategy-execution.js';
 import type { Address, Hex } from 'viem';
 
@@ -629,6 +631,27 @@ export async function requireTypedVersion(strategyId: number, version: number, o
 export function typedMinimumDeposit(version: StrategyVersion): string {
   if (version.execution.kind === 'per_asset') return minimumAssetContribution(version.execution).toString();
   return minimumAllocationRaw(version.allocation, version.executionChainId ?? configuredChainId()).toString();
+}
+
+/** Account-free preview. Reuse publishing normalization and the persisted-lot planner. */
+export const MAX_PREVIEW_CONTRIBUTION_RAW = 10_000_000n * 10n ** 18n;
+export function contributionPreviewInput(input: unknown): ContributionPreviewInput {
+  if(!record(input))throw new ValidationError('INVALID_EXECUTION','expected { chainId, execution, amountRaw }');
+  exactKeys(input,['chainId','execution','amountRaw'],'INVALID_EXECUTION');
+  if(typeof input.chainId!=='number'||!Number.isSafeInteger(input.chainId)||input.chainId<=0)throw new ValidationError('CHAIN_MISMATCH','invalid chainId');
+  if(!record(input.execution)||!Array.isArray(input.execution.assets))throw new ValidationError('INVALID_EXECUTION','execution requires complete asset settings');
+  const allocation={assets:input.execution.assets.map((a:unknown)=>record(a)?{address:a.asset,weightBps:a.weightBps}:a)};
+  const version=typedVersionInput({chainId:input.chainId,execution:input.execution,allocation});
+  const execution=validateAssetConfig(version.execution,validateAllocation(allocation,input.chainId),input.chainId);
+  if(typeof input.amountRaw!=='string'||input.amountRaw.length>78||!/^(0|[1-9][0-9]*)$/.test(input.amountRaw)||BigInt(input.amountRaw)>UINT256_MAX)throw new ValidationError('INVALID_AMOUNT','amountRaw must be a uint256 decimal string');
+  const amount=BigInt(input.amountRaw),minimum=minimumAssetContribution(execution);
+  if(amount>MAX_PREVIEW_CONTRIBUTION_RAW)throw new AppError(422,'PREVIEW_AMOUNT_TOO_LARGE','preview amount exceeds 10000000 USDT');
+  if(amount<minimum)throw new AppError(422,'BELOW_MINIMUM_ALLOCATION','amount is below the minimum contribution');
+  return {amount,execution,chainId:input.chainId};
+}
+
+export function previewContribution(input: unknown, confirmedAt = new Date()) {
+  return previewFundingContribution(contributionPreviewInput(input),confirmedAt);
 }
 
 // ---------------------------------------------------------------------------

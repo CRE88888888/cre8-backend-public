@@ -1,9 +1,10 @@
 import { executionBatchSize, executionInputGroups } from './execution-batch.js';
 import type { Allocation } from './strategies.js';
-import { minimumAssetContribution, numeraireFor, UINT256_MAX } from './strategy-execution.js';
+import { minimumAssetContribution, numeraireFor, UINT256_MAX, MIN_ASSET_BATCH_RAW, CONTRIBUTION_FEE_RESERVE_RAW } from './strategy-execution.js';
 import type { AssetExecution, AssetMode } from './strategy-execution.js';
 import { USDT_UNIT as U, sumInputs, basketBatch, windowBasketBatch, windowCapacityFits, subtractInputs } from './new-money-plan.js';
 import type { InputVector } from './new-money-plan.js';
+import { AppError } from './errors.js';
 
 export function minimumAssetContributionFromAllocation(allocation: Allocation, chainId: number): bigint {
   return minimumAssetContribution({ kind:'per_asset', numeraire:numeraireFor(chainId), rebalance:'none', assets:allocation.assets.map(a=>({asset:a.address,weightBps:a.weightBps,yield:null})) });
@@ -17,9 +18,9 @@ export function nextAssetSlot(at: Date, mode: Extract<AssetMode,{kind:'stack'}>)
   return candidate;
 }
 export function assetPeriod(mode: AssetMode): number { return mode.kind==='stack' ? (mode.every==='daily'?86400000:604800000) : 86400000; }
-export type ContributionPlan = { minimum:bigint; effectiveSlices:Record<string,number> };
+export type ContributionPlan = { minimum:bigint; effectiveSlices:Record<string,number>; slots:{at:Date;budgetRaw:string}[] };
 /** Evaluate actual merged timestamps, preserving signed N while shortening only this lot.
- * At most assets.length*52 count reductions; no search proportional to uint256 amounts.
+ * At most assets.length*365 count reductions (each pass visits at most assets.length*365 slots); no search proportional to uint256 amounts.
  */
 export function planContribution(total:bigint,config:AssetExecution,confirmedAt:Date,reserve:bigint,feeWindow=false):ContributionPlan|null {
   if(total<=0n||total>UINT256_MAX||reserve<0n)throw new RangeError('invalid contribution');
@@ -49,7 +50,7 @@ export function planContribution(total:bigint,config:AssetExecution,confirmedAt:
       }));
       return assetBatchBudget(inputs,reserve,new Map(Object.keys(inputs).map(a=>[a,null])),UINT256_MAX,stepLimit,s.finalAssets,feeWindow)===null;
     });
-    if(failing.length===0)return {minimum,effectiveSlices:counts};
+    if(failing.length===0)return {minimum,effectiveSlices:counts,slots:[...slots.entries()].sort(([a],[b])=>a-b).map(([at,s])=>({at:new Date(at),budgetRaw:s.budget.toString()}))};
     const reducible=assets.filter(a=>failing.some(s=>s.assets.includes(a.asset))&&(counts[a.asset]??1)>1);
     if(reducible.length===0)return null;
     // Reduce the largest count first; equal calendars stay aligned where possible.
@@ -64,12 +65,12 @@ export function assetBatchBudget(budgets:InputVector,reserve:bigint,caps:Readonl
   const total=sumInputs(budgets),entries=Object.entries(budgets);
   // Validate the step limit even on empty or otherwise unexecutable inputs.
   executionInputGroups({},stepLimit,reserve);
-  if(total<50n*U||buyLimit<=0n||!entries.length)return null;
+  if(total<MIN_ASSET_BATCH_RAW||buyLimit<=0n||!entries.length)return null;
   const minimumGroups=Math.ceil(entries.length/stepLimit);
   const maximumGroups=stepLimit===1?minimumGroups:Math.ceil((entries.length-1)/(stepLimit-1));
   for(let groups=minimumGroups;groups<=Math.max(minimumGroups,maximumGroups);groups++){
     const groupCount=BigInt(groups);
-    let maximum=total/(50n*U*groupCount);
+    let maximum=total/(MIN_ASSET_BATCH_RAW*groupCount);
     for(const [asset,raw] of entries){const n=BigInt(raw)/(finalAssets.has(asset)?1n:U);if(n<maximum)maximum=n;}
     if(maximum<1n)continue;
     const at=(count:bigint)=>{
@@ -82,14 +83,17 @@ export function assetBatchBudget(budgets:InputVector,reserve:bigint,caps:Readonl
       return {inputs,fee,count};
     };
     const capacity=(count:bigint)=>{const b=at(count);if(!b)return false;
-      if(feeWindow)return windowCapacityFits(b.inputs,count,reserve,caps,buyLimit,50n*U*groupCount);
+      if(feeWindow)return windowCapacityFits(b.inputs,count,reserve,caps,buyLimit,MIN_ASSET_BATCH_RAW*groupCount);
       const largest=basketBatch(b.inputs,count);
       return sumInputs(largest)<=buyLimit&&Object.entries(largest).every(([a,v])=>{if(!caps.has(a))throw new Error('missing capacity');const cap=caps.get(a);return cap===null||(cap!==undefined&&BigInt(v)<=cap);});};
     if(!capacity(maximum))continue;
-    let low=1n,high=maximum;while(low<high){const mid=(low+high)/2n;if(capacity(mid))high=mid;else low=mid+1n;}
+    // Preview/admission slots have no depth caps: their first batch usually fits.
+    // Keep the original feasibility bound, but avoid a uint256-wide search for k=1.
+    let low=1n,high=maximum===1n||capacity(1n)?1n:maximum;
+    while(low<high){const mid=(low+high)/2n;if(capacity(mid))high=mid;else low=mid+1n;}
     const result=at(low);if(!result)continue;
     if(feeWindow){
-      const first=windowBasketBatch(result.inputs,low,reserve,50n*U*groupCount);
+      const first=windowBasketBatch(result.inputs,low,reserve,MIN_ASSET_BATCH_RAW*groupCount);
       const firstGroups=executionInputGroups(first,stepLimit,reserve,finalAssets,true);
       const later=low===1n?null:Object.fromEntries(Object.entries(subtractInputs(result.inputs,first)).map(([a,v])=>[a,(BigInt(v)/(low-1n)).toString()]));
       const laterGroups=later===null?[]:executionInputGroups(later,stepLimit,0n,finalAssets,true);
@@ -101,4 +105,19 @@ export function assetBatchBudget(budgets:InputVector,reserve:bigint,caps:Readonl
     if(children&&children.length<=groups)return result;
   }
   return null;
+}
+
+/** Same conservative fee bound and chain-specific window semantics for preview and persisted lots. */
+export function planFundingContribution(total:bigint,config:AssetExecution,confirmedAt:Date,chainId:number):ContributionPlan|null {
+  const reserve=config.assets.some(a=>a.asset!==config.numeraire)?CONTRIBUTION_FEE_RESERVE_RAW:0n;
+  return planContribution(total,config,confirmedAt,reserve,chainId===97);
+}
+
+export type ContributionPreviewInput = { amount: bigint; execution: AssetExecution; chainId: number };
+/** Pure worker entry point; publishing validation stays with the HTTP caller. */
+export function previewFundingContribution(input: ContributionPreviewInput, confirmedAt: Date) {
+  const planned=planFundingContribution(input.amount,input.execution,confirmedAt,input.chainId);
+  if(!planned)throw new AppError(422,'BELOW_MIN_BATCH','contribution cannot form complete execution batches');
+  const selected=planned.slots.length<=4?planned.slots:[...planned.slots.slice(0,3),...planned.slots.slice(-1)];
+  return {minimumRaw:planned.minimum.toString(),effectiveSlices:planned.effectiveSlices,slots:selected.map(s=>({at:s.at.toISOString(),budgetRaw:s.budgetRaw}))};
 }

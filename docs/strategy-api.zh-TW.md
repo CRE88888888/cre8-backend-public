@@ -1,6 +1,6 @@
 # 逐資產策略 API、投入與排程契約
 
-對應 backend#82／#83／#92／#96、db 0031／0032／0034／0038，以及 [測試網參數總表](https://github.com/CRE8Finance/docs/blob/main/docs/TESTNET_PARAMETERS.zh-TW.md)。每批 50 USDT 是**含費總預算**；每資產實際輸入至少 1 USDT，最後一期正數餘額例外。只在 chain 97 開新錢自動化；主網舊 target_weight 行為保留。chain 97 版本不設資產數上限，chain 56 最終含 USDT 最多 16 個；單筆 UserOp 最多 16 步，依持有數縮小並驗總 gas ≤14M。保留完整原投入向量，僅按 confirmed 子批扣減；已配置現金與費用尾款不重算為新本金。
+對應 backend#82／#83／#92／#96／#118、db 0031／0032／0034／0038／0043，以及 [測試網參數總表](https://github.com/CRE8Finance/docs/blob/main/docs/TESTNET_PARAMETERS.zh-TW.md)。schema 2 每批 10 USDT 是**含費總預算**；每資產實際輸入至少 1 USDT，最後一期正數餘額例外。只在 chain 97 開新錢自動化；主網舊 target_weight 行為保留。chain 97 版本不設資產數上限，chain 56 最終含 USDT 最多 16 個；單筆 UserOp 最多 16 步，依持有數縮小並驗總 gas ≤14M。保留完整原投入向量，僅按 confirmed 子批扣減；已配置現金與費用尾款不重算為新本金。
 
 ## 發版
 
@@ -32,7 +32,7 @@
 
 上述 schema 2 發版只開放 chain 97。chain 56 HTTP 沿用 interval／cron 的 schema 0 發版，拒絕 execution／idleYield／funding，不會自動轉成 per_asset；顯式 chainId 必須符合 API 部署鏈。
 
-stack 由創作者指定 daily／weekly、UTC 整分時刻、實際原設定 2–52 期。daily 的 weekday 為 null；weekly 為 0–6（週日為 0）。UI 先展示創作者當地預設每週一 09:00、12 期，再換成 UTC 送入；API 不猜時區。固定 UTC 後跨 DST 的當地時刻可能改變。買的人只決定投入總額。
+stack 由創作者指定 daily／weekly、UTC 整分時刻、實際原設定 daily 2–365 期、weekly 2–52 期；每天超過 52 期需先套用 db migration 0043。daily 的 weekday 為 null；weekly 為 0–6（週日為 0）。UI 先展示創作者當地預設每週一 09:00、12 期，再換成 UTC 送入；API 不猜時區。固定 UTC 後跨 DST 的當地時刻可能改變。買的人只決定投入總額。
 
 rebalance 僅全非現金資產皆 hold 可選 none／monthly／drift；預設 none。drift 是任一資產偏離目標**超過 500 bps**，等於不觸發；monthly 跨 UTC 月後才再執行。再平衡沿用既有 target_weight quote／refresh／operation／gas 管線。尚有新錢未配置或在途時先處理原工作；再平衡的 USDT 實收付與 operation 同交易更新 allocated_cash，避免再次分類或虛假現金短缺。
 
@@ -45,6 +45,20 @@ schema 2 外層固定鍵順序：domain、schemaVersion、chainId、execution、
 `configHash=keccak256(UTF8(canonical))`，交既有 `Version.scheduleHash`，不改合約驗證或 ABI。[schema 2 goldens](../test/fixtures/strategy-config-v2-golden.json) 以 Python JSON＋`cast keccak` 獨立產生。schema 1 舊 canonical 與 [goldens](../test/fixtures/strategy-config-golden.json) 保留；舊 stack 指令與工作只允許歷史讀取／未知結果對帳，不能新增。
 
 enroll、投入及執行均核對 pinned 版本、chain、allocation、scheduleHash、生效時間；不使用 latest 取代 pinned。新版本不能改舊設定。相同 publish 重試保留原版本與原 activeAt；未知 mirror 不重送 publish。DB 或 RPC 不完整回 503，衝突回 409。schema 0 target_weight 與內部舊 writer 保留。
+
+## 入金期數預覽（#118）
+
+`POST /strategies/preview-contribution` 不需登入，body 為 `{chainId, execution, amountRaw}`。execution 與發布版本使用相同 schema／純驗證（含完整 cash 項），目前同發布介面只接受 chain 97 的 schema 2。amountRaw 為 uint256 十進位整數字串，預覽上限 **10,000,000 USDT（10^25 raw，含等號）**；實際入帳不受這個預覽上限限制。使用既有 auth IP 每分鐘限流，會先限流再解析 body；計算不讀寫 DB、不呼叫 RPC、不簽名。
+
+計算在 worker 執行，不占用 HTTP 主執行緒。同一 API 程序全站共用最多 **2** 個計算、最多 **4** 個排隊；超額立即回 429／RATE_LIMITED，`Retry-After: 1`。每次計算（含 worker 啟動）預算 **1 秒**，超時終止 worker 並回 503／PREVIEW_TIMEOUT，停止後才釋放計算名額；排隊時間另計，最多等待前面兩輪計算。沒有閒置 worker 常駐。多 API 實例各自維持同一限制。
+
+回 `{minimumRaw, effectiveSlices: {[asset]: n}, slots: [{at, budgetRaw}]}`，raw 為 18 decimals。`at` 是 UTC ISO；至多回前三個合併時點與最後一個（少於四期全回、無重複），budgetRaw 是該時點各非現金資產的含費原預算，非現金 dust 仍按既有規則 defer。confirmedAt 取伺服器現在；實際入帳取 canonical receipt 時間，時點相同時兩者期數相同。無換幣的純現金回空 slots／effectiveSlices。
+
+預覽沒有帳戶／策略 ID，不能讀取已付最低費的帳戶窗口，因此預覽與實際入帳的**期數證書**統一保守預留 0.30 USDT 上界，chain 97 同樣使用每窗口一次 reserve 的算法。真實入帳仍查驗鏈上費用預留，超過此上界回 503／MIN_FEE_UNAVAILABLE。執行、合約最低費與 feeWindow 帳務仍以原即時 RPC／收據為準；期數證書不預留或扣款。其餘發布所需 enabled 生息市場檢查仍在發布時查 DB，本端點僅驗證 yield 欄位格式。
+
+低於 minimum 回 422／BELOW_MINIMUM_ALLOCATION；超過預覽上限回 422／PREVIEW_AMOUNT_TOO_LARGE；無可行完整批次回 422／BELOW_MIN_BATCH；格式錯誤 400、限流或佇列滿 429（Retry-After）、限流儲存失敗 503。計算逾時回 503／PREVIEW_TIMEOUT，worker 啟動或執行失敗回 503／PREVIEW_UNAVAILABLE，不回傳內部例外細節。無法獨立規劃的實際產品入帳仍沿用 waiting_for_merged_budget，等待同時點其他來源，預覽不承諾此類合單。
+
+規劃縮減次數至多「非現金資產數 ×365」，每次日曆至多同樣數量的槽位；容量分批先檢查單批是否可容納，僅在需要分批時使用 bigint 對數搜尋，預覽與實際入帳共用相同演算法及結果判定。缺期記錄每資產最多 daily 365／weekly 52，prefund 的下一期本金與費用預留支援同一上限。
 
 ## 個人端點
 
@@ -75,15 +89,15 @@ APP 在已完成 enrollment 的基金買入前呼叫 `buy-funding`。有原迎�
 
 投入全額是**本金與費用的總預算**。新 lot 按原權重一次固定逐資產預算；非現金 floor(total×bps/10000)，尾差歸 cash。hold／stack 分別進 unallocated_hold／stack_prefund，cash 立即 allocated 且完成，不再乘權重。純現金無費用、無空買單。永久鍵 `(chain,txHash,logIndex)`；重播保留原確認時間，不重加桶。重組保留原預留並停止新工作，不復活來源。
 
-最低認購固定 50（含費），不隨現金比重提高；例如 99% 現金的 1,000 投入仍先記帳，等非現金預算合單達含費 50 才買入。來源日曆使用驗證過的 canonical block 確認時間，API 延遲不改首期期次。依實際各資產時點合單縮減該 lot 的期數，原版本 N／hash 不變。單資產 N12：50→M1、100→M2、600→M12。縮成一期的 stack 仍嚴格等確認後的下一指定點，等號等下次。
+最低認購為 `max(50, ceil(10 / (1 − w0)))` USDT（整 USDT 向上取整，w0 為現金比例）；純現金仍為 50。50% 現金最低 50，90% 最低 100，99% 最低 1,000。不因最小資產權重另外提高最低認購，0.5% 權重的 50 投入可在最後一期併入零碎額。來源日曆使用驗證過的 canonical block 確認時間，API 延遲不改首期期次。依實際各資產時點合單縮減該 lot 的期數，原版本 N／hash 不變。單資產 N12：50→M5、100→M10、120→M12。縮成一期的 stack 仍嚴格等確認後的下一指定點，等號等下次。
 
-每個 lot 不獨立要求達到一整批 50：不同時點的小來源可保存一期計畫，`fundingStatus=waiting_for_merged_budget`，等同帳戶同版本同時點其他 lot 合單。這代表記帳成功，未承諾立即可成交。重播回 recorded。若目前窗口仍不達門檻就等待；過期略過、不把該期 base 補扣到下一期。
+每個 lot 不獨立要求達到一整批 10：不同時點的小來源可保存一期計畫，`fundingStatus=waiting_for_merged_budget`，等同帳戶同版本同時點其他 lot 合單。這代表記帳成功，未承諾立即可成交。重播回 recorded。若目前窗口仍不達門檻就等待；過期略過、不把該期 base 補扣到下一期。
 
 ## 執行、零碎額與未知狀態
 
-同帳戶同 slot 所有到期資產／lot 先收齊成一個 asset job，window 取來源最早截止；一次估 k×R 並分攤所有來源。保留現金不進工作。非終期資產合單後實際輸入 <1 則 deferred_min_asset，無預留；下期攜帶前筆未掛 job 的零碎預算。最後一期（含 hold 唯一期）將正數餘額一起買入，豁免單資產 1 USDT，整批仍須含費 ≥50。略過只保留更早的 carry，不補扣該期 base；已掛 job／未知的預留永不再次 carry。既有已落終態 dust 不回補，只能提領退出。
+同帳戶同 slot 所有到期資產／lot 先收齊成一個 asset job，window 取來源最早截止；一次估 k×R 並分攤所有來源。保留現金不進工作。非終期資產合單後實際輸入 <1 則 deferred_min_asset，無預留；下期攜帶前筆未掛 job 的零碎預算。最後一期（含 hold 唯一期）將正數餘額一起買入，豁免單資產 1 USDT，整批仍須含費 ≥10。略過只保留更早的 carry，不補扣該期 base；已掛 job／未知的預留永不再次 carry。既有已落終態 dust 不回補，只能提領退出。
 
-子批同比例分各成分，實際最小輸入 1、含費總預算 50；50 投入可輸入 49.73＋R0.27。k 批預留 k×R，未使用費用回已配置現金，實際收費依 receipt，不重複收。逐來源 raw 尾差後重查全部 cap／buyAllowance。任一成分缺報價、oracle、深度或休市，整個子批等候，不跳掉資產。全 hold 再平衡也使用每資產 1／含費 50，賣出以同塊 oracle 名義額計算；新投入及部分成交不標記 monthly 完成，重啟續作到全數完成才記當月。legacy 最低步預設改為 1 USDT，仍保留原本環境變數覆寫與名義額口徑。
+子批同比例分各成分，實際最小輸入 1、含費總預算 10；10 預算可輸入 9.73＋R0.27。k 批預留 k×R，未使用費用回已配置現金，實際收費依 receipt，不重複收。逐來源 raw 尾差後重查全部 cap／buyAllowance。任一成分缺報價、oracle、深度或休市，整個子批等候，不跳掉資產。全 hold 再平衡也使用每資產 1／含費 50，賣出以同塊 oracle 名義額計算；新投入及部分成交不標記 monthly 完成，重啟續作到全數完成才記當月。legacy 最低步預設改為 1 USDT，仍保留原本環境變數覆寫與名義額口徑。
 
 股票使用 [NYSE 2026–2028 官方日曆](https://ir.theice.com/press/news-details/2025/NYSE-Group-Announces-2026-2027-and-2028-Holiday-and-Early-Closings-Calendar/default.aspx) 與 America/New_York DST，開盤含等號、收盤不含；未知年份不買股票。加密資產無股票日曆限制。跨基金共用每鏈保守 DEX 隊列：未知 operation 持久占位，成交後等下一區塊再取新報價。
 

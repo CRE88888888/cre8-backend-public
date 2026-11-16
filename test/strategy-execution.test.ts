@@ -7,7 +7,7 @@ import type { Hex } from 'viem';
 import golden from './fixtures/strategy-config-golden.json' with { type: 'json' };
 import v2Golden from './fixtures/strategy-config-v2-golden.json' with { type: 'json' };
 import { canonicalConfig, canonicalConfigHash, defaultAmountUsdt, minimumAllocationRaw, UINT256_MAX, usdtRaw, utcDate, validateExecution, validateAssetConfig, minimumAssetContribution } from '../src/strategy-execution.js';
-import { typedVersionInput, validateAllocation } from '../src/strategies.js';
+import { typedVersionInput, validateAllocation, previewContribution } from '../src/strategies.js';
 import type { StrategyVersion } from '../src/strategies.js';
 import { createPortfolioStrategyService } from '../src/portfolio-strategies.js';
 import { assertVersionOnchain, publishVersionOnchain, REGISTRY_ABI } from '../src/chain.js';
@@ -94,7 +94,7 @@ test('#83 per-asset creator calendars validate daily/weekly bounds and reject ho
   const base={kind:'per_asset',numeraire:cash,rebalance:'none',assets:[
     {asset:risky,weightBps:5000,execution:{kind:'stack',every:'weekly',weekday:1,timeUtc:'01:00',slices:12},yield:null},
     {asset:cash,weightBps:5000,yield:null}]};
-  for (const slices of [2,52]) {
+  for (const slices of [2,52,365]) {
     const value={...base,assets:[{...base.assets[0],execution:{kind:'stack',every:'daily',weekday:null,timeUtc:'23:59',slices}},base.assets[1]]};
     assert.equal(validateAssetConfig(value,allocation,97).kind,'per_asset');
   }
@@ -273,10 +273,10 @@ test('#96 chain 56 HTTP preserves interval schema 0 and caps the final allocatio
   assert.equal(validateAllocation({assets:[...entries.slice(0,15).map(a=>({...a,weightBps:600})),{address:cash56,weightBps:1000}]},56).assets.length,16);
 });
 
-test('#96 subscription minimum is exactly 50 independently of the cash allocation',()=>{
+test('#118 subscription minimum follows the risky-weight batch floor',()=>{
   for(const weightBps of [0,5000,9900,10000]){
     const basket={assets:weightBps===10000?[{address:cash,weightBps}]:[{address:risky,weightBps:10000-weightBps},{address:cash,weightBps}]};
-    assert.equal(minimumAssetContribution(validateAssetConfig(undefined,basket,97)),50n*10n**18n);
+    assert.equal(minimumAssetContribution(validateAssetConfig(undefined,basket,97)),(weightBps===9900?1000n:50n)*10n**18n);
   }
 });
 
@@ -284,4 +284,17 @@ test('#96 subscription minimum is exactly 50 independently of the cash allocatio
 test('#96 legacy HTTP normalization cannot erase an explicit wrong chain identity',()=>{
   const allocation={assets:[{address:'0x55d398326f99059ff775485246999027b3197955',weightBps:10000}]};
   assert.throws(()=>typedVersionInput({allocation,chainId:1337,schedule:{kind:'interval',intervalSeconds:60}}),denied('CHAIN_MISMATCH'));
+});
+
+
+test('#118 preview keeps short calendars unique, advances equal confirmation times and omits pure cash slots',()=>{
+  const at=new Date('2026-11-16T13:00:00Z'),U=10n**18n;
+  const basket=validateAllocation({assets:[{address:risky,weightBps:10000},{address:cash,weightBps:0}]},97);
+  const execution=validateAssetConfig({kind:'per_asset',numeraire:cash,assets:[
+    {asset:risky,weightBps:10000,execution:{kind:'stack',every:'daily',weekday:null,timeUtc:'13:00',slices:2},yield:null},
+    {asset:cash,weightBps:0,yield:null}]},basket,97);
+  const preview=previewContribution({chainId:97,execution,amountRaw:(50n*U).toString()},at);
+  assert.deepEqual(preview.slots,[{at:'2026-11-17T13:00:00.000Z',budgetRaw:(25n*U).toString()},{at:'2026-11-18T13:00:00.000Z',budgetRaw:(25n*U).toString()}]);
+  const only=validateAssetConfig(undefined,{assets:[{address:cash,weightBps:10000}]},97);
+  assert.deepEqual(previewContribution({chainId:97,execution:only,amountRaw:(50n*U).toString()},at),{minimumRaw:(50n*U).toString(),effectiveSlices:{},slots:[]});
 });

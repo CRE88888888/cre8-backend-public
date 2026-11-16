@@ -1,4 +1,5 @@
 import './strategy-execution.test.js';
+import './contribution-preview.test.js';
 // Keep faucet HTTP coverage in the existing no-DB CI entry point.
 import './faucet.test.js';
 import './points.test.js';
@@ -1082,4 +1083,48 @@ test('#63 default HTTP dependency loads optional Privy env without affecting SIW
     assert.equal(result.code, 0, result.output);
     assert.ok(!result.output.includes(identityToken), 'JWT must not reach output');
   }
+});
+test('#118 contribution preview is public, bounded, rate limited and rejects invalid inputs before computation',async()=>{
+  const {record}=await import('../src/strategy-execution.js');
+  const {TESTNET_97}=await import('../src/testnet-profile.js');
+  const {RequestRateLimiter,MemoryRateLimitStore}=await import('../src/ratelimit.js');
+  const {loadRateLimitConfig}=await import('../src/config.js');
+  const cash=TESTNET_97.contracts.usdt,asset=TESTNET_97.assets.WBNB.token,U=10n**18n;
+  const execution={kind:'per_asset',numeraire:cash,rebalance:'none',assets:[
+    {asset,weightBps:10000,execution:{kind:'stack',every:'daily',weekday:null,timeUtc:'13:00',slices:365},yield:null},
+    {asset:cash,weightBps:0,yield:null}]};
+  const rateLimiter=new RequestRateLimiter({...loadRateLimitConfig({}),authPerMinute:30},new MemoryRateLimitStore());
+  const server=createServer({rateLimiter});
+  await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try{
+    const address=server.address();assert.ok(address&&typeof address!=='string');
+    const url=`http://127.0.0.1:${address.port}/strategies/preview-contribution`;
+    const post=(body:unknown)=>fetch(url,{method:'POST',body:JSON.stringify(body)});
+    const body={chainId:97,execution,amountRaw:(100n*U).toString()};
+    const aboveLimit=await post({...body,amountRaw:(10_000_000n*U+1n).toString()});
+    assert.equal(aboveLimit.status,422);
+    const aboveError:unknown=await aboveLimit.json();assert.ok(record(aboveError)&&record(aboveError.error));
+    assert.equal(aboveError.error.code,'PREVIEW_AMOUNT_TOO_LARGE');
+    const success=await post(body);assert.equal(success.status,200);
+    const value:unknown=await success.json();assert.ok(record(value));assert.equal(value.minimumRaw,(50n*U).toString());
+    assert.deepEqual(value.effectiveSlices,{[asset]:10});assert.ok(Array.isArray(value.slots));assert.equal(value.slots.length,4);
+    assert.ok(value.slots.every((s:unknown)=>record(s)&&typeof s.at==='string'&&Number.isFinite(Date.parse(s.at))&&s.budgetRaw===(10n*U).toString()));
+    for(const amount of [0n,50n*U-1n]){
+      const response=await post({...body,amountRaw:amount.toString()});assert.equal(response.status,422);
+      const error:unknown=await response.json();assert.ok(record(error));assert.ok(record(error.error));assert.equal(error.error.code,'BELOW_MINIMUM_ALLOCATION');
+    }
+    for(const amountRaw of ['-1','01','1.0','1e20',100,null,((1n<<256n)).toString()])assert.equal((await post({...body,amountRaw})).status,400);
+    for(const extra of [{unknown:1},{chainId:'97'},{chainId:56},{execution:{...execution,unexpected:1}},{execution:null}])assert.equal((await post({...body,...extra})).status,400);
+    const impossible={...execution,assets:[...Object.values(TESTNET_97.assets).map((a,i)=>({asset:a.token,weightBps:i===0?81:109,execution:{kind:'hold'},yield:null})),{asset:cash,weightBps:0,yield:null}]};
+    // 92 assets / 16-step children cannot fit in a 50-USDT complete budget.
+    const noPlan=await post({...body,execution:impossible,amountRaw:(50n*U).toString()});assert.equal(noPlan.status,422);
+    assert.equal((await fetch(url)).status,405);
+    const limited=createServer({rateLimiter:new RequestRateLimiter({...loadRateLimitConfig({}),authPerMinute:0},new MemoryRateLimitStore())});
+    await new Promise<void>(resolve=>limited.listen(0,'127.0.0.1',resolve));
+    try{
+      const addr=limited.address();assert.ok(addr&&typeof addr!=='string');
+      const r=await fetch(`http://127.0.0.1:${addr.port}/strategies/preview-contribution`,{method:'POST',body:'invalid'});
+      assert.equal(r.status,429);assert.ok(r.headers.get('retry-after'));
+    }finally{await new Promise<void>(resolve=>limited.close(()=>resolve()));}
+  }finally{await new Promise<void>(resolve=>server.close(()=>resolve()));}
 });

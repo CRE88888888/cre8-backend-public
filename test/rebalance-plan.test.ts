@@ -3223,6 +3223,20 @@ test('#96 default ordinary step minimum is 1 USDT and per-asset hold batches cou
   f.step.amountIn=4973n*U/100n;
   assert.equal(await checkTradeMinimums(f.client,getAddress(THRESHOLD_CASH),[f.step],'ordinary',123n,50n*U),null);
 });
+test('#118 sender minimum accepts schema2 ten including fees, rejects 9.99, and retains legacy/all-hold fifty',async()=>{
+  const U=10n**18n,f=oracleFixture(),reserve=27n*U/100n;
+  for(const budget of [999n*U/100n,10n*U-1n,10n*U]){
+    const step={...f.step,amountIn:budget-reserve};
+    const result=await checkTradeMinimums(f.client,getAddress(THRESHOLD_CASH),[step],'ordinary',123n,budget);
+    assert.equal(result===null,budget===10n*U);
+    assert.match(await checkTradeMinimums(f.client,getAddress(THRESHOLD_CASH),[step],'ordinary',123n)??'',/BELOW_MIN_BATCH/);
+    assert.match(await checkTradeMinimums(f.client,getAddress(THRESHOLD_CASH),[step],'ordinary',123n,undefined,undefined,reserve)??'',/BELOW_MIN_BATCH/);
+  }
+  const tiny={...f.step,amountIn:U/4n},large={...f.step,tokenOut:TOKEN3,amountIn:10n*U-U/4n-reserve};
+  assert.match(await checkTradeMinimums(f.client,getAddress(THRESHOLD_CASH),[tiny,large],'ordinary',123n,10n*U)??'',/BELOW_MIN_STEP/);
+  assert.equal(await checkTradeMinimums(f.client,getAddress(THRESHOLD_CASH),[tiny,large],'ordinary',123n,10n*U,new Set([tiny.tokenOut.toLowerCase()])),null);
+  f.state.fail='numeraire';assert.match(await checkTradeMinimums(f.client,getAddress(THRESHOLD_CASH),[large],'ordinary',123n,10n*U)??'',/TRADE_MINIMUM_UNAVAILABLE/);
+});
 
 
 test('#96 final installment exception permits positive remainder but never a zero input',()=>{

@@ -65,12 +65,24 @@ test('#116 reserve sums each active next budget including fee, final remainder a
   assert.equal(await stackLiquidityReserve(db, 97, 1, at), UINT256_MAX);
   rows.push({ ...source, effective_slices: 1 });
   assert.equal(await stackLiquidityReserve(db, 97, 1, at), null);
-  for (const patch of [{ mode: null }, { first_slot_at: null }, { effective_slices: 0 }, { effective_slices: 53 }, { next_index: 4 }, { budget_raw: '0' }, { carry: '-1' }]) {
+  for (const patch of [{ mode: null }, { first_slot_at: null }, { effective_slices: 0 }, { effective_slices: 366 }, { next_index: 4 }, { budget_raw: '0' }, { carry: '-1' }]) {
     rows = [{ ...source, ...patch }]; assert.equal(await stackLiquidityReserve(db, 97, 1, at), null);
   }
   rows = []; assert.equal(await stackLiquidityReserve(db, 97, 1, at), 0n);
   legacy = [{}]; assert.equal(await stackLiquidityReserve(db, 97, 1, at), null);
   await assert.rejects(stackLiquidityReserve(async () => { throw new Error('DB timeout'); }, 97, 1, at), /DB timeout/);
+});
+test('#118 daily 365 liquidity reserve covers first/middle/final raw remainder and rejects invalid calendars',async()=>{
+  const at=new Date('2026-11-17T00:00:00Z'),day=86400000;
+  const source={budget_raw:'36501',effective_slices:365,first_slot_at:at,mode:{kind:'stack',every:'daily'},next_index:0,carry:'7'};
+  let rows:unknown[]=[source];
+  const db:YieldStateQuery=async sql=>({rows:sql.includes('stack_instructions')?[]:rows});
+  for(const index of [0,182,363,364,365]){
+    assert.equal(await stackLiquidityReserve(db,97,1,new Date(+at+index*day)),index===365?0n:index===364?108n:107n);
+  }
+  for(const patch of [{effective_slices:366},{mode:{kind:'stack',every:'weekly'}},{next_index:366}]){
+    rows=[{...source,...patch}];assert.equal(await stackLiquidityReserve(db,97,1,at),null);
+  }
 });
 test('#116 outstanding prefund basis follows FIFO/scaled units, consumes realized losses and never borrows another source', () => {
   const first = { kind: 'supply' as const, assets: 10n, before: 0n, after: 5n, prefund: 0n };

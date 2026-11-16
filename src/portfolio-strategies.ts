@@ -1,5 +1,5 @@
 import { cashDifference } from './yield-domain.js';
-import { planContribution } from './asset-plan.js';
+import { planFundingContribution } from './asset-plan.js';
 import { minimumFeeReserve } from './rebalance-plan.js';
 import { loadSessionKeyConfig } from './config.js';
 import { getChain } from './chain.js';
@@ -17,7 +17,7 @@ import { readFaucetFundingEvidence, settleFaucetClaim } from './faucet.js';
 import { createWelcomeService, findWelcomeGrant, readWelcomeFundingEvidence, settleWelcomeGrant } from './welcome-grants.js';
 import type { WelcomeGrant } from './welcome-grants.js';
 import { readAccountCash } from './chain.js';
-import { defaultAmountUsdt, exactKeys, minimumAllocationRaw, record, usdtRaw, utcDate, minimumAssetContribution, numeraireFor } from './strategy-execution.js';
+import { defaultAmountUsdt, exactKeys, minimumAllocationRaw, record, usdtRaw, utcDate, CONTRIBUTION_FEE_RESERVE_RAW, minimumAssetContribution, numeraireFor } from './strategy-execution.js';
 
 export type FundingSource = { kind: 'faucet_claim'; claimId: string } | { kind: 'welcome_grant'; grantId: string };
 type LotRow = { id: string; chain_id: string; portfolio_id: string; strategy_id: string; version: number; kind: 'hold' | 'stack' | 'asset'; effective_slices?: Record<string,number>; created_at: Date;
@@ -186,6 +186,7 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
     catch (error) { await reconcileReorg(error); throw error; }
     const confirmedAt = evidence.confirmedAt;
     const feeReserve = version.execution.kind === 'per_asset' && version.execution.assets.some(a=>a.asset!==numeraireFor(p.chainId)) ? await deps.feeReserve(p,version) : 0n;
+    if(feeReserve<0n||feeReserve>CONTRIBUTION_FEE_RESERVE_RAW)throw new AppError(503,'MIN_FEE_UNAVAILABLE','contribution fee bound unavailable');
     const result = await deps.transaction(async (client) => {
       await cashLock(client, p);
       await checkReorg(client, p);
@@ -202,7 +203,7 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
         if(Number(original.portfolio_id)!==id||Number(original.strategy_id)!==p.strategyId||original.version!==p.version||original.kind!==kind||original.amount_raw!==evidence.amountRaw||original.state!=='confirmed')throw new AppError(409,'FUNDING_EVENT_CONFLICT','funding event conflicts with its original authorization');
         return { ...mapLot(original), source, replayed:true, fundingStatus:'recorded' };
       }
-      const standalone = version.execution.kind === 'per_asset' ? planContribution(BigInt(evidence.amountRaw),version.execution,confirmedAt,feeReserve,p.chainId===97) : null;
+      const standalone = version.execution.kind === 'per_asset' ? planFundingContribution(BigInt(evidence.amountRaw),version.execution,confirmedAt,p.chainId) : null;
       // Subscription minimum is distinct from the eventual account/time batch.
       // An individually small source may join another lot at the same creator slot.
       const minimum=version.execution.kind==='per_asset'?minimumAssetContribution(version.execution):0n;

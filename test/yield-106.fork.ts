@@ -1,5 +1,5 @@
 /** Explicit acceptance: bun --no-env-file test ./test/yield-106.fork.ts --timeout=1200000.
- * Requires the reviewed manifest deployed on chain 97 anvil 8599, alto 3099, DB cre8_be112.
+ * Requires the reviewed manifest deployed on chain 97 anvil 8599, alto 3099, DB cre8_be116.
  * No automatic discovery, external signing service, key files or public-chain writes.
  */
 import assert from 'node:assert/strict';
@@ -8,11 +8,11 @@ import { setTimeout as pause } from 'node:timers/promises';
 import { createKernelAccount, createKernelAccountClient, encodeCallDataEpV07 } from '@zerodev/sdk';
 import { signerToEcdsaValidator } from '@zerodev/ecdsa-validator';
 import { KERNEL_V3_3 } from '@zerodev/sdk/constants';
-import { createPublicClient, createTestClient, createWalletClient, concatHex, toHex, encodeFunctionData, erc20Abi, http, maxUint256, parseAbi } from 'viem';
+import { createPublicClient, createTestClient, createWalletClient, concatHex, toHex, decodeEventLog, encodeFunctionData, erc20Abi, http, maxUint256, parseAbi } from 'viem';
 import type { Address, Hex } from 'viem';
 import { mnemonicToAccount } from 'viem/accounts';
 import { bscTestnet } from 'viem/chains';
-import { closePool, migrate, query, withPortfolioLock } from '../src/db.js';
+import { closePool, migrate, query, withPortfolioLock, withTransaction } from '../src/db.js';
 import { REGISTRY_ABI } from '../src/chain.js';
 import { AppError } from '../src/errors.js';
 import { computeSalt, getKernelAccountParams } from '../src/kernel.js';
@@ -28,15 +28,18 @@ import { readYieldAccount } from '../src/yield-reader.js';
 import { yieldProfile, WAD } from '../src/yield-domain.js';
 import { gasExecutionKey, canonicalKernelCalls, createPaymasterService } from '../src/paymaster.js';
 import type { SnapshotRow } from '../src/yield-store.js';
-import { restoreYieldOperation } from '../src/yield-store.js';
+import { restoreYieldOperation, readPrefundPositions } from '../src/yield-store.js';
 import { yieldSessionAvailable } from '../src/yield-session.js';
 import { reconcileYieldOperation, submitYieldAction, quoteYieldAction } from '../src/yield-execution.js';
 import type { SavedYieldOperation } from '../src/yield-execution.js';
 import { localAcceptanceEnv } from './fixtures/local-acceptance.js';
+import { fundingLots, prepareStrategyJob, cancelJob } from '../src/strategy-jobs.js';
+import type { JobContext } from '../src/strategy-jobs.js';
+import type { AssetExecution } from '../src/strategy-execution.js';
 
 const lane = localAcceptanceEnv(process.env, true);
 const rpcUrl = 'http://127.0.0.1:8599', bundlerUrl = 'http://127.0.0.1:3099';
-assert.ok(lane.rpcUrl === rpcUrl && lane.bundler?.url === bundlerUrl && lane.backendPort === 8699 && lane.databaseName === 'cre8_be112', 'select only the BE112 local lane');
+assert.ok(lane.rpcUrl === rpcUrl && lane.bundler?.url === bundlerUrl && lane.backendPort === 8699 && lane.databaseName === 'cre8_be116', 'select only the BE116 local lane');
 assert.equal(process.env.ENABLE_YIELD_EXECUTION, '1');
 const client = createPublicClient({ chain: bscTestnet, transport: http(rpcUrl, { retryCount: 0, timeout: 120000 }), pollingInterval: 100, cacheTime: 0 });
 const local = createTestClient({ chain: bscTestnet, mode: 'anvil', transport: http(rpcUrl, { retryCount: 0, timeout: 120000 }) });
@@ -142,11 +145,12 @@ test('#110 cross-block durable scheduler + real sponsored Kernel lifecycle for V
     check((await readNativeBudgetPrice(client, C.executor, 97)).nativePrice > 0n, 'production gas budget oracle has a fresh real quote');
     const catalog = await service.markets(97);
     check(catalog.markets.length === 30 && catalog.markets.every(m => m.aprBps !== null && BigInt(m.aprBps) > 0n) && catalog.markets.filter(m => m.symbol === 'USDT').every(m => m.supplyOpen), 'production market reader admits the configured yield catalog with all 30 APRs nonzero');
-    for (const protocol of ['Venus', 'Lista', 'Aave'] as const) {
+    for (const scenario of ['Prefund', 'Venus', 'Lista', 'Aave'] as const) {
+      const prefund=scenario==='Prefund',protocol=prefund?'Venus':scenario;
       const market = T.yieldMarkets.find(m => m.protocol === protocol && m.symbol === 'USDT'); assert.ok(market);
       const strategyId = 1n + await client.readContract({ address: C.registry, abi: extra, functionName: 'nextStrategyId' });
       await landed(await ownerWallet.writeContract({ address: C.registry, abi: REGISTRY_ABI, functionName: 'registerStrategy', args: [`BE110 ${protocol}`, 'local Kernel yield acceptance', false] }));
-      await landed(await ownerWallet.writeContract({ address: C.registry, abi: REGISTRY_ABI, functionName: 'publishVersion', args: [strategyId, [C.usdt], [10000], `0x${'00'.repeat(32)}`, 0n] }));
+      await landed(await ownerWallet.writeContract({ address: C.registry, abi: REGISTRY_ABI, functionName: 'publishVersion', args: [strategyId, prefund?[C.usdt,T.assets.WBNB.token]:[C.usdt], prefund?[0,10000]:[10000], `0x${'00'.repeat(32)}`, 0n] }));
       const initial = deriveSessionKeyFor(owner.address, strategyId, material);
       const validUntil = Number((await client.getBlock()).timestamp) + 86400;
       const baseline = await buildSessionPermissions({ publicClient: client, sessionKeyAddress: initial.address, executorAddress: C.executor, validUntil });
@@ -155,13 +159,23 @@ test('#110 cross-block durable scheduler + real sponsored Kernel lifecycle for V
       });
       await landed(await operator.sendTransaction({ to: params.factory, data: params.factoryData, gas: 4_000_000n }));
       await landed(await operator.writeContract({ address: C.registry, abi: REGISTRY_ABI, functionName: 'enroll', args: [params.address, strategyId] }));
-      const amount = 100n * WAD;
-      await landed(await operator.writeContract({ address: C.usdt, abi: parseAbi(['function claimFor(address,uint256)']), functionName: 'claimFor', args: [params.address, amount] }));
+      const allocatedAmount=prefund?1000n*WAD:0n;
+      const amount = (prefund?1300n:100n) * WAD,fundingAmount=prefund?400n*WAD:amount;
+      const funding=await landed(await operator.writeContract({ address: C.usdt, abi: parseAbi(['function claimFor(address,uint256)']), functionName: 'claimFor', args: [params.address, fundingAmount] }));
+      if(prefund){
+        // Minting the extra 1,000 would exceed this Kernel's 24h faucet quota.
+        // Keep the 400 funding receipt exact; transfer the separate allocated cash.
+        const keeper=createWalletClient({chain:bscTestnet,account:T.roles.keeper,transport:http(rpcUrl,{retryCount:0,timeout:120000})});
+        assert.ok(await client.readContract({address:C.usdt,abi:erc20Abi,functionName:'balanceOf',args:[T.roles.keeper]})>=allocatedAmount,'seed keeper allocated-cash inventory before acceptance');
+        await landed(await keeper.writeContract({address:C.usdt,abi:erc20Abi,functionName:'transfer',args:[params.address,allocatedAmount]}));
+      }
       const sid = (await query<{ id: string }>('insert into strategies(provider,name,onchain_id) values($1,$2,$3) returning id::text', [owner.address.toLowerCase(), `be110-${protocol}`, strategyId.toString()])).rows[0]?.id; assert.ok(sid);
       const selected = profile.markets.find(m => m.marketId === market.marketId); assert.ok(selected);
-      const execution = { kind: 'per_asset', numeraire: C.usdt, rebalance: 'none', assets: [{ asset: C.usdt, weightBps: 10000, yield: { market: selected.id } }] };
+      const stackTime=new Date(Date.now()+120000).toISOString().slice(11,16);
+      const stack:AssetExecution['assets']=prefund?[{asset:T.assets.WBNB.token,weightBps:10000,yield:null,execution:{kind:'stack',every:'daily',weekday:null,timeUtc:stackTime,slices:4}}]:[];
+      const execution:AssetExecution = { kind: 'per_asset', numeraire: C.usdt, rebalance: 'none', assets: [{ asset: C.usdt, weightBps: prefund?0:10000, yield: { market: selected.id } },...stack] };
       await query(`insert into strategy_versions(strategy_id,version,allocation,schedule,active_at,execution_schema_version,execution,execution_chain_id,config_hash)
-        values($1,1,$2,'{"kind":"funding"}',now()-interval '1 day',2,$3,97,$4)`, [sid, JSON.stringify({ assets: [{ address: C.usdt, weightBps: 10000 }] }), JSON.stringify(execution), `0x${'01'.repeat(32)}`]);
+        values($1,1,$2,'{"kind":"funding"}',now()-interval '1 day',2,$3,97,$4)`, [sid, JSON.stringify({ assets: execution.assets.map(a=>({address:a.asset,weightBps:a.weightBps})) }), JSON.stringify(execution), `0x${'01'.repeat(32)}`]);
       const pid = (await query<{ id: string }>("insert into portfolios(user_id,strategy_id,version,schedule_state) values($1,$2,1,'active') returning id::text", [owner.address.toLowerCase(), sid])).rows[0]?.id; assert.ok(pid);
       const id = Number(pid), account = params.address.toLowerCase() as Address;
       await query("insert into smart_accounts(portfolio_id,chain_id,address,owner,account_type) values($1,97,$2,$3,'KERNEL')", [id, account, owner.address.toLowerCase()]);
@@ -199,7 +213,18 @@ test('#110 cross-block durable scheduler + real sponsored Kernel lifecycle for V
       ]);
       await service.consent(id, owner.address, { markets: [market.marketId], txHash: proof });
       check((await query('select id from yield_consents where portfolio_id=$1 and opted_out_at is null', [id])).rows.length === 1, `${protocol} canonical consent persists`);
-      await query('update strategy_cash_balances set allocated_cash_raw=$2 where portfolio_id=$1', [id, amount.toString()]);
+      if(prefund){
+        const confirmed=new Date(Number((await client.getBlock({blockNumber:funding.blockNumber})).timestamp)*1000);
+        const transfer=funding.logs.find(log=>{
+          if(log.address.toLowerCase()!==C.usdt)return false;
+          try{const e=decodeEventLog({abi:erc20Abi,data:log.data,topics:log.topics});return e.eventName==='Transfer'&&e.args.to.toLowerCase()===account&&e.args.value===fundingAmount;}catch{return false;}
+        });assert.ok(transfer?.logIndex!==null&&transfer?.logIndex!==undefined);
+        await withTransaction(async db=>{
+          await db.query(`insert into strategy_funding_lots(chain_id,portfolio_id,strategy_id,version,kind,tx_hash,log_index,block_number,block_hash,amount_raw,minimum_contribution_raw,effective_slices,created_at,updated_at)
+            values(97,$1,$2,1,'asset',$3,$4,$5,$6,$7,$8,$9,$10,$10)`,[id,sid,funding.transactionHash,transfer.logIndex,funding.blockNumber.toString(),funding.blockHash,fundingAmount.toString(),(50n*WAD).toString(),JSON.stringify({[T.assets.WBNB.token]:4}),confirmed]);
+          await db.query('update strategy_cash_balances set stack_prefund_raw=$2,allocated_cash_raw=$3 where portfolio_id=$1',[id,fundingAmount.toString(),allocatedAmount.toString()]);
+        });
+      }else await query('update strategy_cash_balances set allocated_cash_raw=$2 where portfolio_id=$1', [id, amount.toString()]);
       async function tick(phase: string) {
         await refreshClock();
         const result = await withPortfolioLock(id, () => service.tick({ portfolioId: id, chainId: 97, account }, false));
@@ -216,13 +241,41 @@ test('#110 cross-block durable scheduler + real sponsored Kernel lifecycle for V
       check(reconciled.status === 'confirmed', `${protocol} independent restart receipt reconciliation`);
       await verifyOriginalQuote(saved, reconciled.evidence.txHash);
       gas.push({ protocol, phase: 'supply', gasUsed: reconciled.evidence.gasUsed.toString(), txHash: reconciled.evidence.txHash });
+      if(prefund){
+        const cash=(await query<{n:string}>('select stack_prefund_raw::text n from strategy_cash_balances where portfolio_id=$1',[id])).rows[0];
+        check(cash?.n===(100n*WAD).toString(),'prefund supply retains exactly the next fee-inclusive installment');
+        const sources=(await query<{source_breakdown:{allocated_cash_raw:string;stack_prefund_raw:string}}>('select source_breakdown from yield_actions where execution_key=$1',[supplyRow.execution_key])).rows[0]?.source_breakdown;
+        check(sources?.allocated_cash_raw===allocatedAmount.toString()&&sources.stack_prefund_raw===(300n*WAD).toString(),'mixed supply preserves allocated and prefund origin evidence');
+        const first=(await query<{first_slot_at:Date}>('select first_slot_at from strategy_lot_assets where lot_id in (select id from strategy_funding_lots where portfolio_id=$1) and asset=$2',[id,T.assets.WBNB.token])).rows[0];assert.ok(first);
+        while(Date.now()<+first.first_slot_at)await pause(Math.min(1000,+first.first_slot_at-Date.now()));
+        const context:JobContext={chainId:97,portfolioId:id,strategyId:Number(sid),version:1,kind:'asset',execution,account,
+          allocation:{assets:execution.assets.map(a=>({address:a.asset,weightBps:a.weightBps}))},cash:C.usdt,now:new Date(),reserve:WAD/4n,
+          caps:new Map([[T.assets.WBNB.token,null]]),buyLimit:maxUint256,observedCash:100n*WAD,enabled:true,marketOpen:true};
+        const run:import('../src/scheduler.js').WithTransactionFn=fn=>withTransaction(db=>fn({query:(sql,params)=>db.query(sql,params?[...params]:[])}));
+        const prepared=await withPortfolioLock(id,async()=>prepareStrategyJob(run,context,await fundingLots(query,context)));
+        assert.ok(prepared?.job);
+        const job=prepared.job;
+        check(BigInt(job.amount_raw)+BigInt(job.fee_reserve_raw)===100n*WAD,'first prefund period uses only its original input and fee reserve');
+        check((await tick('prefund next-period gap'))?.includes('領出已確認'),'prefund next-period shortfall withdraws during the 24h supply cooldown');
+        const withdrawal=(await query<SnapshotRow>(`select s.* from yield_execution_snapshots s join yield_actions a using(execution_key) where a.portfolio_id=$1 and a.kind='withdraw'`,[id])).rows[0];assert.ok(withdrawal);
+        const original=restoreYieldOperation(withdrawal);
+        // The planner accrues Venus inside the shared eth_call before reading its rate.
+        const quoted=(await readYieldAccount(client,profile,account,{block:original.plan.quoteBlock})).positions.find(p=>p.market.marketId===market.marketId);
+        assert.ok(quoted?.rate);const rate=quoted.rate;
+        check(original.plan.amount===(100n*WAD*WAD+rate-1n)/rate,'prefund redemption signs only the next shortfall rounded up to a receipt');
+        const recovered=(await query<{p:string;a:string}>('select stack_prefund_raw::text p,allocated_cash_raw::text a from strategy_cash_balances where portfolio_id=$1',[id])).rows[0];
+        check(recovered?.p===(100n*WAD).toString()&&recovered.a==='0','one mixed-source withdrawal fills the exact 100 prefund gap without crediting allocated');
+        check((await readPrefundPositions(query,97,id))[0]?.principal===200n*WAD,'directed canonical history retires precisely 100 prefund principal');
+        check((await query("select name from yield_runtime_state where name like 'fact-prefund-withdraw-%' and value->>'executionKey'=$1",[withdrawal.execution_key])).rows.length===1,'directed purpose persists with the original execution journal');
+        await run(async({query})=>cancelJob(query,context,job));
+      }
       // Even one real elapsed second produces nonzero raw interest in these markets.
       // Keep the production APR and every SQL freshness check intact.
       await pause(1100); await refreshClock();
       await refreshGasPriceFeeds();
       const accrued = await readYieldAccount(client, profile, account);
       const position = accrued.positions.find(p => p.market.marketId === market.marketId); assert.ok(position);
-      check(position.state === 'known' && position.claim !== null && position.claim > amount && position.value === position.claim, `${protocol} interest accrues into claim and NAV`);
+      check(position.state === 'known' && position.claim !== null && position.claim > amount-(prefund?100n*WAD:0n) && position.value === position.claim, `${scenario} interest accrues into claim and NAV`);
       // Exercise BOTH public sponsorship simulations against the real Kernel runtime;
       // this read-only reserve adapter returns no signature to a browser or bundler.
       const preview=await quoteYieldAction(client,account,{kind:'withdraw',marketId:market.marketId,amount:(position.receipt??0n)/10n});
@@ -245,7 +298,7 @@ test('#110 cross-block durable scheduler + real sponsored Kernel lifecycle for V
       await service.exit(id, owner.address, { markets: [market.marketId], txHash: exit });
       await landed(await marketOwner.writeContract({ address: market.target, abi: extra, functionName: 'setLiquidity', args: [1_000_000n * WAD] }));
       check(await tick('full exit') === '生息領出已確認', `${protocol} stop and withdraw remainder`);
-      let withdrawals = 2, completed = false;
+      let withdrawals = prefund?3:2, completed = false;
       // Aave's raw aToken balance keeps growing after the immutable amount is signed.
       // Let the production durable exit consume each accrued remainder; require strict
       // scaled-unit progress and eventual zero instead of assuming a fixed action count.
@@ -294,11 +347,11 @@ test('#110 cross-block durable scheduler + real sponsored Kernel lifecycle for V
         gas.push({ protocol, phase: index === 0 ? 'partial' : index === 1 ? 'full' : `accrued remainder ${index - 1}`, gasUsed: verified.evidence.gasUsed.toString(), txHash: verified.evidence.txHash });
       }
       if (protocol === 'Aave') { assert.equal(units, 0n); assert.equal(remainingBasis, 0n); }
-      const cash = (await query<{ allocated: string; earnings: string }>('select allocated_cash_raw::text as allocated,yield_raw::text as earnings from strategy_cash_balances where portfolio_id=$1', [id])).rows[0]; assert.ok(cash);
+      const cash = (await query<{ allocated: string; prefund:string; earnings: string }>('select allocated_cash_raw::text as allocated,stack_prefund_raw::text as prefund,yield_raw::text as earnings from strategy_cash_balances where portfolio_id=$1', [id])).rows[0]; assert.ok(cash);
       const balance = await client.readContract({ address: C.usdt, abi: erc20Abi, functionName: 'balanceOf', args: [account] });
       const returnedPrincipal = amount - realizedLoss, interest = withdrawnAssets - returnedPrincipal;
-      check(BigInt(cash.allocated) === returnedPrincipal && BigInt(cash.earnings) === interest && interest > 0n &&
-        returnedPrincipal + interest === balance, `${protocol} exact canonical principal/loss/interest match DB and cash without loss top-up`);
+      check((prefund?BigInt(cash.prefund)===400n*WAD&&BigInt(cash.allocated)===allocatedAmount-realizedLoss:BigInt(cash.allocated) === returnedPrincipal) && BigInt(cash.earnings) === interest && interest > 0n &&
+        returnedPrincipal + interest + (prefund?100n*WAD:0n) === balance, `${scenario} exact canonical principal/loss/interest match DB and cash without loss top-up`);
       console.log('YIELD_110_SETTLEMENT ' + JSON.stringify({ protocol, principal: returnedPrincipal.toString(), loss: realizedLoss.toString(), interest: interest.toString(), balance: balance.toString() }));
       check(await client.getBalance({ address: account }) === 0n, `${protocol} Kernel holds zero native gas funds`);
       if (protocol === 'Aave') {
@@ -318,7 +371,7 @@ test('#110 cross-block durable scheduler + real sponsored Kernel lifecycle for V
       }
     }
     check(await client.readContract({ address: C.paymaster, abi: extra, functionName: 'getDeposit' }) < depositBefore, 'paymaster EntryPoint deposit paid actual gas');
-    check((await query("select execution_key from yield_actions where state in ('reserved','submitted','unknown')")).rows.length === 0, 'no unresolved yield operations after all three lifecycles');
+    check((await query("select execution_key from yield_actions where state in ('reserved','submitted','unknown')")).rows.length === 0, 'no unresolved yield operations after all lifecycles');
     console.log('YIELD_110_GAS ' + JSON.stringify(gas));
     console.log(`YIELD_110_ACCEPTANCE: ${passes} pass / 0 skip / 0 fail`);
   } finally {

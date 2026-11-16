@@ -18,7 +18,7 @@ export function yieldFixture(protocols:YieldProtocol[]=['venus','lista','aave_v3
     rate:m.protocol==='aave_v3'?RAY:WAD,scale:m.protocol==='aave_v3'?RAY:WAD,aprBps:500n,supplyOpen:true,exiting:false,underlyingDecimals:18,receiptDecimals:m.protocol==='aave_v3'?18:8}));
   const read:YieldRead={profile,observation,positions,accountValue:1000n*WAD,risks:profile.markets.map(m=>({...observation,key:`${m.protocol}:${riskSource}:${asset}`,protocol:m.protocol,asset,riskSource,underlyingMarketId:null,
     configuration:blockHash,state:'known',reason:null,supply:10_000_000n*WAD,liquidity:10_000_000n*WAD,exposure:0n,externalReserved:0n,headroom:1_000_000n*WAD,utilizationBps:0}))};
-  const state={fail:'',chainId:97,blockHash,at,receipt:10n*10n**8n,units:10n*10n**8n,tracked:10n*10n**8n,rate:WAD,claim:10n*10n**8n,utilization:8000n,reads:[] as string[],nav:1000n*WAD,paused:false,withdrawPaused:false,registryCode:'0x6000' as Hex,proofHash:hash(),proofAccount:account,proofMarket:profile.markets[0]?.marketId??hash(),proofSid:1n,proofVersion:1,proofEnabled:true,proofDaily:UINT256_MAX,proofKind:'policy',proofAssets:0n,proofShares:0n,proofRemaining:0n,proofRemoved:false,proofDuplicate:false,proofSuccess:true};
+  const state={fail:'',chainId:97,blockHash,at,receipt:10n*10n**8n,units:10n*10n**8n,tracked:10n*10n**8n,rate:WAD,claim:10n*10n**8n,utilization:8000n,reads:[] as string[],nav:1000n*WAD,cash:1000n*WAD,paused:false,withdrawPaused:false,registryCode:'0x6000' as Hex,proofHash:hash(),proofAccount:account,proofMarket:profile.markets[0]?.marketId??hash(),proofSid:1n,proofVersion:1,proofEnabled:true,proofDaily:UINT256_MAX,proofKind:'policy',proofAssets:0n,proofShares:0n,proofRemaining:0n,proofLogIndex:1,proofRemoved:false,proofDuplicate:false,proofSuccess:true};
   const sessionState={exhausted:[] as string[],gasFailure:false,missing:[] as string[],revoked:[] as string[],cleared:[] as string[],invalidNonce:[] as string[],validNonceFrom:1,missingNumber:false,missingHash:false,reorg:false,exiting:true,exitPolicyEnabled:false};
   const client=createPublicClient({transport:custom({request:async({method,params})=>{
     if(state.fail===method)throw new Error('SECRET_RPC_KEY');
@@ -49,13 +49,13 @@ export function yieldFixture(protocols:YieldProtocol[]=['venus','lista','aave_v3
         if(sessionState.gasFailure)throw new Error('SECRET_GAS_RPC');
         return encodeAbiParameters([{type:'uint128'},{type:'bool'},{type:'address'}],[sessionState.exhausted.includes(data.slice(10,18))?0n:1n,true,account]);
       }
-      if(data.startsWith(toFunctionSelector('balanceOf(address)')))return encodeAbiParameters([{type:'uint256'}],[1000n*WAD]);
+      if(data.startsWith(toFunctionSelector('balanceOf(address)')))return encodeAbiParameters([{type:'uint256'}],[state.cash]);
       if(data.startsWith(toFunctionSelector('lastSupply(address,address)')))return encodeAbiParameters([{type:'uint256'}],[0n]);
     }
     if(method==='eth_getTransactionReceipt'){
-      const business=state.proofKind==='withdraw';
-      const log={address:business?executor:registry,blockHash:state.blockHash,blockNumber:toHex(block),transactionHash:state.proofHash,transactionIndex:'0x0',logIndex:business?'0x1':'0x0',removed:state.proofRemoved,
-        topics:[toEventSelector(business?'WithdrawExecuted(address,bytes32,uint256,uint256,uint256)':state.proofKind==='exit'?'YieldExitRequested(address,bytes32)':'YieldPolicySet(address,bytes32,uint256,uint256,uint16,bool)'),encodeAbiParameters([{type:'address'}],[state.proofAccount]),state.proofMarket],
+      const business=state.proofKind==='withdraw'||state.proofKind==='supply';
+      const log={address:business?executor:registry,blockHash:state.blockHash,blockNumber:toHex(block),transactionHash:state.proofHash,transactionIndex:'0x0',logIndex:business?toHex(state.proofLogIndex):'0x0',removed:state.proofRemoved,
+        topics:[toEventSelector(business?(state.proofKind==='supply'?'SupplyExecuted(address,bytes32,uint256,uint256,uint256)':'WithdrawExecuted(address,bytes32,uint256,uint256,uint256)'):state.proofKind==='exit'?'YieldExitRequested(address,bytes32)':'YieldPolicySet(address,bytes32,uint256,uint256,uint16,bool)'),encodeAbiParameters([{type:'address'}],[state.proofAccount]),state.proofMarket],
         data:business?encodeAbiParameters([{type:'uint256'},{type:'uint256'},{type:'uint256'}],[state.proofAssets,state.proofShares,state.proofRemaining]):state.proofKind==='exit'?'0x':encodeAbiParameters([{type:'uint256'},{type:'uint256'},{type:'uint16'},{type:'bool'}],[state.proofDaily,state.proofSid,state.proofVersion,state.proofEnabled])};
       return{transactionHash:state.proofHash,transactionIndex:'0x0',blockHash:state.blockHash,blockNumber:toHex(block),from:account,to:registry,gasUsed:'0x100',cumulativeGasUsed:'0x100',effectiveGasPrice:'0x1',type:'0x2',status:state.proofSuccess?'0x1':'0x0',contractAddress:null,logsBloom:`0x${'0'.repeat(512)}`,logs:state.proofDuplicate?[log,log]:[log]};
     }

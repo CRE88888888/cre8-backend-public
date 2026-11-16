@@ -1,8 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cashDifference, accountValue, fresh, idleCash, mustExit, raw, restoreSources, restoreScaledSources, riskHeadroom, supplyDecision, UINT256_MAX, WAD, yieldProfile } from '../src/yield-domain.js';
+import { cashDifference, accountValue, fresh, idleCash, mustExit, raw, restoreSources, restoreScaledSources, restoreSourceHistory, riskHeadroom, supplyDecision, UINT256_MAX, WAD, yieldProfile } from '../src/yield-domain.js';
 import type { YieldPosition, YieldRisk } from '../src/yield-domain.js';
 import type { Address, Hex } from 'viem';
+import { stackLiquidityReserve, prefundBasis, prefundWithdrawal } from '../src/yield-prefund.js';
+import type { YieldStateQuery } from '../src/yield-runtime-state.js';
 const a: Address = `0x${'12'.repeat(20)}`, h: Hex = `0x${'34'.repeat(32)}`, now = new Date();
 const market = { id: 'venus_usdt', marketId: h, protocol: 'venus' as const, asset: a, symbol: 'USDT', receipt: a, target: a, simulated: true };
 const p: YieldPosition = { market, block: 1n, blockHash: h, at: now, source: 'rpc', state: 'known', reason: null, receipt: 1n, observedUnits: 1n, trackedUnits: 1n,
@@ -37,6 +39,64 @@ test('yield NAV includes illiquid claims once and keeps unknown as null', () => 
   assert.equal(accountValue(3n, [{ ...p, maxWithdraw: 0n }], now), 5n);
   assert.equal(accountValue(3n, [{ ...p, value: null }], now), null);
   assert.equal(accountValue(null, [], now), null);
+});
+test('#116 idle cash lends only prefund above the next installment, retaining unknown reserve', () => {
+  const cash = { allocated: 5n, earnings: 2n, prefund: 100n, reserve: 30n, observed: 107n, classified: 107n };
+  assert.equal(idleCash(cash), 77n);
+  assert.equal(idleCash({ ...cash, reserve: null }), 7n);
+  for (const reserve of [100n, 101n, UINT256_MAX]) assert.equal(idleCash({ ...cash, reserve }), 7n);
+  assert.equal(idleCash({ ...cash, reserve: 0n }), 107n);
+  assert.equal(idleCash({ ...cash, prefund: 0n }), 7n);
+  assert.equal(idleCash({ ...cash, observed: 108n }), 0n);
+});
+test('#116 reserve sums each active next budget including fee, final remainder and unreserved dust', async () => {
+  const at = new Date('2026-11-17T00:00:00Z');
+  const source = { budget_raw: '101', effective_slices: 3, first_slot_at: at, mode: { kind: 'stack', every: 'daily' }, next_index: 0, carry: '0' };
+  let rows: unknown[] = [source], legacy: unknown[] = [];
+  const db: YieldStateQuery = async sql => ({ rows: sql.includes('stack_instructions') ? legacy : rows });
+  assert.equal(await stackLiquidityReserve(db, 97, 1, new Date(+at - 1)), 33n);
+  assert.equal(await stackLiquidityReserve(db, 97, 1, at), 33n);
+  rows = [{ ...source, next_index: 2, carry: '7' }, { ...source, mode: { kind: 'stack', every: 'weekly' } }, { mode: { kind: 'hold' } }];
+  assert.equal(await stackLiquidityReserve(db, 97, 1, at), 75n);
+  rows = [source];
+  assert.equal(await stackLiquidityReserve(db, 97, 1, new Date(+at + 2 * 86400000)), 35n);
+  assert.equal(await stackLiquidityReserve(db, 97, 1, new Date(+at + 3 * 86400000)), 0n);
+  rows = [{ ...source, budget_raw: UINT256_MAX.toString(), effective_slices: 1 }];
+  assert.equal(await stackLiquidityReserve(db, 97, 1, at), UINT256_MAX);
+  rows.push({ ...source, effective_slices: 1 });
+  assert.equal(await stackLiquidityReserve(db, 97, 1, at), null);
+  for (const patch of [{ mode: null }, { first_slot_at: null }, { effective_slices: 0 }, { effective_slices: 53 }, { next_index: 4 }, { budget_raw: '0' }, { carry: '-1' }]) {
+    rows = [{ ...source, ...patch }]; assert.equal(await stackLiquidityReserve(db, 97, 1, at), null);
+  }
+  rows = []; assert.equal(await stackLiquidityReserve(db, 97, 1, at), 0n);
+  legacy = [{}]; assert.equal(await stackLiquidityReserve(db, 97, 1, at), null);
+  await assert.rejects(stackLiquidityReserve(async () => { throw new Error('DB timeout'); }, 97, 1, at), /DB timeout/);
+});
+test('#116 outstanding prefund basis follows FIFO/scaled units, consumes realized losses and never borrows another source', () => {
+  const first = { kind: 'supply' as const, assets: 10n, before: 0n, after: 5n, prefund: 0n };
+  const second = { kind: 'supply' as const, assets: 20n, before: 5n, after: 15n, prefund: 20n };
+  const loss = { kind: 'withdraw' as const, assets: 0n, before: 15n, after: 10n, prefund: 0n };
+  assert.deepEqual(prefundBasis([first, second, loss], false), { principal: 20n, units: 10n });
+  assert.deepEqual(prefundBasis([first, second, loss], true), { principal: 14n, units: 10n });
+  for (const scaled of [false, true]) {
+    assert.deepEqual(prefundBasis([], scaled), { principal: 0n, units: 0n });
+    assert.deepEqual(prefundBasis([first, second, loss, { ...loss, before: 10n, after: 0n }], scaled), { principal: 0n, units: 0n });
+    assert.throws(() => prefundBasis([{ ...first, prefund: 11n }], scaled));
+    assert.throws(() => prefundBasis([first, { ...loss, before: 6n }], scaled));
+    assert.throws(() => prefundBasis([first, { ...loss, before: 5n, after: 5n }], scaled));
+  }
+});
+test('#116 shortfall redemption respects receipt rounding, liquidity, units, pause and freshness without a supply cooldown', () => {
+  const position = { ...p, receipt: 100n, observedUnits: 100n, trackedUnits: 100n, maxWithdraw: 200n, maxRedeem: 100n };
+  assert.equal(prefundWithdrawal(position, 20n, 100n, now), 10n);
+  assert.equal(prefundWithdrawal(position, 21n, 100n, now), 11n);
+  assert.equal(prefundWithdrawal(position, 0n, 100n, now), 0n);
+  assert.equal(prefundWithdrawal({ ...position, maxWithdraw: 9n }, 21n, 100n, now), 4n);
+  assert.equal(prefundWithdrawal({ ...position, maxRedeem: 3n }, 21n, 100n, now), 3n);
+  assert.equal(prefundWithdrawal({ ...position, market: { ...market, protocol: 'aave_v3' } }, 21n, 100n, now), 21n);
+  for (const patch of [{ withdrawPaused: true }, { maxWithdraw: null }, { maxRedeem: 0n }, { rate: 0n }, { scale: null }, { observedUnits: 99n }, { state: 'unknown' as const }, { at: new Date(+now - 60001) }]) {
+    assert.equal(prefundWithdrawal({ ...position, ...patch }, 20n, 100n, now), 0n);
+  }
 });
 test('yield redemption preserves cash origin, handles partial lots and accrues only actual returned interest', () => {
   const supplies = [{ assets: 10n, shares: 3n, sources: { allocated_cash_raw: '10' } }];
@@ -139,4 +199,77 @@ test('#104 sequential sell floors fund buys, retain the fee top-up and do not to
   assert.equal(yieldRebalanceDue('drift',last,500,now),false);
   assert.equal(yieldRebalanceDue('drift',last,501,now),true);
   assert.equal(yieldRebalanceDue('none',last,9000,now),false);
+});
+test('#117 directed prefund redemption bypasses older allocated basis for fixed and scaled receipts', () => {
+  const supplies=[{assets:1000000n,shares:1000000n,sources:{allocated_cash_raw:'1000000'}},
+    {assets:300n,shares:300n,sources:{stack_prefund_raw:'300'}}];
+  const withdrawal={shares:100n,assets:100n,prefundTarget:100n};
+  assert.equal(restoreSources(supplies,[withdrawal]).stack_prefund_raw,'100');
+  const events=[{kind:'supply' as const,assets:1000000n,unitsBefore:0n,unitsAfter:1000000n,sources:{allocated_cash_raw:'1000000'}},
+    {kind:'supply' as const,assets:300n,unitsBefore:1000000n,unitsAfter:1000300n,sources:{stack_prefund_raw:'300'}},
+    {kind:'withdraw' as const,assets:100n,unitsBefore:1000300n,unitsAfter:1000200n,prefundTarget:100n}];
+  assert.equal(restoreScaledSources(events).stack_prefund_raw,'100');
+});
+
+test('#117 directed attribution caps gap and basis, preserves interest and consumes actual loss without makeup',()=>{
+  const supplies=[{assets:1000000n,shares:1000000n,sources:{allocated_cash_raw:'1000000'}},{assets:300n,shares:300n,sources:{stack_prefund_raw:'300'}}];
+  for(const [assets,target,prefund,allocated,interest]of [[100n,100n,100n,0n,0n],[110n,100n,100n,0n,10n],[80n,100n,80n,0n,0n],[100n,0n,0n,100n,0n],[100n,50n,50n,50n,0n],[400n,400n,300n,100n,0n]]){
+    assert.ok(assets!==undefined&&target!==undefined&&prefund!==undefined&&allocated!==undefined&&interest!==undefined);
+    const shares=target===400n?400n:100n;
+    const credits=restoreSources(supplies,[{shares,assets,prefundTarget:target}]);
+    assert.equal(BigInt(credits.stack_prefund_raw??'0'),prefund);assert.equal(BigInt(credits.allocated_cash_raw??'0'),allocated);assert.equal(BigInt(credits.yield_raw??'0'),interest);
+  }
+  const exits=[{shares:100n,assets:80n,prefundTarget:100n},{shares:1000200n,assets:1000200n}];
+  assert.deepEqual(restoreSources(supplies,exits),{allocated_cash_raw:'1000000',stack_prefund_raw:'280',yield_raw:'0'});
+  assert.throws(()=>restoreSources(supplies,[{shares:0n,assets:100n,prefundTarget:100n}]));
+  assert.throws(()=>restoreSources(supplies,[{shares:100n,assets:100n,prefundTarget:-1n}]));
+});
+
+test('#117 accrued receipt growth cannot leave a nominal prefund shortfall or realize the same interest twice',()=>{
+  const events=[{kind:'supply' as const,assets:1000n,unitsBefore:0n,unitsAfter:1000n,sources:{allocated_cash_raw:'1000'}},
+    {kind:'supply' as const,assets:300n,unitsBefore:1000n,unitsAfter:1300n,sources:{stack_prefund_raw:'300'}},
+    {kind:'withdraw' as const,assets:100n,unitsBefore:1300n,unitsAfter:1250n,prefundTarget:100n}];
+  for(const scaled of [false,true]){
+    const ledger=restoreSourceHistory(events,scaled);
+    assert.equal(ledger.returned.stack_prefund_raw,'100');assert.equal(ledger.returned.yield_raw,'0');
+    assert.equal(ledger.remaining.stack_prefund_raw,'200');assert.equal(ledger.remaining.allocated_cash_raw,'1000');
+    const final=restoreSourceHistory([...events,{kind:'withdraw',assets:2500n,unitsBefore:1250n,unitsAfter:0n}],scaled);
+    assert.equal(final.returned.stack_prefund_raw,'300');assert.equal(final.returned.allocated_cash_raw,'1000');assert.equal(final.returned.yield_raw,'1300');
+  }
+});
+
+test('#117 repeated directed draws across a later supply conserve source basis, including total loss and uint256 boundary',()=>{
+  const events=[{kind:'supply' as const,assets:1000n,unitsBefore:0n,unitsAfter:1000n,sources:{allocated_cash_raw:'1000'}},
+    {kind:'supply' as const,assets:300n,unitsBefore:1000n,unitsAfter:1300n,sources:{stack_prefund_raw:'300'}},
+    {kind:'withdraw' as const,assets:100n,unitsBefore:1300n,unitsAfter:1200n,prefundTarget:100n},
+    {kind:'supply' as const,assets:100n,unitsBefore:1200n,unitsAfter:1300n,sources:{stack_prefund_raw:'100'}},
+    {kind:'withdraw' as const,assets:100n,unitsBefore:1300n,unitsAfter:1200n,prefundTarget:100n}];
+  for(const scaled of [false,true]){
+    const ledger=restoreSourceHistory(events,scaled);
+    assert.equal(ledger.returned.stack_prefund_raw,'200');assert.equal(ledger.remaining.stack_prefund_raw,'200');
+    assert.equal(ledger.remaining.allocated_cash_raw,'1000');assert.equal(ledger.returned.yield_raw,'0');
+    const final=restoreSourceHistory([...events,{kind:'withdraw',assets:1200n,unitsBefore:1200n,unitsAfter:0n}],scaled);
+    assert.equal(final.returned.stack_prefund_raw,'400');assert.equal(final.returned.allocated_cash_raw,'1000');assert.equal(final.returned.yield_raw,'0');
+    const supply={kind:'supply' as const,assets:UINT256_MAX,unitsBefore:0n,unitsAfter:UINT256_MAX,sources:{stack_prefund_raw:UINT256_MAX.toString()}};
+    for(const assets of [0n,UINT256_MAX]){
+      const cleared=restoreSourceHistory([supply,{kind:'withdraw',assets,unitsBefore:UINT256_MAX,unitsAfter:0n,prefundTarget:UINT256_MAX}],scaled);
+      assert.equal(BigInt(cleared.returned.stack_prefund_raw??'0'),assets);assert.equal(cleared.remaining.stack_prefund_raw,'0');assert.equal(cleared.returned.yield_raw,'0');
+    }
+  }
+});
+
+test('#117 unknown period evidence uses separate conservative windows for wait facts',async()=>{
+  const {recordPrefundWait}=await import('../src/yield-prefund.js');
+  const facts=new Map<string,unknown>();
+  const db:YieldStateQuery=async(sql,params=[])=>{
+    if(sql.startsWith('select l.id::text'))return{rows:[{lot_id:'1',asset:a,first_slot_at:null,next_index:0,every:'daily'}]};
+    if(sql.startsWith('insert into yield_runtime_state')){
+      const name=params[0],value=params[1];
+      if(typeof name!=='string'||typeof value!=='string')throw new Error('invalid public wait fact');
+      if(!facts.has(name))facts.set(name,JSON.parse(value));return{rows:[]};
+    }
+    return{rows:[{matches:true}]};
+  };
+  for(const at of [now,now,new Date(+now+86400000)])await recordPrefundWait(db,97,1,null,0n,'schedule_unknown',{now:at,marketId:h});
+  assert.equal(facts.size,2);
 });

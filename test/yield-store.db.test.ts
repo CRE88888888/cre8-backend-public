@@ -10,6 +10,12 @@ import { WAD, RAY, UINT256_MAX } from '../src/yield-domain.js';
 import { AppError } from '../src/errors.js';
 import type { YieldRead } from '../src/yield-domain.js';
 import type { YieldPlan, YieldPrepare, YieldEvidence } from '../src/yield-port.js';
+import type { AssetExecution } from '../src/strategy-execution.js';
+import type { JobContext } from '../src/strategy-jobs.js';
+import { fundingLots, prepareStrategyJob } from '../src/strategy-jobs.js';
+import { createYieldService } from '../src/yield-service.js';
+import { stackLiquidityReserve, recordPrefundWait } from '../src/yield-prefund.js';
+import { readPrefundPositions } from '../src/yield-store.js';
 import { gasExecutionKey } from '../src/paymaster.js';
 import type { Reservation } from '../src/paymaster.js';
 import { yieldFixture, address, hash } from './fixtures/yield.js';
@@ -17,15 +23,18 @@ import { config, kernelCall, operation } from './fixtures/paymaster.js';
 
 const paymasters:string[]=[];
 after(async()=>{if(paymasters.length)await query('delete from paymaster_sponsorships where chain_id=97 and paymaster=any($1::text[])',[paymasters]);await closePool();});
-async function fixture(read?:YieldRead,rebalance:'none'|'monthly'|'drift'='none',f=yieldFixture(['venus'])){
+async function fixture(read?:YieldRead,rebalance:'none'|'monthly'|'drift'='none',f=yieldFixture(['venus']),stackSlices=0){
   await migrate();const r=read??f.read;
   await syncYieldCatalog(r);const market=r.profile.markets[0];assert.ok(market);
   const owner=address(),account=f.account;
   const strategy=(await query<{id:string}>("insert into strategies(provider,name) values($1,'be84-yield') returning id::text",[owner])).rows[0];assert.ok(strategy);
   await query('update strategies set onchain_id=$2 where id=$1',[strategy.id,BigInt(strategy.id)+84000000n]);
-  const execution={kind:'per_asset',numeraire:market.asset,rebalance,assets:[{asset:market.asset,weightBps:10000,yield:{market:market.id}}]};
+  const stackAsset=address();
+  const stack:AssetExecution['assets']=stackSlices?[{asset:stackAsset,weightBps:10000,yield:null,execution:{kind:'stack',every:'daily',weekday:null,timeUtc:'00:00',slices:stackSlices}}]:[];
+  const execution:AssetExecution={kind:'per_asset',numeraire:market.asset,rebalance,assets:[{asset:market.asset,weightBps:stackSlices?0:10000,yield:{market:market.id}},
+    ...stack]};
   await query(`insert into strategy_versions(strategy_id,version,allocation,schedule,active_at,execution_schema_version,execution,execution_chain_id,config_hash)
-    values($1,1,$2,'{"kind":"funding"}',now()-interval '1 day',2,$3,97,$4)`,[strategy.id,JSON.stringify({assets:[{address:market.asset,weightBps:10000}]}),JSON.stringify(execution),hash()]);
+    values($1,1,$2,'{"kind":"funding"}',now()-interval '1 day',2,$3,97,$4)`,[strategy.id,JSON.stringify({assets:execution.assets.map(a=>({address:a.asset,weightBps:a.weightBps}))}),JSON.stringify(execution),hash()]);
   const p=(await query<{id:string}>("insert into portfolios(user_id,strategy_id,version,schedule_state) values($1,$2,1,'active') returning id::text",[owner,strategy.id])).rows[0];assert.ok(p);
   await query("insert into smart_accounts(portfolio_id,chain_id,address,owner,account_type) values($1,97,$2,$3,'KERNEL')",[p.id,account,owner]);
   const context={portfolioId:Number(p.id),chainId:97,account};
@@ -49,7 +58,7 @@ async function fixture(read?:YieldRead,rebalance:'none'|'monthly'|'drift'='none'
   let current=prepared();
   const ctx:JournalContext={...context,cashAsset:market.asset,consentId:consent.id,exitRequestId:null,sources:{allocated_cash_raw:(50n*WAD).toString()},reserve:()=>current.reservation,validate:async()=>{},settlement:async()=>proof};
   const journal=createYieldJournal(ctx);
-  return{...f,owner,strategyId:strategy.id,context,plan,ctx,journal,get current(){return current;},set current(v){current=v;},prepared,setProof:(v:SettlementRead)=>{proof=v;},read:r,market};
+  return{...f,execution,stackAsset,owner,strategyId:strategy.id,context,plan,ctx,journal,get current(){return current;},set current(v){current=v;},prepared,setProof:(v:SettlementRead)=>{proof=v;},read:r,market};
 }
 const balance=async(id:number)=>(await query<{n:string}>('select allocated_cash_raw::text as n from strategy_cash_balances where portfolio_id=$1',[id])).rows[0]?.n;
 const locked=<T>(id:number,fn:()=>Promise<T>)=>withPortfolioLock(id,fn);
@@ -707,4 +716,308 @@ test('#113 cursor DB failure aborts the round before any account attempt and a r
     assert.equal(attempts,0);await blocker.query('rollback');
     await runYieldRound({dryRun:false,limit:1},overrides);assert.equal(attempts,1);
   }finally{await blocker.query('rollback');await blocker.end();if(previous===undefined)delete process.env.CHAIN_ID;else process.env.CHAIN_ID=previous;}
+});
+
+async function prefundFixture(amount=400n*WAD){
+  const f=await fixture(undefined,'none',yieldFixture(['venus']),4),id=f.context.portfolioId;
+  const confirmed=new Date(f.at);confirmed.setUTCHours(0,0,0,-1);
+  await withTransaction(async db=>{
+    await db.query(`insert into strategy_funding_lots(chain_id,portfolio_id,strategy_id,version,kind,tx_hash,log_index,block_number,block_hash,amount_raw,minimum_contribution_raw,effective_slices,created_at,updated_at)
+      values(97,$1,$2,1,'asset',$3,0,10,$4,$5,$6,$7,$8,$8)`,[id,f.strategyId,hash(),f.blockHash,amount.toString(),(50n*WAD).toString(),JSON.stringify({[f.stackAsset]:4}),confirmed]);
+    await db.query('update strategy_cash_balances set allocated_cash_raw=0,stack_prefund_raw=$2 where portfolio_id=$1',[id,amount.toString()]);
+  });
+  f.state.cash=amount;f.state.proofSid=BigInt(f.strategyId)+84000000n;
+  await upgraded(f,1);
+  const position=f.read.positions[0];assert.ok(position);
+  const actions:{kind:string;amount:bigint}[]=[],control={failure:false};
+  const service=createYieldService({profile:()=>f.profile,client:()=>f.client,now:()=>f.at,read:async()=>structuredClone(f.read),canSend:()=>true,
+    port:async()=>({reconcileYieldOperation:async()=>{throw new Error('unexpected reconcile');},submitYieldAction:async args=>{
+      actions.push({kind:args.action.kind,amount:args.action.amount});
+      if(control.failure)throw new Error('SECRET_RPC_TIMEOUT');
+      const amount=args.action.amount,kind=args.action.kind,nonce=BigInt(actions.length);
+      const prepared=f.prepared({...f.plan,kind,amount,minimum:amount,assetBalance:f.state.cash,receiptBalance:position.receipt??0n},nonce);
+      assert.ok(args.paymaster?.reserve);await args.paymaster.reserve(prepared.reservation);
+      await args.journal.prepare(prepared.input);await args.journal.sending(prepared.input.executionKey);
+      const remaining=(position.receipt??0n)+(kind==='supply'?amount:-amount);
+      f.state.cash+=kind==='supply'?-amount:amount;
+      Object.assign(position,{receipt:remaining,observedUnits:remaining,trackedUnits:remaining,claim:remaining,value:remaining,maxWithdraw:remaining,maxRedeem:remaining});
+      f.read.risks=f.read.risks.map(r=>({...r,exposure:remaining}));
+      const evidence={assets:amount,shares:amount,remainingReceipts:remaining,txHash:hash(),userOpHash:prepared.input.userOpHash,gasUsed:1n};
+      Object.assign(f.state,{proofKind:kind,proofHash:evidence.txHash,proofAssets:amount,proofShares:amount,proofRemaining:remaining,proofLogIndex:Number(nonce)});
+      await args.journal.confirmed(prepared.input.executionKey,evidence);
+      await args.journal.confirmed(prepared.input.executionKey,evidence);
+      return evidence;
+    }})});
+  const context:JobContext={...f.context,strategyId:Number(f.strategyId),version:1,kind:'asset',execution:f.execution,
+    allocation:{assets:f.execution.assets.map(a=>({address:a.asset,weightBps:a.weightBps}))},cash:f.asset,now:f.at,reserve:WAD/4n,
+    caps:new Map([[f.stackAsset,null]]),buyLimit:UINT256_MAX,observedCash:amount,enabled:true,marketOpen:true};
+  const reserve=async(now=f.at)=>locked(id,async()=>prepareStrategyJob(fn=>withTransaction(db=>fn({query:(sql,params)=>db.query(sql,params?[...params]:[])})),
+    {...context,now,observedCash:f.state.cash},await fundingLots(query,context)));
+  return Object.assign(f,{position,service,actions,control,reserve});
+}
+
+test('#117 owner withdrawal is reconciled before installment admission and triggers prefund recovery without a permanent skip',async()=>{
+  const f=await prefundFixture(),id=f.context.portfolioId;
+  await locked(id,()=>f.service.tick(f.context,false));
+  f.state.cash=0n;
+  const context:JobContext={...f.context,strategyId:Number(f.strategyId),version:1,kind:'asset',execution:f.execution,
+    allocation:{assets:f.execution.assets.map(a=>({address:a.asset,weightBps:a.weightBps}))},cash:f.asset,now:f.at,reserve:WAD/4n,
+    caps:new Map([[f.stackAsset,null]]),buyLimit:UINT256_MAX,observedCash:0n,enabled:true,marketOpen:true,
+    withdrawals:[{txHash:hash(),logIndex:0,blockNumber:100n,blockHash:f.blockHash,amount:100n*WAD}]};
+  const lots=await fundingLots(query,context);
+  const result=await locked(id,()=>prepareStrategyJob(fn=>withTransaction(db=>fn({query:(sql,params)=>db.query(sql,params?[...params]:[])})),context,lots));
+  assert.match(result?.reason??'',/YIELD_PREFUND_PENDING/);
+  assert.equal((await query('select * from strategy_asset_slices where lot_id in (select id from strategy_funding_lots where portfolio_id=$1)',[id])).rows.length,0);
+  assert.match(await locked(id,()=>f.service.tick(f.context,false))??'',/YIELD_PREFUND_PENDING.*領出已確認/);
+  assert.equal((await query<{p:string}>('select stack_prefund_raw::text p from strategy_cash_balances where portfolio_id=$1',[id])).rows[0]?.p,(100n*WAD).toString());
+});
+
+test('#117 pending facts deduplicate within a period but retain separate windows and markets',async()=>{
+  const f=await prefundFixture(),id=f.context.portfolioId;
+  for(const now of [f.at,f.at,new Date(+f.at+86400000)]){
+    await recordPrefundWait(query,97,id,100n*WAD,0n,'withdraw_failed',{now,marketId:f.market.marketId});
+  }
+  await recordPrefundWait(query,97,id,100n*WAD,50n*WAD,'withdraw_failed',{now:f.at,marketId:f.market.marketId});
+  await recordPrefundWait(query,97,id,100n*WAD,0n,'withdraw_failed',{now:f.at,marketId:hash()});
+  const facts=(await query<{value:{marketId:string;periods:{lotId:string;asset:string;slotIndex:number}[]}}>('select value from yield_runtime_state where name like $1',[`fact-prefund-97-${id}-%`])).rows;
+  assert.equal(facts.length,3);assert.ok(facts.every(f=>f.value.periods.length===1&&f.value.periods[0]?.asset));
+});
+
+test('#116 supplies excess prefund, reserves one fee-inclusive period, then automatically withdraws only the next gap and settles once',async()=>{
+  const f=await prefundFixture(),id=f.context.portfolioId;
+  assert.equal(await stackLiquidityReserve(query,97,id,f.at),100n*WAD);
+  assert.equal(await locked(id,()=>f.service.tick(f.context,false)),'生息供給已確認');
+  assert.deepEqual(f.actions,[{kind:'supply',amount:300n*WAD}]);
+  const sources=(await query<{source_breakdown:unknown}>('select source_breakdown from yield_actions where portfolio_id=$1',[id])).rows[0]?.source_breakdown;
+  assert.deepEqual(sources,{allocated_cash_raw:'0',yield_raw:'0',stack_prefund_raw:(300n*WAD).toString()});
+  const first=await f.reserve();assert.ok(first?.job);assert.equal(first.job.fee_reserve_raw,(WAD/4n).toString());
+  assert.equal(BigInt(first.job.amount_raw)+BigInt(first.job.fee_reserve_raw),100n*WAD);
+  const result=await locked(id,()=>f.service.tick(f.context,false));assert.match(result??'',/YIELD_PREFUND_PENDING.*領出已確認/);
+  assert.deepEqual(f.actions[1],{kind:'withdraw',amount:100n*WAD});
+  const cash=(await query<{stack_prefund_raw:string;allocated_cash_raw:string;yield_raw:string}>('select stack_prefund_raw::text,allocated_cash_raw::text,yield_raw::text from strategy_cash_balances where portfolio_id=$1',[id])).rows[0];
+  assert.equal(cash?.stack_prefund_raw,(100n*WAD).toString());assert.equal(cash.allocated_cash_raw,'0');assert.equal(cash.yield_raw,'0');
+  assert.deepEqual(await readPrefundPositions(query,97,id),[{marketId:f.market.marketId,principal:200n*WAD,units:200n*WAD}]);
+  assert.equal((await query('select execution_key from yield_events where portfolio_id=$1',[id])).rows.length,2);
+  assert.equal((await query('select name from yield_runtime_state where name like $1',[`fact-prefund-97-${id}-%`])).rows.length,1);
+});
+
+test('#116 unavailable withdrawals defer the installment durably without borrowing hold, allocated cash or earnings',async()=>{
+  const f=await prefundFixture(),id=f.context.portfolioId;
+  await locked(id,()=>f.service.tick(f.context,false));
+  // Execute the first period through the ordinary immutable job/batch settlement path.
+  const job=await f.reserve();assert.ok(job?.job);
+  const {settleStrategyBatch}=await import('../src/strategy-jobs.js');
+  const j=job.job;
+  const op=await withTransaction(async db=>{
+    await db.query("update strategy_jobs set state='running',asset_started_at=slot_at,updated_at=clock_timestamp() where id=$1",[j.id]);
+    await db.query('insert into strategy_job_batches(job_id,batch_index,input_raw) values($1,0,$2)',[j.id,JSON.stringify(j.remaining_input)]);
+    const row=(await db.query<{id:string}>(`insert into operations(portfolio_id,type,state,idempotency_key,payload_hash,deadline,user_op_nonce,strategy_job_id,strategy_batch_index)
+      values($1,'rebalance','pending',$2,$3,$4,0,$5,0) returning id::text`,[id,hash(),hash(),new Date(+f.at+300000),j.id])).rows[0];assert.ok(row);
+    await db.query("update operations set state='submitted',user_op_hash=$2,tx_hash=$3 where id=$1",[row.id,hash(),hash()]);return row.id;
+  });
+  await settleStrategyBatch(fn=>withTransaction(db=>fn({query:(sql,params)=>db.query(sql,params?[...params]:[])})),f.context,op,
+    {received:{[f.stackAsset]:'1'},fees:{},feePaid:WAD/4n,blockNumber:100n,blockHash:f.blockHash});
+  f.state.cash=0n;
+  await query('update strategy_cash_balances set allocated_cash_raw=$2,yield_raw=$3,unallocated_hold_raw=$4 where portfolio_id=$1',[id,(50n*WAD).toString(),(20n*WAD).toString(),(10n*WAD).toString()]);
+  f.state.cash=80n*WAD;
+  const before=(await query('select * from strategy_cash_balances where portfolio_id=$1',[id])).rows;
+  for(const patch of [{maxWithdraw:0n,maxRedeem:0n},{maxWithdraw:300n*WAD,maxRedeem:300n*WAD,withdrawPaused:true}]){
+    Object.assign(f.position,patch);
+    assert.match(await locked(id,()=>f.service.tick(f.context,false))??'',/YIELD_PREFUND_PENDING/);
+    const deferred=await f.reserve();assert.equal(deferred?.job,null);assert.match(deferred?.reason??'',/YIELD_PREFUND_PENDING/);
+  }
+  assert.equal(f.actions.length,1);assert.deepEqual((await query('select * from strategy_cash_balances where portfolio_id=$1',[id])).rows,before);
+  assert.equal((await query("select slice_index from strategy_asset_slices where lot_id in (select id from strategy_funding_lots where portfolio_id=$1)",[id])).rows.length,1);
+  assert.equal((await query('select name from yield_runtime_state where name like $1',[`fact-prefund-97-${id}-%`])).rows.length,2);
+  Object.assign(f.position,{withdrawPaused:false});f.control.failure=true;
+  await assert.rejects(locked(id,()=>f.service.tick(f.context,false)),e=>e instanceof AppError&&!e.message.includes('SECRET'));
+  assert.equal((await query("select name from yield_runtime_state where name like $1 and value->>'reason'='withdraw_failed'",[`fact-prefund-97-${id}-%`])).rows.length,1);
+  assert.deepEqual((await query('select * from strategy_cash_balances where portfolio_id=$1',[id])).rows,before);
+});
+
+test('#116 unknown next schedule retains every prefund raw while ordinary idle cash still follows supply gates',async()=>{
+  const f=await prefundFixture(),id=f.context.portfolioId;
+  await query('update strategy_cash_balances set allocated_cash_raw=$2 where portfolio_id=$1',[id,(50n*WAD).toString()]);f.state.cash+=50n*WAD;
+  async function overrides<T extends QueryResultRow=QueryResultRow>(sql:string,params?:readonly unknown[]){
+    const result=await query<T>(sql,params);
+    if(sql.includes('select a.budget_raw::text'))for(const row of result.rows)Reflect.set(row,'first_slot_at',null);
+    return result;
+  }
+  // Observe production selection here; journal rollback is covered separately below.
+  let supplied=0n;
+  const service=createYieldService({query:overrides,profile:()=>f.profile,client:()=>f.client,read:async()=>structuredClone(f.read),now:()=>f.at,canSend:()=>true,
+    port:async()=>({reconcileYieldOperation:async()=>{throw new Error('unexpected reconcile');},submitYieldAction:async args=>{
+      supplied=args.action.amount;return{assets:supplied,shares:supplied,remainingReceipts:supplied,txHash:hash(),userOpHash:hash(),gasUsed:1n};
+    }})});
+  await locked(id,()=>service.tick(f.context,false));assert.equal(supplied,50n*WAD);
+  assert.equal((await query<{n:string}>('select stack_prefund_raw::text as n from strategy_cash_balances where portfolio_id=$1',[id])).rows[0]?.n,(400n*WAD).toString());
+});
+
+test('#116 journal revalidates the next reserve atomically; canonical revert restores prefund once and DB failure never debits it',async()=>{
+  const f=await prefundFixture(),id=f.context.portfolioId;
+  const prepare=(amount:bigint,nonce:bigint)=>{f.current=f.prepared({...f.plan,amount,minimum:amount,assetBalance:400n*WAD},nonce);f.ctx.sources={stack_prefund_raw:amount.toString()};};
+  prepare(300n*WAD+1n,1n);
+  await assert.rejects(locked(id,()=>f.journal.prepare(f.current.input)));
+  assert.equal((await query('select execution_key from yield_actions where portfolio_id=$1',[id])).rows.length,0);
+  prepare(300n*WAD,2n);
+  const failed=createYieldJournal(f.ctx,{transaction:fn=>withTransaction(async db=>{await fn(db);throw new Error('SECRET_DB_COMMIT_TIMEOUT');})});
+  await assert.rejects(locked(id,()=>failed.prepare(f.current.input)));
+  assert.equal((await query('select execution_key from yield_actions where portfolio_id=$1',[id])).rows.length,0);
+  await locked(id,()=>f.journal.prepare(f.current.input));
+  const key=f.current.input.executionKey,evidence={status:'reverted' as const,txHash:hash(),userOpHash:f.current.input.userOpHash,gasUsed:1n,retryable:false};
+  await locked(id,()=>f.journal.reverted(key,evidence));await locked(id,()=>f.journal.reverted(key,evidence));
+  assert.equal((await query<{n:string}>('select stack_prefund_raw::text as n from strategy_cash_balances where portfolio_id=$1',[id])).rows[0]?.n,(400n*WAD).toString());
+  assert.equal((await query('select execution_key from yield_actions where portfolio_id=$1',[id])).rows.length,1);
+});
+
+test('#116 mixed source redemption credits prefund principal and interest separately; losses consume basis without makeup or duplicate replay',async()=>{
+  for(const lost of [false,true]){
+    const f=await fixture(),id=f.context.portfolioId,position=f.read.positions[0];assert.ok(position);
+    await query('update strategy_cash_balances set stack_prefund_raw=$2 where portfolio_id=$1',[id,(30n*WAD).toString()]);
+    f.ctx.sources={allocated_cash_raw:(20n*WAD).toString(),stack_prefund_raw:(30n*WAD).toString()};
+    await locked(id,()=>f.journal.prepare(f.current.input));
+    Object.assign(position,{receipt:50n*WAD,observedUnits:50n*WAD,trackedUnits:50n*WAD,claim:50n*WAD,value:50n*WAD});
+    f.setProof({read:f.read,logIndex:0,blockNumber:100n,blockHash:f.blockHash,occurredAt:f.at});
+    await locked(id,()=>f.journal.confirmed(f.current.input.executionKey,{assets:50n*WAD,shares:50n*WAD,remainingReceipts:50n*WAD,txHash:hash(),userOpHash:f.current.input.userOpHash,gasUsed:1n}));
+    const proceeds=(lost?40n:55n)*WAD;
+    f.current=f.prepared({...f.plan,kind:'withdraw',amount:50n*WAD,minimum:proceeds,receiptBalance:50n*WAD},1n);f.ctx.sources={};f.ctx.consentId=null;
+    await locked(id,()=>f.journal.prepare(f.current.input));
+    Object.assign(position,{receipt:0n,observedUnits:0n,trackedUnits:0n,claim:0n,value:0n});
+    f.setProof({read:f.read,logIndex:1,blockNumber:100n,blockHash:f.blockHash,occurredAt:f.at});
+    const e={assets:proceeds,shares:50n*WAD,remainingReceipts:0n,txHash:hash(),userOpHash:f.current.input.userOpHash,gasUsed:1n};
+    for(let n=0;n<2;n++)await locked(id,()=>f.journal.confirmed(f.current.input.executionKey,e));
+    const cash=(await query<{p:string;y:string;a:string}>('select stack_prefund_raw::text p,yield_raw::text y,allocated_cash_raw::text a from strategy_cash_balances where portfolio_id=$1',[id])).rows[0];
+    assert.equal(cash?.p,((lost?24n:30n)*WAD).toString());assert.equal(cash.y,((lost?0n:5n)*WAD).toString());
+    assert.equal(cash.a,((lost?996n:1000n)*WAD).toString());
+    assert.deepEqual(await readPrefundPositions(query,97,id),[{marketId:f.market.marketId,principal:0n,units:0n}]);
+  }
+});
+
+test('#116 an expired unstarted installment returns its own cash before deferring a larger final remainder',async()=>{
+  const f=await prefundFixture(400n*WAD+3n),id=f.context.portfolioId;
+  await locked(id,()=>f.service.tick(f.context,false));
+  const first=await f.reserve();assert.ok(first?.job?.window_end_at);
+  const finalWindow=new Date(+first.job.window_end_at+2*86400000);
+  const next=await f.reserve(finalWindow);
+  assert.equal(next?.job,null);assert.match(next?.reason??'',/YIELD_PREFUND_PENDING/);
+  assert.equal((await query<{state:string}>('select state from strategy_jobs where id=$1',[first.job.id])).rows[0]?.state,'cancelled');
+  assert.equal((await query('select slice_index from strategy_asset_slices where lot_id in (select id from strategy_funding_lots where portfolio_id=$1)',[id])).rows.length,1);
+  assert.equal((await query<{n:string}>('select stack_prefund_raw::text n from strategy_cash_balances where portfolio_id=$1',[id])).rows[0]?.n,(100n*WAD).toString());
+});
+
+test('#116 Aave prefund basis uses canonical scaled snapshots through raw rebase and rejects missing original units',async()=>{
+  const f=await fixture(undefined,'none',yieldFixture(['aave_v3'])),id=f.context.portfolioId,position=f.read.positions[0];assert.ok(position);
+  await query('update strategy_cash_balances set stack_prefund_raw=$2 where portfolio_id=$1',[id,(30n*WAD).toString()]);
+  f.current=f.prepared({...f.plan,scaledReceiptBalance:0n});f.ctx.sources={allocated_cash_raw:(20n*WAD).toString(),stack_prefund_raw:(30n*WAD).toString()};
+  await locked(id,()=>f.journal.prepare(f.current.input));
+  Object.assign(position,{receipt:50n*WAD,observedUnits:40n*WAD,trackedUnits:40n*WAD,claim:50n*WAD,value:50n*WAD,rate:5n*RAY/4n});
+  f.setProof({read:f.read,logIndex:0,blockNumber:100n,blockHash:f.blockHash,occurredAt:f.at});
+  await locked(id,()=>f.journal.confirmed(f.current.input.executionKey,{assets:50n*WAD,shares:50n*WAD,remainingReceipts:50n*WAD,txHash:hash(),userOpHash:f.current.input.userOpHash,gasUsed:1n}));
+  assert.deepEqual(await readPrefundPositions(query,97,id),[{marketId:f.market.marketId,principal:30n*WAD,units:40n*WAD}]);
+  f.current=f.prepared({...f.plan,kind:'withdraw',amount:30n*WAD,minimum:30n*WAD,receiptBalance:60n*WAD,scaledReceiptBalance:40n*WAD},1n);f.ctx.sources={};f.ctx.consentId=null;
+  await locked(id,()=>f.journal.prepare(f.current.input));
+  Object.assign(position,{receipt:30n*WAD,observedUnits:20n*WAD,trackedUnits:20n*WAD,claim:30n*WAD,value:30n*WAD,rate:3n*RAY/2n});
+  f.setProof({read:f.read,logIndex:1,blockNumber:100n,blockHash:f.blockHash,occurredAt:f.at});
+  const evidence={assets:30n*WAD,shares:30n*WAD,remainingReceipts:30n*WAD,txHash:hash(),userOpHash:f.current.input.userOpHash,gasUsed:1n};
+  await locked(id,()=>f.journal.confirmed(f.current.input.executionKey,evidence));await locked(id,()=>f.journal.confirmed(f.current.input.executionKey,evidence));
+  assert.deepEqual(await readPrefundPositions(query,97,id),[{marketId:f.market.marketId,principal:15n*WAD,units:20n*WAD}]);
+  assert.equal((await query<{p:string;y:string}>('select stack_prefund_raw::text p,yield_raw::text y from strategy_cash_balances where portfolio_id=$1',[id])).rows[0]?.p,(15n*WAD).toString());
+  async function missing(sql:string,params?:readonly unknown[]){const result=await query(sql,params);if(sql.includes('e.remaining_receipts_raw::text,e.state'))for(const row of result.rows)row.units_before=null;return result;}
+  await assert.rejects(readPrefundPositions(missing,97,id));
+});
+
+test('#117 mixed million allocated plus 300 prefund recovers 100 in one canonical draw for Venus and Aave; restart, replay and reorg never duplicate credits',async()=>{
+  for(const protocol of ['venus','aave_v3'] as const){
+    const fixtureRead=yieldFixture([protocol]);
+    fixtureRead.read.risks=fixtureRead.read.risks.map(r=>({...r,supply:1000000000n*WAD,liquidity:1000000000n*WAD,headroom:10000000n*WAD}));
+    const f=await fixture(undefined,'none',fixtureRead),id=f.context.portfolioId,p=f.read.positions[0];assert.ok(p);
+    await query('update strategy_cash_balances set allocated_cash_raw=$2,stack_prefund_raw=$3 where portfolio_id=$1',[id,(1000000n*WAD).toString(),(300n*WAD).toString()]);
+    const consent=f.ctx.consentId;
+    for(const [i,amount]of [1000000n*WAD,300n*WAD].entries()){
+      const before=i===0?0n:1000000n*WAD,after=before+amount;
+      f.current=f.prepared({...f.plan,amount,minimum:amount,assetBalance:1000300n*WAD-before,receiptBalance:before,...(protocol==='aave_v3'?{scaledReceiptBalance:before}:{})},BigInt(i));
+      f.ctx.sources=i===0?{allocated_cash_raw:amount.toString()}:{stack_prefund_raw:amount.toString()};f.ctx.consentId=consent;
+      await locked(id,()=>f.journal.prepare(f.current.input));
+      Object.assign(p,{receipt:after,observedUnits:after,trackedUnits:after,claim:after,value:after,maxWithdraw:after,maxRedeem:after});
+      f.setProof({read:f.read,logIndex:i,blockNumber:100n,blockHash:f.blockHash,occurredAt:new Date(+f.at-(1-i)*86400001)});
+      await locked(id,()=>f.journal.confirmed(f.current.input.executionKey,{assets:amount,shares:amount,remainingReceipts:after,txHash:hash(),userOpHash:f.current.input.userOpHash,gasUsed:1n}));
+    }
+    f.current=f.prepared({...f.plan,kind:'withdraw',amount:100n*WAD,minimum:100n*WAD,assetBalance:0n,receiptBalance:1000300n*WAD,
+      ...(protocol==='aave_v3'?{scaledReceiptBalance:1000300n*WAD}:{})},2n);
+    f.ctx.sources={};f.ctx.consentId=null;f.ctx.prefundWithdrawal={requiredRaw:(100n*WAD).toString(),liquidRaw:'0',targetRaw:(100n*WAD).toString()};
+    const key=f.current.input.executionKey;
+    const intent=f.ctx.prefundWithdrawal;
+    for(const invalid of [{...intent,targetRaw:'0'},{...intent,targetRaw:(101n*WAD).toString()},
+      {...intent,requiredRaw:(400n*WAD).toString(),targetRaw:(301n*WAD).toString()}]){
+      f.ctx.prefundWithdrawal=invalid;
+      await assert.rejects(locked(id,()=>f.journal.prepare(f.current.input)),e=>e instanceof AppError&&e.code==='YIELD_UNAVAILABLE');
+      assert.equal((await query('select execution_key from yield_actions where execution_key=$1',[key])).rows.length,0);
+      assert.equal((await query('select execution_key from gas_budget_reservations where execution_key=$1',[key])).rows.length,0);
+      assert.equal((await query("select name from yield_runtime_state where value->>'executionKey'=$1",[key])).rows.length,0);
+    }
+    f.ctx.prefundWithdrawal=intent;
+    const broken=createYieldJournal(f.ctx,{transaction:fn=>withTransaction(async db=>{await fn(db);throw new Error('SECRET_DB_TIMEOUT');})});
+    await assert.rejects(locked(id,()=>broken.prepare(f.current.input)));
+    assert.equal((await query('select execution_key from yield_actions where execution_key=$1',[key])).rows.length,0);
+    assert.equal((await query('select name from yield_runtime_state where value->>\'executionKey\'=$1',[key])).rows.length,0);
+    await locked(id,()=>f.journal.prepare(f.current.input));
+    const fact=(await query<{value:{purpose:string;marketId:string;targetRaw:string}}>("select value from yield_runtime_state where name like 'fact-prefund-withdraw-%' and value->>'executionKey'=$1",[key])).rows[0];
+    assert.equal(fact?.value.purpose,'prefund_shortfall');assert.equal(fact.value.marketId,f.market.marketId);assert.equal(fact.value.targetRaw,(100n*WAD).toString());
+    Object.assign(p,{receipt:1000200n*WAD,observedUnits:1000200n*WAD,trackedUnits:1000200n*WAD,claim:1000200n*WAD,value:1000200n*WAD});
+    f.setProof({read:f.read,logIndex:2,blockNumber:100n,blockHash:f.blockHash,occurredAt:f.at});
+    const e={assets:100n*WAD,shares:100n*WAD,remainingReceipts:1000200n*WAD,txHash:hash(),userOpHash:f.current.input.userOpHash,gasUsed:1n};
+    // A new process has no in-memory withdrawal purpose: original evidence must suffice.
+    delete f.ctx.prefundWithdrawal;
+    const restarted=createYieldJournal(f.ctx);
+    for(let n=0;n<2;n++)await locked(id,()=>restarted.confirmed(key,e));
+    const cash=async()=>(await query<{p:string;a:string;y:string}>('select stack_prefund_raw::text p,allocated_cash_raw::text a,yield_raw::text y from strategy_cash_balances where portfolio_id=$1',[id])).rows[0];
+    assert.deepEqual(await cash(),{p:(100n*WAD).toString(),a:'0',y:'0'});
+    assert.deepEqual(await readPrefundPositions(query,97,id),[{marketId:f.market.marketId,principal:200n*WAD,units:1000200n*WAD}]);
+    async function mismatchedIntent(sql:string,params?:readonly unknown[]){
+      const result=await query(sql,params);
+      if(sql.includes('f.value as prefund_intent'))for(const row of result.rows){
+        if(row.prefund_intent)row.prefund_intent={...row.prefund_intent,portfolioId:id+1};
+      }
+      return result;
+    }
+    await assert.rejects(readPrefundPositions(mismatchedIntent,97,id),e=>e instanceof AppError&&e.code==='YIELD_UNAVAILABLE');
+    assert.deepEqual(await cash(),{p:(100n*WAD).toString(),a:'0',y:'0'});
+    f.state.blockHash=hash();
+    const service=createYieldService({profile:()=>f.profile,client:()=>f.client,now:()=>f.at,read:async()=>structuredClone(f.read),canSend:()=>false});
+    await assert.rejects(locked(id,()=>service.tick(f.context,false)),e=>e instanceof AppError&&e.code==='YIELD_UNAVAILABLE');
+    await assert.rejects(readPrefundPositions(query,97,id));
+    await locked(id,()=>restarted.confirmed(key,e));
+    assert.deepEqual(await cash(),{p:(100n*WAD).toString(),a:'0',y:'0'});
+  }
+});
+
+test('#117 round records pending prefund safely; DB wait-fact failure rolls back withdrawal reconciliation and leaves the slot unconsumed',async()=>{
+  const f=await prefundFixture(),id=f.context.portfolioId;
+  await locked(id,()=>f.service.tick(f.context,false));
+  await query('update strategy_cash_balances set stack_prefund_raw=0 where portfolio_id=$1',[id]);f.state.cash=0n;
+  Object.assign(f.position,{maxWithdraw:0n,maxRedeem:0n});
+  const {runYieldRound}=await import('../src/yield-service.js'),prior=process.env.CHAIN_ID,info=console.info,logs:string[]=[];
+  process.env.CHAIN_ID='97';console.info=(value:unknown)=>logs.push(String(value));
+  async function scoped<T extends QueryResultRow=QueryResultRow>(sql:string,params:readonly unknown[]=[]){
+    return sql.includes('from smart_accounts sa')?query<T>(sql.replace('from smart_accounts sa','from (select * from smart_accounts where portfolio_id=$2) sa'),[...params,id]):query<T>(sql,params);
+  }
+  try{
+    assert.deepEqual(await runYieldRound({dryRun:false,limit:1},{query:scoped,profile:()=>f.profile,client:()=>f.client,now:()=>f.at,read:async()=>structuredClone(f.read),canSend:()=>false}),{checked:1,blocked:0});
+    assert.deepEqual(logs.map(s=>JSON.parse(s)),[{msg:'yield_prefund_pending',portfolioId:id,code:'YIELD_PREFUND_PENDING'}]);
+    assert.doesNotMatch(logs.join('\n'),/SECRET|http|postgres/);
+  }finally{console.info=info;if(prior===undefined)delete process.env.CHAIN_ID;else process.env.CHAIN_ID=prior;}
+  await query('update strategy_cash_balances set stack_prefund_raw=$2 where portfolio_id=$1',[id,(100n*WAD).toString()]);
+  const context:JobContext={...f.context,strategyId:Number(f.strategyId),version:1,kind:'asset',execution:f.execution,
+    allocation:{assets:f.execution.assets.map(a=>({address:a.asset,weightBps:a.weightBps}))},cash:f.asset,now:f.at,reserve:WAD/4n,
+    caps:new Map([[f.stackAsset,null]]),buyLimit:UINT256_MAX,observedCash:0n,enabled:true,marketOpen:true,
+    withdrawals:[{txHash:hash(),logIndex:0,blockNumber:100n,blockHash:f.blockHash,amount:100n*WAD}]};
+  const lots=await fundingLots(query,context);
+  const run:import('../src/scheduler.js').WithTransactionFn=fn=>withTransaction(db=>fn({query:async(sql,params)=>{
+    if(sql.includes('insert into yield_runtime_state'))throw new Error('synthetic DB timeout');
+    return db.query(sql,params?[...params]:[]);
+  }}));
+  await assert.rejects(locked(id,()=>prepareStrategyJob(run,context,lots)));
+  assert.equal((await query<{p:string}>('select stack_prefund_raw::text p from strategy_cash_balances where portfolio_id=$1',[id])).rows[0]?.p,(100n*WAD).toString());
+  assert.equal((await query("select id from operations where portfolio_id=$1 and type='withdraw'",[id])).rows.length,0);
+  assert.equal((await query('select * from strategy_asset_slices where lot_id in (select id from strategy_funding_lots where portfolio_id=$1)',[id])).rows.length,0);
 });

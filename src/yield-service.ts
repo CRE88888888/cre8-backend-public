@@ -8,7 +8,7 @@ import { AppError, ValidationError } from './errors.js';
 import { object, address, hash, raw, fresh, mustExit, riskHeadroom, idleCash, supplyDecision, yieldProfile, unavailable } from './yield-domain.js';
 import type { YieldProfile, YieldSources } from './yield-domain.js';
 import { readYieldAccount } from './yield-reader.js';
-import { createYieldJournal, persistYieldRead, restoreYieldOperation, syncYieldCatalog, yieldLocks } from './yield-store.js';
+import { createYieldJournal, persistYieldRead, restoreYieldOperation, syncYieldCatalog, yieldLocks, readPrefundPositions } from './yield-store.js';
 import type { JournalContext, SnapshotRow, YieldAccount, YieldStoreDeps } from './yield-store.js';
 import { yieldExecutionPort } from './yield-port.js';
 import type { YieldExecutionPort, YieldPrepare } from './yield-port.js';
@@ -22,6 +22,8 @@ import { rebalanceWithdrawals, yieldRebalanceDue } from './yield-rebalance.js';
 import { randomInt } from 'node:crypto';
 import { readYieldState, writeYieldState } from './yield-runtime-state.js';
 import { yieldSessionAvailable } from './yield-session.js';
+import { stackLiquidityReserve, prefundWithdrawal, recordPrefundWait } from './yield-prefund.js';
+import type { PrefundWaitReason } from './yield-prefund.js';
 
 const POLICY = parseAbi([
   'event YieldPolicySet(address indexed account,bytes32 indexed marketId,uint256 dailyAssets,uint256 strategyId,uint16 version,bool enabled)',
@@ -258,6 +260,30 @@ export function createYieldService(overrides:Partial<YieldServiceDeps>={}){
         return complete?'生息已全部領回':'生息持續待領回';
       }
       await deps.transaction(async db=>{await yieldLocks(db,p);await db.query("update yield_positions p set exit_state='completed',exit_reason=null,next_retry_at=null,updated_at=clock_timestamp() from yield_position_snapshots s where s.id=p.latest_snapshot_id and p.chain_id=$1 and p.portfolio_id=$2 and p.exit_state in ('exiting','retry') and p.receipt_raw=0 and p.tracked_units_raw=0 and s.valuation_state='known' and s.observed_units_raw=0",[p.chainId,p.portfolioId]);});
+      const liquidityReserve=await stackLiquidityReserve(deps.query,p.chainId,p.portfolioId,deps.now());
+      const cash=(await deps.query<Record<string,string>>(`select unallocated_hold_raw::text,stack_prefund_raw::text,allocated_cash_raw::text,reserved_input_raw::text,reserved_fee_raw::text,withdrawal_raw::text,yield_raw::text from strategy_cash_balances where chain_id=$1 and portfolio_id=$2`,[p.chainId,p.portfolioId])).rows[0];
+      if(cash&&(liquidityReserve===null||raw(cash.stack_prefund_raw)<liquidityReserve)){
+        const positions=(await readPrefundPositions(deps.query,p.chainId,p.portfolioId)).filter(p=>p.principal>0n);
+        if(positions.length){
+          const liquid=raw(cash.stack_prefund_raw),record=async(reason:PrefundWaitReason,marketId:Hex|null=null)=>{
+            for(const basis of marketId===null?positions:positions.filter(b=>b.marketId===marketId))
+              await recordPrefundWait(deps.query,p.chainId,p.portfolioId,liquidityReserve,liquid,reason,{now:deps.now(),marketId:basis.marketId});
+          };
+          if(liquidityReserve===null){await record('schedule_unknown');return '[YIELD_PREFUND_PENDING] 下一期金額未知，保留來源與期次';}
+          const observed=await client.readContract({address:cashAsset,abi:erc20Abi,functionName:'balanceOf',args:[p.account],blockNumber:state.observation.block});
+          if(observed!==Object.values(cash).reduce((n,v)=>n+raw(v),0n)){await record('cash_unreconciled');throw unavailable();}
+          for(const basis of positions.sort((a,b)=>a.marketId.localeCompare(b.marketId))){
+            const position=state.positions.find(s=>s.market.marketId===basis.marketId&&s.market.asset===cashAsset);
+            if(!position||position.block!==state.observation.block||position.blockHash!==state.observation.blockHash)continue;
+            const amount=prefundWithdrawal(position,liquidityReserve-liquid,basis.units,deps.now());
+            if(amount===0n)continue;
+            ctx.prefundWithdrawal={requiredRaw:liquidityReserve.toString(),liquidRaw:liquid.toString(),targetRaw:(basis.principal<liquidityReserve-liquid?basis.principal:liquidityReserve-liquid).toString()};
+            await record('withdraw_requested',basis.marketId);
+            try{return `[YIELD_PREFUND_PENDING] ${await send(basis.marketId,'withdraw',amount)}；重新讀值後才預留定投`;}catch{await record('withdraw_failed',basis.marketId);throw unavailable();}
+          }
+          await record('market_unavailable');return '[YIELD_PREFUND_PENDING] 市場暫停、流動性或證據不足，保留期次待領回';
+        }
+      }
       if(state.accountValue===null)return '帳戶估值未知，停止新供給';
       const current=(await deps.query<{strategy_id:string;onchain_id:string|null;version:number;schedule_state:string;execution:unknown}>(`select p.strategy_id::text,(select onchain_id::text from strategies where id=p.strategy_id) as onchain_id,p.version,p.schedule_state,v.execution from portfolios p join strategy_versions v on (v.strategy_id,v.version)=(p.strategy_id,p.version) where p.id=$1`,[p.portfolioId])).rows[0];
       if(!current||!current.onchain_id||current.schedule_state!=='active')return '帳戶停止新供給';
@@ -285,8 +311,10 @@ export function createYieldService(overrides:Partial<YieldServiceDeps>={}){
         if(s.market.asset===cashAsset){
           const b=(await deps.query<Record<string,string>>(`select unallocated_hold_raw::text,stack_prefund_raw::text,allocated_cash_raw::text,reserved_input_raw::text,reserved_fee_raw::text,withdrawal_raw::text,yield_raw::text from strategy_cash_balances where chain_id=$1 and portfolio_id=$2`,[p.chainId,p.portfolioId])).rows[0];
           if(!b)continue;const total=Object.values(b).reduce((n,v)=>n+raw(v),0n);
-          idle=idleCash({allocated:raw(b.allocated_cash_raw),earnings:raw(b.yield_raw),observed:balance,classified:total});
-          ctx.sources={allocated_cash_raw:raw(b.allocated_cash_raw).toString(),yield_raw:raw(b.yield_raw).toString()};
+          const prefund=raw(b.stack_prefund_raw);
+          idle=idleCash({allocated:raw(b.allocated_cash_raw),earnings:raw(b.yield_raw),prefund,reserve:liquidityReserve,observed:balance,classified:total});
+          ctx.sources={allocated_cash_raw:raw(b.allocated_cash_raw).toString(),yield_raw:raw(b.yield_raw).toString(),
+            ...(liquidityReserve!==null&&prefund>liquidityReserve?{stack_prefund_raw:(prefund-liquidityReserve).toString()}:{})};
         }else ctx.sources={asset_holding:balance.toString()};
         const oracle=await client.readContract({address:f.executor,abi:POLICY,functionName:'oracle'});
         const value=s.market.asset===cashAsset?balance:balance===0n?0n:(await client.readContract({address:oracle,abi:POLICY,functionName:'previewSwap',args:[s.market.asset,cashAsset,balance],blockNumber:state.observation.block}))[1];
@@ -326,7 +354,12 @@ export function createYieldService(overrides:Partial<YieldServiceDeps>={}){
   };
 }
 function hashPermission(v:unknown):Hex{if(typeof v!=='string'||!/^0x[0-9a-fA-F]{8}$/.test(v))throw unavailable();return `0x${v.slice(2)}`;}
-function cashSources(s:YieldSources,amount:bigint):YieldSources{const allocated=raw(s.allocated_cash_raw??'0'),a=amount<allocated?amount:allocated;return{allocated_cash_raw:a.toString(),yield_raw:(amount-a).toString()};}
+function cashSources(s:YieldSources,amount:bigint):YieldSources{
+  const a=raw(s.allocated_cash_raw??'0')<amount?raw(s.allocated_cash_raw??'0'):amount,left=amount-a;
+  const y=raw(s.yield_raw??'0')<left?raw(s.yield_raw??'0'):left,p=left-y;
+  if(p>raw(s.stack_prefund_raw??'0'))throw unavailable();
+  return{allocated_cash_raw:a.toString(),yield_raw:y.toString(),...(p>0n?{stack_prefund_raw:p.toString()}:{})};
+}
 
 export async function runYieldRound(options:{dryRun:boolean;limit:number},overrides:Partial<YieldServiceDeps>={}):Promise<{checked:number;blocked:number}>{
   const deps={...defaults,...overrides};
@@ -364,7 +397,10 @@ export async function runYieldRound(options:{dryRun:boolean;limit:number},overri
   });
   let checked=0,blocked=0;
   for(const row of accounts){
-    try{const result=await deps.lock(Number(row.portfolio_id),()=>service.tick({portfolioId:Number(row.portfolio_id),chainId:97,account:row.account},options.dryRun));if(result!==null)checked++;}
+    try{const result=await deps.lock(Number(row.portfolio_id),()=>service.tick({portfolioId:Number(row.portfolio_id),chainId:97,account:row.account},options.dryRun));if(result!==null){
+        checked++;
+        if(result.startsWith('[YIELD_PREFUND_PENDING]'))console.info(JSON.stringify({msg:'yield_prefund_pending',portfolioId:Number(row.portfolio_id),code:'YIELD_PREFUND_PENDING'}));
+      }}
     catch(error){
       blocked++;
       const codes=new Set(['YIELD_UNAVAILABLE','YIELD_QUOTE_UNAVAILABLE','YIELD_RECONCILIATION_REQUIRED','SESSION_AUTHORIZATION_REQUIRED','GAS_BUDGET_EXCEEDED','PAYMASTER_SUBMISSION_UNAVAILABLE']);

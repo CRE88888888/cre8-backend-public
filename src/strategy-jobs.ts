@@ -1,3 +1,4 @@
+import { reconcileCashWithdrawals } from './cash-reconciliation.js';
 import type { CashWithdrawal } from './cash-reconciliation.js';
 import { prepareAssetJob, completeAssetSchedules, recordAssetInflight } from './asset-jobs.js';
 import type { AssetExecution } from './strategy-execution.js';
@@ -6,6 +7,9 @@ import type { Allocation } from './strategies.js';
 import type { WithTransactionFn, SchedulerQueryFn } from './scheduler.js';
 import { addInputs, allocationInputs, basketFits, currentSlot, moneyBudget, subtractInputs, sumInputs, windowBasketFits } from './new-money-plan.js';
 import type { InputVector, MoneyBudget } from './new-money-plan.js';
+import { stackLiquidityReserve, recordPrefundWait } from './yield-prefund.js';
+import { readPrefundPositions } from './yield-store.js';
+import { object, raw, unavailable } from './yield-domain.js';
 
 export type StrategyJob = { id: string; chain_id: string; portfolio_id: string; kind: 'hold' | 'stack' | 'asset'; asset_started_at?:Date|null; lot_id: string | null;
   instruction_revision: string | null; amount_raw: string; fee_reserve_raw: string; allocated_cash_raw: string;
@@ -53,7 +57,38 @@ export async function recordInflightSlots(run:WithTransactionFn,c:Pick<JobContex
 }
 /** Reserve source money, immutable vectors and configured cash together. No chain calls in the transaction. */
 export async function prepareStrategyJob(run: WithTransactionFn, c: JobContext, verifiedLots: readonly FundingLot[]): Promise<{ job: StrategyJob|null; reason: string }> {
-  if(c.kind==='asset'){if(!c.execution)throw new Error('missing per-asset config');return prepareAssetJob(run,c,c.execution,verifiedLots);}
+  if(c.kind==='asset'){
+    if(!c.execution)throw new Error('missing per-asset config');
+    const execution=c.execution;
+    if(c.chainId!==97||!c.enabled||!execution.assets.some(a=>a.execution?.kind==='stack'))return prepareAssetJob(run,c,execution,verifiedLots);
+    return run(async client=>{
+      await lockCash(client.query,c);
+      let existing=await readJob(client.query,c);
+      // Match the ordinary unstarted-job timeout before checking the next period. Its
+      // returned source cash may cover that period; final remainders can still need yield.
+      if(existing?.kind==='asset'&&existing.asset_started_at==null&&existing.window_end_at!==null&&existing.window_end_at<=c.now&&
+          !(await client.query(`select id from operations where portfolio_id=$1 and ${unresolvedSql} limit 1`,[c.portfolioId])).rows.length&&
+          !(await client.query("select id from strategy_funding_lots where chain_id=$1 and portfolio_id=$2 and state='reorged' limit 1",[c.chainId,c.portfolioId])).rows.length){
+        await cancelJob(client.query,c,existing);existing=null;
+      }
+      const unresolved=(await client.query(`select id from operations where portfolio_id=$1 and ${unresolvedSql} limit 1`,[c.portfolioId])).rows.length>0;
+      const reorged=(await client.query("select id from strategy_funding_lots where chain_id=$1 and portfolio_id=$2 and state='reorged' limit 1",[c.chainId,c.portfolioId])).rows.length>0;
+      if(!unresolved&&!reorged)await reconcileCashWithdrawals(client.query,c,c.withdrawals??[]);
+      if(!existing&&!unresolved&&!reorged){
+        const reserve=await stackLiquidityReserve(client.query,c.chainId,c.portfolioId,c.now);
+        const cash=(await client.query('select stack_prefund_raw::text from strategy_cash_balances where chain_id=$1 and portfolio_id=$2',[c.chainId,c.portfolioId])).rows[0];
+        if(!cash)throw unavailable();
+        const liquid=raw(object(cash).stack_prefund_raw);
+        const positions=reserve===null||liquid<reserve?(await readPrefundPositions(client.query,c.chainId,c.portfolioId)).filter(p=>p.principal>0n):[];
+        if(positions.length){
+          for(const position of positions)
+            await recordPrefundWait(client.query,c.chainId,c.portfolioId,reserve,liquid,'installment_deferred',{now:c.now,marketId:position.marketId});
+          return{job:null,reason:'[YIELD_PREFUND_PENDING] 原定投本金待領回，本期保留且不挪用其他來源'};
+        }
+      }
+      return prepareAssetJob(fn=>fn(client),c,execution,verifiedLots);
+    });
+  }
   return run(async ({query}) => {
     await lockCash(query,c);
     const reorg = await query("select id from strategy_funding_lots where chain_id=$1 and portfolio_id=$2 and state='reorged' limit 1",[c.chainId,c.portfolioId]);

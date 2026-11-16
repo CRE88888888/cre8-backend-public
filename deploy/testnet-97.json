@@ -1,10 +1,10 @@
 {
   "chainId": 97,
-  "mode": "fork",
-  "note": "fork = verified on a local anvil fork of chain 97; the public deployment lands on the same CREATE2 addresses",
-  "verifiedAtBlock": 142542018,
-  "generatedAt": "2026-11-16T12:12:07Z",
-  "gitCommit": "e699bd83d3892e3261b925d751ee2cd2606de564",
+  "mode": "public",
+  "note": "deployed on public BSC testnet (chain 97)",
+  "verifiedAtBlock": 143098069,
+  "generatedAt": "2026-11-16T16:42:07Z",
+  "gitCommit": "92e6963848d106ab9dc86334928af11b708c1dfa",
   "versioning": {
     "enrollAbi": "enroll(address,uint256,uint16)",
     "publicationDelaySeconds": 86400,

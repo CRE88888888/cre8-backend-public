@@ -10,6 +10,16 @@ import { createTestnetWebsite, gatewayClientIp } from '../scripts/testnet-web.js
 import { websiteProxyIps } from '../scripts/testnet-api.js';
 import { prepareDeploy } from '../scripts/prepare-deploy.js';
 import { runPointsSync } from '../scripts/points-sync.js';
+import workerConfig from '../deploy/testnet-97-worker.json' with { type: 'json' };
+import apiConfig from '../railway.json' with { type: 'json' };
+
+test('#136 enabled workers have no HTTP healthcheck; API retains its readiness check', () => {
+  assert.deepEqual(workerConfig.build, apiConfig.build);
+  assert.equal(workerConfig.deploy.restartPolicyType, 'ON_FAILURE');
+  assert.equal(workerConfig.deploy.restartPolicyMaxRetries, 10);
+  assert.equal(Object.hasOwn(workerConfig.deploy, 'healthcheckPath'), false);
+  assert.equal(apiConfig.deploy.healthcheckPath, '/health');
+});
 
 async function listen(server: Server): Promise<string> {
   await new Promise<void>((done) => server.listen(0, '127.0.0.1', done));

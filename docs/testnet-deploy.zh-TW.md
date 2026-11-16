@@ -1,6 +1,34 @@
 # Railway 測試網部署（backend#79）
 
-僅限 `accurate-wisdom` 測試專案。使用者 2026-11-14 的 T 段授權不適用其他 Railway 專案、Cloudflare、正式網域或主網。這張沒有送公開 chain 97 交易；合約仍是本機 fork 的地址簿，服務先以停用模式交付。
+僅限 `accurate-wisdom` 測試專案。使用者 2026-11-14 的 T 段授權不適用其他 Railway 專案、Cloudflare、正式網域或主網。下列 #79／#87 是停用階段的歷史紀錄；#136 已同步公開 chain 97 地址簿，啟用狀態以部署回報為準。
+
+## #136 公開 manifest 同步
+
+來源是 contracts main `6b9b6a45391eb3afa70ffc880a59ef3bfa10e3ec` 的完整 manifest，
+`mode=public`、`gitCommit=92e6963848d106ab9dc86334928af11b708c1dfa`。
+使用該 commit 的乾淨暫時 checkout，先編譯並保存 unlinked YieldView artifact，
+再以 manifest 的 YieldView 地址連結編譯其餘合約。只讀公開 chain 97 RPC，
+本機 anvil 固定在公開區塊 **143099686**（不挖礦、不部署、不改 state）：
+
+```sh
+bun --no-env-file scripts/sync-testnet-profile.ts "$CONTRACTS_CHECKOUT" \
+  http://127.0.0.1:8566 public 6b9b6a4 "$UNLINKED_YIELD_VIEW_ARTIFACT"
+```
+
+腳本核對 artifact 全部 source hashes、registry／executor／yieldRegistry／YieldView 的
+完整 runtime（僅遮 compiler-declared immutable slots）、P11 selectors 與 registry reader。
+其後 `checkTestnetProfile` 對同一個固定區塊核對全部 **381** 項 codehash／必要 selectors，
+結果 **381 ok／0 warn／0 fail**。公開 CREATE2 地址與先前 fork 相同，所有 runtime pins
+也相同；仍重新讀取、產生來源證據、profile、ABI 與 golden，沒有沿用未驗證結果。
+這是 profile 同步驗證，不能代替部署後含 DB、oracle、餘額與角色設定的 strict preflight。
+
+#136 啟用設定沿用下列 #97 額度，僅將帳戶部署餘額門檻按 C3 派工設為
+`ACCOUNT_DEPLOYMENT_MIN_BALANCE_WEI=10000000000000000`。scheduler 維持 dry-run、
+operator rebalance 與 points 關閉，points-sync 維持停用。SIWE 目前只接受單一 domain／URI，
+使用 `tst.cre8.finance`／`https://tst.cre8.finance`；加入 CORS origin 不會擴大 SIWE domain。
+本次部署結果與 deployment IDs 寫在 `/tmp/cre8-codex/railway-report.md`，不含秘密。
+啟用 scheduler／keeper 時，Railway Config File 指定 `/deploy/testnet-97-worker.json`，
+並清除服務設定中的 HTTP healthcheck；API／website 保留根目錄的 `/health` 設定。
 
 ## 來源與封裝
 

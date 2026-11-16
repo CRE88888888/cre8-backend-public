@@ -1,9 +1,9 @@
 {
   "source": "local anvil runtime from forge DeployTestnet; executor/registry/YieldView checked against forge deployedBytecode + immutableReferences; registry reader matches YieldView",
-  "contractsCommit": "e699bd83d3892e3261b925d751ee2cd2606de564",
-  "forgeCheckoutCommit": "e699bd83d3892e3261b925d751ee2cd2606de564",
-  "blockNumber": "142542018",
-  "blockHash": "0x8fec138e024e46206bef72277229c6e797143887af89d13531a9153fad515e64",
+  "contractsCommit": "92e6963848d106ab9dc86334928af11b708c1dfa",
+  "forgeCheckoutCommit": "6b9b6a45391eb3afa70ffc880a59ef3bfa10e3ec",
+  "blockNumber": "143099686",
+  "blockHash": "0x32b16d1cac8b0fc75d311b4b10019d1eb892b4365bb3e90103d0fd36958c69a2",
   "hashes": {
     "ownedDeployer": "0xbf6af3242c601a8b5793e40122a8f0a4fa96587ee5bcd45761f180c41028cdfe",
     "registry": "0x7616968e7f3f01170c70456ce6048d5a198a37baf0979a526ca3df0096beeddc",

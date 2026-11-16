@@ -2,7 +2,20 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { keccak256 } from 'viem';
 import { profileFromManifest, verifyArtifactSources } from '../scripts/sync-testnet-profile.js';
-import manifest from '../deploy/testnet-97.json' with { type: 'json' };
+import publicManifest from '../deploy/testnet-97.json' with { type: 'json' };
+
+// Keep fork-mode rejection coverage after the production input becomes public.
+const manifest = { ...publicManifest, mode: 'fork' };
+
+test('#136 public deployment requires explicit public mode and preserves every manifest field', () => {
+  assert.equal(publicManifest.mode, 'public');
+  assert.throws(() => profileFromManifest(publicManifest), /metadata \/ mode/);
+  const profile = profileFromManifest(publicManifest, 'public');
+  assert.equal(profile.mode, 'public');
+  assert.equal(profile.sourceCommit, publicManifest.gitCommit);
+  assert.deepEqual(profileFromManifest(structuredClone(publicManifest), 'public'), profile);
+  assert.throws(() => profileFromManifest(manifest, 'public'), /metadata \/ mode/);
+});
 
 test('#110 missing YieldView aborts profile generation before any runtime capture', () => {
   const contracts: Record<string, string> = { ...manifest.contracts };

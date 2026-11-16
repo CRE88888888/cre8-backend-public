@@ -29,7 +29,7 @@ APP（C2）需同步整份 manifest 的 roles、contracts（含 registry／route
 
 ## 報價、gas 與退出
 
-`quoteYieldAction` 將 market 身分、non-view `quoteSupply`／`quoteWithdraw` 的 eth_call、餘額與 executor 預演釘在同一 canonical block。min 原樣取完整 preview，必須正數；deadline 取鏈上時間加 1–300 秒，預設 300。Aave 另保存 scaled receipt balance，公開 amount／min／事件仍使用 raw aToken／underlying，不混用單位。
+`quoteYieldAction` 將 market 身分、non-view `quoteSupply`／`quoteWithdraw` 的 eth_call、餘額與 executor 預演釘在同一 canonical block。依 #110 現行規格，min = floor(quote × 9995 / 10000)，以 bigint 先乘再除且必須正數；quote=0 或 1 均拒送，不能補成 1；deadline 取鏈上時間加 1–300 秒，預設 300。Aave 另保存 scaled receipt balance，公開 amount／min／事件仍使用 raw aToken／underlying，不混用單位。
 
 `submitYieldAction` 用既有 Kernel 派生器、自架 bundler 與 `schedulerPaymaster`。call gas 是實際估算 **200%**，不裁掉餘裕；和既有分批共用 `assertUserOpCapacity`／`userOpGasOverhead`，含 verification／preVerification／paymaster 的整筆 gas 不超過 **14M**。paymaster 再檢查最終 gas；超過就拒絕，不強送。
 
@@ -37,7 +37,7 @@ APP（C2）需同步整份 manifest 的 roles、contracts（含 registry／route
 
 Venus／Lista 補息可能讓舊區塊的 min 失效。只對 ABI 已證明的 `YieldMinimum` 重取完整 quote，總共最多 3 次；每次都重新編碼 payload。送出後只有 canonical EntryPoint 失敗、無業務／資產異動且已記錄 reverted，才可新 quote 重試。RPC timeout、送出未取得 hash、DB commit 未知及證據缺漏一律保留在途。**不降低舊 min，也不以任意 bps 或 rounding tolerance 解鎖。** 三次仍失敗會回 `YIELD_QUOTE_RETRY_EXHAUSTED`。
 
-本次 fork 成功路徑固定 anvil timestamp，以可重現地驗同狀態 min；另實際推進時間驗舊 quote 拒絕，以及連續三次補息後重報價達上限、沒有送出。這不保證公開鏈跨區塊一定成交，尤其真 Venus 按區塊補息；若產品要求保證執行，需要 C3／C1 另定同交易原子 quote 介面。本 PR 不擴充合約或放寬 min。Aave 的固定 raw aToken 領出額不因 index 上升而改變該 raw 額的 underlying quote，退出全額需重讀最新 raw balance。
+以下為 #85 歷史驗收；已由 [#110 跨區塊驗收](yield-be110.zh-TW.md) 取代。當時 fork 成功路徑固定 anvil timestamp，以可重現地驗同狀態 min；另實際推進時間驗舊 quote 拒絕，以及連續三次補息後重報價達上限、沒有送出。這不保證公開鏈跨區塊一定成交，尤其真 Venus 按區塊補息；若產品要求保證執行，需要 C3／C1 另定同交易原子 quote 介面。本 PR 不擴充合約或放寬 min。Aave 的固定 raw aToken 領出額不因 index 上升而改變該 raw 額的 underlying quote，退出全額需重讀最新 raw balance。
 
 ## 0036／BE-3 的持久化契約
 

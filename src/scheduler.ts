@@ -1848,7 +1848,7 @@ export async function runSchedulerOnce(
   const resolved = resolveDeps({ thresholdBps }, {...deps,clock:deps.clock??(args.now?()=>new Date(now):()=>new Date())});
 
   // Yield exits/recovery have their own account lock and precede DEX queues, buy throttles and price gates.
-  try { await (deps.yieldRound??runYieldRound)({dryRun,limit}); } catch { resolved.log('[yield] 生息讀值／對帳未完成，保留原部位與預留'); }
+  try { const result=await (deps.yieldRound??runYieldRound)({dryRun,limit}); resolved.log('[yield] '+JSON.stringify(result)); } catch { resolved.log('[yield] 生息讀值／對帳未完成，保留原部位與預留'); }
 
   let executorPaused: boolean | null = null;
   try {

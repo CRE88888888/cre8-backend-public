@@ -149,6 +149,7 @@ export function createYieldJournal(context:JournalContext,overrides:Partial<Yiel
         if(await reserveSponsorship(r,async fn=>fn(client))!==r.validUntil)throw unavailable();
         await client.query(`insert into yield_actions(execution_key,chain_id,portfolio_id,account,market_id,kind,amount_raw,minimum_output_raw,source_breakdown,consent_id,exit_request_id)
           values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,[key,p.chainId,p.portfolioId,p.account,plan.marketId,plan.kind,plan.amount.toString(),plan.minimum.toString(),JSON.stringify(context.sources),context.consentId,context.exitRequestId]);
+        if(plan.kind==='supply')await reopenCompleted(client,p,plan.marketId);
         if(plan.kind==='supply'&&plan.asset===context.cashAsset){
           for(const [source,amount]of Object.entries(context.sources)){
             if(!isSource(source)||source==='asset_holding')throw unavailable();
@@ -183,6 +184,7 @@ export function createYieldJournal(context:JournalContext,overrides:Partial<Yiel
         await client.query(`insert into yield_events(chain_id,tx_hash,log_index,execution_key,portfolio_id,account,market_id,kind,assets_raw,shares_raw,remaining_receipts_raw,block_number,block_hash,occurred_at)
           values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,[p.chainId,evidence.txHash,proof.logIndex,key,p.portfolioId,p.account,original.plan.marketId,original.plan.kind,
           evidence.assets.toString(),evidence.shares.toString(),evidence.remainingReceipts.toString(),proof.blockNumber.toString(),proof.blockHash,proof.occurredAt]);
+        if(original.plan.kind==='supply')await reopenCompleted(client,p,original.plan.marketId);
         await writeYieldPosition(client,p,position);
         for(const r of [...proof.read.risks].sort((a,b)=>a.key.localeCompare(b.key)))await writeYieldRisk(client,p.chainId,r);
         if(original.plan.kind==='withdraw')await creditRedemption(client,p,original.plan.marketId);
@@ -207,6 +209,11 @@ export function createYieldJournal(context:JournalContext,overrides:Partial<Yiel
       });
     },
   };
+}
+async function reopenCompleted(client:PoolClient,p:YieldAccount,marketId:Hex){
+  // Only an admitted new supply / proven supply settlement may reopen an automatic zero exit.
+  // Keep this in the action's transaction, so an aborted prepare cannot erase completed.
+  await client.query("update yield_positions set exit_state='none',exit_reason=null,next_retry_at=null,updated_at=clock_timestamp() where chain_id=$1 and portfolio_id=$2 and market_id=$3 and exit_state='completed' and receipt_raw=0 and tracked_units_raw=0",[p.chainId,p.portfolioId,marketId]);
 }
 async function gasState(client:PoolClient,key:string,state:string){
   const g=(await client.query<{chain_id:string;account:string;day:string}>(`select chain_id::text,account,to_char(utc_day,'YYYY-MM-DD') as day from gas_budget_reservations where execution_key=$1`,[key])).rows[0];

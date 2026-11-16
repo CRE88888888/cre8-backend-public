@@ -15,6 +15,8 @@ const READ = parseAbi([
   'function oracle() view returns(address)', 'function numeraire() view returns(address)', 'function previewSwap(address,address,uint256) view returns(uint256,uint256)',
   'function market(bytes32) view returns ((uint256 chainId,uint8 kind,address asset,address receipt,address target,address riskSource,bytes32 configuration,uint256 minRate,uint256 maxRate,bool supplyEnabled,bool retired))',
   'function refreshHealth(bytes32) returns ((uint256 supply,uint256 liquidity,uint256 utilizationBps,bytes32 configuration))',
+  'function health(bytes32) view returns ((uint256 supply,uint256 liquidity,uint256 utilizationBps,bytes32 configuration))',
+  'function rateCheckpoint(bytes32) view returns(uint256 rate,uint256 observedAt)',
   'function quoteWithdraw(bytes32,uint256) returns(uint256)',
   'function receiptAssets(bytes32,address) view returns(uint256)',
   'function accountUnits(address,bytes32) view returns(uint256)',
@@ -137,7 +139,7 @@ export async function readYieldAccount(client: PublicClient, profile: YieldProfi
       positions.push(...reads);
       const valid = reads.every(p => p.state === 'known');
       const health = await healthRead(group).catch(() => null);
-      // healthRead repeats sync and conversions in ONE call; no unaccrued C or summed Lista core cash.
+      // Exit health uses lenient accrued quotes, independently of supply rate admission.
       const keys = [key, ...new Set(group.flatMap(i => i.queues).map(id => `${key}:${id}`))];
       for (const bucket of keys) {
         const i = group[0]; if (!i) throw unavailable();
@@ -235,16 +237,21 @@ export async function readYieldAccount(client: PublicClient, profile: YieldProfi
           if (integer(v[6])>1000000n || rate === 0n || units !== tracked || i.market.protocol === 'aave_v3' && receipt !== units * rate / RAY) throw unavailable();
           // NAV uses the executor's undiscounted quote; the 50 USDT supply minimum uses its floor.
           return { ...observation, market: i.market, state: 'known', reason: null, receipt, observedUnits: units, trackedUnits: tracked, claim,
-            value: null, maxWithdraw: null, maxRedeem: null, rate, scale, aprBps: integer(v[6]), retired:i.retired, supplyOpen: i.supplyOpen,
+            value: null, maxWithdraw: null, maxRedeem: null, rate, scale, aprBps: integer(v[6]), retired:i.retired, supplyOpen: i.supplyOpen && values[n] !== null,
             exiting: v[7], underlyingDecimals: i.underlyingDecimals, receiptDecimals: i.receiptDecimals };
         } catch { return unknownPosition(i.market, i); }
       });
     }
     async function healthRead(group: MarketIdentity[]) {
-      const calls: ReadCall[] = sync(group);
+      const calls: ReadCall[] = group.map(i=>({target:profile.registry,name:'quoteWithdraw',args:[i.market.marketId,1n]}));
       for (const i of group) {
         const m = i.market;
-        calls.push({ target: m.protocol === 'aave_v3' ? m.target : m.receipt,
+        calls.push({target:profile.registry,name:'health',args:[m.marketId]},
+          {target:profile.registry,name:'rateCheckpoint',args:[m.marketId]},
+          {target:m.protocol==='aave_v3'?m.target:m.receipt,
+            name:m.protocol==='venus'?'exchangeRateStored':m.protocol==='lista'?'convertToAssets':'getReserveNormalizedIncome',
+            args:m.protocol==='venus'?[]:[m.protocol==='lista'?WAD:m.asset]},
+          { target: m.protocol === 'aave_v3' ? m.target : m.receipt,
           name: m.protocol === 'venus' ? 'exchangeRateStored' : m.protocol === 'lista' ? 'totalAssets' : 'getReserveNormalizedIncome',
           args: m.protocol === 'aave_v3' ? [m.asset] : [] },
           { target: m.receipt, name: 'totalSupply' },
@@ -255,7 +262,11 @@ export async function readYieldAccount(client: PublicClient, profile: YieldProfi
       const v = await deps.batch(client, observation.block, calls);
       let supply = UINT256_MAX, liquidity = UINT256_MAX, exposure = 0n, headroom = UINT256_MAX, utilization = 0;
       for (const [n, i] of group.entries()) {
-        const h = object(v[n]), rate = integer(v[group.length + n * 3]), receiptSupply = integer(v[group.length + n * 3 + 1]), cap = integer(v[group.length + n * 3 + 2]);
+        const offset=group.length+n*6,h=object(v[offset]),checkpoint=v[offset+1];
+        const currentRate=integer(v[offset+2]),rate=integer(v[offset+3]),receiptSupply=integer(v[offset+4]),cap=integer(v[offset+5]);
+        const checkpointRate=i.market.protocol==='aave_v3'?currentRate/10n**9n:currentRate;
+        if(v[n]===null||!Array.isArray(checkpoint)||checkpoint.length!==2||integer(checkpoint[0])===0n||
+          integer(checkpoint[1])>block.timestamp||checkpointRate<integer(checkpoint[0]))throw unavailable();
         if (hash(h.configuration) !== i.configuration || integer(h.supply) === 0n || integer(h.utilizationBps) > 10000n) throw unavailable();
         supply = min(supply, integer(h.supply)); liquidity = min(liquidity, integer(h.liquidity)); utilization = Math.max(utilization, num(h.utilizationBps));
         if(i.market.protocol==='lista'&&i.totalUnits>0n&&receiptSupply===0n)throw unavailable();

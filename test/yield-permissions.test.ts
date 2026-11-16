@@ -9,11 +9,42 @@ import { YIELD_EXECUTOR_ABI } from '../src/yield-abi.js';
 import { validateSponsoredCalls } from '../src/paymaster.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
 import { config, SENDER, TEST_SIGNER, operation } from './fixtures/paymaster.js';
+import { yieldFixture } from './fixtures/yield.js';
+import { yieldSessionAvailable } from '../src/yield-session.js';
 
 const client = createPublicClient({ chain: bscTestnet, transport: custom({ request: async () => { throw new Error('unexpected RPC'); } }) });
 const executor = T.contracts.executor;
 const OWNER = getAddress('0x2000000000000000000000000000000000000001');
 const validUntil = 1_900_000_000;
+
+test('#112 session availability rejects time boundaries and missing installation; RPC uncertainty never becomes a fallback signal',async()=>{
+  const f=yieldFixture(['venus']),now=Math.floor(+f.at/1000);
+  for(const until of [0,now-1,now,now+1]){
+    const s=await buildSessionPermissions({publicClient:f.client,sessionKeyAddress:f.account,executorAddress:f.executor,validUntil:until,yieldAccount:f.account});
+    assert.equal(await yieldSessionAvailable(f.client,s.policySnapshot,f.account,f.executor,f.at),until>now);
+    if(until>now){
+      f.sessionState.missing=[s.permissionId.slice(2)];
+      assert.equal(await yieldSessionAvailable(f.client,s.policySnapshot,f.account,f.executor,f.at),false);
+      f.sessionState.missing=[];f.state.fail='eth_call';
+      await assert.rejects(yieldSessionAvailable(f.client,s.policySnapshot,f.account,f.executor,f.at));f.state.fail='';
+    }
+  }
+});
+
+test('#112 retained signer does not override a revoked selector, cleared validation or invalidated nonce',async()=>{
+  const f=yieldFixture(['venus']);
+  const s=await buildSessionPermissions({publicClient:f.client,sessionKeyAddress:f.account,executorAddress:f.executor,validUntil:Math.floor(+f.at/1000)+86400,yieldAccount:f.account});
+  const available=()=>yieldSessionAvailable(f.client,s.policySnapshot,f.account,f.executor,f.at);
+  for(const kind of ['revoked','cleared','invalidNonce'] as const){
+    f.sessionState[kind]=[s.permissionId.slice(2)];assert.equal(await available(),false,kind);f.sessionState[kind]=[];
+  }
+  assert.equal(await available(),true,'validation nonce exactly equals validNonceFrom');
+  f.sessionState.validNonceFrom=2;assert.equal(await available(),false);
+  f.sessionState.validNonceFrom=1;
+  for(const missing of ['missingNumber','missingHash','reorg'] as const){
+    f.sessionState[missing]=true;await assert.rejects(available());f.sessionState[missing]=false;f.state.blockHash=f.blockHash;
+  }
+});
 
 test('#85 legacy deployment policies stay byte-identical; owner renewal adds exactly two self-account calls', async () => {
   const legacy = describePolicies({ executorAddress: executor, validUntil, chainId: 97 });
@@ -61,4 +92,14 @@ test('#85 ABI selectors and canonical paymaster allow only positive self supply/
     assert.throws(() => validateSponsoredCalls(call(`${data}00`), c), /PAYMASTER_CALL_FORBIDDEN/);
     assert.throws(() => validateSponsoredCalls(call(data, T.contracts.registry), c), /PAYMASTER_CALL_FORBIDDEN/);
   }
+});
+
+
+test('#112-r2 GasPolicy zero is unavailable, one wei remains live, and unknown allowance fails closed',async()=>{
+  const f=yieldFixture(['venus']);
+  const s=await buildSessionPermissions({publicClient:f.client,sessionKeyAddress:f.account,executorAddress:f.executor,validUntil:Math.floor(+f.at/1000)+86400,yieldAccount:f.account});
+  const available=()=>yieldSessionAvailable(f.client,s.policySnapshot,f.account,f.executor,f.at);
+  assert.equal(await available(),true);
+  f.sessionState.exhausted=[s.permissionId.slice(2)];assert.equal(await available(),false);
+  f.sessionState.exhausted=[];f.sessionState.gasFailure=true;await assert.rejects(available());
 });

@@ -1,6 +1,6 @@
 # BE-106：新版生息 manifest 與 Kernel 驗收
 
-> 以下為 #106 歷史紀錄。現行 E2E 已固定 #110 的 `cre8_be110` lane；第二輪同步與跨區塊驗收見 [BE-110](yield-be110.zh-TW.md)。
+> 以下為 #106 歷史紀錄。第二輪同步與跨區塊驗收見 [BE-110](yield-be110.zh-TW.md)；現行 E2E 的 `cre8_be112` lane 與部署前審查修正見 [BE-112](yield-be112.zh-TW.md)。
 
 contracts checkout 為 `8abbc61`；該 commit 重產的 manifest 標記 Solidity 來源 `84e70fd`。
 executor／registry runtime 以本機部署後的 bytecode 核對 forge artifact，僅忽略編譯器列出的 immutable 槽，

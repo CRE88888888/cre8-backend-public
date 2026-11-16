@@ -19,6 +19,9 @@ import { planPortfolio } from './snapshot.js';
 import type { PortfolioPlan } from './snapshot.js';
 import type { PlannedStep } from './rebalance-plan.js';
 import { rebalanceWithdrawals, yieldRebalanceDue } from './yield-rebalance.js';
+import { randomInt } from 'node:crypto';
+import { readYieldState, writeYieldState } from './yield-runtime-state.js';
+import { yieldSessionAvailable } from './yield-session.js';
 
 const POLICY = parseAbi([
   'event YieldPolicySet(address indexed account,bytes32 indexed marketId,uint256 dailyAssets,uint256 strategyId,uint16 version,bool enabled)',
@@ -47,13 +50,6 @@ function body(value:unknown,profile:YieldProfile):{markets:Hex[];txHash:Hex}{
   if(new Set(markets).size!==markets.length)throw new ValidationError('INVALID_YIELD_REQUEST','市場不能重複');
   return {markets,txHash:hash(v.txHash)};
 }
-async function permission(policies:unknown,account:Address,executor:Address):Promise<'ok'|'needs_update'>{
-  // BE-4 owns the complete selector/rule parser; absence never grants permission.
-  const path='./permissions.js',loaded:unknown=await import(path),fn=object(loaded).yieldAuthorization;
-  if(typeof fn!=='function')return 'needs_update';
-  const result:unknown=fn(policies,account,executor);
-  return object(result).status==='ready'?'ok':'needs_update';
-}
 export function createYieldService(overrides:Partial<YieldServiceDeps>={}){
   const deps={...defaults,...overrides};
   const store={query:deps.query,transaction:deps.transaction};
@@ -72,7 +68,7 @@ export function createYieldService(overrides:Partial<YieldServiceDeps>={}){
       throw unavailable();
     }
   }
-  const keyRows=async(id:number)=>(await deps.query<{key_ref:string;permissions:unknown}>('select key_ref,permissions from session_keys where portfolio_id=$1 and status=\'active\' order by expires_at desc,key_ref',[id])).rows;
+  const keyRows=async(id:number)=>(await deps.query<{key_ref:string;permissions:unknown}>('select key_ref,permissions from session_keys where portfolio_id=$1 and status=\'active\' and expires_at>$2::timestamptz order by expires_at desc,key_ref',[id,deps.now()])).rows;
   async function request(id:number,wallet:string,value:unknown,kind:'consent'|'exit'|'revoke'){
     return safe(async()=>{
       const p=await owned(id,wallet),f=profile(),input=body(value,f),client=deps.client();
@@ -97,7 +93,6 @@ export function createYieldService(overrides:Partial<YieldServiceDeps>={}){
           if(matching.length!==1)throw new AppError(409,'YIELD_PROOF_UNCONFIRMED','缺少唯一且相符的市場同意／退出事件');
           const event=matching[0];if(!event)throw unavailable();
           if(kind==='exit'){
-            if(!await client.readContract({address:f.registry,abi:POLICY,functionName:'exiting',args:[address(p.accountAddress),market]}))throw unavailable();
             evidence.set(market,{daily:0n,enabled:false});
           }else{
             if(event.eventName!=='YieldPolicySet')throw unavailable();
@@ -109,6 +104,17 @@ export function createYieldService(overrides:Partial<YieldServiceDeps>={}){
         }
         if((await deps.query("select execution_key from yield_actions where chain_id=97 and portfolio_id=$1 and state in ('reserved','submitted','unknown')",[id])).rows.length)throw new AppError(409,'YIELD_RECONCILIATION_REQUIRED','原生息操作對帳中，請用同一筆鏈上證據重試');
         const state=await read({chainId:p.chainId,portfolioId:id,account:address(p.accountAddress)});
+        if(kind==='exit')for(const market of input.markets){
+          const [policy,exiting]=await Promise.all([
+            client.readContract({address:f.registry,abi:POLICY,functionName:'policies',args:[address(p.accountAddress),market],blockNumber:state.observation.block}),
+            client.readContract({address:f.registry,abi:POLICY,functionName:'exiting',args:[address(p.accountAddress),market],blockNumber:state.observation.block}),
+          ]);
+          const position=state.positions.find(s=>s.market.marketId===market);
+          if(policy[3]||state.observation.block<receipt.blockNumber||!fresh(state.observation.at,deps.now())||state.observation.at<at||
+            !exiting&&(!position||position.state!=='known'||!fresh(position.at,deps.now())||position.at<at||
+              position.block!==state.observation.block||position.blockHash!==state.observation.blockHash||
+              position.receipt!==0n||position.observedUnits!==0n||position.trackedUnits!==0n))throw unavailable();
+        }
         await persistYieldRead({chainId:p.chainId,portfolioId:id,account:address(p.accountAddress)},state,store);
         return deps.transaction(async db=>{
           await yieldLocks(db,{chainId:p.chainId,portfolioId:id,account:address(p.accountAddress)});
@@ -162,8 +168,8 @@ export function createYieldService(overrides:Partial<YieldServiceDeps>={}){
       if(!choices.some(c=>typeof c==='string')&&!consents.rows.length&&!openExit&&!rows.rows.some(p=>raw(p.receipt_raw)>0n||p.exit_state==='exiting'||p.exit_state==='retry'))return null;
       const frozen=(await deps.query("select execution_key from yield_events where chain_id=97 and portfolio_id=$1 and state='reorged' limit 1",[id])).rows.length>0;
       const state=await read(a);
-      const keys=await keyRows(id),permissions=await Promise.all(keys.map(k=>permission(k.permissions,a.account,f.executor)));
-      return {permission:permissions.includes('ok')?'ok':'needs_update',accountValue:frozen||state.positions.some(s=>s.state==='unknown'||s.value===null)?null:state.accountValue?.toString()??null,assets:state.positions.filter(s=>choices.includes(s.market.id)||s.receipt!==null&&s.receipt>0n||rows.rows.some(p=>p.market_id===s.market.marketId&&raw(p.receipt_raw)>0n)||consents.rows.some(c=>c.market_id===s.market.marketId)).map(s=>{
+      const keys=await keyRows(id),permissions=await Promise.all(keys.map(k=>yieldSessionAvailable(deps.client(),k.permissions,a.account,f.executor,deps.now())));
+      return {permission:permissions.includes(true)?'ok':'needs_update',accountValue:frozen||state.positions.some(s=>s.state==='unknown'||s.value===null)?null:state.accountValue?.toString()??null,assets:state.positions.filter(s=>choices.includes(s.market.id)||s.receipt!==null&&s.receipt>0n||rows.rows.some(p=>p.market_id===s.market.marketId&&raw(p.receipt_raw)>0n)||consents.rows.some(c=>c.market_id===s.market.marketId)).map(s=>{
         const prior=rows.rows.find(r=>r.market_id===s.market.marketId),risk=state.risks.filter(r=>r.protocol===s.market.protocol&&r.asset===s.market.asset);
         const consented=consents.rows.some(c=>c.market_id===s.market.marketId);
         const exiting=(frozen||s.receipt===null||s.receipt>0n||prior?.exit_state==='exiting'||prior?.exit_state==='retry')&&(frozen||mustExit(s,risk,prior?.exit_state==='exiting'||prior?.exit_state==='retry',deps.now()));
@@ -297,14 +303,21 @@ export function createYieldService(overrides:Partial<YieldServiceDeps>={}){
         if(!deps.canSend())return '生息讀值與退出要求已保存；執行開關尚未啟用';
         const keys=await keyRows(p.portfolioId);
         for(const key of keys){
-          if(await permission(key.permissions,p.account,f.executor)!=='ok')continue;
+          if(!await yieldSessionAvailable(client,key.permissions,p.account,f.executor,deps.now()))continue;
           const policies=object(key.permissions),timestamp=object(policies.timestamp);
           if(!/^m\/44'\/60'\/[0-9'/]+$/.test(key.key_ref)||typeof timestamp.validUntil!=='number'||!Number.isSafeInteger(timestamp.validUntil))throw unavailable();
           const keyRef:SessionKeyRef['keyRef']=`m/44'/60'/${key.key_ref.slice(10)}`;
           const owner=(await deps.query<{owner:Address}>('select owner from smart_accounts where chain_id=$1 and portfolio_id=$2',[p.chainId,p.portfolioId])).rows[0]?.owner;if(!owner)throw unavailable();
           const sessionKey:SessionKeyRef={keyRef,permissionId:hashPermission(policies.permissionId),sessionKeyAddress:address(policies.sessionKeyAddress),validUntil:timestamp.validUntil,owner};
           const paymaster:PaymasterDeps={reserve:async r=>{reservation=r;return r.validUntil;}};
-          await(await deps.port()).submitYieldAction({publicClient:client,bundlerUrl:resolveBundlerUrl(),account:p.account,sessionKey,policies:key.permissions,action:{marketId,kind,amount},journal,paymaster});
+          let preparing=false;
+          const guarded={...journal,prepare:async(input:YieldPrepare)=>{preparing=true;return journal.prepare(input);}};
+          try{await(await deps.port()).submitYieldAction({publicClient:client,bundlerUrl:resolveBundlerUrl(),account:p.account,sessionKey,policies:key.permissions,action:{marketId,kind,amount},journal:guarded,paymaster});}
+          catch(error){
+            if(!preparing&&!await yieldSessionAvailable(client,key.permissions,p.account,f.executor,deps.now()))continue;
+            if(!preparing&&error instanceof AppError&&error.code==='SESSION_AUTHORIZATION_REQUIRED')continue;
+            throw error;
+          }
           return kind==='withdraw'?'生息領出已確認':'生息供給已確認';
         }
         return '需要 owner 更新生息 session 權限';
@@ -319,19 +332,45 @@ export async function runYieldRound(options:{dryRun:boolean;limit:number},overri
   const deps={...defaults,...overrides};
   if(configuredChainId()!==97||deps.profile()===null)return{checked:0,blocked:0};
   const service=createYieldService(deps);
-  const accounts=(await deps.query<{portfolio_id:string;account:Address}>(`select sa.portfolio_id::text,sa.address as account from smart_accounts sa
-    join portfolios p on p.id=sa.portfolio_id where sa.chain_id=97 and sa.account_type='KERNEL'
-    and (exists(select 1 from strategy_versions v,jsonb_array_elements(case when jsonb_typeof(v.execution->'assets')='array' then v.execution->'assets' else '[]'::jsonb end) a where (v.strategy_id,v.version)=(p.strategy_id,p.version) and a.value->'yield'<>'null'::jsonb)
-      or exists(select 1 from yield_positions yp where yp.portfolio_id=p.id and (yp.receipt_raw>0 or yp.tracked_units_raw>0 or yp.exit_state in ('exiting','retry')))
-      or exists(select 1 from yield_actions ya where ya.portfolio_id=p.id and ya.state in ('reserved','submitted','unknown'))
-      or exists(select 1 from yield_exit_requests ye where ye.portfolio_id=p.id and ye.state<>'completed'))
-    order by exists(select 1 from yield_actions a where a.portfolio_id=p.id and a.state in ('reserved','submitted','unknown')) desc,
-    exists(select 1 from yield_exit_requests e where e.portfolio_id=p.id and e.state<>'completed') desc,
-    (select max(s.observed_at) from yield_position_snapshots s where s.portfolio_id=p.id) nulls first,p.id limit $1`,[options.limit])).rows;
+  if(!Number.isSafeInteger(options.limit)||options.limit<=0)return{checked:0,blocked:0};
+  // Claim a persistent cursor before attempting ANY portfolio lock/RPC. Failed and unknown
+  // accounts advance too. Four independent quotas prevent owner/risk/recovery starvation.
+  const accounts=await deps.transaction(async db=>{
+    await db.query("select pg_advisory_xact_lock(hashtextextended('yield_round_cursor:97',0))");
+    const candidates=(await deps.query<{portfolio_id:string;account:Address;queue:number}>(`with candidates as (
+    select sa.portfolio_id::text,sa.address as account,p.id,
+      case when exists(select 1 from yield_actions a where a.portfolio_id=p.id and a.state in ('reserved','submitted','unknown')) then 0
+        when exists(select 1 from yield_exit_requests e where e.portfolio_id=p.id and e.state<>'completed')
+          or exists(select 1 from yield_positions yp where yp.portfolio_id=p.id and (yp.receipt_raw>0 or yp.tracked_units_raw>0 or yp.exit_state in ('exiting','retry'))) then case when exists(select 1 from yield_exit_requests e where e.portfolio_id=p.id and e.state<>'completed') then 1 else 2 end
+        else 3 end as queue
+    from smart_accounts sa join portfolios p on p.id=sa.portfolio_id
+    where $1::int>0 and sa.chain_id=97 and sa.account_type='KERNEL'
+      and (exists(select 1 from strategy_versions v,jsonb_array_elements(case when jsonb_typeof(v.execution->'assets')='array' then v.execution->'assets' else '[]'::jsonb end) a where (v.strategy_id,v.version)=(p.strategy_id,p.version) and a.value->'yield'<>'null'::jsonb)
+        or exists(select 1 from yield_positions yp where yp.portfolio_id=p.id and (yp.receipt_raw>0 or yp.tracked_units_raw>0 or yp.exit_state in ('exiting','retry')))
+        or exists(select 1 from yield_actions ya where ya.portfolio_id=p.id and ya.state in ('reserved','submitted','unknown'))
+        or exists(select 1 from yield_exit_requests ye where ye.portfolio_id=p.id and ye.state<>'completed'))
+  ) select portfolio_id,account,queue from candidates order by id`,[options.limit])).rows;
+    const selected:typeof candidates=[];
+    for(const queue of [0,1,2,3]){
+      const group=candidates.filter(row=>row.queue===queue);if(!group.length)continue;
+      const key=`cursor-97-${options.dryRun?'dry':'live'}-${queue}`,saved=await readYieldState(key,(sql,params)=>db.query(sql,params?[...params]:[]));
+      if(saved!==null&&(typeof saved!=='number'||!Number.isSafeInteger(saved)||saved<0))throw unavailable();
+      const after=typeof saved==='number'?group.findIndex(row=>Number(row.portfolio_id)>saved):randomInt(group.length);
+      const offset=after<0?0:after,ordered=[...group.slice(offset),...group.slice(0,offset)];
+      const batch=ordered.slice(0,options.limit),last=batch.at(-1);if(!last)continue;
+      await writeYieldState(key,Number(last.portfolio_id),(sql,params)=>db.query(sql,params?[...params]:[]));selected.push(...batch);
+    }
+    return selected;
+  });
   let checked=0,blocked=0;
   for(const row of accounts){
     try{const result=await deps.lock(Number(row.portfolio_id),()=>service.tick({portfolioId:Number(row.portfolio_id),chainId:97,account:row.account},options.dryRun));if(result!==null)checked++;}
-    catch{blocked++;}
+    catch(error){
+      blocked++;
+      const codes=new Set(['YIELD_UNAVAILABLE','YIELD_QUOTE_UNAVAILABLE','YIELD_RECONCILIATION_REQUIRED','SESSION_AUTHORIZATION_REQUIRED','GAS_BUDGET_EXCEEDED','PAYMASTER_SUBMISSION_UNAVAILABLE']);
+      const code=error instanceof AppError&&codes.has(error.code)?error.code:'YIELD_UNAVAILABLE';
+      console.warn(JSON.stringify({msg:'yield_account_blocked',portfolioId:Number(row.portfolio_id),code}));
+    }
   }
   return {checked,blocked};
 }

@@ -1,14 +1,14 @@
 /** Explicit acceptance: bun --no-env-file test ./test/yield-106.fork.ts --timeout=1200000.
- * Requires the reviewed manifest deployed on chain 97 anvil 8599, alto 3099, DB cre8_be110.
+ * Requires the reviewed manifest deployed on chain 97 anvil 8599, alto 3099, DB cre8_be112.
  * No automatic discovery, external signing service, key files or public-chain writes.
  */
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import { setTimeout as pause } from 'node:timers/promises';
-import { createKernelAccount, createKernelAccountClient } from '@zerodev/sdk';
+import { createKernelAccount, createKernelAccountClient, encodeCallDataEpV07 } from '@zerodev/sdk';
 import { signerToEcdsaValidator } from '@zerodev/ecdsa-validator';
 import { KERNEL_V3_3 } from '@zerodev/sdk/constants';
-import { createPublicClient, createTestClient, createWalletClient, encodeFunctionData, erc20Abi, http, maxUint256, parseAbi } from 'viem';
+import { createPublicClient, createTestClient, createWalletClient, concatHex, toHex, encodeFunctionData, erc20Abi, http, maxUint256, parseAbi } from 'viem';
 import type { Address, Hex } from 'viem';
 import { mnemonicToAccount } from 'viem/accounts';
 import { bscTestnet } from 'viem/chains';
@@ -26,16 +26,17 @@ import { YIELD_EXECUTOR_ABI, YIELD_REGISTRY_ABI } from '../src/yield-abi.js';
 import { createYieldService, runYieldRound } from '../src/yield-service.js';
 import { readYieldAccount } from '../src/yield-reader.js';
 import { yieldProfile, WAD } from '../src/yield-domain.js';
-import { gasExecutionKey, canonicalKernelCalls } from '../src/paymaster.js';
+import { gasExecutionKey, canonicalKernelCalls, createPaymasterService } from '../src/paymaster.js';
 import type { SnapshotRow } from '../src/yield-store.js';
 import { restoreYieldOperation } from '../src/yield-store.js';
-import { reconcileYieldOperation, submitYieldAction } from '../src/yield-execution.js';
+import { yieldSessionAvailable } from '../src/yield-session.js';
+import { reconcileYieldOperation, submitYieldAction, quoteYieldAction } from '../src/yield-execution.js';
 import type { SavedYieldOperation } from '../src/yield-execution.js';
 import { localAcceptanceEnv } from './fixtures/local-acceptance.js';
 
 const lane = localAcceptanceEnv(process.env, true);
 const rpcUrl = 'http://127.0.0.1:8599', bundlerUrl = 'http://127.0.0.1:3099';
-assert.ok(lane.rpcUrl === rpcUrl && lane.bundler?.url === bundlerUrl && lane.backendPort === 8699 && lane.databaseName === 'cre8_be110', 'select only the BE110 local lane');
+assert.ok(lane.rpcUrl === rpcUrl && lane.bundler?.url === bundlerUrl && lane.backendPort === 8699 && lane.databaseName === 'cre8_be112', 'select only the BE112 local lane');
 assert.equal(process.env.ENABLE_YIELD_EXECUTION, '1');
 const client = createPublicClient({ chain: bscTestnet, transport: http(rpcUrl, { retryCount: 0, timeout: 120000 }), pollingInterval: 100, cacheTime: 0 });
 const local = createTestClient({ chain: bscTestnet, mode: 'anvil', transport: http(rpcUrl, { retryCount: 0, timeout: 120000 }) });
@@ -187,6 +188,7 @@ test('#110 cross-block durable scheduler + real sponsored Kernel lifecycle for V
       await ownerCalls('A10 upgrade', renewed.initConfig.map(data => ({ to: params.address, data, value: 0n })));
       check(kernel.address === params.address && baseline.permissionId !== renewed.permissionId, `${protocol} owner upgrade preserves Kernel and changes permission`);
       await query("insert into session_keys(portfolio_id,key_ref,permissions,expires_at,status) values($1,$2,$3,$4,'active')", [id, renewed.keyRef, JSON.stringify(renewed.policySnapshot), renewed.expiresAt]);
+      check(await yieldSessionAvailable(client,renewed.policySnapshot,account,C.executor,new Date()),`${protocol} real GasPolicy remaining allowance admits the installed key`);
       await refreshClock();
       const beforeConsent = await runYieldRound({ dryRun: false, limit: 10 }, chainDeps);
       check(beforeConsent.blocked === 0 && (await query('select execution_key from yield_actions where portfolio_id=$1', [id])).rows.length === 0, `${protocol} scheduler sends nothing without consent`);
@@ -221,6 +223,19 @@ test('#110 cross-block durable scheduler + real sponsored Kernel lifecycle for V
       const accrued = await readYieldAccount(client, profile, account);
       const position = accrued.positions.find(p => p.market.marketId === market.marketId); assert.ok(position);
       check(position.state === 'known' && position.claim !== null && position.claim > amount && position.value === position.claim, `${protocol} interest accrues into claim and NAV`);
+      // Exercise BOTH public sponsorship simulations against the real Kernel runtime;
+      // this read-only reserve adapter returns no signature to a browser or bundler.
+      const preview=await quoteYieldAction(client,account,{kind:'withdraw',marketId:market.marketId,amount:(position.receipt??0n)/10n});
+      const simulationNonce=await kernel.getNonce(),fee=await client.getGasPrice();
+      const countBefore=(await query('select user_op_hash from paymaster_sponsorships where sender=$1',[account])).rows.length;
+      for(const wrapped of [false,true]){
+        const callData=await encodeCallDataEpV07([{to:C.executor,data:preview.data,value:0n}],'call',wrapped);
+        const result=await createPaymasterService({reserve:async()=>{}}).sponsor({userOperation:{sender:account,nonce:simulationNonce,initCode:'0x',callData,
+          accountGasLimits:concatHex([toHex(500000n,{size:16}),toHex(2000000n,{size:16})]),preVerificationGas:50000n,
+          gasFees:concatHex([toHex(fee,{size:16}),toHex(fee,{size:16})]),paymasterAndData:'0x',signature:'0x'}},owner.address);
+        check(result.validUntil>Math.floor(Date.now()/1000),`${protocol} ${wrapped?'wrapped':'plain'} exit simulates real Kernel/hook successfully`);
+      }
+      check((await query('select user_op_hash from paymaster_sponsorships where sender=$1',[account])).rows.length===countBefore,`${protocol} read-only sponsorship simulations leave no reservation`);
       const marketOwner = createWalletClient({ chain: bscTestnet, account: T.roles.owner, transport: http(rpcUrl, { retryCount: 0, timeout: 120000 }) });
       await landed(await marketOwner.writeContract({ address: market.target, abi: extra, functionName: 'setLiquidity', args: [50n * WAD] }));
       check(await tick('partial liquidity exit') === '生息領出已確認', `${protocol} risk withdrawal through session/bundler/journal`);

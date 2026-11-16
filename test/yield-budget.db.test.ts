@@ -4,7 +4,7 @@ import { after, test } from 'node:test';
 import { encodeCallDataEpV07 } from '@zerodev/sdk';
 import { bytesToHex, encodeFunctionData } from 'viem';
 import { closePool, query } from '../src/db.js';
-import { createPaymasterService } from '../src/paymaster.js';
+import { createPaymasterService, gasExecutionKey, settleGasBudget } from '../src/paymaster.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
 import { YIELD_EXECUTOR_ABI } from '../src/yield-abi.js';
 import { config, operation, OWNER, TEST_SIGNER, NOW } from './fixtures/paymaster.js';
@@ -14,7 +14,7 @@ test('#85 supply uses the existing 60/day account cap; exhausted ordinary quotas
   const sender = bytesToHex(randomBytes(20));
   const c = config({ CHAIN_ID: '97', RPC_URL: 'http://127.0.0.1:8592', PAYMASTER_SIGNER_PRIVATE_KEY: TEST_SIGNER });
   const service = createPaymasterService({ config: c, now: () => NOW,
-    query: async () => ({ rows: [{ owner: OWNER, user_id: OWNER }] }), checkChain: async () => {},
+    query: async () => ({ rows: [{ owner: OWNER, user_id: OWNER }] }), checkChain: async () => {}, verifyYieldWithdraw:async()=>[],
     readBudgetContext: async () => ({ purpose: 'ordinary', nativePrice: 1n, priceSource: 'test:yield-85' }) });
   const op = async (nonce: bigint, kind: 'executeSupply' | 'executeWithdraw' = 'executeSupply') => operation({ sender, nonce,
     callData: await encodeCallDataEpV07([{ to: c.executor, value: 0n, data: encodeFunctionData({ abi: YIELD_EXECUTOR_ABI,
@@ -26,8 +26,9 @@ test('#85 supply uses the existing 60/day account cap; exhausted ordinary quotas
     await service.sponsor({ userOperation: await op(60n, 'executeWithdraw') }, OWNER);
     const usage = await query<{ n: string; exits: string }>("select count(*)::text as n,count(*) filter(where purpose='exit')::text as exits from gas_budget_reservations where chain_id=97 and account=$1", [sender]);
     assert.equal(usage.rows[0]?.n, '61'); assert.equal(usage.rows[0]?.exits, '1');
+    await settleGasBudget(gasExecutionKey(97,await op(60n,'executeWithdraw')),'confirmed');
     const capped = createPaymasterService({ config: { ...c, siteDailyGas: 0n }, now: () => NOW,
-      query: async () => ({ rows: [{ owner: OWNER, user_id: OWNER }] }), checkChain: async () => {},
+      query: async () => ({ rows: [{ owner: OWNER, user_id: OWNER }] }), checkChain: async () => {}, verifyYieldWithdraw:async()=>[],
       readBudgetContext: async () => ({ purpose: 'ordinary', nativePrice: 1n, priceSource: 'test:yield-85' }) });
     await assert.rejects(capped.sponsor({ userOperation: await op(61n, 'executeWithdraw') }, OWNER), /PAYMASTER_QUOTA_EXCEEDED/);
   } finally {

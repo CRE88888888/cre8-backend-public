@@ -1,6 +1,6 @@
 import {
   concatHex, createPublicClient, decodeAbiParameters, decodeFunctionData, encodeAbiParameters,
-  encodeFunctionData, http, isAddressEqual, keccak256, pad, parseAbi, slice, toHex, toFunctionSelector, zeroAddress,
+  encodeFunctionData, http, isAddressEqual, keccak256, pad, parseAbi, parseAbiItem, slice, toHex, toFunctionSelector, zeroAddress,
 } from 'viem';
 import { KernelV3_3AccountAbi } from '@zerodev/sdk';
 import { PolicyFlags } from '@zerodev/permissions';
@@ -9,6 +9,7 @@ import { toEmptyECDSASigner, toSignerId } from '@zerodev/permissions/signers';
 import type { Address, Hex, PublicClient } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import type { GetPaymasterDataParameters, PaymasterActions } from 'viem/account-abstraction';
+import { entryPoint07Abi } from 'viem/account-abstraction';
 import { EXECUTOR_ABI, REGISTRY_ABI } from './chain.js';
 import { KERNEL_V3_3_ADDRESSES } from './addresses.js';
 import { loadPaymasterConfig, loadTradingConfig } from './config.js';
@@ -20,6 +21,10 @@ import { TESTNET_97, testnetAssets } from './testnet-profile.js';
 import { SESSION_GAS_ALLOWED_WEI, sessionCallPermissions } from './permissions.js';
 import { YIELD_REGISTRY_ABI } from './yield-abi.js';
 import { MAX_USER_OP_GAS } from './execution-batch.js';
+import { applyExpiredExitProofs, expiredExitProofs, rememberExitFacts } from './paymaster-exit-reconciliation.js';
+import type { ExpiredExitProof } from './paymaster-exit-reconciliation.js';
+export { reconcileExpiredExitAuthorizations } from './paymaster-exit-reconciliation.js';
+import { fresh } from './yield-domain.js';
 
 export type PackedSponsorOperation = {
   sender: Address; nonce: bigint; initCode: Hex; callData: Hex; accountGasLimits: Hex;
@@ -30,7 +35,11 @@ export type Reservation = {
   verificationGas: bigint; callGas: bigint; maxFee: bigint; gasLimit: bigint; maxCostWei: bigint;
   budget: GasBudgetRequest;
   now?: () => number;
+  /** Internal canonical EntryPoint consumption evidence; never accepted from request JSON. */
+  consumedAuthorizations?: readonly ConsumedAuthorization[];
+  expiredAuthorizations?: readonly ExpiredExitProof[];
 };
+export type ConsumedAuthorization = { userOpHash:Hex; executionKey:string; success:boolean };
 export type GasPurpose = 'ordinary' | 'setup' | 'exit';
 export type GasBudgetRequest = {
   executionKey: string; chainId: number; account: Address; purpose: GasPurpose;
@@ -54,6 +63,7 @@ export type PaymasterDeps = {
   checkChain?: (op: PackedSponsorOperation, config: PaymasterConfig) => Promise<void>;
   reserve?: (request: Reservation) => Promise<number | void>;
   readBudgetContext?: (op: PackedSponsorOperation, config: PaymasterConfig) => Promise<BudgetContext>;
+  verifyYieldWithdraw?: (op: PackedSponsorOperation, config: PaymasterConfig, now: number, query: Query) => Promise<readonly ConsumedAuthorization[]>;
   /** Internal scheduler evidence, bound to the exact canonical Kernel calldata. Never request input. */
   exitCallData?: Hex;
 };
@@ -325,6 +335,81 @@ export function pureYieldWithdraw(op: PackedSponsorOperation, c: PaymasterConfig
   } catch { return false; }
 }
 
+const EXIT_READ = parseAbi(['function balanceOf(address) view returns(uint256)',
+  'function accountUnits(address,bytes32) view returns(uint256)', 'function getNonce(address,uint192) view returns(uint256)']);
+const USER_OP_EVENT = parseAbiItem('event UserOperationEvent(bytes32 indexed userOpHash,address indexed sender,address indexed paymaster,uint256 nonce,bool success,uint256 actualGasCost,uint256 actualGasUsed)');
+/** Public sponsorship has no trusted scheduler plan. Prove holdings and simulate the entire
+ * exact Kernel batch, so duplicate markets cannot borrow the same balance twice.
+ */
+async function verifyYieldWithdraw(op:PackedSponsorOperation,c:PaymasterConfig,now:number,db:Query):Promise<readonly ConsumedAuthorization[]>{
+  try{
+    const client=rpc(c),block=await client.getBlock({blockTag:'latest'});
+    if(c.chainId!==97||await client.getChainId()!==97||op.initCode!=='0x'||block.number===null||block.hash===null||
+      !fresh(new Date(Number(block.timestamp)*1000),new Date(now*1000)))throw rejected('PAYMASTER_EXIT_INVALID',403);
+    const nonce=await client.readContract({address:TESTNET_97.contracts.entryPoint,abi:EXIT_READ,functionName:'getNonce',args:[op.sender,op.nonce>>64n],blockNumber:block.number});
+    if(nonce!==op.nonce)throw rejected('PAYMASTER_EXIT_INVALID',403);
+    const amounts=new Map<Hex,bigint>();
+    for(const call of sponsoredCalls(op)){
+      const decoded=decodeFunctionData({abi:EXECUTOR_ABI,data:call.callData});
+      if(!isAddressEqual(call.target,c.executor)||decoded.functionName!=='executeWithdraw')throw rejected('PAYMASTER_EXIT_INVALID',403);
+      amounts.set(decoded.args[1],(amounts.get(decoded.args[1])??0n)+decoded.args[2]);
+    }
+    for(const [id,amount]of amounts){
+      const market=TESTNET_97.yieldMarkets.find(m=>m.marketId===id);if(!market)throw rejected('PAYMASTER_EXIT_INVALID',403);
+      const [balance,units]=await Promise.all([
+        client.readContract({address:market.receipt,abi:EXIT_READ,functionName:'balanceOf',args:[op.sender],blockNumber:block.number}),
+        client.readContract({address:TESTNET_97.contracts.yieldRegistry,abi:EXIT_READ,functionName:'accountUnits',args:[op.sender,id],blockNumber:block.number}),
+      ]);
+      if(amount===0n||amount>balance||units===0n)throw rejected('PAYMASTER_EXIT_INVALID',403);
+    }
+    let data=op.callData;
+    let stateOverride:Parameters<typeof client.call>[0]['stateOverride'];
+    if(op.callData.startsWith(EXECUTE_USER_OP_SELECTOR)){
+      // EntryPoint v0.7 _executeUserOp ABI-encodes the full op, not the SDK prefix.
+      const userOpHash=packedOperationHash(op,c.chainId),nonceBytes=toHex(op.nonce,{size:32});
+      const abi=parseAbi(['function rootValidator() view returns(bytes21)','function validationConfig(bytes21) view returns(uint32 nonce,address hook)']);
+      const id=slice(nonceBytes,1,2)==='0x00'
+        ?await client.readContract({address:op.sender,abi,functionName:'rootValidator',blockNumber:block.number})
+        :slice(nonceBytes,1,2)==='0x02'?pad(slice(nonceBytes,1,6),{size:21,dir:'right'}):slice(nonceBytes,1,22);
+      const [,hook]=await client.readContract({address:op.sender,abi,functionName:'validationConfig',args:[id],blockNumber:block.number});
+      // Kernel 0.3.3 validateUserOp writes executionHook[userOpHash] (ordinary slot 0).
+      // Reproduce only that write in this eth_call; run the real installed hook as well.
+      stateOverride=[{address:op.sender,stateDiff:[{slot:keccak256(encodeAbiParameters([{type:'bytes32'},{type:'uint256'}],[userOpHash,0n])),value:pad(hook)}]}];
+      data=encodeFunctionData({abi:KernelV3_3AccountAbi,functionName:'executeUserOp',args:[op,userOpHash]});
+    }
+    await client.call({account:TESTNET_97.contracts.entryPoint,to:op.sender,data,gas:gasCost(op,c).callGas,blockNumber:block.number,...(stateOverride?{stateOverride}:{})});
+    const candidates=await db(`select s.user_op_hash from paymaster_sponsorships s where s.chain_id=$1 and s.sender=$2 and s.state not in ('confirmed','failed','expired')
+      and exists(select 1 from gas_budget_reservations g where g.chain_id=s.chain_id and g.account=s.sender and g.purpose='exit' and g.state in ('reserved','submitted','unknown'))`,[c.chainId,op.sender]);
+    const hashes=candidates.rows.map(row=>hex(object(row).user_op_hash,32));
+    const consumed:ConsumedAuthorization[]=[];
+    if(hashes.length){
+      const logs=await client.getLogs({address:TESTNET_97.contracts.entryPoint,event:USER_OP_EVENT,args:{sender:op.sender,userOpHash:hashes},strict:true,
+        fromBlock:block.number>1024n?block.number-1024n:0n,toBlock:block.number});
+      for(const log of logs){
+        if(log.removed||log.blockNumber===null||log.blockHash===null)continue;
+        if((await client.getBlock({blockNumber:log.blockNumber})).hash!==log.blockHash)throw rejected('PAYMASTER_EXIT_UNAVAILABLE',503);
+        const [tx,receipt]=await Promise.all([client.getTransaction({hash:log.transactionHash}),client.getTransactionReceipt({hash:log.transactionHash})]);
+        if(tx.hash!==log.transactionHash||tx.blockHash!==log.blockHash||tx.blockNumber!==log.blockNumber||!tx.to||!isAddressEqual(tx.to,TESTNET_97.contracts.entryPoint)||
+          receipt.status!=='success'||receipt.transactionHash!==tx.hash||receipt.blockHash!==log.blockHash||receipt.blockNumber!==log.blockNumber||
+          !receipt.logs.some(candidate=>!candidate.removed&&candidate.transactionHash===log.transactionHash&&candidate.blockHash===log.blockHash&&candidate.blockNumber===log.blockNumber&&
+            candidate.logIndex===log.logIndex&&isAddressEqual(candidate.address,log.address)&&candidate.data===log.data&&
+            candidate.topics.length===log.topics.length&&candidate.topics.every((topic,index)=>topic===log.topics[index])))throw rejected('PAYMASTER_EXIT_UNAVAILABLE',503);
+        const decoded=decodeFunctionData({abi:entryPoint07Abi,data:tx.input});
+        const packed=decoded.functionName==='handleOps'?decoded.args[0]:decoded.functionName==='handleAggregatedOps'?decoded.args[0].flatMap(group=>group.userOps):[];
+        const originals=packed.filter(original=>packedOperationHash(original,c.chainId)===log.args.userOpHash);
+        const original=originals[0];
+        if(originals.length!==1||!original||!isAddressEqual(original.sender,op.sender)||original.nonce!==log.args.nonce)throw rejected('PAYMASTER_EXIT_UNAVAILABLE',503);
+        consumed.push({userOpHash:log.args.userOpHash,executionKey:gasExecutionKey(c.chainId,original),success:log.args.success});
+      }
+    }
+    if((await client.getBlock({blockNumber:block.number})).hash!==block.hash)throw rejected('PAYMASTER_EXIT_UNAVAILABLE',503);
+    return consumed;
+  }catch(error){
+    if(error instanceof AppError&&error.code==='PAYMASTER_EXIT_INVALID')throw error;
+    throw rejected('PAYMASTER_EXIT_UNAVAILABLE',503);
+  }
+}
+
 function decimalE8(value: bigint): string {
   return `${value / 100000000n}.${(value % 100000000n).toString().padStart(8, '0')}`;
 }
@@ -400,15 +485,28 @@ export async function reserveSponsorship(r: Reservation, transaction: typeof wit
       await client.query("select set_config('statement_timeout', $1, true), set_config('lock_timeout', $1, true)", [String(c.timeoutMs)]);
       // Execution lock spans UTC midnight; day locks still govern all site/account writers.
       await client.query("select pg_advisory_xact_lock(hashtextextended('paymaster_execution:' || $1::text,0))", [gasExecutionKey(c.chainId, r.op)]);
+      // This lock deliberately has no UTC day or paymaster component: the outstanding
+      // authorization invariant must also hold across midnight and signer rotations.
+      await client.query("select pg_advisory_xact_lock(hashtextextended('paymaster_account:' || $1::bigint::text || ':' || $2::text,0))",[c.chainId,r.op.sender]);
       const pinned = await client.query<{ day: string }>("select to_char(transaction_timestamp() at time zone 'UTC', 'YYYY-MM-DD') as day");
       const day = pinned.rows[0]?.day;
       if (!day) throw new Error('missing UTC day');
       await client.query("select pg_advisory_xact_lock(hashtextextended('paymaster_sponsorships:' || $1::bigint::text || ':' || to_char($2::date, 'YYYY-MM-DD'), 0))", [c.chainId, day]);
       if (r.budget.chainId !== c.chainId || !isAddressEqual(r.budget.account, r.op.sender) || r.budget.gasLimit !== r.gasLimit || r.budget.maxFeePerGas !== r.maxFee) throw rejected('GAS_BUDGET_CONFLICT', 409);
+      for(const proof of r.consumedAuthorizations??[]){
+        const prior=(await client.query<{day:string}>("select to_char(utc_day,'YYYY-MM-DD') as day from gas_budget_reservations where execution_key=$1 and chain_id=$2 and account=$3",[proof.executionKey,c.chainId,r.op.sender])).rows[0];
+        if(prior){
+          await client.query("select pg_advisory_xact_lock(hashtextextended('gas_budget_reservations:'||$1::bigint::text||':'||$2::text||':'||$3::text,0))",[c.chainId,r.op.sender,prior.day]);
+          await client.query("update gas_budget_reservations set state=$2,updated_at=greatest(updated_at,clock_timestamp()) where execution_key=$1 and state in ('reserved','submitted','unknown')",[proof.executionKey,proof.success?'confirmed':'failed']);
+        }
+        await client.query("update paymaster_sponsorships set state=$4,updated_at=greatest(updated_at,clock_timestamp()) where chain_id=$1 and sender=$2 and user_op_hash=$3 and state not in ('confirmed','failed')",[c.chainId,r.op.sender,proof.userOpHash,proof.success?'confirmed':'failed']);
+      }
+      await applyExpiredExitProofs(client,c.chainId,r.op.sender,r.expiredAuthorizations??[]);
+      const pendingExit=pureYieldWithdraw(r.op,c)&&(await client.query("select execution_key from gas_budget_reservations where chain_id=$1 and account=$2 and purpose='exit' and state in ('reserved','submitted','unknown') limit 1",[c.chainId,r.op.sender])).rows.length>0;
       await reserveBudgetOnClient(r.budget, client, day, loadTradingConfig(process.env, c.chainId));
       // A request that arrived earlier may acquire the execution lock later. Refresh after waiting.
       const now = (r.now ?? (() => Math.floor(Date.now() / 1000)))();
-      const candidates = await client.query<{ user_op_hash: Hex; valid_until: Date }>(`select user_op_hash,valid_until
+      const candidates = await client.query<{ user_op_hash: Hex; valid_until: Date; state:string }>(`select user_op_hash,valid_until,state
         from paymaster_sponsorships where chain_id=$1 and paymaster=$2 and sender=$3
         and valid_until>to_timestamp($4::double precision) order by valid_until`,
         [c.chainId, c.address.toLowerCase(), r.op.sender.toLowerCase(), now]);
@@ -427,6 +525,10 @@ export async function reserveSponsorship(r: Reservation, transaction: typeof wit
         if (previous.rows[0]?.matches !== true) throw rejected('PAYMASTER_RESERVATION_CONFLICT', 409);
         return r.validUntil;
       }
+      // At most one unconsumed authorization per yield-exit account. Exact live retries above
+      // reuse it. Canonically consumed signatures permit the next real exit immediately;
+      // all historical gas/site charges remain, including expired or failed requests.
+      if(pendingExit)throw rejected('PAYMASTER_EXIT_AUTHORIZATION_PENDING',429);
       const usage = await client.query<{ count: string; gas: string; wei: string; account_count: string; account_gas: string; account_wei: string }>(`
         select count(*)::text as count, coalesce(sum(gas_limit),0)::text as gas, coalesce(sum(max_cost_wei),0)::text as wei,
           count(*) filter (where sender = $3)::text as account_count,
@@ -440,6 +542,14 @@ export async function reserveSponsorship(r: Reservation, transaction: typeof wit
           ...(c.accountDailyWei === null ? [] : [[BigInt(u.account_wei), r.maxCostWei, c.accountDailyWei] as const])];
       const budgets: (readonly [bigint, bigint, bigint])[] = [...accountBudgets, [BigInt(u.gas), r.gasLimit, c.siteDailyGas], [BigInt(u.wei), r.maxCostWei, c.siteDailyWei]];
       if (budgets.some(([used, amount, cap]) => cap === 0n || used + amount > cap)) throw rejected('PAYMASTER_QUOTA_EXCEEDED', 429);
+      await rememberExitFacts({chainId:c.chainId,account:r.op.sender,userOpHash:r.hash,executionKey:r.budget.executionKey,nonce:r.op.nonce.toString(),validUntil:r.validUntil,purpose:r.budget.purpose},(sql,params)=>client.query(sql,params?[...params]:[]));
+      if(pureYieldWithdraw(r.op,c)){
+        const original=(await client.query<{day:string}>("select to_char(utc_day,'YYYY-MM-DD') as day from gas_budget_reservations where execution_key=$1 and state='failed'",[r.budget.executionKey])).rows[0];
+        if(original){
+          await client.query("select pg_advisory_xact_lock(hashtextextended('gas_budget_reservations:'||$1::bigint::text||':'||$2::text||':'||$3::text,0))",[c.chainId,r.op.sender,original.day]);
+          await client.query("update gas_budget_reservations set state='reserved',updated_at=greatest(updated_at,clock_timestamp()) where execution_key=$1 and state='failed'",[r.budget.executionKey]);
+        }
+      }
       await client.query(`insert into paymaster_sponsorships (user_op_hash,chain_id,paymaster,sender,verification_gas_limit,call_gas_limit,
         pre_verification_gas,paymaster_verification_gas_limit,paymaster_post_op_gas_limit,max_fee_per_gas,valid_until)
         values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,to_timestamp($11::double precision))`, reservationParams(r));
@@ -500,12 +610,15 @@ async function authorization(op: PackedSponsorOperation, c: PaymasterConfig, val
   const paymasterData = concatHex([encodeAbiParameters([{ type: 'uint48' }, { type: 'uint48' }], [validUntil, 0]), signature]);
   const paymasterAndData = concatHex([header(c), paymasterData]);
   // Actual EntryPoint v0.7 UserOp hash, including the final paymaster authorization, excluding account signature.
-  const packedHash = keccak256(encodeAbiParameters(
-    [{ type: 'address' }, { type: 'uint256' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'uint256' }, { type: 'bytes32' }, { type: 'bytes32' }],
-    [op.sender, op.nonce, keccak256(op.initCode), keccak256(op.callData), op.accountGasLimits, op.preVerificationGas, op.gasFees, keccak256(paymasterAndData)]));
-  const userOpHash = keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'address' }, { type: 'uint256' }], [packedHash, KERNEL_V3_3_ADDRESSES.entryPointV07, BigInt(c.chainId)]));
+  const userOpHash=packedOperationHash({...op,paymasterAndData},c.chainId);
   return { paymasterAndData, paymaster: c.address, paymasterData, paymasterVerificationGasLimit: c.verificationGasLimit,
     paymasterPostOpGasLimit: c.postOpGasLimit, validUntil, validAfter: 0, userOpHash };
+}
+function packedOperationHash(op:PackedSponsorOperation,chainId:number):Hex{
+  const packedHash = keccak256(encodeAbiParameters(
+    [{ type: 'address' }, { type: 'uint256' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'uint256' }, { type: 'bytes32' }, { type: 'bytes32' }],
+    [op.sender, op.nonce, keccak256(op.initCode), keccak256(op.callData), op.accountGasLimits, op.preVerificationGas, op.gasFees, keccak256(op.paymasterAndData)]));
+  return keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'address' }, { type: 'uint256' }], [packedHash, KERNEL_V3_3_ADDRESSES.entryPointV07, BigInt(chainId)]));
 }
 
 export function createPaymasterService(deps: PaymasterDeps = {}) {
@@ -538,10 +651,18 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
         });
       }
       validateSponsoredCalls(op, c, { owner: hex(owner.owner, 20), assets });
+      const cost = gasCost(op, c);
+      if (cost.gasLimit > MAX_USER_OP_GAS) throw rejected('PAYMASTER_USER_OP_CAPACITY', 400);
       await bounded((deps.checkChain ?? checkChain)(op, c), c.timeoutMs);
       let signed = await authorization(op, c, validUntil);
       const context = await bounded((deps.readBudgetContext ?? readBudgetContext)(op, c), c.timeoutMs);
-      if (pureYieldWithdraw(op, c)) context.purpose = 'exit';
+      let consumedAuthorizations:readonly ConsumedAuthorization[]=[];
+      let expiredAuthorizations:readonly ExpiredExitProof[]=[];
+      if (pureYieldWithdraw(op, c)) {
+        consumedAuthorizations=await bounded((deps.verifyYieldWithdraw??verifyYieldWithdraw)({...op,paymasterAndData:signed.paymasterAndData},c,now,deps.query??query),c.timeoutMs);
+        if(!deps.verifyYieldWithdraw)expiredAuthorizations=await bounded(expiredExitProofs(c,op.sender,deps.query??query),c.timeoutMs);
+        context.purpose = 'exit';
+      }
       if (deps.exitCallData !== undefined && deps.exitCallData.toLowerCase() === op.callData.toLowerCase()) {
         const executorCall = calls.length === 1 ? calls[0] : undefined;
         const decoded = executorCall !== undefined && isAddressEqual(executorCall.target, c.executor)
@@ -550,9 +671,8 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
         if (decoded?.functionName !== 'executeRebalance' || !decoded.args[1].every((step) => isAddressEqual(step.tokenOut, numeraire))) throw rejected('GAS_BUDGET_INVALID', 503);
         context.purpose = 'exit';
       }
-      const cost = gasCost(op, c);
-      if (cost.gasLimit > MAX_USER_OP_GAS) throw rejected('PAYMASTER_USER_OP_CAPACITY', 400);
       const reservedUntil = await (deps.reserve ?? reserveSponsorship)({ hash: signed.userOpHash, op, config: c, validUntil, now: deps.now ?? (() => Math.floor(Date.now() / 1000)), ...cost,
+        consumedAuthorizations,expiredAuthorizations,
         budget: { executionKey: gasExecutionKey(c.chainId, op), chainId: c.chainId, account: op.sender,
           gasLimit: cost.gasLimit, maxFeePerGas: cost.maxFee, ...context } });
       if (reservedUntil !== undefined && reservedUntil !== validUntil) {
@@ -616,4 +736,20 @@ export function schedulerPaymaster(expectedSender: Address, deps: PaymasterDeps 
       } catch (error) { throw paymasterExecutionError(error); }
     },
   };
+}
+
+/** Manual binding of a legacy opaque hash requires the ORIGINAL signed packed UserOp.
+ * Recompute both identities; never save signatures, supplied paths or unverified nonce claims.
+ */
+export async function bindExitAuthorizationEvidence(input:unknown):Promise<void>{
+  const op=parsePackedSponsorOperation(input),hash=packedOperationHash(op,97),executionKey=gasExecutionKey(97,op);
+  const [until,after]=decodeAbiParameters([{type:'uint48'},{type:'uint48'}],slice(op.paymasterAndData,52,116));
+  if(after!==0||until===0)throw rejected('PAYMASTER_EXIT_INVALID',403);
+  await withTransaction(async db=>{
+    await db.query("select pg_advisory_xact_lock(hashtextextended('paymaster_account:97:'||$1::text,0))",[op.sender]);
+    const row=(await db.query<{paymaster:Address;valid_until:Date;purpose:string}>(`select s.paymaster,s.valid_until,g.purpose from paymaster_sponsorships s join gas_budget_reservations g on g.chain_id=s.chain_id and g.account=s.sender
+      where s.chain_id=97 and s.sender=$1 and s.user_op_hash=$2 and g.execution_key=$3 and s.state not in ('confirmed','failed','expired')`,[op.sender,hash,executionKey])).rows[0];
+    if(!row||row.valid_until.getTime()!==until*1000||!isAddressEqual(row.paymaster,slice(op.paymasterAndData,0,20)))throw rejected('PAYMASTER_EXIT_INVALID',403);
+    await rememberExitFacts({chainId:97,account:op.sender,userOpHash:hash,executionKey,nonce:op.nonce.toString(),validUntil:until,purpose:row.purpose},(sql,params)=>db.query(sql,params?[...params]:[]));
+  });
 }

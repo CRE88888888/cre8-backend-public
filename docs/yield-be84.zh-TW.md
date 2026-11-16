@@ -16,7 +16,7 @@ U=8000 bps 允許；8001 不供給；9000 開始退出。退出黏住至零，�
 
 ## API 與前端 #95
 
-- `GET /yield/markets?chainId=97`：`{ chainId, registry, markets }`，每市場含 `id`（平台 slug）、`marketId`（bytes32）、`protocol: venus|lista|aave_v3`、`asset`、`symbol`、`receipt`、`aprBps`、`simulated`、`supplyOpen`；另附 `is_simulated`、`dataAt`。APR 直接讀目前 mock 的 APR，**不是 APY**。讀不到時 `aprBps=null`／`supplyOpen=false`；前端現有嚴格 parser 會丟掉無利率市場。
+- `GET /yield/markets?chainId=97`：`{ chainId, registry, markets }`，每市場含 `id`（平台 slug）、`marketId`（bytes32）、`protocol: venus|lista|aave_v3`、`asset`、`symbol`、`receipt`、`aprBps`、`simulated`、`supplyOpen`；另附 `is_simulated`、`dataAt`。APR 直接讀目前 mock 的 APR，**不是 APY**。讀不到時 `aprBps=null`／`supplyOpen=false`；前端 parser 接受 APR=null，顯示「—」，並停止該市場的新供給。
 - `GET /portfolios/:id/execution` 新增 `yield: { permission, accountValue, assets }`。只列目前選的市場、有同意或持有歷史債權的市場，不列全部空市場。`receiptValue`、`pending.value`、`accountValue` 都是 **USDT raw 字串**，未知為 null。另附 `claimAssets`／`maxWithdraw`（underlying raw）、`valuationState`、`simulated`／`is_simulated`。`pending.reason` 可為既有的三種原因或 `unknown`。沒有生息 profile 時不附 yield。`cash.reconciliationPending` 為新增布林值；生息在途時 unclassifiedRaw／deficitRaw 都為 null，不能把未扣／已扣但未結算的供給誤作新投入。
 - `yield.assets[]` 每筆另附 `consented: boolean`：目前 enrollment（策略與版本）下，該市場已驗證的本人同意是否仍有效。未同意、`revoke` 或全帳戶 `exit` 後為 false；新的有效同意成立後為 true，舊版 enrollment 的同意不沿用。此欄與既有 `state`／估值分開：撤銷後仍有收據時保留 `state="supplied"`、`receiptValue` 等原語意，同時回 `consented=false`；估值未知也不把既有同意改成 false。
 - `POST /portfolios/:id/yield/consent`、`/yield/exit`：沿用 `{ markets, txHash }`，markets 接受 API 的 slug 或 bytes32。本人先簽 policy／requestExit，再通知；後端驗成功 receipt、canonical block、唯一 account／market 事件、目前 policy 與 enrollment。未知 DB commit 重試原 txHash，不假稱尚未上鏈。
@@ -40,7 +40,7 @@ monthly 的持久化月份錨點或 drift 的新鮮 >500 bps 報告尚待完成�
 
 ## Journal 與鎖序
 
-帳戶 session lock → cash 獨立 statement FOR UPDATE → 排序市場 → 排序 bucket → position／action → site/day → account/day。RPC 在短交易外。
+帳戶 session lock → cash 獨立 statement FOR UPDATE → 排序市場 → 排序 bucket → position／action → paymaster execution key → paymaster chain/account（不含日期）→ site/day → gas account/day（沿原預留日）。RPC 在短交易外。
 
 BE-4 準備 paymaster 時，注入既有 reserve callback 暫存 request；journal.prepare 再核對報價區塊號／hash、新鮮度及 deadline，透過既有 `reserveSponsorship` 的 transaction 參數，將 gas／sponsorship、來源扣款、action、pending operation、0040 原始快照提交到**同一 client／同一 commit**。沒有簽名或私鑰進快照。prepare commit 不明確成功就不廣播；原 execution key 再進 prepare 一律轉對帳，不允許第二次廣播。
 

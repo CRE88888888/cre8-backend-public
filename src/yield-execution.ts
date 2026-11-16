@@ -10,7 +10,8 @@ import { assertUserOpCapacity, MAX_USER_OP_GAS, userOpGasOverhead } from './exec
 import { canonicalKernelCalls, estimationPaymaster, schedulerPaymaster, gasExecutionKey, settleGasBudget, paymasterExecutionError } from './paymaster.js';
 import type { PaymasterDeps } from './paymaster.js';
 import { yieldAuthorization } from './permissions.js';
-import { sessionKernelAccount, KERNEL_PERMISSION_ABI } from './scheduler.js';
+import { sessionKernelAccount } from './scheduler.js';
+import { yieldSessionAvailable } from './yield-session.js';
 import type { SessionKeyRef } from './scheduler.js';
 import { signPreparedOperation } from './user-operation.js';
 
@@ -279,10 +280,8 @@ async function submitYieldWithSession(args: YieldSubmitArgs): Promise<YieldEvide
   const attempts = args.maxQuoteAttempts ?? 3;
   if (!Number.isSafeInteger(attempts) || attempts < 1 || attempts > 3) throw fail('YIELD_INVALID_ACTION', '報價重試上限必須是 1 到 3', 400);
   const publicClient = args.publicClient;
-  const installation = await publicClient.readContract({ address: args.account,
-    abi: KERNEL_PERMISSION_ABI,
-    functionName: 'permissionConfig', args: [args.sessionKey.permissionId] });
-  if (isAddressEqual(installation.signer, zeroAddress) || installation.policyData.length !== 3) throw fail('SESSION_AUTHORIZATION_REQUIRED', '需要更新授權：生息 permission 尚未安裝', 409);
+  if (!await yieldSessionAvailable(publicClient, args.policies, args.account, TESTNET_97.contracts.executor, new Date()))
+    throw fail('SESSION_AUTHORIZATION_REQUIRED', '需要更新授權：生息 permission 未安裝或已過期', 409);
   const account = await sessionKernelAccount({ account: args.account, executor: TESTNET_97.contracts.executor,
     sessionKey: { ...args.sessionKey, yieldAccount: args.account } }, publicClient);
   const paymaster = schedulerPaymaster(args.account, args.paymaster);

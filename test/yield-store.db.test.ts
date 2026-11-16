@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import { encodeFunctionData, parseAbi } from 'viem';
 import type { Hex } from 'viem';
+import type { QueryResultRow } from 'pg';
 import { closePool, migrate, query, withTransaction, withPortfolioLock } from '../src/db.js';
 import { persistYieldRead, syncYieldCatalog, createYieldJournal, restoreYieldOperation } from '../src/yield-store.js';
 import type { JournalContext, SnapshotRow, SettlementRead } from '../src/yield-store.js';
@@ -16,8 +17,8 @@ import { config, kernelCall, operation } from './fixtures/paymaster.js';
 
 const paymasters:string[]=[];
 after(async()=>{if(paymasters.length)await query('delete from paymaster_sponsorships where chain_id=97 and paymaster=any($1::text[])',[paymasters]);await closePool();});
-async function fixture(read?:YieldRead,rebalance:'none'|'monthly'|'drift'='none'){
-  await migrate();const f=yieldFixture(['venus']),r=read??f.read;
+async function fixture(read?:YieldRead,rebalance:'none'|'monthly'|'drift'='none',f=yieldFixture(['venus'])){
+  await migrate();const r=read??f.read;
   await syncYieldCatalog(r);const market=r.profile.markets[0];assert.ok(market);
   const owner=address(),account=f.account;
   const strategy=(await query<{id:string}>("insert into strategies(provider,name) values($1,'be84-yield') returning id::text",[owner])).rows[0];assert.ok(strategy);
@@ -52,6 +53,174 @@ async function fixture(read?:YieldRead,rebalance:'none'|'monthly'|'drift'='none'
 }
 const balance=async(id:number)=>(await query<{n:string}>('select allocated_cash_raw::text as n from strategy_cash_balances where portfolio_id=$1',[id])).rows[0]?.n;
 const locked=<T>(id:number,fn:()=>Promise<T>)=>withPortfolioLock(id,fn);
+
+test('#112 twenty durable unknowns cannot consume exit/risk or new-supply slots across repeated rounds',async()=>{
+  const unknowns:Awaited<ReturnType<typeof fixture>>[]=[];
+  for(let n=0;n<20;n++){
+    const f=await fixture();await locked(f.context.portfolioId,()=>f.journal.prepare(f.current.input));
+    await locked(f.context.portfolioId,()=>f.journal.unknown(f.current.input.executionKey));unknowns.push(f);
+  }
+  const exit=await fixture(),risk=await fixture(),supply=await fixture();
+  await query('insert into yield_exit_requests(request_key,chain_id,portfolio_id,account,requested_by) values($1,97,$2,$3,$4)',[hash(),exit.context.portfolioId,exit.account,exit.owner]);
+  const position=risk.read.positions[0];assert.ok(position);Object.assign(position,{receipt:1n,observedUnits:1n,trackedUnits:1n,claim:1n,value:1n});await persistYieldRead(risk.context,risk.read);
+  const all=[...unknowns,exit,risk,supply].map(f=>f.context.portfolioId),selected:number[]=[];
+  async function scoped<T extends QueryResultRow=QueryResultRow>(sql:string,params:readonly unknown[]=[]){
+    return query<T>(sql.replace('from smart_accounts sa','from (select * from smart_accounts where portfolio_id=any($2::bigint[])) sa'),[...params,all]);
+  }
+  const {runYieldRound}=await import('../src/yield-service.js');const previous=process.env.CHAIN_ID;process.env.CHAIN_ID='97';
+  try{
+    for(let n=0;n<3;n++){
+      selected.length=0;
+      await runYieldRound({dryRun:false,limit:20},{query:scoped,profile:()=>exit.profile,lock:async id=>{selected.push(id);return null;}});
+      assert.ok(selected.includes(exit.context.portfolioId));assert.ok(selected.includes(risk.context.portfolioId));assert.ok(selected.includes(supply.context.portfolioId));
+      assert.equal(selected.filter(id=>unknowns.some(f=>f.context.portfolioId===id)).length,20);
+    }
+    assert.equal((await query("select execution_key from yield_actions where portfolio_id=any($1::bigint[]) and state='unknown'",[unknowns.map(f=>f.context.portfolioId)])).rows.length,20);
+  }finally{if(previous===undefined)delete process.env.CHAIN_ID;else process.env.CHAIN_ID=previous;}
+});
+
+test('#112 first quote failure with no receipt/action leaves a traceable safe portfolio error',async()=>{
+  const f=await fixture(),{runYieldRound}=await import('../src/yield-service.js');
+  const id=(await query<{id:string}>("insert into portfolios(user_id,strategy_id,version,schedule_state) values($1,$2,1,'active') returning id::text",[f.owner,f.strategyId])).rows[0]?.id;assert.ok(id);
+  const account=address();await query("insert into smart_accounts(portfolio_id,chain_id,address,owner,account_type) values($1,97,$2,$3,'KERNEL')",[id,account,f.owner]);
+  async function scoped<T extends QueryResultRow=QueryResultRow>(sql:string,params:readonly unknown[]=[]){
+    return sql.includes('from smart_accounts sa')?query<T>(sql.replace('from smart_accounts sa','from (select * from smart_accounts where portfolio_id=$2) sa'),[...params,id]):query<T>(sql,params);
+  }
+  const previous=process.env.CHAIN_ID,original=console.warn,logs:string[]=[];process.env.CHAIN_ID='97';console.warn=(message:unknown)=>logs.push(String(message));
+  f.state.fail='eth_call';
+  try{
+    assert.deepEqual(await runYieldRound({dryRun:false,limit:20},{query:scoped,profile:()=>f.profile,client:()=>f.client}),{checked:0,blocked:1});
+    assert.deepEqual(logs.map(line=>JSON.parse(line)),[{msg:'yield_account_blocked',portfolioId:Number(id),code:'YIELD_UNAVAILABLE'}]);
+    assert.doesNotMatch(logs.join('\n'),/SECRET|http|postgres/);
+    assert.equal((await query('select market_id from yield_positions where portfolio_id=$1',[id])).rows.length,0);
+  }finally{console.warn=original;if(previous===undefined)delete process.env.CHAIN_ID;else process.env.CHAIN_ID=previous;}
+});
+
+test('#112 automatic full exit can recover and settle a new supply atomically; failed prepare retains completed',async()=>{
+  const f=await fixture(),p=f.read.positions[0];assert.ok(p);
+  const {createYieldService}=await import('../src/yield-service.js');
+  const service=createYieldService({profile:()=>f.profile,client:()=>f.client,read:async()=>structuredClone(f.read),canSend:()=>false});
+  async function settle(kind:'supply'|'withdraw',nonce:bigint){
+    assert.ok(p);
+    const next=f.prepared({...f.plan,kind,receiptBalance:kind==='withdraw'?50n*WAD:0n},nonce);
+    f.current=next;f.ctx.sources=kind==='supply'?{allocated_cash_raw:(50n*WAD).toString()}:{};
+    f.ctx.consentId=kind==='supply'?f.ctx.consentId:null;
+    await locked(f.context.portfolioId,()=>f.journal.prepare(next.input));
+    await locked(f.context.portfolioId,()=>f.journal.sending(next.input.executionKey));
+    const remaining=kind==='supply'?50n*WAD:0n;
+    const block=101n+nonce;
+    Object.assign(p,{block,receipt:remaining,observedUnits:remaining,trackedUnits:remaining,claim:remaining,value:remaining});
+    f.read.risks=f.read.risks.map(r=>({...r,block,exposure:remaining}));
+    // The initial confirmed supply is historical, outside the real DB's 24h cooldown.
+    f.setProof({read:f.read,logIndex:0,blockNumber:block,blockHash:f.blockHash,occurredAt:nonce===0n?new Date(+f.at-86400001):f.at});
+    const evidence={assets:50n*WAD,shares:50n*WAD,remainingReceipts:remaining,txHash:hash(),userOpHash:next.input.userOpHash,gasUsed:1n};
+    await locked(f.context.portfolioId,()=>f.journal.confirmed(next.input.executionKey,evidence));
+    await locked(f.context.portfolioId,()=>f.journal.confirmed(next.input.executionKey,evidence));
+  }
+  const consentId=f.ctx.consentId;
+  await settle('supply',0n);
+  f.read.risks=f.read.risks.map(r=>({...r,utilizationBps:9000}));
+  await locked(f.context.portfolioId,()=>service.tick(f.context,false));
+  await settle('withdraw',1n);
+  await locked(f.context.portfolioId,()=>service.tick(f.context,false));
+  const exit=async()=>(await query<{exit_state:string}>('select exit_state from yield_positions where portfolio_id=$1',[f.context.portfolioId])).rows[0]?.exit_state;
+  assert.equal(await exit(),'completed');
+  f.read.risks=f.read.risks.map(r=>({...r,utilizationBps:0}));f.ctx.consentId=consentId;
+  await persistYieldRead(f.context,f.read);
+  f.current=f.prepared(f.plan,2n);f.ctx.sources={allocated_cash_raw:(50n*WAD).toString()};
+  const broken=createYieldJournal(f.ctx,{transaction:async fn=>withTransaction(async db=>{await fn(db);throw new Error('SECRET_COMMIT_FAILURE');})});
+  await assert.rejects(locked(f.context.portfolioId,()=>broken.prepare(f.current.input)));
+  assert.equal(await exit(),'completed');assert.equal(await balance(f.context.portfolioId),(1000n*WAD).toString());
+  await settle('supply',2n);
+  assert.equal(await exit(),'none');assert.equal(await balance(f.context.portfolioId),(950n*WAD).toString());
+  assert.equal((await query("select execution_key from yield_actions where portfolio_id=$1 and state='confirmed'",[f.context.portfolioId])).rows.length,3);
+});
+
+test('#112 empty and mixed-market exit accepts stopped policy plus fresh zero units; missing, stale, nonzero or enabled proof stays closed',async()=>{
+  for(const protocols of [['venus'],['venus','lista']] satisfies import('../src/yield-domain.js').YieldProtocol[][]){
+    const f=await fixture(undefined,'none',yieldFixture(protocols));
+    const {createYieldService}=await import('../src/yield-service.js');const {requireOwnedPortfolio}=await import('../src/portfolios.js');
+    f.state.proofSid=BigInt(f.strategyId)+84000000n;f.state.proofKind='exit';f.state.proofMarket=f.market.marketId;f.sessionState.exiting=false;
+    const p=f.read.positions[0];assert.ok(p);
+    const other=f.read.positions[1];if(other)Object.assign(other,{receipt:10n,observedUnits:10n,trackedUnits:10n,claim:10n,value:10n});
+    const service=createYieldService({profile:()=>f.read.profile,read:async()=>structuredClone(f.read),client:()=>f.client,owned:(id,wallet)=>requireOwnedPortfolio(id,wallet,{chainId:97})});
+    const input={markets:[f.market.id],txHash:f.state.proofHash};
+    for(const patch of [{receipt:1n},{trackedUnits:1n},{observedUnits:1n},{state:'unknown' as const},{at:new Date(+f.at-60001)}]){
+      const before={...p};Object.assign(p,patch);await assert.rejects(service.exit(f.context.portfolioId,f.owner,input));Object.assign(p,before);
+    }
+    f.sessionState.exitPolicyEnabled=true;await assert.rejects(service.exit(f.context.portfolioId,f.owner,input));f.sessionState.exitPolicyEnabled=false;
+    const first=await service.exit(f.context.portfolioId,f.owner,input),replay=await service.exit(f.context.portfolioId,f.owner,input);
+    assert.equal(first.state,'requested');assert.equal(replay.requestId,first.requestId);assert.equal(replay.replayed,true);
+    assert.equal((await query('select id from yield_consents where portfolio_id=$1 and opted_out_at is null',[f.context.portfolioId])).rows.length,0);
+  }
+});
+
+async function upgraded(f:Awaited<ReturnType<typeof fixture>>,index:number,expires=new Date(+f.at+86400000)){
+  const {buildSessionPermissions}=await import('../src/permissions.js');
+  const session=await buildSessionPermissions({publicClient:f.client,sessionKeyAddress:address(),executorAddress:f.read.profile.executor,validUntil:Math.floor(+expires/1000),yieldAccount:f.account});
+  await query("insert into session_keys(portfolio_id,key_ref,permissions,status,expires_at) values($1,$2,$3,'active',$4)",[f.context.portfolioId,`m/44'/60'/0'/0/${f.context.portfolioId*1000+index}`,JSON.stringify(session.policySnapshot),expires]);
+  return session;
+}
+
+test('#112 permission status excludes expired keys and uninstalled upgrades, and selects the older live key',async()=>{
+  const f=await fixture(),{createYieldService}=await import('../src/yield-service.js'),{requireOwnedPortfolio}=await import('../src/portfolios.js');
+  const service=createYieldService({profile:()=>f.profile,client:()=>f.client,read:async()=>structuredClone(f.read),owned:(id,wallet)=>requireOwnedPortfolio(id,wallet,{chainId:97})});
+  await upgraded(f,0,new Date(+f.at-1000));
+  assert.equal((await service.status(f.context.portfolioId,f.owner))?.permission,'needs_update');
+  const live=await upgraded(f,1);f.sessionState.missing.push(live.permissionId.slice(2));
+  assert.equal((await service.status(f.context.portfolioId,f.owner))?.permission,'needs_update');
+  f.sessionState.missing=[];
+  assert.equal((await service.status(f.context.portfolioId,f.owner))?.permission,'ok');
+  f.sessionState.exhausted=[live.permissionId.slice(2)];
+  assert.equal((await service.status(f.context.portfolioId,f.owner))?.permission,'needs_update','API shares GasPolicy exhaustion');
+});
+
+test('#112 risk exit tries older installed sessions; only proven pre-prepare authorization rejection may fallback',async()=>{
+  for(const failure of ['uninstalled','revoked','exhausted','exhausted-late','authorization','after-prepare','unknown','rpc'] as const){
+    const f=await fixture(),{createYieldService}=await import('../src/yield-service.js');
+    const old=await upgraded(f,10),latest=await upgraded(f,11,new Date(+f.at+172800000));
+    if(failure==='uninstalled')f.sessionState.missing.push(latest.permissionId.slice(2));
+    if(failure==='revoked')f.sessionState.revoked.push(latest.permissionId.slice(2));
+    if(failure==='exhausted')f.sessionState.exhausted.push(latest.permissionId.slice(2));
+    const p=f.read.positions[0];assert.ok(p);Object.assign(p,{receipt:50n*WAD,observedUnits:50n*WAD,trackedUnits:50n*WAD,claim:50n*WAD,value:50n*WAD,maxRedeem:50n*WAD});
+    f.read.risks=f.read.risks.map(r=>({...r,utilizationBps:9000}));
+    const tried:Hex[]=[];
+    const service=createYieldService({profile:()=>f.profile,client:()=>f.client,read:async()=>structuredClone(f.read),canSend:()=>true,port:async()=>({reconcileYieldOperation:async()=>{throw new Error('unexpected reconcile');},submitYieldAction:async args=>{
+      tried.push(args.sessionKey.permissionId);
+      if(args.sessionKey.permissionId===latest.permissionId){
+        if(failure==='after-prepare'){
+          const saved=f.prepared({...f.plan,kind:'withdraw',receiptBalance:50n*WAD});assert.ok(args.paymaster?.reserve);
+          await args.paymaster.reserve(saved.reservation);await args.journal.prepare(saved.input);
+          throw new AppError(409,'SESSION_AUTHORIZATION_REQUIRED','failure after durable prepare');
+        }
+        if(failure==='exhausted-late'){f.sessionState.exhausted.push(latest.permissionId.slice(2));throw new AppError(503,'PAYMASTER_SUBMISSION_UNAVAILABLE','prepare estimate failed');}
+        if(failure==='authorization')throw new AppError(409,'SESSION_AUTHORIZATION_REQUIRED','pre-send installation missing');
+        if(failure==='unknown')throw new AppError(503,'YIELD_RECONCILIATION_REQUIRED','unknown');
+        throw new Error('SECRET_RPC_TIMEOUT');
+      }
+      return{assets:50n*WAD,shares:50n*WAD,remainingReceipts:0n,txHash:hash(),userOpHash:hash(),gasUsed:1n};
+    }})});
+    if(failure==='unknown'||failure==='rpc'||failure==='after-prepare')await assert.rejects(locked(f.context.portfolioId,()=>service.tick(f.context,false)));
+    else assert.equal(await locked(f.context.portfolioId,()=>service.tick(f.context,false)),'生息領出已確認');
+    assert.deepEqual(tried,failure==='uninstalled'||failure==='revoked'||failure==='exhausted'?[old.permissionId]:failure==='authorization'||failure==='exhausted-late'?[latest.permissionId,old.permissionId]:[latest.permissionId]);
+  }
+});
+
+test('#112 Aave rebase followed by a reorg persists an irreversible tombstone and freezes supply and cash',async()=>{
+  const f=await fixture(undefined,'none',yieldFixture(['aave_v3'])),i=f.prepared({...f.plan,scaledReceiptBalance:0n});f.current=i;
+  await locked(f.context.portfolioId,()=>f.journal.prepare(i.input));
+  const p=f.read.positions[0];assert.ok(p);Object.assign(p,{receipt:50n*WAD,observedUnits:50n*WAD,trackedUnits:50n*WAD,claim:50n*WAD,value:50n*WAD});
+  f.read.risks=f.read.risks.map(r=>({...r,exposure:50n*WAD}));
+  f.setProof({read:f.read,logIndex:0,blockNumber:f.read.observation.block,blockHash:f.blockHash,occurredAt:f.at});
+  await locked(f.context.portfolioId,()=>f.journal.confirmed(i.input.executionKey,{assets:50n*WAD,shares:50n*WAD,remainingReceipts:50n*WAD,txHash:hash(),userOpHash:i.input.userOpHash,gasUsed:1n}));
+  Object.assign(p,{receipt:51n*WAD,rate:RAY*51n/50n,claim:51n*WAD,value:51n*WAD});await persistYieldRead(f.context,f.read);
+  f.state.blockHash=hash();const {createYieldService}=await import('../src/yield-service.js');
+  const service=createYieldService({profile:()=>f.read.profile,client:()=>f.client,read:async()=>structuredClone(f.read)});
+  for(let n=0;n<2;n++)await assert.rejects(locked(f.context.portfolioId,()=>service.tick(f.context,false)));
+  assert.equal((await query<{state:string}>('select state from yield_events where execution_key=$1',[i.input.executionKey])).rows[0]?.state,'reorged');
+  await assert.rejects(query("update yield_events set state='confirmed',updated_at=clock_timestamp() where execution_key=$1",[i.input.executionKey]));
+  assert.equal(await balance(f.context.portfolioId),(950n*WAD).toString());
+});
 
 for(const scenario of ['confirmed','missing','ambiguous'] as const)test(`#106 Aave rebasing settlement: ${scenario}`,async()=>{
   const f=await fixture(yieldFixture(['aave_v3']).read),principal=100n*WAD;
@@ -485,4 +654,57 @@ test('#104 monthly/drift pending survives a new service and suppresses re-supply
     await locked(f.context.portfolioId,()=>createYieldService(overrides).tick(f.context,false));
     assert.equal(sends,1,'remaining consent and normal idle/cooldown/cap rules can supply again');
   }
+});
+
+
+test('#112-r2 durable rotation visits 21 unknowns and gives owner exits and held-risk independent slots even when locks are busy',async()=>{
+  const group:Awaited<ReturnType<typeof fixture>>[]=[];
+  for(let n=0;n<21;n++){
+    const f=await fixture();await locked(f.context.portfolioId,()=>f.journal.prepare(f.current.input));
+    await locked(f.context.portfolioId,()=>f.journal.unknown(f.current.input.executionKey));group.push(f);
+  }
+  const owners:Awaited<ReturnType<typeof fixture>>[]=[];
+  for(let n=0;n<20;n++){
+    const f=await fixture();await query('insert into yield_exit_requests(request_key,chain_id,portfolio_id,account,requested_by) values($1,97,$2,$3,$4)',[hash(),f.context.portfolioId,f.account,f.owner]);owners.push(f);
+  }
+  const risk=await fixture(),p=risk.read.positions[0];assert.ok(p);Object.assign(p,{receipt:1n,observedUnits:1n,trackedUnits:1n});await persistYieldRead(risk.context,risk.read);
+  const ids=[...group,...owners,risk].map(f=>f.context.portfolioId),seen=new Set<number>();
+  async function scoped<T extends QueryResultRow=QueryResultRow>(sql:string,params:readonly unknown[]=[]){return query<T>(sql.replace('from smart_accounts sa','from (select * from smart_accounts where portfolio_id=any($2::bigint[])) sa'),[...params,ids]);}
+  const {runYieldRound}=await import('../src/yield-service.js'),previous=process.env.CHAIN_ID;process.env.CHAIN_ID='97';
+  try{
+    for(let n=0;n<3;n++){
+      const round:number[]=[];
+      if(n===2){
+        const {execFileSync}=await import('node:child_process');
+        const code=`import {query,closePool} from './src/db.ts';import {runYieldRound} from './src/yield-service.ts';import {yieldFixture} from './test/fixtures/yield.ts';
+          const ids=JSON.parse(process.env.ROTATION_IDS),seen=[];
+          const scoped=(sql,params=[])=>query(sql.replace('from smart_accounts sa','from (select * from smart_accounts where portfolio_id=any($2::bigint[])) sa'),[...params,ids]);
+          try{await runYieldRound({dryRun:false,limit:20},{query:scoped,profile:()=>yieldFixture(['venus']).profile,lock:async id=>{seen.push(id);return null;}});console.log(JSON.stringify(seen));}finally{await closePool();}`;
+        const output=execFileSync(process.execPath,['--no-env-file','--eval',code],{encoding:'utf8',timeout:10000,env:{...process.env,ROTATION_IDS:JSON.stringify(ids)}});
+        const result:unknown=JSON.parse(output.trim().split('\n').at(-1)??'null');assert.ok(Array.isArray(result));
+        for(const id of result){assert.equal(typeof id,'number');round.push(id);seen.add(id);}
+      }else await runYieldRound({dryRun:false,limit:20},{query:scoped,profile:()=>risk.profile,lock:async id=>{seen.add(id);round.push(id);if(n===1)throw new AppError(503,'YIELD_UNAVAILABLE','safe');return null;}});
+      assert.ok(round.includes(risk.context.portfolioId),'risk cannot starve behind owner exits');
+    }
+    assert.equal(seen.size,ids.length,'unknowns rotate despite no new observation or acquired lock');
+  }finally{if(previous===undefined)delete process.env.CHAIN_ID;else process.env.CHAIN_ID=previous;}
+});
+
+test('#113 cursor DB failure aborts the round before any account attempt and a retry can proceed',async()=>{
+  const f=await fixture(),{runYieldRound}=await import('../src/yield-service.js');
+  const {default:pg}=await import('pg');
+  const blocker=new pg.Client({connectionString:process.env.DATABASE_URL});await blocker.connect();
+  const previous=process.env.CHAIN_ID;process.env.CHAIN_ID='97';let attempts=0;
+  async function scoped<T extends QueryResultRow=QueryResultRow>(sql:string,params:readonly unknown[]=[]){
+    return query<T>(sql.replace('from smart_accounts sa','from (select * from smart_accounts where portfolio_id=$2) sa'),[...params,f.context.portfolioId]);
+  }
+  const overrides={query:scoped,profile:()=>f.profile,lock:async()=>{attempts++;return null;},transaction:async<T>(fn:Parameters<typeof withTransaction<T>>[0])=>withTransaction(async db=>{
+    await db.query("set local statement_timeout='25ms'");return fn(db);
+  })};
+  try{
+    await blocker.query('begin');await blocker.query('lock table yield_runtime_state in access exclusive mode');
+    await assert.rejects(runYieldRound({dryRun:false,limit:1},overrides),/^Error: yield state unavailable$/);
+    assert.equal(attempts,0);await blocker.query('rollback');
+    await runYieldRound({dryRun:false,limit:1},overrides);assert.equal(attempts,1);
+  }finally{await blocker.query('rollback');await blocker.end();if(previous===undefined)delete process.env.CHAIN_ID;else process.env.CHAIN_ID=previous;}
 });

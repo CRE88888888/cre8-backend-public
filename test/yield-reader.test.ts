@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { readYieldAccount } from '../src/yield-reader.js';
 import { yieldFixture } from './fixtures/yield.js';
 import { keccak256,toFunctionSelector } from 'viem';
-import { RAY, WAD } from '../src/yield-domain.js';
+import { RAY, WAD, mustExit } from '../src/yield-domain.js';
 
 test('yield Venus reads current APR and non-18 receipt units after same-call accrual',async()=>{
   const f=yieldFixture(['venus']);f.state.rate=2n*WAD;f.state.claim=20n*10n**8n;
@@ -13,6 +13,33 @@ test('yield Venus reads current APR and non-18 receipt units after same-call acc
   assert.equal(r.risks[0]?.exposure,20n);assert.equal(r.risks[0]?.utilizationBps,8000);
   assert.ok(f.state.reads.indexOf('refreshHealth')<f.state.reads.indexOf('balanceOf'));
 });
+test('#112 a supply-only rate jump closes admission without inventing exit risk; loss, U=90% and failed risk reads still exit',async()=>{
+  for(const protocol of ['venus','lista','aave_v3'] as const){
+    const f=yieldFixture([protocol]);
+    f.state.rate=protocol==='aave_v3'?2n*RAY:2n*WAD;
+    f.state.receipt=protocol==='aave_v3'?f.state.units*2n:f.state.units;
+    const batch:typeof f.batch=async(...args)=>{
+      const values=await f.batch(...args);
+      return values.map((v,n)=>args[2][n]?.name==='refreshHealth'?null:v);
+    };
+    const jump=await readYieldAccount(f.client,f.profile,f.account,{batch,now:()=>f.at});
+    const position=jump.positions[0];assert.ok(position);
+    assert.equal(position.supplyOpen,false);
+    assert.equal(jump.risks[0]?.state,'known');
+    assert.equal(mustExit(position,jump.risks,false,f.at),false);
+    f.state.utilization=9000n;
+    const high=await readYieldAccount(f.client,f.profile,f.account,{batch,now:()=>f.at});
+    assert.ok(high.positions[0]);assert.equal(mustExit(high.positions[0],high.risks,false,f.at),true);
+    f.state.utilization=8999n;f.state.rate=protocol==='aave_v3'?RAY/2n:WAD/2n;
+    f.state.receipt=protocol==='aave_v3'?f.state.units/2n:f.state.units;
+    const loss=await readYieldAccount(f.client,f.profile,f.account,{batch,now:()=>f.at});
+    assert.ok(loss.positions[0]);assert.equal(mustExit(loss.positions[0],loss.risks,false,f.at),true);
+    f.state.fail='health';
+    const failed=await readYieldAccount(f.client,f.profile,f.account,{batch,now:()=>f.at});
+    assert.equal(failed.risks[0]?.state,'unknown');
+  }
+});
+
 test('yield Aave preserves full ray index and rejects nominal/scaled mismatch',async()=>{
   const f=yieldFixture(['aave_v3']);f.state.rate=RAY+123456789n;f.state.units=10n**30n;f.state.tracked=f.state.units;
   f.state.receipt=f.state.units*f.state.rate/RAY;f.state.claim=f.state.receipt;

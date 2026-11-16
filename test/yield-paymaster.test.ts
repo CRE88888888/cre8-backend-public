@@ -8,6 +8,7 @@ import { createPaymasterService, gasExecutionKey, pureYieldWithdraw, validateSpo
 import type { Reservation } from '../src/paymaster.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
 import { YIELD_EXECUTOR_ABI, YIELD_REGISTRY_ABI } from '../src/yield-abi.js';
+import { unusedExitUsage } from '../src/paymaster-exit-reconciliation.js';
 import { config, operation, SENDER, OWNER, TEST_SIGNER, NOW } from './fixtures/paymaster.js';
 
 const c = config({ CHAIN_ID: '97', RPC_URL: 'http://127.0.0.1:8592', PAYMASTER_SIGNER_PRIVATE_KEY: TEST_SIGNER });
@@ -15,6 +16,35 @@ const market = T.yieldMarkets[0];
 const data = (kind: 'executeSupply' | 'executeWithdraw') => encodeFunctionData({ abi: YIELD_EXECUTOR_ABI, functionName: kind,
   args: [SENDER, market.marketId, 1n, 1n, BigInt(NOW + 300)] });
 const call = (kind: 'executeSupply' | 'executeWithdraw') => ({ to: T.contracts.executor, data: data(kind), value: 0n });
+
+test('#114 new exit authorizations require ten minutes; ordinary validity and live retries retain their bounds', async () => {
+  const saved: Reservation[] = [];
+  const service = createPaymasterService({ config: c, now: () => NOW,
+    query: async () => ({ rows: [{ owner: OWNER, user_id: OWNER }] }), checkChain: async () => {}, verifyYieldWithdraw: async () => [],
+    readBudgetContext: async () => ({ purpose: 'ordinary', nativePrice: 1n, priceSource: 'test:114' }),
+    reserve: async r => { saved.push(r); return r.validUntil; } });
+  const op = operation({ callData: await encodeCallDataEpV07([call('executeWithdraw')]) });
+  for (const seconds of [0, 1, 300, 599]) {
+    await assert.rejects(service.sponsor({ userOperation: op, validUntil: NOW + seconds }, OWNER), /PAYMASTER_EXPIRED/);
+  }
+  assert.equal(saved.length, 0);
+  assert.equal((await service.sponsor({ userOperation: op, validUntil: NOW + 600 }, OWNER)).validUntil, NOW + 600);
+  assert.equal((await service.sponsor({ userOperation: op }, OWNER)).validUntil, NOW + 600);
+  await assert.rejects(service.sponsor({ userOperation: op, validUntil: NOW + 601 }, OWNER), /PAYMASTER_EXPIRED/);
+  const ordinary = operation({ callData: await encodeCallDataEpV07([call('executeSupply')]) });
+  assert.equal((await service.sponsor({ userOperation: ordinary }, OWNER)).validUntil, NOW + 300);
+  await assert.rejects(service.sponsor({ userOperation: ordinary, validUntil: NOW + 301 }, OWNER), /PAYMASTER_EXPIRED/);
+});
+
+test('#114 unused-exit storage rejects absent and malformed totals, preserving exact bigint precision', async () => {
+  for (const row of [undefined, null, {}, { count: '0', gas: '0' }, { count: 0, gas: '0', wei: '0' },
+    { count: '0', gas: '-1', wei: '0' }, { count: '0', gas: '0', wei: 'NaN' }]) {
+    await assert.rejects(unusedExitUsage(async () => ({ rows: row === undefined ? [] : [row] }), 97, SENDER, '2026-11-16'), /exit reconciliation evidence unavailable/);
+  }
+  assert.deepEqual(await unusedExitUsage(async () => ({ rows: [{ count: '0', gas: '0', wei: '0' }] }), 97, SENDER, '2026-11-16'), { count: 0n, gas: 0n, wei: 0n });
+  assert.deepEqual(await unusedExitUsage(async () => ({ rows: [{ count: '3', gas: '9007199254740993', wei: '90071992547409930' }] }), 97, SENDER, '2026-11-16'),
+    { count: 3n, gas: 9007199254740993n, wei: 90071992547409930n });
+});
 
 test('#112 public exit exemption requires fresh nonzero tracked holdings, current nonce and exact Kernel withdrawal simulation',async()=>{
   let mode='zero',reserved=0,simulated=0;

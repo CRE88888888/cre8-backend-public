@@ -400,7 +400,8 @@ test('#112-r2 manual command binds a legacy original hash, rejects forged nonce 
   const c=sponsorConfig({CHAIN_ID:'97',PAYMASTER_SIGNER_PRIVATE_KEY:key,RPC_URL:`http://127.0.0.1:${endpoint.port}`}),file=`.bun-cache/manual-${randomUUID()}.json`;
   try{
     let legacy:Reservation|undefined;
-    const service=createPaymasterService({reserve:async r=>{legacy=r;},config:c,now:()=>now,query:async()=>({rows:[{owner:OWNER,user_id:OWNER}]}),checkChain:async()=>{},verifyYieldWithdraw:async()=>[],readBudgetContext:async()=>({purpose:'exit',nativePrice:1n,priceSource:'test:112-manual'})});
+    // Recreate a legacy signature issued ten minutes earlier, now about to expire.
+    const service=createPaymasterService({reserve:async r=>{legacy=r;},config:c,now:()=>until-600,query:async()=>({rows:[{owner:OWNER,user_id:OWNER}]}),checkChain:async()=>{},verifyYieldWithdraw:async()=>[],readBudgetContext:async()=>({purpose:'exit',nativePrice:1n,priceSource:'test:112-manual'})});
     const signed=await service.sponsor({userOperation:op,validUntil:until},OWNER),original={...op,sender:getAddress(op.sender),paymasterAndData:signed.paymasterAndData};
     // A pre-0042 sponsorship has its original ledgers but no runtime metadata.
     assert.ok(legacy);await reserveGasBudget(legacy.budget);

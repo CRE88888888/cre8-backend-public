@@ -21,7 +21,7 @@ import { TESTNET_97, testnetAssets } from './testnet-profile.js';
 import { SESSION_GAS_ALLOWED_WEI, sessionCallPermissions } from './permissions.js';
 import { YIELD_REGISTRY_ABI } from './yield-abi.js';
 import { MAX_USER_OP_GAS } from './execution-batch.js';
-import { applyExpiredExitProofs, expiredExitProofs, rememberExitFacts } from './paymaster-exit-reconciliation.js';
+import { applyExpiredExitProofs, expiredExitProofs, rememberExitFacts, unusedExitUsage } from './paymaster-exit-reconciliation.js';
 import type { ExpiredExitProof } from './paymaster-exit-reconciliation.js';
 export { reconcileExpiredExitAuthorizations } from './paymaster-exit-reconciliation.js';
 import { fresh } from './yield-domain.js';
@@ -542,6 +542,14 @@ export async function reserveSponsorship(r: Reservation, transaction: typeof wit
           ...(c.accountDailyWei === null ? [] : [[BigInt(u.account_wei), r.maxCostWei, c.accountDailyWei] as const])];
       const budgets: (readonly [bigint, bigint, bigint])[] = [...accountBudgets, [BigInt(u.gas), r.gasLimit, c.siteDailyGas], [BigInt(u.wei), r.maxCostWei, c.siteDailyWei]];
       if (budgets.some(([used, amount, cap]) => cap === 0n || used + amount > cap)) throw rejected('PAYMASTER_QUOTA_EXCEEDED', 429);
+      if(c.chainId===97&&r.budget.purpose==='exit'){
+        const unused=await unusedExitUsage((sql,params)=>client.query(sql,params?[...params]:[]),c.chainId,r.op.sender,day);
+        if(unused.count>=3n)throw rejected('PAYMASTER_EXIT_RETRY_LIMIT',429);
+        // Reserve room for this authorization to expire unused too. Checking only past
+        // releases permits the last signature to overshoot the account's 10% share.
+        if(unused.gas+r.gasLimit>c.siteDailyGas/10n||unused.wei+r.maxCostWei>c.siteDailyWei/10n)
+          throw rejected('PAYMASTER_EXIT_UNUSED_BUDGET_EXCEEDED',429);
+      }
       await rememberExitFacts({chainId:c.chainId,account:r.op.sender,userOpHash:r.hash,executionKey:r.budget.executionKey,nonce:r.op.nonce.toString(),validUntil:r.validUntil,purpose:r.budget.purpose},(sql,params)=>client.query(sql,params?[...params]:[]));
       if(pureYieldWithdraw(r.op,c)){
         const original=(await client.query<{day:string}>("select to_char(utc_day,'YYYY-MM-DD') as day from gas_budget_reservations where execution_key=$1 and state='failed'",[r.budget.executionKey])).rows[0];
@@ -630,9 +638,8 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
       if (Object.keys(request).some((key) => !['userOperation', 'validUntil'].includes(key))) throw rejected('PAYMASTER_INVALID_OPERATION');
       const op = parsePackedSponsorOperation(request.userOperation);
       const now = (deps.now ?? (() => Math.floor(Date.now() / 1000)))();
-      const requestedUntil = request.validUntil ?? now + 300;
-      if (typeof requestedUntil !== 'number' || !Number.isSafeInteger(requestedUntil) || requestedUntil <= now || requestedUntil > now + 300) throw rejected('PAYMASTER_EXPIRED');
-      let validUntil = requestedUntil;
+      const requestedUntil = request.validUntil;
+      if (requestedUntil !== undefined && (typeof requestedUntil !== 'number' || !Number.isSafeInteger(requestedUntil) || requestedUntil <= now)) throw rejected('PAYMASTER_EXPIRED');
       if (op.paymasterAndData !== '0x') throw rejected('PAYMASTER_INVALID_OPERATION');
       const calls = sponsoredCalls(op);
       const known = await bounded((deps.query ?? query)(`select s.owner, p.user_id from smart_accounts s join portfolios p on p.id = s.portfolio_id
@@ -654,15 +661,10 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
       const cost = gasCost(op, c);
       if (cost.gasLimit > MAX_USER_OP_GAS) throw rejected('PAYMASTER_USER_OP_CAPACITY', 400);
       await bounded((deps.checkChain ?? checkChain)(op, c), c.timeoutMs);
-      let signed = await authorization(op, c, validUntil);
       const context = await bounded((deps.readBudgetContext ?? readBudgetContext)(op, c), c.timeoutMs);
       let consumedAuthorizations:readonly ConsumedAuthorization[]=[];
       let expiredAuthorizations:readonly ExpiredExitProof[]=[];
-      if (pureYieldWithdraw(op, c)) {
-        consumedAuthorizations=await bounded((deps.verifyYieldWithdraw??verifyYieldWithdraw)({...op,paymasterAndData:signed.paymasterAndData},c,now,deps.query??query),c.timeoutMs);
-        if(!deps.verifyYieldWithdraw)expiredAuthorizations=await bounded(expiredExitProofs(c,op.sender,deps.query??query),c.timeoutMs);
-        context.purpose = 'exit';
-      }
+      if (pureYieldWithdraw(op, c)) context.purpose = 'exit';
       if (deps.exitCallData !== undefined && deps.exitCallData.toLowerCase() === op.callData.toLowerCase()) {
         const executorCall = calls.length === 1 ? calls[0] : undefined;
         const decoded = executorCall !== undefined && isAddressEqual(executorCall.target, c.executor)
@@ -670,6 +672,17 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
         const numeraire = c.chainId === 97 ? TESTNET_97.contracts.usdt : '0x55d398326f99059ff775485246999027b3197955';
         if (decoded?.functionName !== 'executeRebalance' || !decoded.args[1].every((step) => isAddressEqual(step.tokenOut, numeraire))) throw rejected('GAS_BUDGET_INVALID', 503);
         context.purpose = 'exit';
+      }
+      const exit=c.chainId===97&&context.purpose==='exit';
+      // Keep authorization lifetimes bounded. New chain-97 exits use exactly ten
+      // minutes; live retries below still reuse the original hash without extension.
+      const lifetime=exit?600:300;
+      let validUntil=requestedUntil??now+lifetime;
+      if(validUntil>now+lifetime||exit&&validUntil<now+600)throw rejected('PAYMASTER_EXPIRED');
+      let signed=await authorization(op,c,validUntil);
+      if (pureYieldWithdraw(op, c)) {
+        consumedAuthorizations=await bounded((deps.verifyYieldWithdraw??verifyYieldWithdraw)({...op,paymasterAndData:signed.paymasterAndData},c,now,deps.query??query),c.timeoutMs);
+        if(!deps.verifyYieldWithdraw)expiredAuthorizations=await bounded(expiredExitProofs(c,op.sender,deps.query??query),c.timeoutMs);
       }
       const reservedUntil = await (deps.reserve ?? reserveSponsorship)({ hash: signed.userOpHash, op, config: c, validUntil, now: deps.now ?? (() => Math.floor(Date.now() / 1000)), ...cost,
         consumedAuthorizations,expiredAuthorizations,

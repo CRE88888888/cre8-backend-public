@@ -96,6 +96,8 @@ export type StatusDrift = {
 
 export type PortfolioStatus = {
   portfolioId: number;
+  /** Buying only: independent of valuation completeness, registry pause flags and exits. */
+  buyingPaused: { reason: 'NEW_VERSION_ACTIVE'; joinedVersion: number; activeVersion: number } | null;
   /** Registry pause sources at `block`: Safe=1, operator=2, account=4. null means unreadable. */
   pauseFlags: number | null;
   pauseSources: PauseSource[] | null;
@@ -427,7 +429,7 @@ export async function resolveStatusSessionKey(
  * 讀鏈/讀 DB 失敗一律變成 503 並帶上原因。這裡刻意不 catch 之後回一個 `holdings: []` 的空狀態：
  * 使用者會把「讀不到」讀成「這個投組是空的」，然後看著一個空的投組按下再平衡。
  */
-async function statusOf(portfolioId: number, deps: StatusDeps): Promise<PortfolioStatus> {
+async function statusOf(portfolioId: number, deps: StatusDeps, joinedVersion: number): Promise<PortfolioStatus> {
   const planFn = deps.planPortfolio ?? ((id: number) => planPortfolio(id));
 
   let plan: PortfolioPlan;
@@ -539,6 +541,8 @@ async function statusOf(portfolioId: number, deps: StatusDeps): Promise<Portfoli
 
   return {
     portfolioId: plan.portfolioId,
+    buyingPaused: joinedVersion !== plan.pinnedVersion.version
+      ? { reason: 'NEW_VERSION_ACTIVE', joinedVersion, activeVersion: plan.pinnedVersion.version } : null,
     pauseFlags: flags,
     pauseSources: sources,
     executorAddress: executor,
@@ -568,7 +572,7 @@ export function createPortfolioStatusReader(deps: StatusDeps = {}): PortfolioSta
   const cache = new Map<number, { expiresAt: number; value: Promise<PortfolioStatus> }>();
 
   return async (portfolioId: number, wallet: string): Promise<PortfolioStatus> => {
-    await find(portfolioId, wallet);
+    const owned = await find(portfolioId, wallet);
 
     const at = now();
     const hit = cache.get(portfolioId);
@@ -579,7 +583,7 @@ export function createPortfolioStatusReader(deps: StatusDeps = {}): PortfolioSta
       // **算完的時間**重算到期時間（見下面）。TTL 從「開始算」起算的話，一份要 8 秒的狀態在
       // 10 秒 TTL 下幾乎立刻失效，快取就等於不存在。
       expiresAt: at + STATUS_CACHE_TTL_MS,
-      value: statusOf(portfolioId, deps),
+      value: statusOf(portfolioId, deps, owned.version),
     };
     cache.set(portfolioId, entry);
     if (cache.size > STATUS_CACHE_MAX_ENTRIES) {

@@ -643,7 +643,7 @@ test('#59 proxy trust walks right-to-left, isolates users and rejects forged or 
 test('#59 config validates budgets, nonce capacity and relayer wei without echoing raw values', () => {
   const names = ['RATE_LIMIT_AUTH_PER_MINUTE', 'RATE_LIMIT_STRATEGIES_PER_DAY', 'RATE_LIMIT_VERSIONS_PER_DAY',
     'RATE_LIMIT_PORTFOLIOS_PER_DAY', 'RATE_LIMIT_PLAN_PER_MINUTE', 'RATE_LIMIT_REDEEM_PER_MINUTE',
-    'RATE_LIMIT_CLOSE_PER_MINUTE', 'RATE_LIMIT_ASSETS_PER_MINUTE'];
+    'RATE_LIMIT_CLOSE_PER_MINUTE', 'RATE_LIMIT_ASSETS_PER_MINUTE', 'RATE_LIMIT_ENROLLMENT_PER_MINUTE'];
   for (const name of names) {
     assert.ok(Object.values(loadRateLimitConfig({ [name]: '0' })).includes(0));
     for (const raw of ['secret-invalid-value', '-1', '0.5', '1000001', 'Infinity']) {
@@ -1129,4 +1129,22 @@ test('#118 contribution preview is public, bounded, rate limited and rejects inv
       assert.equal(r.status,429);assert.ok(r.headers.get('retry-after'));
     }finally{await new Promise<void>(resolve=>limited.close(()=>resolve()));}
   }finally{await new Promise<void>(resolve=>server.close(()=>resolve()));}
+});
+
+
+test('#124 pending account deployment returns 202 and a retry hint without setup calldata', async () => {
+  const server = createServer({
+    auth: { authenticate: async () => '0x1000000000000000000000000000000000000001',
+      issueNonce: () => { throw new Error('unexpected'); }, login: async () => { throw new Error('unexpected'); }, logout: async () => {} },
+    rateLimiter: new RequestRateLimiter(loadRateLimitConfig({}), new MemoryRateLimitStore()),
+    preparePortfolioEnrollment: async () => { throw new AppError(202, 'ACCOUNT_DEPLOYMENT_PENDING', 'original account deployment is pending'); },
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address(); assert.ok(address && typeof address !== 'string');
+    const response = await fetch(`http://127.0.0.1:${address.port}/portfolios/enrollment-params`, { method: 'POST', body: JSON.stringify({ strategyId: 1 }) });
+    assert.equal(response.status, 202); assert.equal(response.headers.get('retry-after'), '3');
+    assert.equal(response.headers.get('access-control-expose-headers'), 'Retry-After');
+    assert.deepEqual(await response.json(), { accountDeployed: false, retryAfterSeconds: 3, error: { code: 'ACCOUNT_DEPLOYMENT_PENDING', message: 'original account deployment is pending' } });
+  } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
 });

@@ -1,13 +1,18 @@
+import { performanceFee, readVersionState, registryConfigHash, storedVersionSettings, typedVersionSettings, VERSION_NOTICE_SECONDS } from './registry-versioning.js';
+import { REGISTRY_ABI, REGISTRY_VERSION_ABI } from './registry-abi.js';
+import type { VersionSettings } from './registry-versioning.js';
 import { withRelayerLock } from './relayer-lock.js';
 import { configuredChainId, TESTNET_97, testnetAssets } from './testnet-profile.js';
-import { assertVersionOnchain, getChain, isChainConfigured, publishVersionOnchain, registerStrategyOnchain } from './chain.js';
+import { assertVersionOnchain, canonicalScheduleHash, getChain, isChainConfigured, publishVersionOnchain, validateVersionPublication, versionCancelledOnchain, registerStrategyOnchain } from './chain.js';
 import { isForeignKeyViolation, isUniqueViolation, query, withTransaction } from './db.js';
 import { AppError, ForbiddenError, NotFoundError, ValidationError } from './errors.js';
 import { canonicalConfigHash, exactKeys, minimumAllocationRaw, record, utcDate, validateExecution, validateFundingSchedule, validateIdleYield, numeraireFor, validateAssetConfig, minimumAssetContribution, UINT256_MAX } from './strategy-execution.js';
 import { previewFundingContribution } from './asset-plan.js';
 import type { ContributionPreviewInput } from './asset-plan.js';
 import type { FundingSchedule, TypedExecution } from './strategy-execution.js';
+import { createPublicClient, http } from 'viem';
 import type { Address, Hex } from 'viem';
+import { getConfig } from './config.js';
 
 /** Basis-point denominator. On-chain AtpRegistry uses the same TOTAL_WEIGHT_BPS. */
 export const BPS_DENOMINATOR = 10_000;
@@ -60,6 +65,7 @@ export type StrategyVersion = {
   execution: TypedExecution | { kind: 'target_weight' };
   executionChainId: number | null;
   configHash: Hex | null;
+  versionSettings?: VersionSettings;
   idleYield: { enabled: false };
   changeLog: string | null;
   activeAt: string | null;
@@ -78,6 +84,7 @@ export type CreateStrategyInput = {
 
 export type PublishVersionInput = {
   allocation: unknown;
+  performanceFeeBps?: unknown;
   schedule?: unknown;
   execution?: unknown;
   chainId?: unknown;
@@ -134,7 +141,8 @@ type VersionRow = {
 /** HTTP always uses this path. Untagged internal legacy writers retain their existing encoding. */
 export function typedVersionInput(input: unknown): PublishVersionInput {
   if (!record(input)) throw new ValidationError('INVALID_VERSION', 'request body must be a JSON object');
-  exactKeys(input, ['allocation', 'schedule', 'execution', 'chainId', 'idleYield', 'changeLog', 'activeAt'], 'INVALID_VERSION');
+  exactKeys(input, ['allocation', 'schedule', 'execution', 'chainId', 'idleYield', 'changeLog', 'activeAt', 'performanceFeeBps'], 'INVALID_VERSION');
+  if (input.performanceFeeBps !== undefined) performanceFee(input.performanceFeeBps);
   const chainId = input.chainId === undefined ? configuredChainId() : input.chainId;
   if (typeof chainId !== 'number' || !Number.isSafeInteger(chainId) || chainId <= 0) throw new ValidationError('CHAIN_MISMATCH', 'invalid chainId');
   if(!record(input.allocation))throw new ValidationError('INVALID_ALLOCATION','allocation must be an object');
@@ -147,6 +155,7 @@ export function typedVersionInput(input: unknown): PublishVersionInput {
       throw new ValidationError('EXECUTION_UNAVAILABLE', 'per-asset funding is only available on chain 97');
     }
     return { allocation, schedule: validateSchedule(input.schedule),
+      ...(input.performanceFeeBps === undefined ? {} : { performanceFeeBps: performanceFee(input.performanceFeeBps) }),
       ...(input.changeLog === undefined ? {} : { changeLog: validateChangeLog(input.changeLog) }),
       ...(input.activeAt === undefined ? {} : { activeAt: validateActiveAt(input.activeAt) }) };
   }
@@ -454,6 +463,42 @@ export async function getStrategy(id: number): Promise<StrategyDetail> {
   return { ...mapStrategy(row), versions: versions.rows.map(mapVersion) };
 }
 
+/** Public detail retains DB execution settings, but assets, fees and activation are chain authority. */
+export async function getStrategyWithVersionState(id: number, deps: {
+  strategy?: typeof getStrategy;
+  state?: (onchainId: number, version: number) => ReturnType<typeof readVersionState>;
+} = {}) {
+  const strategy = await (deps.strategy ?? getStrategy)(id);
+  const readState = deps.state ?? readPublicVersionState;
+  return { ...strategy, versions: await Promise.all(strategy.versions.map(async version => {
+    if (strategy.onchainId === null) return { ...version, status: 'unmirrored' as const, canCancel: false };
+    const state = await readState(strategy.onchainId, version.version);
+    return { ...version, ...state, allocation: { assets: state.assets.map((address, index) => ({ address: address.toLowerCase(), weightBps: state.weightsBps[index] ?? 0 })) } };
+  })) };
+}
+
+async function readPublicVersionState(onchainId: number, version: number) {
+  try {
+    const config = getConfig();
+    if (!config.rpcUrl || !config.registryAddress) throw new Error('missing configuration');
+    const client = createPublicClient({ transport: http(config.rpcUrl, { retryCount: 0, timeout: 5000 }) });
+    if (await client.getChainId() !== config.chainId) throw new Error('wrong chain');
+    return await readVersionState(client, config.registryAddress as Address, onchainId, version);
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw new AppError(503, 'VERSION_STATE_UNAVAILABLE', 'version state unavailable');
+  }
+}
+
+export async function strategyVersionState(id: number, version: number) {
+  const strategy = await getStrategy(id).catch(error => {
+    if (error instanceof AppError) throw error;
+    throw new AppError(503, 'VERSION_STATE_UNAVAILABLE', 'strategy version storage unavailable');
+  });
+  if (strategy.onchainId === null) throw new AppError(409, 'STRATEGY_NOT_ON_CHAIN', 'strategy has no chain identity');
+  return readPublicVersionState(strategy.onchainId, version);
+}
+
 /**
  * Append a new version. Version numbers are assigned here (max + 1) and protected by the
  * (strategy_id, version) primary key: on a concurrent publish the unique violation is retried.
@@ -466,6 +511,8 @@ export async function getStrategy(id: number): Promise<StrategyDetail> {
 export type TypedPublishDeps = {
   isChainConfigured: typeof isChainConfigured;
   validateChain: () => void;
+  validatePublication: typeof validateVersionPublication;
+  isCancelled: typeof versionCancelledOnchain;
   publishOnchain: typeof publishVersionOnchain;
   relayerLock: typeof withRelayerLock;
 };
@@ -476,12 +523,13 @@ export async function publishVersion(
   provider: string,
   deps: Partial<TypedPublishDeps> = {},
 ): Promise<StrategyVersion> {
-  exactKeys(input, ['allocation', 'schedule', 'execution', 'chainId', 'idleYield', 'changeLog', 'activeAt'], 'INVALID_VERSION');
+  exactKeys(input, ['allocation', 'schedule', 'execution', 'chainId', 'idleYield', 'changeLog', 'activeAt', 'performanceFeeBps'], 'INVALID_VERSION');
   if (input.execution !== undefined || input.chainId !== undefined || input.idleYield !== undefined || (record(input.schedule) && input.schedule.kind === 'funding')) return publishTypedVersion(strategyId, input, provider, deps);
   const allocation = validateAllocation(input.allocation);
   const schedule = validateSchedule(input.schedule);
   const changeLog = validateChangeLog(input.changeLog);
   const activeAt = validateActiveAt(input.activeAt);
+  const versionSettings: VersionSettings = { scheduleHash: canonicalScheduleHash(schedule), settingsHash: `0x${'00'.repeat(32)}`, performanceFeeBps: performanceFee(input.performanceFeeBps) };
 
   const owner = await query<{ provider: string; onchain_id: string | null }>(
     'select provider, onchain_id from strategies where id = $1',
@@ -491,11 +539,22 @@ export async function publishVersion(
   if (ownerRow === undefined) throw new NotFoundError(`strategy ${strategyId} not found`);
   assertProviderOwns(ownerRow.provider, provider);
   const onchainId = ownerRow.onchain_id === null ? null : Number(ownerRow.onchain_id);
+  if (onchainId !== null && !isChainConfigured()) throw new AppError(503, 'VERSION_UNAVAILABLE', 'chain mirror configuration unavailable; no new version stored');
 
   const attempts = 3;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const version = await nextVersion(strategyId);
     try {
+      // Mirror to chain when the strategy is already registered on-chain (onchain_id set).
+      if (onchainId !== null && isChainConfigured()) {
+        await publishVersionOnchain(onchainId, {
+          assets: allocation.assets.map((a) => a.address as `0x${string}`),
+          weightsBps: allocation.assets.map((a) => a.weightBps),
+          schedule,
+          activeAt, versionSettings, configHash: registryConfigHash(allocation.assets.map(a => a.address as Address), allocation.assets.map(a => a.weightBps), versionSettings), expectedVersion: version,
+        });
+      }
+
       const { rows } = await query<VersionRow>(
         `insert into strategy_versions (strategy_id, version, allocation, schedule, change_log, active_at)
          values ($1, $2, $3::jsonb, $4::jsonb, $5, $6)
@@ -503,7 +562,7 @@ export async function publishVersion(
         [
           strategyId,
           version,
-          JSON.stringify(allocation),
+          JSON.stringify({ ...allocation, p11: versionSettings }),
           JSON.stringify(schedule),
           changeLog,
           activeAt,
@@ -511,19 +570,7 @@ export async function publishVersion(
       );
       const row = rows[0];
       if (!row) throw new Error('insert into strategy_versions returned no row');
-      const mapped = mapVersion(row);
-
-      // Mirror to chain when the strategy is already registered on-chain (onchain_id set).
-      if (onchainId !== null && isChainConfigured()) {
-        await publishVersionOnchain(onchainId, {
-          assets: allocation.assets.map((a) => a.address as `0x${string}`),
-          weightsBps: allocation.assets.map((a) => a.weightBps),
-          schedule,
-          activeAt,
-        });
-      }
-
-      return mapped;
+      return mapVersion(row);
     } catch (err) {
       if (isUniqueViolation(err)) continue;
       if (isForeignKeyViolation(err)) throw new NotFoundError(`strategy ${strategyId} not found`);
@@ -535,7 +582,7 @@ export async function publishVersion(
 }
 
 async function publishTypedVersion(strategyId: number, raw: PublishVersionInput, provider: string, overrides: Partial<TypedPublishDeps>): Promise<StrategyVersion> {
-  const deps: TypedPublishDeps = { isChainConfigured, validateChain: () => { getChain(); }, publishOnchain: publishVersionOnchain, relayerLock: withRelayerLock, ...overrides };
+  const deps: TypedPublishDeps = { isCancelled: versionCancelledOnchain, validatePublication: validateVersionPublication, isChainConfigured, validateChain: () => { getChain(); }, publishOnchain: publishVersionOnchain, relayerLock: withRelayerLock, ...overrides };
   if(raw.chainId!==undefined&&raw.chainId!==configuredChainId())throw new ValidationError('CHAIN_MISMATCH','chainId must match this API deployment');
   if(configuredChainId()!==97)throw new ValidationError('EXECUTION_UNAVAILABLE','per-asset funding is only available on chain 97');
   const input = typedVersionInput(raw);
@@ -555,8 +602,8 @@ async function publishTypedVersion(strategyId: number, raw: PublishVersionInput,
   const changeLog = validateChangeLog(input.changeLog);
   const suppliedAt = input.activeAt === undefined || input.activeAt === null ? null :
     input.activeAt instanceof Date ? input.activeAt : utcDate(input.activeAt, 'activeAt');
-  if (suppliedAt !== null && (!Number.isFinite(suppliedAt.getTime()) || suppliedAt.getTime() < 0 || suppliedAt.getTime() % 1000 !== 0)) {
-    throw new ValidationError('INVALID_ACTIVE_AT', 'activeAt must be a nonnegative whole-second timestamp');
+  if (suppliedAt !== null && (!Number.isFinite(suppliedAt.getTime()) || suppliedAt.getTime() <= 0 || suppliedAt.getTime() % 1000 !== 0)) {
+    throw new ValidationError('INVALID_ACTIVE_AT', 'activeAt must be a positive whole-second timestamp; omit it for the earliest safe default');
   }
   try {
     const preflight = (await query<{ provider: string; onchain_id: string | null }>('select provider,onchain_id from strategies where id=$1', [strategyId])).rows[0];
@@ -583,17 +630,23 @@ async function publishTypedVersion(strategyId: number, raw: PublishVersionInput,
         const previous = (await client.query<VersionRow>(`select ${VERSION_COLUMNS} from strategy_versions where strategy_id=$1 order by version desc limit 1`, [strategyId])).rows[0];
         // Retry a failed/unknown mirror with the same immutable config, including its original default time.
         const retryAt = previous?.active_at;
-        const retry = suppliedAt === null && retryAt !== undefined && retryAt !== null && previous?.config_hash ===
-          canonicalConfigHash({ chainId, execution, allocation, schedule, activeAt: retryAt });
-        const activeAt = suppliedAt ?? (retry && retryAt ? retryAt : new Date(Math.floor(Date.now() / 1000) * 1000));
-        const configHash = canonicalConfigHash({ chainId, execution, allocation, schedule, activeAt });
-        if (previous?.config_hash === configHash) return { row: previous, onchainId: owner.onchain_id, created: false };
+        const versionSettings = typedVersionSettings({ chainId, execution, allocation, schedule, activeAt: new Date(0) }, input.performanceFeeBps);
+        const configHash = registryConfigHash(allocation.assets.map(a => a.address as Address), allocation.assets.map(a => a.weightBps), versionSettings);
+        const cancelled = previous?.config_hash === configHash && owner.onchain_id !== null
+          ? await deps.isCancelled(Number(owner.onchain_id), previous.version) : false;
+        const retry = !cancelled && suppliedAt === null && retryAt !== undefined && retryAt !== null && previous?.config_hash === configHash;
+        const activeAt = suppliedAt ?? (retry && retryAt ? retryAt : new Date((Math.floor(Date.now() / 1000) + VERSION_NOTICE_SECONDS + 60) * 1000));
+        if (!cancelled && previous?.config_hash === configHash && previous.active_at?.getTime() === activeAt.getTime()) return { row: previous, onchainId: owner.onchain_id, created: false };
         const version = (previous?.version ?? 0) + 1;
         if (version > 65535) throw new ValidationError('VERSION_LIMIT', 'strategy version exceeds uint16');
+        if (owner.onchain_id !== null) await deps.validatePublication(Number(owner.onchain_id), {
+          assets: allocation.assets.map(a => a.address as Address), weightsBps: allocation.assets.map(a => a.weightBps),
+          schedule, activeAt, versionSettings, configHash, expectedVersion: version,
+        });
         const row = (await client.query<VersionRow>(`insert into strategy_versions
           (strategy_id,version,allocation,schedule,change_log,active_at,execution_schema_version,execution,execution_chain_id,config_hash)
           values($1,$2,$3::jsonb,$4::jsonb,$5,$6,2,$7::jsonb,$8,$9) returning ${VERSION_COLUMNS}`,
-          [strategyId, version, JSON.stringify(allocation), JSON.stringify(schedule), changeLog, activeAt, JSON.stringify(execution), chainId, configHash])).rows[0];
+          [strategyId, version, JSON.stringify({ ...allocation, p11: versionSettings }), JSON.stringify(schedule), changeLog, activeAt, JSON.stringify(execution), chainId, configHash])).rows[0];
         if (!row) throw new Error('missing version');
         return { row, onchainId: owner.onchain_id, created: true };
       });
@@ -602,7 +655,7 @@ async function publishTypedVersion(strategyId: number, raw: PublishVersionInput,
         assertHeld();
         await deps.publishOnchain(Number(written.onchainId), { assets: allocation.assets.map((asset) => asset.address as Address),
           weightsBps: allocation.assets.map((asset) => asset.weightBps), schedule, activeAt: written.row.active_at ?? new Date(0),
-          configHash: written.row.config_hash ?? undefined, expectedVersion: version.version, allowPublish: written.created }, { lock: async (_chainId, action) => action(assertHeld) });
+          configHash: written.row.config_hash ?? undefined, versionSettings: version.versionSettings, expectedVersion: version.version, allowPublish: written.created }, { lock: async (_chainId, action) => action(assertHeld) });
       }
       return version;
     };
@@ -615,7 +668,7 @@ async function publishTypedVersion(strategyId: number, raw: PublishVersionInput,
 
 /** Pinned version only; latest DB version is never a substitute for chain enrollment. */
 export async function requireTypedVersion(strategyId: number, version: number, onchainId: number, account?: Address,
-  deps: { chainId?: number; assertOnchain?: typeof assertVersionOnchain; verifyChain?: boolean; blockNumber?: bigint; blockHash?: Hex } = {}): Promise<StrategyVersion> {
+  deps: { chainId?: number; assertOnchain?: typeof assertVersionOnchain; verifyChain?: boolean; requireLatest?: boolean; blockNumber?: bigint; blockHash?: Hex } = {}): Promise<StrategyVersion> {
   const detail = await getStrategy(strategyId);
   const pinned = detail.versions.find((candidate) => candidate.version === version);
   if (!pinned || ![1,2].includes(pinned.executionSchemaVersion) || pinned.configHash === null || pinned.activeAt === null || pinned.executionChainId !== (deps.chainId ?? configuredChainId())) {
@@ -623,8 +676,9 @@ export async function requireTypedVersion(strategyId: number, version: number, o
   }
   const config = { chainId: pinned.executionChainId, execution: pinned.execution.kind === 'per_asset' ? validateAssetConfig(pinned.execution,pinned.allocation,pinned.executionChainId) : validateExecution(pinned.execution), allocation: pinned.allocation,
     schedule: validateFundingSchedule(pinned.schedule), activeAt: new Date(pinned.activeAt) };
-  if (canonicalConfigHash(config) !== pinned.configHash) throw new AppError(409, 'CONFIG_HASH_MISMATCH', 'stored config hash does not match the pinned version');
-  if (deps.verifyChain !== false) await (deps.assertOnchain ?? assertVersionOnchain)(onchainId, version, { ...config, configHash: pinned.configHash }, account, { blockNumber: deps.blockNumber, blockHash: deps.blockHash });
+  const computed = pinned.versionSettings === undefined ? canonicalConfigHash(config) : registryConfigHash(config.allocation.assets.map(a => a.address as Address), config.allocation.assets.map(a => a.weightBps), typedVersionSettings(config, pinned.versionSettings.performanceFeeBps));
+  if (computed !== pinned.configHash) throw new AppError(409, 'CONFIG_HASH_MISMATCH', 'stored config hash does not match the pinned version');
+  if (deps.verifyChain !== false) await (deps.assertOnchain ?? assertVersionOnchain)(onchainId, version, { ...config, configHash: pinned.configHash, versionSettings: pinned.versionSettings }, account, { requireLatest: deps.requireLatest, blockNumber: deps.blockNumber, blockHash: deps.blockHash });
   return pinned;
 }
 
@@ -676,8 +730,9 @@ function mapVersion(row: VersionRow): StrategyVersion {
     strategyId: Number(row.strategy_id),
     version: row.version,
     // jsonb comes back already parsed; the DB shape check and validateAllocation guard the contents.
-    allocation: row.allocation as Allocation,
+    allocation: { assets: (row.allocation as Allocation).assets },
     schedule: row.schedule as RebalanceSchedule | FundingSchedule,
+    ...(storedVersionSettings(row.allocation) === undefined ? {} : { versionSettings: storedVersionSettings(row.allocation) }),
     executionSchemaVersion: row.execution_schema_version,
     execution: row.execution,
     executionChainId: row.execution_chain_id === null ? null : Number(row.execution_chain_id),
@@ -720,11 +775,11 @@ function validateChangeLog(value: unknown): string | null {
 }
 
 function validateActiveAt(value: unknown): Date {
-  if (value === undefined || value === null) return new Date();
+  if (value === undefined || value === null) return new Date((Math.floor(Date.now() / 1000) + VERSION_NOTICE_SECONDS + 60) * 1000);
   if(typeof value!=='string'&&!(value instanceof Date))throw new ValidationError('INVALID_ACTIVE_AT','activeAt must be a valid ISO-8601 timestamp');
   const parsed = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(parsed.getTime())) {
-    throw new ValidationError('INVALID_ACTIVE_AT', 'activeAt must be a valid ISO-8601 timestamp');
+  if (!Number.isFinite(parsed.getTime()) || parsed.getTime() <= 0 || parsed.getTime() % 1000 !== 0) {
+    throw new ValidationError('INVALID_ACTIVE_AT', 'activeAt must be a positive whole-second ISO-8601 timestamp');
   }
   return parsed;
 }

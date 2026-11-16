@@ -1,3 +1,4 @@
+import { enrollmentApprovalHash } from '../src/registry-versioning.js';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { decodeErrorResult, encodeErrorResult, getAddress, toFunctionSelector, zeroAddress } from 'viem';
@@ -20,7 +21,7 @@ function fakeChain(operator: Address, signer = SIGNER) {
   const order: string[] = [];
   const state = {
     operator, enrolled: false, strategyId: 0n, version: 0, paused: false,
-    activeVersion: 1, receiptStatus: 'success',
+    approved: true, configHash: `0x${'11'.repeat(32)}` as `0x${string}`, activeVersion: 1, receiptStatus: 'success',
   };
   const chain = {
     chainId: 56,
@@ -35,6 +36,9 @@ function fakeChain(operator: Address, signer = SIGNER) {
         order.push(String(args.functionName));
         switch (args.functionName) {
           case 'operator': return state.operator;
+          case 'activeVersion': return state.activeVersion;
+          case 'version': return { configHash: state.configHash };
+          case 'enrollmentApproval': return state.approved ? enrollmentApprovalHash(7n, state.activeVersion, state.configHash) : `0x${'00'.repeat(32)}`;
           case 'isEnrolled': return state.enrolled;
           case 'enrollments': return [state.strategyId, state.version, state.paused];
           default: throw new Error('unexpected contract read');
@@ -65,7 +69,7 @@ test('enrollOnchain reads the operator before enrolling the smart account and aw
 
   assert.equal(await enrollOnchain(SMART_ACCOUNT, 7, chain), 1);
 
-  assert.deepEqual(order, ['isEnrolled', 'enrollments', 'operator', 'write', 'receipt', 'isEnrolled', 'enrollments']);
+  assert.deepEqual(order, ['isEnrolled', 'enrollments', 'operator', 'activeVersion', 'version', 'enrollmentApproval', 'write', 'receipt', 'isEnrolled', 'enrollments']);
   assert.equal(reads[0]?.address, REGISTRY);
   assert.equal(reads[2]?.functionName, 'operator');
   assert.equal(reads[0]?.blockNumber, 100n);
@@ -73,8 +77,8 @@ test('enrollOnchain reads the operator before enrolling the smart account and aw
   assert.equal(writes[0]?.address, REGISTRY);
   assert.equal(writes[0]?.account, chain.account);
   assert.equal(writes[0]?.functionName, 'enroll');
-  assert.deepEqual(writes[0]?.args, [SMART_ACCOUNT, 7n]);
-  assert.deepEqual(receipts, [{ hash: TX_HASH }]);
+  assert.deepEqual(writes[0]?.args, [SMART_ACCOUNT, 7n, 1]);
+  assert.deepEqual(receipts, [{ hash: TX_HASH, timeout: 30_000 }]);
 
   // A role change between the read and execution can still revert; viem must recognize its error.
   const abi = writes[0]?.abi as Abi;
@@ -90,6 +94,29 @@ test('enrollOnchain compares addresses without requiring the same letter case', 
 
   assert.equal(writes.length, 1);
 });
+
+test('#124 missing/revoked owner consent and no effective version never submit enrollment', async () => {
+  for (const activeVersion of [0, 1, 65535]) {
+    const { chain, state, writes } = fakeChain(SIGNER);
+    state.activeVersion = activeVersion; state.approved = false;
+    await assert.rejects(enrollOnchain(SMART_ACCOUNT, 7, chain), (error: unknown) => error instanceof Error &&
+      error.message.includes(activeVersion === 0 ? 'no effective version' : 'sudo'));
+    assert.equal(writes.length, 0);
+  }
+});
+
+for (const failedFunction of ['activeVersion', 'version', 'enrollmentApproval']) {
+  test(`#124 RPC failure during ${failedFunction} cannot authorize enrollment`, async () => {
+    const { chain, writes } = fakeChain(SIGNER);
+    const read = chain.publicClient.readContract;
+    chain.publicClient.readContract = async args => {
+      if (args.functionName === failedFunction) throw new Error('sensitive upstream credential');
+      return read(args);
+    };
+    await assert.rejects(enrollOnchain(SMART_ACCOUNT, 7, chain), (error: unknown) => error instanceof Error && !error.message.includes('sensitive'));
+    assert.equal(writes.length, 0);
+  });
+}
 
 for (const [name, registryOperator, signer] of [
   ['signer is not the operator', OWNER, SIGNER],

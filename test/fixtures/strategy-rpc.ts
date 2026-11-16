@@ -13,15 +13,16 @@ export function strategyRpc(allocation: Allocation, configHash: Hex, activeAt: D
   const state = { chainId: 97, blockHash: BLOCK_HASH, receiptBlockHash: BLOCK_HASH, logIndex: 0, removed: false,
     success: true, logs: true, duplicateLog: false, malformed: false, by: TESTNET_97.roles.operator as Address,
     to: TEST_ACCOUNT, token: TESTNET_97.contracts.usdt as Address, amount: TEST_AMOUNT, txHash,
-    now: BigInt(activeAt.getTime() / 1000), configHash, activeAt: BigInt(activeAt.getTime() / 1000),
+    now: BigInt(activeAt.getTime() / 1000), gasEstimate: 1000000n, configHash, activeAt: BigInt(activeAt.getTime() / 1000),
     weights: allocation.assets.map((asset) => asset.weightBps), version: 1, pinned: 1, strategyId: 82n,
-    historicalPinned: 1, historicalNow: BigInt(activeAt.getTime() / 1000), latestBlockNumber: 130n,
+    historicalVersion: 1, historicalPinned: 1, historicalNow: BigInt(activeAt.getTime() / 1000), latestBlockNumber: 130n,
     mint: false, minter: true, transferFrom: zeroAddress as Address, txFrom: TESTNET_97.roles.operator as Address, txTo: TESTNET_97.contracts.usdt as Address, txValue: 0n, wrongInput: false, missingReceipt: false,
     txNonce: 0, receiptDelayMs: 0, broadcasts: [] as Hex[], blockReads: 0, reorgAtBlockRead: 0, cashRaw: TEST_AMOUNT, fail: '', reads: [] as string[] };
   const client = createPublicClient({ transport: custom({ request: async ({ method, params }) => {
     state.reads.push(method);
     if (state.fail === method || state.fail === '*') throw new Error('SECRET_RPC_CREDENTIAL');
     if (method === 'eth_chainId') return toHex(state.chainId);
+    if (method === 'eth_estimateGas') return toHex(state.gasEstimate);
     const historical = Array.isArray(params) && (method === 'eth_call' ? params[1] : params[0]) === '0x82' && state.latestBlockNumber !== 130n;
     if (method === 'eth_getBlockByNumber') { state.blockReads++; return { number: historical ? '0x82' : toHex(state.latestBlockNumber), hash: state.reorgAtBlockRead > 0 && state.blockReads >= state.reorgAtBlockRead ? OTHER_HASH : state.blockHash, timestamp: toHex(historical ? state.historicalNow : state.now), gasLimit: '0x1c9c380', gasUsed: '0x0',
       miner: TEST_OWNER, size: '0x1', extraData: '0x', parentHash: OTHER_HASH, transactions: [], difficulty: '0x0', totalDifficulty: '0x0',
@@ -55,9 +56,11 @@ export function strategyRpc(allocation: Allocation, configHash: Hex, activeAt: D
       if (data.startsWith(toFunctionSelector('isFaucet(address)'))) return encodeAbiParameters([{ type: 'bool' }], [state.minter]);
       if (data.startsWith(toFunctionSelector('balanceOf(address)'))) return encodeAbiParameters([{ type: 'uint256' }], [state.cashRaw]);
       if (data.startsWith(toFunctionSelector('version(uint256,uint16)'))) return encodeAbiParameters([
-        { type: 'tuple', components: [{ name: 'assets', type: 'address[]' }, { name: 'weightsBps', type: 'uint16[]' }, { name: 'scheduleHash', type: 'bytes32' }, { name: 'activeAt', type: 'uint64' }] },
-      ], [{ assets: allocation.assets.map((asset) => asset.address as Address), weightsBps: state.weights, scheduleHash: state.configHash, activeAt: state.activeAt }]);
-      if (data.startsWith(toFunctionSelector('activeVersion(uint256)'))) return encodeAbiParameters([{ type: 'uint16' }], [state.version]);
+        { type: 'tuple', components: [{ name: 'assets', type: 'address[]' }, { name: 'weightsBps', type: 'uint16[]' }, { name: 'scheduleHash', type: 'bytes32' }, { name: 'activeAt', type: 'uint64' }, { name: 'settingsHash', type: 'bytes32' }, { name: 'performanceFeeBps', type: 'uint16' }, { name: 'configHash', type: 'bytes32' }] },
+      ], [{ assets: allocation.assets.map((asset) => asset.address as Address), weightsBps: state.weights, scheduleHash: state.configHash, activeAt: state.activeAt, settingsHash: OTHER_HASH, performanceFeeBps: 500, configHash: state.configHash }]);
+      if (data.startsWith(toFunctionSelector('cancelledVersion(uint256,uint16)'))) return encodeAbiParameters([{type:'bool'}],[false]);
+      if (data.startsWith(toFunctionSelector('versionCount(uint256)'))) return encodeAbiParameters([{type:'uint256'}],[BigInt(state.version)]);
+      if (data.startsWith(toFunctionSelector('activeVersion(uint256)'))) return encodeAbiParameters([{ type: 'uint16' }], [historical ? state.historicalVersion : state.version]);
       if (data.startsWith(toFunctionSelector('isEnrolled(address)'))) return encodeAbiParameters([{ type: 'bool' }], [true]);
       if (data.startsWith(toFunctionSelector('enrollments(address)'))) return encodeAbiParameters([{ type: 'uint256' }, { type: 'uint16' }, { type: 'bool' }], [state.strategyId, historical ? state.historicalPinned : state.pinned, false]);
     }

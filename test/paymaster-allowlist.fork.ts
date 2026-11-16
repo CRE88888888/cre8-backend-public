@@ -1,8 +1,9 @@
+import { localAcceptanceEnv } from './fixtures/local-acceptance.js';
 /** Explicit local-only acceptance: real Kernel v3.3 + EntryPoint v0.7 on a chain 97 fork.
  * Source artifacts must come from `git archive origin/main` of cre8-contracts, then forge build.
  * Extract into .bun-cache/issue-71-contracts and build src/testnet/TestnetToken.sol plus
- * src/testnet/aa/samples/VerifyingPaymaster.sol. Start the fork on port 8558, migrate the isolated
- * cre8_x1d DB, set CHAIN_ID=97, then run bun test ./test/paymaster-allowlist.fork.ts --timeout=120000.
+ * src/testnet/aa/samples/VerifyingPaymaster.sol. Select isolated localhost ports and TEST_DATABASE_NAME via localAcceptanceEnv,
+ * migrate that disposable DB, set CHAIN_ID=97, then run bun test ./test/paymaster-allowlist.fork.ts --timeout=120000.
  * Uses only the public Anvil test key. No bundler or public-chain writes.
  */
 import assert from 'node:assert/strict';
@@ -24,7 +25,7 @@ import { TESTNET_97 as T } from '../src/testnet-profile.js';
 import { TEST_SIGNER, config } from './fixtures/paymaster.js';
 
 after(closePool);
-const rpcUrl = 'http://127.0.0.1:8558';
+const rpcUrl = localAcceptanceEnv(process.env).rpcUrl;
 const client = createPublicClient({ chain: bscTestnet, transport: http(rpcUrl, { retryCount: 0 }) });
 const local = createTestClient({ chain: bscTestnet, mode: 'anvil', transport: http(rpcUrl) });
 const owner = privateKeyToAccount(TEST_SIGNER);
@@ -32,7 +33,7 @@ const wallet = createWalletClient({ account: owner, chain: bscTestnet, transport
 const C = T.contracts;
 
 async function deploy(name: string, source: string, args: readonly unknown[] = []): Promise<Address> {
-  const artifact: unknown = JSON.parse(await readFile(new URL(`../.bun-cache/issue-71-contracts/out/${source}.sol/${name}.json`, import.meta.url), 'utf8'));
+  const artifact: unknown = JSON.parse(await readFile(`${process.env.CONTRACT_ARTIFACTS_DIR ?? '.bun-cache/issue-71-contracts/out'}/${source}.sol/${name}.json`, 'utf8'));
   assert.ok(typeof artifact === 'object' && artifact !== null && 'abi' in artifact && Array.isArray(artifact.abi) &&
     'bytecode' in artifact && typeof artifact.bytecode === 'object' && artifact.bytecode !== null && 'object' in artifact.bytecode);
   const code = artifact.bytecode.object;

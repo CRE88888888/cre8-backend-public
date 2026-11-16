@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { test, mock } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createServer } from '../src/server.js';
 import { MemoryRateLimitStore, RequestRateLimiter } from '../src/ratelimit.js';
@@ -128,20 +128,63 @@ test('#123 two maximum previews keep concurrent health requests under 200ms', as
     const base = `http://127.0.0.1:${address.port}`;
     await (await fetch(base + '/health')).arrayBuffer();
     const body = { chainId: 97, execution: largestContributionExecution(), amountRaw: (10_000_000n * 10n ** 18n).toString() };
-    const started = performance.now();
     const pending = Promise.all([0, 1].map(async () => {
       const response = await fetch(base + '/strategies/preview-contribution', { method: 'POST', body: JSON.stringify(body) });
-      await response.arrayBuffer();
-      return response.status;
+      const result: unknown = await response.json();
+      assert.ok(response.status === 200 || response.status === 503);
+      if (response.status === 503) {
+        assert.ok(record(result) && record(result.error));
+        assert.equal(result.error.code, 'PREVIEW_TIMEOUT');
+      } else {
+        assert.ok(record(result));
+        assert.ok(typeof result.minimumRaw === 'string' && /^[0-9]+$/.test(result.minimumRaw));
+        assert.ok(Array.isArray(result.slots) && result.slots.length > 0);
+      }
+      const healthStarted = performance.now();
+      await (await fetch(base + '/health')).arrayBuffer();
+      assert.ok(performance.now() - healthStarted < 200, 'health remains responsive after either preview outcome');
     }));
     await delay(20);
+    const healthStarted = performance.now();
     await (await fetch(base + '/health')).arrayBuffer();
-    const healthMs = performance.now() - started;
-    const statuses = await pending;
-    assert.deepEqual(statuses, [200, 200]);
+    const healthMs = performance.now() - healthStarted;
+    await pending;
     assert.ok(healthMs < 200, `concurrent health took ${healthMs.toFixed(0)}ms`);
   } finally {
     server.closeAllConnections();
     await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+
+test('#123 injected short preview budget deterministically returns PREVIEW_TIMEOUT while health remains responsive', async () => {
+  const nativeTimeout = globalThis.setTimeout;
+  // Test-only clock injection; the production pool still requests its unchanged 1000ms budget.
+  const timer = mock.method(globalThis, 'setTimeout', (callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) =>
+    nativeTimeout(callback, ms === PREVIEW_TIMEOUT_MS ? 25 : ms, ...args));
+  const pool = new ContributionPreviewPool(fixtureUrl);
+  const server = createServer({
+    rateLimiter: new RequestRateLimiter(loadRateLimitConfig({}), new MemoryRateLimitStore()),
+    previewContribution: () => pool.run({ action: 'spin', body: preparedSimple }, at),
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address(); assert.ok(address && typeof address !== 'string');
+    const base = `http://127.0.0.1:${address.port}`;
+    const pending = fetch(base + '/strategies/preview-contribution', { method: 'POST', body: '{}' });
+    const started = performance.now();
+    await (await fetch(base + '/health')).arrayBuffer();
+    assert.ok(performance.now() - started < 200);
+    const response = await pending;
+    const body: unknown = await response.json();
+    assert.equal(response.status, 503);
+    assert.ok(record(body) && record(body.error)); assert.equal(body.error.code, 'PREVIEW_TIMEOUT');
+    const after = performance.now();
+    await (await fetch(base + '/health')).arrayBuffer();
+    assert.ok(performance.now() - after < 200);
+    assert.equal(PREVIEW_TIMEOUT_MS, 1_000);
+  } finally {
+    timer.mock.restore();
+    server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });

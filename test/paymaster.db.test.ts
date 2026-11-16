@@ -20,7 +20,7 @@ test('#97 identical sponsorship retries across seconds and service instances reu
   let clock = Math.floor(Date.now() / 1000);
   const originalClock = clock;
   const sender = bytesToHex(randomBytes(20));
-  const op = operation({ sender, callData: kernelCall(encodeFunctionData({ abi: parseAbi(['function enroll(address,uint256)']), functionName: 'enroll', args: [sender, 1n] }), REGISTRY) });
+  const op = operation({ sender, callData: kernelCall(encodeFunctionData({ abi: parseAbi(['function enroll(address,uint256,uint16)']), functionName: 'enroll', args: [sender, 1n, 1] }), REGISTRY) });
   const c = { ...sponsorConfig(), accountDailyCount: 2n };
   const make = () => createPaymasterService({ config: c, now: () => clock,
     query: async () => ({ rows: [{ owner: OWNER, user_id: OWNER }] }), checkChain: async () => {},

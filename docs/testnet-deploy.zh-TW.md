@@ -83,6 +83,9 @@ ENABLE_OPERATOR_REBALANCE=0
 RATE_LIMIT_STRATEGIES_PER_DAY=10
 RATE_LIMIT_VERSIONS_PER_DAY=50
 RATE_LIMIT_PORTFOLIOS_PER_DAY=20
+ACCOUNT_DEPLOYMENTS_PER_DAY=300
+ACCOUNT_DEPLOYMENT_MIN_BALANCE_WEI=50000000000000000
+RATE_LIMIT_ENROLLMENT_PER_MINUTE=30
 ```
 
 `SERVICE_ROLE`、`PORT` 依服務設定；未完成啟用驗收前 `SERVICE_ENABLED=0`。
@@ -111,7 +114,11 @@ reserved／unknown 等狀態仍代表未完成，200 只表示成功讀回原紀
 
 scheduler 每輪先對帳 chain 97 relayer，不需要 operator key。預設 dry-run 只查原交易的 canonical receipt 並結算已知結果；只有明確 `--live`／`SCHEDULER_LIVE=1` 才重播 DB 保存的同一筆 signed bytes。hash、簽章、chain、nonce、token、recipient、calldata、amount 或 receipt 證據不符時保留未決；RPC／DB 失敗、逾時、舊 hash-only 資料也不解鎖、不退款、不準備替代交易。失敗輪次下輪再試。迎新走 `welcomeFor(account)`，operator 須有 `isFaucet`，無 USDT minter 權限；每日走 `claimFor(account, amount)`，上限 1,000。
 
-每日建基金／發版本／加入基金限額預設 10／50／20（C3 暫定），由 `RATE_LIMIT_STRATEGIES_PER_DAY`、`RATE_LIMIT_VERSIONS_PER_DAY`、`RATE_LIMIT_PORTFOLIOS_PER_DAY` 設定。依登入 owner／action／DB UTC 日原子記錄到 `daily_operation_counts`，重啟與多實例共用；等於上限允許，0 禁止，超過回 429 與 Retry-After。這是 action 前消耗的嘗試額度，body 或 action 失敗也計數；DB 錯誤／逾時／未知 commit 回 503，不自動重試扣額或 fallback。scheduler live 只清除七個完整 UTC 日以前的計數，未啟 live 時舊資料保留，不影響正確性。短窗口的登入／查詢限額仍使用記憶體。
+每日建基金／發版本限額預設 10／50，由 `RATE_LIMIT_STRATEGIES_PER_DAY`、`RATE_LIMIT_VERSIONS_PER_DAY` 設定。依登入 owner／action／DB UTC 日原子記錄到 `daily_operation_counts`，重啟與多實例共用；等於上限允許，0 禁止，超過回 429 與 Retry-After。這是 action 前消耗的嘗試額度，body 或 action 失敗也計數；DB 錯誤／逾時／未知 commit 回 503，不自動重試扣額或 fallback。scheduler live 只清除七個完整 UTC 日以前的計數，未啟 live 時舊資料保留，不影響正確性。短窗口的登入／查詢限額仍使用記憶體。
+
+Chain 97 的加入額度在 operator 首次實際嘗試廣播帳戶部署前才消耗：每 owner／UTC 日預設 20 次（`RATE_LIMIT_PORTFOLIOS_PER_DAY`），全站預設 300 次（`ACCOUNT_DEPLOYMENTS_PER_DAY`）。兩者在同一 DB 交易原子扣額；拒絕時整筆回滾，未知 COMMIT 不廣播、不自動退款。全站計數沿用 `daily_operation_counts`，以固定 MetaFactory 合約地址＋`join` 作保留 namespace，不因登入 owner 或 operator 輪替重置。每錢包超限回 429；全站超限回 503 `ACCOUNT_DEPLOYMENT_DAILY_LIMIT`。送出前以 pending 區塊讀 operator 原生幣餘額，低於 `ACCOUNT_DEPLOYMENT_MIN_BALANCE_WEI`（預設 0.05 tBNB）回 503 `ACCOUNT_DEPLOYMENT_LOW_BALANCE`，等於門檻允許。DB／餘額 RPC 不可用皆不廣播；已部署直接跳過。已簽名但尚未廣播的交易只有程序內副本，重啟後仍沿用 getCode 守衛，不是部署 outbox。
+
+`enrollment-params`（含 `POST /portfolios`）與 `enrollment-confirm` 各有獨立每 owner／分鐘預設 30 次的短期限流（`RATE_LIMIT_ENROLLMENT_PER_MINUTE`）。同 intent 輪詢、部署中的 202、已部署重試與確認不再重扣每日部署額度；短窗口超過回 429。非 97 的加入路由維持既有每日 20 次語意。
 
 **contracts#48／#49 與地址同步：** #85 已完整替換本 repo 的 chain 97 manifest、profile、ABI 與 380 項 runtime pins，含新 executor／yieldRegistry。DB 資產資料與 APP 仍須由各 lane 同步；生息須等 0036 adapter、BE-3 整合及 APP-3 驗收，沒有新增開關或 HTTP 路由。不得把本單 CI／本機測試視為可公開部署，公開啟用仍須下列清單。`test/relayer-recovery.fork.ts` 的隔離 manifest override 是既有驗收方式，不代表目前 repo 仍使用舊地址簿。
 

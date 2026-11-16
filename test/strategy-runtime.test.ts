@@ -4,7 +4,8 @@ import { createPublicClient, custom, decodeFunctionData, encodeFunctionResult, i
 import type { Address } from 'viem';
 import { TWAP_PRICE_SOURCE } from '../src/positions.js';
 import { bscTestnet } from 'viem/chains';
-import { defaultNewMoneyDeps } from '../src/strategy-runtime.js';
+import { defaultNewMoneyDeps, prepareNewMoney } from '../src/strategy-runtime.js';
+import type { NewMoneyDeps } from '../src/strategy-runtime.js';
 import { TESTNET_97 as P } from '../src/testnet-profile.js';
 import type { PortfolioPlan } from '../src/snapshot.js';
 import type { DuePortfolio, SchedulerQueryFn } from '../src/scheduler.js';
@@ -87,3 +88,25 @@ test('#104 yield planning projects claim units once, prices missing direct asset
   p.claim=4n*U;p.state='unknown';await assert.rejects(deps.yieldHoldings(plan));
   p.state='known';f.state.fail='eth_call';await assert.rejects(deps.yieldHoldings(plan));
 });
+
+for (const activeVersion of [2, 65535]) for (const dryRun of [false, true]) {
+  test(`#124 version ${activeVersion} stops old funding before RPC, DB, reservation or quote (dryRun=${dryRun})`, async () => {
+    const { yieldFixture, yieldRebalancePlan } = await import('./fixtures/yield.js');
+    const f = yieldFixture(['venus']), plan = yieldRebalancePlan(f);
+    plan.pinnedVersion.version = activeVersion;
+    const now = new Date('2026-11-16T00:00:00Z');
+    const due: DuePortfolio = { portfolioId: 1, strategyId: 1, version: 1, executionKind: 'per_asset', scheduleState: 'active',
+      account: f.account, accountType: 'KERNEL', intervalSeconds: 60, unsupportedReason: null, nextRunAt: now };
+    let calls = 0;
+    const forbidden = () => { calls++; throw new Error('version mismatch must stop before external effects'); };
+    const query: SchedulerQueryFn = async () => forbidden();
+    const deps: NewMoneyDeps = { version: async () => forbidden(), policy: async () => forbidden(),
+      withdrawals: async () => forbidden(), rebalanceReserve: async () => forbidden(), yieldHoldings: async () => forbidden(),
+      withdrawYield: async () => forbidden(), verifyLots: async () => forbidden(), quote: async () => forbidden(), marketOpen: forbidden };
+    for (const version of [1, undefined]) {
+      await assert.rejects(prepareNewMoney({ due: { ...due, version }, plan, query, run: async () => forbidden(), chainId: 97, now, dryRun, deps }),
+        /\[PINNED_VERSION_CHANGED\]/);
+    }
+    assert.equal(calls, 0);
+  });
+}

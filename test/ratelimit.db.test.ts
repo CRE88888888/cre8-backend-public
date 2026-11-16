@@ -3,8 +3,10 @@ import { after, test } from 'node:test';
 import { randomBytes } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { closePool, migrate, query, withTransaction } from '../src/db.js';
-import { RequestRateLimiter, RateLimitError, PersistentRateLimitStore, pruneDailyOperationCounts } from '../src/ratelimit.js';
+import { RequestRateLimiter, RateLimitError, PersistentRateLimitStore, pruneDailyOperationCounts, consumeAccountDeploymentBudget } from '../src/ratelimit.js';
 import { loadRateLimitConfig } from '../src/config.js';
+import { kernelAddressesForChain } from '../src/addresses.js';
+import type { Address } from 'viem';
 import pg from 'pg';
 
 after(closePool);
@@ -72,4 +74,30 @@ test('#97 contended daily count times out without increment; invalid policies an
   for (const limit of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1]) await assert.rejects(store.consume(key, { limit, windowMs: 86400000 }, 0), RangeError);
   assert.equal((await store.consume(key, { limit: 0, windowMs: 86400000 }, 0)).allowed, false);
   assert.equal((await query('select count from daily_operation_counts where owner=$1', [key.split(':')[1]])).rows.length, 0);
+});
+
+test('#124 deployment quota shares a durable UTC-day cap across owners and atomically preserves both budgets on denial',async()=>{
+  await migrate();
+  const global=kernelAddressesForChain(97).kernelMetaFactory.toLowerCase(),wallet=owner() as Address;
+  await query('delete from daily_operation_counts where owner=$1',[global]);
+  try{
+    await assert.rejects(consumeAccountDeploymentBudget(wallet,withTransaction,{perOwner:20,perDay:0}),{code:'ACCOUNT_DEPLOYMENT_DAILY_LIMIT'});
+    assert.equal((await query('select count from daily_operation_counts where owner in ($1,$2)',[global,wallet])).rows.length,0);
+    await consumeAccountDeploymentBudget(wallet,withTransaction,{perOwner:1,perDay:2});
+    await assert.rejects(consumeAccountDeploymentBudget(wallet,withTransaction,{perOwner:1,perDay:2}),RateLimitError);
+    const others=Array.from({length:10},()=>owner() as Address);
+    const results=await Promise.allSettled(others.map(w=>consumeAccountDeploymentBudget(w,withTransaction,{perOwner:20,perDay:2})));
+    assert.equal(results.filter(r=>r.status==='fulfilled').length,1);
+    for(const r of results)if(r.status==='rejected')assert.equal(r.reason.code,'ACCOUNT_DEPLOYMENT_DAILY_LIMIT');
+    assert.equal((await query<{count:string}>('select count::text from daily_operation_counts where owner=$1',[global])).rows[0]?.count,'2');
+    assert.equal((await query('select owner from daily_operation_counts where owner=any($1::text[])',[others])).rows.length,1);
+    const script=`import {consumeAccountDeploymentBudget} from './src/ratelimit.ts';import {withTransaction,closePool} from './src/db.ts';
+      try{await consumeAccountDeploymentBudget('${owner()}',withTransaction,{perOwner:20,perDay:2});console.log('unexpected')}catch(e){console.log(e.code)}finally{await closePool()}`;
+    assert.equal(execFileSync(process.execPath,['--no-env-file','--eval',script],{encoding:'utf8',env:process.env}).trim(),'ACCOUNT_DEPLOYMENT_DAILY_LIMIT');
+    await query('delete from daily_operation_counts where owner=$1',[global]);
+    const lost:typeof withTransaction=async fn=>{await withTransaction(fn);throw new Error('SECRET_QUOTA_COMMIT');};
+    await assert.rejects(consumeAccountDeploymentBudget(owner() as Address,lost,{perOwner:20,perDay:1}),{code:'ACCOUNT_DEPLOYMENT_BUDGET_UNAVAILABLE'});
+    await assert.rejects(consumeAccountDeploymentBudget(owner() as Address,withTransaction,{perOwner:20,perDay:1}),{code:'ACCOUNT_DEPLOYMENT_DAILY_LIMIT'});
+    await assert.rejects(consumeAccountDeploymentBudget(owner() as Address,async()=>{throw new Error('SECRET_DB');}),error=>error instanceof Error&&!error.message.includes('SECRET')&&'code'in error&&error.code==='ACCOUNT_DEPLOYMENT_BUDGET_UNAVAILABLE');
+  }finally{await query('delete from daily_operation_counts where owner=$1',[global]);}
 });

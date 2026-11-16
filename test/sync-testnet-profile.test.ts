@@ -46,3 +46,19 @@ test('#85 identical manifest produces identical full profile; all markets and ro
   assert.throws(() => profileFromManifest({ ...manifest, mode: 'public' }));
   assert.equal(profileFromManifest({ ...manifest, mode: 'public' }, 'public').mode, 'public');
 });
+
+
+test('#124 optional performanceFeeLedger metadata survives parsing without core integration', () => {
+  const input = { ...manifest, performanceFeeLedger: {
+    address: manifest.contracts.registry, registry: manifest.contracts.registry, oracle: manifest.contracts.router,
+    yieldRegistry: manifest.contracts.yieldRegistry, numeraire: manifest.contracts.usdt, platformRecipient: manifest.roles.owner,
+    initialPlatformShareBps: 1000, maxPlatformShareBps: 2000, platformNoticeSeconds: 604800, chainId: manifest.chainId,
+    registryVersionDelaySeconds: manifest.versioning.publicationDelaySeconds,
+    registryPublicationIntervalSeconds: manifest.versioning.publicationIntervalSeconds,
+    maxStrategyAssets: 128, minCreatorFeeBps: 500, maxCreatorFeeBps: 2000,
+  } };
+  const profile = profileFromManifest(input);
+  assert.deepEqual(Reflect.get(profile, 'performanceFeeLedger'), input.performanceFeeLedger);
+  assert.equal(Reflect.get(profileFromManifest(manifest), 'performanceFeeLedger'), undefined);
+  assert.deepEqual(profile.contracts, profileFromManifest(manifest).contracts);
+});

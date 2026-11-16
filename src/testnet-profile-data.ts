@@ -3,9 +3,20 @@ export const TESTNET_97 = {
   "chainId": 97,
   "mode": "fork",
   "note": "fork = verified on a local anvil fork of chain 97; the public deployment lands on the same CREATE2 addresses",
-  "verifiedAtBlock": 142961469,
-  "generatedAt": "2026-11-15T23:50:30Z",
-  "gitCommit": "ccf994a813f707dc5ccca570b960b2f1dedcef73",
+  "verifiedAtBlock": 142542018,
+  "generatedAt": "2026-11-16T12:12:07Z",
+  "gitCommit": "e699bd83d3892e3261b925d751ee2cd2606de564",
+  "versioning": {
+    "enrollAbi": "enroll(address,uint256,uint16)",
+    "publicationDelaySeconds": 86400,
+    "publicationIntervalSeconds": 604800,
+    "consent": "account sudo enroll, or account approveEnrollment(uint256,uint16) then operator first enroll",
+    "settingsAbi": "publishSettingsVersion(uint256,address[],uint16[],bytes32,bytes32,uint16,uint64)",
+    "performanceFeeBpsRange": [
+      500,
+      2000
+    ]
+  },
   "roles": {
     "deployer": "0x55662b4183fca1230694d5d57f56e4f2e0e3008a",
     "owner": "0x09bbb9a06a0c49ad24bddb18808944041783054e",
@@ -18,10 +29,10 @@ export const TESTNET_97 = {
   },
   "contracts": {
     "ownedDeployer": "0xc92079ccb13ebd608d5cd03f5e302dcde5b37096",
-    "registry": "0x7d39178401923140df8b5a559a02682326f17350",
+    "registry": "0x8b970a9c5df5b54ec9db677fd78b6cec77c1631f",
     "router": "0x8e9371550fc397144d198a7c159c2da5d143239e",
-    "executor": "0xe3725cbdc1b4be58ed9b49e6f863cdde654bbfce",
-    "yieldRegistry": "0x80d3a6ad26dbe4b33bc6fe4abd38b1e1d78cbd14",
+    "executor": "0x35477567b09f760c82981612379011edea540451",
+    "yieldRegistry": "0x37bd15e1df1178b07ca5eb223f63d5b51dcecd5d",
     "yieldView": "0xc8eeba84f9c74b2d879dfaedb02a0a523aa02657",
     "usdt": "0x7ad6e310b0f6744b66d97cb7cb525bd974501cb5",
     "feed.USDT/USD": "0x1f720990c22c7496eda9156ead91ca334ef097db",
@@ -1194,5 +1205,5 @@ export const TESTNET_97 = {
     }
   ],
   "yieldMarketCountNote": "C3 table heading says 32, but has 30 rows (21 Venus, 4 Lista, 5 Aave); no unspecified markets added",
-  "sourceCommit": "ccf994a813f707dc5ccca570b960b2f1dedcef73"
+  "sourceCommit": "e699bd83d3892e3261b925d751ee2cd2606de564"
 } as const;

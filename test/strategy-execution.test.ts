@@ -182,6 +182,21 @@ test('#82 retrying an unconfirmed stored version never submits a new publish tra
   assert.equal(sends, 0);
 });
 
+test('#124 publication gas estimation failure or zero never broadcasts a transaction', async () => {
+  for (const scenario of ['rpc', 'zero']) {
+    const rpc = strategyRpc(allocation, hash, activeAt); rpc.state.version = 0;
+    if (scenario === 'rpc') rpc.state.fail = 'eth_estimateGas'; else rpc.state.gasEstimate = 0n;
+    let sends = 0;
+    const wallet = createWalletClient({ account: toAccount(TEST_OWNER), transport: custom({ request: async () => { sends++; throw new Error('unexpected broadcast'); } }) });
+    const chain = { chainId: 97, rpcUrl: 'http://127.0.0.1:8561', registryAddress: TESTNET_97.contracts.registry,
+      account: toAccount(TEST_OWNER), wallet, publicClient: rpc.client, kernel: kernelAddressesForChain(97) };
+    await assert.rejects(publishVersionOnchain(82, { assets: allocation.assets.map(a => a.address as Hex), weightsBps: allocation.assets.map(a => a.weightBps),
+      schedule: { kind: 'funding' }, activeAt, configHash: hash, expectedVersion: 1 },
+    { chain, lock: async (_chainId, run) => run(() => {}) }), denied('VERSION_PUBLISH_UNAVAILABLE'));
+    assert.equal(sends, 0);
+  }
+});
+
 test('#82 services sanitize DB failures and reject unsupported sources before receipt reads',async()=>{
   const service=createPortfolioStrategyService({owned:async()=>{throw new Error('SECRET_DB_URL');}});
   await assert.rejects(service.read(82,TEST_OWNER),denied('EXECUTION_STORAGE_UNAVAILABLE'));

@@ -135,6 +135,9 @@ function stubClient(chain: StubChain): PublicClient {
     async readContract(args: { address: Address; functionName: string; args?: readonly unknown[]; blockNumber?: bigint }) {
       const block = args.blockNumber ?? chain.head;
       chain.contractBlocks.push(block);
+      if (args.functionName === 'numeraire') return USDT;
+      if (args.functionName === 'activeVersion') return PINNED_VERSION;
+      if (args.functionName === 'historicalAssets') return ENROLLMENTS_ABI_SHAPE.assets;
       if (args.functionName === 'enrollments') return [BigInt(ONCHAIN_STRATEGY_ID), PINNED_VERSION, false];
       if (args.functionName === 'version') {
         return {

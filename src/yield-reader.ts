@@ -11,7 +11,8 @@ const READ = parseAbi([
   'function marketCount() view returns(uint256)', 'function marketIds(uint256) view returns(bytes32)',
   'function registry() view returns(address)', 'function yieldRegistry() view returns(address)',
   'function enrollments(address) view returns(uint256 strategyId,uint16 version,bool paused)',
-  'function version(uint256,uint16) view returns((address[] assets,uint16[] weightsBps,bytes32 scheduleHash,uint64 activeAt))',
+  'function historicalAssets(uint256) view returns(address[])',
+  'function version(uint256,uint16) view returns((address[] assets,uint16[] weightsBps,bytes32 scheduleHash,uint64 activeAt,bytes32 settingsHash,uint16 performanceFeeBps,bytes32 configHash))',
   'function oracle() view returns(address)', 'function numeraire() view returns(address)', 'function previewSwap(address,address,uint256) view returns(uint256,uint256)',
   'function market(bytes32) view returns ((uint256 chainId,uint8 kind,address asset,address receipt,address target,address riskSource,bytes32 configuration,uint256 minRate,uint256 maxRate,bool supplyEnabled,bool retired))',
   'function refreshHealth(bytes32) returns ((uint256 supply,uint256 liquidity,uint256 utilizationBps,bytes32 configuration))',
@@ -161,8 +162,10 @@ export async function readYieldAccount(client: PublicClient, profile: YieldProfi
       try{
         const enrolled=(await deps.batch(client,observation.block,[{target:strategyRegistry,name:'enrollments',args:[account]}]))[0];
         if(!Array.isArray(enrolled)||enrolled.length!==3)throw unavailable();
-        const version=(await deps.batch(client,observation.block,[{target:strategyRegistry,name:'version',args:[integer(enrolled[0]),num(enrolled[1])]}]))[0];
-        const assets=object(version).assets;if(!Array.isArray(assets))throw unavailable();
+        // Executor values the effective history, independently of the enrollment's
+        // immutable yield-policy version. Pin both reads to the NAV block.
+        const assets=(await deps.batch(client,observation.block,[{target:strategyRegistry,name:'historicalAssets',args:[integer(enrolled[0])]}]))[0];
+        if(!Array.isArray(assets)||assets.length>128)throw unavailable();
         const tokens=[...new Set([numeraire,...assets.map(address)])].filter(a=>!profile.markets.some(m=>m.receipt===a));
         const balances=await deps.batch(client,observation.block,tokens.map((token):ReadCall=>({target:token,name:'balanceOf',args:[account]})));
         let direct=0n;

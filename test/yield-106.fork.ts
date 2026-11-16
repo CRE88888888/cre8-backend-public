@@ -1,5 +1,6 @@
+import { ownerEnroll } from './fixtures/p11-kernel.js';
 /** Explicit acceptance: bun --no-env-file test ./test/yield-106.fork.ts --timeout=1200000.
- * Requires the reviewed manifest deployed on chain 97 anvil 8599, alto 3099, DB cre8_be116.
+ * Requires the reviewed manifest deployed on the explicit isolated chain 97 anvil/alto/DB selected by localAcceptanceEnv.
  * No automatic discovery, external signing service, key files or public-chain writes.
  */
 import assert from 'node:assert/strict';
@@ -14,6 +15,7 @@ import { mnemonicToAccount } from 'viem/accounts';
 import { bscTestnet } from 'viem/chains';
 import { closePool, migrate, query, withPortfolioLock, withTransaction } from '../src/db.js';
 import { REGISTRY_ABI } from '../src/chain.js';
+import { REGISTRY_VERSION_ABI } from '../src/registry-abi.js';
 import { AppError } from '../src/errors.js';
 import { computeSalt, getKernelAccountParams } from '../src/kernel.js';
 import { buildSessionPermissions, deriveSessionKeyFor, sudoValidator } from '../src/permissions.js';
@@ -38,8 +40,8 @@ import type { JobContext } from '../src/strategy-jobs.js';
 import type { AssetExecution } from '../src/strategy-execution.js';
 
 const lane = localAcceptanceEnv(process.env, true);
-const rpcUrl = 'http://127.0.0.1:8599', bundlerUrl = 'http://127.0.0.1:3099';
-assert.ok(lane.rpcUrl === rpcUrl && lane.bundler?.url === bundlerUrl && lane.backendPort === 8699 && lane.databaseName === 'cre8_be116', 'select only the BE116 local lane');
+assert.ok(lane.bundler);
+const rpcUrl = lane.rpcUrl, bundlerUrl = lane.bundler.url;
 assert.equal(process.env.ENABLE_YIELD_EXECUTION, '1');
 const client = createPublicClient({ chain: bscTestnet, transport: http(rpcUrl, { retryCount: 0, timeout: 120000 }), pollingInterval: 100, cacheTime: 0 });
 const local = createTestClient({ chain: bscTestnet, mode: 'anvil', transport: http(rpcUrl, { retryCount: 0, timeout: 120000 }) });
@@ -107,7 +109,7 @@ test('#110 cross-block durable scheduler + real sponsored Kernel lifecycle for V
   const info: unknown = await (await fetch(rpcUrl, { method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'anvil_nodeInfo', params: [] }) })).json();
   check(info && typeof info === 'object' && 'result' in info && info.result && await client.getChainId() === 97, 'local anvil chain 97 proof');
-  check((await checkTestnetProfile(client)).every(c => c.level === 'ok'), 'all manifest runtime hashes and selectors match before local signer substitution');
+  check((await checkTestnetProfile(client)).every(c => c.level === 'ok'), 'configured local runtime hashes and selectors match; original deployment pins are verified separately by sync');
   check((await client.readContract({ address: C.yieldRegistry, abi: YIELD_REGISTRY_ABI, functionName: 'reader' })).toLowerCase() === C.yieldView, 'registry links the pinned YieldView');
   check(await client.readContract({ address: C.executor, abi: YIELD_EXECUTOR_ABI, functionName: 'YIELD_QUOTE_TOLERANCE_BPS' }) === 10n, 'executor has the reviewed 10 bps cross-block tolerance');
   await migrate();
@@ -115,7 +117,7 @@ test('#110 cross-block durable scheduler + real sponsored Kernel lifecycle for V
   const profile = yieldProfile(); assert.ok(profile);
   const originalCode = await client.getCode({ address: C.paymaster }); assert.ok(originalCode);
   const originalSigner = T.roles.paymasterSigner.slice(2).padStart(64, '0');
-  check(originalCode.toLowerCase().includes(originalSigner), 'reviewed paymaster embeds the expected signer');
+  check(originalCode.toLowerCase().includes(originalSigner), 'local fixture paymaster embeds the selected signer');
   // Replace ONLY the immutable signer in this local fork, retaining real verification and payment.
   // The deployed testnet signer has no public key material; no real key file is opened.
   await local.setCode({ address: C.paymaster, bytecode: originalCode.toLowerCase().replaceAll(originalSigner, sponsor.address.slice(2).toLowerCase().padStart(64, '0')) as Hex });
@@ -137,8 +139,17 @@ test('#110 cross-block durable scheduler + real sponsored Kernel lifecycle for V
     console.log('YIELD_110_CROSS_BLOCK ' + JSON.stringify({ kind: p.kind, market: p.marketId, quote: quoted.toString(), minimum: p.minimum.toString(), quoteBlock: p.quoteBlock.toString(), executionBlock: receipt.blockNumber.toString(), elapsedSeconds: (after.timestamp - before.timestamp).toString() }));
   }
   try {
-    // The launcher deploys on an older fork block. Catch up once: TWAP warms without
-    // future-dated SQL evidence or any replacement of PostgreSQL's clock.
+    // Publish every fixture before advancing the old local fork to wall time. This preserves
+    // the real 24-hour notice and receipt-time DB checks without a future-dated clock.
+    const fixtureIds = new Map<string, bigint>();
+    for (const scenario of ['Prefund', 'Venus', 'Lista', 'Aave'] as const) {
+      const strategyId = 1n + await client.readContract({ address: C.registry, abi: extra, functionName: 'nextStrategyId' });
+      await landed(await ownerWallet.writeContract({ address: C.registry, abi: REGISTRY_ABI, functionName: 'registerStrategy', args: [`BE124 ${scenario}`, 'local Kernel yield acceptance', false] }));
+      await landed(await ownerWallet.writeContract({ address: C.registry, abi: REGISTRY_ABI, functionName: 'publishVersion', args: [strategyId, scenario === 'Prefund' ? [C.usdt, T.assets.WBNB.token] : [C.usdt], scenario === 'Prefund' ? [0, 10000] : [10000], `0x${'00'.repeat(32)}`, 0n] }));
+      const version = await client.readContract({ address: C.registry, abi: REGISTRY_VERSION_ABI, functionName: 'version', args: [strategyId, 1] });
+      check(version.activeAt <= BigInt(Math.floor(Date.now() / 1000)), `${scenario} deployment fork is older than the full 24-hour notice`);
+      fixtureIds.set(scenario, strategyId);
+    }
     await refreshClock();
     await refreshGasPriceFeeds();
     await pokeGasPricePool();
@@ -148,9 +159,7 @@ test('#110 cross-block durable scheduler + real sponsored Kernel lifecycle for V
     for (const scenario of ['Prefund', 'Venus', 'Lista', 'Aave'] as const) {
       const prefund=scenario==='Prefund',protocol=prefund?'Venus':scenario;
       const market = T.yieldMarkets.find(m => m.protocol === protocol && m.symbol === 'USDT'); assert.ok(market);
-      const strategyId = 1n + await client.readContract({ address: C.registry, abi: extra, functionName: 'nextStrategyId' });
-      await landed(await ownerWallet.writeContract({ address: C.registry, abi: REGISTRY_ABI, functionName: 'registerStrategy', args: [`BE110 ${protocol}`, 'local Kernel yield acceptance', false] }));
-      await landed(await ownerWallet.writeContract({ address: C.registry, abi: REGISTRY_ABI, functionName: 'publishVersion', args: [strategyId, prefund?[C.usdt,T.assets.WBNB.token]:[C.usdt], prefund?[0,10000]:[10000], `0x${'00'.repeat(32)}`, 0n] }));
+      const strategyId = fixtureIds.get(scenario); assert.ok(strategyId);
       const initial = deriveSessionKeyFor(owner.address, strategyId, material);
       const validUntil = Number((await client.getBlock()).timestamp) + 86400;
       const baseline = await buildSessionPermissions({ publicClient: client, sessionKeyAddress: initial.address, executorAddress: C.executor, validUntil });
@@ -158,7 +167,6 @@ test('#110 cross-block durable scheduler + real sponsored Kernel lifecycle for V
         plugins: { sudo: await sudoValidator(client, owner.address), regular: baseline.permissionValidator }, initConfig: baseline.initConfig,
       });
       await landed(await operator.sendTransaction({ to: params.factory, data: params.factoryData, gas: 4_000_000n }));
-      await landed(await operator.writeContract({ address: C.registry, abi: REGISTRY_ABI, functionName: 'enroll', args: [params.address, strategyId] }));
       const allocatedAmount=prefund?1000n*WAD:0n;
       const amount = (prefund?1300n:100n) * WAD,fundingAmount=prefund?400n*WAD:amount;
       const funding=await landed(await operator.writeContract({ address: C.usdt, abi: parseAbi(['function claimFor(address,uint256)']), functionName: 'claimFor', args: [params.address, fundingAmount] }));
@@ -179,6 +187,7 @@ test('#110 cross-block durable scheduler + real sponsored Kernel lifecycle for V
       const pid = (await query<{ id: string }>("insert into portfolios(user_id,strategy_id,version,schedule_state) values($1,$2,1,'active') returning id::text", [owner.address.toLowerCase(), sid])).rows[0]?.id; assert.ok(pid);
       const id = Number(pid), account = params.address.toLowerCase() as Address;
       await query("insert into smart_accounts(portfolio_id,chain_id,address,owner,account_type) values($1,97,$2,$3,'KERNEL')", [id, account, owner.address.toLowerCase()]);
+      await ownerEnroll(client, owner, params.address, strategyId, rpcUrl, bundlerUrl);
       const sudo = await signerToEcdsaValidator(client, { signer: owner, entryPoint, kernelVersion: KERNEL_V3_3, validatorAddress: C.ecdsaValidatorV31 });
       const kernel = await createKernelAccount(client, { address: params.address, plugins: { sudo }, entryPoint, kernelVersion: KERNEL_V3_3 });
       const paymaster = schedulerPaymaster(account); assert.ok(paymaster);

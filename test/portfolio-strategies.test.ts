@@ -325,7 +325,7 @@ test('#82 DB typed publish admits the relayer before storing a version and safel
   const basket={assets:[{address:TESTNET_97.contracts.usdt,weightBps:10000}]};
   const input={execution:assetConfig('hold',basket,97),allocation:basket};
   let busy = true; let sends = 0;
-  const deps = { isChainConfigured: () => true, validateChain: () => {},
+  const deps = { isChainConfigured: () => true, validateChain: () => {}, validatePublication: async () => {}, isCancelled: async () => false,
     relayerLock: async <T,>(_chainId: number, run: (assertHeld: () => void) => Promise<T>) => { if (busy) throw new AppError(503, 'RELAYER_BUSY', 'busy'); return run(() => {}); },
     publishOnchain: async (_id: number, version: Parameters<typeof import('../src/chain.js').publishVersionOnchain>[1]) => {
       assert.ok(version.configHash); assert.equal(version.expectedVersion, 1);
@@ -340,6 +340,52 @@ test('#82 DB typed publish admits the relayer before storing a version and safel
   assert.equal(published.version, 1);
   assert.equal((await publishVersion(strategy.id, input, owner, deps)).configHash, published.configHash);
   assert.equal(sends, 1);
+}));
+
+test('#124 deterministic publication rejection/timeout leaves no immutable DB version', async () => onTestnet(async () => {
+  const owner = address(); const strategy = await createStrategy({ name: 'be124-rejected-publication' }, owner);
+  await query('update strategies set onchain_id=$2 where id=$1', [strategy.id, strategy.id + 90_000_000]);
+  const basket = { assets: [{ address: TESTNET_97.contracts.usdt, weightBps: 10000 }] };
+  for (const code of ['VERSION_CONTRACT_REJECTED', 'VERSION_PUBLICATION_UNAVAILABLE']) {
+    let sends = 0;
+    await assert.rejects(publishVersion(strategy.id, { allocation: basket, execution: assetConfig('hold', basket, 97) }, owner, {
+      isChainConfigured: () => true, validateChain: () => {},
+      validatePublication: async () => { throw new AppError(code === 'VERSION_CONTRACT_REJECTED' ? 409 : 503, code, 'safe rejection'); },
+      relayerLock: async (_chainId, run) => run(() => {}), publishOnchain: async () => { sends++; return 1; },
+    }), denied(code));
+    assert.equal(sends, 0);
+    assert.equal((await getStrategy(strategy.id)).versions.length, 0);
+  }
+}));
+
+test('#124 zero/fractional activation times cannot publish an unresolved contract-default timestamp', async () => onTestnet(async () => {
+  const basket = { assets: [{ address: TESTNET_97.contracts.usdt, weightBps: 10000 }] };
+  for (const activeAt of [new Date(0), new Date(-1000), new Date(Math.floor(Date.now() / 1000) * 1000 + 1)]) {
+    await assert.rejects(publishVersion(1, { allocation: basket, execution: assetConfig('hold', basket, 97), activeAt }, address()), denied('INVALID_ACTIVE_AT'));
+  }
+}));
+
+test('#124 cancelled publication is append-only and can be published again after contract admission', async () => onTestnet(async () => {
+  const owner = address(); const strategy = await createStrategy({ name: 'be124-cancelled-republish' }, owner);
+  await query('update strategies set onchain_id=$2 where id=$1', [strategy.id, strategy.id + 90_000_000]);
+  const basket = { assets: [{ address: TESTNET_97.contracts.usdt, weightBps: 10000 }] };
+  let cancelled = false;
+  const deps = { isChainConfigured: () => true, validateChain: () => {}, validatePublication: async () => {}, isCancelled: async () => cancelled,
+    relayerLock: async <T,>(_chainId: number, run: (held: () => void) => Promise<T>) => run(() => {}),
+    publishOnchain: async (_id: number, version: Parameters<typeof import('../src/chain.js').publishVersionOnchain>[1]) => {
+      assert.ok(version.expectedVersion); return version.expectedVersion;
+    } };
+  const input = { allocation: basket, execution: assetConfig('hold', basket, 97), performanceFeeBps: 2000 };
+  const first = await publishVersion(strategy.id, input, owner, deps);
+  assert.equal(first.versionSettings?.performanceFeeBps, 2000);
+  assert.ok(first.activeAt && Date.parse(first.activeAt) >= Date.now() + 86400000);
+  assert.equal((await publishVersion(strategy.id, input, owner, deps)).version, 1);
+  cancelled = true;
+  assert.equal((await publishVersion(strategy.id, input, owner, deps)).version, 2);
+  const stored = await getStrategy(strategy.id);
+  assert.equal(stored.versions.length, 2);
+  assert.deepEqual(stored.versions[0]?.allocation, basket);
+  assert.deepEqual(stored.versions[0]?.schedule, { kind: 'funding' });
 }));
 
 test('#83 DB HTTP retains per-asset lot plan and removes personal instruction endpoints', async () => {

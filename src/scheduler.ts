@@ -125,7 +125,9 @@ import type { PlanPartial, PlannedStep, RebalancePlan, RefreshFloorsResult } fro
 import { DEFAULT_THRESHOLD_BPS, planPortfolio } from './snapshot.js';
 import type { PortfolioPlan } from './snapshot.js';
 import { MIN_INTERVAL_SECONDS } from './strategies.js';
-import { defaultNewMoneyDeps, prepareNewMoney } from './strategy-runtime.js';
+import { defaultNewMoneyDeps, prepareNewMoney, PinnedVersionChangedError } from './strategy-runtime.js';
+import { readBuyVersionWindow } from './registry-versioning.js';
+import type { BuyVersionWindow } from './registry-versioning.js';
 import type { NewMoneyDeps } from './strategy-runtime.js';
 import { lockCash, readJob, settleStrategyBatch, recordInflightSlots } from './strategy-jobs.js';
 import type { BatchEvidence, JobContext, StrategyJob } from './strategy-jobs.js';
@@ -479,6 +481,8 @@ export type PermissionInstallation = { signer: Address; policyCount: number };
 export type Erc20Args = { token: Address; owner: Address; spender?: Address };
 
 export type ExecuteArgs = {
+  /** Revalidate after signing, immediately before the broadcast RPC. Never changes signed calldata. */
+  beforeSending?: () => Promise<void>;
   feeBudget?: bigint;
   gasPurpose?: 'ordinary' | 'exit';
   strategyId?: bigint;
@@ -538,6 +542,7 @@ export type FloorRefreshInput = {
 };
 
 export type SchedulerDeps = {
+  readBuyVersionWindow?: (strategyId: bigint) => Promise<BuyVersionWindow>;
   yieldRound?: typeof runYieldRound;
   clock?:()=>Date;
   withDexLock?: typeof withDexLock;
@@ -1488,8 +1493,10 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
         maxFeePerGas: prepared.maxFeePerGas });
     }
     await assertDexLock();
-    args.onSending();
     const signed = await signPreparedOperation(prepared, (operation) => account.signUserOperation(operation));
+    await args.beforeSending?.();
+    await assertDexLock();
+    args.onSending();
     const userOpHash = await client.sendUserOperation(signed);
     // alto 有 simulation：被拒的 op **不會**回 userOpHash。所以拿到 hash = 這一筆被接受了。
     await args.onSubmitted({ userOpHash });
@@ -1511,6 +1518,7 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
     });
   } catch (error) {
     if (budgetKey !== null) await settleGasBudget(budgetKey, 'unknown').catch(() => {});
+    if (isBuyVersionError(error)) throw error;
     const decoded = decodePriceSourceError(error);
     if (decoded === null) throw paymaster === undefined ? error : paymasterExecutionError(error);
     let detailed = decoded;
@@ -1631,6 +1639,7 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
 
   return {
     query,
+    readBuyVersionWindow: provided.readBuyVersionWindow ?? (id => readBuyVersionWindow(defaultPublicClient(), registryAddress(), id)),
     clock:provided.clock??(()=>new Date()),
     withDexLock: provided.withDexLock ?? withDexLock,
     dexGate: provided.dexGate ?? createDexGate(query, {
@@ -2094,6 +2103,23 @@ async function releaseUnresolvedOperation(
   return { ...base, outcome: 'noop', reason };
 }
 
+function activationImminent() {
+  return new AppError(409, 'VERSION_ACTIVATION_IMMINENT', '[VERSION_ACTIVATION_IMMINENT] 新版本即將生效；保留原本金與期次，不送買入');
+}
+
+function isBuyVersionError(error: unknown): error is PinnedVersionChangedError | AppError {
+  return error instanceof PinnedVersionChangedError || error instanceof AppError &&
+    (error.code === 'VERSION_ACTIVATION_IMMINENT' || error.code === 'VERSION_STATE_UNAVAILABLE');
+}
+
+function buyDeadline(window: BuyVersionWindow, plannedVersion: number, deadline: bigint, now: Date): bigint {
+  if (window.activeVersion !== plannedVersion) throw new PinnedVersionChangedError();
+  const bound = window.pendingActiveAt === null ? deadline : window.pendingActiveAt - 60n;
+  const result = deadline < bound ? deadline : bound;
+  if (result <= window.timestamp || result <= BigInt(Math.floor(now.getTime()/1000))) throw activationImminent();
+  return result;
+}
+
 async function runOne(
   due: DuePortfolio,
   ctx: { dryRun: boolean; now: Date; thresholdBps: number; deps: ResolvedDeps; forcePlan?: boolean; roundBlockReason: string | null },
@@ -2125,6 +2151,7 @@ async function runOne(
     // 並在下一輪重試；next_run_at 已經推進過了，所以不會變成熱迴圈。
     result = { ...base, outcome: 'blocked', reason: due.executionKind === undefined
       ? `處理時拋錯，這一輪不執行：${oneLine(error)}`
+      : isBuyVersionError(error) ? error.message
       : '[STRATEGY_UNAVAILABLE] 讀鏈／DB／鎖資料不完整，保留原預算與原交易身分，先對帳' };
   }
 
@@ -2256,16 +2283,9 @@ async function decideAndMaybeExecute(
   if(!ctx.dryRun){const queued=await ctx.deps.dexGate(ctx.deps.chainId,due.portfolioId);if(queued!==null)return {...base,outcome:'blocked',reason:queued};}
   const plan = await ctx.deps.planPortfolio(due.portfolioId);
 
-  // 把「鏈上釘住的版本」同步回 DB。
-  //
-  // 為什麼需要：`portfolios.version` 是 enrollment 當下寫的，但 owner 可以在鏈上
-  // 重新 `registry.enroll` 換版本（我們就手動把 portfolio 1 從 v1 換到 v2 過）。
-  // 那時 DB 不會知道，於是 operator 頁顯示 `v1`、鏈上其實是 `v2` —— 實測就發生過。
-  //
-  // 規劃器讀的是**鏈上**版本（`snapshot.ts` 的 `enrollment[1]`），所以行為一直正確，
-  // 錯的只是標籤。這裡把它們對齊，讓「畫面上寫的」與「實際在跑的」一致。
-  //
-  // 失敗不影響這一輪：版本標籤不是交易的前置條件。
+  // Legacy drift portfolios mirror the effective target version for display.
+  // Typed funding lots keep their immutable source/version identities: a changed active
+  // version stops buys until the follow-up execution-plan rollover is available.
   try {
     if (due.executionKind === undefined) {
     await ctx.deps.query('update portfolios set version = $1 where id = $2 and version <> $1', [
@@ -2357,6 +2377,11 @@ async function decideAndMaybeExecute(
   const cash = ctx.deps.chainId === 97 ? TESTNET_97.contracts.usdt : '0x55d398326f99059ff775485246999027b3197955';
   const hasBuy = rebalance.steps.some((step) => !isAddressEqual(step.tokenOut, cash));
   if (gasPurpose === 'exit' && hasBuy) return { ...base, outcome: 'blocked', reason: '[INVALID_EXIT] 退出計畫包含買入，不送交易' };
+  // Bound before refreshing router data and hashing/persisting the exact payload.
+  if (hasBuy) {
+    rebalance = { ...rebalance, deadline: buyDeadline(await ctx.deps.readBuyVersionWindow(BigInt(plan.pinnedVersion.onchainStrategyId)),
+      plan.pinnedVersion.version, rebalance.deadline, ctx.deps.clock()) };
+  }
   if (hasBuy && due.executionKind===undefined) {
     try {
       const minimum = minimumDepositUsdtWei(plan.targets, cash);
@@ -2491,6 +2516,13 @@ async function decideAndMaybeExecute(
   } catch {
     return { ...withPlan, outcome: 'blocked', reason: '[USER_OP_EVIDENCE_UNAVAILABLE] 無法取得有效的原 nonce／deadline，不寫 pending、不送交易' };
   }
+  const beforeSending = hasBuy ? async () => {
+    const bounded = buyDeadline(await ctx.deps.readBuyVersionWindow(BigInt(plan.pinnedVersion.onchainStrategyId)),
+      plan.pinnedVersion.version, rebalance.deadline, ctx.deps.clock());
+    // A newly scheduled earlier activation needs a new quote/hash, never a mutated signed payload.
+    if (bounded !== rebalance.deadline) throw activationImminent();
+  } : undefined;
+  await beforeSending?.();
   let gate: OperationGate;
   try {
     gate = await ctx.deps.withTransaction(async (client) => {
@@ -2518,6 +2550,7 @@ async function decideAndMaybeExecute(
   });
 
   const execution = await executeAndSettle(ctx.deps, {
+    ...(beforeSending === undefined ? {} : { beforeSending }),
     gasPurpose,
     strategyId: BigInt(plan.pinnedVersion.onchainStrategyId),
     portfolioId: due.portfolioId,
@@ -2532,6 +2565,9 @@ async function decideAndMaybeExecute(
     trackAllocatedCash:due.executionKind==='per_asset',
     ...(money?.job ? { strategy: { context: money.context, job: money.job } } : {}),
   });
+  if (execution.errorCode === 'PINNED_VERSION_CHANGED' || execution.errorCode === 'VERSION_ACTIVATION_IMMINENT' || execution.errorCode === 'VERSION_STATE_UNAVAILABLE') {
+    return { ...withPlan, execution, outcome: 'blocked', reason: execution.error ?? '[VERSION_STATE_UNAVAILABLE] 不送買入' };
+  }
   if (execution.errorCode === 'GAS_BUDGET_EXCEEDED') {
     const nextDay = execution.budgetResetAt === undefined ? new Date(ctx.now) : new Date(execution.budgetResetAt);
     if (execution.budgetResetAt === undefined) nextDay.setUTCHours(24, 0, 0, 0);
@@ -2766,6 +2802,7 @@ export function strategyReceiptEvidence(receipt:UserOperationReceipt,steps:reado
 async function executeAndSettle(
   deps: ResolvedDeps,
   args: {
+    beforeSending?: () => Promise<void>;
     strategy?: {context:JobContext;job:StrategyJob};
     trackAllocatedCash?:boolean;
     gasPurpose: 'ordinary' | 'exit';
@@ -2818,7 +2855,9 @@ async function executeAndSettle(
   let received: ExecutionOutcome | null = null;
 
   try {
+    await args.beforeSending?.();
     const outcome = await deps.executeRebalance({
+      ...(args.beforeSending === undefined ? {} : { beforeSending: args.beforeSending }),
       ...(args.strategy?{feeBudget:BigInt(args.strategy.job.remaining_fee_raw)}:{}),
       gasPurpose: args.gasPurpose,
       strategyId: args.strategyId,
@@ -2860,10 +2899,11 @@ async function executeAndSettle(
     return outcome;
   } catch (error) {
     const failure = decodePriceSourceError(error);
-    const message = typed ? '[STRATEGY_EXECUTION_UNAVAILABLE] 無法確認執行結果，保留原身分待對帳' : oneLine(error);
+    const message = isBuyVersionError(error) ? error.message : typed ? '[STRATEGY_EXECUTION_UNAVAILABLE] 無法確認執行結果，保留原身分待對帳' : oneLine(error);
     const unknown = sending || (received !== null && received.status !== 'error');
     const outcome: ExecutionOutcome = { status: unknown ? 'unknown' : 'error',
       ...(error instanceof AppError ? { errorCode: error.code } : {}),
+      ...(error instanceof PinnedVersionChangedError ? { errorCode: 'PINNED_VERSION_CHANGED' } : {}),
       ...(error instanceof GasBudgetExceededError ? { budgetResetAt: error.resetAt } : {}),
       userOpHash: received?.userOpHash ?? submitted.userOpHash ?? null,
       txHash: received?.txHash ?? submitted.txHash ?? null, gasUsed: received?.gasUsed ?? null, error: message,

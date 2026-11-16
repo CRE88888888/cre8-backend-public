@@ -25,7 +25,7 @@ const hash=():Hex=>`0x${randomBytes(32).toString('hex')}`;
 const cash=TESTNET_97.contracts.usdt,a=TESTNET_97.assets.WBNB.token,b=TESTNET_97.assets.ETH.token;
 const R=27n*U/100n,start=new Date('2026-11-15T13:00:00Z');
 const run:WithTransactionFn=fn=>withTransaction(client=>fn({query:(s,p)=>client.query(s,p===undefined?[]:[...p])}));
-async function fixture(kind:'hold'|'stack'='hold',cashWeight=0,slices=4,rebalance:'none'|'monthly'|'drift'='none',otherMode?:AssetMode,weights?:readonly number[],assetCount=2){
+async function fixture(kind:'hold'|'stack'='hold',cashWeight=0,slices=4,rebalance:'none'|'monthly'|'drift'='none',otherMode?:AssetMode,weights?:readonly number[],assetCount=2,version=1){
   await migrate();
   const owner=address(),account=address();
   const sid=(await query<{id:string}>("insert into strategies(provider,name) values($1,'be83-isolated') returning id",[owner])).rows[0]?.id;assert.ok(sid);
@@ -43,20 +43,20 @@ async function fixture(kind:'hold'|'stack'='hold',cashWeight=0,slices=4,rebalanc
   const execution=validateAssetConfig({kind:'per_asset',numeraire:cash,rebalance,assets:allocation.assets.map(x=>({asset:x.address,weightBps:x.weightBps,yield:null,...(x.address===cash?{}:{execution:x.address===b&&otherMode?otherMode:kind==='hold'?{kind:'hold'}:{kind:'stack',every:'daily',weekday:null,timeUtc:'13:00',slices}})}))},allocation,97);
   const configHash=canonicalConfigHash({chainId:97,allocation,execution,schedule:{kind:'funding'},activeAt});
   await query(`insert into strategy_versions(strategy_id,version,allocation,schedule,active_at,execution_schema_version,execution,execution_chain_id,config_hash)
-    values($1,1,$2,'{"kind":"funding"}',$3,2,$4,97,$5)`,[sid,JSON.stringify(allocation),activeAt,JSON.stringify(execution),configHash]);
-  const pid=(await query<{id:string}>("insert into portfolios(user_id,strategy_id,version,schedule_state) values($1,$2,1,'active') returning id",[owner,sid])).rows[0]?.id;assert.ok(pid);
+    values($1,$6,$2,'{"kind":"funding"}',$3,2,$4,97,$5)`,[sid,JSON.stringify(allocation),activeAt,JSON.stringify(execution),configHash,version]);
+  const pid=(await query<{id:string}>("insert into portfolios(user_id,strategy_id,version,schedule_state) values($1,$2,$3,'active') returning id",[owner,sid,version])).rows[0]?.id;assert.ok(pid);
   const id=Number(pid);
   await query("insert into smart_accounts(portfolio_id,chain_id,address,owner,account_type) values($1,97,$2,$3,'KERNEL')",[pid,account,owner]);
   await query('insert into strategy_cash_balances(chain_id,portfolio_id,account) values(97,$1,$2)',[id,account]);
   await query(`insert into session_keys(portfolio_id,key_ref,permissions,status,expires_at)
     values($1,$2,$3,'active','2030-01-01')`,[id,`m/44'/60'/0'/0/${id}`,JSON.stringify({permissionId:'0x12345678',sessionKeyAddress:owner,timestamp:{validUntil:1893456000}})]);
-  const context:JobContext={chainId:97,portfolioId:id,strategyId,version:1,kind:'asset',execution,account,allocation,cash,now:new Date(start),reserve:R,
+  const context:JobContext={chainId:97,portfolioId:id,strategyId,version,kind:'asset',execution,account,allocation,cash,now:new Date(start),reserve:R,
     caps:new Map(allocation.assets.filter(x=>x.address!==cash).map(x=>[x.address,null])),buyLimit:UINT256_MAX,observedCash:1000000n*U,enabled:true,marketOpen:true};
   async function fund(amount:bigint,confirmedAt=new Date(start.getTime()-60000),effectiveOverride?:Record<string,number>){
     const certificate=effectiveOverride?{minimum:50n*U,effectiveSlices:effectiveOverride}:planContribution(amount,execution,confirmedAt,R);assert.ok(certificate,'fixture contribution must meet the actual calendar minimum');
     return withTransaction(async client=>{
       const lot=(await client.query<{id:string}>(`insert into strategy_funding_lots(chain_id,portfolio_id,strategy_id,version,kind,tx_hash,log_index,block_number,block_hash,amount_raw,minimum_contribution_raw,effective_slices,created_at,updated_at)
-        values(97,$1,$2,1,'asset',$3,0,10,$4,$5,$6,$7,$8,$8) returning id`,[id,sid,hash(),hash(),amount.toString(),certificate.minimum.toString(),JSON.stringify(certificate.effectiveSlices),confirmedAt])).rows[0];assert.ok(lot);
+        values(97,$1,$2,$9,'asset',$3,0,10,$4,$5,$6,$7,$8,$8) returning id`,[id,sid,hash(),hash(),amount.toString(),certificate.minimum.toString(),JSON.stringify(certificate.effectiveSlices),confirmedAt,version])).rows[0];assert.ok(lot);
       const amounts=(await client.query<{asset:string;budget_raw:string}>('select asset,budget_raw::text from strategy_lot_assets where lot_id=$1',[lot.id])).rows;
       let hold=0n,stack=0n,cashTotal=0n;
       for(const row of amounts)if(row.asset===cash)cashTotal+=BigInt(row.budget_raw);else if(execution.assets.find(asset=>asset.asset===row.asset)?.execution?.kind==='hold')hold+=BigInt(row.budget_raw);else stack+=BigInt(row.budget_raw);
@@ -217,11 +217,11 @@ function plan(f:Fixture):PortfolioPlan{return {portfolioId:f.id,strategyId:f.str
   snapshot:{portfolioId:f.id,block:20n,nativeBalanceWei:U,holdings:[{asset:cash,amountWei:10000n*U,decimals:18,usdPriceE8:100000000n,priceSource:TWAP_PRICE_SOURCE}],unpriced:[]},
   scan:{portfolioId:f.id,block:20n,cursor:{portfolioId:f.id,startBlock:1n,lastScannedBlock:20n},scannedRange:null,candidateCount:0,unknownHoldings:[],zeroBalanceCount:0,unreadableCandidates:[],deployment:{block:1n,reason:'resolved',detail:'test'},universeComplete:true,incompleteReasons:[]},
   report:{totalUsdE8:1000000000000n,assets:[],maxAbsDeltaBps:0,grossDriftBps:0,needsRebalance:false,thresholdBps:100},blocked:[],targets:f.allocation.assets.map(a=>({asset:a.address,weightBps:a.weightBps,symbol:'test'})),
-  pinnedVersion:{version:1,onchainStrategyId:f.strategyId+99000000,paused:false},allocationCheck:{consistent:true,chain:[],mismatches:[]},thresholdBps:100};}
+  pinnedVersion:{version:f.context.version,onchainStrategyId:f.strategyId+99000000,paused:false},allocationCheck:{consistent:true,chain:[],mismatches:[]},thresholdBps:100};}
 function scheduler(f:Fixture,extra:SchedulerDeps={}){
   const sends:ExecuteArgs[]=[],userHash=hash(),txHash=hash();
-  let status:ExecutionOutcome['status']='success';
-  const deps:SchedulerDeps={query,withTransaction:singlePortfolioClaim(f.id),chainId:97,executor:TESTNET_97.contracts.executor,
+  let status:ExecutionOutcome['status']='success',currentTime=start;
+  const deps:SchedulerDeps={clock:()=>currentTime,readBuyVersionWindow:async()=>({activeVersion:f.context.version,timestamp:BigInt(Math.floor(currentTime.getTime()/1000)),pendingActiveAt:null}),query,withTransaction:singlePortfolioClaim(f.id),chainId:97,executor:TESTNET_97.contracts.executor,
     readGlobalPaused:async()=>false,withPortfolioLock,dexGate:async()=>null,log:()=>{},writeSnapshot:async()=>({headerInserted:true,inserted:0,updated:0}),
     planPortfolio:async()=>plan(f),planRebalance:async()=>{throw new Error('hold/stack must never enter drift planner');},
     readPermissionConfig:async()=>({signer:f.owner,policyCount:3}),deriveSessionKeyAddress:async()=>f.owner,readAllowance:async()=>UINT256_MAX,readBalance:async()=>UINT256_MAX,
@@ -229,10 +229,10 @@ function scheduler(f:Fixture,extra:SchedulerDeps={}){
     newMoney:{withdrawals:async()=>[],rebalanceReserve:async()=>R,version:(sid,v,onchainId,account,options)=>requireTypedVersion(sid,v,onchainId,account,{...options,verifyChain:false}),
       policy:async()=>({reserve:R,caps:new Map(f.context.caps),buyLimit:UINT256_MAX,cash:10000n*U}),verifyLots:async()=>{},marketOpen:()=>true,
       quote:async(_due,_plan,inputs,deadline)=>({kind:'ready',steps:Object.entries(inputs).map(([token,raw])=>({tokenIn:cash,tokenOut:token as Address,amountIn:BigInt(raw),amountOutMin:90n,oracleFloor:80n,venue:TESTNET_97.contracts.universalRouter,data:'0x'})),deadline,rationale:'test exact new money'})},
-    executeRebalance:async args=>{sends.push(args);args.onSending();await args.onSubmitted({userOpHash:userHash});return {status,userOpHash:userHash,txHash:status==='unknown'?null:txHash,gasUsed:'100',error:status==='success'?null:'receipt timeout'};},
+    executeRebalance:async args=>{await args.beforeSending?.();sends.push(args);args.onSending();await args.onSubmitted({userOpHash:userHash});return {status,userOpHash:userHash,txHash:status==='unknown'?null:txHash,gasUsed:'100',error:status==='success'?null:'receipt timeout'};},
     reconcileRebalance:async input=>({kind:'found',outcome:{status:'success',userOpHash:userHash,txHash,gasUsed:'100',error:null,
       batchEvidence:{received:Object.fromEntries(Object.keys(input.expectedInputs??{}).map(a=>[a,'100'])),fees:{},feePaid:0n,blockNumber:21n,blockHash:hash()}}}),...extra};
-  async function once(now=start,dryRun=false){await query('update portfolios set next_run_at=null where id=$1',[f.id]);return runSchedulerOnce({dryRun,now,skipAlerts:true},deps);}
+  async function once(now=start,dryRun=false){currentTime=now;await query('update portfolios set next_run_at=null where id=$1',[f.id]);return runSchedulerOnce({dryRun,now,skipAlerts:true},deps);}
   return {deps,sends,once,setStatus:(s:ExecutionOutcome['status'])=>{status=s;}};
 }
 test('#83 scheduler dispatch precedes drift; first plus two additions buy only their lots; dry-run writes nothing',async()=>{
@@ -676,6 +676,7 @@ test('#92 93-asset DB job survives timeout/restart and buys each original input 
   const s=scheduler(f);
   s.deps.planPortfolio=async()=>{
     const current=plan(f);
+    current.historicalAssetCount=f.allocation.assets.filter(asset=>asset.address!==cash).length;
     for(const asset of held)current.snapshot.holdings.push({asset,amountWei:U,decimals:18,usdPriceE8:100000000n,priceSource:TWAP_PRICE_SOURCE});
     return current;
   };
@@ -897,3 +898,134 @@ test('#96 insufficient notifications reread conflicts without resetting delivery
     else {await attempt();const saved=await notifications(f);assert.equal(saved.length,2);assert.ok(saved.every(e=>e.state==='delivered'));await f.reserve({...f.context,observedCash:0n});assert.deepEqual(await notifications(f),saved);}
   }
 });
+
+
+test('#124 removed historical holdings govern complete child groups without truncating the frozen vector',async()=>{
+  const marketAt=new Date('2026-11-16T15:00:00Z');
+  const f=await fixture('hold',0,4,'none',undefined,undefined,16);
+  await f.fund(1000n*U);
+  const active=new Set(f.allocation.assets.map(asset=>asset.address));
+  const removed=Object.values(TESTNET_97.assets).map(asset=>asset.token).filter(asset=>!active.has(asset));
+  const bought=new Set<Address>();
+  const s=scheduler(f);
+  s.deps.planPortfolio=async()=>{
+    const current=plan(f);
+    current.historicalAssetCount=active.size-1+removed.length;
+    current.targets.push(...removed.map(asset=>({asset,weightBps:0,symbol:'removed'})));
+    for(const asset of [...removed,...bought])current.snapshot.holdings.push({asset,amountWei:U,decimals:18,usdPriceE8:100000000n,priceSource:TWAP_PRICE_SOURCE});
+    return current;
+  };
+  assert.equal((await s.once(marketAt)).results[0]?.outcome,'executed');
+  assert.equal(s.sends[0]?.steps.length,8,'the complete safe child is half of this 16-asset basket, never a later 13-step truncation');
+  const original=await job(f);assert.ok(original);
+  for(const step of s.sends[0]?.steps??[])bought.add(step.tokenOut);
+  assert.equal((await s.once(new Date(marketAt.getTime()+60000))).results[0]?.outcome,'executed');
+  assert.equal(await job(f),null);
+  assert.equal(s.sends.length,2);assert.ok(s.sends.every(send=>send.steps.length===8));
+  const spent:Record<string,bigint>={};
+  for(const send of s.sends)for(const step of send.steps){
+    assert.ok(active.has(step.tokenOut),'removed holdings cannot be bought');
+    spent[step.tokenOut.toLowerCase()]=(spent[step.tokenOut.toLowerCase()]??0n)+step.amountIn;
+  }
+  assert.deepEqual(Object.fromEntries(Object.entries(spent).map(([asset,amount])=>[asset,amount.toString()])),original.original_input);
+});
+
+
+async function versionTransitionEvidence(f: Fixture) {
+  const rows = async (sql: string) => (await query(sql, [f.id])).rows;
+  return {
+    cash: await balances(f),
+    lots: await rows('select * from strategy_funding_lots where portfolio_id=$1 order by id'),
+    assets: await rows('select a.* from strategy_lot_assets a join strategy_funding_lots l on l.id=a.lot_id where l.portfolio_id=$1 order by a.lot_id,a.asset'),
+    slices: await rows('select s.* from strategy_asset_slices s join strategy_funding_lots l on l.id=s.lot_id where l.portfolio_id=$1 order by s.lot_id,s.asset,s.slice_index'),
+    jobs: await rows('select * from strategy_jobs where portfolio_id=$1 order by id'),
+    operations: await rows('select * from operations where portfolio_id=$1 order by id'),
+    portfolio: await rows('select version,schedule_state,last_rebalance_at from portfolios where id=$1'),
+  };
+}
+
+for (const state of ['unstarted', 'reserved', 'partial', 'completed'] as const) {
+  test(`#124 active version change fail-closes ${state} work and preserves all source cash for later rollover`, async () => {
+    const f = await fixture(state === 'completed' ? 'hold' : 'stack');
+    await f.fund(500n * U);
+    if (state !== 'unstarted') {
+      const reserved = (await f.reserve())?.job; assert.ok(reserved);
+      if (state !== 'reserved') await complete(f, reserved);
+    }
+    const before = await versionTransitionEvidence(f), logs: string[] = [];
+    const s = scheduler(f, { planPortfolio: async () => { const p = plan(f); p.pinnedVersion.version = 2; return p; }, log: line => logs.push(line) });
+    assert.ok(s.deps.newMoney);
+    s.deps.newMoney.policy = async () => { throw new Error('no capacity read before rollover'); };
+    s.deps.newMoney.quote = async () => { throw new Error('no quote before rollover'); };
+    for (const dryRun of [true, false, false]) {
+      const result = (await s.once(start, dryRun)).results[0];
+      assert.equal(result?.outcome, 'blocked');
+      assert.match(result.reason, /\[PINNED_VERSION_CHANGED\]/);
+      assert.deepEqual(await versionTransitionEvidence(f), before, 'retry must not alter lots, slices, jobs, operations or cash');
+    }
+    assert.equal(s.sends.length, 0);
+    assert.ok(logs.some(line => line.includes('[PINNED_VERSION_CHANGED]')));
+  });
+}
+
+test('#124 an old in-flight receipt settles once before the changed-version buy guard', async () => {
+  const f = await fixture('stack'); await f.fund(500n * U);
+  const s = scheduler(f); s.setStatus('unknown');
+  assert.equal((await s.once()).results[0]?.outcome, 'blocked'); assert.equal(s.sends.length, 1);
+  const original = (await query<{user_op_hash:string;payload_hash:string}>('select user_op_hash,payload_hash from operations where portfolio_id=$1', [f.id])).rows[0]; assert.ok(original);
+  s.deps.planPortfolio = async () => { const p = plan(f); p.pinnedVersion.version = 2; return p; };
+  assert.equal((await s.once(new Date(start.getTime() + 60000))).results[0]?.outcome, 'executed');
+  const after = await versionTransitionEvidence(f);
+  const result = (await s.once(new Date(start.getTime() + 120000))).results[0];
+  assert.equal(result?.outcome, 'blocked'); assert.match(result.reason, /\[PINNED_VERSION_CHANGED\]/);
+  assert.deepEqual(await versionTransitionEvidence(f), after); assert.equal(s.sends.length, 1);
+  const settled = (await query<{state:string;user_op_hash:string;payload_hash:string}>('select state,user_op_hash,payload_hash from operations where portfolio_id=$1', [f.id])).rows;
+  assert.equal(settled.length, 1); assert.equal(settled[0]?.state, 'confirmed');
+  assert.equal(settled[0]?.user_op_hash, original.user_op_hash); assert.equal(settled[0]?.payload_hash, original.payload_hash);
+});
+
+test('#124 a fresh contribution accepted on active version 2 uses only its version 2 source', async () => {
+  const f = await fixture('hold', 0, 4, 'none', undefined, undefined, 2, 2);
+  await f.fund(100n * U);
+  const s = scheduler(f);
+  assert.equal((await s.once()).results[0]?.outcome, 'executed'); assert.equal(s.sends.length, 1);
+  const lots = (await query<{version:number}>('select version from strategy_funding_lots where portfolio_id=$1', [f.id])).rows;
+  assert.deepEqual(lots.map(l => l.version), [2]);
+  const sent = s.sends[0]; assert.ok(sent);
+  assert.equal(sumInputs(Object.fromEntries(sent.steps.map(step => [step.tokenOut, step.amountIn.toString()]))), 100n * U - R);
+  assert.equal((await s.once()).results[0]?.outcome, 'noop'); assert.equal(s.sends.length, 1);
+});
+
+for (const phase of ['quote', 'refresh', 'sign'] as const) {
+  test(`#124 typed version activation during ${phase} preserves principal and installment evidence without broadcast`, async () => {
+    const f = await fixture('stack'); await f.fund(500n * U);
+    const reserved = (await f.reserve())?.job; assert.ok(reserved);
+    const before = await versionTransitionEvidence(f);
+    let activeVersion = 1;
+    const s = scheduler(f, { readBuyVersionWindow: async () => ({ activeVersion,
+      timestamp: BigInt(Math.floor(start.getTime()/1000)), pendingActiveAt: null }),
+      planPortfolio: async () => { const p = plan(f); p.pinnedVersion.version = activeVersion; return p; } });
+    assert.ok(s.deps.newMoney);
+    if (phase === 'quote') {
+      const quote = s.deps.newMoney.quote; assert.ok(quote);
+      s.deps.newMoney.quote = async (...args) => { const result = await quote(...args); activeVersion = 2; return result; };
+    } else if (phase === 'refresh') s.deps.refreshFloors = async input => {
+      activeVersion = 2; return { ok: true, steps: [...input.steps], refreshes: [], note: 'crossed activation' };
+    };
+    else s.deps.executeRebalance = async args => {
+      activeVersion = 2; await args.beforeSending?.();
+      s.sends.push(args); throw new Error('broadcast must not be reached');
+    };
+    const result = (await s.once()).results[0];
+    assert.equal(result?.outcome, 'blocked'); assert.match(result.reason, /PINNED_VERSION_CHANGED/);
+    assert.equal(s.sends.length, 0);
+    const after = await versionTransitionEvidence(f);
+    for (const key of ['cash', 'lots', 'assets', 'slices', 'portfolio'] as const) assert.deepEqual(after[key], before[key], key);
+    const current = await job(f); assert.ok(current);
+    assert.deepEqual(current.remaining_input, reserved.remaining_input); assert.equal(current.remaining_fee_raw, reserved.remaining_fee_raw);
+    assert.ok(after.operations.every(row => typeof row === 'object' && row !== null && Reflect.get(row, 'state') === 'failed' && Reflect.get(row, 'user_op_hash') === null));
+    const stopped = await versionTransitionEvidence(f);
+    assert.match((await s.once()).results[0]?.reason ?? '', /PINNED_VERSION_CHANGED/);
+    assert.deepEqual(await versionTransitionEvidence(f), stopped, 'retry cannot consume or rewrite old sources');
+  });
+}

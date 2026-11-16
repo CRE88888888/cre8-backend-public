@@ -20,7 +20,9 @@ import { createSiweMessage } from 'viem/siwe';
 import type { PermissionPlugin } from '@zerodev/permissions';
 import { KERNEL_V3_3_ADDRESSES } from '../src/addresses.js';
 import type { SiweChallenge } from '../src/auth.js';
-import { canonicalScheduleHash, deploySmartAccount } from '../src/chain.js';
+import { canonicalScheduleHash, deploySmartAccount, REGISTRY_ABI } from '../src/chain.js';
+import { AppError } from '../src/errors.js';
+import { FOLLOW_VERSIONS_TERMS, FOLLOW_VERSIONS_TEXT } from '../src/registry-versioning.js';
 import type { ChainConfig } from '../src/chain.js';
 import { requireSessionKeyConfig, DEFAULT_MIN_SESSION_GAS_WEI } from '../src/config.js';
 import { closePool, migrate } from '../src/db.js';
@@ -28,7 +30,7 @@ import { describeGasStatus } from '../src/funding.js';
 import { computeSalt } from '../src/kernel.js';
 import { deriveSessionKeyFor, describePolicies, sessionKeyIndexFor, sessionValidUntil } from '../src/permissions.js';
 import type { SessionPolicySnapshot } from '../src/permissions.js';
-import { enrollPortfolio } from '../src/portfolios.js';
+import { enrollPortfolio, preparePortfolioEnrollment } from '../src/portfolios.js';
 import type { EnrollDeps, Portfolio } from '../src/portfolios.js';
 import { createServer } from '../src/server.js';
 import type { ServerDeps } from '../src/server.js';
@@ -481,6 +483,7 @@ function fakeEnrollDeps(existingRows: unknown[] = [], insertedPortfolioId = '11'
   const fakeGasPrice: EnrollDeps['getGasPriceWei'] = async () => FAKE_GAS_PRICE_WEI;
 
   const deps: Partial<EnrollDeps> = {
+    activeVersion: async () => activeVersion,
     query: fakeQuery,
     withTransaction: fakeTransaction,
     deploySmartAccount: fakeDeploy,
@@ -498,6 +501,40 @@ function fakeEnrollDeps(existingRows: unknown[] = [], insertedPortfolioId = '11'
   return { deps, calls, intents };
 }
 
+test('#124 chain 97 deploys before preparing an owner enroll UserOp without enrolling or creating a portfolio', async () => {
+  const { deps, calls } = fakeEnrollDeps();
+  deps.chainId = 97;
+  deps.accountParams = async () => ({ address: KERNEL_CHECKSUMMED, factory: KERNEL_V3_3_ADDRESSES.kernelMetaFactory, factoryData: '0x1234' });
+  deps.prepareApproval = async (address, id, direct) => {
+    assert.equal(direct, true);
+    return { account: address, expectedVersion: 1, configHash: FOLLOW_VERSIONS_TERMS,
+      activeAt: new Date(0).toISOString(), performanceFeeBps: 500, terms: FOLLOW_VERSIONS_TEXT, termsHash: FOLLOW_VERSIONS_TERMS,
+      signingMode: 'sudo', call: { to: EXECUTOR, value: '0', data: encodeFunctionData({ abi: REGISTRY_ABI, functionName: 'enroll', args: [address, BigInt(id), 1] }) } };
+  };
+  const prepared = await preparePortfolioEnrollment(3, ROUTE_WALLET.address, deps);
+  assert.equal(prepared.account.toLowerCase(), KERNEL_LOWERCASE);
+  assert.equal(prepared.accountDeployed, true); assert.equal('factory' in prepared, false); assert.equal('factoryData' in prepared, false);
+  assert.deepEqual(decodeFunctionData({ abi: REGISTRY_ABI, data: prepared.call.data }), { functionName: 'enroll', args: [KERNEL_CHECKSUMMED, BigInt(STRATEGY_ON_CHAIN.onchain_id), 1] });
+  assert.equal(calls.deploy.length, 1); assert.equal(calls.enroll.length, 0); assert.equal(calls.writes.length, 0);
+});
+
+test('#124 chain 97 confirms owner enrollment before DB writes and never uses the operator path', async () => {
+  for (const confirmed of [false, true]) {
+    const { deps, calls } = fakeEnrollDeps(); deps.chainId = 97;
+    deps.accountParams = async () => ({ address: KERNEL_CHECKSUMMED, factory: KERNEL_V3_3_ADDRESSES.kernelMetaFactory, factoryData: '0x1234' });
+    deps.confirmEnrollment = async (address, id) => {
+      assert.equal(address, KERNEL_CHECKSUMMED); assert.equal(id, Number(STRATEGY_ON_CHAIN.onchain_id));
+      assert.equal(calls.writes.length, 0);
+      if (!confirmed) throw new Error('owner enrollment missing');
+      return 1;
+    };
+    if (confirmed) assert.equal((await enrollPortfolio(3, ROUTE_WALLET.address, deps)).version, 1);
+    else await assert.rejects(enrollPortfolio(3, ROUTE_WALLET.address, deps));
+    assert.equal(calls.deploy.length, 0); assert.equal(calls.enroll.length, 0);
+    assert.equal(calls.writes.filter(c => c.text.includes('insert into portfolios')).length, confirmed ? 1 : 0);
+  }
+});
+
 test('enrollPortfolio returns the existing KERNEL portfolio without deploying or enrolling', async () => {
   const { deps, calls } = fakeEnrollDeps([enrollmentRow('11', 'KERNEL')]);
 
@@ -513,6 +550,26 @@ test('enrollPortfolio returns the existing KERNEL portfolio without deploying or
   assert.equal(calls.deploy.length, 0, 'an idempotent re-enroll must not deploy');
   assert.equal(calls.enroll.length, 0, 'an idempotent re-enroll must not send an enroll tx');
   assert.equal(calls.writes.length, 0, 'an idempotent re-enroll must not write a DB row');
+});
+
+test('#124 owner consent preparation reuses the intent/account but never enrolls or stores portfolio rows', async () => {
+  const { deps, calls } = fakeEnrollDeps();
+  const registry: Address = '0x0000000000000000000000000000000000000070';
+  deps.prepareApproval = async (account, onchainId) => ({ account, expectedVersion: 1, configHash: FOLLOW_VERSIONS_TERMS,
+    activeAt: new Date(0).toISOString(), performanceFeeBps: 500, terms: FOLLOW_VERSIONS_TEXT, termsHash: FOLLOW_VERSIONS_TERMS,
+    signingMode: 'sudo', call: { to: registry, value: '0', data: encodeFunctionData({ abi: REGISTRY_ABI, functionName: 'approveEnrollment', args: [BigInt(onchainId), 1] }) } });
+  const prepared = await preparePortfolioEnrollment(3, ROUTE_WALLET.address, deps);
+  assert.equal(prepared.account.toLowerCase(), KERNEL_LOWERCASE);
+  assert.equal(prepared.signingMode, 'sudo'); assert.equal(prepared.call.to, registry);
+  assert.equal(calls.deploy.length, 1); assert.equal(calls.enroll.length, 0); assert.equal(calls.writes.length, 0);
+  assert.ok(calls.permissions.every(p => p.executorAddress !== registry));
+});
+
+test('#124 consent preparation RPC failure leaves no enrollment or portfolio/session rows', async () => {
+  const { deps, calls } = fakeEnrollDeps();
+  deps.prepareApproval = async () => { throw new Error('approval preparation unavailable'); };
+  await assert.rejects(preparePortfolioEnrollment(3, ROUTE_WALLET.address, deps), /approval preparation unavailable/);
+  assert.equal(calls.enroll.length, 0); assert.equal(calls.writes.length, 0);
 });
 
 test('a chain retry pinned to an older version writes that version, never the latest DB version', async () => {
@@ -1280,4 +1337,35 @@ test('#82 typed existing enrollment cannot return a foreign-chain account', asyn
   const run = fakeEnrollDeps([row]);
   await assert.rejects(enrollPortfolio(3, ROUTE_WALLET.address, run.deps), /does not match this owner and chain/);
   assert.equal(run.calls.deploy.length, 0); assert.equal(run.calls.writes.length, 0);
+});
+
+
+test('#124 deployment failures and account mismatch never expose enrollment calldata or create a portfolio', async () => {
+  for (const mode of ['pending', 'reverted', 'rpc', 'mismatch']) {
+    const { deps, calls } = fakeEnrollDeps(); deps.chainId = 97;
+    deps.accountParams = async () => ({ address: KERNEL_CHECKSUMMED, factory: KERNEL_V3_3_ADDRESSES.kernelMetaFactory, factoryData: '0x1234' });
+    let approvals = 0;
+    deps.prepareApproval = async () => { approvals++; throw new Error('must not prepare'); };
+    deps.deploySmartAccount = async () => {
+      if (mode === 'mismatch') return { address: EXECUTOR, deployed: true };
+      if (mode === 'rpc') throw new Error('SECRET_RPC');
+      throw new AppError(mode === 'pending' ? 202 : 502, mode === 'pending' ? 'ACCOUNT_DEPLOYMENT_PENDING' : 'ACCOUNT_DEPLOYMENT_REVERTED', 'deployment incomplete');
+    };
+    await assert.rejects(preparePortfolioEnrollment(3, ROUTE_WALLET.address, deps), (error: unknown) => error instanceof AppError && !error.message.includes('SECRET'));
+    assert.equal(approvals, 0); assert.equal(calls.enroll.length, 0); assert.equal(calls.writes.length, 0);
+  }
+});
+
+test('#124 sponsorship preparation is read-only and requires existing account code', async () => {
+  for (const deployed of [false, true]) {
+    const { deps, calls } = fakeEnrollDeps(); deps.chainId = 97; deps.verifyAccountDeployment = true;
+    deps.accountParams = async () => ({ address: KERNEL_CHECKSUMMED, factory: KERNEL_V3_3_ADDRESSES.kernelMetaFactory, factoryData: '0x1234' });
+    assert.ok(deps.publicClient);
+    deps.publicClient = { ...deps.publicClient, getCode: async () => deployed ? '0x6001' : '0x' };
+    deps.prepareApproval = async account => ({ account, expectedVersion: 1, configHash: FOLLOW_VERSIONS_TERMS, activeAt: new Date(0).toISOString(),
+      performanceFeeBps: 500, terms: FOLLOW_VERSIONS_TEXT, termsHash: FOLLOW_VERSIONS_TERMS, signingMode: 'sudo', call: { to: EXECUTOR, value: '0', data: '0x' } });
+    if (deployed) assert.equal((await preparePortfolioEnrollment(3, ROUTE_WALLET.address, deps)).accountDeployed, true);
+    else await assert.rejects(preparePortfolioEnrollment(3, ROUTE_WALLET.address, deps), (error: unknown) => error instanceof AppError && error.code === 'PAYMASTER_ACCOUNT_UNDEPLOYED');
+    assert.equal(calls.deploy.length, 0); assert.equal(calls.enroll.length, 0); assert.equal(calls.writes.length, 0);
+  }
 });

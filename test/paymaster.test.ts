@@ -51,7 +51,7 @@ test('#66 config disabled without signer; decimal quotas, zero and malformed con
 test('#66 whitelist decodes every Kernel batch item, rejects value, delegatecall, mode extensions, unknown/truncated/trailing calls', () => {
   const c = config();
   validateSponsoredCalls(operation(), c);
-  const enroll = encodeFunctionData({ abi: parseAbi(['function enroll(address,uint256)']), functionName: 'enroll', args: [SENDER, 1n] });
+  const enroll = encodeFunctionData({ abi: parseAbi(['function enroll(address,uint256,uint16)']), functionName: 'enroll', args: [SENDER, 1n, 1] });
   const tuple: { target: Hex; value: bigint; callData: Hex }[] = [{ target: REGISTRY, value: 0n, callData: enroll }, { target: REGISTRY, value: 0n, callData: enroll }];
   const batchAbi = [{ type: 'tuple[]', components: [{ type: 'address', name: 'target' }, { type: 'uint256', name: 'value' }, { type: 'bytes', name: 'callData' }] }] as const;
   const batch = (items: typeof tuple) => encodeFunctionData({ abi: KERNEL_EXECUTE_ABI, functionName: 'execute', args: [toHex(1n << 248n, { size: 32 }), encodeAbiParameters(batchAbi, [items])] });
@@ -66,9 +66,11 @@ test('#66 whitelist decodes every Kernel batch item, rejects value, delegatecall
 test('#66 executor account and registry enrollment account must equal sender; direct faucet calls forbidden', () => {
   const rebalance = (account: Hex) => encodeFunctionData({ abi: EXECUTOR_ABI, functionName: 'executeRebalance', args: [account, [{ tokenIn: USDT, tokenOut: REGISTRY, amountIn: 1n, amountOutMin: 1n, venue: REGISTRY, data: '0x' }], 2_000_000_000n] });
   validateSponsoredCalls(operation({ callData: kernelCall(rebalance(SENDER), EXECUTOR) }), config());
-  const enrollAbi = parseAbi(['function enroll(address account,uint256 id)']);
-  validateSponsoredCalls(operation({ callData: kernelCall(encodeFunctionData({ abi: enrollAbi, functionName: 'enroll', args: [SENDER, 1n] }), REGISTRY) }), config());
-  for (const callData of [kernelCall(rebalance(REGISTRY), EXECUTOR), kernelCall(encodeFunctionData({ abi: enrollAbi, functionName: 'enroll', args: [REGISTRY, 1n] }), REGISTRY),
+  const enrollAbi = parseAbi(['function enroll(address account,uint256 id,uint16 expectedVersion)']);
+  validateSponsoredCalls(operation({ callData: kernelCall(encodeFunctionData({ abi: enrollAbi, functionName: 'enroll', args: [SENDER, 1n, 1] }), REGISTRY) }), config());
+  for (const callData of [kernelCall(encodeFunctionData({ abi: enrollAbi, functionName: 'enroll', args: [SENDER, 1n, 0] }), REGISTRY),
+    kernelCall(encodeFunctionData({ abi: enrollAbi, functionName: 'enroll', args: [SENDER, 0n, 1] }), REGISTRY),
+    kernelCall(rebalance(REGISTRY), EXECUTOR), kernelCall(encodeFunctionData({ abi: enrollAbi, functionName: 'enroll', args: [REGISTRY, 1n, 1] }), REGISTRY),
     kernelCall(encodeFunctionData({ abi: parseAbi(['function mint(address to,uint256 amount)']), functionName: 'mint', args: [SENDER, 1n] })),
     kernelCall(encodeFunctionData({ abi: CLAIM_ABI, functionName: 'claim', args: [0n] }))]) {
     assert.throws(() => validateSponsoredCalls(operation({ callData }), config()), errorCode('PAYMASTER_CALL_FORBIDDEN'));

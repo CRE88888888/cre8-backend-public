@@ -1,3 +1,5 @@
+import { prepareEnrollmentApproval } from './registry-versioning.js';
+import { REGISTRY_VERSION_ABI } from './registry-abi.js';
 import { minimumAssetContributionFromAllocation } from './asset-plan.js';
 import type { Address, PublicClient } from 'viem';
 import {
@@ -6,6 +8,7 @@ import {
   getAccountGasBalance,
   getChain,
   getGasPriceWei,
+  readOwnerEnrollment,
 } from './chain.js';
 import { getConfig, getGasConfig, requireSessionKeyConfig } from './config.js';
 import { query, withTransaction } from './db.js';
@@ -18,6 +21,9 @@ import type { Allocation } from './strategies.js';
 import { configuredChainId, TESTNET_97 } from './testnet-profile.js';
 import { minimumDepositUsdtWei } from './rebalance-plan.js';
 import { minimumAllocationRaw } from './strategy-execution.js';
+import { computeSalt, getKernelAccountParams } from './kernel.js';
+
+export type EnrollmentPreparation = Awaited<ReturnType<typeof prepareEnrollmentApproval>> & { accountDeployed?: true };
 
 export function allocationMinimumDeposit(allocation: Allocation | null | undefined): string | null {
   if (allocation === null || allocation === undefined) return null;
@@ -134,6 +140,12 @@ export type ResolveValidUntil = (userId: string, strategyId: bigint, chainId: bi
  * `enrollPortfolio(strategyId, wallet)`; unit tests inject fakes instead of a chain plus database.
  */
 export type EnrollDeps = {
+  /** Sponsorship may only observe deployed code for the persisted owner intent; it must never broadcast. */
+  verifyAccountDeployment: boolean;
+  accountParams: typeof getKernelAccountParams;
+  confirmEnrollment: typeof readOwnerEnrollment;
+  activeVersion: (onchainId: number) => Promise<number>;
+  prepareApproval: (account: Address, onchainId: number, direct?: boolean) => ReturnType<typeof prepareEnrollmentApproval>;
   requireTypedVersion: typeof requireTypedVersion;
   query: typeof query;
   withTransaction: typeof withTransaction;
@@ -211,11 +223,24 @@ const ACTIVE_ENROLLMENT_SQL = `select p.id, p.user_id, p.strategy_id, p.version,
  * 逾時的 RPC 呼叫把已經完成（且會走 idempotent 分支回同一列）的 enroll 變成 500，只會製造一個
  * 「看起來失敗、其實成功」的請求。查不到就回 `gas: null`。
  */
-export async function enrollPortfolio(
+export async function enrollPortfolio(strategyId: number, wallet: string, deps: Partial<EnrollDeps> = {}): Promise<Portfolio> {
+  const result = await prepareOrEnroll(strategyId, wallet, deps, false);
+  if (!('smartAccounts' in result)) throw new Error('enrollment did not return a portfolio');
+  return result;
+}
+
+export async function preparePortfolioEnrollment(strategyId: number, wallet: string, deps: Partial<EnrollDeps> = {}) {
+  const result = await prepareOrEnroll(strategyId, wallet, deps, true);
+  if ('smartAccounts' in result) throw new AppError(409, 'ALREADY_ENROLLED', 'portfolio is already enrolled');
+  return result;
+}
+
+async function prepareOrEnroll(
   strategyId: number,
   wallet: string,
-  deps: Partial<EnrollDeps> = {},
-): Promise<Portfolio> {
+  deps: Partial<EnrollDeps>,
+  prepareOnly: boolean,
+): Promise<Portfolio | EnrollmentPreparation> {
   const find = deps.query ?? query;
   const runInTransaction = deps.withTransaction ?? withTransaction;
   const deployAccount = deps.deploySmartAccount ?? deploySmartAccount;
@@ -232,13 +257,13 @@ export async function enrollPortfolio(
       const minimumWei = deps.minSessionGasWei ?? getGasConfig().minSessionGasWei;
       const [balanceWei, gasPriceWei] = await Promise.all([balanceOf(account), gasPriceOf()]);
       return describeGasStatus({ address: account, balanceWei, minimumWei, gasPriceWei });
-    } catch (err) {
+    } catch {
       console.error(
         JSON.stringify({
           level: 'warn',
           msg: 'gas status unavailable (enroll is unaffected)',
           address: account,
-          error: err instanceof Error ? err.message : String(err),
+          error: 'gas balance or price read unavailable',
         }),
       );
       return null;
@@ -287,8 +312,14 @@ export async function enrollPortfolio(
     return toPortfolio(existingRow, [existingRow], gas);
   }
 
+  const effectiveVersion = await (deps.activeVersion ?? (async (id: number) => {
+    const client = deps.publicClient ?? getChain().publicClient;
+    return client.readContract({ address: getChain().registryAddress, abi: REGISTRY_VERSION_ABI,
+      functionName: 'activeVersion', args: [BigInt(id)] });
+  }))(onchainId).catch(() => { throw new AppError(503, 'VERSION_CHAIN_UNAVAILABLE', 'effective enrollment version unavailable'); });
+  if (effectiveVersion < 1) throw new AppError(409, 'VERSION_NOT_ACTIVE', 'strategy has no effective version');
   if ((row.execution_schema_version === 1 || row.execution_schema_version === 2)) {
-    await (deps.requireTypedVersion ?? requireTypedVersion)(strategyId, version, onchainId);
+    await (deps.requireTypedVersion ?? requireTypedVersion)(strategyId, effectiveVersion, onchainId);
   }
 
   // Session key: the config first, so a missing env fails with a message naming the variable
@@ -329,15 +360,37 @@ export async function enrollPortfolio(
   // Both halves of the account have to be given together: `plugins.regular` installs the session key
   // as a signer, `initConfig` installs the permissions. Only initConfig changes the address, so
   // dropping it would silently yield an account whose session key can sign nothing.
-  const smartAccount = await deployAccount(account as Address, BigInt(strategyId), {
-    plugins: { sudo: await sudoValidator(publicClient, account as Address), regular: session.permissionValidator },
-    initConfig: session.initConfig,
-  });
+  const options = { plugins: { sudo: await sudoValidator(publicClient, account as Address), regular: session.permissionValidator },
+    initConfig: session.initConfig };
+  const smartAccount = chainId === 97
+    ? await (deps.accountParams ?? getKernelAccountParams)(publicClient, account as Address, computeSalt(account as Address, BigInt(strategyId)), options)
+    : await deployAccount(account as Address, BigInt(strategyId), options);
+
+  if (prepareOnly) {
+    if (chainId === 97) {
+      try {
+        if (deps.verifyAccountDeployment) {
+          const code = await publicClient.getCode({ address: smartAccount.address });
+          if (!code || code === '0x') throw new AppError(403, 'PAYMASTER_ACCOUNT_UNDEPLOYED', 'owner setup requires a deployed account');
+        } else {
+          const deployed = await deployAccount(account as Address, BigInt(strategyId), options);
+          if (deployed.address.toLowerCase() !== smartAccount.address.toLowerCase()) throw new AppError(503, 'ACCOUNT_DEPLOYMENT_MISMATCH', 'deployed account differs from persisted owner intent');
+        }
+      } catch (error) {
+        if (error instanceof AppError) throw error;
+        throw new AppError(503, 'ACCOUNT_DEPLOYMENT_UNAVAILABLE', 'account deployment cannot be confirmed; retry later');
+      }
+    }
+    const prepared = await (deps.prepareApproval ?? ((address, id, direct) => prepareEnrollmentApproval(publicClient, getChain().registryAddress, address, id, direct)))(smartAccount.address, onchainId, chainId === 97);
+    return { ...prepared, ...(chainId === 97 ? { accountDeployed: true as const } : {}) };
+  }
 
   // On-chain first: enroll the smart account (not the EOA), and fail here on a revert before any
   // DB row exists.
-  // A retry may find an older pinned version on-chain. Publishing a version never upgrades it.
-  const enrolledVersion = await enroll(smartAccount.address, onchainId);
+  // A retry may find the original consent version on-chain; P11 swaps follow activeVersion.
+  const enrolledVersion = chainId === 97
+    ? await (deps.confirmEnrollment ?? readOwnerEnrollment)(smartAccount.address, onchainId)
+    : await enroll(smartAccount.address, onchainId);
   if ((row.execution_schema_version === 1 || row.execution_schema_version === 2)) {
     await (deps.requireTypedVersion ?? requireTypedVersion)(strategyId, enrolledVersion, onchainId, smartAccount.address);
   }

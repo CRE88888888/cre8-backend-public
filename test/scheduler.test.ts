@@ -556,6 +556,7 @@ function deps(db: StubDb, chain: StubChain, extra: SchedulerDeps = {}): Schedule
     chainId: TEST_CHAIN_ID,
     executor: EXECUTOR,
     readGlobalPaused: async () => false,
+    readBuyVersionWindow: async () => ({ activeVersion: 1, timestamp: BigInt(Math.floor(NOW.getTime()/1000)), pendingActiveAt: null }),
     readRebalanceNonce: async () => 0n,
     readLatestBlockTimestamp: async () => 0n,
     readEntryPointNonce: async () => 0n,
@@ -589,6 +590,7 @@ function deps(db: StubDb, chain: StubChain, extra: SchedulerDeps = {}): Schedule
     readAllowance: async (_args: Erc20Args) => chain.allowance,
     readBalance: async (_args: Erc20Args) => chain.balance,
     executeRebalance: async (args: ExecuteArgs) => {
+      await args.beforeSending?.();
       chain.executeCalls.push(args);
       if (chain.executeError !== null) throw new Error(chain.executeError);
       if (chain.executeResult.userOpHash !== null) await args.onSubmitted({ userOpHash: chain.executeResult.userOpHash });
@@ -3681,3 +3683,80 @@ test('#83 canonical business receipt verifies exact inputs, actual receipts and 
     f.receipt.logs=bad;await assert.rejects(readRebalanceReceipt(f.input,f.reader));
   }
 });
+
+for (const phase of ['quote', 'refresh', 'sign'] as const) {
+  test(`#124 active version changes during ${phase}: old buys never reach broadcast`, async () => {
+    const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] }), chain = stubChain();
+    chain.rebalance = readyPlan([step({ tokenIn: TOKEN_OUT, tokenOut: TOKEN_IN })]);
+    let activeVersion = 1;
+    const overrides: SchedulerDeps = {
+      clock: () => NOW,
+      readBuyVersionWindow: async () => ({ activeVersion, timestamp: BigInt(Math.floor(NOW.getTime()/1000)), pendingActiveAt: null }),
+    };
+    if (phase === 'quote') overrides.planRebalance = async () => { activeVersion = 2; return chain.rebalance; };
+    if (phase === 'refresh') chain.refresh = async input => { activeVersion = 2; return { ok: true, steps: [...input.steps], refreshes: [], note: 'crossed activation' }; };
+    if (phase === 'sign') overrides.executeRebalance = async args => {
+      activeVersion = 2;
+      await args.beforeSending?.();
+      chain.executeCalls.push(args); args.onSending();
+      return chain.executeResult;
+    };
+    const result = (await runSchedulerOnce({ dryRun: false, now: NOW, skipAlerts: true }, deps(db, chain, overrides))).results[0];
+    assert.equal(chain.executeCalls.length, 0);
+    assert.equal(result?.outcome, 'blocked'); assert.match(result.reason, /PINNED_VERSION_CHANGED/);
+    assert.ok(db.operations.every(op => op.state === 'failed' && op.userOpHash === null));
+  });
+}
+
+for (const seconds of [59n, 60n, 61n, 600n, 3600n, 6000000n]) {
+  test(`#124 pending activation in ${seconds}s caps the exact hashed, refreshed and sent buy deadline`, async () => {
+    const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] }), chain = stubChain();
+    chain.rebalance = readyPlan([step({ tokenIn: TOKEN_OUT, tokenOut: TOKEN_IN })]);
+    const timestamp = BigInt(Math.floor(NOW.getTime()/1000)), activeAt = timestamp + seconds;
+    const result = (await runSchedulerOnce({ dryRun: false, now: NOW, skipAlerts: true }, deps(db, chain, {
+      clock: () => NOW,
+      readBuyVersionWindow: async () => ({ activeVersion: 1, timestamp, pendingActiveAt: activeAt }),
+    }))).results[0];
+    if (seconds <= 60n) {
+      assert.equal(result?.outcome, 'blocked'); assert.match(result.reason, /VERSION_ACTIVATION_IMMINENT/);
+      assert.equal(chain.executeCalls.length, 0); assert.equal(db.operations.length, 0);
+    } else {
+      const sent = chain.executeCalls[0]; assert.ok(sent);
+      const expected = chain.rebalance.deadline < activeAt - 60n ? chain.rebalance.deadline : activeAt - 60n;
+      assert.equal(sent.deadline, expected); assert.equal(result?.plan?.deadline, expected.toString());
+      assert.equal(result?.plan?.planHash, planHashFor(sent.steps, expected));
+    }
+  });
+}
+
+for (const purpose of ['ordinary', 'exit'] as const) {
+  test(`#124 version read failure never blocks ${purpose} sells`, async () => {
+    const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] }), chain = stubChain();
+    chain.rebalance = { ...readyPlan(), ...(purpose === 'exit' ? { purpose } : {}) };
+    const result = (await runSchedulerOnce({ dryRun: false, now: NOW, skipAlerts: true }, deps(db, chain, {
+      readBuyVersionWindow: async () => { throw new Error('version RPC must not run for sells'); },
+    }))).results[0];
+    assert.equal(result?.outcome, 'executed'); assert.equal(chain.executeCalls.length, 1);
+  });
+}
+
+for (const phase of ['before-pending', 'after-sign'] as const) for (const failure of ['rpc', 'new-pending', 'too-late'] as const) {
+  test(`#124 ${failure} ${phase} refuses the unchanged signed payload without broadcast`, async () => {
+    const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] }), chain = stubChain();
+    chain.rebalance = readyPlan([step({ tokenIn: TOKEN_OUT, tokenOut: TOKEN_IN })]);
+    const timestamp = BigInt(Math.floor(NOW.getTime()/1000)), originalDeadline = chain.rebalance.deadline; let changed = false;
+    const readBuyVersionWindow = async () => {
+      if (changed && failure === 'rpc') throw new AppError(503, 'VERSION_STATE_UNAVAILABLE', '[VERSION_STATE_UNAVAILABLE] 讀鏈失敗');
+      return { activeVersion: 1, timestamp: changed && failure === 'too-late' ? originalDeadline : timestamp,
+        pendingActiveAt: changed && failure === 'new-pending' ? timestamp + 600n : null };
+    };
+    const result = (await runSchedulerOnce({ dryRun: false, now: NOW, skipAlerts: true }, deps(db, chain, {
+      clock: () => NOW, readBuyVersionWindow,
+      readRebalanceNonce: async () => { if (phase === 'before-pending') changed = true; return 0n; },
+      executeRebalance: async args => { changed = true; await args.beforeSending?.(); chain.executeCalls.push(args); return chain.executeResult; },
+    }))).results[0];
+    assert.equal(result?.outcome, 'blocked'); assert.match(result.reason, /VERSION_STATE_UNAVAILABLE|VERSION_ACTIVATION_IMMINENT/);
+    assert.equal(chain.executeCalls.length, 0);
+    assert.ok(db.operations.every(op => op.state === 'failed' && op.userOpHash === null));
+  });
+}

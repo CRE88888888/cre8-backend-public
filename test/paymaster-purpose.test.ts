@@ -11,9 +11,10 @@ import { config, kernelCall, operation, OWNER, EXECUTOR, USDT, SENDER, NOW } fro
 after(closePool);
 const ASSET = '0x1000000000000000000000000000000000000006';
 const ABI = parseAbi(['function oracle() view returns(address)', 'function numeraire() view returns(address)',
+  'function historicalAssets(uint256) view returns(address[])',
   'function decimals() view returns(uint8)', 'function previewSwap(address,address,uint256) view returns(uint256,uint256)',
   'function enrollments(address) view returns(uint256,uint16,bool)',
-  'function version(uint256,uint16) view returns((address[] assets,uint16[] weightsBps,bytes32 scheduleHash,uint64 activeAt))',
+  'function version(uint256,uint16) view returns((address[] assets,uint16[] weightsBps,bytes32 scheduleHash,uint64 activeAt,bytes32 settingsHash,uint16 performanceFeeBps,bytes32 configHash))',
   'function balanceOf(address) view returns(uint256)']);
 
 test('#75 public sponsorship derives setup/full exit/ordinary from canonical calls and complete balances; RPC failure never authorizes', async () => {
@@ -38,7 +39,8 @@ test('#75 public sponsorship derives setup/full exit/ordinary from canonical cal
         case 'previewSwap': result = encodeFunctionResult({ abi: ABI, functionName: 'previewSwap', result: [600n * 10n ** 18n, 590n * 10n ** 18n] }); break;
         case 'balanceOf': result = encodeFunctionResult({ abi: ABI, functionName: 'balanceOf', result: to === USDT ? cash : asset }); break;
         case 'enrollments': result = encodeFunctionResult({ abi: ABI, functionName: 'enrollments', result: [1n, 1, false] }); break;
-        case 'version': result = encodeFunctionResult({ abi: ABI, functionName: 'version', result: { assets: [USDT, ASSET], weightsBps: [5000, 5000], scheduleHash: `0x${'0'.repeat(64)}`, activeAt: 1n } }); break;
+        case 'historicalAssets': result = encodeFunctionResult({ abi: ABI, functionName: 'historicalAssets', result: [USDT, ASSET] }); break;
+        case 'version': result = encodeFunctionResult({ abi: ABI, functionName: 'version', result: { assets: [USDT, ASSET], weightsBps: [5000, 5000], scheduleHash: `0x${'0'.repeat(64)}`, activeAt: 1n, settingsHash: `0x${'0'.repeat(64)}`, performanceFeeBps: 500, configHash: `0x${'0'.repeat(64)}` } }); break;
       }
     }
     res.setHeader('content-type', 'application/json');

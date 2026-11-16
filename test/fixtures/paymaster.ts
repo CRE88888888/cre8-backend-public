@@ -23,7 +23,7 @@ export function kernelCall(data: Hex = claim, target: Hex = USDT, value = 0n, mo
   return encodeFunctionData({ abi: KERNEL_EXECUTE_ABI, functionName: 'execute', args: [mode, concatHex([target, toHex(value, { size: 32 }), data])] });
 }
 export function operation(overrides: Partial<PackedSponsorOperation> = {}): PackedSponsorOperation {
-  return { sender: SENDER, nonce: 0n, initCode: '0x', callData: kernelCall(encodeFunctionData({ abi: parseAbi(['function enroll(address,uint256)']), functionName: 'enroll', args: [SENDER, 1n] }), REGISTRY), accountGasLimits: concatHex([toHex(100_000n, { size: 16 }), toHex(200_000n, { size: 16 })]),
+  return { sender: SENDER, nonce: 0n, initCode: '0x', callData: kernelCall(encodeFunctionData({ abi: parseAbi(['function enroll(address,uint256,uint16)']), functionName: 'enroll', args: [SENDER, 1n, 1] }), REGISTRY), accountGasLimits: concatHex([toHex(100_000n, { size: 16 }), toHex(200_000n, { size: 16 })]),
     preVerificationGas: 50_000n, gasFees: concatHex([toHex(1n, { size: 16 }), toHex(2n, { size: 16 })]), paymasterAndData: '0x', signature: '0x', ...overrides };
 }
 export function config(env: NodeJS.ProcessEnv = ENV) {

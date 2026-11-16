@@ -1,9 +1,52 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { readYieldAccount } from '../src/yield-reader.js';
-import { yieldFixture } from './fixtures/yield.js';
+import { yieldFixture, address } from './fixtures/yield.js';
 import { keccak256,toFunctionSelector } from 'viem';
 import { RAY, WAD, mustExit } from '../src/yield-domain.js';
+
+test('#124 NAV includes same-block historical assets added after enrollment, once each, and fails closed on missing history',async()=>{
+  const f=yieldFixture(['venus']),added=address();let fail=false,seen=0;
+  const batch:typeof f.batch=async(client,block,calls)=>{
+    assert.equal(block,100n);
+    const values=await f.batch(client,block,calls.filter(c=>c.name!=='historicalAssets'));
+    let i=0;
+    return calls.map(c=>{
+      if(c.name==='historicalAssets')return fail?null:[f.asset,added,added];
+      const value=values[i++];
+      if(c.name==='balanceOf'&&c.target===added){seen++;return 7n*WAD;}
+      if(c.name==='previewSwap'&&c.args?.[0]===added)return [7n*WAD,6n*WAD];
+      if(c.name==='previewAccountValue')return f.state.nav+f.state.claim+7n*WAD;
+      return value;
+    });
+  };
+  const r=await readYieldAccount(f.client,f.profile,f.account,{batch,now:()=>f.at});
+  assert.equal(r.accountValue,f.state.nav+f.state.claim+7n*WAD);
+  assert.equal(seen,1);assert.equal(r.positions[0]?.state,'known');
+  fail=true;assert.equal((await readYieldAccount(f.client,f.profile,f.account,{batch,now:()=>f.at})).accountValue,null);
+});
+
+test('#124 historical NAV accepts zero holdings and the 128-asset limit; missing balance/quote/history or a one-wei NAV mismatch stays unknown',async()=>{
+  const f=yieldFixture(['venus']),added=address(),history=Array.from({length:127},address);
+  let mode='zero';
+  const batch:typeof f.batch=async(client,block,calls)=>{
+    assert.equal(block,100n);
+    if(mode==='rpc'&&calls.some(c=>c.name==='historicalAssets'))throw new Error('SECRET_HISTORY_RPC');
+    const values=await f.batch(client,block,calls);
+    return calls.map((c,i)=>{
+      if(c.name==='historicalAssets')return mode==='empty'?[]:mode==='maximum'?[f.asset,...history]:mode==='overflow'?[f.asset,added,...history]:mode==='malformed'?[null]:[f.asset,added];
+      if(c.name==='balanceOf'&&c.target!==f.asset&&!f.profile.markets.some(m=>m.receipt===c.target))return mode==='missing-balance'?null:mode==='zero'||mode==='maximum'?0n:WAD;
+      if(c.name==='previewSwap'&&c.args?.[0]===added)return mode==='missing-quote'?null:[WAD,WAD];
+      if(c.name==='previewAccountValue'&&!['zero','maximum','empty'].includes(mode))return f.state.nav+f.state.claim+WAD+(mode==='mismatch'?1n:0n);
+      return values[i];
+    });
+  };
+  for(mode of ['zero','maximum','empty'])assert.equal((await readYieldAccount(f.client,f.profile,f.account,{batch,now:()=>f.at})).accountValue,f.state.nav+f.state.claim,mode);
+  for(mode of ['overflow','malformed','missing-balance','missing-quote','rpc','mismatch']){
+    const read=await readYieldAccount(f.client,f.profile,f.account,{batch,now:()=>f.at});
+    assert.equal(read.accountValue,null,mode);assert.equal(read.positions[0]?.state,'known',mode);
+  }
+});
 
 test('yield Venus reads current APR and non-18 receipt units after same-call accrual',async()=>{
   const f=yieldFixture(['venus']);f.state.rate=2n*WAD;f.state.claim=20n*10n**8n;

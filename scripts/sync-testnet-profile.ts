@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createPublicClient, encodeAbiParameters, http, isAddress, keccak256 } from 'viem';
+import { createPublicClient, encodeAbiParameters, http, isAddress, keccak256, toFunctionSelector } from 'viem';
 import type { Address } from 'viem';
 import { TESTNET_ASSETS } from '../src/keeper/assets.js';
 import caps from '../test/fixtures/testnet-launch-caps.json' with { type: 'json' };
@@ -27,6 +27,10 @@ export function profileFromManifest(input: unknown, expectedMode: 'fork' | 'publ
   if (m.chainId !== 97 || m.mode !== expectedMode || typeof m.gitCommit !== 'string' || !/^[0-9a-f]{40}$/.test(m.gitCommit) ||
       !Number.isSafeInteger(m.verifiedAtBlock) || Number(m.verifiedAtBlock) < 1 || typeof m.generatedAt !== 'string') throw new Error('invalid chain 97 manifest metadata / mode');
   const contracts = addresses(m.contracts), roles = addresses(m.roles);
+  const versioning = record(m.versioning);
+  if (versioning.enrollAbi !== 'enroll(address,uint256,uint16)' || versioning.publicationDelaySeconds !== 86400 ||
+      versioning.publicationIntervalSeconds !== 604800 || versioning.settingsAbi !== 'publishSettingsVersion(uint256,address[],uint16[],bytes32,bytes32,uint16,uint64)' ||
+      JSON.stringify(versioning.performanceFeeBpsRange) !== '[500,2000]' || typeof versioning.consent !== 'string') throw new Error('invalid P11 versioning manifest');
   for (const key of ['registry', 'router', 'usdt', 'executor', 'yieldRegistry', 'yieldView', 'paymaster', 'gasPolicy', 'entryPoint',
     'ownedDeployer', 'feed.USDT/USD', 'v3Factory', 'positionManager', 'universalRouter', 'permit2']) {
     if (!contracts[key]) throw new Error('missing manifest contract: ' + key);
@@ -75,7 +79,7 @@ export function verifyArtifactSources(artifact: unknown, readSource: (path: stri
   }
 }
 
-export async function syncProfile(root: string, rpcUrl: string, mode: 'fork' | 'public', revision = 'HEAD') {
+export async function syncProfile(root: string, rpcUrl: string, mode: 'fork' | 'public', revision = 'HEAD', unlinkedYieldViewArtifact?: string) {
   const url = new URL(rpcUrl);
   if (url.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) || url.username || url.password ||
       url.pathname !== '/' || url.search || url.hash) throw new Error('capture requires local anvil');
@@ -105,8 +109,11 @@ export async function syncProfile(root: string, rpcUrl: string, mode: 'fork' | '
   }
   // Compare forge runtime against captured code, ignoring only compiler-declared immutable slots.
   const artifacts = new Map<string, Record<string, unknown>>();
-  for (const [name, key] of [['AtpExecutor', 'executor'], ['AtpYieldRegistry', 'yieldRegistry'], ['YieldView', 'yieldView']] as const) {
-    const artifact: unknown = JSON.parse(readFileSync(resolve(root, `out/${name}.sol/${name}.json`), 'utf8'));
+  for (const [name, key] of [['AtpRegistry', 'registry'], ['AtpExecutor', 'executor'], ['AtpYieldRegistry', 'yieldRegistry'], ['YieldView', 'yieldView']] as const) {
+    // DeployYieldView deliberately pins UNLINKED metadata; a later linked build changes it.
+    // Check the exact deployed artifact, retaining full metadata/source verification.
+    const artifactPath = name === 'YieldView' && unlinkedYieldViewArtifact ? resolve(unlinkedYieldViewArtifact) : resolve(root, `out/${name}.sol/${name}.json`);
+    const artifact: unknown = JSON.parse(readFileSync(artifactPath, 'utf8'));
     verifyArtifactSources(artifact, path => execFileSync('git', ['show', sourceCommit + ':' + path], { cwd: root }));
     const runtime = record(record(artifact).deployedBytecode);
     if (typeof runtime.object !== 'string') throw new Error('missing forge runtime');
@@ -127,6 +134,8 @@ export async function syncProfile(root: string, rpcUrl: string, mode: 'fork' | '
       return bytes.toString('hex');
     };
     if (normalize(deployed) !== normalize(runtime.object)) throw new Error('forge runtime differs: ' + name);
+    if (name === 'AtpRegistry' && ['enroll(address,uint256,uint16)', 'approveEnrollment(uint256,uint16)', 'cancelVersion(uint256)',
+      'activeVersion(uint256)', 'historicalAssets(uint256)', 'MAX_STRATEGY_ASSETS()'].some(signature => !deployed.toLowerCase().includes(toFunctionSelector(signature).slice(2)))) throw new Error('missing P11 registry selector');
     artifacts.set(name, record(artifact));
   }
   const registryAddress = profile.contracts.yieldRegistry;
@@ -159,7 +168,7 @@ export async function syncProfile(root: string, rpcUrl: string, mode: 'fork' | '
 }
 
 if (resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url)) {
-  const [, , root, rpcUrl, mode = 'fork', revision = 'HEAD'] = process.argv;
-  if (!root || !rpcUrl || !['fork', 'public'].includes(mode)) throw new Error('usage: sync-testnet-profile.ts <contracts root> <local rpc> [fork|public] [source revision]');
-  await syncProfile(resolve(root), rpcUrl, mode === 'public' ? 'public' : 'fork', revision);
+  const [, , root, rpcUrl, mode = 'fork', revision = 'HEAD', unlinkedYieldViewArtifact] = process.argv;
+  if (!root || !rpcUrl || !['fork', 'public'].includes(mode)) throw new Error('usage: sync-testnet-profile.ts <contracts root> <local rpc> [fork|public] [source revision] [unlinked YieldView artifact]');
+  await syncProfile(resolve(root), rpcUrl, mode === 'public' ? 'public' : 'fork', revision, unlinkedYieldViewArtifact);
 }

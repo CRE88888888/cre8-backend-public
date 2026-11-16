@@ -68,6 +68,9 @@ type StubChain = {
   batches: StubBatch[];
   /** `enrollments(account)` 的回傳（攤平三元組）。 */
   enrollment: readonly [bigint, number, boolean];
+  activeVersion?: number;
+  historicalAssets?: Address[];
+  failRead?: string;
   /** `version(id, n)` 的回傳：n → { assets, weightsBps }。 */
   versions: Map<number, { assets: readonly Address[]; weightsBps: readonly number[] }>;
   /** 持有掃描發出去的 `eth_getLogs` 區間（它問的是「哪個塊到哪個塊」，不是 eth_call）。 */
@@ -89,6 +92,7 @@ function stubClient(chain: StubChain): PublicClient {
     }): Promise<unknown> => {
       const key = args.address.toLowerCase();
       chain.calls.push({ functionName: args.functionName, address: key, blockNumber: args.blockNumber });
+      if (chain.failRead === args.functionName) throw new Error('private RPC credential');
       switch (args.functionName) {
         case 'balanceOf': {
           if (chain.broken.has(key)) throw new Error('execution reverted: not an ERC-20');
@@ -129,6 +133,9 @@ function stubClient(chain: StubChain): PublicClient {
             throw new Error(`stub 不認得的內層 callData：${call.callData.slice(0, 10)}`);
           });
         }
+        case 'numeraire': return USDT;
+        case 'activeVersion': return chain.activeVersion ?? chain.enrollment[1];
+        case 'historicalAssets': return chain.historicalAssets ?? chain.versions.get(chain.activeVersion ?? chain.enrollment[1])?.assets ?? [];
         case 'enrollments':
           return chain.enrollment;
         case 'version': {
@@ -633,30 +640,32 @@ function planDeps(chain: StubChain, db: FakeDb, priceToken = oneDollarPrice()) {
   };
 }
 
-test('目標權重用鏈上 enrollment.version，不是 active version', async () => {
+test('P11 目標權重用最新生效版本，enrollment.version 保留本人接受紀錄', async () => {
   // 鏈上：enrollment 釘在 v1，但 v2 已經發佈（active = 2）。DB 兩版都有。
-  // 用錯版本的話 targets 會是 v2 的 1000/9000——那個報告看起來仍然「合理」。
+  // P11 必須跟隨已生效 v2 的 1000/9000，不能沿用本人接受時的 v1 權重。
   const chain = baseChain({
-    enrollment: [1n, 1, false],
+    enrollment: [1n, 1, false], activeVersion: 2,
     versions: new Map([
       [1, { assets: [AAA, BBB], weightsBps: [6000, 4000] }],
       [2, { assets: [AAA, BBB], weightsBps: [1000, 9000] }],
     ]),
   });
   const db = baseDb();
+  assert.ok(db.versions.get('11')?.has(2));
   const plan = await planPortfolio(5, planDeps(chain, db));
 
-  assert.equal(plan.pinnedVersion.version, 1);
+  assert.equal(plan.pinnedVersion.version, 2);
   assert.deepEqual(
     plan.targets.map((target) => [target.asset, target.weightBps]),
     [
-      [AAA.toLowerCase(), 6000],
-      [BBB.toLowerCase(), 4000],
+      [AAA.toLowerCase(), 1000],
+      [BBB.toLowerCase(), 9000],
+      ['0x55d398326f99059ff775485246999027b3197955', 0],
     ],
   );
-  // 查 DB 用的版本號也必須是 1：這兩件事任一錯了，漂移就整個歪掉。
+  // 查 DB 用的版本號也必須是 2，與鏈上生效版本保持一致。
   const allocationCall = db.calls.find((call) => call.text.includes('from strategy_versions'));
-  assert.deepEqual(allocationCall?.params, [11, 1]);
+  assert.deepEqual(allocationCall?.params, [11, 2]);
   assert.equal(plan.allocationCheck.consistent, true);
   assert.ok(plan.report !== null);
   assert.equal(plan.report.totalUsdE8, 0n);
@@ -668,6 +677,31 @@ test('目標權重用鏈上 enrollment.version，不是 active version', async (
 test('enrollment.version 是 0 就拋錯：version(0) 會解析成 active version，那是同一個錯誤的另一個入口', async () => {
   const chain = baseChain({ enrollment: [1n, 0, false] });
   await assert.rejects(() => planPortfolio(5, planDeps(chain, baseDb())), /enrollment\.version 是 0/);
+});
+
+test('#124 latest targets retain historical holdings once at zero weight for sales and gas valuation', async () => {
+  const chain = baseChain({ activeVersion: 2, historicalAssets: [AAA, AAA, BBB], versions: new Map([
+    [1, { assets: [AAA, BBB], weightsBps: [6000, 4000] }],
+    [2, { assets: [BBB], weightsBps: [10000] }],
+  ]) });
+  chain.balances.set(AAA.toLowerCase(), 10n * 10n ** 18n);
+  const db = baseDb(); db.versions.get('11')?.set(2, { assets: [{ address: BBB, weightBps: 10000 }] });
+  db.tokens.push({ address: USDT, symbol: 'USDT', usdt_pool: null, is_numeraire: true });
+  const plan = await planPortfolio(5, planDeps(chain, db));
+  assert.equal(plan.pinnedVersion.version, 2);
+  assert.equal(plan.historicalAssetCount, 2);
+  assert.equal(plan.targets.filter(t => t.asset === AAA.toLowerCase()).length, 1);
+  assert.equal(plan.targets.find(t => t.asset === AAA.toLowerCase())?.weightBps, 0);
+  assert.equal(plan.report?.totalUsdE8, 10n * ONE_USD);
+  assert.equal(plan.allocationCheck.consistent, true);
+  for (const read of chain.calls.filter(c => ['activeVersion', 'historicalAssets'].includes(c.functionName))) assert.equal(read.blockNumber, chain.blockNumber);
+});
+
+test('#124 missing active version and registry RPC failure refuse a portfolio plan', async () => {
+  await assert.rejects(planPortfolio(5, planDeps(baseChain({ activeVersion: 0 }), baseDb())), /no effective version/);
+  for (const failRead of ['activeVersion', 'historicalAssets']) {
+    await assert.rejects(planPortfolio(5, planDeps(baseChain({ failRead }), baseDb())), (error: unknown) => error instanceof Error && !error.message.includes('credential'));
+  }
 });
 
 test('鏈上 enroll 的策略與 DB 的 onchain_id 不同 → 拋錯，不猜哪一邊才對', async () => {
@@ -725,7 +759,7 @@ test('策略資產無價（查價表有它、但沒有池）→ 拒算漂移（�
   );
   assert.match(plan.blocked[0]?.detail ?? '', /NOPOOL no_usdt_pool/);
   // 目標權重照樣算出來（那是 DB + 鏈的事，跟持倉無關），只是漂移不出數字。
-  assert.equal(plan.targets.length, 2);
+  assert.equal(plan.targets.length, 3);
   console.log(`[策略資產無價] blocked=${JSON.stringify(plan.blocked.map((b) => [b.code, b.detail]))}`);
 });
 

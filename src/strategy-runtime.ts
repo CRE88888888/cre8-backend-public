@@ -96,10 +96,15 @@ export function defaultNewMoneyDeps(client:()=>PublicClient,executor:()=>Address
     },
   };
 }
+/** A local control error; its fixed message is safe to expose without RPC/DB details. */
+export class PinnedVersionChangedError extends Error {
+  constructor() { super('[PINNED_VERSION_CHANGED] 生效版本已變更；保留原本金與期次，等待轉版重排，不買入'); }
+}
+
 export async function prepareNewMoney(args:{due:DuePortfolio;plan:PortfolioPlan;query:SchedulerQueryFn;run:WithTransactionFn;
   chainId:number;now:Date;dryRun:boolean;deps:NewMoneyDeps}):Promise<{job:StrategyJob|null;context:JobContext;rebalance:RebalancePlan;useTargetWeights?:boolean}>{
   const {due,plan,query,run,chainId,now,deps}=args;
-  if(due.version===undefined||plan.pinnedVersion.version!==due.version)throw new Error('[PINNED_VERSION_CHANGED] 版本需先對帳');
+  if(due.version===undefined||plan.pinnedVersion.version!==due.version)throw new PinnedVersionChangedError();
   const version=await deps.version(due.strategyId,due.version,plan.pinnedVersion.onchainStrategyId,due.account,{chainId,blockNumber:plan.snapshot.block});
   if(version.execution.kind!=='hold'&&version.execution.kind!=='stack'&&version.execution.kind!=='per_asset')throw new Error('typed mode missing');
   const cash=numeraireFor(chainId) as Address;
@@ -119,7 +124,7 @@ export async function prepareNewMoney(args:{due:DuePortfolio;plan:PortfolioPlan;
   }
   const policy=assets.length===0?{reserve:0n,caps:new Map<string,bigint|null>(),buyLimit:0n,
     cash:plan.snapshot.holdings.find(h=>h.asset.toLowerCase()===cash)?.amountWei??0n}:await deps.policy(due,plan,assets);
-  const batchStepLimit=executionBatchSize(version.allocation.assets.filter(a=>a.address!==cash).length);
+  const batchStepLimit=executionBatchSize(plan.historicalAssetCount ?? version.allocation.assets.filter(a=>a.address!==cash).length);
   if(batchStepLimit===0)throw new Error('[USER_OP_CAPACITY] 無可行買入批次');
   const context:JobContext={batchStepLimit,chainId,portfolioId:due.portfolioId,strategyId:due.strategyId,version:due.version,kind:version.execution.kind==='per_asset'?'asset':version.execution.kind,
     ...(version.execution.kind==='per_asset'?{execution:version.execution,marketOpenFor:(selected:readonly string[])=>deps.marketOpen({...version,allocation:{assets:version.allocation.assets.filter(a=>selected.includes(a.address))}},now)}:{}),
@@ -158,7 +163,9 @@ export async function prepareNewMoney(args:{due:DuePortfolio;plan:PortfolioPlan;
   const reserve=feeWindow&&BigInt(job.remaining_fee_raw)<policy.reserve?BigInt(job.remaining_fee_raw):policy.reserve;
   context.reserve=reserve;
   const remaining=Object.fromEntries(Object.entries(job.remaining_input).filter(([,n])=>BigInt(n)>0n));
-  const held=plan.snapshot.holdings.filter(h=>h.amountWei>0n&&h.asset.toLowerCase()!==cash&&version.allocation.assets.some(a=>a.address===h.asset.toLowerCase())).length;
+  // Include held assets removed from the active version: snapshot targets contain
+  // the full effective history. Match the scheduler so it never truncates this child.
+  const held=plan.snapshot.holdings.filter(h=>h.amountWei>0n&&h.asset.toLowerCase()!==cash&&plan.targets.some(a=>a.asset.toLowerCase()===h.asset.toLowerCase())).length;
   const stepLimit=executionBatchSize(held);
   if(stepLimit===0)return {job,context,rebalance:{kind:'blocked',reason:'[USER_OP_CAPACITY] 估值已超過單筆容量'}};
   const maximum=newMode?maximumRemainingBatches(remaining,BigInt(job.remaining_fee_raw),reserve,stepLimit,context.finalAssets,feeWindow):feeWindow?maxWindowBatches(remaining,reserve):maxBasketBatches(job.remaining_input,feeBatches);

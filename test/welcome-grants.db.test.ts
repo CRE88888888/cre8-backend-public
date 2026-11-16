@@ -217,11 +217,12 @@ test('#91 DB grant confirmation survives lot rollback and unknown cash commit; r
 });
 
 test('#91 DB missing proof, RPC error, enrollment mismatch and stale settlement never create a welcome lot', async () => {
-  for (const scenario of ['missing', 'rpc', 'version', 'before-active', 'settlement']) {
+  for (const scenario of ['missing', 'rpc', 'version', 'effective-version', 'before-active', 'settlement']) {
     const f = await fixture(); await f.deps.welcome?.issue(f.recipient);
     if (scenario === 'missing') f.rpc.state.logs = false;
     if (scenario === 'rpc') f.rpc.state.fail = 'eth_getTransactionReceipt';
-    if (scenario === 'version') { f.rpc.state.latestBlockNumber = 131n; f.rpc.state.historicalPinned = 2; }
+    if (scenario === 'version') { f.rpc.state.latestBlockNumber = 131n; f.rpc.state.historicalPinned = 2; f.rpc.state.historicalVersion = 2; }
+    if (scenario === 'effective-version') { f.rpc.state.latestBlockNumber = 131n; f.rpc.state.historicalVersion = 2; }
     if (scenario === 'before-active') { f.rpc.state.latestBlockNumber = 131n; f.rpc.state.historicalNow--; }
     const service = scenario === 'settlement' ? createPortfolioStrategyService({ ...f.deps, settleWelcome: async () => { throw new AppError(503, 'WELCOME_STORAGE_UNAVAILABLE', 'SECRET omitted'); } }) : f.service;
     await assert.rejects(service.buyFunding(f.id, f.owner, {}));
@@ -287,4 +288,31 @@ test('#91 DB buy rejects malformed/foreign/mainnet/RPC-error requests; existing 
   assert.equal(result.funding, 'welcome_grant');
   assert.equal(result.lot?.amountRaw, WELCOME_AMOUNT_WEI.toString(), 'transferred dust is not credited to the product lot');
   assert.ok(await findWelcomeGrant(97, f.owner)); assert.equal(f.sends(), 1);
+});
+
+test('#124 latest effective version is checked before the first welcome mint; RPC failure also mints nothing', async () => {
+  for (const scenario of ['active', 'changed', 'zero', 'rpc']) {
+    const f = await fixture();
+    if (scenario === 'changed') f.rpc.state.version = 2;
+    if (scenario === 'zero') f.rpc.state.version = 0;
+    if (scenario === 'rpc') f.rpc.state.fail = 'eth_call';
+    if (scenario === 'active') {
+      assert.equal((await f.service.buyFunding(f.id, f.owner, {})).state, 'ready');
+      assert.equal(f.sends(), 1);
+    } else {
+      await assert.rejects(f.service.buyFunding(f.id, f.owner, {}), denied(scenario !== 'rpc' ? 'CHAIN_VERSION_MISMATCH' : 'VERSION_CHAIN_UNAVAILABLE'));
+      assert.equal(f.sends(), 0);
+      assert.equal(await findWelcomeGrant(97, f.owner), null);
+      assert.equal((await query('select id from strategy_funding_lots where portfolio_id=$1', [f.id])).rows.length, 0);
+    }
+  }
+});
+
+test('#124 original welcome receipt remains reconcilable when a newer version becomes effective', async () => {
+  const f = await fixture();
+  await f.service.buyFunding(f.id, f.owner, {});
+  f.rpc.state.latestBlockNumber = 131n; f.rpc.state.version = 2;
+  const retry = await f.service.buyFunding(f.id, f.owner, {});
+  assert.equal(retry.lot?.replayed, true);
+  assert.equal(f.sends(), 1);
 });

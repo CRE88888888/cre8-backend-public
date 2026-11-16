@@ -111,11 +111,11 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
     if (portfolio.ownerAddress.toLowerCase() !== wallet.toLowerCase()) throw new ForbiddenError('smart account belongs to another owner');
     return portfolio;
   }
-  async function context(id: number, wallet: string, verifyChain = true) {
+  async function context(id: number, wallet: string, verifyChain = true, requireLatest = false) {
     const portfolio = await ownedContext(id, wallet);
     const onchainId = (await deps.query<{ onchain_id: string | null }>('select onchain_id from strategies where id=$1', [portfolio.strategyId])).rows[0]?.onchain_id;
     if (!onchainId) throw new AppError(409, 'STRATEGY_NOT_ON_CHAIN', 'strategy has no chain identity');
-    const version = await deps.version(portfolio.strategyId, portfolio.version, Number(onchainId), portfolio.accountAddress as Address, { verifyChain });
+    const version = await deps.version(portfolio.strategyId, portfolio.version, Number(onchainId), portfolio.accountAddress as Address, { verifyChain, requireLatest });
     return { portfolio, version };
   }
   async function locked<T>(id: number, run: () => Promise<T>): Promise<T> {
@@ -182,7 +182,7 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
     const onchainId = (await deps.query<{ onchain_id: string }>('select onchain_id from strategies where id=$1', [p.strategyId])).rows[0]?.onchain_id;
     if (!onchainId) throw new AppError(409, 'STRATEGY_NOT_ON_CHAIN', 'strategy has no chain identity');
     const version = await deps.version(p.strategyId, p.version, Number(onchainId), p.accountAddress as Address);
-    try { await deps.version(p.strategyId, p.version, Number(onchainId), p.accountAddress as Address, { blockNumber: evidence.blockNumber, blockHash: evidence.blockHash }); }
+    try { await deps.version(p.strategyId, p.version, Number(onchainId), p.accountAddress as Address, { requireLatest: true, blockNumber: evidence.blockNumber, blockHash: evidence.blockHash }); }
     catch (error) { await reconcileReorg(error); throw error; }
     const confirmedAt = evidence.confirmedAt;
     const feeReserve = version.execution.kind === 'per_asset' && version.execution.assets.some(a=>a.asset!==numeraireFor(p.chainId)) ? await deps.feeReserve(p,version) : 0n;
@@ -310,7 +310,12 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
         const cash = await deps.cash(p.chainId, p.accountAddress as Address);
         if (!/^\d+$/.test(cash.amountRaw)) throw storageUnavailable();
         if (grant && BigInt(cash.amountRaw) > 0n) return { state: 'ready' as const, lot: null, funding: 'existing_cash' as const };
-        if (!grant) grant = await deps.welcome.issue({ chainId: 97, owner: p.ownerAddress as Address, portfolioId: id, account: p.accountAddress as Address });
+        if (!grant) {
+          // Existing receipts above must still reconcile against their original block/version.
+          // A fresh mint must never fund a version the scheduler can no longer buy.
+          await context(id, wallet, true, true);
+          grant = await deps.welcome.issue({ chainId: 97, owner: p.ownerAddress as Address, portfolioId: id, account: p.accountAddress as Address });
+        }
         if (grant.portfolioId !== id || grant.state === 'failed') {
           throw new AppError(409, 'DAILY_FAUCET_REQUIRED', 'welcome already assigned; claim daily 1000 test USDT via POST /faucet/usdt for this account');
         }

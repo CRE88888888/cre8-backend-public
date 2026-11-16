@@ -1,3 +1,4 @@
+import { verifyEnrollmentSponsorship } from './enrollment-sponsorship.js';
 import {
   concatHex, createPublicClient, decodeAbiParameters, decodeFunctionData, encodeAbiParameters,
   encodeFunctionData, http, isAddressEqual, keccak256, pad, parseAbi, parseAbiItem, slice, toHex, toFunctionSelector, zeroAddress,
@@ -10,7 +11,7 @@ import type { Address, Hex, PublicClient } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import type { GetPaymasterDataParameters, PaymasterActions } from 'viem/account-abstraction';
 import { entryPoint07Abi } from 'viem/account-abstraction';
-import { EXECUTOR_ABI, REGISTRY_ABI } from './chain.js';
+import { EXECUTOR_ABI, REGISTRY_ABI, REGISTRY_VERSION_ABI } from './chain.js';
 import { KERNEL_V3_3_ADDRESSES } from './addresses.js';
 import { loadPaymasterConfig, loadTradingConfig } from './config.js';
 import type { PaymasterConfig, TradingConfig } from './config.js';
@@ -58,6 +59,7 @@ export class GasBudgetExceededError extends AppError {
 type Query = (sql: string, params?: readonly unknown[]) => Promise<{ rows: unknown[] }>;
 export type PaymasterDeps = {
   config?: PaymasterConfig | null;
+  enrollmentSetup?: typeof verifyEnrollmentSponsorship;
   now?: () => number;
   query?: Query;
   checkChain?: (op: PackedSponsorOperation, config: PaymasterConfig) => Promise<void>;
@@ -197,7 +199,7 @@ export function validateSponsoredCalls(op: PackedSponsorOperation, c: PaymasterC
             encodeFunctionData({ abi: YIELD_REGISTRY_ABI, functionName: inner.functionName, args: inner.args }).toLowerCase() !== call.callData.toLowerCase()) throw new Error('invalid yield owner calldata');
       } else if (isAddressEqual(call.target, c.registry)) {
         const inner = decodeFunctionData({ abi: REGISTRY_ABI, data: call.callData });
-        if (inner.functionName !== 'enroll' || !isAddressEqual(inner.args[0], op.sender) || inner.args[1] === 0n ||
+        if (inner.functionName !== 'enroll' || !isAddressEqual(inner.args[0], op.sender) || inner.args[1] === 0n || inner.args[2] === 0 ||
             encodeFunctionData({ abi: REGISTRY_ABI, functionName: inner.functionName, args: inner.args }).toLowerCase() !== call.callData.toLowerCase()) throw new Error('invalid enrollment');
       } else if ((assets.some((asset) => isAddressEqual(call.target, asset)) ||
           c.chainId === 97 && TESTNET_97.yieldMarkets.some(m => isAddressEqual(call.target, m.receipt)) && call.callData.startsWith(toFunctionSelector('approve(address,uint256)'))) &&
@@ -295,10 +297,9 @@ async function readBudgetContext(op: PackedSponsorOperation, c: PaymasterConfig)
     const blockNumber = await client.getBlockNumber({ cacheTime: 0 });
     const numeraire = await client.readContract({ address: c.executor, abi: BUDGET_ORACLE_ABI, functionName: 'numeraire', blockNumber });
     const enrollment = await client.readContract({ address: c.registry, abi: REGISTRY_ABI, functionName: 'enrollments', args: [op.sender], blockNumber });
-    const version = await client.readContract({ address: c.registry,
-      abi: parseAbi(['function version(uint256,uint16) view returns ((address[] assets,uint16[] weightsBps,bytes32 scheduleHash,uint64 activeAt))']),
-      functionName: 'version', args: [enrollment[0], enrollment[1]], blockNumber });
-    const assets = version.assets;
+    // P11 exits must account for every historically effective asset, including new versions.
+    const assets = await client.readContract({ address: c.registry, abi: REGISTRY_VERSION_ABI,
+      functionName: 'historicalAssets', args: [enrollment[0]], blockNumber });
     const moved = new Map<string, bigint>();
     if (tokenCalls) {
       for (const call of calls) {
@@ -637,6 +638,7 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
       const request = object(input);
       if (Object.keys(request).some((key) => !['userOperation', 'validUntil'].includes(key))) throw rejected('PAYMASTER_INVALID_OPERATION');
       const op = parsePackedSponsorOperation(request.userOperation);
+      if (c.chainId === 97 && op.initCode !== '0x') throw rejected('PAYMASTER_ACCOUNT_UNDEPLOYED', 403);
       const now = (deps.now ?? (() => Math.floor(Date.now() / 1000)))();
       const requestedUntil = request.validUntil;
       if (requestedUntil !== undefined && (typeof requestedUntil !== 'number' || !Number.isSafeInteger(requestedUntil) || requestedUntil <= now)) throw rejected('PAYMASTER_EXPIRED');
@@ -644,7 +646,11 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
       const calls = sponsoredCalls(op);
       const known = await bounded((deps.query ?? query)(`select s.owner, p.user_id from smart_accounts s join portfolios p on p.id = s.portfolio_id
         where s.chain_id = $1 and s.address = $2 and s.account_type = 'KERNEL'`, [c.chainId, op.sender]), c.timeoutMs);
-      const owner = known.rows.length === 1 ? object(known.rows[0]) : null;
+      let owner = known.rows.length === 1 ? object(known.rows[0]) : null;
+      if (known.rows.length === 0 && c.chainId === 97) {
+        await bounded((deps.enrollmentSetup ?? verifyEnrollmentSponsorship)(op, c, wallet), c.timeoutMs);
+        owner = { owner: wallet, user_id: wallet };
+      }
       if (!owner || typeof owner.owner !== 'string' || typeof owner.user_id !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(wallet) ||
           owner.owner.toLowerCase() !== wallet.toLowerCase() || owner.user_id.toLowerCase() !== wallet.toLowerCase()) throw rejected('PAYMASTER_SENDER_FORBIDDEN', 403);
       // Chain 97 never falls back to mainnet's DB seed. Local forks use the existing enabled address book.

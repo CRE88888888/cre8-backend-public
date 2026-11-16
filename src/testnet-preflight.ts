@@ -22,7 +22,9 @@ export function testnetProfileTargets(): { name: string; address: Address }[] {
 }
 
 const selectors: Record<string, readonly string[]> = {
-  registry: ['enroll(address,uint256)', 'operator()', 'owner()', 'numeraire()'],
+  kernelMetaFactory: ['deployWithFactory(address,bytes,bytes32)'],
+  registry: ['enroll(address,uint256,uint16)', 'approveEnrollment(uint256,uint16)', 'cancelVersion(uint256)',
+    'activeVersion(uint256)', 'historicalAssets(uint256)', 'MAX_STRATEGY_ASSETS()', 'operator()', 'owner()', 'numeraire()'],
   executor: ['executeRebalance(address,(address,address,uint256,uint256,address,bytes)[],uint256)', 'numeraire()', 'oracle()', 'venues(address)',
     'executeSupply(address,bytes32,uint256,uint256,uint256)', 'executeWithdraw(address,bytes32,uint256,uint256,uint256)', 'yieldRegistry()'],
   yieldRegistry: ['quoteSupply(bytes32,address,uint256)', 'quoteWithdraw(bytes32,uint256)', 'market(bytes32)', 'setYieldPolicy(bytes32,uint256,bool)'],

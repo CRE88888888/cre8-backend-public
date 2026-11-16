@@ -70,6 +70,7 @@ export function yieldFixture(protocols:YieldProtocol[]=['venus','lista','aave_v3
       if(c.name==='actionPaused'||c.name==='paused')return state.withdrawPaused;
       if(c.name==='marketCount')return BigInt(profile.markets.length);if(c.name==='marketIds')return profile.markets[Number(c.args?.[0])]?.marketId;
       if(c.name==='registry'||c.name==='yieldRegistry')return registry;if(c.name==='enrollments')return[1n,1,false];if(c.name==='version')return{assets:[asset]};
+      if(c.name==='historicalAssets')return [asset];
       if(c.name==='oracle')return oracle;if(c.name==='numeraire')return asset;
       if(c.name==='market')return{chainId:97n,kind:({venus:1,lista:2,aave_v3:3})[m.protocol],asset,receipt:m.receipt,target:m.target,riskSource,configuration:blockHash,minRate:1n,maxRate:WAD*1000n,supplyEnabled:!state.paused,retired:false};
       if(c.name==='refreshHealth'||c.name==='health')return state.paused?null:{supply:1_000_000n*WAD,liquidity:100_000n*WAD,utilizationBps:state.utilization,configuration:blockHash};

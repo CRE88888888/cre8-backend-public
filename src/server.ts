@@ -1,3 +1,4 @@
+import { configuredChainId } from './testnet-profile.js';
 import { createYieldService } from './yield-service.js';
 import { createServer as createHttpServer } from 'node:http';
 import { createPublicClient, http, toHex } from 'viem';
@@ -22,10 +23,10 @@ import { getConfig, getSessionKeyConfig } from './config.js';
 import { createPlatformStatusReader } from './chain.js';
 import { query } from './db.js';
 import { AppError, ValidationError } from './errors.js';
-import { createStrategy, getStrategy, listStrategies, publishVersion, typedVersionInput, typedMinimumDeposit } from './strategies.js';
+import { strategyVersionState, getStrategyWithVersionState, createStrategy, getStrategy, listStrategies, publishVersion, typedVersionInput, typedMinimumDeposit } from './strategies.js';
 import { previewContributionAsync } from './contribution-preview.js';
 import { createPortfolioStrategyService } from './portfolio-strategies.js';
-import { listPortfolios, enrollPortfolio, allocationMinimumDeposit, strategyMinimumDeposit } from './portfolios.js';
+import { listPortfolios, enrollPortfolio, preparePortfolioEnrollment, allocationMinimumDeposit, strategyMinimumDeposit } from './portfolios.js';
 import { buildRenewalParams, recordRenewalResult, resolveBundlerUrl } from './renewal.js';
 import {
   OPERATOR_REBALANCE_ENV,
@@ -189,6 +190,9 @@ export type ServerDeps = {
   createStrategy: typeof createStrategy;
   publishVersion: typeof publishVersion;
   enrollPortfolio: typeof enrollPortfolio;
+  preparePortfolioEnrollment: typeof preparePortfolioEnrollment;
+  strategyVersionState: typeof strategyVersionState;
+  strategyDetail: typeof getStrategyWithVersionState;
   listPortfolios: typeof listPortfolios;
   buildRenewalParams: typeof buildRenewalParams;
   recordRenewalResult: typeof recordRenewalResult;
@@ -312,7 +316,7 @@ const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
   platformStatus: createPlatformStatusReader(),
   createStrategy,
   publishVersion,
-  enrollPortfolio,
+  enrollPortfolio, preparePortfolioEnrollment, strategyVersionState, strategyDetail: getStrategyWithVersionState,
   listPortfolios,
   buildRenewalParams,
   recordRenewalResult,
@@ -610,7 +614,16 @@ async function route(
     }
     if (segments.length === 2) {
       if (method !== 'GET') return methodNotAllowed(res, ['GET']);
-      return detailRoute(res, parsePositiveInteger(segments[1] ?? '', 'strategy id'));
+      return detailRoute(res, parsePositiveInteger(segments[1] ?? '', 'strategy id'), deps);
+    }
+    if (segments.length === 4 && segments[2] === 'versions') {
+      if (segments[3] === 'cancel') throw new AppError(404, 'NOT_FOUND', 'route not found');
+      if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+      await deps.auth.authenticate(req.headers.authorization);
+      const version = parsePositiveInteger(segments[3] ?? '', 'version');
+      if (version > 65535) throw new ValidationError('INVALID_ID', 'version must fit uint16');
+      sendJson(res, 200, await deps.strategyVersionState(parsePositiveInteger(segments[1] ?? '', 'strategy id'), version));
+      return;
     }
     if (segments.length === 3 && segments[2] === 'versions') {
       if (method !== 'POST') return methodNotAllowed(res, ['POST']);
@@ -624,6 +637,17 @@ async function route(
   }
 
   if (root === 'portfolios') {
+    if (segments.length === 2 && (segments[1] === 'enrollment-params' || segments[1] === 'enrollment-confirm')) {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      const wallet = await deps.auth.authenticate(req.headers.authorization);
+      await deps.rateLimiter.wallet(configuredChainId() === 97 ? segments[1] : 'portfolios', wallet);
+      const body = await readJsonBody(req);
+      if (typeof body !== 'object' || body === null || Array.isArray(body) || !('strategyId' in body)) throw new ValidationError('INVALID_PORTFOLIO', 'strategyId is required');
+      const strategyId = parsePositiveInteger(String(body.strategyId), 'strategyId');
+      sendJson(res, 200, segments[1] === 'enrollment-confirm' ? await deps.enrollPortfolio(strategyId, wallet) : await deps.preparePortfolioEnrollment(strategyId, wallet));
+      return;
+    }
+
     // `/portfolios` 有 GET（列表）與 POST（enroll）兩個 method，`/portfolios/:id/<action>` 有兩個子路由。
     // 分派一律先看 segment 數量、再看 method：只看前綴的話 `POST /portfolios/:id/renewal-result` 會被
     // 「POST /portfolios」吃掉（它也是 POST，只差在路徑長度）。
@@ -789,8 +813,8 @@ async function listRoute(res: ServerResponse, url: URL): Promise<void> {
 }
 
 /** GET /strategies/:id — metadata plus version history (newest first). */
-async function detailRoute(res: ServerResponse, id: number): Promise<void> {
-  const strategy = await getStrategy(id);
+async function detailRoute(res: ServerResponse, id: number, deps: ServerDeps): Promise<void> {
+  const strategy = await deps.strategyDetail(id);
   const versions = strategy.versions.map((version) => ({ ...version, minDepositUsdtWei: version.executionSchemaVersion !== 0 ? typedMinimumDeposit(version) : allocationMinimumDeposit(version.allocation) }));
   sendJson(res, 200, { ...strategy, versions, minDepositUsdtWei: versions[0]?.minDepositUsdtWei ?? null });
 }
@@ -840,12 +864,16 @@ async function publishVersionRoute(
  */
 async function enrollRoute(req: IncomingMessage, res: ServerResponse, deps: ServerDeps): Promise<void> {
   const provider = await deps.auth.authenticate(req.headers.authorization);
-  await deps.rateLimiter.wallet('portfolios', provider);
+  await deps.rateLimiter.wallet(configuredChainId() === 97 ? 'enrollment-params' : 'portfolios', provider);
   const body = await readJsonBody(req);
   if (typeof body !== 'object' || body === null || Array.isArray(body)) {
     throw new ValidationError('INVALID_PORTFOLIO', 'request body must be a JSON object');
   }
   const strategyId = parsePositiveInteger(String((body as Record<string, unknown>).strategyId ?? ''), 'strategyId');
+  if (configuredChainId() === 97) {
+    sendJson(res, 200, await deps.preparePortfolioEnrollment(strategyId, provider));
+    return;
+  }
   const portfolio = await deps.enrollPortfolio(strategyId, provider);
   sendJson(res, 201, portfolio, { location: `/portfolios/${portfolio.id}` });
 }
@@ -1192,6 +1220,10 @@ function sendError(res: ServerResponse, err: unknown): void {
   if (err instanceof RateLimitError) {
     res.setHeader('retry-after', String(err.retryAfterSeconds));
     res.setHeader('access-control-expose-headers', 'Retry-After');
+  }
+  if (err instanceof AppError && err.status === 202 && err.code === 'ACCOUNT_DEPLOYMENT_PENDING') {
+    sendJson(res, 202, { accountDeployed: false, retryAfterSeconds: 3, error: { code: err.code, message: err.message } }, { 'retry-after': '3', 'access-control-expose-headers': 'Retry-After' });
+    return;
   }
   if (err instanceof AppError) {
     sendJson(res, err.status, { error: { code: err.code, message: err.message } });

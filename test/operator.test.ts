@@ -98,6 +98,11 @@ function samplePlan(overrides: Partial<PortfolioPlan> = {}): PortfolioPlan {
   };
 }
 
+function ownedPortfolio() {
+  return { id: PORTFOLIO_ID, userId: WALLET.address, strategyId: 447, version: 1, scheduleState: 'active',
+    createdAt: new Date(0).toISOString(), chainId: 56, accountAddress: ACCOUNT, ownerAddress: WALLET.address, existingKeyRefs: [] };
+}
+
 const SYMBOL_ROWS = [
   { address: WBNB, symbol: 'WBNB' },
   { address: USDT, symbol: 'USDT' },
@@ -157,7 +162,7 @@ function symbolQuery(rows: unknown[] = SYMBOL_ROWS) {
 test('status 回傳漂移、持倉、目標與 blocked，並且持倉的 usdValueE8 與漂移報告逐位相同', async () => {
   const reader = createPortfolioStatusReader({
     planPortfolio: async () => samplePlan(),
-    requireOwnedPortfolio: async () => undefined as never,
+    requireOwnedPortfolio: async () => ownedPortfolio(),
     query: symbolQuery(),
   });
 
@@ -201,7 +206,7 @@ test('status 在 blocked 時回報原因、drift 是 null、complete 是 false�
           unpriced: [{ asset: USDT, symbol: 'USDT', amountWei: 5n, decimals: 18, reason: 'no_usdt_pool' }],
         },
       }),
-    requireOwnedPortfolio: async () => undefined as never,
+    requireOwnedPortfolio: async () => ownedPortfolio(),
     query: symbolQuery(),
   });
 
@@ -219,7 +224,7 @@ test('status 在 blocked 時回報原因、drift 是 null、complete 是 false�
 test('status 讀不到 ticker 時整支 503，不回一份沒有 ticker 的表', async () => {
   const reader = createPortfolioStatusReader({
     planPortfolio: async () => samplePlan(),
-    requireOwnedPortfolio: async () => undefined as never,
+    requireOwnedPortfolio: async () => ownedPortfolio(),
     query: async () => {
       throw new Error('relation "priceable_assets" does not exist');
     },
@@ -240,7 +245,7 @@ test('planPortfolio 失敗時回 503 並帶上原因（不是 500，也不是空
     planPortfolio: async () => {
       throw new Error('fork 過期：403 Must be authenticated!');
     },
-    requireOwnedPortfolio: async () => undefined as never,
+    requireOwnedPortfolio: async () => ownedPortfolio(),
     query: symbolQuery(),
     log: () => undefined,
   });
@@ -266,7 +271,7 @@ test('TTL 內連點兩次只讀一次鏈，TTL 過了才重讀', async () => {
       calls += 1;
       return samplePlan();
     },
-    requireOwnedPortfolio: async () => undefined as never,
+    requireOwnedPortfolio: async () => ownedPortfolio(),
     query: symbolQuery(),
     now: () => clock,
   });
@@ -295,7 +300,7 @@ test('同時進來的兩個請求共用同一次讀鏈（連點的真正殺傷�
       await gate;
       return samplePlan();
     },
-    requireOwnedPortfolio: async () => undefined as never,
+    requireOwnedPortfolio: async () => ownedPortfolio(),
     query: symbolQuery(),
   });
 
@@ -315,7 +320,7 @@ test('失敗不快取：RPC 掛掉時下一個請求會真的重試', async () =
       if (calls === 1) throw new Error('connect ECONNREFUSED 127.0.0.1:8545');
       return samplePlan();
     },
-    requireOwnedPortfolio: async () => undefined as never,
+    requireOwnedPortfolio: async () => ownedPortfolio(),
     query: symbolQuery(),
     log: () => undefined,
   });
@@ -336,7 +341,7 @@ test('擁有者檢查在快取之前：命中快取也一定會再驗一次「�
     },
     requireOwnedPortfolio: async () => {
       owned += 1;
-      return undefined as never;
+      return ownedPortfolio();
     },
     query: symbolQuery(),
   });
@@ -620,6 +625,7 @@ async function loginToken(baseUrl: string, wallet: Pick<PrivateKeyAccount, 'addr
 }
 
 const SAMPLE_STATUS: PortfolioStatus = {
+  buyingPaused: null,
   portfolioId: PORTFOLIO_ID,
   pauseFlags: 0,
   pauseSources: [],
@@ -1095,7 +1101,7 @@ function runResult(overrides: Partial<PortfolioRunResult> = {}): PortfolioRunRes
   };
 }
 
-const OWNED = async () => undefined as never;
+const OWNED = async () => ownedPortfolio();
 
 function schedulerStub(result: PortfolioRunResult | null, seen: { dryRun?: boolean | undefined; limit?: number | undefined } = {}) {
   return (async (args: { dryRun?: boolean; limit?: number }) => {
@@ -1312,7 +1318,7 @@ test('portfolioStatus：gas 算得出來就帶上，讀不到是 null 而不是 
   const makeReader = (balance: (() => Promise<bigint>) | null) =>
     createPortfolioStatusReader({
       planPortfolio: async () => samplePlan(),
-      requireOwnedPortfolio: async () => undefined as never,
+      requireOwnedPortfolio: async () => ownedPortfolio(),
       query: symbolQuery(),
       // session key 的讀取會打鏈；這條測試只關心 gas，所以讓它失敗（status 會記在 sessionKey.error）。
       publicClient: {
@@ -1571,4 +1577,36 @@ test('#96 closed-market stock redemption blocks first, continuation and close wi
     const open=await buildRedeemPlan({portfolioId:PORTFOLIO_ID,account:ACCOUNT,plan:stockPlan},request,{...f.deps,now:()=>new Date('2026-11-16T16:00:00Z')});
     assert.equal(open.plan.kind,'ready',open.plan.kind==='blocked'?open.plan.reason:'stock sale must resume during trading hours');
   }
+});
+
+for (const joinedVersion of [1, 2]) {
+  test(`#124 status exposes joined ${joinedVersion}/active 2 buying pause separately from valuation and exits`, async () => {
+    const reader = createPortfolioStatusReader({
+      planPortfolio: async () => samplePlan({ pinnedVersion: { version: 2, onchainStrategyId: 3, paused: false } }),
+      requireOwnedPortfolio: async () => ({ id: PORTFOLIO_ID, userId: WALLET.address, strategyId: 447, version: joinedVersion,
+        scheduleState: 'active', createdAt: new Date(0).toISOString(), chainId: 56, accountAddress: ACCOUNT,
+        ownerAddress: WALLET.address, existingKeyRefs: [] }),
+      query: symbolQuery(), readPauseFlags: async () => 0, accountGasBalance: async () => 10n**18n, gasPrice: async () => 1n,
+    });
+    const status = await reader(PORTFOLIO_ID, WALLET.address);
+    assert.deepEqual(status.buyingPaused, joinedVersion === 1 ? { reason: 'NEW_VERSION_ACTIVE', joinedVersion: 1, activeVersion: 2 } : null);
+    assert.equal(status.complete, true); assert.deepEqual(status.blocked, []);
+    assert.equal(status.totalUsdE8, '60000000000'); assert.equal(status.holdings.length, 2);
+  });
+}
+
+test('#124 authenticated fund status serializes buying pause independently from complete and blocked', async () => {
+  const reader = createPortfolioStatusReader({
+    planPortfolio: async () => samplePlan({ pinnedVersion: { version: 2, onchainStrategyId: 3, paused: false } }),
+    requireOwnedPortfolio: async () => ownedPortfolio(), query: symbolQuery(), readPauseFlags: async () => 0, accountGasBalance: async () => 10n**18n, gasPrice: async () => 1n,
+  });
+  await withServer(async base => {
+    const token = await loginToken(base, WALLET);
+    const response = await getJson(base, `/portfolios/${PORTFOLIO_ID}/status`, token);
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.ok(typeof result === 'object' && result !== null && 'buyingPaused' in result && 'complete' in result && 'blocked' in result && 'totalUsdE8' in result);
+    assert.deepEqual(result.buyingPaused, { reason: 'NEW_VERSION_ACTIVE', joinedVersion: 1, activeVersion: 2 });
+    assert.equal(result.complete, true); assert.deepEqual(result.blocked, []); assert.equal(result.totalUsdE8, '60000000000');
+  }, { portfolioStatus: reader });
 });

@@ -197,6 +197,7 @@ export type RateLimitConfig = {
   redeemPerMinute: number;
   closePerMinute: number;
   assetsPerMinute: number;
+  enrollmentPerMinute: number;
   maxNonces: number;
   trustedProxyIps: string[];
 };
@@ -218,6 +219,7 @@ export function loadRateLimitConfig(env: NodeJS.ProcessEnv = process.env): RateL
     redeemPerMinute: budget('RATE_LIMIT_REDEEM_PER_MINUTE', 30),
     closePerMinute: budget('RATE_LIMIT_CLOSE_PER_MINUTE', 30),
     assetsPerMinute: budget('RATE_LIMIT_ASSETS_PER_MINUTE', 120),
+    enrollmentPerMinute: budget('RATE_LIMIT_ENROLLMENT_PER_MINUTE', 30),
     maxNonces: parseInteger(env, 'AUTH_MAX_NONCES', 10_000, { min: 1, max: 1_000_000 }),
     trustedProxyIps,
   };
@@ -225,6 +227,13 @@ export function loadRateLimitConfig(env: NodeJS.ProcessEnv = process.env): RateL
 
 export function loadRelayerGasConfig(env: NodeJS.ProcessEnv = process.env): { minRelayerGasWei: bigint } {
   return { minRelayerGasWei: parseBigInt(env, 'MIN_RELAYER_GAS_WEI', 10n ** 16n) };
+}
+
+export function loadAccountDeploymentConfig(env: NodeJS.ProcessEnv = process.env) {
+  return {
+    perDay: parseInteger(env, 'ACCOUNT_DEPLOYMENTS_PER_DAY', 300, { min: 0, max: 1_000_000 }),
+    minBalanceWei: parseBigInt(env, 'ACCOUNT_DEPLOYMENT_MIN_BALANCE_WEI', 50_000_000_000_000_000n),
+  };
 }
 
 /** 選填但必須成對設定；錯誤訊息只列變數名，不回顯憑證。 */
@@ -306,6 +315,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   loadTelegramConfig(env);
   loadRateLimitConfig(env);
   loadRelayerGasConfig(env);
+  loadAccountDeploymentConfig(env);
   loadPaymasterConfig(env);
   loadTradingConfig(env);
   loadPointsConfig(env);

@@ -1,8 +1,11 @@
 import { isIP } from 'node:net';
 import { AppError } from './errors.js';
-import { ConfigurationError, loadRateLimitConfig } from './config.js';
+import { ConfigurationError, loadRateLimitConfig, loadAccountDeploymentConfig } from './config.js';
 import type { RateLimitConfig } from './config.js';
 import { withTransaction } from './db.js';
+import type { PoolClient } from 'pg';
+import type { Address } from 'viem';
+import { kernelAddressesForChain } from './addresses.js';
 
 const MINUTE_MS = 60_000;
 const DAY_MS = 86_400_000;
@@ -55,7 +58,46 @@ export class MemoryRateLimitStore implements RateLimitStore {
   }
 }
 
-export type WalletAction = 'strategies' | 'versions' | 'portfolios' | 'plan' | 'redeem' | 'close' | 'assets';
+export type WalletAction = 'strategies' | 'versions' | 'portfolios' | 'plan' | 'redeem' | 'close' | 'assets' | 'enrollment-params' | 'enrollment-confirm';
+
+async function consumeDaily(client: PoolClient, owner: string, action: string, limit: number): Promise<RateLimitDecision> {
+  if (!/^0x[0-9a-f]{40}$/.test(owner) || /^0x0{40}$/.test(owner) ||
+      !['create_strategy','publish_version','join'].includes(action) || !Number.isSafeInteger(limit) || limit < 0) throw new RangeError('invalid daily request budget');
+  const clock = (await client.query<{ retry: number }>(`select greatest(1,ceil(extract(epoch from
+    (date_trunc('day',transaction_timestamp() at time zone 'UTC')+interval '1 day'-(transaction_timestamp() at time zone 'UTC')))))::int as retry`)).rows[0];
+  if (!clock || !Number.isSafeInteger(clock.retry) || clock.retry < 1) throw new Error('budget clock unavailable');
+  const consumed = await client.query(`insert into daily_operation_counts(owner,action,utc_day,count)
+    select $1,$2,(transaction_timestamp() at time zone 'UTC')::date,1 where $3::bigint>0
+    on conflict(owner,action,utc_day) do update set count=daily_operation_counts.count+1,updated_at=clock_timestamp()
+    where daily_operation_counts.count<$3::bigint returning count`, [owner, action, limit]);
+  return { allowed: consumed.rows.length === 1, retryAfterSeconds: consumed.rows.length === 1 ? 0 : clock.retry };
+}
+
+/** Both counters commit together immediately before a deployment attempt. The pinned
+ * MetaFactory contract is the shared namespace in the existing join counter (it
+ * cannot be a signing login wallet). No operator/owner rotation resets this budget.
+ * Unknown COMMIT denies broadcast; a committed attempt is never refunded/retried.
+ */
+export async function consumeAccountDeploymentBudget(owner: Address, transaction = withTransaction,
+  limits = { perOwner: loadRateLimitConfig().portfoliosPerDay, perDay: loadAccountDeploymentConfig().perDay }): Promise<void> {
+  const globalOwner = kernelAddressesForChain(97).kernelMetaFactory.toLowerCase();
+  try {
+    if (owner.toLowerCase() === globalOwner) throw new Error('deployment owner conflicts with quota namespace');
+    await transaction(async client => {
+      await client.query("set local statement_timeout='5s'");
+      await client.query("set local lock_timeout='5s'");
+      // Global row first gives concurrent writers a consistent lock order.
+      if (!(await consumeDaily(client, globalOwner, 'join', limits.perDay)).allowed) {
+        throw new AppError(503, 'ACCOUNT_DEPLOYMENT_DAILY_LIMIT', 'daily account deployment limit reached; retry next UTC day');
+      }
+      const personal = await consumeDaily(client, owner.toLowerCase(), 'join', limits.perOwner);
+      if (!personal.allowed) throw new RateLimitError(personal.retryAfterSeconds);
+    });
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw new AppError(503, 'ACCOUNT_DEPLOYMENT_BUDGET_UNAVAILABLE', 'account deployment budget unavailable; retry later');
+  }
+}
 
 /** Daily attempted-request budgets use the database UTC clock and one atomic UPSERT.
  * Never retry an ambiguous commit or fall back to process memory.
@@ -65,22 +107,16 @@ export class PersistentRateLimitStore implements RateLimitStore {
   constructor(readonly transaction = withTransaction) {}
   async consume(key: string, policy: RateLimitPolicy, now: number): Promise<RateLimitDecision> {
     const match = /^wallet:(0x[0-9a-f]{40}):(strategies|versions|portfolios)$/.exec(key);
+    const owner = match?.[1];
     if (policy.windowMs !== DAY_MS) return this.#shortWindows.consume(key, policy, now);
-    if (!match || !match[1] || /^0x0{40}$/.test(match[1]) || !Number.isSafeInteger(policy.limit) || policy.limit < 0) throw new RangeError('invalid daily request budget');
+    if (!match || !owner || /^0x0{40}$/.test(owner) || !Number.isSafeInteger(policy.limit) || policy.limit < 0) throw new RangeError('invalid daily request budget');
     const actions: Record<string, string> = { strategies: 'create_strategy', versions: 'publish_version', portfolios: 'join' };
     const action = actions[match[2] ?? ''];
     if (!action) throw new RangeError('invalid daily request action');
     return this.transaction(async client => {
       await client.query("set local statement_timeout='5s'");
       await client.query("set local lock_timeout='5s'");
-      const clock = (await client.query<{ retry: number }>(`select greatest(1,ceil(extract(epoch from
-        (date_trunc('day',transaction_timestamp() at time zone 'UTC')+interval '1 day'-(transaction_timestamp() at time zone 'UTC')))))::int as retry`)).rows[0];
-      if (!clock || !Number.isSafeInteger(clock.retry) || clock.retry < 1) throw new Error('budget clock unavailable');
-      const consumed = await client.query(`insert into daily_operation_counts(owner,action,utc_day,count)
-        select $1,$2,(transaction_timestamp() at time zone 'UTC')::date,1 where $3::bigint>0
-        on conflict(owner,action,utc_day) do update set count=daily_operation_counts.count+1,updated_at=clock_timestamp()
-        where daily_operation_counts.count<$3::bigint returning count`, [match[1], action, policy.limit]);
-      return { allowed: consumed.rows.length === 1, retryAfterSeconds: consumed.rows.length === 1 ? 0 : clock.retry };
+      return consumeDaily(client, owner, action, policy.limit);
     });
   }
 }
@@ -132,6 +168,8 @@ export class RequestRateLimiter {
       redeem: { limit: this.config.redeemPerMinute, windowMs: MINUTE_MS },
       close: { limit: this.config.closePerMinute, windowMs: MINUTE_MS },
       assets: { limit: this.config.assetsPerMinute, windowMs: MINUTE_MS },
+      'enrollment-params': { limit: this.config.enrollmentPerMinute, windowMs: MINUTE_MS },
+      'enrollment-confirm': { limit: this.config.enrollmentPerMinute, windowMs: MINUTE_MS },
     };
     const policy = limits[action];
     await this.#consume('wallet:' + wallet.toLowerCase() + ':' + action, policy.limit, policy.windowMs);

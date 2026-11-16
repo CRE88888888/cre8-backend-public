@@ -61,6 +61,9 @@ jobs:
           test/yield-scheduler.test.ts
           test/alerts.test.ts
           test/chain.enroll.test.ts
+          test/account-deployment.test.ts
+          test/registry-versioning.test.ts
+          test/enrollment-sponsorship.test.ts
           test/drift.test.ts
           test/deployment.test.ts
           test/alto.test.ts

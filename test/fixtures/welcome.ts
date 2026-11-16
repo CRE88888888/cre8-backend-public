@@ -6,6 +6,7 @@ import { query, migrate } from '../../src/db.js';
 import { createPortfolioStrategyService } from '../../src/portfolio-strategies.js';
 import type { PortfolioStrategyDeps } from '../../src/portfolio-strategies.js';
 import { requireOwnedPortfolio } from '../../src/portfolios.js';
+import { registryConfigHash, typedVersionSettings } from '../../src/registry-versioning.js';
 import { requireTypedVersion, validateAllocation } from '../../src/strategies.js';
 import { canonicalConfigHash } from '../../src/strategy-execution.js';
 import type { AssetExecution, AssetSetting } from '../../src/strategy-execution.js';
@@ -22,7 +23,7 @@ export const hash = (): Hex => `0x${randomBytes(32).toString('hex')}`;
 export const welcomeConfig = { chainId: 97 as const, siteDailyWei: (1n << 256n) - 1n, timeoutMs: 5000 };
 
 /** Real DB/ownership/version/receipt readers; only the RPC transport and signing are controlled. */
-export async function welcomeFixture(owner = address(), kind: 'hold' | 'stack' = 'hold') {
+export async function welcomeFixture(owner = address(), kind: 'hold' | 'stack' = 'hold', options: { activeAt?: Date; p11?: boolean } = {}) {
   await migrate();
   const account = address();
   const s = (await query<{ id: string }>("insert into strategies(provider,name) values($1,'welcome-91') returning id", [owner])).rows[0];
@@ -34,10 +35,12 @@ export async function welcomeFixture(owner = address(), kind: 'hold' | 'stack' =
     a.address === TESTNET_97.contracts.usdt ? { asset: a.address, weightBps: a.weightBps, yield: null } : {
       asset: a.address, weightBps: a.weightBps, yield: null, execution: kind === 'hold' ? { kind: 'hold' } : { kind: 'stack', every: 'daily', weekday: null, timeUtc: '14:00', slices: 12 },
     }).sort((a, b) => a.asset.localeCompare(b.asset)) };
-  const activeAt = new Date('2026-11-15T00:00:00Z');
-  const configHash = canonicalConfigHash({ chainId: 97, execution, allocation, schedule: { kind: 'funding' }, activeAt });
+  const activeAt = options.activeAt ?? new Date('2026-11-15T00:00:00Z');
+  const config = { chainId: 97, execution, allocation, schedule: { kind: 'funding' as const }, activeAt };
+  const p11 = options.p11 ? typedVersionSettings(config) : undefined;
+  const configHash = p11 ? registryConfigHash(allocation.assets.map(a => a.address as Address), allocation.assets.map(a => a.weightBps), p11) : canonicalConfigHash(config);
   await query(`insert into strategy_versions(strategy_id,version,allocation,schedule,active_at,execution_schema_version,execution,execution_chain_id,config_hash)
-    values($1,1,$2,'{"kind":"funding"}',$3,2,$4,97,$5)`, [strategyId, JSON.stringify(allocation), activeAt, JSON.stringify(execution), configHash]);
+    values($1,1,$2,'{"kind":"funding"}',$3,2,$4,97,$5)`, [strategyId, JSON.stringify({ ...allocation, ...(p11 ? { p11 } : {}) }), activeAt, JSON.stringify(execution), configHash]);
   const p = (await query<{ id: string }>("insert into portfolios(user_id,strategy_id,version,schedule_state) values($1,$2,1,'paused') returning id", [owner, strategyId])).rows[0];
   assert.ok(p); const id = Number(p.id);
   await query("insert into smart_accounts(portfolio_id,chain_id,address,owner,account_type) values($1,97,$2,$3,'KERNEL')", [id, account, owner]);

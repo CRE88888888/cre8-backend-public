@@ -24,10 +24,8 @@ import { readPositions } from './positions.js';
  * ① **native BNB 不進漂移。** `readPositions` 把 gas 用的 BNB 單獨回傳，`holdings` 只有投資部位。
  *    詳見 positions.ts 的檔頭。
  *
- * ② **目標權重釘在鏈上的 `enrollment.version`，不是 DB 的 `portfolios.version`。**
- *    排程器要對齊的是「該帳戶被釘住的版本」：策略發了新版本之後，跟著舊版的帳戶若照新版的權重
- *    算，漂移會完全錯（而且看起來很合理）。`registry.version(id, 0)` 會被解析成 active version，
- *    那是同一種錯誤的另一個入口，所以 `version === 0` 在這裡是硬錯誤。
+ * ② **P11：目標權重取同一塊的最新已生效版本。** enrollment.version 只記錄本人接受時的版本。
+ *    未生效／取消版本不改目標；歷史曾生效資產以零權重納入賣出與估值。
  *
  * ③ **無價資產 → 整份拒算漂移（設計 (a)）。** `drift.ts` 的 `Holding` 需要 `usdPriceE8`；把無價
  *    資產當成 0 會讓其他資產的權重集體偏高，算出來的 `grossDriftBps` 看起來仍然合理，於是一個
@@ -42,12 +40,9 @@ import { readPositions } from './positions.js';
  *    表頭是那個永遠存在的東西，並且帶著 `complete`：false = 這一輪的漂移數字不可信（拒算的原因見
  *    ③ 與 `allocationCheck`），判讀前必須先看它。
  *
- * ⑤ **讀取與定價的宇宙 == 策略的 `version.assets`，不是 `priceable_assets` 全表。**
- *    執行器只允許換 `version.assets` 裡的代幣（`AtpExecutor.sol:180-182` 的 `isAssetAllowed`），
- *    所以策略外的代幣（空投、使用者亂轉）**賣不掉** → 不可能參與再平衡 → 不該進漂移的分母。
- *    `priceable_assets` 降級成查價表（「這個地址的價格怎麼查」），只回答定價，不回答「要讀哪些資產」。
- *    策略資產在查價表裡找不到、或沒有池／沒有價 → **仍然 blocked**（`UNPRICED_HOLDINGS`）：
- *    我們不知道策略成分值多少，就算不出權重，那是真正的問題。
+ * ⑤ **P11：讀取與定價的宇宙是曾生效資產的去重聯集。** 最新生效版本決定買入權重；
+ *    已移除資產的目標為零，只能賣回 numeraire。pending、取消與空投不進准入宇宙。
+ *    `priceable_assets` 只提供定價資料，不決定交易權限。
  *
  * ⑥ **策略外持倉：不阻擋，只記錄。** 它不進 `blocked`，也不進 `unpriced`（沒有 `decimals`，掃描
  *    只從日誌拿到地址），而是走表頭的 `unknown_token_count`（`holdings-scan.ts` 的掃描結果）。
@@ -67,40 +62,8 @@ const E18 = 10n ** 18n;
 const E8_TO_E18 = 10n ** 10n;
 
 /** 只用到兩個 view，但兩者的回傳形狀不同（struct vs 攤平），照合約定義寫清楚。 */
-const REGISTRY_ABI = [
-  {
-    type: 'function',
-    name: 'enrollments',
-    stateMutability: 'view',
-    inputs: [{ name: 'account', type: 'address' }],
-    outputs: [
-      { name: 'strategyId', type: 'uint256' },
-      { name: 'version', type: 'uint16' },
-      { name: 'paused', type: 'bool' },
-    ],
-  },
-  {
-    type: 'function',
-    name: 'version',
-    stateMutability: 'view',
-    inputs: [
-      { name: 'id', type: 'uint256' },
-      { name: 'versionNumber', type: 'uint16' },
-    ],
-    outputs: [
-      {
-        name: '',
-        type: 'tuple',
-        components: [
-          { name: 'assets', type: 'address[]' },
-          { name: 'weightsBps', type: 'uint16[]' },
-          { name: 'scheduleHash', type: 'bytes32' },
-          { name: 'activeAt', type: 'uint64' },
-        ],
-      },
-    ],
-  },
-] as const;
+import { REGISTRY_ABI as ENROLLMENT_ABI, REGISTRY_VERSION_ABI } from './registry-abi.js';
+const REGISTRY_ABI = [...ENROLLMENT_ABI, ...REGISTRY_VERSION_ABI] as const;
 
 const SQL_PORTFOLIO = `
   select p.id as portfolio_id, p.strategy_id, s.onchain_id, sa.address
@@ -118,7 +81,7 @@ const SQL_TOKENS =
 /** DB 的最小介面：只要求 `{ rows }`，`db.query` 與測試 stub 都直接接得上。 */
 export type QueryFn = (text: string, params?: readonly unknown[]) => Promise<{ rows: unknown[] }>;
 
-/** 鏈上 enrollment 釘住的版本。`version` 一定是 >= 1：0 會解析成 active version，這裡不接受。 */
+/** P11 最新生效版本（保留既有欄位名稱）。本人接受紀錄仍留在鏈上 enrollment.version。 */
 export type PinnedVersion = {
   version: number;
   onchainStrategyId: number;
@@ -161,6 +124,7 @@ export type PortfolioPlan = {
   pinnedVersion: PinnedVersion;
   allocationCheck: AllocationCheck;
   thresholdBps: number;
+  historicalAssetCount?: number;
 };
 
 export type PlanDeps = {
@@ -258,9 +222,7 @@ async function loadPortfolioContext(
 /**
  * `priceable_assets` → **查價表**：這個地址的價格怎麼查（有沒有池、是不是 numeraire、ticker 叫什麼）。
  *
- * 它**不再是**「要讀哪些資產」的來源。讀哪些資產由策略的 `version.assets` 決定，見 `planPortfolio`：
- * 執行器只允許換 `version.assets` 裡的代幣（`AtpExecutor.sol:180-182`），策略外的代幣賣不掉，
- * 所以它不可能參與再平衡，也就不該進漂移的分母。
+ * 它不決定讀取宇宙；P11 由 `historicalAssets` 與最新生效版本決定可賣出與買入的資產。
  *
  * `is_numeraire` 一定是 boolean 才算數：這一欄決定「要不要去問池子」，猜錯或預設成 false 會讓 USDT
  * 退回「無價」，於是持有 USDT 的帳戶又開始拒算漂移——一個看起來很安全、實際上讓索引器失效的狀態。
@@ -309,9 +271,8 @@ function defaultPublicClient(): PublicClient {
  * 排程決策——看過就是看過了，與這一輪要不要寫快照無關，所以它跟著觀測一起落地（`--write` 與純唯讀
  * 兩條路都會推進它）。`portfolio_snapshots`／`positions_snapshots` 仍然只有 `writeSnapshot` 會寫。
  *
- * 順序刻意是「先讀 DB 的 portfolio → 再讀鏈上的 enrollment → 用 enrollment.version 查 DB 的
- * allocation」：版本號只有鏈上那一份是權威的，DB 的 `portfolios.version` 是入學當下的鏡像，
- * 兩者分岔時以鏈上為準（而且分岔正好會被 `allocationCheck` 抓到）。
+ * 在同一塊讀 enrollment、activeVersion 與 historicalAssets，再用生效版本查 DB 及對照 allocation。
+ * 沒有 DB 鏡像時拒絕規劃；不猜測新設定，也不沿用接受時的舊權重。
  */
 export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): Promise<PortfolioPlan> {
   const query = deps.query ?? dbQuery;
@@ -337,15 +298,16 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
     functionName: 'enrollments',
     args: [account],
     blockNumber: block,
-  });
+  }).catch(() => { throw new Error('registry enrollment unavailable'); });
   const enrolledStrategyId = toInteger(enrollment[0].toString(), 'enrollment.strategyId');
-  const pinned = toInteger(enrollment[1], 'enrollment.version');
+  const accepted = toInteger(enrollment[1], 'enrollment.version');
+  const pinned = await client.readContract({ address: registryAddress, abi: REGISTRY_VERSION_ABI,
+    functionName: 'activeVersion', args: [BigInt(enrolledStrategyId)], blockNumber: block }).catch(() => { throw new Error('registry active version unavailable'); });
   if (enrolledStrategyId === 0) {
     throw new Error(`${account} 在 registry 上沒有 enroll 紀錄（enrollments 全為 0）`);
   }
-  if (pinned === 0) {
-    // 0 會讓 version(id, 0) 解析成 active version：那正是「用錯版本」的入口，不能放行。
-    throw new Error(`${account} 的 enrollment.version 是 0：這個帳戶沒有釘住任何版本，拒絕用 active version 猜`);
+  if (accepted === 0) {
+    throw new Error(`${account} 的 enrollment.version 是 0：這個帳戶沒有有效的本人同意版本，拒絕規劃`);
   }
   if (enrolledStrategyId !== onchainStrategyId) {
     throw new Error(
@@ -354,9 +316,11 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
     );
   }
 
+  if (pinned < 1 || pinned > 65535) throw new Error('registry has no effective version');
+
   const allocationRow = (await query(SQL_ALLOCATION, [strategyId, pinned])).rows[0];
   if (allocationRow === undefined) {
-    throw new Error(`DB 沒有 strategy_versions(${strategyId}, ${pinned})：鏈上釘住的版本還沒鏡像到 off-chain`);
+    throw new Error(`DB 沒有 strategy_versions(${strategyId}, ${pinned})：最新生效版本還沒鏡像到 off-chain`);
   }
   // 先讀 priceable_assets：targets 的 symbol 以它為權威（見 `parseAllocation` 的註解）。
   // 這一次查詢本來就會發生（後面定價要用），提前到這裡只是把同一個結果用在兩處。
@@ -377,7 +341,7 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
     functionName: 'version',
     args: [BigInt(enrolledStrategyId), pinned],
     blockNumber: block,
-  });
+  }).catch(() => { throw new Error('registry version config unavailable'); });
   const chainTargets: TargetWeight[] = onchainVersion.assets.map((asset, index) => ({
     asset: asset.toLowerCase(),
     weightBps: toInteger(onchainVersion.weightsBps[index], `registry.version().weightsBps[${index}]`),
@@ -401,27 +365,25 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
   }
   const allocationCheck: AllocationCheck = { consistent: mismatches.length === 0, chain: chainTargets, mismatches };
 
-  // 讀取與定價的宇宙 == 這個策略的 `version.assets`（鏈上 `registry.version()`；DB 的 allocation
-  // 靠 `allocationCheck` 對照）。**不是** `priceable_assets` 全表：
-  //
-  //   ① 執行器只允許換 `version.assets` 裡的代幣（AtpExecutor.sol:180-182 的 isAssetAllowed），
-  //      所以策略外的代幣（空投、使用者亂轉）**賣不掉**；
-  //   ② 賣不掉的東西不可能參與再平衡 ⇒ 它不該進漂移的分母；
-  //   ③ 把它讀進來、再因為「沒有價格」擋下漂移，就是把「無法執行的東西」當成「必須處理的東西」，
-  //      於是一個完全在目標上的投組會被一顆空投搞到停止再平衡。
-  //
-  // 查價表只用來回答「這個地址的價格怎麼查」。策略資產不在查價表裡 = 沒有定價來源，仍然照讀餘額，
-  // 但一持有就擋下漂移（`UNPRICED_HOLDINGS`）：我們不知道策略成分值多少，就算不出權重——那是真問題。
+  // P11 歷史資產去重後以零權重加入；最新版本以外的資產永不產生買入需求。
+  const history = await client.readContract({ address: registryAddress, abi: REGISTRY_VERSION_ABI,
+    functionName: 'historicalAssets', args: [BigInt(enrolledStrategyId)], blockNumber: block }).catch(() => { throw new Error('registry historical assets unavailable'); });
+  const historicalAssets = [...new Set(history.map(asset => asset.toLowerCase()))];
+  for (const asset of historicalAssets) if (!targets.some(t => t.asset === asset)) {
+    targets.push({ asset, weightBps: 0, symbol: symbolByAddress.get(asset) ?? shortAddress(asset) });
+  }
+  const cash = (await client.readContract({ address: registryAddress, abi: ENROLLMENT_ABI, functionName: 'numeraire', blockNumber: block }).catch(() => { throw new Error('registry numeraire unavailable'); })).toLowerCase();
+  if (!targets.some(t => t.asset === cash)) targets.push({ asset: cash, weightBps: 0, symbol: 'USDT' });
   const priceTable = await loadPriceTable(query, chainId);
   const symbolsByAsset = new Map(targets.map((target) => [target.asset, target.symbol]));
-  const universe: PriceableAsset[] = chainTargets.map((target) => {
+  const universe: PriceableAsset[] = targets.map((target) => {
     const known = priceTable.get(target.asset);
     if (known !== undefined) return known;
     return {
       address: target.asset as Address,
       symbol: symbolsByAsset.get(target.asset) ?? shortAddress(target.asset),
       usdtPool: null,
-      isNumeraire: false,
+      isNumeraire: target.asset === cash,
     };
   });
 
@@ -519,6 +481,7 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
     report: blocked.length === 0 ? computeDrift(valuationHoldings(snapshot), targets, thresholdBps) : null,
     blocked,
     targets,
+    historicalAssetCount: historicalAssets.filter(asset => asset !== cash).length,
     pinnedVersion: { version: pinned, onchainStrategyId: enrolledStrategyId, paused: enrollment[2] },
     allocationCheck,
     thresholdBps,

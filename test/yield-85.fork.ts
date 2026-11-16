@@ -1,17 +1,21 @@
-/** Explicit acceptance only: chain 97 anvil 8592, alto 3092, DB cre8_be85. No real keys. */
+import { localAcceptanceEnv } from './fixtures/local-acceptance.js';
+import { ownerEnroll, refreshP11Markets } from './fixtures/p11-kernel.js';
+/** Explicit acceptance only: explicit isolated chain 97 anvil/alto/DB selected by localAcceptanceEnv. No real keys. */
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import { writeFileSync } from 'node:fs';
+import { setTimeout as pause } from 'node:timers/promises';
 import { createKernelAccount, createKernelAccountClient } from '@zerodev/sdk';
 import { signerToEcdsaValidator } from '@zerodev/ecdsa-validator';
 import { KERNEL_V3_3 } from '@zerodev/sdk/constants';
 import type { GetKernelVersion } from '@zerodev/sdk/types';
-import { createPublicClient, createWalletClient, createTestClient, custom, decodeFunctionData, encodeFunctionData, erc20Abi, http, parseAbi, RpcRequestError } from 'viem';
+import { createPublicClient, createWalletClient, createTestClient, decodeFunctionData, encodeFunctionData, erc20Abi, http, parseAbi } from 'viem';
 import type { Hex } from 'viem';
 import { bscTestnet } from 'viem/chains';
 import { mnemonicToAccount } from 'viem/accounts';
 import { closePool, query } from '../src/db.js';
 import { REGISTRY_ABI } from '../src/chain.js';
+import { REGISTRY_VERSION_ABI } from '../src/registry-abi.js';
 import { computeSalt, getKernelAccountParams } from '../src/kernel.js';
 import { buildSessionPermissions, deriveSessionKeyFor, sudoValidator } from '../src/permissions.js';
 import { buildRenewalKey } from '../src/renewal.js';
@@ -19,13 +23,13 @@ import { estimationPaymaster, reserveGasBudget, schedulerPaymaster, settleGasBud
 import { sessionKernelAccount } from '../src/scheduler.js';
 import { signPreparedOperation } from '../src/user-operation.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
-import { quoteYieldAction, reconcileYieldOperation, submitYieldAction } from '../src/yield-execution.js';
+import { quoteYieldAction, reconcileYieldOperation, submitYieldAction, isYieldMinimumError } from '../src/yield-execution.js';
 import type { SavedYieldOperation, YieldOperationJournal, YieldPlan } from '../src/yield-execution.js';
 import { YIELD_EXECUTOR_ABI, YIELD_REGISTRY_ABI } from '../src/yield-abi.js';
 
-const rpcUrl = 'http://127.0.0.1:8592', bundlerUrl = 'http://127.0.0.1:3092';
-if (process.env.RPC_URL !== rpcUrl || process.env.BUNDLER_URL !== bundlerUrl || process.env.CHAIN_ID !== '97' ||
-    new URL(process.env.DATABASE_URL ?? '').pathname !== '/cre8_be85') throw new Error('select the dedicated BE-85 local lane explicitly');
+const lane = localAcceptanceEnv(process.env, true);
+assert.ok(lane.bundler);
+const rpcUrl = lane.rpcUrl, bundlerUrl = lane.bundler.url;
 const client = createPublicClient({ chain: bscTestnet, transport: http(rpcUrl, { retryCount: 0, timeout: 120000 }), pollingInterval: 100 });
 const local = createTestClient({ chain: bscTestnet, mode: 'anvil', transport: http(rpcUrl, { retryCount: 0, timeout: 120000 }) });
 const mnemonic = 'test test test test test test test test test test test junk';
@@ -57,12 +61,22 @@ test('#85 Venus, Lista, Aave real sponsored Kernel supply/withdraw; old session 
   await local.setBlockTimestampInterval({ interval: 0 });
   const gasResults: { protocol: string; supply: string; withdraw: string }[] = [];
   try {
+    const ids = new Map<string, bigint>();
     for (const protocol of ['Venus', 'Lista', 'Aave']) {
-      const market = T.yieldMarkets.find(m => m.protocol === protocol && m.symbol === 'USDT'); assert.ok(market);
       const strategyId = 1n + await client.readContract({ address: C.registry, abi: registryExtra, functionName: 'nextStrategyId' });
       await landed(await ownerWallet.writeContract({ address: C.registry, abi: REGISTRY_ABI, functionName: 'registerStrategy', args: [`BE85 ${protocol}`, 'local yield acceptance', false] }));
-      await landed(await ownerWallet.writeContract({ address: C.registry, abi: REGISTRY_ABI, functionName: 'publishVersion',
-        args: [strategyId, [C.usdt], [10000], `0x${'00'.repeat(32)}`, 0n] }));
+      await landed(await ownerWallet.writeContract({ address: C.registry, abi: REGISTRY_ABI, functionName: 'publishVersion', args: [strategyId, [C.usdt], [10000], `0x${'00'.repeat(32)}`, 0n] }));
+      const version = await client.readContract({ address: C.registry, abi: REGISTRY_VERSION_ABI, functionName: 'version', args: [strategyId, 1] });
+      assert.ok(version.activeAt <= BigInt(Math.floor(Date.now() / 1000)), 'old fork must cover the complete notice period');
+      ids.set(protocol, strategyId);
+    }
+    // A sponsorship cannot expire before PostgreSQL created_at. Prepare on the old fork,
+    // then catch up only after all three 24-hour notices have elapsed.
+    await local.setNextBlockTimestamp({ timestamp: BigInt(Math.floor(Date.now() / 1000)) }); await local.mine({ blocks: 1 });
+    for (const protocol of ['Venus', 'Lista', 'Aave']) {
+      const market = T.yieldMarkets.find(m => m.protocol === protocol && m.symbol === 'USDT'); assert.ok(market);
+      const strategyId = ids.get(protocol); assert.ok(strategyId);
+      await refreshP11Markets(client, rpcUrl, [T.assets.WBNB.token]);
       const initial = deriveSessionKeyFor(owner.address, strategyId, material);
       const validUntil = Number((await client.getBlock()).timestamp) + 86400;
       const baseline = await buildSessionPermissions({ publicClient: client, sessionKeyAddress: initial.address, executorAddress: C.executor, validUntil });
@@ -70,12 +84,12 @@ test('#85 Venus, Lista, Aave real sponsored Kernel supply/withdraw; old session 
         plugins: { sudo: await sudoValidator(client, owner.address), regular: baseline.permissionValidator }, initConfig: baseline.initConfig,
       });
       await landed(await operator.sendTransaction({ to: params.factory, data: params.factoryData, gas: 4_000_000n }));
-      await landed(await operator.writeContract({ address: C.registry, abi: REGISTRY_ABI, functionName: 'enroll', args: [params.address, strategyId] }));
       await landed(await operator.writeContract({ address: C.usdt, abi: parseAbi(['function claimFor(address,uint256)']), functionName: 'claimFor', args: [params.address, 1000n * 10n ** 18n] }));
       const sid = (await query<{ id: string }>('insert into strategies(provider,name,onchain_id) values($1,$2,$3) returning id', [owner.address.toLowerCase(), `be85-${protocol}`, strategyId.toString()])).rows[0]?.id; assert.ok(sid);
       await query("insert into strategy_versions(strategy_id,version,allocation,schedule,active_at) values($1,1,$2,'{\"kind\":\"interval\",\"seconds\":86400}',now())", [sid, JSON.stringify({ assets: [{ address: C.usdt, weightBps: 10000 }] })]);
       const pid = (await query<{ id: string }>('insert into portfolios(user_id,strategy_id,version) values($1,$2,1) returning id', [owner.address.toLowerCase(), sid])).rows[0]?.id; assert.ok(pid);
       await query("insert into smart_accounts(portfolio_id,chain_id,address,owner,account_type) values($1,97,$2,$3,'KERNEL')", [pid, params.address.toLowerCase(), owner.address.toLowerCase()]);
+      await ownerEnroll(client, owner, params.address, strategyId, rpcUrl, bundlerUrl);
       const kernelVersion: GetKernelVersion<'0.7'> = KERNEL_V3_3;
       const sudo = await signerToEcdsaValidator(client, { signer: owner, entryPoint, kernelVersion, validatorAddress: C.ecdsaValidatorV31 });
       const ownerAccount = await createKernelAccount(client, { address: params.address, plugins: { sudo }, entryPoint, kernelVersion });
@@ -133,51 +147,26 @@ test('#85 Venus, Lista, Aave real sponsored Kernel supply/withdraw; old session 
       assert.deepEqual(calls, ['prepare', 'sending', 'submitted', 'confirmed']);
       assert.ok(savedPlan);
       let held = await client.readContract({ address: market.receipt, abi: erc20Abi, functionName: 'balanceOf', args: [params.address] });
-      if (protocol === 'Venus') {
-        const minima: bigint[] = [];
-        const stale = createPublicClient({ chain: bscTestnet, transport: custom({ request: async ({ method, params }) => {
-          const call: unknown = Array.isArray(params) ? params[0] : null;
-          if (method === 'eth_call' && Array.isArray(params) && params[1] === 'latest' && call && typeof call === 'object' &&
-              String(Reflect.get(call, 'to')).toLowerCase() === C.executor) {
-            const data: unknown = Reflect.get(call, 'data');
-            if (typeof data === 'string' && data.startsWith('0x63f865c0')) {
-              const decoded = decodeFunctionData({ abi: YIELD_EXECUTOR_ABI, data: data as Hex });
-              assert.ok(decoded.functionName === 'executeWithdraw'); minima.push(decoded.args[3]);
-              await local.setNextBlockTimestamp({ timestamp: (await client.getBlock()).timestamp + 1n }); await local.mine({ blocks: 1 });
-            }
-          }
-          const response: unknown = await (await fetch(rpcUrl, { method: 'POST', headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) })).json();
-          assert.ok(response && typeof response === 'object');
-          if ('error' in response) {
-            const error: unknown = response.error; assert.ok(error && typeof error === 'object');
-            const code: unknown = Reflect.get(error, 'code'), message: unknown = Reflect.get(error, 'message');
-            assert.ok(typeof code === 'number' && typeof message === 'string');
-            throw new RpcRequestError({ body: { method, params }, url: rpcUrl,
-              error: { code, message, data: Reflect.get(error, 'data') } });
-          }
-          assert.ok('result' in response); return response.result;
-        } }, { retryCount: 0 }) });
-        const before = calls.length;
-        await assert.rejects(submitYieldAction({ ...base, publicClient: stale, sessionKey, policies: renewed.policySnapshot,
-          action: { kind: 'withdraw', marketId: market.marketId, amount: held } }), /未放寬 min/);
-        assert.equal(minima.length, 3);
-        assert.ok(minima.every((min, index) => index === 0 || min > (minima[index - 1] ?? min)));
-        assert.equal(calls.length, before, 'stale pre-broadcast attempts never create or resend an intent');
-        currentTime = (await client.getBlock()).timestamp;
-      }
-      // Demonstrate that advancing accrual invalidates an old minimum without changing it.
+      // The reviewed executor accepts a 10-bps floor, rather than requiring an exact fresh quote.
+      // Exercise the real boundary without broadcasting an invalid withdrawal or changing its signed minimum.
+      const beforePreview = calls.length;
       const oldQuote = await quoteYieldAction(client, params.address, { kind: 'withdraw', marketId: market.marketId, amount: held });
+      const decoded = decodeFunctionData({ abi: YIELD_EXECUTOR_ABI, data: oldQuote.data }); assert.equal(decoded.functionName, 'executeWithdraw');
+      assert.ok(decoded.functionName === 'executeWithdraw');
+      const quoted = (await client.simulateContract({ address: C.yieldRegistry, abi: YIELD_REGISTRY_ABI, functionName: 'quoteWithdraw', args: [market.marketId, held], account: params.address })).result;
+      assert.equal(decoded.args[3], quoted * 9995n / 10000n);
+      const floor = quoted * 9990n / 10000n; assert.ok(floor > 1n);
+      const withMinimum = (minimum: bigint) => encodeFunctionData({ abi: YIELD_EXECUTOR_ABI, functionName: 'executeWithdraw', args: [params.address, market.marketId, held, minimum, decoded.args[4]] });
+      await client.call({ account: params.address, to: C.executor, data: withMinimum(floor) });
+      await assert.rejects(client.call({ account: params.address, to: C.executor, data: withMinimum(floor - 1n) }), isYieldMinimumError);
       const quoteTime = (await client.getBlock()).timestamp;
+      // Preserve the sixty-second accrual case without violating production's no-future observation guard.
+      while (BigInt(Math.floor(Date.now() / 1000)) < quoteTime + 60n) await pause(1000);
       await local.setNextBlockTimestamp({ timestamp: quoteTime + 60n }); await local.mine({ blocks: 1 });
       assert.equal((await client.getBlock()).timestamp, quoteTime + 60n);
-      if (protocol === 'Venus' || protocol === 'Lista') {
-        await assert.rejects(client.call({ account: params.address, to: C.executor, data: oldQuote.data }));
-      } else {
-        // Aave public shares are raw aToken: a fixed raw amount has a fixed underlying quote.
-        await client.call({ account: params.address, to: C.executor, data: oldQuote.data });
-        assert.equal((await quoteYieldAction(client, params.address, { kind: 'withdraw', marketId: market.marketId, amount: held })).minimum, oldQuote.minimum);
-      }
+      await client.call({ account: params.address, to: C.executor, data: oldQuote.data });
+      if (protocol === 'Aave') assert.equal((await quoteYieldAction(client, params.address, { kind: 'withdraw', marketId: market.marketId, amount: held })).minimum, oldQuote.minimum);
+      assert.equal(calls.length, beforePreview, 'boundary and cross-block previews never create or resend an intent');
       currentTime = (await client.getBlock()).timestamp;
       await landed(await operator.writeContract({ address: C.registry, abi: registryExtra, functionName: 'setPaused', args: [params.address, true] }));
       held = await client.readContract({ address: market.receipt, abi: erc20Abi, functionName: 'balanceOf', args: [params.address] });

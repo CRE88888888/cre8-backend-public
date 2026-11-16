@@ -413,6 +413,9 @@ bun run preflight --strict                                 # 0 warn · 0 fail
 
 ## API
 
+P11 新 registry／executor 的加入同意、三參數 enroll、24 小時版本生效與版本狀態，見
+[P11 後端版本介面](docs/versioning-p11.zh-TW.md)。該文件的版本跟隨語意取代本文舊有的 enrollment 版本釘選說明。
+
 所有回應都是 `application/json; charset=utf-8`，一般錯誤格式為
 `{"error":{"code":"...","message":"..."}}`；`/platform/status` 讀鏈不可用時仍回傳下述狀態物件。
 

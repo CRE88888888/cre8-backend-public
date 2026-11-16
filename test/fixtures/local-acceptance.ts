@@ -19,6 +19,6 @@ export function localAcceptanceEnv(env: NodeJS.ProcessEnv, needsBundler = false)
   const bundler = needsBundler ? endpoint(env.BUNDLER_URL) : null;
   const ports = [Number(rpc.port), port, ...(bundler ? [Number(bundler.port)] : [])];
   if (ports.some(p => p < 1024) || new Set(ports).size !== ports.length) throw fail();
-  return { rpcUrl: env.RPC_URL, apiUrl: `http://127.0.0.1:${port}`, backendPort: port,
+  return { rpcUrl: env.RPC_URL ?? '', apiUrl: `http://127.0.0.1:${port}`, backendPort: port,
     databaseName: env.TEST_DATABASE_NAME, bundler: bundler ? { url: env.BUNDLER_URL ?? '', port: Number(bundler.port) } : null };
 }

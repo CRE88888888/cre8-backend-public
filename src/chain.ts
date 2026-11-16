@@ -1,3 +1,4 @@
+import { deployAccount97 } from './account-deployment.js';
 import { withRelayerLock } from './relayer-lock.js';
 import {
   createPublicClient,
@@ -10,6 +11,7 @@ import {
   toHex,
   toFunctionSelector,
   zeroAddress,
+  zeroHash,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { activeChain } from './chain-object.js';
@@ -36,89 +38,10 @@ import { YIELD_EXECUTOR_ABI } from './yield-abi.js';
 
 /** Minimal AtpRegistry ABI: the three write paths this slice drives, plus the events used to read
  *  return values (registerStrategy → id, publishVersion → version) from the receipt. */
-export const REGISTRY_ABI = [
-  { type: 'function', name: 'numeraire', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] },
-  {
-    type: 'function',
-    name: 'registerStrategy',
-    inputs: [
-      { name: 'name', type: 'string' },
-      { name: 'description', type: 'string' },
-      { name: 'isPublic', type: 'bool' },
-    ],
-    outputs: [{ name: 'id', type: 'uint256' }],
-    stateMutability: 'nonpayable',
-  },
-  {
-    type: 'function',
-    name: 'publishVersion',
-    inputs: [
-      { name: 'id', type: 'uint256' },
-      { name: 'assets', type: 'address[]' },
-      { name: 'weightsBps', type: 'uint16[]' },
-      { name: 'scheduleHash', type: 'bytes32' },
-      { name: 'activeAt', type: 'uint64' },
-    ],
-    outputs: [{ name: 'versionNumber', type: 'uint16' }],
-    stateMutability: 'nonpayable',
-  },
-  {
-    type: 'function',
-    name: 'operator',
-    inputs: [],
-    outputs: [{ name: '', type: 'address' }],
-    stateMutability: 'view',
-  },
-  {
-    type: 'function',
-    name: 'enroll',
-    inputs: [
-      { name: 'account', type: 'address' },
-      { name: 'id', type: 'uint256' },
-    ],
-    outputs: [],
-    stateMutability: 'nonpayable',
-  },
-  { type: 'error', name: 'Unauthorized', inputs: [] },
-  { type: 'error', name: 'AlreadyEnrolled', inputs: [{ name: 'account', type: 'address' }] },
-  { type: 'function', name: 'isEnrolled', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }], outputs: [{ type: 'bool' }] },
-  {
-    type: 'function', name: 'enrollments', stateMutability: 'view',
-    inputs: [{ name: 'account', type: 'address' }],
-    outputs: [{ name: 'strategyId', type: 'uint256' }, { name: 'version', type: 'uint16' }, { name: 'paused', type: 'bool' }],
-  },
-  { type: 'function', name: 'pauseFlags', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }], outputs: [{ type: 'uint8' }] },
-  {
-    type: 'event', name: 'PauseFlagsSet',
-    inputs: [{ name: 'account', type: 'address', indexed: true }, { name: 'flags', type: 'uint8', indexed: false }],
-  },
-  {
-    type: 'event',
-    name: 'StrategyRegistered',
-    inputs: [
-      { name: 'id', type: 'uint256', indexed: true },
-      { name: 'provider', type: 'address', indexed: true },
-      { name: 'name', type: 'string', indexed: false },
-    ],
-  },
-  {
-    type: 'event',
-    name: 'VersionPublished',
-    inputs: [
-      { name: 'id', type: 'uint256', indexed: true },
-      { name: 'version', type: 'uint16', indexed: false },
-      { name: 'scheduleHash', type: 'bytes32', indexed: false },
-    ],
-  },
-] as const;
-
-export const REGISTRY_VERSION_ABI = [
-  { type: 'function', name: 'activeVersion', stateMutability: 'view', inputs: [{ type: 'uint256' }], outputs: [{ type: 'uint16' }] },
-  { type: 'function', name: 'version', stateMutability: 'view', inputs: [{ type: 'uint256' }, { type: 'uint16' }], outputs: [
-    { type: 'tuple', components: [{ name: 'assets', type: 'address[]' }, { name: 'weightsBps', type: 'uint16[]' },
-      { name: 'scheduleHash', type: 'bytes32' }, { name: 'activeAt', type: 'uint64' }] },
-  ] },
-] as const;
+export { REGISTRY_ABI, REGISTRY_VERSION_ABI } from './registry-abi.js';
+import { REGISTRY_ABI, REGISTRY_VERSION_ABI } from './registry-abi.js';
+import { enrollmentApprovalHash, p11Error, registryConfigHash } from './registry-versioning.js';
+import type { VersionSettings } from './registry-versioning.js';
 
 export async function readAccountCash(chainId: number, account: Address, suppliedClient?: PublicClient) {
   try {
@@ -141,8 +64,8 @@ export async function readAccountCash(chainId: number, account: Address, supplie
 
 /** Read-only, bounded and pinned to one block. No operator key is needed. */
 export async function assertVersionOnchain(onchainId: number, version: number,
-  expected: Pick<CanonicalConfig, 'chainId' | 'allocation' | 'activeAt'> & { configHash: Hex }, account?: Address,
-  deps: { client?: PublicClient; registry?: Address; requireActive?: boolean; blockNumber?: bigint; blockHash?: Hex } = {}): Promise<void> {
+  expected: Pick<CanonicalConfig, 'chainId' | 'allocation' | 'activeAt'> & { configHash: Hex; versionSettings?: VersionSettings }, account?: Address,
+  deps: { client?: PublicClient; registry?: Address; requireActive?: boolean; requireLatest?: boolean; blockNumber?: bigint; blockHash?: Hex } = {}): Promise<void> {
   try {
     const config = getConfig();
     const registry = deps.registry ?? config.registryAddress;
@@ -154,22 +77,25 @@ export async function assertVersionOnchain(onchainId: number, version: number,
     if (deps.blockHash !== undefined && block.hash !== deps.blockHash) throw new AppError(409, 'FUNDING_REORGED', 'source block changed; reconciliation required');
     const actual = await client.readContract({ address: registry as Address, abi: REGISTRY_VERSION_ABI, functionName: 'version', args: [BigInt(onchainId), version], blockNumber: block.number });
     const pairs = (assets: readonly string[], weights: readonly number[]) => assets.map((asset, index) => `${asset.toLowerCase()}:${weights[index]}`).sort();
-    if (actual.scheduleHash.toLowerCase() !== expected.configHash || actual.activeAt !== BigInt(expected.activeAt.getTime() / 1000) ||
+    const settings = expected.versionSettings;
+    const expectedHash = settings === undefined ? expected.configHash : registryConfigHash(expected.allocation.assets.map(a => a.address as Address), expected.allocation.assets.map(a => a.weightBps), settings);
+    if ((settings === undefined ? actual.scheduleHash.toLowerCase() !== expected.configHash :
+        actual.scheduleHash !== settings.scheduleHash || actual.settingsHash !== settings.settingsHash || actual.performanceFeeBps !== settings.performanceFeeBps || actual.configHash !== expectedHash || expectedHash !== expected.configHash) || actual.activeAt !== BigInt(expected.activeAt.getTime() / 1000) ||
         actual.assets.length !== actual.weightsBps.length || JSON.stringify(pairs(actual.assets, actual.weightsBps)) !==
         JSON.stringify(pairs(expected.allocation.assets.map((asset) => asset.address), expected.allocation.assets.map((asset) => asset.weightBps)))) {
       throw new AppError(409, 'CHAIN_CONFIG_MISMATCH', 'chain version does not match the committed config');
     }
     if (deps.requireActive !== false) {
       if (block.timestamp < actual.activeAt) throw new AppError(409, 'VERSION_NOT_ACTIVE', 'version has not reached activeAt');
-      if (account === undefined) {
+      if (account === undefined || deps.requireLatest === true) {
         const active = await client.readContract({ address: registry as Address, abi: REGISTRY_VERSION_ABI, functionName: 'activeVersion', args: [BigInt(onchainId)], blockNumber: block.number });
         if (active !== version) throw new AppError(409, 'CHAIN_VERSION_MISMATCH', 'new enrollment version differs from the selected version');
       }
     }
     if (account !== undefined) {
       const enrolled = await client.readContract({ address: registry as Address, abi: REGISTRY_ABI, functionName: 'isEnrolled', args: [account], blockNumber: block.number });
-      const [id, pinned] = await client.readContract({ address: registry as Address, abi: REGISTRY_ABI, functionName: 'enrollments', args: [account], blockNumber: block.number });
-      if (!enrolled || id !== BigInt(onchainId) || pinned !== version) throw new AppError(409, 'CHAIN_VERSION_MISMATCH', 'account is not pinned to the authorized version');
+      const [id, acceptedVersion] = await client.readContract({ address: registry as Address, abi: REGISTRY_ABI, functionName: 'enrollments', args: [account], blockNumber: block.number });
+      if (!enrolled || id !== BigInt(onchainId) || acceptedVersion !== version) throw new AppError(409, 'CHAIN_VERSION_MISMATCH', 'account is not enrolled in the authorized strategy');
     }
     const canonical = await client.getBlock({ blockNumber: block.number });
     if (canonical.hash !== block.hash) throw new AppError(409, 'FUNDING_REORGED', 'version block changed during verification; reconciliation required');
@@ -457,6 +383,7 @@ export async function publishVersionOnchain(
     schedule: RebalanceSchedule | FundingSchedule;
     activeAt: Date;
     configHash?: Hex;
+    versionSettings?: VersionSettings;
     expectedVersion?: number;
     /** False on a stored-config retry: unknown submissions must be reconciled, never re-broadcast. */
     allowPublish?: boolean;
@@ -471,24 +398,35 @@ export async function publishVersionOnchain(
     const configHash = version.configHash;
     return (deps.lock ?? withRelayerLock)(chainConfig.chainId, async (assertHeld) => {
       try {
-        const latest = await publicClient.readContract({ address: registryAddress, abi: REGISTRY_VERSION_ABI, functionName: 'activeVersion', args: [BigInt(onchainId)] });
-        if (latest < expectedVersion) {
+        const latest = await publicClient.readContract({ address: registryAddress, abi: REGISTRY_VERSION_ABI, functionName: 'versionCount', args: [BigInt(onchainId)] });
+        if (latest < BigInt(expectedVersion)) {
           if (version.allowPublish === false) throw new AppError(503, 'VERSION_PENDING_RECONCILIATION', 'stored version is not confirmed on chain; no new publish transaction sent');
-          if (latest + 1 !== expectedVersion) throw new Error('version sequence mismatch');
+          if (latest + 1n !== BigInt(expectedVersion)) throw new Error('version sequence mismatch');
           assertHeld();
-          const hash = await wallet.writeContract({ account: operator, chain: activeChain(), address: registryAddress, abi: REGISTRY_ABI,
-            functionName: 'publishVersion', args: [BigInt(onchainId), version.assets, version.weightsBps, configHash, BigInt(version.activeAt.getTime() / 1000)] });
+          const request = { account: operator, chain: activeChain(), address: registryAddress, abi: REGISTRY_ABI,
+            functionName: 'publishSettingsVersion' as const, args: [BigInt(onchainId), version.assets, version.weightsBps,
+              version.versionSettings?.scheduleHash ?? configHash, version.versionSettings?.settingsHash ?? zeroHash,
+              version.versionSettings?.performanceFeeBps ?? 500, BigInt(version.activeAt.getTime() / 1000)] as const };
+          const estimate = await publicClient.estimateContractGas(request);
+          if (estimate <= 0n) throw new Error('invalid publication gas estimate');
+          // Crossing activeAt while mining can add historical-array/mapping SSTOREs absent
+          // from an estimate against the parent block (especially an immediate fee decrease).
+          const gas = estimate * 3n / 2n + 100_000n + BigInt(version.assets.length) * 50_000n;
+          const hash = await wallet.writeContract({ ...request, gas });
           const receipt = await publicClient.waitForTransactionReceipt({ hash, timeout: 30_000 });
           if (receipt.status !== 'success' || decodeReturnedId(receipt.logs, 'VersionPublished', 'version') !== expectedVersion) throw new Error('publish not confirmed');
         }
+        if (await publicClient.readContract({ address: registryAddress, abi: REGISTRY_VERSION_ABI, functionName: 'cancelledVersion', args: [BigInt(onchainId), expectedVersion] })) throw new AppError(409, 'VERSION_CANCELLED', 'cancelled version cannot be retried');
         // A retry after an unknown receipt verifies the original index instead of publishing again.
         await assertVersionOnchain(onchainId, expectedVersion, { chainId: chainConfig.chainId,
           allocation: { assets: version.assets.map((address, index) => ({ address, weightBps: version.weightsBps[index] ?? 0 })) },
-          activeAt: version.activeAt, configHash }, undefined,
+          activeAt: version.activeAt, configHash, versionSettings: version.versionSettings }, undefined,
           { client: publicClient, registry: registryAddress, requireActive: false });
         return expectedVersion;
       } catch (error) {
         if (error instanceof AppError) throw error;
+        const rejected = p11Error(error);
+        if (rejected !== null) throw rejected;
         throw new AppError(503, 'VERSION_PUBLISH_UNAVAILABLE', 'version mirror is not confirmed; retry the same config');
       }
     });
@@ -515,9 +453,54 @@ export async function publishVersionOnchain(
   return decodeReturnedId(receipt.logs, 'VersionPublished', 'version');
 }
 
+/** Deterministic contract rejection must precede the immutable DB insert. */
+export async function validateVersionPublication(onchainId: number, version: Parameters<typeof publishVersionOnchain>[1]): Promise<void> {
+  const { publicClient, registryAddress, account } = getChain();
+  const settings = version.versionSettings;
+  if (settings === undefined) throw new AppError(400, 'CONFIG_HASH_REQUIRED', 'complete version settings required');
+  try {
+    await publicClient.simulateContract({ address: registryAddress, abi: REGISTRY_ABI, account,
+      functionName: 'publishSettingsVersion', args: [BigInt(onchainId), version.assets, version.weightsBps,
+        settings.scheduleHash, settings.settingsHash, settings.performanceFeeBps, BigInt(version.activeAt.getTime() / 1000)] });
+  } catch (error) {
+    const rejected = p11Error(error);
+    if (rejected !== null) throw rejected;
+    throw new AppError(503, 'VERSION_PUBLICATION_UNAVAILABLE', 'publication simulation unavailable; no new version stored');
+  }
+}
+
+export async function versionCancelledOnchain(onchainId: number, version: number): Promise<boolean> {
+  try {
+    const { publicClient, registryAddress } = getChain();
+    return await publicClient.readContract({ address: registryAddress, abi: REGISTRY_VERSION_ABI, functionName: 'cancelledVersion', args: [BigInt(onchainId), version] });
+  } catch { throw new AppError(503, 'VERSION_STATE_UNAVAILABLE', 'version cancellation status unavailable'); }
+}
+
+/** Confirmation only: owner sudo has already enrolled; never deploy or send a transaction. */
+export async function readOwnerEnrollment(account: Address, onchainId: number, chain?: ChainConfig): Promise<number> {
+  const { publicClient, registryAddress, chainId } = chain ?? getChain();
+  try {
+    if (await publicClient.getChainId() !== chainId) throw new Error('wrong chain');
+    const block = await publicClient.getBlock({ blockTag: 'latest' });
+    if (block.number === null || block.hash === null) throw new Error('missing block');
+    const [enrolled, value] = await Promise.all([
+      publicClient.readContract({ address: registryAddress, abi: REGISTRY_ABI, functionName: 'isEnrolled', args: [account], blockNumber: block.number }),
+      publicClient.readContract({ address: registryAddress, abi: REGISTRY_ABI, functionName: 'enrollments', args: [account], blockNumber: block.number }),
+    ]);
+    if ((await publicClient.getBlock({ blockNumber: block.number })).hash !== block.hash) throw new Error('reorg');
+    if (!enrolled || value[0] !== BigInt(onchainId) || value[1] < 1 || value[1] > 65535 || value[2]) {
+      throw new AppError(409, 'ENROLLMENT_NOT_CONFIRMED', 'owner sudo enrollment must be confirmed for this strategy and account');
+    }
+    return value[1];
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw new AppError(503, 'ENROLLMENT_CONFIRMATION_UNAVAILABLE', 'owner enrollment confirmation unavailable');
+  }
+}
+
 /** First enrollment only. Same-strategy retries preserve the chain's version and pause sources. */
 export async function enrollOnchain(account: Address, onchainId: number, chain?: ChainConfig): Promise<number> {
-  const { wallet, publicClient, registryAddress, account: operator } = chain ?? getChain();
+  const { wallet, publicClient, registryAddress, account: operator, chainId } = chain ?? getChain();
 
   try {
     const readEnrollment = async (blockNumber: bigint): Promise<number | null> => {
@@ -552,21 +535,36 @@ export async function enrollOnchain(account: Address, onchainId: number, chain?:
       );
     }
 
-    const hash = await withRelayerLock(getConfig().chainId, () => wallet.writeContract({
+    const approvalBlock = await publicClient.getBlockNumber({ cacheTime: 0 });
+    const approvedVersion = await publicClient.readContract({ address: registryAddress, abi: REGISTRY_VERSION_ABI,
+      functionName: 'activeVersion', args: [BigInt(onchainId)], blockNumber: approvalBlock });
+    if (approvedVersion === 0) throw new AppError(409, 'VERSION_NOT_ACTIVE', 'strategy has no effective version');
+    const config = await publicClient.readContract({ address: registryAddress, abi: REGISTRY_VERSION_ABI,
+      functionName: 'version', args: [BigInt(onchainId), approvedVersion], blockNumber: approvalBlock });
+    const approval = await publicClient.readContract({ address: registryAddress, abi: REGISTRY_ABI,
+      functionName: 'enrollmentApproval', args: [account], blockNumber: approvalBlock });
+    if (approval !== enrollmentApprovalHash(BigInt(onchainId), approvedVersion, config.configHash)) {
+      throw new AppError(409, 'ENROLLMENT_CONSENT_REQUIRED', 'owner must call approveEnrollment through account sudo for the effective version before operator enrollment');
+    }
+
+    const hash = await withRelayerLock(chainId, () => wallet.writeContract({
       account: operator,
       chain: activeChain(),
       address: registryAddress,
       abi: REGISTRY_ABI,
       functionName: 'enroll',
-      args: [account, BigInt(onchainId)],
+      args: [account, BigInt(onchainId), approvedVersion],
     }));
-    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+    const receipt = await publicClient.waitForTransactionReceipt({ hash, timeout: 30_000 });
     if (receipt.status !== 'success') throw new AppError(502, 'ENROLL_REVERTED', 'enroll transaction reverted：未完成 enrollment');
     const enrolledVersion = await readEnrollment(receipt.blockNumber);
+    if (enrolledVersion !== null && enrolledVersion !== approvedVersion) throw new AppError(409, 'CHAIN_VERSION_MISMATCH', 'confirmed enrollment differs from approved version');
     if (enrolledVersion === null) throw new AppError(503, 'ENROLLMENT_MISSING', 'enroll receipt 成功但 enrollment 缺漏：拒絕回報成功');
     return enrolledVersion;
   } catch (error) {
     if (error instanceof AppError) throw error;
+    const rejected = p11Error(error);
+    if (rejected !== null) throw rejected;
     const message = a10ErrorMessage(error);
     if (message !== null) throw new AppError(409, 'ALREADY_ENROLLED', message);
     throw new AppError(503, 'ENROLL_UNAVAILABLE', 'enroll 無法完成確認：鏈上狀態、RPC 或交易回執不可用，請稍後重試');
@@ -616,6 +614,8 @@ export async function deploySmartAccount(
     plugins: options.plugins,
     initConfig: options.initConfig,
   });
+
+  if (chain.chainId === 97) return deployAccount97({ address, owner, strategyId, factory, factoryData }, chain);
 
   const code = await publicClient.getCode({ address });
   if (code !== undefined && code !== '0x') return { address, deployed: false };

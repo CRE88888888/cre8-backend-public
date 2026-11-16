@@ -1,3 +1,5 @@
+import { ownerEnroll } from './fixtures/p11-kernel.js';
+import { REGISTRY_VERSION_ABI } from '../src/registry-abi.js';
 /** Explicit local acceptance, not discovered by bun test. Run after clean contracts main
  * deploy-97.sh on the lane-selected local fork. Env: CHAIN_ID=97, RPC_URL,
  * PORT, DATABASE_URL, TEST_DATABASE_NAME, MIGRATIONS_DIR, OPERATOR_PRIVATE_KEY,
@@ -25,7 +27,9 @@ import { TESTNET_97 as P } from '../src/testnet-profile.js';
 import { welcomeFixture } from './fixtures/welcome.js';
 
 import { localAcceptanceEnv } from './fixtures/local-acceptance.js';
-const endpoints = localAcceptanceEnv(process.env);
+const endpoints = localAcceptanceEnv(process.env, true);
+assert.ok(endpoints.bundler);
+const BUNDLER = endpoints.bundler.url;
 const RPC = endpoints.rpcUrl, API = endpoints.apiUrl;
 const client = createPublicClient({ chain: bscTestnet, transport: http(RPC, { retryCount: 0, timeout: 120000 }), cacheTime: 0 });
 const local = createTestClient({ chain: bscTestnet, mode: 'anvil', transport: http(RPC) });
@@ -52,26 +56,37 @@ async function main() {
   check(addr(contracts.usdt).toLowerCase() === P.contracts.usdt, 'current-main manifest USDT matches product funding token');
   await local.impersonateAccount({ address: P.roles.operator }); await local.setBalance({ address: P.roles.operator, value: 100n * 10n ** 18n });
   const owner = mnemonicToAccount('test test test test test test test test test test test junk', { addressIndex: 5 });
-  const f = await welcomeFixture(owner.address.toLowerCase() as Address);
-  const registration = await landed(await operator.writeContract({ address: registry, abi: REGISTRY_ABI, functionName: 'registerStrategy', args: ['welcome91-local', '', false] }));
-  let onchainId: bigint | undefined;
-  for (const log of registration.logs) {
-    try { const e = decodeEventLog({ abi: REGISTRY_ABI, eventName: 'StrategyRegistered', data: log.data, topics: log.topics }); onchainId = e.args.id; } catch { /* unrelated log */ }
+  async function prepareFund(name: string) {
+    const f = await welcomeFixture(owner.address.toLowerCase() as Address, 'hold', { p11: true, activeAt: new Date(Number((await client.getBlock()).timestamp + 86500n) * 1000) });
+    const registration = await landed(await operator.writeContract({ address: registry, abi: REGISTRY_ABI, functionName: 'registerStrategy', args: [name, '', false] }));
+    let onchainId: bigint | undefined;
+    for (const log of registration.logs) {
+      try { onchainId = decodeEventLog({ abi: REGISTRY_ABI, eventName: 'StrategyRegistered', data: log.data, topics: log.topics }).args.id; } catch { /* unrelated log */ }
+    }
+    assert.ok(onchainId);
+    await query('update strategies set onchain_id=$2 where id=$1', [f.strategyId, onchainId.toString()]);
+    const v = await requireTypedVersion(f.strategyId, 1, Number(onchainId), undefined, { chainId: 97, verifyChain: false });
+    assert.ok(v.configHash && v.activeAt && v.versionSettings);
+    await landed(await operator.writeContract({ address: registry, abi: REGISTRY_ABI, functionName: 'publishSettingsVersion', args: [onchainId,
+      v.allocation.assets.map(a => addr(a.address)), v.allocation.assets.map(a => a.weightBps), v.versionSettings.scheduleHash, v.versionSettings.settingsHash,
+      v.versionSettings.performanceFeeBps, BigInt(Date.parse(v.activeAt) / 1000)] }));
+    const kernel = await getKernelAccountParams(client, owner.address, computeSalt(owner.address, BigInt(f.strategyId)));
+    await landed(await operator.sendTransaction({ to: kernel.factory, data: kernel.factoryData }));
+    check((await client.getCode({ address: kernel.address })) !== '0x', 'real Kernel deployed');
+    await query('update smart_accounts set address=$2 where portfolio_id=$1', [f.id, kernel.address.toLowerCase()]);
+    return { f, kernel, onchainId, activeAt: BigInt(Date.parse(v.activeAt) / 1000) };
   }
-  assert.ok(onchainId);
-  await query('update strategies set onchain_id=$2 where id=$1', [f.strategyId, onchainId.toString()]);
-  const v = await requireTypedVersion(f.strategyId, 1, Number(onchainId), undefined, { chainId: 97, verifyChain: false }); assert.ok(v.configHash); assert.ok(v.activeAt);
-  await landed(await operator.writeContract({ address: registry, abi: REGISTRY_ABI, functionName: 'publishVersion', args: [onchainId, v.allocation.assets.map(a => addr(a.address)), v.allocation.assets.map(a => a.weightBps), v.configHash, BigInt(Date.parse(v.activeAt) / 1000)] }));
-  const kernel = await getKernelAccountParams(client, owner.address, computeSalt(owner.address, BigInt(f.strategyId)));
-  await landed(await operator.sendTransaction({ to: kernel.factory, data: kernel.factoryData }));
-  check((await client.getCode({ address: kernel.address })) !== '0x', 'real Kernel deployed');
-  await query('update smart_accounts set address=$2 where portfolio_id=$1', [f.id, kernel.address.toLowerCase()]);
-  await landed(await operator.writeContract({ address: registry, abi: REGISTRY_ABI, functionName: 'enroll', args: [kernel.address, onchainId] }));
+  const first = await prepareFund('welcome124-local'), otherFund = await prepareFund('welcome124-second-local');
+  const wall = BigInt(Math.floor(Date.now() / 1000));
+  assert.ok(first.activeAt <= wall && otherFund.activeAt <= wall, 'the old fork must cover both full notice periods');
+  await local.setNextBlockTimestamp({ timestamp: wall }); await local.mine({ blocks: 1 });
+  const { f, kernel, onchainId } = first;
+  await ownerEnroll(client, owner, kernel.address, onchainId, RPC, BUNDLER);
   check(await client.readContract({ address: registry, abi: REGISTRY_ABI, functionName: 'isEnrolled', args: [kernel.address] }), 'real current-main receipt-time enrollment');
   const service = createPortfolioStrategyService({ ...f.deps, welcome: createWelcomeService(),
     feeReserve: async p => {
       const row = (await query<{ onchain_id: string }>('select onchain_id from strategies where id=$1', [p.strategyId])).rows[0]; assert.ok(row);
-      return minimumFeeReserve(client, executor, BigInt(row.onchain_id), await client.getBlockNumber({ cacheTime: 0 }));
+      return minimumFeeReserve(client, executor, BigInt(row.onchain_id), await client.getBlockNumber({ cacheTime: 0 }), addr(p.accountAddress), true);
     },
     version: (sid, version, chainSid, account, options) => requireTypedVersion(sid, version, chainSid, account, { ...options, chainId: 97,
       assertOnchain: (sid, version, expected, account, opts) => assertVersionOnchain(sid, version, expected, account, { ...opts, client, registry }) }),
@@ -86,6 +101,10 @@ async function main() {
     const beforeNonce = await client.getTransactionCount({ address: P.roles.operator, blockTag: 'latest' });
     const path = `/portfolios/${f.id}/buy-funding`;
     const concurrent = await Promise.all([fetch(API + path, { method: 'POST', body: '{}', headers: { authorization: 'Bearer ' + token } }), fetch(API + path, { method: 'POST', body: '{}', headers: { authorization: 'Bearer ' + token } })]);
+    if (!concurrent.some(r => r.status === 200)) {
+      const outcomes = await Promise.all(concurrent.map(async r => { const body = obj(await r.json()), error = obj(body.error ?? {}); return { status: r.status, code: typeof error.code === 'string' && /^[A-Z_]+$/.test(error.code) ? error.code : 'unknown' }; }));
+      console.error('WELCOME_CONCURRENT_FAILURE ' + JSON.stringify(outcomes));
+    }
     check(concurrent.filter(r => r.status === 200).length === 1 && concurrent.filter(r => r.status === 409).length === 1, 'concurrent first buys: one success, one portfolio busy');
     const grant = await findWelcomeGrant(97, owner.address); assert.ok(grant?.txHash);
     check(grant.state === 'confirmed' && grant.amountWei === WELCOME_AMOUNT_WEI, 'original grant confirmed for exactly 10000');
@@ -95,21 +114,8 @@ async function main() {
     const replay = await request(path, 'POST', {}); check(obj(replay.lot).replayed === true, 'HTTP retry reuses original lot');
     check(await client.getTransactionCount({ address: P.roles.operator, blockTag: 'latest' }) === nonceAfter, 'retry sends no new nonce');
     // A second genuinely deployed/enrolled fund for the same controlling owner.
-    const other = await welcomeFixture(owner.address.toLowerCase() as Address);
-    const otherKernel = await getKernelAccountParams(client, owner.address, computeSalt(owner.address, BigInt(other.strategyId)));
-    await landed(await operator.sendTransaction({ to: otherKernel.factory, data: otherKernel.factoryData }));
-    await query('update smart_accounts set address=$2 where portfolio_id=$1', [other.id, otherKernel.address.toLowerCase()]);
-    const otherRegistration = await landed(await operator.writeContract({ address: registry, abi: REGISTRY_ABI, functionName: 'registerStrategy', args: ['welcome91-second-local', '', false] }));
-    let otherOnchainId: bigint | undefined;
-    for (const log of otherRegistration.logs) {
-      try { otherOnchainId = decodeEventLog({ abi: REGISTRY_ABI, eventName: 'StrategyRegistered', data: log.data, topics: log.topics }).args.id; } catch { /* unrelated log */ }
-    }
-    assert.ok(otherOnchainId);
-    await query('update strategies set onchain_id=$2 where id=$1', [other.strategyId, otherOnchainId.toString()]);
-    const otherVersion = await requireTypedVersion(other.strategyId, 1, Number(otherOnchainId), undefined, { chainId: 97, verifyChain: false });
-    assert.ok(otherVersion.configHash); assert.ok(otherVersion.activeAt);
-    await landed(await operator.writeContract({ address: registry, abi: REGISTRY_ABI, functionName: 'publishVersion', args: [otherOnchainId, otherVersion.allocation.assets.map(a => addr(a.address)), otherVersion.allocation.assets.map(a => a.weightBps), otherVersion.configHash, BigInt(Date.parse(otherVersion.activeAt) / 1000)] }));
-    await landed(await operator.writeContract({ address: registry, abi: REGISTRY_ABI, functionName: 'enroll', args: [otherKernel.address, otherOnchainId] }));
+    const { f: other, kernel: otherKernel, onchainId: otherOnchainId } = otherFund;
+    await ownerEnroll(client, owner, otherKernel.address, otherOnchainId, RPC, BUNDLER);
     const second = await request(`/portfolios/${other.id}/buy-funding`, 'POST', {}, 409);
     check(obj(second.error).code === 'DAILY_FAUCET_REQUIRED', 'same owner second fund cannot receive welcome');
     const daily = await request('/faucet/usdt', 'POST', { account: kernel.address });

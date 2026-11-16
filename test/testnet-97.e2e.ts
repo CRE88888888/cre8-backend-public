@@ -1,5 +1,7 @@
+import { stockMarketOpen } from '../src/trading-calendar.js';
+import { refreshP11Markets, ownerSetupPaymaster } from './fixtures/p11-kernel.js';
 /** #87 opt-in acceptance. Run with bun run test/testnet-97.e2e.ts after the CLEAN
- * contracts b767bf6 deploy-97.sh on the lane-selected local fork and a 30-minute warm-up. No automatic bun-test discovery.
+ * contracts main e699bd8 deploy-97.sh on the lane-selected local fork and a 30-minute warm-up. No automatic bun-test discovery.
  * Env only: CHAIN_ID=97, RPC_URL, PORT, DATABASE_URL, TEST_DATABASE_NAME, MIGRATIONS_DIR, OPERATOR_PRIVATE_KEY, SESSION_KEY_MASTER_SEED,
  * PAYMASTER_SIGNER_PRIVATE_KEY, BUNDLER_EXECUTOR_PRIVATE_KEY, BUNDLER_UTILITY_PRIVATE_KEY,
  * ALTO_CLI_PATH (installed alto CLI), BUNDLER_URL (distinct localhost port),
@@ -25,15 +27,17 @@ import { TESTNET_97 as P } from '../src/testnet-profile.js';
 import { countSwapExecuted, runSchedulerOnce } from '../src/scheduler.js';
 import { checkTestnetProfile } from '../src/testnet-preflight.js';
 import { buildRedeemPlan } from '../src/operator.js';
-import { EXECUTOR_ABI } from '../src/chain.js';
+import { EXECUTOR_ABI, REGISTRY_ABI } from '../src/chain.js';
 import { schedulerPaymaster, estimationPaymaster } from '../src/paymaster.js';
 import { planPortfolio } from '../src/snapshot.js';
+import { signPreparedOperation } from '../src/user-operation.js';
 import { publishVersion } from '../src/strategies.js';
 import { localAcceptanceEnv } from './fixtures/local-acceptance.js';
 const endpoints = localAcceptanceEnv(process.env, true);
 assert.ok(endpoints.bundler);
 const RPC = endpoints.rpcUrl, API = endpoints.apiUrl, BUNDLER = endpoints.bundler.url;
 const bundlerPort = endpoints.bundler.port;
+const localPreload = process.env.P11_LOCAL_ROLES === '1' ? ['--preload', './test/fixtures/p11-local-roles.ts'] : [];
 const client = createPublicClient({ chain: bscTestnet, transport: http(RPC, { timeout: 120000, retryCount: 0 }), cacheTime: 0 });
 const local = createTestClient({ chain: bscTestnet, mode: 'anvil', transport: http(RPC) });
 const owner = mnemonicToAccount('test test test test test test test test test test test junk', { addressIndex: 7 });
@@ -44,6 +48,7 @@ function obj(value: unknown): Record<string, unknown> { assert.ok(typeof value =
 function str(value: unknown): string { assert.equal(typeof value, 'string'); return String(value); }
 function addr(value: unknown): Address { return getAddress(str(value)); }
 let token = '';
+function hex(value: unknown): `0x${string}` { assert.ok(typeof value === 'string' && /^0x[0-9a-f]*$/i.test(value)); return value as `0x${string}`; }
 async function request(path: string, method = 'GET', body?: unknown, status = 200) {
   const response = await fetch(API + path, { method, headers: { 'content-type': 'application/json', ...(token ? { authorization: 'Bearer ' + token } : {}) },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(120000) });
@@ -73,12 +78,12 @@ async function main() {
   // UserOps later use the local fork fee scenario under the unchanged USD budget.
   await local.setNextBlockBaseFeePerGas({ baseFeePerGas: 10_000_000_000n });
   await local.mine({ blocks: 1 });
-  check((await checkTestnetProfile(client)).every((c) => c.level === 'ok'), '319 pinned runtime hashes and selectors');
+  check((await checkTestnetProfile(client)).every((c) => c.level === 'ok'), 'all configured local runtime hashes and selectors');
   mkdirSync('.bun-cache', { recursive: true });
   const log = openSync('.bun-cache/testnet-services-87.log', 'a', 0o600);
   const alto = spawn('sh', ['alto/entrypoint.sh'], { stdio: ['ignore', log, log], env: { ...process.env, CHAIN_ID: '97', PORT: String(bundlerPort), RPC_URL: RPC,
     EXECUTOR_PRIVATE_KEY: process.env.BUNDLER_EXECUTOR_PRIVATE_KEY, UTILITY_PRIVATE_KEY: process.env.BUNDLER_UTILITY_PRIVATE_KEY } });
-  const backend = spawn(process.execPath, ['src/index.ts'], { stdio: ['ignore', log, log], env: process.env });
+  const backend = spawn(process.execPath, [...localPreload, 'src/index.ts'], { stdio: ['ignore', log, log], env: process.env });
   let strategyId: number | undefined;
   try {
     await ready(BUNDLER, true); await ready(API + '/health', false);
@@ -92,41 +97,70 @@ async function main() {
     // #86 HTTP publication creates hold/stack funding schedules, intentionally rejected by
     // the legacy drift scheduler until BE-2. Build its existing interval fixture through
     // the retained production service; enrollment/faucet remain real authenticated HTTP.
-    const version = await publishVersion(strategyId, { allocation: { assets: [{ address: P.assets.TONCOIN.token, weightBps: 10000 }] }, schedule: { kind: 'interval', intervalSeconds: 3600 }, activeAt: new Date(Number((await client.getBlock()).timestamp) * 1000) }, owner.address);
+    const version = await publishVersion(strategyId, { allocation: { assets: [{ address: P.assets.TONCOIN.token, weightBps: 10000 }] }, schedule: { kind: 'interval', intervalSeconds: 3600 }, activeAt: new Date(Number((await client.getBlock()).timestamp + 86500n) * 1000) }, owner.address);
     check(version.executionSchemaVersion === 0, 'production legacy interval fixture (BE-2 hold/stack not asserted)');
-    const portfolio = await request('/portfolios', 'POST', { strategyId }, 201);
-    check(typeof portfolio.id === 'number' && Array.isArray(portfolio.smartAccounts), 'real strategy publish and Kernel enrollment');
-    const portfolioId = Number(portfolio.id);
-    const account = addr(obj(portfolio.smartAccounts[0]).address);
-    const claimed = await request('/faucet/usdt', 'POST', { account });
-    check(claimed.state === 'confirmed' && claimed.amountWei === String(1000n * 10n ** 18n), 'HTTP faucet receipt and exact 1000 MockUSDT');
-    const repeat = await request('/faucet/usdt', 'POST', { account });
-    check(repeat.replayed === true && repeat.claimId === claimed.claimId && repeat.txHash === claimed.txHash && repeat.state === claimed.state, 'same-recipient retry returns the original durable claim');
-    // Approval is owner-authorized and self-funded; #66 intentionally does not sponsor approve.
-    await local.setBalance({ address: account, value: 10n ** 16n });
+    assert.ok(version.activeAt);
+    await local.setNextBlockTimestamp({ timestamp: BigInt(Math.max(Date.parse(version.activeAt) / 1000, Math.floor(Date.now() / 1000))) }); await local.mine({ blocks: 1 });
+    await refreshP11Markets(client, RPC, [P.assets.TONCOIN.token, P.assets.WBNB.token]);
+    const prepared = await request('/portfolios', 'POST', { strategyId });
+    check(prepared.signingMode === 'sudo' && prepared.expectedVersion === 1 && !('id' in prepared), 'HTTP preparation requires owner sudo and creates no portfolio');
+    const account = addr(prepared.account);
+    const accountCode = await client.getCode({ address: account });
+    check(prepared.accountDeployed === true && accountCode && accountCode !== '0x', 'operator deploys Kernel before owner setup; API confirms deployment');
+    check(!('factory' in prepared) && !('factoryData' in prepared), 'setup API provides no initCode deployment arguments');
+    const deploymentNonce = await client.getTransactionCount({ address: P.roles.operator });
+    const repeated = await request('/portfolios/enrollment-params', 'POST', { strategyId });
+    const afterRetryNonce = await client.getTransactionCount({ address: P.roles.operator });
+    check(repeated.account === prepared.account && repeated.accountDeployed === true && afterRetryNonce === deploymentNonce, 'HTTP retry reuses deployed account without another operator transaction');
+    await request('/portfolios/enrollment-confirm', 'POST', { strategyId }, 409);
+    // The owner signs enrollment only; the real paymaster sponsors the deployed Kernel at zero BNB.
+    assert.equal(await client.getBalance({ address: account }), 0n);
+    const setupTime = Number((await client.getBlock()).timestamp);
+    const setupPaymaster = ownerSetupPaymaster(account, owner.address, () => setupTime); assert.ok(setupPaymaster);
     const entryPoint = { address: P.contracts.entryPoint, version: '0.7' } as const;
     const sudo = await signerToEcdsaValidator(client, { signer: owner, entryPoint, kernelVersion: KERNEL_V3_3, validatorAddress: P.contracts.ecdsaValidatorV31 });
     const kernel = await createKernelAccount(client, { address: account, plugins: { sudo }, entryPoint, kernelVersion: KERNEL_V3_3,
       factoryAddress: P.contracts.kernelFactoryV33, metaFactoryAddress: P.contracts.kernelMetaFactory, accountImplementationAddress: P.contracts.kernelImplV33 });
-    const ownerClient = createKernelAccountClient({ account: kernel, chain: bscTestnet, client, bundlerTransport: http(BUNDLER, { timeout: 120000 }),
+    const ownerClient = createKernelAccountClient({ account: kernel, paymaster: setupPaymaster, chain: bscTestnet, client, bundlerTransport: http(BUNDLER, { timeout: 120000 }),
       userOperation: { estimateFeesPerGas: async () => { const price = await client.getGasPrice(); return { maxFeePerGas: price, maxPriorityFeePerGas: price }; } } });
-    const approveHash = await ownerClient.sendUserOperation({ calls: [{ to: P.contracts.usdt, data: encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [P.contracts.executor, (1n << 256n) - 1n] }) }], callGasLimit: 300000n });
-    check((await ownerClient.waitForUserOperationReceipt({ hash: approveHash, timeout: 120000 })).success, 'owner-authorized approve through local alto');
-    await local.setBalance({ address: account, value: 0n });
+    const enrollCall = obj(prepared.call);
+    const setupCalls = [
+      { to: addr(enrollCall.to), data: hex(enrollCall.data) },
+      { to: P.contracts.usdt, data: encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [P.contracts.executor, (1n << 256n) - 1n] }) },
+    ];
+    const nonce = await kernel.getNonce();
+    const estimate = await ownerClient.estimateUserOperationGas({ calls: setupCalls, nonce, paymaster: estimationPaymaster(setupPaymaster) });
+    const setupOperation = await ownerClient.prepareUserOperation({ calls: setupCalls, nonce, callGasLimit: estimate.callGasLimit * 3n / 2n,
+      verificationGasLimit: estimate.verificationGasLimit, preVerificationGas: estimate.preVerificationGas });
+    assert.equal(setupOperation.factory, undefined); assert.equal(setupOperation.factoryData, undefined);
+    const setupHash = await ownerClient.sendUserOperation(await signPreparedOperation(setupOperation, op => kernel.signUserOperation(op)));
+    const setup = await ownerClient.waitForUserOperationReceipt({ hash: setupHash, timeout: 120000 });
+    check(setup.success && setup.receipt.status === 'success', 'one real owner sudo UserOp without initCode enrolls expected version and approves USDT');
+    check((await client.readContract({ address: P.contracts.registry, abi: REGISTRY_ABI, functionName: 'enrollments', args: [account] }))[1] === 1, 'registry records owner-accepted version');
+    const portfolio = await request('/portfolios/enrollment-confirm', 'POST', { strategyId });
+    check(typeof portfolio.id === 'number' && Array.isArray(portfolio.smartAccounts), 'only canonical owner enrollment creates the portfolio');
+    const portfolioId = Number(portfolio.id);
+    const claimed = await request('/faucet/usdt', 'POST', { account });
+    check(claimed.state === 'confirmed' && claimed.amountWei === String(1000n * 10n ** 18n), 'HTTP faucet receipt and exact 1000 MockUSDT');
+    const repeat = await request('/faucet/usdt', 'POST', { account });
+    check(repeat.replayed === true && repeat.claimId === claimed.claimId && repeat.txHash === claimed.txHash && repeat.state === claimed.state, 'same-recipient retry returns the original durable claim');
+    check(await client.getBalance({ address: account }) === 0n, 'owner setup requires zero account BNB');
+    let openTime = (await client.getBlock()).timestamp;
+    const lastOpenTime = openTime + 7n * 86400n;
+    while (!stockMarketOpen(new Date(Number(openTime) * 1000)) && openTime < lastOpenTime) openTime += 60n;
+    assert.ok(stockMarketOpen(new Date(Number(openTime) * 1000)), 'ordinary scheduler requires an admitted open session');
+    await refreshP11Markets(client, RPC);
     const localBaseFee = process.env.TESTNET_ACCEPTANCE_GAS_PRICE_WEI;
     assert.ok(localBaseFee && /^[1-9][0-9]*$/.test(localBaseFee), 'supply an explicit local fork base-fee scenario');
     await local.setNextBlockBaseFeePerGas({ baseFeePerGas: BigInt(localBaseFee) });
     await local.mine({ blocks: 1 });
     const depositBefore = await client.readContract({ address: P.contracts.paymaster, abi: pmAbi, functionName: 'getDeposit' });
-    // TWAP warm-up advances the local fork. Align ONLY this acceptance process's wall clock
-    // to simulated time so the production signer still uses its normal 300-second expiry.
-    const now = Date.now;
-    const block = await client.getBlock({ blockTag: 'latest' });
-    const offset = Number(block.timestamp) * 1000 - now();
-    Date.now = () => now() + offset;
-    try {
+    // Calendar admission is an explicit scenario input. RPC and DB observations keep
+    // the real wall clock, including every production freshness/expiry check.
+    const calendarNow = new Date(Number(openTime) * 1000);
+    {
       await query('update portfolios set next_run_at=null where id=$1', [portfolioId]);
-      const round = await runSchedulerOnce({ dryRun: false, limit: 10, skipAlerts: true });
+      const round = await runSchedulerOnce({ dryRun: false, limit: 10, skipAlerts: true, now: calendarNow });
       const result = round.results.find((r) => r.portfolioId === portfolioId);
       check(result?.outcome === 'executed', 'production scheduler session-key rebalance executed: ' + (result?.reason ?? 'missing'));
       check(result.plan?.steps.every((step) => step.venue.toLowerCase() === P.contracts.universalRouter), 'all steps use chain 97 Pancake V3');
@@ -138,7 +172,7 @@ async function main() {
       check(await client.readContract({ address: P.assets.TONCOIN.token, abi: erc20Abi, functionName: 'decimals' }) === 9, 'new TONCOIN trades with its real 9-decimal token');
       const status = await request(`/portfolios/${portfolioId}/status`);
       check(JSON.stringify(status).includes('TONCOIN') && !JSON.stringify(status).includes('0x55d398'), 'status ticker uses profile');
-      const redeem = await buildRedeemPlan({ portfolioId, plan: snapshot, account }, { close: true }, { publicClient: client, executor: P.contracts.executor, query });
+      const redeem = await buildRedeemPlan({ portfolioId, plan: snapshot, account }, { close: true }, { publicClient: client, executor: P.contracts.executor, query, now: () => calendarNow });
       check(redeem.plan.kind === 'ready' && redeem.plan.steps.every((step) => step.tokenOut.toLowerCase() === P.contracts.usdt), 'redeem plan returns MockUSDT');
       assert.equal(redeem.plan.kind, 'ready');
       const hooks = schedulerPaymaster(account);
@@ -161,31 +195,45 @@ async function main() {
       await send([{ to: P.contracts.usdt, data: encodeFunctionData({ abi: erc20Abi, functionName: 'transfer', args: [owner.address, cash] }) }]);
       check(await client.readContract({ address: P.contracts.usdt, abi: erc20Abi, functionName: 'balanceOf', args: [account] }) === 0n &&
         await client.readContract({ address: P.contracts.usdt, abi: erc20Abi, functionName: 'balanceOf', args: [owner.address] }) === before + cash, 'owner receives exact full MockUSDT withdrawal');
-    } finally { Date.now = now; }
+    }
     check(await client.readContract({ address: P.contracts.paymaster, abi: pmAbi, functionName: 'getDeposit' }) < depositBefore, 'own paymaster paid scheduler gas');
     check(await client.getBalance({ address: account }) === 0n, 'scheduler required no account BNB');
     const sponsored = await query<{ n: string }>('select count(*)::text as n from paymaster_sponsorships where chain_id=97 and sender=$1', [account.toLowerCase()]);
     check(Number(sponsored.rows[0]?.n) >= 1, 'production paymaster persisted authorization');
-    // --prune-history cannot serve a deployment-era state binary search. Use the
-    // real deployment receipt block supplied by the fork launcher for venue logs.
+    // Use the actual deployment receipt block, retaining enough local state
+    // history to verify code creation as well as all venue events.
     const deploymentBlock = process.env.EXECUTOR_DEPLOYMENT_BLOCK;
     assert.ok(deploymentBlock && /^[1-9][0-9]*$/.test(deploymentBlock), 'executor deployment receipt block required');
-    const preflight = spawn(process.execPath, ['scripts/preflight.ts', '--chain', '97', '--strict'], { stdio: ['ignore', log, log], env: { ...process.env, EXECUTOR_DEPLOYMENT_BLOCK: deploymentBlock } });
+    const preflight = spawn(process.execPath, [...localPreload, 'scripts/preflight.ts', '--chain', '97', '--strict'], { stdio: ['ignore', log, log], env: { ...process.env, EXECUTOR_DEPLOYMENT_BLOCK: deploymentBlock } });
     const code = await new Promise<number | null>((resolve) => preflight.once('exit', resolve));
     check(code === 0, 'strict preflight all green (details in service log)');
-    console.log(`TESTNET_97_ACCEPTANCE: ${passes} pass / 0 skip / 0 fail`);
   } finally {
     token = '';
     backend.kill('SIGTERM'); alto.kill('SIGTERM'); closeSync(log);
-    if (strategyId !== undefined) {
-      await query('delete from paymaster_sponsorships where sender in (select address from smart_accounts where portfolio_id in (select id from portfolios where strategy_id=$1))', [strategyId]);
-      await query('delete from portfolios where strategy_id=$1', [strategyId]);
-      await query('delete from strategies where id=$1', [strategyId]);
-      await query('delete from enrollment_intents where strategy_id=$1', [strategyId]);
-      await query('delete from faucet_claims where owner=$1 and chain_id=97', [owner.address.toLowerCase()]);
-      await query('delete from auth_sessions where wallet=$1', [owner.address.toLowerCase()]);
-    }
-    await closePool();
+    try {
+      if (strategyId !== undefined) {
+        await query('delete from paymaster_sponsorships where sender in (select address from smart_accounts where portfolio_id in (select id from portfolios where strategy_id=$1))', [strategyId]);
+        await query('delete from portfolios where strategy_id=$1', [strategyId]);
+        await query('delete from enrollment_intents where strategy_id=$1', [strategyId]);
+        await query('delete from strategies where id=$1', [strategyId]);
+        // Faucet claims and original outbox bytes are immutable evidence. Keep both;
+        // this isolated disposable DB is reset by the acceptance launcher between suites.
+        await query('delete from auth_sessions where wallet=$1', [owner.address.toLowerCase()]);
+      }
+    } finally { await closePool(); }
   }
+  console.log(`TESTNET_97_ACCEPTANCE: ${passes} pass / 0 skip / 0 fail`);
 }
-main().catch(() => { console.error('TESTNET_97_ACCEPTANCE failed (local assertion or dependency unavailable)'); process.exitCode = 1; });
+main().catch((error: unknown) => {
+  const trail: { name: string; code?: string | number; aa?: string; selector?: string; reason?: string }[] = [];
+  for (let value = error, depth = 0; depth < 8 && typeof value === 'object' && value !== null; depth++) {
+    const name = Reflect.get(value, 'name'), code = Reflect.get(value, 'code'), message = Reflect.get(value, 'message'), data = Reflect.get(value, 'data');
+    const item: (typeof trail)[number] = { name: typeof name === 'string' && /^[A-Za-z]{1,64}$/.test(name) ? name : 'Error' };
+    if (typeof code === 'number' || typeof code === 'string' && /^[A-Z_]{1,80}$/.test(code)) item.code = code;
+    if ((code === -32502 || code === -32500) && typeof message === 'string') item.reason = message.replace(/0x[0-9a-f]+/gi, '<hex>').replace(/(?:https?|postgres(?:ql)?):\S+/g, '<endpoint>').slice(0, 240);
+    if (typeof message === 'string') item.aa = message.match(/\bAA[0-9]{2}\b/)?.[0];
+    if (typeof data === 'string' && /^0x[0-9a-f]+$/i.test(data)) item.selector = data.slice(0, 10);
+    trail.push(item); value = Reflect.get(value, 'cause');
+  }
+  console.error('TESTNET_97_ACCEPTANCE failed ' + JSON.stringify(trail)); process.exitCode = 1;
+});

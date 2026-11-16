@@ -28,7 +28,9 @@ const AAVE_ACCOUNTING_ABI = parseAbi(['function scaledBalanceOf(address) view re
 const RAY = 10n ** 27n;
 
 /** Both quote and execution preview use one canonical block and include protocol accrual via eth_call.
- * No slippage discount and no broadcast for non-view quote functions.
+ * C3 #110: sign floor(quote * 9995 / 10000), leaving 5 bps of the executor's 10 bps tolerance
+ * for cross-block accrual. A rounded-zero minimum never reaches signing or submission.
+ * Non-view quote functions are simulated, never broadcast.
  */
 export async function quoteYieldAction(client: PublicClient, account: Address, action: YieldAction, ttlSeconds = 300): Promise<YieldPlan> {
   if (!['supply', 'withdraw'].includes(action.kind) || action.amount <= 0n || action.amount >= 1n << 256n ||
@@ -46,12 +48,13 @@ export async function quoteYieldAction(client: PublicClient, account: Address, a
     if (!isAddressEqual(registered.asset, market.asset) || !isAddressEqual(registered.receipt, market.receipt) ||
         !isAddressEqual(registered.target, market.target) || registered.chainId !== 97n ||
         registered.kind !== ({ Venus: 1, Lista: 2, Aave: 3 } as const)[market.protocol]) throw new Error('market mismatch');
-    const minimum = action.kind === 'supply'
+    const quote = action.kind === 'supply'
       ? (await client.simulateContract({ address: yieldRegistry, abi: YIELD_REGISTRY_ABI, functionName: 'quoteSupply',
         args: [action.marketId, account, action.amount], account, blockNumber: block.number })).result
       : (await client.simulateContract({ address: yieldRegistry, abi: YIELD_REGISTRY_ABI, functionName: 'quoteWithdraw',
         args: [action.marketId, action.amount], account, blockNumber: block.number })).result;
-    if (minimum <= 0n) throw new Error('zero quote');
+    const minimum = quote * 9995n / 10000n;
+    if (minimum <= 0n) throw new Error('zero minimum');
     const [assetBalance, receiptBalance] = await Promise.all([market.asset, market.receipt].map(address => client.readContract({
       address, abi: erc20Abi, functionName: 'balanceOf', args: [account], blockNumber: block.number })));
     if (assetBalance === undefined || receiptBalance === undefined ||

@@ -16,7 +16,7 @@ const block = { number: '0x7b', hash: blockHash, parentHash: blockHash, timestam
   difficulty: '0x0', extraData: '0x', miner: account, nonce: '0x0000000000000000', size: '0x1',
   receiptsRoot: blockHash, sha3Uncles: blockHash, stateRoot: blockHash, transactionsRoot: blockHash };
 
-function quoteClient(mode = 'ok') {
+function quoteClient(mode = 'ok', quoted = 100n) {
   const calls: { address: Address; data: Hex; block: unknown }[] = [];
   const client = createPublicClient({ chain: bscTestnet, transport: custom({ request: async ({ method, params }) => {
     if (mode === 'rpc') throw new Error('SECRET_RPC_TOKEN');
@@ -36,7 +36,7 @@ function quoteClient(mode = 'ok') {
       const decoded = decodeFunctionData({ abi: YIELD_EXECUTOR_ABI, data: data as Hex });
       if (decoded.functionName === 'yieldRegistry') return encodeFunctionResult({ abi: YIELD_EXECUTOR_ABI, functionName: 'yieldRegistry', result: T.contracts.yieldRegistry });
       assert.ok(decoded.functionName === 'executeSupply' || decoded.functionName === 'executeWithdraw');
-      assert.equal(decoded.args[3], 100n, 'full preview min, never discounted');
+      assert.equal(decoded.args[3], quoted * 9995n / 10000n, 'preview uses the signed 5 bps minimum');
       assert.equal(decoded.args[4], BigInt(block.timestamp) + 300n);
       if (mode === 'simulation') throw new Error('SECRET_REVERT');
       return '0x';
@@ -48,21 +48,48 @@ function quoteClient(mode = 'ok') {
         receipt: market.receipt, riskSource: market.target, configuration: blockHash, minRate: 1n, maxRate: 10n ** 36n, supplyEnabled: true, retired: false,
       } });
       assert.ok(decoded.functionName === 'quoteSupply' || decoded.functionName === 'quoteWithdraw');
-      return encodeFunctionResult({ abi: YIELD_REGISTRY_ABI, functionName: decoded.functionName, result: mode === 'zero' ? 0n : 100n });
+      if (mode === 'quote-timeout') throw new Error('SECRET_RPC_TIMEOUT');
+      return encodeFunctionResult({ abi: YIELD_REGISTRY_ABI, functionName: decoded.functionName, result: mode === 'zero' ? 0n : quoted });
     }
+    if (mode === 'missing-balance') return '0x';
     return encodeFunctionResult({ abi: erc20Abi, functionName: 'balanceOf', result: mode === 'insufficient' ? 0n : 1000n });
   } }, { retryCount: 0 }) });
   return { client, calls };
 }
 
-test('#85 supply and withdraw use non-view accrued quote at one canonical block with exact minimum and deadline', async () => {
+test('#110 supply and withdraw use accrued quote at one canonical block with the signed 5 bps minimum and deadline', async () => {
   for (const kind of ['supply', 'withdraw'] as const) {
     const { client, calls } = quoteClient();
     const plan = await quoteYieldAction(client, account, { kind, marketId: market.marketId, amount: 100n });
-    assert.equal(plan.minimum, 100n); assert.equal(plan.quoteBlock, 123n); assert.equal(plan.quoteBlockHash, blockHash);
+    assert.equal(plan.minimum, 99n); assert.equal(plan.quoteBlock, 123n); assert.equal(plan.quoteBlockHash, blockHash);
     assert.equal(plan.assetBalance, 1000n); assert.equal(plan.receiptBalance, 1000n);
     assert.equal(calls.length, 6);
     assert.equal(plan.data.slice(0, 10), kind === 'supply' ? '0x5728db07' : '0x63f865c0');
+  }
+});
+
+test('#110 signed minimum floors 5 bps at the first positive unit, exact denominator, rounding edges and uint256 maximum', async () => {
+  for (const kind of ['supply', 'withdraw'] as const) {
+    for (const [quoted, expected] of [[2n, 1n], [1999n, 1998n], [2000n, 1999n], [2001n, 1999n],
+      [10000n, 9995n], [(1n << 256n) - 1n, ((1n << 256n) - 1n) * 9995n / 10000n]] as const) {
+      const { client } = quoteClient('ok', quoted);
+      const plan = await quoteYieldAction(client, account, { kind, marketId: market.marketId, amount: 1n });
+      assert.equal(plan.minimum, expected);
+      const decoded = decodeFunctionData({ abi: YIELD_EXECUTOR_ABI, data: plan.data });
+      assert.ok(decoded.functionName === 'executeSupply' || decoded.functionName === 'executeWithdraw');
+      assert.equal(decoded.args[3], expected);
+    }
+  }
+});
+
+test('#110 zero quote and positive quote rounded to zero reject before balance reads, preview or signing', async () => {
+  for (const kind of ['supply', 'withdraw'] as const) {
+    for (const quoted of [0n, 1n]) {
+      const { client, calls } = quoteClient('ok', quoted);
+      await assert.rejects(quoteYieldAction(client, account, { kind, marketId: market.marketId, amount: 1n }),
+        (error: unknown) => error instanceof Error && /未送交易/.test(error.message));
+      assert.equal(calls.length, 3, 'only registry link, market identity and accrued quote are read');
+    }
   }
 });
 
@@ -74,10 +101,12 @@ test('#85 zero/negative/overflow amounts, invalid TTL and unknown markets reject
   assert.equal(calls.length, 0);
 });
 
-test('#85 RPC/missing block/identity/zero quote/reorg/insufficient balance/simulation fail closed and redact errors', async () => {
-  for (const mode of ['rpc', 'chain', 'missing-block', 'identity', 'zero', 'reorg', 'insufficient', 'simulation']) {
-    await assert.rejects(quoteYieldAction(quoteClient(mode).client, account, { kind: 'supply', marketId: market.marketId, amount: 1n }),
-      (error: unknown) => error instanceof Error && /未送交易/.test(error.message) && !error.message.includes('SECRET'), mode);
+test('#110 both actions fail closed and redact RPC/quote timeout/missing data/identity/reorg/balance/preview errors', async () => {
+  for (const kind of ['supply', 'withdraw'] as const) {
+    for (const mode of ['rpc', 'chain', 'missing-block', 'identity', 'zero', 'quote-timeout', 'reorg', 'insufficient', 'missing-balance', 'simulation']) {
+      await assert.rejects(quoteYieldAction(quoteClient(mode).client, account, { kind, marketId: market.marketId, amount: 1n }),
+        (error: unknown) => error instanceof Error && /未送交易/.test(error.message) && !error.message.includes('SECRET'), `${kind} ${mode}`);
+    }
   }
 });
 

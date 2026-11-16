@@ -90,7 +90,7 @@ test('#69 profile preflight verifies every codehash and selector; wrong chain, e
     const checks = await checkTestnetProfile(client, expected);
     assert.equal(checks.some((c) => c.level === 'fail'), mode !== 'ok', mode);
     assert.doesNotMatch(JSON.stringify(checks), /secret-rpc/);
-    if (mode === 'ok') assert.equal(checks.length, 380);
+    if (mode === 'ok') assert.equal(checks.length, 381);
   }
 });
 
@@ -157,7 +157,8 @@ test('#87 all 92 raw specs/caps align, original caps stay fixed and every runtim
   }
   assert.equal(extensions, 54);
   assert.deepEqual(Object.keys(hashes).sort(), testnetProfileTargets().map((t) => t.name).sort());
-  assert.equal(testnetProfileTargets().length, 380);
+  assert.equal(testnetProfileTargets().length, 381);
+  assert.ok(testnetProfileTargets().some(t => t.name === 'yieldView' && t.address === TESTNET_97.contracts.yieldView));
   assert.equal(TESTNET_97.assets.TONCOIN.decimals, 9);
   assert.ok(Object.hasOwn(TESTNET_97.assets, 'Cake'));
 });

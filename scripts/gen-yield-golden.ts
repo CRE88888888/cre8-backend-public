@@ -17,7 +17,7 @@ export async function yieldGoldenVector() {
   const session = await buildSessionPermissions({ publicClient: client, sessionKeyAddress: sessionKey,
     executorAddress: T.contracts.executor, yieldAccount: account, validUntil });
   return { encodingOnly: true, chainId: 97, sourceCommit: T.sourceCommit, account, sessionKey, validUntil,
-    executor: T.contracts.executor, yieldRegistry: T.contracts.yieldRegistry,
+    executor: T.contracts.executor, yieldRegistry: T.contracts.yieldRegistry, yieldView: T.contracts.yieldView,
     permissionId: session.permissionId, policySnapshot: session.policySnapshot, initConfig: session.initConfig,
     calls: T.yieldMarkets.slice(0, 3).flatMap(market => ['executeSupply', 'executeWithdraw'].map(functionName => {
       const kind = functionName === 'executeSupply' ? 'executeSupply' : 'executeWithdraw';

@@ -4,6 +4,12 @@ import { keccak256 } from 'viem';
 import { profileFromManifest, verifyArtifactSources } from '../scripts/sync-testnet-profile.js';
 import manifest from '../deploy/testnet-97.json' with { type: 'json' };
 
+test('#110 missing YieldView aborts profile generation before any runtime capture', () => {
+  const contracts: Record<string, string> = { ...manifest.contracts };
+  delete contracts.yieldView;
+  assert.throws(() => profileFromManifest({ ...manifest, contracts }), /missing manifest contract: yieldView/);
+});
+
 test('#85 generator rejects chain/mode/count/identity/duplicate/missing manifest data before writes', () => {
   // Actual current deployment input is checked again in testnet-profile.test.ts.
   for (const change of [{ chainId: 56 }, { mode: 'public' }, { mode: undefined }, { gitCommit: '' },

@@ -1,5 +1,5 @@
 /** Local fork capture of forge-deployed runtime, including constructor immutables.
- * bun scripts/sync-testnet-profile.ts <contracts checkout> http://127.0.0.1:8592 fork
+ * bun scripts/sync-testnet-profile.ts <contracts checkout> http://127.0.0.1:8599 fork
  * Never reads signing material. Invalid inputs/code abort before any output is written.
  */
 import { execFileSync } from 'node:child_process';
@@ -27,7 +27,7 @@ export function profileFromManifest(input: unknown, expectedMode: 'fork' | 'publ
   if (m.chainId !== 97 || m.mode !== expectedMode || typeof m.gitCommit !== 'string' || !/^[0-9a-f]{40}$/.test(m.gitCommit) ||
       !Number.isSafeInteger(m.verifiedAtBlock) || Number(m.verifiedAtBlock) < 1 || typeof m.generatedAt !== 'string') throw new Error('invalid chain 97 manifest metadata / mode');
   const contracts = addresses(m.contracts), roles = addresses(m.roles);
-  for (const key of ['registry', 'router', 'usdt', 'executor', 'yieldRegistry', 'paymaster', 'gasPolicy', 'entryPoint',
+  for (const key of ['registry', 'router', 'usdt', 'executor', 'yieldRegistry', 'yieldView', 'paymaster', 'gasPolicy', 'entryPoint',
     'ownedDeployer', 'feed.USDT/USD', 'v3Factory', 'positionManager', 'universalRouter', 'permit2']) {
     if (!contracts[key]) throw new Error('missing manifest contract: ' + key);
   }
@@ -105,18 +105,18 @@ export async function syncProfile(root: string, rpcUrl: string, mode: 'fork' | '
   }
   // Compare forge runtime against captured code, ignoring only compiler-declared immutable slots.
   const artifacts = new Map<string, Record<string, unknown>>();
-  for (const name of ['AtpExecutor', 'AtpYieldRegistry']) {
+  for (const [name, key] of [['AtpExecutor', 'executor'], ['AtpYieldRegistry', 'yieldRegistry'], ['YieldView', 'yieldView']] as const) {
     const artifact: unknown = JSON.parse(readFileSync(resolve(root, `out/${name}.sol/${name}.json`), 'utf8'));
     verifyArtifactSources(artifact, path => execFileSync('git', ['show', sourceCommit + ':' + path], { cwd: root }));
     const runtime = record(record(artifact).deployedBytecode);
     if (typeof runtime.object !== 'string') throw new Error('missing forge runtime');
-    const addr = name === 'AtpExecutor' ? profile.contracts.executor : profile.contracts.yieldRegistry;
+    const addr = profile.contracts[key];
     if (!addr) throw new Error('missing yield address');
     const deployed = await client.getCode({ address: addr, blockNumber: block.number });
     if (!deployed) throw new Error('missing deployed runtime');
     const normalize = (code: string) => {
       const bytes = Buffer.from(code.replace(/^0x/, ''), 'hex');
-      for (const refs of Object.values(record(runtime.immutableReferences))) {
+      for (const refs of Object.values(record(runtime.immutableReferences ?? {}))) {
         if (!Array.isArray(refs)) throw new Error('invalid immutable references');
         for (const ref of refs) {
           const slot = record(ref);
@@ -129,8 +129,12 @@ export async function syncProfile(root: string, rpcUrl: string, mode: 'fork' | '
     if (normalize(deployed) !== normalize(runtime.object)) throw new Error('forge runtime differs: ' + name);
     artifacts.set(name, record(artifact));
   }
+  const registryAddress = profile.contracts.yieldRegistry;
+  if (!registryAddress) throw new Error('missing yield registry');
+  const reader = await client.readContract({ address: registryAddress, abi: [{ type: 'function', name: 'reader', inputs: [], outputs: [{ type: 'address' }], stateMutability: 'pure' }], functionName: 'reader', blockNumber: block.number });
+  if (reader.toLowerCase() !== profile.contracts.yieldView) throw new Error('registry reader differs from manifest YieldView');
   if ((await client.getBlock({ blockNumber: block.number })).hash !== block.hash) throw new Error('capture reorg');
-  const provenance = { source: 'local anvil runtime from forge DeployTestnet; executor/registry checked against forge deployedBytecode + immutableReferences',
+  const provenance = { source: 'local anvil runtime from forge DeployTestnet; executor/registry/YieldView checked against forge deployedBytecode + immutableReferences; registry reader matches YieldView',
     contractsCommit: profile.sourceCommit, forgeCheckoutCommit: sourceCommit,
     blockNumber: block.number.toString(), blockHash: block.hash };
   // Read compiled artifacts without invoking forge: the contracts checkout is read-only.
@@ -141,14 +145,15 @@ export async function syncProfile(root: string, rpcUrl: string, mode: 'fork' | '
   };
   const executorAbi = abi('AtpExecutor').filter(value => {
     const fn = record(value);
-    return fn.type === 'error' || ['yieldRegistry', 'executeSupply', 'executeWithdraw', 'previewAccountValue', 'previewBuyAllowance', 'SupplyExecuted', 'WithdrawExecuted'].includes(String(fn.name));
+    return fn.type === 'error' || ['yieldRegistry', 'YIELD_QUOTE_TOLERANCE_BPS', 'executeSupply', 'executeWithdraw', 'previewAccountValue', 'previewBuyAllowance', 'SupplyExecuted', 'WithdrawExecuted'].includes(String(fn.name));
   });
   const registryAbi = abi('AtpYieldRegistry');
+  const viewAbi = abi('YieldView');
   writeFileSync('deploy/testnet-97.json', JSON.stringify(manifest, null, 2) + '\n');
   writeFileSync('deploy/testnet-97-codehashes.json', JSON.stringify({ ...provenance, hashes }, null, 2) + '\n');
   writeFileSync('src/testnet-profile-data.ts', '// Generated by scripts/sync-testnet-profile.ts; do not edit.\nexport const TESTNET_97 = ' + JSON.stringify(profile, null, 2) + ' as const;\n');
   writeFileSync('src/testnet-codehashes.ts', '// Generated from deploy/testnet-97-codehashes.json by scripts/sync-testnet-profile.ts.\nexport default ' + JSON.stringify(hashes, null, 2) + ' as const;\n');
-  writeFileSync('src/yield-abi.ts', '// Generated from forge artifacts; source contracts ' + profile.sourceCommit + '.\nexport const YIELD_EXECUTOR_ABI = ' + JSON.stringify(executorAbi) + ' as const;\nexport const YIELD_REGISTRY_ABI = ' + JSON.stringify(registryAbi) + ' as const;\n');
+  writeFileSync('src/yield-abi.ts', '// Generated from forge artifacts; source contracts ' + profile.sourceCommit + '.\nexport const YIELD_EXECUTOR_ABI = ' + JSON.stringify(executorAbi) + ' as const;\nexport const YIELD_REGISTRY_ABI = ' + JSON.stringify(registryAbi) + ' as const;\nexport const YIELD_VIEW_ABI = ' + JSON.stringify(viewAbi) + ' as const;\n');
   execFileSync('bun', ['scripts/gen-yield-golden.ts']);
   console.log('generated chain 97 profile: 92 assets, 30 yield markets, ' + targets.length + ' runtime pins');
 }

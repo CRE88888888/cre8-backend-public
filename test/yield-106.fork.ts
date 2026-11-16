@@ -1,5 +1,5 @@
 /** Explicit acceptance: bun --no-env-file test ./test/yield-106.fork.ts --timeout=1200000.
- * Requires the reviewed manifest deployed on chain 97 anvil 8599, alto 3099, DB cre8_be106.
+ * Requires the reviewed manifest deployed on chain 97 anvil 8599, alto 3099, DB cre8_be110.
  * No automatic discovery, external signing service, key files or public-chain writes.
  */
 import assert from 'node:assert/strict';
@@ -22,19 +22,20 @@ import { estimationPaymaster, readNativeBudgetPrice, schedulerPaymaster, settleG
 import { signPreparedOperation } from '../src/user-operation.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
 import { checkTestnetProfile } from '../src/testnet-preflight.js';
-import { YIELD_REGISTRY_ABI } from '../src/yield-abi.js';
+import { YIELD_EXECUTOR_ABI, YIELD_REGISTRY_ABI } from '../src/yield-abi.js';
 import { createYieldService, runYieldRound } from '../src/yield-service.js';
 import { readYieldAccount } from '../src/yield-reader.js';
 import { yieldProfile, WAD } from '../src/yield-domain.js';
 import { gasExecutionKey, canonicalKernelCalls } from '../src/paymaster.js';
 import type { SnapshotRow } from '../src/yield-store.js';
 import { restoreYieldOperation } from '../src/yield-store.js';
-import { reconcileYieldOperation } from '../src/yield-execution.js';
+import { reconcileYieldOperation, submitYieldAction } from '../src/yield-execution.js';
+import type { SavedYieldOperation } from '../src/yield-execution.js';
 import { localAcceptanceEnv } from './fixtures/local-acceptance.js';
 
 const lane = localAcceptanceEnv(process.env, true);
 const rpcUrl = 'http://127.0.0.1:8599', bundlerUrl = 'http://127.0.0.1:3099';
-assert.ok(lane.rpcUrl === rpcUrl && lane.bundler?.url === bundlerUrl && lane.backendPort === 8699 && lane.databaseName === 'cre8_be106', 'select only the BE106 local lane');
+assert.ok(lane.rpcUrl === rpcUrl && lane.bundler?.url === bundlerUrl && lane.backendPort === 8699 && lane.databaseName === 'cre8_be110', 'select only the BE110 local lane');
 assert.equal(process.env.ENABLE_YIELD_EXECUTION, '1');
 const client = createPublicClient({ chain: bscTestnet, transport: http(rpcUrl, { retryCount: 0, timeout: 120000 }), pollingInterval: 100, cacheTime: 0 });
 const local = createTestClient({ chain: bscTestnet, mode: 'anvil', transport: http(rpcUrl, { retryCount: 0, timeout: 120000 }) });
@@ -47,10 +48,20 @@ process.env.PAYMASTER_SIGNER_PRIVATE_KEY = `0x${Buffer.from(sponsorKey).toString
 const C = T.contracts, entryPoint = { address: C.entryPoint, version: '0.7' } as const;
 const operator = createWalletClient({ chain: bscTestnet, account: T.roles.operator, transport: http(rpcUrl, { retryCount: 0, timeout: 120000 }) });
 const ownerWallet = createWalletClient({ chain: bscTestnet, account: owner, transport: http(rpcUrl, { retryCount: 0, timeout: 120000 }) });
-const extra = parseAbi(['function nextStrategyId() view returns(uint256)', 'function setLiquidity(uint256)', 'function getDeposit() view returns(uint256)']);
+const extra = parseAbi(['function nextStrategyId() view returns(uint256)', 'function setLiquidity(uint256)', 'function getDeposit() view returns(uint256)', 'function scaledBalanceOf(address) view returns(uint256)']);
 const feeds = parseAbi(['function latestRoundData() view returns(uint80,int256,uint256,uint256,uint80)', 'function push(int256)']);
 // Use the real local RPC client without requiring the deployment operator's private key.
-const chainDeps = { client: () => client };
+const chainDeps = { client: () => client, port: async () => ({ reconcileYieldOperation,
+  submitYieldAction: (args: Parameters<typeof submitYieldAction>[0]) => submitYieldAction({ ...args, maxQuoteAttempts: 1,
+    journal: { ...args.journal, prepare: async input => {
+      const id = await args.journal.prepare(input);
+      // Advance real time and a local block AFTER the immutable quote is persisted.
+      // Production quoting, signing, sponsorship, submission and settlement stay intact.
+      await pause(2100); await refreshClock();
+      return id;
+    } },
+  }),
+}) };
 const service = createYieldService(chainDeps);
 let passes = 0;
 function check(value: unknown, label: string): asserts value { assert.ok(value, label); passes++; console.log('PASS ' + label); }
@@ -88,11 +99,13 @@ async function pokeGasPricePool() {
 }
 after(closePool);
 
-test('#106 durable scheduler + real sponsored Kernel lifecycle for Venus, Lista and Aave, with 60/day boundary', { timeout: 1200000 }, async () => {
+test('#110 cross-block durable scheduler + real sponsored Kernel lifecycle for Venus, Lista and Aave, with 60/day boundary', { timeout: 1200000 }, async () => {
   const info: unknown = await (await fetch(rpcUrl, { method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'anvil_nodeInfo', params: [] }) })).json();
   check(info && typeof info === 'object' && 'result' in info && info.result && await client.getChainId() === 97, 'local anvil chain 97 proof');
   check((await checkTestnetProfile(client)).every(c => c.level === 'ok'), 'all manifest runtime hashes and selectors match before local signer substitution');
+  check((await client.readContract({ address: C.yieldRegistry, abi: YIELD_REGISTRY_ABI, functionName: 'reader' })).toLowerCase() === C.yieldView, 'registry links the pinned YieldView');
+  check(await client.readContract({ address: C.executor, abi: YIELD_EXECUTOR_ABI, functionName: 'YIELD_QUOTE_TOLERANCE_BPS' }) === 10n, 'executor has the reviewed 10 bps cross-block tolerance');
   await migrate();
   check((await query('select portfolio_id from smart_accounts')).rows.length === 0, 'fresh isolated acceptance database');
   const profile = yieldProfile(); assert.ok(profile);
@@ -108,6 +121,17 @@ test('#106 durable scheduler + real sponsored Kernel lifecycle for Venus, Lista 
   await local.setBlockTimestampInterval({ interval: 0 });
   const depositBefore = await client.readContract({ address: C.paymaster, abi: extra, functionName: 'getDeposit' });
   const gas: { protocol: string; phase: string; gasUsed: string; txHash: Hex }[] = [];
+  async function verifyOriginalQuote(saved: SavedYieldOperation, txHash: Hex) {
+    const p = saved.plan;
+    const quoted = p.kind === 'supply'
+      ? (await client.simulateContract({ address: C.yieldRegistry, abi: YIELD_REGISTRY_ABI, functionName: 'quoteSupply', args: [p.marketId, p.account, p.amount], account: p.account, blockNumber: p.quoteBlock })).result
+      : (await client.simulateContract({ address: C.yieldRegistry, abi: YIELD_REGISTRY_ABI, functionName: 'quoteWithdraw', args: [p.marketId, p.amount], account: p.account, blockNumber: p.quoteBlock })).result;
+    check(p.minimum === quoted * 9995n / 10000n && p.minimum > 0n, `${p.kind} persisted signed minimum floors the original quote with 5 bps tolerance`);
+    const receipt = await client.getTransactionReceipt({ hash: txHash });
+    const before = await client.getBlock({ blockNumber: p.quoteBlock }), after = await client.getBlock({ blockNumber: receipt.blockNumber });
+    check(before.hash === p.quoteBlockHash && receipt.blockNumber >= p.quoteBlock + 2n && after.timestamp > before.timestamp, `${p.kind} original quote succeeds across two blocks and real elapsed time without retry`);
+    console.log('YIELD_110_CROSS_BLOCK ' + JSON.stringify({ kind: p.kind, market: p.marketId, quote: quoted.toString(), minimum: p.minimum.toString(), quoteBlock: p.quoteBlock.toString(), executionBlock: receipt.blockNumber.toString(), elapsedSeconds: (after.timestamp - before.timestamp).toString() }));
+  }
   try {
     // The launcher deploys on an older fork block. Catch up once: TWAP warms without
     // future-dated SQL evidence or any replacement of PostgreSQL's clock.
@@ -116,11 +140,11 @@ test('#106 durable scheduler + real sponsored Kernel lifecycle for Venus, Lista 
     await pokeGasPricePool();
     check((await readNativeBudgetPrice(client, C.executor, 97)).nativePrice > 0n, 'production gas budget oracle has a fresh real quote');
     const catalog = await service.markets(97);
-    check(catalog.markets.length === 30 && catalog.markets.filter(m => m.symbol === 'USDT').every(m => m.supplyOpen && m.aprBps !== null), 'production market reader admits the configured yield catalog before version publication');
+    check(catalog.markets.length === 30 && catalog.markets.every(m => m.aprBps !== null && BigInt(m.aprBps) > 0n) && catalog.markets.filter(m => m.symbol === 'USDT').every(m => m.supplyOpen), 'production market reader admits the configured yield catalog with all 30 APRs nonzero');
     for (const protocol of ['Venus', 'Lista', 'Aave'] as const) {
       const market = T.yieldMarkets.find(m => m.protocol === protocol && m.symbol === 'USDT'); assert.ok(market);
       const strategyId = 1n + await client.readContract({ address: C.registry, abi: extra, functionName: 'nextStrategyId' });
-      await landed(await ownerWallet.writeContract({ address: C.registry, abi: REGISTRY_ABI, functionName: 'registerStrategy', args: [`BE106 ${protocol}`, 'local Kernel yield acceptance', false] }));
+      await landed(await ownerWallet.writeContract({ address: C.registry, abi: REGISTRY_ABI, functionName: 'registerStrategy', args: [`BE110 ${protocol}`, 'local Kernel yield acceptance', false] }));
       await landed(await ownerWallet.writeContract({ address: C.registry, abi: REGISTRY_ABI, functionName: 'publishVersion', args: [strategyId, [C.usdt], [10000], `0x${'00'.repeat(32)}`, 0n] }));
       const initial = deriveSessionKeyFor(owner.address, strategyId, material);
       const validUntil = Number((await client.getBlock()).timestamp) + 86400;
@@ -132,7 +156,7 @@ test('#106 durable scheduler + real sponsored Kernel lifecycle for Venus, Lista 
       await landed(await operator.writeContract({ address: C.registry, abi: REGISTRY_ABI, functionName: 'enroll', args: [params.address, strategyId] }));
       const amount = 100n * WAD;
       await landed(await operator.writeContract({ address: C.usdt, abi: parseAbi(['function claimFor(address,uint256)']), functionName: 'claimFor', args: [params.address, amount] }));
-      const sid = (await query<{ id: string }>('insert into strategies(provider,name,onchain_id) values($1,$2,$3) returning id::text', [owner.address.toLowerCase(), `be106-${protocol}`, strategyId.toString()])).rows[0]?.id; assert.ok(sid);
+      const sid = (await query<{ id: string }>('insert into strategies(provider,name,onchain_id) values($1,$2,$3) returning id::text', [owner.address.toLowerCase(), `be110-${protocol}`, strategyId.toString()])).rows[0]?.id; assert.ok(sid);
       const selected = profile.markets.find(m => m.marketId === market.marketId); assert.ok(selected);
       const execution = { kind: 'per_asset', numeraire: C.usdt, rebalance: 'none', assets: [{ asset: C.usdt, weightBps: 10000, yield: { market: selected.id } }] };
       await query(`insert into strategy_versions(strategy_id,version,allocation,schedule,active_at,execution_schema_version,execution,execution_chain_id,config_hash)
@@ -188,6 +212,7 @@ test('#106 durable scheduler + real sponsored Kernel lifecycle for Venus, Lista 
       check(saved.plan.minimum > 0n && saved.plan.amount === amount && canonicalKernelCalls(saved.callData).length === 1, `${protocol} original journal payload/nonce/minimum restored`);
       const reconciled = await reconcileYieldOperation(client, bundlerUrl, saved);
       check(reconciled.status === 'confirmed', `${protocol} independent restart receipt reconciliation`);
+      await verifyOriginalQuote(saved, reconciled.evidence.txHash);
       gas.push({ protocol, phase: 'supply', gasUsed: reconciled.evidence.gasUsed.toString(), txHash: reconciled.evidence.txHash });
       // Even one real elapsed second produces nonzero raw interest in these markets.
       // Keep the production APR and every SQL freshness check intact.
@@ -205,23 +230,61 @@ test('#106 durable scheduler + real sponsored Kernel lifecycle for Venus, Lista 
       await service.exit(id, owner.address, { markets: [market.marketId], txHash: exit });
       await landed(await marketOwner.writeContract({ address: market.target, abi: extra, functionName: 'setLiquidity', args: [1_000_000n * WAD] }));
       check(await tick('full exit') === '生息領出已確認', `${protocol} stop and withdraw remainder`);
-      await pause(1100);
-      check(await tick('complete') === '生息已全部領回', `${protocol} durable exit completed only after fresh zero read`);
+      let withdrawals = 2, completed = false;
+      // Aave's raw aToken balance keeps growing after the immutable amount is signed.
+      // Let the production durable exit consume each accrued remainder; require strict
+      // scaled-unit progress and eventual zero instead of assuming a fixed action count.
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const before = (await readYieldAccount(client, profile, account)).positions.find(p => p.market.marketId === market.marketId);
+        assert.ok(before?.state === 'known' && before.observedUnits !== null);
+        await pause(1100);
+        const result = await tick(`complete ${attempt + 1}`);
+        if (result === '生息已全部領回') { completed = true; break; }
+        assert.equal(result, '生息領出已確認');
+        const after = (await readYieldAccount(client, profile, account)).positions.find(p => p.market.marketId === market.marketId);
+        check(protocol === 'Aave' && after?.state === 'known' && after.observedUnits !== null &&
+          after.observedUnits < before.observedUnits, `${protocol} accrued remainder ${attempt + 1} strictly reduces scaled units`);
+        withdrawals++;
+      }
+      check(completed, `${protocol} durable exit completed only after fresh zero read`);
       const final = await readYieldAccount(client, profile, account);
       const zero = final.positions.find(p => p.market.marketId === market.marketId); assert.ok(zero);
       check(zero.receipt === 0n && zero.observedUnits === 0n && zero.trackedUnits === 0n && !zero.exiting, `${protocol} receipt, scaled/account units and exit flag zero`);
       check((await query("select id from yield_exit_requests where portfolio_id=$1 and state<>'completed'", [id])).rows.length === 0, `${protocol} no pending DB exit`);
-      const cash = (await query<{ allocated: string; earnings: string }>('select allocated_cash_raw::text as allocated,yield_raw::text as earnings from strategy_cash_balances where portfolio_id=$1', [id])).rows[0]; assert.ok(cash);
-      const balance = await client.readContract({ address: C.usdt, abi: erc20Abi, functionName: 'balanceOf', args: [account] });
-      check(BigInt(cash.allocated) === amount && BigInt(cash.earnings) > 0n && BigInt(cash.allocated) + BigInt(cash.earnings) === balance, `${protocol} realized interest credited once and principal restored`);
       const rows = await query<{ plan_json: unknown; user_op_hash: Hex; nonce: string; execution_key: string }>('select plan_json,user_op_hash,nonce,execution_key from yield_execution_snapshots where account=$1 order by quote_block_number,nonce', [account]);
-      check(rows.rows.length === 3 && !JSON.stringify(rows.rows).includes('signature'), `${protocol} three immutable public execution snapshots`);
+      check(rows.rows.length === 1 + withdrawals && !JSON.stringify(rows.rows).includes('signature'), `${protocol} every supply/withdraw has an immutable public execution snapshot`);
       const exits = await query<{ user_op_hash: Hex }>("select s.user_op_hash from yield_execution_snapshots s join yield_actions a using(execution_key) where a.portfolio_id=$1 and a.kind='withdraw' order by s.quote_block_number", [id]);
+      assert.equal(exits.rows.length, withdrawals);
+      const supplyBlock = (await client.getTransactionReceipt({ hash: reconciled.evidence.txHash })).blockNumber;
+      let units = protocol === 'Aave' ? await client.readContract({ address: market.receipt, abi: extra,
+        functionName: 'scaledBalanceOf', args: [account], blockNumber: supplyBlock }) : 0n;
+      let remainingBasis = amount, realizedLoss = 0n, withdrawnAssets = 0n;
       for (const [index, row] of exits.rows.entries()) {
         const snapshot = (await query<SnapshotRow>('select * from yield_execution_snapshots where user_op_hash=$1', [row.user_op_hash])).rows[0]; assert.ok(snapshot);
-        const verified = await reconcileYieldOperation(client, bundlerUrl, restoreYieldOperation(snapshot)); assert.equal(verified.status, 'confirmed');
-        gas.push({ protocol, phase: index === 0 ? 'partial' : 'full', gasUsed: verified.evidence.gasUsed.toString(), txHash: verified.evidence.txHash });
+        const original = restoreYieldOperation(snapshot);
+        const verified = await reconcileYieldOperation(client, bundlerUrl, original); assert.equal(verified.status, 'confirmed');
+        await verifyOriginalQuote(original, verified.evidence.txHash);
+        withdrawnAssets += verified.evidence.assets;
+        if (protocol === 'Aave') {
+          assert.equal(original.plan.scaledReceiptBalance, units);
+          const blockNumber = (await client.getTransactionReceipt({ hash: verified.evidence.txHash })).blockNumber;
+          const after = await client.readContract({ address: market.receipt, abi: extra, functionName: 'scaledBalanceOf', args: [account], blockNumber });
+          assert.ok(units > 0n && after < units);
+          // Independent single-deposit cost basis from canonical RPC units and actual assets.
+          // BE106 realizes loss per redemption; later interest never replenishes lost principal.
+          const consumedBasis = after === 0n ? remainingBasis : remainingBasis * (units - after) / units;
+          if (consumedBasis > verified.evidence.assets) realizedLoss += consumedBasis - verified.evidence.assets;
+          remainingBasis -= consumedBasis; units = after;
+        }
+        gas.push({ protocol, phase: index === 0 ? 'partial' : index === 1 ? 'full' : `accrued remainder ${index - 1}`, gasUsed: verified.evidence.gasUsed.toString(), txHash: verified.evidence.txHash });
       }
+      if (protocol === 'Aave') { assert.equal(units, 0n); assert.equal(remainingBasis, 0n); }
+      const cash = (await query<{ allocated: string; earnings: string }>('select allocated_cash_raw::text as allocated,yield_raw::text as earnings from strategy_cash_balances where portfolio_id=$1', [id])).rows[0]; assert.ok(cash);
+      const balance = await client.readContract({ address: C.usdt, abi: erc20Abi, functionName: 'balanceOf', args: [account] });
+      const returnedPrincipal = amount - realizedLoss, interest = withdrawnAssets - returnedPrincipal;
+      check(BigInt(cash.allocated) === returnedPrincipal && BigInt(cash.earnings) === interest && interest > 0n &&
+        returnedPrincipal + interest === balance, `${protocol} exact canonical principal/loss/interest match DB and cash without loss top-up`);
+      console.log('YIELD_110_SETTLEMENT ' + JSON.stringify({ protocol, principal: returnedPrincipal.toString(), loss: realizedLoss.toString(), interest: interest.toString(), balance: balance.toString() }));
       check(await client.getBalance({ address: account }) === 0n, `${protocol} Kernel holds zero native gas funds`);
       if (protocol === 'Aave') {
         const count = async () => Number((await query<{ n: string }>('select count(*)::text as n from paymaster_sponsorships where chain_id=97 and sender=$1', [account])).rows[0]?.n);
@@ -241,8 +304,8 @@ test('#106 durable scheduler + real sponsored Kernel lifecycle for Venus, Lista 
     }
     check(await client.readContract({ address: C.paymaster, abi: extra, functionName: 'getDeposit' }) < depositBefore, 'paymaster EntryPoint deposit paid actual gas');
     check((await query("select execution_key from yield_actions where state in ('reserved','submitted','unknown')")).rows.length === 0, 'no unresolved yield operations after all three lifecycles');
-    console.log('YIELD_106_GAS ' + JSON.stringify(gas));
-    console.log(`YIELD_106_ACCEPTANCE: ${passes} pass / 0 skip / 0 fail`);
+    console.log('YIELD_110_GAS ' + JSON.stringify(gas));
+    console.log(`YIELD_110_ACCEPTANCE: ${passes} pass / 0 skip / 0 fail`);
   } finally {
     await local.setCode({ address: C.paymaster, bytecode: originalCode });
     await local.stopImpersonatingAccount({ address: T.roles.operator });

@@ -57,15 +57,18 @@ const EXCLUDE = new Set([
 ]);
 const INCLUDE = ['src', 'scripts', 'deploy', 'alto', 'package.json', 'bun.lock', 'Dockerfile', 'docker-entrypoint.sh', 'railway.json'];
 
-async function copyDir(from: string, to: string): Promise<number> {
+const CONFIG_FILES = new Set(['railway.json', 'railway.toml']);
+
+async function copyDir(from: string, to: string, configAsCode = true): Promise<number> {
   let count = 0;
   await mkdir(to, { recursive: true });
   for (const entry of await readdir(from, { withFileTypes: true })) {
     if (EXCLUDE.has(entry.name) || entry.name.startsWith('.env') || entry.name.endsWith('.log')) continue;
+    if (!configAsCode && CONFIG_FILES.has(entry.name)) continue;
     const source = join(from, entry.name);
     const target = join(to, entry.name);
     if (entry.isDirectory()) {
-      count += await copyDir(source, target);
+      count += await copyDir(source, target, configAsCode);
     } else if (entry.isFile()) {
       await cp(source, target);
       count += 1;
@@ -74,7 +77,7 @@ async function copyDir(from: string, to: string): Promise<number> {
   return count;
 }
 
-export async function prepareDeploy(backend = BACKEND, migrationsSrc = process.env.MIGRATIONS_DIR || MIGRATIONS_SRC, deploy = DEPLOY, website?: string): Promise<void> {
+export async function prepareDeploy(backend = BACKEND, migrationsSrc = process.env.MIGRATIONS_DIR || MIGRATIONS_SRC, deploy = DEPLOY, website?: string, configAsCode = true): Promise<void> {
   if (!existsSync(migrationsSrc)) {
     throw new Error(
       `找不到 migration 目錄：${migrationsSrc}\n` +
@@ -88,13 +91,14 @@ export async function prepareDeploy(backend = BACKEND, migrationsSrc = process.e
   await mkdir(deploy, { recursive: true });
   let copied = 0;
   for (const name of INCLUDE) {
+    if (!configAsCode && CONFIG_FILES.has(name)) continue;
     const source = join(backend, name);
     const info = await stat(source);
-    if (info.isDirectory()) copied += await copyDir(source, join(deploy, name));
+    if (info.isDirectory()) copied += await copyDir(source, join(deploy, name), configAsCode);
     else { await cp(source, join(deploy, name)); copied++; }
   }
   if (website) {
-    await copyDir(website, join(deploy, 'website'));
+    await copyDir(website, join(deploy, 'website'), configAsCode);
     // Cloudflare's Worker is not this deployment's router and must not be served as a public file.
     await rm(join(deploy, 'website', '_worker.js'), { force: true });
   }
@@ -132,9 +136,11 @@ export async function prepareDeploy(backend = BACKEND, migrationsSrc = process.e
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const args = process.argv.slice(2);
-  if (args.length !== 0 && (args.length !== 2 || args[0] !== '--website-dist')) throw new Error('usage: prepare-deploy [--website-dist PATH]');
-  prepareDeploy(BACKEND, process.env.MIGRATIONS_DIR || MIGRATIONS_SRC, DEPLOY, args[1]).catch(() => {
+  const rawArgs = process.argv.slice(2);
+  const configFlags = rawArgs.filter((arg) => arg === '--no-config-as-code');
+  const args = rawArgs.filter((arg) => arg !== '--no-config-as-code');
+  if (configFlags.length > 1 || (args.length !== 0 && (args.length !== 2 || args[0] !== '--website-dist'))) throw new Error('usage: prepare-deploy [--website-dist PATH] [--no-config-as-code]');
+  prepareDeploy(BACKEND, process.env.MIGRATIONS_DIR || MIGRATIONS_SRC, DEPLOY, args[1], configFlags.length === 0).catch(() => {
     console.error('[prepare-deploy] failed; check source, migration and website directories');
     process.exitCode = 1;
   });

@@ -24,6 +24,7 @@ import { reconcileRelayerTransactions } from '../src/relayer-reconciliation.js';
 import { pruneDailyOperationCounts } from '../src/ratelimit.js';
 import { DEFAULT_THRESHOLD_BPS } from '../src/snapshot.js';
 import type { PortfolioOutcome, SchedulerRound } from '../src/scheduler.js';
+import { startWorkerHealth } from '../src/worker-health.js';
 
 // `.env` 只補沒設的變數（override: false）：CLI 前面 inline 帶的 env 優先。
 loadDotenv({ override: false });
@@ -183,6 +184,8 @@ async function listAlerts(): Promise<void> {
   }
 }
 
+let stopHealth: () => Promise<void> = async () => {};
+
 async function main(): Promise<number> {
   const args = parseArgs(process.argv.slice(2));
   // 先載入 .env（DATABASE_URL 等），讓設定錯誤在跑迴圈之前就炸出來。
@@ -195,6 +198,7 @@ async function main(): Promise<number> {
   }
 
   describeEnvironment(args);
+  if (args.mode === 'loop') stopHealth = await startWorkerHealth();
 
   const startedAt = new Date();
   const runRound = async (): Promise<SchedulerRound> => {
@@ -293,6 +297,7 @@ try {
   console.error(`\n失敗：${error instanceof Error ? error.message : String(error)}`);
   exitCode = 1;
 } finally {
+  await stopHealth();
   await closePool().catch(() => undefined);
 }
 process.exitCode = exitCode;

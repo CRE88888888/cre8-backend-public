@@ -106,6 +106,11 @@ test('#79 packaging uses runtime allowlist and explicit migrations; excludes env
     assert.equal(await readFile(join(output, 'migrations/0001.sql'), 'utf8'), 'migrations/0001.sql');
     assert.equal(await readFile(join(output, 'website/index.html'), 'utf8'), 'dist/index.html');
     for (const name of ['src/.env.production', 'scripts/.env.local', 'src/debug.log', '.env.secret', 'src/link', 'website/_worker.js']) await assert.rejects(readFile(join(output, name)), /ENOENT/);
+    await writeFile(join(root, 'alto/railway.json'), '{}');
+    await writeFile(join(root, 'alto/railway.toml'), '');
+    await prepareDeploy(root, join(root, 'migrations'), output, join(root, 'dist'), false);
+    for (const name of ['railway.json', 'alto/railway.json', 'alto/railway.toml']) await assert.rejects(readFile(join(output, name)), /ENOENT/);
+    assert.equal(await readFile(join(output, 'Dockerfile'), 'utf8'), 'Dockerfile');
     await assert.rejects(prepareDeploy(root, join(root, 'absent'), output), /找不到 migration/);
     await assert.rejects(prepareDeploy(root, join(root, 'migrations'), output, join(root, 'absent')), /website index/);
   } finally { await rm(root, { recursive: true, force: true }); }

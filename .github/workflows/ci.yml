@@ -66,6 +66,7 @@ jobs:
           test/enrollment-sponsorship.test.ts
           test/drift.test.ts
           test/deployment.test.ts
+          test/worker-health.test.ts
           test/alto.test.ts
           test/testnet-profile.test.ts
           test/price-keeper.test.ts

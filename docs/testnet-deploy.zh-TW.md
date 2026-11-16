@@ -27,8 +27,12 @@ bun --no-env-file scripts/sync-testnet-profile.ts "$CONTRACTS_CHECKOUT" \
 operator rebalance 與 points 關閉，points-sync 維持停用。SIWE 目前只接受單一 domain／URI，
 使用 `tst.cre8.finance`／`https://tst.cre8.finance`；加入 CORS origin 不會擴大 SIWE domain。
 本次部署結果與 deployment IDs 寫在 `/tmp/cre8-codex/railway-report.md`，不含秘密。
-啟用 scheduler／keeper 時，Railway Config File 指定 `/deploy/testnet-97-worker.json`，
-並清除服務設定中的 HTTP healthcheck；API／website 保留根目錄的 `/health` 設定。
+依 #136 最新 C3 指示，測試專案不使用 config-as-code 或 IaC；`railwayConfigFile` 維持 null，
+以 `serviceInstanceUpdate` 設定 healthcheck／restart policy。封裝加 `--no-config-as-code`，
+排除所有 `railway.json`／`railway.toml`，避免上傳檔覆蓋服務設定；正式環境的既有設定不變。
+平台若無法清除 worker 的 healthcheck，保留 `/health`；啟用的 chain 97 scheduler loop／keeper
+提供 process readiness，結束或啟動失敗時關閉。這不取代成功輪次、heartbeat、
+keeper 成交與 strict preflight；`--once`／`--alerts` 不啟 HTTP。
 
 ## 來源與封裝
 
@@ -40,7 +44,7 @@ operator rebalance 與 points 關閉，points-sync 維持停用。SIWE 目前只
 ```sh
 bun install --frozen-lockfile
 bun run typecheck
-bun scripts/prepare-deploy.ts --website-dist "$APP_DIST"
+bun scripts/prepare-deploy.ts --website-dist "$APP_DIST" --no-config-as-code
 ```
 
 執行前設定 `MIGRATIONS_DIR` 與 `APP_DIST`。worktree 的 migration 必須指向共用 db 的絕對路徑。封裝採 runtime 根目錄白名單，排除 `.env*`、log、symlink、套件快取、git 與未列入的檔案；網站不帶 Cloudflare `_worker.js`。`.deploy/` 是產物，禁止 commit。
@@ -181,7 +185,7 @@ Railway 的 `X-Forwarded-For` 含額外代理 hop，不能取最右側當使用�
 railway up .deploy --path-as-root --no-gitignore --detach --service api --project "$TESTNET_PROJECT_ID"
 ```
 
-其他 backend 角色使用相同產物；alto 的 context 是 `alto/`，不可誤傳到 Postgres。每次部署記錄 backend commit、app commit、manifest commit、migration 版本及 deployment ID。等待 Railway deployment 成功與 `/health` 的內容，不能只看 upload 成功。啟用的 scheduler／keeper 沒有 HTTP health endpoint（points-sync 維持停用），要移除該服務的 HTTP healthcheck，改看成功輪次、scheduler heartbeat 與故障退出；停用階段則保留 readiness healthcheck。
+其他 backend 角色使用相同產物；alto 的 context 是 `alto/`，不可誤傳到 Postgres。每次部署記錄 backend commit、app commit、manifest commit、migration 版本及 deployment ID。等待 Railway deployment 成功與 `/health` 的內容，不能只看 upload 成功。啟用的 scheduler／keeper 優先移除 HTTP healthcheck；平台無法清除時，依上節保留 process readiness，另驗成功輪次、scheduler heartbeat 與故障退出。points-sync 維持停用。
 
 回滾前先停用 scheduler、keeper、alto、points-sync 與 API 的交易能力；保留 DB volume 與 session seed，再回到已記錄的相容 deployment／封裝版本。只把 scheduler 切回 dry-run 不足以停掉其他角色。migration 有 checksum，**不修改已套用 SQL、不刪 DB、不自動降 schema**；舊版不相容時維持停用，由 C3 協調 db lane。不能靠回滾應用撤銷鏈上交易。keep-alive／進程狀態與舊 DNS 必須重驗。
 

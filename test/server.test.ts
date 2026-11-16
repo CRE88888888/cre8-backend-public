@@ -1,3 +1,4 @@
+import './waitlist.test.js';
 import './strategy-execution.test.js';
 import './contribution-preview.test.js';
 // Keep faucet HTTP coverage in the existing no-DB CI entry point.

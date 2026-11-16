@@ -12,6 +12,7 @@ import { EXECUTOR_ORACLE_ABI, ORACLE_OF_ABI, listPriceableAssets } from './asset
 import type { PriceableAsset, TradableProbe } from './assets.js';
 import { authenticate, issueNonce, login, logout, parseLoginBody } from './auth.js';
 import { loginWithPrivy } from './privy.js';
+import { createWaitlistService } from './waitlist.js';
 import { claimFaucetUsdt } from './faucet.js';
 import { sponsorUserOperation } from './paymaster.js';
 import { createPointsService } from './points.js';
@@ -178,6 +179,7 @@ export type ServerDeps = {
   claimFaucetUsdt: typeof claimFaucetUsdt;
   sponsorUserOperation: typeof sponsorUserOperation;
   privyLogin: typeof loginWithPrivy;
+  waitlist: ReturnType<typeof createWaitlistService>;
   rateLimiter: RequestRateLimiter;
   auth: { authenticate: typeof authenticate; issueNonce: typeof issueNonce; login: typeof login; logout: typeof logout };
   /** Public platform snapshot, with a process-wide TTL cache and no wallet/DB reads. */
@@ -302,6 +304,7 @@ const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
   claimFaucetUsdt,
   sponsorUserOperation,
   privyLogin: loginWithPrivy,
+  waitlist: createWaitlistService(),
   auth: { authenticate, issueNonce, login, logout },
   platformStatus: createPlatformStatusReader(),
   createStrategy,
@@ -461,13 +464,25 @@ async function route(
   }
 
   // 所有 /operator/* 共用同一道授權，不能只靠登入或鏈上的交易限制。
-  // 先驗登入（401），再驗寫入開關（403，與 /portfolios/:id/rebalance 一致），最後驗身分。
+  // 先驗登入（401），投組 POST 再驗寫入開關（403），最後驗身分；waitlist 只寫名單、不受再平衡開關影響。
   if (root === 'operator') {
     const wallet = await deps.auth.authenticate(req.headers.authorization);
-    if (method === 'POST') requireOperatorRebalanceEnabled(deps);
+    if (method === 'POST' && segments[1] === 'portfolios') requireOperatorRebalanceEnabled(deps);
     const wallets = deps.operatorWallets ?? resolveOperatorWallets();
     if (!wallets.some((allowed) => allowed.toLowerCase() === wallet.toLowerCase())) {
       throw new AppError(403, 'OPERATOR_FORBIDDEN', 'wallet is not authorized to use operator endpoints');
+    }
+    if (segments[1] === 'waitlist') {
+      if (segments.length === 2) {
+        if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+        sendJson(res, 200, await deps.waitlist.list(url.searchParams));
+        return;
+      }
+      if (segments.length === 4 && (segments[3] === 'approve' || segments[3] === 'revoke')) {
+        if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+        sendJson(res, 200, await deps.waitlist.transition(segments[2] ?? '', segments[3] === 'approve' ? 'approved' : 'revoked', wallet));
+        return;
+      }
     }
     if (segments.length === 4 && segments[1] === 'portfolios') {
       if (method === 'GET' && segments[3] === 'plan') await deps.rateLimiter.wallet('plan', wallet);
@@ -514,6 +529,18 @@ async function route(
     const wallet = await deps.auth.authenticate(req.headers.authorization);
     await deps.rateLimiter.wallet('assets', wallet);
     sendJson(res, 200, { assets: await deps.listAssets() });
+    return;
+  }
+
+  if (root === 'waitlist' && segments.length === 2 && (segments[1] === 'join' || segments[1] === 'me')) {
+    await deps.rateLimiter.auth(deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
+    if (segments[1] === 'join') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      sendJson(res, 200, await deps.waitlist.join(await readJsonBody(req)));
+    } else {
+      if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+      sendJson(res, 200, await deps.waitlist.me(req.headers.authorization));
+    }
     return;
   }
 
@@ -961,7 +988,7 @@ async function operatorRebalanceRoute(
   sendJson(res, 200, await deps.operatorRebalance(id, wallet));
 }
 
-/** owner 手動再平衡與 /operator/* 寫入共用同一個部署開關。 */
+/** owner 手動再平衡與 /operator/portfolios/* 寫入共用同一個部署開關。 */
 function requireOperatorRebalanceEnabled(deps: ServerDeps): void {
   const enabled = deps.operatorRebalanceEnabled ?? operatorRebalanceEnabled;
   if (!enabled()) {

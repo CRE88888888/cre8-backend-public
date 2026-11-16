@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { profileFromManifest } from '../scripts/sync-testnet-profile.js';
+import { keccak256 } from 'viem';
+import { profileFromManifest, verifyArtifactSources } from '../scripts/sync-testnet-profile.js';
 import manifest from '../deploy/testnet-97.json' with { type: 'json' };
 
 test('#85 generator rejects chain/mode/count/identity/duplicate/missing manifest data before writes', () => {
@@ -8,6 +9,17 @@ test('#85 generator rejects chain/mode/count/identity/duplicate/missing manifest
   for (const change of [{ chainId: 56 }, { mode: 'public' }, { mode: undefined }, { gitCommit: '' },
     { assets: {} }, { yieldMarkets: [] }, { contracts: {} }, { roles: {} }]) {
     assert.throws(() => profileFromManifest({ ...manifest, ...change }));
+  }
+});
+
+test('#106 artifact provenance rejects a rebuild from different or missing source before generation', () => {
+  const bytes = Buffer.from('contract Reviewed {}');
+  const artifact = { metadata: { sources: { 'src/Reviewed.sol': { keccak256: keccak256(bytes) } } } };
+  verifyArtifactSources(artifact, path => { assert.equal(path, 'src/Reviewed.sol'); return bytes; });
+  assert.throws(() => verifyArtifactSources(artifact, () => Buffer.from('contract Unreviewed {}')), /source differs/);
+  assert.throws(() => verifyArtifactSources(artifact, () => { throw new Error('missing source'); }), /missing source/);
+  for (const invalid of [{}, { metadata: { sources: {} } }, { metadata: { sources: { 'src/Reviewed.sol': {} } } }]) {
+    assert.throws(() => verifyArtifactSources(invalid, () => bytes));
   }
 });
 

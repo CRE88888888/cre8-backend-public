@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { encodeCallDataEpV07 } from '@zerodev/sdk';
-import { concatHex, encodeFunctionData, erc20Abi, toHex } from 'viem';
+import { concatHex, encodeFunctionData, erc20Abi, parseAbi, toHex } from 'viem';
 import { createPaymasterService, pureYieldWithdraw, validateSponsoredCalls } from '../src/paymaster.js';
 import type { Reservation } from '../src/paymaster.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
@@ -58,7 +58,10 @@ test('#85 owner setup accepts only registered receipt approve to executor and ty
     { to: market.receipt, data: encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [SENDER, 1n] }), value: 0n },
     { to: market.receipt, data: encodeFunctionData({ abi: erc20Abi, functionName: 'transfer', args: [SENDER, 1n] }), value: 0n },
     { to: T.contracts.yieldRegistry, data: encodeFunctionData({ abi: YIELD_REGISTRY_ABI, functionName: 'setYieldPolicy', args: [market.marketId, 0n, true] }), value: 0n },
-    { to: T.contracts.yieldRegistry, data: encodeFunctionData({ abi: YIELD_REGISTRY_ABI, functionName: 'releaseReservation', args: [SENDER, market.marketId, 1n] }), value: 0n },
+    // Keep the forbidden legacy selector test after it disappears from the generated current ABI.
+    { to: T.contracts.yieldRegistry, data: encodeFunctionData({ abi: parseAbi(['function releaseReservation(address,bytes32,uint256)']), functionName: 'releaseReservation', args: [SENDER, market.marketId, 1n] }), value: 0n },
+    { to: T.contracts.yieldRegistry, data: encodeFunctionData({ abi: YIELD_REGISTRY_ABI, functionName: 'reconcile', args: [SENDER, market.marketId] }), value: 0n },
+    { to: T.contracts.yieldRegistry, data: encodeFunctionData({ abi: YIELD_REGISTRY_ABI, functionName: 'acknowledgeIdentity', args: [market.marketId, market.marketId] }), value: 0n },
   ];
   for (const call of forbidden) {
     const callData = await encodeCallDataEpV07([call]);

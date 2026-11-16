@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cashDifference, accountValue, fresh, idleCash, mustExit, raw, restoreSources, riskHeadroom, supplyDecision, UINT256_MAX, WAD, yieldProfile } from '../src/yield-domain.js';
+import { cashDifference, accountValue, fresh, idleCash, mustExit, raw, restoreSources, restoreScaledSources, riskHeadroom, supplyDecision, UINT256_MAX, WAD, yieldProfile } from '../src/yield-domain.js';
 import type { YieldPosition, YieldRisk } from '../src/yield-domain.js';
 import type { Address, Hex } from 'viem';
 const a: Address = `0x${'12'.repeat(20)}`, h: Hex = `0x${'34'.repeat(32)}`, now = new Date();
@@ -45,6 +45,39 @@ test('yield redemption preserves cash origin, handles partial lots and accrues o
   assert.throws(() => restoreSources(supplies, [{ shares: 4n, assets: 20n }]));
   assert.deepEqual(restoreSources(supplies, [{ shares: 3n, assets: 9n }]), {allocated_cash_raw:'9',yield_raw:'0'},'canonical realized loss never invents cash or negative interest');
   assert.deepEqual(restoreSources([{assets:3n,shares:3n,sources:{allocated_cash_raw:'2',yield_raw:'1'}}],[{shares:3n,assets:2n}]),{allocated_cash_raw:'1',yield_raw:'1'});
+});
+test('#106 Aave actual raw-share growth restores principal by scaled proportion and clears the final remainder',()=>{
+  const principal=100n*WAD,units=99999567448598564709n,left=49999783866992728648n;
+  const rawMinted=99999999999999999999n,rawPartial=50n*WAD,rawFinal=50000000428082192684n;
+  const sources={allocated_cash_raw:principal.toString()},original=structuredClone(sources);
+  assert.throws(()=>restoreSources([{assets:principal,shares:rawMinted,sources}],[{shares:rawPartial,assets:rawPartial},{shares:rawFinal,assets:rawFinal}]));
+  const supplied={kind:'supply' as const,assets:principal,unitsBefore:0n,unitsAfter:units,sources};
+  const partial={kind:'withdraw' as const,assets:rawPartial,unitsBefore:units,unitsAfter:left};
+  const restored=principal*(units-left)/units;
+  assert.deepEqual(restoreScaledSources([supplied,partial]),{allocated_cash_raw:restored.toString(),yield_raw:(rawPartial-restored).toString()});
+  assert.deepEqual(restoreScaledSources([supplied,partial,{kind:'withdraw',assets:rawFinal,unitsBefore:left,unitsAfter:0n}]),{allocated_cash_raw:principal.toString(),yield_raw:(rawPartial+rawFinal-principal).toString()});
+  assert.deepEqual(supplied.sources,original,'replay never mutates persisted source evidence');
+});
+test('#106 scaled allocation handles interleaved supplies, 1-unit dust, realized loss and zero proceeds without inventing principal',()=>{
+  assert.deepEqual(restoreScaledSources([]),{});
+  const first={kind:'supply' as const,assets:3n,unitsBefore:0n,unitsAfter:3n,sources:{allocated_cash_raw:'2',stack_prefund_raw:'1'}};
+  const partial={kind:'withdraw' as const,assets:1n,unitsBefore:3n,unitsAfter:2n};
+  assert.deepEqual(restoreScaledSources([first,partial]),{yield_raw:'1'},'sub-raw basis remains until later scaled redemption');
+  const more={kind:'supply' as const,assets:2n,unitsBefore:2n,unitsAfter:4n,sources:{yield_raw:'2'}};
+  assert.deepEqual(restoreScaledSources([first,partial,more,{kind:'withdraw',assets:5n,unitsBefore:4n,unitsAfter:0n}]),{allocated_cash_raw:'2',stack_prefund_raw:'1',yield_raw:'3'});
+  assert.deepEqual(restoreScaledSources([first,{kind:'withdraw',assets:2n,unitsBefore:3n,unitsAfter:0n}]),{allocated_cash_raw:'1',stack_prefund_raw:'1',yield_raw:'0'});
+  assert.deepEqual(restoreScaledSources([first,{kind:'withdraw',assets:0n,unitsBefore:3n,unitsAfter:0n}]),{allocated_cash_raw:'0',stack_prefund_raw:'0',yield_raw:'0'});
+  assert.deepEqual(restoreScaledSources([{...first,assets:UINT256_MAX,unitsAfter:UINT256_MAX,sources:{allocated_cash_raw:UINT256_MAX.toString()}},{kind:'withdraw',assets:UINT256_MAX,unitsBefore:UINT256_MAX,unitsAfter:0n}]),{allocated_cash_raw:UINT256_MAX.toString(),yield_raw:'0'});
+});
+test('#106 scaled accounting rejects missing/discontinuous/zero/negative/overflow evidence and mismatched source principal',()=>{
+  const first={kind:'supply' as const,assets:10n,unitsBefore:0n,unitsAfter:5n,sources:{allocated_cash_raw:'10'}};
+  for(const patch of [{unitsBefore:1n},{unitsAfter:0n},{unitsAfter:-1n},{unitsAfter:UINT256_MAX+1n},{assets:0n},{assets:11n}])assert.throws(()=>restoreScaledSources([{...first,...patch}]));
+  for(const patch of [{unitsBefore:0n},{unitsBefore:6n},{unitsAfter:5n},{unitsAfter:6n},{unitsAfter:-1n},{assets:-1n}])assert.throws(()=>restoreScaledSources([first,{kind:'withdraw',assets:1n,unitsBefore:5n,unitsAfter:0n,...patch}]));
+  assert.throws(()=>restoreScaledSources([{kind:'withdraw',assets:1n,unitsBefore:0n,unitsAfter:0n}]));
+  assert.throws(()=>restoreScaledSources([first,{...first,unitsBefore:5n,unitsAfter:6n,sources:{allocated_cash_raw:'9'}}]));
+  const unknownSource={...first,sources:{...first.sources,invalid:'1'}};
+  assert.throws(()=>restoreScaledSources([unknownSource]));
+  assert.throws(()=>restoreScaledSources([{...first,sources:{allocated_cash_raw:'-1'}}]));
 });
 test('yield profile remains absent until BE-4 generated manifest, rejects invented simulation flags', () => {
   assert.equal(yieldProfile({ chainId: 97, contracts: {} }), null);

@@ -4,7 +4,7 @@ import type { Address, Hex } from 'viem';
 import { withTransaction, query } from './db.js';
 import { canonicalKernelCalls, gasExecutionKey, reserveSponsorship } from './paymaster.js';
 import type { Reservation } from './paymaster.js';
-import { address, hash, isSource, object, raw, restoreSources, unavailable } from './yield-domain.js';
+import { address, hash, isSource, object, raw, restoreSources, restoreScaledSources, unavailable } from './yield-domain.js';
 import type { YieldRead, YieldSources, YieldPosition, YieldRisk } from './yield-domain.js';
 import type { SavedYieldOperation, YieldEvidence, YieldOperationJournal, YieldPlan, YieldPrepare, YieldReceiptResult } from './yield-port.js';
 
@@ -215,12 +215,36 @@ async function gasState(client:PoolClient,key:string,state:string){
   await client.query(`update gas_budget_reservations set state=$2,updated_at=greatest(updated_at,clock_timestamp()) where execution_key=$1 and state in ('reserved','submitted','unknown')`,[key,state]);
 }
 async function creditRedemption(client:PoolClient,p:YieldAccount,marketId:Hex){
-  const rows=(await client.query<{kind:string;assets_raw:string;shares_raw:string;source_breakdown:YieldSources;underlying:string}>(`select e.kind,e.assets_raw::text,e.shares_raw::text,a.source_breakdown,m.underlying
+  const rows=(await client.query<{kind:string;assets_raw:string;shares_raw:string;source_breakdown:YieldSources;underlying:string;protocol:string}>(`select e.kind,e.assets_raw::text,e.shares_raw::text,a.source_breakdown,m.underlying,m.protocol
     from yield_events e join yield_actions a using(execution_key) join yield_markets m on (m.chain_id,m.market_id)=(e.chain_id,e.market_id)
     where e.chain_id=$1 and e.portfolio_id=$2 and e.market_id=$3 and e.state='confirmed' order by e.block_number,e.log_index`,[p.chainId,p.portfolioId,marketId])).rows;
   const sources=rows.filter(r=>r.kind==='supply').map(r=>({assets:raw(r.assets_raw),shares:raw(r.shares_raw),sources:r.source_breakdown}));
   const exits=rows.filter(r=>r.kind==='withdraw').map(r=>({assets:raw(r.assets_raw),shares:raw(r.shares_raw)}));
-  const all=restoreSources(sources,exits),prior=restoreSources(sources,exits.slice(0,-1));
+  let all:YieldSources,prior:YieldSources;
+  if(rows[0]?.protocol==='aave_v3'){
+    // Append-only post-event snapshots are pinned to the SAME canonical block and receipt.
+    // Conflicting/missing observations or missing original scaled evidence retain the in-flight action.
+    const history=(await client.query<{kind:string;assets_raw:string;source_breakdown:YieldSources;units_before:string|null;units_after:string[]|null}>(`
+      select e.kind,e.assets_raw::text,a.source_breakdown,s.plan_json->>'scaledReceiptBalance' as units_before,
+        (select array_agg(distinct ps.tracked_units_raw::text) from yield_position_snapshots ps
+          where (ps.chain_id,ps.portfolio_id,ps.market_id)=(e.chain_id,e.portfolio_id,e.market_id)
+          and ps.block_number=e.block_number and ps.block_hash=e.block_hash and ps.valuation_state='known'
+          and ps.receipt_raw=e.remaining_receipts_raw and ps.observed_units_raw=ps.tracked_units_raw) as units_after
+      from yield_events e join yield_actions a using(execution_key)
+      left join yield_execution_snapshots s using(execution_key)
+      where e.chain_id=$1 and e.portfolio_id=$2 and e.market_id=$3 and e.state='confirmed' order by e.block_number,e.log_index`,[p.chainId,p.portfolioId,marketId])).rows;
+    if(history.length!==rows.length)throw unavailable();
+    const events=history.map(r=>{
+      if(r.units_after?.length!==1)throw unavailable();
+      const common={assets:raw(r.assets_raw),unitsBefore:raw(r.units_before),unitsAfter:raw(r.units_after[0])};
+      if(r.kind==='supply')return {...common,kind:'supply' as const,sources:r.source_breakdown};
+      if(r.kind!=='withdraw')throw unavailable();
+      return {...common,kind:'withdraw' as const};
+    });
+    all=restoreScaledSources(events);prior=restoreScaledSources(events.slice(0,-1));
+  }else{
+    all=restoreSources(sources,exits);prior=restoreSources(sources,exits.slice(0,-1));
+  }
   if(sources.some(s=>s.sources.asset_holding!==undefined))return;
   for(const [source,value]of Object.entries(all)){
     if(!isSource(source)||source==='asset_holding')throw unavailable();

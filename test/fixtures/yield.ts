@@ -18,7 +18,7 @@ export function yieldFixture(protocols:YieldProtocol[]=['venus','lista','aave_v3
     rate:m.protocol==='aave_v3'?RAY:WAD,scale:m.protocol==='aave_v3'?RAY:WAD,aprBps:500n,supplyOpen:true,exiting:false,underlyingDecimals:18,receiptDecimals:m.protocol==='aave_v3'?18:8}));
   const read:YieldRead={profile,observation,positions,accountValue:1000n*WAD,risks:profile.markets.map(m=>({...observation,key:`${m.protocol}:${riskSource}:${asset}`,protocol:m.protocol,asset,riskSource,underlyingMarketId:null,
     configuration:blockHash,state:'known',reason:null,supply:10_000_000n*WAD,liquidity:10_000_000n*WAD,exposure:0n,externalReserved:0n,headroom:1_000_000n*WAD,utilizationBps:0}))};
-  const state={fail:'',chainId:97,blockHash,at,receipt:10n*10n**8n,units:10n*10n**8n,tracked:10n*10n**8n,rate:WAD,claim:10n*10n**8n,utilization:8000n,reads:[] as string[],nav:1000n*WAD,paused:false,withdrawPaused:false,reserved:7n,registryCode:'0x6000' as Hex,proofHash:hash(),proofAccount:account,proofMarket:profile.markets[0]?.marketId??hash(),proofSid:1n,proofVersion:1,proofEnabled:true,proofDaily:UINT256_MAX,proofKind:'policy',proofAssets:0n,proofShares:0n,proofRemaining:0n,proofRemoved:false,proofDuplicate:false,proofSuccess:true};
+  const state={fail:'',chainId:97,blockHash,at,receipt:10n*10n**8n,units:10n*10n**8n,tracked:10n*10n**8n,rate:WAD,claim:10n*10n**8n,utilization:8000n,reads:[] as string[],nav:1000n*WAD,paused:false,withdrawPaused:false,registryCode:'0x6000' as Hex,proofHash:hash(),proofAccount:account,proofMarket:profile.markets[0]?.marketId??hash(),proofSid:1n,proofVersion:1,proofEnabled:true,proofDaily:UINT256_MAX,proofKind:'policy',proofAssets:0n,proofShares:0n,proofRemaining:0n,proofRemoved:false,proofDuplicate:false,proofSuccess:true};
   const client=createPublicClient({transport:custom({request:async({method,params})=>{
     if(state.fail===method)throw new Error('SECRET_RPC_KEY');
     if(method==='eth_getCode')return state.registryCode;
@@ -61,7 +61,7 @@ export function yieldFixture(protocols:YieldProtocol[]=['venus','lista','aave_v3
       if(c.name==='quoteWithdraw')return 1n;if(c.name==='receiptAssets')return state.claim;
       if(c.name==='balanceOf')return c.target===asset?state.nav:state.receipt;if(c.name==='scaledBalanceOf')return state.units;if(c.name==='accountUnits')return state.tracked;
       if(c.name==='decimals')return c.target===asset||m.protocol==='aave_v3'?18:8;
-      if(c.name==='totalUnits')return 10n;if(c.name==='totalReserved')return state.reserved;if(c.name==='totalSupply')return 1_000_000n*WAD;
+      if(c.name==='totalUnits')return 10n;if(c.name==='totalSupply')return 1_000_000n*WAD;
       if(c.name==='totalAssets')return 1_000_000n*WAD;if(c.name==='exchangeRateStored'||c.name==='convertToAssets')return state.rate;
       if(c.name==='getReserveNormalizedIncome')return state.rate;
       if(c.name==='getReserveData')return (18n<<48n)|(1n<<56n);if(c.name==='supplyCaps')return 0n;

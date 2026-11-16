@@ -9,7 +9,7 @@ export const WAD = 10n ** 18n;
 export type YieldProtocol = 'venus' | 'lista' | 'aave_v3';
 export type YieldMarket = Readonly<{ id: string; marketId: Hex; protocol: YieldProtocol; asset: Address; symbol: string;
   receipt: Address; target: Address; simulated: boolean }>;
-export type YieldProfile = Readonly<{ chainId: 97; registry: Address; executor: Address; registryCodeHash?: Hex; reservationMode?: 'db_only' | 'onchain'; markets: readonly YieldMarket[] }>;
+export type YieldProfile = Readonly<{ chainId: 97; registry: Address; executor: Address; registryCodeHash?: Hex; reservationMode?: 'db_only'; markets: readonly YieldMarket[] }>;
 export const unavailable = () => new AppError(503, 'YIELD_UNAVAILABLE', '生息資料或持久化證據不完整，保留部位與在途');
 export function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw unavailable();
@@ -125,6 +125,46 @@ export function restoreSources(supplies: readonly { assets: bigint; shares: bigi
     for(const c of credits){if(remainder>0n){c.amount++;remainder--;}returned[c.key]=(raw(returned[c.key]??'0')+c.amount).toString();}
     if(remainder!==0n)throw unavailable();
     returned.yield_raw = (raw(returned.yield_raw ?? '0') + (w.assets>principal?w.assets-principal:0n)).toString();
+  }
+  return returned;
+}
+export type ScaledSourceEvent = { assets: bigint; unitsBefore: bigint; unitsAfter: bigint } &
+  ({ kind: 'supply'; sources: YieldSources } | { kind: 'withdraw' });
+/** Aave raw aTokens rebase. Consume source basis in proportion to proven scaled units instead.
+ * Replay in chain order so later deposits never fund earlier exits; zero units consumes all dust.
+ */
+export function restoreScaledSources(events: readonly ScaledSourceEvent[]): YieldSources {
+  const remaining: YieldSources = {}, returned: YieldSources = {};
+  let units = 0n;
+  for (const e of events) {
+    const before = raw(e.unitsBefore), after = raw(e.unitsAfter), assets = raw(e.assets);
+    if (before !== units) throw unavailable();
+    if (e.kind === 'supply') {
+      if (after <= before || assets === 0n) throw unavailable();
+      let principal = 0n;
+      for (const [key, value] of Object.entries(e.sources)) {
+        if (!isSource(key)) throw unavailable();
+        const part = raw(value); principal += part;
+        remaining[key] = raw(raw(remaining[key] ?? '0') + part).toString();
+      }
+      if (principal !== assets) throw unavailable();
+    } else {
+      if (before === 0n || after >= before) throw unavailable();
+      const consumed = before - after;
+      // Reuse the exact realized-loss/interest allocation, without changing fixed-share markets.
+      const basis = Object.values(remaining).reduce((sum, value) => sum + raw(value), 0n);
+      const credits = restoreSources([{ assets: basis, shares: before, sources: remaining }], [{ shares: consumed, assets }]);
+      for (const [key, value] of Object.entries(remaining)) {
+        if (!isSource(key)) throw unavailable();
+        const left = raw(value);
+        remaining[key] = (left - (after === 0n ? left : left * consumed / before)).toString();
+      }
+      for (const [key, value] of Object.entries(credits)) {
+        if (!isSource(key)) throw unavailable();
+        returned[key] = raw(raw(returned[key] ?? '0') + raw(value)).toString();
+      }
+    }
+    units = after;
   }
   return returned;
 }

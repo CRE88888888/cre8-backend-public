@@ -5,7 +5,7 @@ import type { Hex } from 'viem';
 import { closePool, migrate, query, withTransaction, withPortfolioLock } from '../src/db.js';
 import { persistYieldRead, syncYieldCatalog, createYieldJournal, restoreYieldOperation } from '../src/yield-store.js';
 import type { JournalContext, SnapshotRow, SettlementRead } from '../src/yield-store.js';
-import { WAD, UINT256_MAX } from '../src/yield-domain.js';
+import { WAD, RAY, UINT256_MAX } from '../src/yield-domain.js';
 import { AppError } from '../src/errors.js';
 import type { YieldRead } from '../src/yield-domain.js';
 import type { YieldPlan, YieldPrepare, YieldEvidence } from '../src/yield-port.js';
@@ -52,6 +52,67 @@ async function fixture(read?:YieldRead,rebalance:'none'|'monthly'|'drift'='none'
 }
 const balance=async(id:number)=>(await query<{n:string}>('select allocated_cash_raw::text as n from strategy_cash_balances where portfolio_id=$1',[id])).rows[0]?.n;
 const locked=<T>(id:number,fn:()=>Promise<T>)=>withPortfolioLock(id,fn);
+
+for(const scenario of ['confirmed','missing','ambiguous'] as const)test(`#106 Aave rebasing settlement: ${scenario}`,async()=>{
+  const f=await fixture(yieldFixture(['aave_v3']).read),principal=100n*WAD;
+  // Actual BE106 fork evidence: raw withdrawals exceed minted raw shares by 428082192685.
+  const supplied=99999999999999999999n,units=99999567448598564709n,left=49999783866992728648n;
+  const finalAssets=50000000428082192684n;
+  f.ctx.sources={allocated_cash_raw:principal.toString()};
+  const supply=f.prepared({...f.plan,amount:principal,minimum:supplied,scaledReceiptBalance:0n});
+  f.current=supply;
+  async function settle(current:ReturnType<typeof f.prepared>,assets:bigint,shares:bigint,remaining:bigint,after:bigint,index:bigint,block:bigint){
+    f.current=current;
+    await locked(f.context.portfolioId,()=>f.journal.prepare(current.input));
+    await locked(f.context.portfolioId,()=>f.journal.sending(current.input.executionKey));
+    const blockHash=hash(),at=new Date();
+    const p=f.read.positions[0];assert.ok(p);
+    Object.assign(p,{block,blockHash,at,receipt:remaining,observedUnits:after,trackedUnits:after,claim:remaining,value:remaining,maxWithdraw:remaining,maxRedeem:remaining,rate:index,scale:RAY});
+    f.read.risks=f.read.risks.map(r=>({...r,block,blockHash,at,exposure:remaining}));
+    f.setProof({read:f.read,logIndex:0,blockNumber:block,blockHash,occurredAt:at});
+    const evidence={assets,shares,remainingReceipts:remaining,txHash:hash(),userOpHash:current.input.userOpHash,gasUsed:1n};
+    const restarted=createYieldJournal({...f.ctx,reserve:()=>null});
+    if(after===0n){
+      const cashBefore=await balance(f.context.portfolioId);
+      const positionBefore=(await query('select receipt_raw,tracked_units_raw from yield_positions where portfolio_id=$1',[f.context.portfolioId])).rows;
+      if(scenario==='ambiguous')await query(`insert into yield_position_snapshots(chain_id,portfolio_id,market_id,block_number,block_hash,observed_at,source,
+        receipt_raw,observed_units_raw,tracked_units_raw,claim_assets_raw,max_withdraw_raw,max_redeem_raw,value_usdt_raw,rate_raw,rate_scale,valuation_state)
+        values(97,$1,$2,$3,$4,clock_timestamp(),'test:conflicting-scaled-proof',0,1,1,0,0,0,0,1,$5,'known')`,
+        [f.context.portfolioId,f.market.marketId,block.toString(),blockHash,RAY.toString()]);
+      for(const journal of [
+        createYieldJournal({...f.ctx,settlement:async()=>{throw new Error('SECRET_RPC_TIMEOUT');}}),
+        createYieldJournal(f.ctx,{transaction:async fn=>withTransaction(async client=>{const result=await fn(client);await client.query('select 1/0');return result;})}),
+      ]){
+        await assert.rejects(locked(f.context.portfolioId,()=>journal.confirmed(current.input.executionKey,evidence)));
+        assert.equal(await balance(f.context.portfolioId),cashBefore,'failed settlement never credits principal');
+        assert.equal((await query('select execution_key from yield_events where execution_key=$1',[current.input.executionKey])).rows.length,0);
+        assert.equal((await query<{state:string}>('select state from yield_actions where execution_key=$1',[current.input.executionKey])).rows[0]?.state,'unknown');
+        assert.deepEqual((await query('select receipt_raw,tracked_units_raw from yield_positions where portfolio_id=$1',[f.context.portfolioId])).rows,positionBefore);
+      }
+      if(scenario!=='confirmed'){
+        await assert.rejects(locked(f.context.portfolioId,()=>restarted.confirmed(current.input.executionKey,evidence)));
+        assert.equal(await balance(f.context.portfolioId),cashBefore);
+        assert.equal((await query('select execution_key from yield_events where execution_key=$1',[current.input.executionKey])).rows.length,0);
+        assert.equal((await query<{state:string}>('select state from yield_actions where execution_key=$1',[current.input.executionKey])).rows[0]?.state,'unknown');
+        assert.deepEqual((await query('select receipt_raw,tracked_units_raw from yield_positions where portfolio_id=$1',[f.context.portfolioId])).rows,positionBefore);
+        return;
+      }
+    }
+    await locked(f.context.portfolioId,()=>restarted.confirmed(current.input.executionKey,evidence));
+    await locked(f.context.portfolioId,()=>restarted.confirmed(current.input.executionKey,evidence));
+    assert.equal((await query('select execution_key from yield_events where execution_key=$1',[current.input.executionKey])).rows.length,1);
+  }
+  await settle(supply,principal,supplied,supplied,units,1000004325532724505327245053n,101n);
+  f.ctx.sources={};f.ctx.consentId=null;
+  const partial=f.prepared({...supply.input.plan,kind:'withdraw',amount:50n*WAD,minimum:50n*WAD,receiptBalance:100000000285388127853n,scaledReceiptBalance:units},1n);
+  await settle(partial,50n*WAD,50n*WAD,50000000285388127852n,left,1000004328386618128422920011n,102n);
+  const final=f.prepared({...partial.input.plan,amount:finalAssets,minimum:finalAssets,receiptBalance:finalAssets,scaledReceiptBalance:scenario==='missing'?undefined:left},2n);
+  await settle(final,finalAssets,finalAssets,0n,0n,1000004331240511761473196018n,103n);
+  if(scenario!=='confirmed')return;
+  assert.equal(await balance(f.context.portfolioId),(1000n*WAD).toString());
+  assert.equal((await query<{n:string}>('select yield_raw::text as n from strategy_cash_balances where portfolio_id=$1',[f.context.portfolioId])).rows[0]?.n,(50n*WAD+finalAssets-principal).toString());
+  assert.deepEqual((await query<{receipt:string;units:string}>('select receipt_raw::text as receipt,tracked_units_raw::text as units from yield_positions where portfolio_id=$1',[f.context.portfolioId])).rows[0],{receipt:'0',units:'0'});
+});
 
 test('BE84 journal commits action/operation/snapshot/cash/sponsorship/gas atomically and restores exact public evidence',async()=>{
   const f=await fixture(),i=f.current.input;

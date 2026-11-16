@@ -1,4 +1,4 @@
-import { decodeFunctionResult, encodeFunctionData, keccak256, toFunctionSelector, parseAbi } from 'viem';
+import { decodeFunctionResult, encodeFunctionData, keccak256, parseAbi } from 'viem';
 import type { Address, Hex, PublicClient } from 'viem';
 import { MULTICALL3_ADDRESS } from './positions.js';
 import { fresh, object, raw, hash, address, RAY, UINT256_MAX, WAD, unavailable } from './yield-domain.js';
@@ -18,7 +18,7 @@ const READ = parseAbi([
   'function quoteWithdraw(bytes32,uint256) returns(uint256)',
   'function receiptAssets(bytes32,address) view returns(uint256)',
   'function accountUnits(address,bytes32) view returns(uint256)',
-  'function totalUnits(bytes32) view returns(uint256)', 'function totalReserved(bytes32) view returns(uint256)',
+  'function totalUnits(bytes32) view returns(uint256)',
   'function exiting(address,bytes32) view returns(bool)', 'function supplyPaused() view returns(bool)',
   'function balanceOf(address) view returns(uint256)', 'function decimals() view returns(uint8)',
   'function scaledBalanceOf(address) view returns(uint256)', 'function exchangeRateStored() view returns(uint256)',
@@ -50,8 +50,8 @@ const num = (v: unknown) => {const n=typeof v==='number'?v:Number(raw(v));if(!Nu
 const integer = (v: unknown) => raw(v);
 const ceil = (a: bigint, b: bigint) => (a + b - 1n) / b;
 const min = (...ns: bigint[]) => ns.reduce((a, b) => a < b ? a : b);
-/** Current contracts have DB-only R; the older pinned deployment still exposes chain R. */
-export type MarketIdentity = { market: YieldMarket; riskSource: Address; configuration: Hex; totalUnits: bigint; totalReserved: bigint;
+/** Reviewed chain 97 registry has no on-chain reservations; capacity reserves live only in DB. */
+export type MarketIdentity = { market: YieldMarket; riskSource: Address; configuration: Hex; totalUnits: bigint;
   minRate: bigint; maxRate: bigint; retired: boolean; supplyOpen: boolean; underlyingDecimals: number; receiptDecimals: number; queues: Hex[] };
 export type YieldReaderDeps = { now: () => Date; timeoutMs: number; batch: typeof yieldBatch };
 async function bounded<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
@@ -70,12 +70,9 @@ export async function readYieldAccount(client: PublicClient, profile: YieldProfi
     if (await client.getChainId() !== profile.chainId) throw unavailable();
     const block = await client.getBlock(options.block === undefined ? { blockTag: 'latest' } : { blockNumber: options.block });
     if (block.number === null || block.hash === null) throw unavailable();
-    let chainReservations=profile.reservationMode!=='db_only';
     if(profile.registryCodeHash!==undefined){
       const code=await client.getCode({address:profile.registry,blockNumber:block.number});
       if(!code||code==='0x'||keccak256(code)!==profile.registryCodeHash)throw unavailable();
-      // The runtime must exactly match BE-4's reviewed hash BEFORE capability inspection.
-      chainReservations=code.toLowerCase().includes(toFunctionSelector('totalReserved(bytes32)').slice(2));
     }
     const base = await deps.batch(client, block.number, [{target: profile.executor, name: 'oracle'}, {target: profile.executor, name: 'numeraire'}, {target:profile.registry,name:'supplyPaused'}, {target:profile.executor,name:'registry'}, {target:profile.registry,name:'marketCount'}, {target:profile.executor,name:'yieldRegistry'}]);
     const oracle = address(base[0]), numeraire = address(base[1]), strategyRegistry=address(base[3]);
@@ -105,19 +102,27 @@ export async function readYieldAccount(client: PublicClient, profile: YieldProfi
             p.value = integer(quoted[0][0]); if (p.value === 0n) throw unavailable();
           }
           const i=group.find(i=>i.market.marketId===p.market.marketId);if(!i)throw unavailable();
-          const syncCall:ReadCall={target:profile.registry,name:'quoteWithdraw',args:[p.market.marketId,1n]};
+          const syncCall:ReadCall={target:profile.registry,name:'quoteWithdraw',args:[p.market.marketId,p.market.protocol!=='aave_v3'&&p.receipt>0n?p.receipt:1n]};
           if(p.market.protocol==='venus'){
             const v=await deps.batch(client,observation.block,[syncCall,{target:p.market.target,name:'getCash'},
               {target:p.market.target,name:'totalReserves'},{target:i.riskSource,name:'actionPaused',args:[p.market.target,1]}]);
             if(v[0]===null||typeof v[3]!=='boolean')throw unavailable();
-            p.withdrawPaused=v[3];const cash=integer(v[1]),reserves=integer(v[2]);
-            p.maxWithdraw=p.withdrawPaused?0n:min(p.claim,cash>reserves?cash-reserves:0n);
-            p.maxRedeem=min(p.receipt,p.maxWithdraw*p.scale/p.rate);
+            p.withdrawPaused=v[3];const cash=integer(v[1]),reserves=integer(v[2]),liquidity=cash>reserves?cash-reserves:0n;
+            const fullQuote=integer(v[0]);
+            p.maxWithdraw=p.withdrawPaused?0n:min(p.claim,liquidity);
+            // Converting a rounded-down full claim back to receipts can strand one raw unit.
+            // Redeem every receipt only when the same-call protocol quote is fully liquid.
+            p.maxRedeem=!p.withdrawPaused&&p.receipt>0n&&fullQuote>0n&&liquidity>=fullQuote
+              ?p.receipt:min(p.receipt,p.maxWithdraw*p.scale/p.rate);
           }else if(p.market.protocol==='lista'){
             const v=await deps.batch(client,observation.block,[syncCall,{target:p.market.target,name:'maxWithdraw',args:[account]},
               {target:p.market.target,name:'maxRedeem',args:[account]},{target:i.riskSource,name:'paused'}]);
             if(v[0]===null||typeof v[3]!=='boolean')throw unavailable();p.withdrawPaused=v[3];
-            p.maxWithdraw=p.withdrawPaused?0n:min(p.claim,integer(v[1]));p.maxRedeem=p.withdrawPaused?0n:min(p.receipt,integer(v[2]));
+            const available=integer(v[1]),conservativeRedeem=integer(v[2]),fullQuote=integer(v[0]);
+            p.maxWithdraw=p.withdrawPaused?0n:min(p.claim,available);
+            // Reviewed MockLista/Moolah redeem enforces cash directly, not the rounded maxRedeem hint.
+            p.maxRedeem=p.withdrawPaused?0n:p.receipt>0n&&fullQuote>0n&&available>=fullQuote
+              ?p.receipt:min(p.receipt,conservativeRedeem);
           }else{
             const v=await deps.batch(client,observation.block,[syncCall,{target:p.market.asset,name:'balanceOf',args:[p.market.receipt]},
               {target:p.market.target,name:'getVirtualUnderlyingBalance',args:[p.market.asset]},
@@ -176,7 +181,6 @@ export async function readYieldAccount(client: PublicClient, profile: YieldProfi
         const v = await deps.batch(client, observation.block, [
           { target: profile.registry, name: 'market', args: [m.marketId] },
           { target: profile.registry, name: 'totalUnits', args: [m.marketId] },
-          ...(chainReservations?[{target:profile.registry,name:'totalReserved' as const,args:[m.marketId] as const}]:[]),
           { target: m.asset, name: 'decimals' }, { target: m.receipt, name: 'decimals' },
         ]);
         const r = object(v[0]);
@@ -194,9 +198,9 @@ export async function readYieldAccount(client: PublicClient, profile: YieldProfi
           ]);
           queues.push(...new Set(entries.map(hash)));
         }
-        const underlyingDecimals = num(v[chainReservations?3:2]), receiptDecimals = num(v[chainReservations?4:3]);
+        const underlyingDecimals = num(v[2]), receiptDecimals = num(v[3]);
         if (underlyingDecimals > 255 || receiptDecimals > 255) throw unavailable();
-        return { market: m, riskSource: address(r.riskSource), configuration: hash(r.configuration), totalUnits: integer(v[1]), totalReserved:chainReservations?integer(v[2]):0n,
+        return { market: m, riskSource: address(r.riskSource), configuration: hash(r.configuration), totalUnits: integer(v[1]),
           minRate: integer(r.minRate), maxRate: integer(r.maxRate), retired:r.retired, supplyOpen: base[2]===false && r.supplyEnabled && !r.retired, underlyingDecimals, receiptDecimals, queues };
       } catch { return null; }
     }
@@ -249,14 +253,13 @@ export async function readYieldAccount(client: PublicClient, profile: YieldProfi
             args: [m.protocol === 'venus' ? m.target : m.protocol === 'lista' ? account : m.asset] });
       }
       const v = await deps.batch(client, observation.block, calls);
-      let supply = UINT256_MAX, liquidity = UINT256_MAX, exposure = 0n, reserved = 0n, headroom = UINT256_MAX, utilization = 0;
+      let supply = UINT256_MAX, liquidity = UINT256_MAX, exposure = 0n, headroom = UINT256_MAX, utilization = 0;
       for (const [n, i] of group.entries()) {
         const h = object(v[n]), rate = integer(v[group.length + n * 3]), receiptSupply = integer(v[group.length + n * 3 + 1]), cap = integer(v[group.length + n * 3 + 2]);
         if (hash(h.configuration) !== i.configuration || integer(h.supply) === 0n || integer(h.utilizationBps) > 10000n) throw unavailable();
         supply = min(supply, integer(h.supply)); liquidity = min(liquidity, integer(h.liquidity)); utilization = Math.max(utilization, num(h.utilizationBps));
         if(i.market.protocol==='lista'&&i.totalUnits>0n&&receiptSupply===0n)throw unavailable();
         exposure += i.totalUnits===0n?0n:i.market.protocol === 'lista' ? ceil(i.totalUnits * (rate + 1n), receiptSupply) : ceil(i.totalUnits * rate, i.market.protocol === 'aave_v3' ? RAY : WAD);
-        reserved+=i.totalReserved;
         let available = cap;
         if (i.market.protocol === 'venus') available = cap === 0n ? UINT256_MAX : cap > integer(h.supply) ? cap - integer(h.supply) : 0n;
         if (i.market.protocol === 'aave_v3') {
@@ -264,9 +267,9 @@ export async function readYieldAccount(client: PublicClient, profile: YieldProfi
           const whole = (cap >> 116n) & ((1n << 36n) - 1n), scaled = whole * 10n ** BigInt(i.underlyingDecimals);
           available = whole === 0n ? UINT256_MAX : scaled > receiptSupply ? scaled - receiptSupply : 0n;
         }
-        headroom = min(headroom, available>i.totalReserved?available-i.totalReserved:0n);
+        headroom = min(headroom, available);
       }
-      return { supply, liquidity, exposure, reserved, headroom, utilization };
+      return { supply, liquidity, exposure, reserved: 0n, headroom, utilization };
     }
   }
 }

@@ -9,7 +9,7 @@ import v2Golden from './fixtures/strategy-config-v2-golden.json' with { type: 'j
 import { canonicalConfig, canonicalConfigHash, defaultAmountUsdt, minimumAllocationRaw, UINT256_MAX, usdtRaw, utcDate, validateExecution, validateAssetConfig, minimumAssetContribution } from '../src/strategy-execution.js';
 import { typedVersionInput, validateAllocation, previewContribution } from '../src/strategies.js';
 import type { StrategyVersion } from '../src/strategies.js';
-import { createPortfolioStrategyService } from '../src/portfolio-strategies.js';
+import { createPortfolioStrategyService, readWalletFundingEvidence } from '../src/portfolio-strategies.js';
 import { assertVersionOnchain, publishVersionOnchain, REGISTRY_ABI } from '../src/chain.js';
 import { kernelAddressesForChain } from '../src/addresses.js';
 import { readFaucetFundingEvidence } from '../src/faucet.js';
@@ -27,6 +27,115 @@ const hash = canonicalConfigHash(config);
 const version: StrategyVersion = { strategyId: 82, version: 1, ...config, activeAt: activeAt.toISOString(), changeLog: null, createdAt: activeAt.toISOString(),
   executionSchemaVersion: 1, executionChainId: 97, configHash: hash, idleYield: { enabled: false } };
 const denied = (code: string) => (error: unknown) => error instanceof AppError && error.code === code;
+
+const walletSource = { chainId: 97, owner: TEST_OWNER, account: TEST_ACCOUNT, txHash: OTHER_HASH };
+function walletRpc() {
+  const rpc = strategyRpc(allocation, hash, activeAt);
+  rpc.state.mint = true;
+  rpc.state.transferFrom = TEST_OWNER;
+  return rpc;
+}
+
+test('#151 wallet proof reads the manifest token Transfer amount at the canonical receipt block, including uint256 boundaries', async () => {
+  for (const amount of [1n, usdtRaw('50'), TEST_AMOUNT, UINT256_MAX]) {
+    const rpc = walletRpc(); rpc.state.amount = amount;
+    assert.deepEqual(await readWalletFundingEvidence(walletSource, rpc.client), {
+      txHash: OTHER_HASH, logIndex: 0, blockNumber: 130n, blockHash: BLOCK_HASH, amountRaw: amount.toString(), confirmedAt: activeAt,
+    });
+    assert.deepEqual(rpc.state.reads, ['eth_chainId', 'eth_getTransactionReceipt', 'eth_getBlockByNumber']);
+    assert.deepEqual(rpc.state.broadcasts, []);
+  }
+});
+
+test('#151 one matching Transfer remains eligible alongside unrelated token logs', async () => {
+  const rpc = walletRpc();
+  const client = createPublicClient({ transport: custom({ request: async ({ method, params }) => {
+    const response: unknown = await rpc.client.transport.request({ method, params });
+    if (method === 'eth_getBlockByNumber') assert.deepEqual(params, ['0x82', false]);
+    if (method === 'eth_getTransactionReceipt') {
+      assert.ok(response && typeof response === 'object');
+      const logs: unknown = Reflect.get(response, 'logs'); assert.ok(Array.isArray(logs) && logs[0]);
+      logs.push({ ...logs[0], address: TEST_OWNER, logIndex: '0x1' });
+    }
+    return response;
+  } }, { retryCount: 0 }) });
+  const evidence = await readWalletFundingEvidence(walletSource, client);
+  assert.equal(evidence.logIndex, 0); assert.equal(evidence.amountRaw, TEST_AMOUNT.toString());
+});
+
+test('#151 wallet proof rejects foreign origins/recipients/tokens, zero, ambiguous logs and invalid receipts', async () => {
+  for (const scenario of ['from', 'to', 'token', 'zero', 'duplicate', 'missing', 'removed', 'reverted', 'malformed', 'claimed', 'reorg', 'chain', 'pending']) {
+    const rpc = walletRpc();
+    if (scenario === 'from') rpc.state.transferFrom = TEST_ACCOUNT;
+    if (scenario === 'to') rpc.state.to = TEST_OWNER;
+    if (scenario === 'token') rpc.state.token = TEST_OWNER;
+    if (scenario === 'zero') rpc.state.amount = 0n;
+    if (scenario === 'duplicate') rpc.state.duplicateLog = true;
+    if (scenario === 'missing') rpc.state.logs = false;
+    if (scenario === 'removed') rpc.state.removed = true;
+    if (scenario === 'reverted') rpc.state.success = false;
+    if (scenario === 'malformed') rpc.state.malformed = true;
+    if (scenario === 'claimed') rpc.state.mint = false;
+    if (scenario === 'reorg') rpc.state.blockHash = OTHER_HASH;
+    if (scenario === 'chain') rpc.state.chainId = 56;
+    if (scenario === 'pending') rpc.state.missingReceipt = true;
+    const code = scenario === 'reorg' ? 'FUNDING_REORGED' : ['chain', 'pending'].includes(scenario) ? 'FUNDING_RPC_UNAVAILABLE' : 'FUNDING_NOT_CONFIRMED';
+    await assert.rejects(readWalletFundingEvidence(walletSource, rpc.client), denied(code), scenario);
+  }
+});
+
+test('#151 receipt/log/block identities and timestamps must be complete and match the requested event', async () => {
+  for (const [target, key, value] of [
+    ['receipt', 'transactionHash', BLOCK_HASH], ['receipt', 'blockNumber', '-0x1'],
+    ['log', 'transactionHash', BLOCK_HASH], ['log', 'blockHash', OTHER_HASH], ['log', 'blockNumber', '0x81'],
+    ['log', 'logIndex', null], ['log', 'logIndex', '-0x1'], ['log', 'logIndex', '0x20000000000000'],
+    ['block', 'number', '0x81'], ['block', 'timestamp', '0x20000000000000'],
+  ] as const) {
+    const rpc = walletRpc();
+    const client = createPublicClient({ transport: custom({ request: async ({ method, params }) => {
+      const response: unknown = await rpc.client.transport.request({ method, params });
+      if ((method === 'eth_getTransactionReceipt' && target !== 'block') || (method === 'eth_getBlockByNumber' && target === 'block')) {
+        assert.ok(response && typeof response === 'object');
+        if (target === 'log') {
+          const logs: unknown = Reflect.get(response, 'logs'); assert.ok(Array.isArray(logs) && logs[0]);
+          Reflect.set(logs[0], key, value);
+        } else Reflect.set(response, key, value);
+      }
+      return response;
+    } }, { retryCount: 0 }) });
+    await assert.rejects(readWalletFundingEvidence(walletSource, client), error => error instanceof AppError && !error.message.includes('SECRET'), `${target}.${key}`);
+  }
+});
+
+test('#151 wallet funding rejects malformed input and non-97 chains before ownership, RPC or storage reads', async () => {
+  let reads = 0;
+  const owned = async (): Promise<never> => { reads++; throw new Error('unexpected ownership read'); };
+  const service = createPortfolioStrategyService({ chainId: () => 97, owned });
+  for (const source of [
+    { kind: 'wallet_transfer' }, ...[null, '', '0x', '0x01', `0x${'gg'.repeat(32)}`, 1].map(txHash => ({ kind: 'wallet_transfer', txHash })),
+    { kind: 'wallet_transfer', txHash: OTHER_HASH, amountRaw: '1' }, { kind: 'wallet_transfer', txHash: OTHER_HASH, claimId: '1' },
+  ]) await assert.rejects(service.funding(82, TEST_OWNER, { source }), denied('INVALID_FUNDING_SOURCE'));
+  for (const chainId of [56, 1337, 31337]) {
+    await assert.rejects(createPortfolioStrategyService({ chainId: () => chainId, owned }).funding(82, TEST_OWNER,
+      { source: { kind: 'wallet_transfer', txHash: OTHER_HASH } }), denied('FUNDING_SOURCE_DISABLED'));
+    await assert.rejects(readWalletFundingEvidence({ ...walletSource, chainId }), denied('FUNDING_SOURCE_DISABLED'));
+  }
+  assert.equal(reads, 0);
+});
+
+test('#151 wallet RPC failures and transport timeouts expose only a fixed error', async () => {
+  for (const method of ['eth_chainId', 'eth_getTransactionReceipt', 'eth_getBlockByNumber']) {
+    const rpc = walletRpc(); rpc.state.fail = method;
+    await assert.rejects(readWalletFundingEvidence(walletSource, rpc.client), error => error instanceof AppError && error.code === 'FUNDING_RPC_UNAVAILABLE' && !error.message.includes('SECRET'));
+  }
+  const server = httpServer(() => {});
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address(); assert.ok(address && typeof address !== 'string');
+    const client = createPublicClient({ transport: http(`http://127.0.0.1:${address.port}`, { timeout: 20, retryCount: 0 }) });
+    await assert.rejects(readWalletFundingEvidence(walletSource, client), denied('FUNDING_RPC_UNAVAILABLE'));
+  } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+});
 
 test('#83 typed HTTP defaults explicitly preserve per-asset hold, funding schedule and disabled yield', () => {
   const input = typedVersionInput({ allocation, chainId: 97 });

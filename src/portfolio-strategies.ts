@@ -1,12 +1,12 @@
 import { cashDifference } from './yield-domain.js';
 import { planFundingContribution } from './asset-plan.js';
 import { minimumFeeReserve } from './rebalance-plan.js';
-import { loadSessionKeyConfig } from './config.js';
+import { getConfig, loadSessionKeyConfig } from './config.js';
 import { getChain } from './chain.js';
-import type { Address, Hex } from 'viem';
-import { formatUnits } from 'viem';
+import type { Address, Hex, PublicClient } from 'viem';
+import { createPublicClient, decodeEventLog, erc20Abi, formatUnits, http } from 'viem';
 import type { PoolClient } from 'pg';
-import { configuredChainId } from './testnet-profile.js';
+import { configuredChainId, TESTNET_97 } from './testnet-profile.js';
 import { query, withPortfolioLock, withTransaction } from './db.js';
 import { AppError, ForbiddenError, ValidationError } from './errors.js';
 import { requireOwnedPortfolio } from './portfolios.js';
@@ -14,12 +14,54 @@ import type { OwnedPortfolio } from './portfolios.js';
 import { requireTypedVersion } from './strategies.js';
 import type { StrategyVersion } from './strategies.js';
 import { readFaucetFundingEvidence, settleFaucetClaim } from './faucet.js';
+import type { FaucetFundingEvidence } from './faucet.js';
 import { createWelcomeService, findWelcomeGrant, readWelcomeFundingEvidence, settleWelcomeGrant } from './welcome-grants.js';
 import type { WelcomeGrant } from './welcome-grants.js';
 import { readAccountCash } from './chain.js';
 import { defaultAmountUsdt, exactKeys, minimumAllocationRaw, record, usdtRaw, utcDate, CONTRIBUTION_FEE_RESERVE_RAW, minimumAssetContribution, numeraireFor } from './strategy-execution.js';
 
-export type FundingSource = { kind: 'faucet_claim'; claimId: string } | { kind: 'welcome_grant'; grantId: string };
+export type FundingSource = { kind: 'faucet_claim'; claimId: string } | { kind: 'welcome_grant'; grantId: string }
+  | { kind: 'wallet_transfer'; txHash: Hex };
+
+/** One mined receipt, pinned to its canonical block, as for faucet/welcome funding. */
+export async function readWalletFundingEvidence(input: { chainId: number; owner: Address; account: Address; txHash: Hex }, suppliedClient?: PublicClient): Promise<FaucetFundingEvidence> {
+  try {
+    if (input.chainId !== 97) throw new ValidationError('FUNDING_SOURCE_DISABLED', 'wallet funding is only available on chain 97');
+    const txHash = fundingHash(input.txHash);
+    const rpcUrl = suppliedClient ? undefined : getConfig().rpcUrl;
+    if (!suppliedClient && !rpcUrl) throw new Error('missing RPC');
+    const client = suppliedClient ?? createPublicClient({ transport: http(rpcUrl ?? undefined, { timeout: 5_000, retryCount: 0 }) });
+    if (await client.getChainId() !== 97) throw new Error('wrong RPC chain');
+    const receipt = await client.getTransactionReceipt({ hash: txHash });
+    if (receipt.status !== 'success' || receipt.transactionHash.toLowerCase() !== txHash || receipt.blockNumber < 0n || !/^0x[0-9a-f]{64}$/.test(receipt.blockHash)) {
+      throw new AppError(409, 'FUNDING_NOT_CONFIRMED', 'successful wallet transfer receipt is required');
+    }
+    const block = await client.getBlock({ blockNumber: receipt.blockNumber });
+    if (block.hash !== receipt.blockHash || block.number !== receipt.blockNumber) throw new AppError(409, 'FUNDING_REORGED', 'wallet funding receipt is not canonical; reconciliation required');
+    const matches = receipt.logs.flatMap(log => {
+      if (log.address.toLowerCase() !== TESTNET_97.contracts.usdt || log.removed || log.transactionHash?.toLowerCase() !== txHash ||
+          log.blockHash !== receipt.blockHash || log.blockNumber !== receipt.blockNumber || log.logIndex === null || !Number.isSafeInteger(log.logIndex) || log.logIndex < 0) return [];
+      try {
+        const event = decodeEventLog({ abi: erc20Abi, eventName: 'Transfer', data: log.data, topics: log.topics });
+        return event.args.from.toLowerCase() === input.owner.toLowerCase() && event.args.to.toLowerCase() === input.account.toLowerCase()
+          ? [{ log, amount: event.args.value }] : [];
+      } catch { return []; }
+    });
+    const match = matches[0];
+    if (matches.length !== 1 || !match || match.log.logIndex === null || match.amount <= 0n) throw new AppError(409, 'FUNDING_NOT_CONFIRMED', 'one positive owner-to-account USDT Transfer is required');
+    const confirmedAt = new Date(Number(block.timestamp) * 1000);
+    if (!Number.isSafeInteger(Number(block.timestamp)) || block.timestamp < 0n || !Number.isFinite(confirmedAt.getTime())) throw new Error('invalid confirmation time');
+    return { txHash, logIndex: match.log.logIndex, blockNumber: receipt.blockNumber, blockHash: receipt.blockHash, amountRaw: match.amount.toString(), confirmedAt };
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw new AppError(503, 'FUNDING_RPC_UNAVAILABLE', 'wallet funding confirmation unavailable; no new lot credited');
+  }
+}
+
+function fundingHash(value: unknown): Hex {
+  if (typeof value !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(value)) throw new ValidationError('INVALID_FUNDING_SOURCE', 'txHash must be a bytes32 hex string');
+  return `0x${value.slice(2).toLowerCase()}`;
+}
 type LotRow = { id: string; chain_id: string; portfolio_id: string; strategy_id: string; version: number; kind: 'hold' | 'stack' | 'asset'; effective_slices?: Record<string,number>; created_at: Date;
   tx_hash: Hex; log_index: string; block_number: string; block_hash: Hex; amount_raw: string; state: string; claim_id?: string | null;
   source_kind: 'faucet_claim' | 'welcome_grant' | null; faucet_claim_id: string | null; welcome_grant_id: string | null };
@@ -34,6 +76,7 @@ export type PortfolioStrategyDeps = {
   owned: typeof requireOwnedPortfolio;
   version: typeof requireTypedVersion;
   evidence: typeof readFaucetFundingEvidence;
+  walletEvidence: typeof readWalletFundingEvidence;
   cash: typeof readAccountCash;
   settleClaim: typeof settleFaucetClaim;
   welcome: ReturnType<typeof createWelcomeService>;
@@ -91,7 +134,7 @@ const conflict = () => new AppError(409, 'REVISION_CONFLICT', 'instruction chang
 
 export function createPortfolioStrategyService(overrides: Partial<PortfolioStrategyDeps> = {}) {
   const deps: PortfolioStrategyDeps = { query, transaction: withTransaction, lock: withPortfolioLock, owned: requireOwnedPortfolio,
-    version: requireTypedVersion, evidence: readFaucetFundingEvidence, cash: readAccountCash, settleClaim: settleFaucetClaim,
+    version: requireTypedVersion, evidence: readFaucetFundingEvidence, walletEvidence: readWalletFundingEvidence, cash: readAccountCash, settleClaim: settleFaucetClaim,
     welcome: createWelcomeService(), welcomeGrant: findWelcomeGrant, welcomeEvidence: readWelcomeFundingEvidence, settleWelcome: settleWelcomeGrant,
     chainId: configuredChainId, now: () => new Date(), feeReserve: async (p) => {
       const chain = getChain();
@@ -138,8 +181,21 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
     if (rows.rows.length) throw new AppError(409, 'FUNDING_REORGED', 'funding reconciliation is required before new authorization');
   }
 
-  async function creditFunding(p: OwnedPortfolio, wallet: string, source: FundingSource) {
-    const id = p.id;
+  async function reconcileFundingReorg(p: OwnedPortfolio, txHash: Hex, error: unknown) {
+    if (error instanceof AppError && error.code === 'FUNDING_REORGED') {
+      await deps.transaction(async (client) => {
+        await cashLock(client, p);
+        await client.query(`update strategy_funding_lots set state='reorged',updated_at=clock_timestamp()
+          where chain_id=$1 and portfolio_id=$2 and tx_hash=$3 and state='confirmed'`, [p.chainId, p.id, txHash]);
+      });
+    }
+  }
+
+  async function fundingEvidence(p: OwnedPortfolio, wallet: string, source: FundingSource) {
+    if (source.kind === 'wallet_transfer') {
+      try { return await deps.walletEvidence({ chainId: p.chainId, owner: p.ownerAddress as Address, account: p.accountAddress as Address, txHash: source.txHash }); }
+      catch (error) { await reconcileFundingReorg(p, source.txHash, error); throw error; }
+    }
     const welcomeGrant = source.kind === 'welcome_grant' ? await deps.welcomeGrant(p.chainId, wallet) : null;
     if (source.kind === 'welcome_grant' && (!welcomeGrant || welcomeGrant.id !== source.grantId || welcomeGrant.portfolioId !== p.id || welcomeGrant.account !== p.accountAddress)) throw new ForbiddenError('welcome is not an authenticated input to this account');
     const claim = welcomeGrant ? { owner: welcomeGrant.owner, account: welcomeGrant.account, amount_wei: welcomeGrant.amountWei.toString(), tx_hash: welcomeGrant.txHash, state: welcomeGrant.state, day: welcomeGrant.day } : (await deps.query<{ owner: string; account: string; amount_wei: string; tx_hash: Hex | null; state: string; day: string }>(
@@ -147,15 +203,8 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
     if (!claim || claim.owner !== wallet.toLowerCase() || claim.account !== p.accountAddress) throw new ForbiddenError('claim is not an authenticated input to this account');
     const from = claim.state;
     if (!claim.tx_hash || (from !== 'submitted' && from !== 'unknown' && from !== 'confirmed')) throw new AppError(409, 'FUNDING_NOT_CONFIRMED', 'claim has no submitted product transaction');
-    const reconcileReorg = async (error: unknown) => {
-      if (error instanceof AppError && error.code === 'FUNDING_REORGED') {
-        await deps.transaction(async (client) => {
-          await cashLock(client, p);
-          await client.query(`update strategy_funding_lots set state='reorged',updated_at=clock_timestamp()
-            where chain_id=$1 and portfolio_id=$2 and tx_hash=$3 and state='confirmed'`, [p.chainId, p.id, claim.tx_hash]);
-        });
-      }
-    };
+    const claimHash = claim.tx_hash;
+    const reconcileReorg = (error: unknown) => reconcileFundingReorg(p, claimHash, error);
     let evidence;
     try { evidence = await (welcomeGrant ? deps.welcomeEvidence : deps.evidence)({ chainId: p.chainId, account: p.accountAddress as Address, amountWei: BigInt(claim.amount_wei), txHash: claim.tx_hash }); }
     catch (error) {
@@ -178,19 +227,28 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
       if (from !== 'confirmed') await deps.settleWelcome(welcomeGrant, 'confirmed', claim.tx_hash, evidence);
     } else if (from !== 'confirmed' && source.kind === 'faucet_claim') await deps.settleClaim({ id: source.claimId, chainId: p.chainId, day: claim.day,
       owner: p.ownerAddress as Address, account: p.accountAddress as Address, amountWei: BigInt(claim.amount_wei) }, from, 'confirmed', claim.tx_hash);
+    return evidence;
+  }
+
+  async function creditFunding(p: OwnedPortfolio, wallet: string, source: FundingSource) {
+    const id = p.id;
+    const evidence = await fundingEvidence(p, wallet, source);
     // The source belongs to its receipt-time enrollment, not a later owner upgrade.
     const onchainId = (await deps.query<{ onchain_id: string }>('select onchain_id from strategies where id=$1', [p.strategyId])).rows[0]?.onchain_id;
     if (!onchainId) throw new AppError(409, 'STRATEGY_NOT_ON_CHAIN', 'strategy has no chain identity');
     const version = await deps.version(p.strategyId, p.version, Number(onchainId), p.accountAddress as Address);
     try { await deps.version(p.strategyId, p.version, Number(onchainId), p.accountAddress as Address, { requireLatest: true, blockNumber: evidence.blockNumber, blockHash: evidence.blockHash }); }
-    catch (error) { await reconcileReorg(error); throw error; }
+    catch (error) { await reconcileFundingReorg(p, evidence.txHash, error); throw error; }
     const confirmedAt = evidence.confirmedAt;
     const feeReserve = version.execution.kind === 'per_asset' && version.execution.assets.some(a=>a.asset!==numeraireFor(p.chainId)) ? await deps.feeReserve(p,version) : 0n;
     if(feeReserve<0n||feeReserve>CONTRIBUTION_FEE_RESERVE_RAW)throw new AppError(503,'MIN_FEE_UNAVAILABLE','contribution fee bound unavailable');
     const result = await deps.transaction(async (client) => {
       await cashLock(client, p);
       await checkReorg(client, p);
-      const original = (await client.query<LotRow>('select * from strategy_funding_lots where chain_id=$1 and tx_hash=$2', [p.chainId, evidence.txHash])).rows[0];
+      const original = (source.kind === 'wallet_transfer'
+        ? await client.query<LotRow>(`select * from strategy_funding_lots where chain_id=$1 and tx_hash=$2
+            and (log_index=$3 or portfolio_id=$4) order by (log_index=$3) desc limit 1`, [p.chainId, evidence.txHash, evidence.logIndex, id])
+        : await client.query<LotRow>('select * from strategy_funding_lots where chain_id=$1 and tx_hash=$2', [p.chainId, evidence.txHash])).rows[0];
       if (original && (original.log_index !== String(evidence.logIndex) || original.block_hash !== evidence.blockHash || original.block_number !== evidence.blockNumber.toString())) {
         if (Number(original.portfolio_id) !== id) throw new AppError(409, 'FUNDING_EVENT_CONFLICT', 'funding source belongs to another portfolio');
         await client.query("update strategy_funding_lots set state='reorged',updated_at=clock_timestamp() where id=$1", [original.id]);
@@ -199,7 +257,7 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
       const kind = version.execution.kind === 'per_asset' ? 'asset' : version.execution.kind;
       if (kind !== 'asset' && kind !== 'hold') throw new Error('non-typed funding');
       if(original){
-        if (original.source_kind !== null && (original.source_kind !== source.kind || (source.kind === 'welcome_grant' ? original.welcome_grant_id !== source.grantId : original.faucet_claim_id !== source.claimId))) throw new AppError(409, 'FUNDING_EVENT_CONFLICT', 'funding source identity conflicts with the saved origin');
+        if (original.source_kind !== null && (original.source_kind !== source.kind || (source.kind === 'welcome_grant' ? original.welcome_grant_id !== source.grantId : source.kind === 'faucet_claim' && original.faucet_claim_id !== source.claimId))) throw new AppError(409, 'FUNDING_EVENT_CONFLICT', 'funding source identity conflicts with the saved origin');
         if(Number(original.portfolio_id)!==id||Number(original.strategy_id)!==p.strategyId||original.version!==p.version||original.kind!==kind||original.amount_raw!==evidence.amountRaw||original.state!=='confirmed')throw new AppError(409,'FUNDING_EVENT_CONFLICT','funding event conflicts with its original authorization');
         return { ...mapLot(original), source, replayed:true, fundingStatus:'recorded' };
       }
@@ -212,7 +270,7 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
       const inserted = await client.query<LotRow>(`insert into strategy_funding_lots
         (chain_id,portfolio_id,strategy_id,version,kind,tx_hash,log_index,block_number,block_hash,amount_raw,minimum_contribution_raw,effective_slices,created_at,updated_at,source_kind,faucet_claim_id,welcome_grant_id)
         values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13,$14,$15,$16) on conflict(chain_id,tx_hash,log_index) do nothing returning *`,
-        [p.chainId, id, p.strategyId, p.version, kind, evidence.txHash, evidence.logIndex, evidence.blockNumber.toString(), evidence.blockHash, evidence.amountRaw, contribution?.minimum.toString() ?? null, contribution ? JSON.stringify(contribution.effectiveSlices) : null, confirmedAt, source.kind, source.kind === 'faucet_claim' ? source.claimId : null, source.kind === 'welcome_grant' ? source.grantId : null]);
+        [p.chainId, id, p.strategyId, p.version, kind, evidence.txHash, evidence.logIndex, evidence.blockNumber.toString(), evidence.blockHash, evidence.amountRaw, contribution?.minimum.toString() ?? null, contribution ? JSON.stringify(contribution.effectiveSlices) : null, confirmedAt, source.kind === 'wallet_transfer' ? null : source.kind, source.kind === 'faucet_claim' ? source.claimId : null, source.kind === 'welcome_grant' ? source.grantId : null]);
       const lot = (await client.query<LotRow>('select * from strategy_funding_lots where chain_id=$1 and tx_hash=$2 and log_index=$3',
         [p.chainId, evidence.txHash, evidence.logIndex])).rows[0];
       if (!lot || Number(lot.portfolio_id) !== id || Number(lot.strategy_id) !== p.strategyId || lot.version !== p.version || lot.kind !== kind ||
@@ -276,13 +334,15 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
     }),
 
     funding: (id: number, wallet: string, input: unknown) => safe(async () => {
-      if (!record(input)) throw new ValidationError('INVALID_FUNDING_SOURCE', 'expected { source: { kind, claimId } }');
+      if (!record(input)) throw new ValidationError('INVALID_FUNDING_SOURCE', 'expected { source: { kind, claimId/grantId/txHash } }');
       exactKeys(input, ['source'], 'INVALID_FUNDING_SOURCE');
       if (!record(input.source)) throw new ValidationError('INVALID_FUNDING_SOURCE', 'source must identify an approved product event');
       const welcome = input.source.kind === 'welcome_grant';
-      exactKeys(input.source, welcome ? ['kind', 'grantId'] : ['kind', 'claimId'], 'INVALID_FUNDING_SOURCE');
-      if (!welcome && input.source.kind !== 'faucet_claim' || deps.chainId() !== 97) throw new ValidationError('FUNDING_SOURCE_DISABLED', 'only chain 97 product funding is approved');
-      const source: FundingSource = welcome ? { kind: 'welcome_grant', grantId: positiveId(input.source.grantId) }
+      const transfer = input.source.kind === 'wallet_transfer';
+      exactKeys(input.source, welcome ? ['kind', 'grantId'] : transfer ? ['kind', 'txHash'] : ['kind', 'claimId'], 'INVALID_FUNDING_SOURCE');
+      if (!welcome && !transfer && input.source.kind !== 'faucet_claim' || deps.chainId() !== 97) throw new ValidationError('FUNDING_SOURCE_DISABLED', 'only chain 97 product funding is approved');
+      const source: FundingSource = transfer ? { kind: 'wallet_transfer', txHash: fundingHash(input.source.txHash) }
+        : welcome ? { kind: 'welcome_grant', grantId: positiveId(input.source.grantId) }
         : { kind: 'faucet_claim', claimId: positiveId(input.source.claimId) };
       const p = await ownedContext(id, wallet);
       return locked(id, async () => {

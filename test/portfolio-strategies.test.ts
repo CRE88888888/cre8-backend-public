@@ -3,19 +3,22 @@ import { randomBytes } from 'node:crypto';
 import { after, afterEach, test } from 'node:test';
 import type { Address, Hex } from 'viem';
 import { closePool, getPool, migrate, query, withConnection, withTransaction } from '../src/db.js';
-import { createPortfolioStrategyService } from '../src/portfolio-strategies.js';
+import { createPortfolioStrategyService, readWalletFundingEvidence } from '../src/portfolio-strategies.js';
 import type { PortfolioStrategyDeps } from '../src/portfolio-strategies.js';
 import { createStrategy, getStrategy, publishVersion, requireTypedVersion, validateAllocation, previewContribution } from '../src/strategies.js';
 import { assertVersionOnchain, readAccountCash } from '../src/chain.js';
 import { enrollPortfolio, requireOwnedPortfolio, strategyMinimumDeposit } from '../src/portfolios.js';
 import { readFaucetFundingEvidence } from '../src/faucet.js';
-import { canonicalConfigHash, usdtRaw } from '../src/strategy-execution.js';
+import { canonicalConfigHash, UINT256_MAX, usdtRaw } from '../src/strategy-execution.js';
 import type { AssetExecution, AssetSetting } from '../src/strategy-execution.js';
 import { AppError } from '../src/errors.js';
 import { TESTNET_97 } from '../src/testnet-profile.js';
 import { strategyRpc, TEST_AMOUNT, OTHER_HASH } from './fixtures/strategy-rpc.js';
 import { claimDuePortfolios } from '../src/scheduler.js';
 import { previewContributionAsync } from '../src/contribution-preview.js';
+import { fundingLots, prepareStrategyJob } from '../src/strategy-jobs.js';
+import type { JobContext } from '../src/strategy-jobs.js';
+import type { WithTransactionFn } from '../src/scheduler.js';
 
 const address = (): Address => `0x${randomBytes(20).toString('hex')}`;
 const txHash = (): Hex => `0x${randomBytes(32).toString('hex')}`;
@@ -55,7 +58,7 @@ async function fixture(kind: 'hold' | 'stack' = 'stack', cashWeight=5000, amount
     owned:(portfolioId,wallet)=>requireOwnedPortfolio(portfolioId,wallet,{chainId:97}),
     version:(sid,v,chainSid,acct,options)=>requireTypedVersion(sid,v,chainSid,acct,{...options,chainId:97,
       assertOnchain:(onchainId,index,expected,account,readOptions)=>assertVersionOnchain(onchainId,index,expected,account,{...readOptions,client:rpc.client,registry:TESTNET_97.contracts.registry})}),
-    evidence:(c)=>readFaucetFundingEvidence(c,rpc.client),cash:(chainId,account)=>readAccountCash(chainId,account,rpc.client)};
+    evidence:(c)=>readFaucetFundingEvidence(c,rpc.client),walletEvidence:c=>readWalletFundingEvidence(c,rpc.client),cash:(chainId,account)=>readAccountCash(chainId,account,rpc.client)};
   const service=createPortfolioStrategyService(deps);
   let nextDay=2;
   async function secondClaim(nextAmount=amount) {
@@ -77,6 +80,177 @@ async function onTestnet<T>(fn:()=>Promise<T>):Promise<T>{
   try{return await fn();}finally{if(previous===undefined)delete process.env.CHAIN_ID;else process.env.CHAIN_ID=previous;}
 }
 const future=()=>new Date(Date.now()+86400_000).toISOString();
+
+async function walletFixture(kind: 'hold' | 'stack' = 'hold', amount = TEST_AMOUNT, cashWeight = 5000) {
+  const f = await fixture(kind, cashWeight, amount === 0n ? TEST_AMOUNT : amount);
+  const hash = txHash();
+  f.rpc.state.txHash = hash;
+  f.rpc.state.mint = true;
+  f.rpc.state.transferFrom = f.owner;
+  f.rpc.state.amount = amount;
+  f.rpc.state.cashRaw = amount;
+  return { ...f, hash, source: { source: { kind: 'wallet_transfer', txHash: hash } } };
+}
+
+test('#151 owner wallet transfer credits one lot and preserves the funding response contract', async () => {
+  const f = await walletFixture();
+  const lot = await f.service.funding(f.id, f.owner, f.source);
+  assert.deepEqual(lot.source, f.source.source);
+  assert.equal(lot.amountRaw, TEST_AMOUNT.toString());
+  assert.equal(lot.replayed, false);
+  assert.equal(lot.kind, 'asset');
+  assert.equal(await bucket(f.id, 'unallocated_hold_raw'), (TEST_AMOUNT / 2n).toString());
+  const saved = (await query('select source_kind,faucet_claim_id,welcome_grant_id,log_index::text from strategy_funding_lots where id=$1', [lot.id])).rows;
+  assert.deepEqual(saved, [{ source_kind: null, faucet_claim_id: null, welcome_grant_id: null, log_index: '0' }]);
+  const read = await f.service.read(f.id, f.owner);
+  assert.equal(read.lots[0]?.id, lot.id); assert.equal(read.lots[0]?.source, null, 'untyped history is never relabelled');
+  assert.equal(read.cash.unclassifiedRaw, '0');
+  assert.equal(read.balances?.allocated_cash_raw, (TEST_AMOUNT / 2n).toString());
+  const replay = await createPortfolioStrategyService(f.deps).funding(f.id, f.owner, f.source);
+  assert.equal(replay.id, lot.id); assert.equal(replay.replayed, true);
+  assert.equal(await bucket(f.id, 'unallocated_hold_raw'), (TEST_AMOUNT / 2n).toString());
+});
+
+test('#151 wallet lots feed the ordinary hold/stack scheduler with the original amount and receipt-time slices', async () => {
+  const run: WithTransactionFn = fn => withTransaction(client => fn({ query: (sql, params) => client.query(sql, params === undefined ? [] : [...params]) }));
+  for (const kind of ['hold', 'stack'] as const) {
+    const f = await walletFixture(kind);
+    const lot = await f.service.funding(f.id, f.owner, f.source);
+    const rows = (await query<{ budget_raw: string; effective_slices: number }>('select budget_raw::text,effective_slices from strategy_lot_assets where lot_id=$1 and asset=$2', [lot.id, TESTNET_97.assets.AAPLB.token])).rows;
+    assert.deepEqual(rows, [{ budget_raw: (TEST_AMOUNT / 2n).toString(), effective_slices: kind === 'hold' ? 1 : 12 }]);
+    const c: JobContext = { chainId: 97, portfolioId: f.id, strategyId: f.strategyId, version: 1, kind: 'asset', execution: f.execution,
+      account: f.account, allocation: f.allocation, cash: TESTNET_97.contracts.usdt, now: new Date('2026-11-15T14:00:00Z'),
+      reserve: 27n * 10n ** 16n, caps: new Map([[TESTNET_97.assets.AAPLB.token, null]]), buyLimit: UINT256_MAX,
+      observedCash: TEST_AMOUNT, enabled: true, marketOpen: true };
+    const lots = await fundingLots(query, c); assert.equal(lots[0]?.id, lot.id);
+    const { job } = await prepareStrategyJob(run, c, lots);
+    assert.ok(job); assert.equal(job.kind, 'asset'); assert.equal(job.state, 'reserved');
+    assert.ok(BigInt(job.remaining_input[TESTNET_97.assets.AAPLB.token] ?? '0') > 0n);
+    assert.deepEqual(f.rpc.state.broadcasts, []);
+  }
+});
+
+test('#151 wallet funding rejects foreign authentication, wrong from/to and RPC failures without lot or cash credit', async () => {
+  for (const scenario of ['auth', 'from', 'to', 'rpc', 'missing']) {
+    const f = await walletFixture();
+    if (scenario === 'from') f.rpc.state.transferFrom = address();
+    if (scenario === 'to') f.rpc.state.to = address();
+    if (scenario === 'rpc') f.rpc.state.fail = 'eth_getTransactionReceipt';
+    if (scenario === 'missing') f.rpc.state.logs = false;
+    await assert.rejects(f.service.funding(f.id, scenario === 'auth' ? address() : f.owner, f.source),
+      denied(scenario === 'auth' ? 'FORBIDDEN' : scenario === 'rpc' ? 'FUNDING_RPC_UNAVAILABLE' : 'FUNDING_NOT_CONFIRMED'));
+    assert.equal((await query('select id from strategy_funding_lots where portfolio_id=$1', [f.id])).rows.length, 0);
+    assert.equal((await query('select portfolio_id from strategy_cash_balances where portfolio_id=$1', [f.id])).rows.length, 0);
+  }
+});
+
+test('#151 zero and one raw below the existing minimum reject; equality and larger transfers preserve exact log amounts', async () => {
+  for (const amount of [0n, usdtRaw('50') - 1n, usdtRaw('50'), usdtRaw('10000001')]) {
+    const f = await walletFixture('hold', amount, 0);
+    if (amount < usdtRaw('50')) {
+      await assert.rejects(f.service.funding(f.id, f.owner, f.source), denied(amount === 0n ? 'FUNDING_NOT_CONFIRMED' : 'BELOW_MINIMUM_ALLOCATION'));
+      assert.equal((await query('select id from strategy_funding_lots where portfolio_id=$1', [f.id])).rows.length, 0);
+      assert.equal(await bucket(f.id, 'unallocated_hold_raw'), '0');
+    } else {
+      const lot = await f.service.funding(f.id, f.owner, f.source);
+      assert.equal(lot.amountRaw, amount.toString()); assert.equal(await bucket(f.id, 'unallocated_hold_raw'), amount.toString());
+    }
+  }
+});
+
+test('#151 competing requests, rollback, DB timeout and lost COMMIT acknowledgement cannot double-credit a wallet transfer', async () => {
+  const f = await walletFixture();
+  const rollback: typeof withTransaction = fn => withTransaction(async client => { await fn(client); throw new Error('SECRET_DB'); });
+  const timeout: typeof withTransaction = fn => withTransaction(async client => {
+    const result = await fn(client); await client.query("set local statement_timeout='20ms'"); await client.query('select pg_sleep(1)'); return result;
+  });
+  for (const transaction of [rollback, timeout]) {
+    await assert.rejects(createPortfolioStrategyService({ ...f.deps, transaction }).funding(f.id, f.owner, f.source),
+      error => error instanceof AppError && error.code === 'EXECUTION_STORAGE_UNAVAILABLE' && !error.message.includes('SECRET'));
+    assert.equal((await query('select id from strategy_funding_lots where portfolio_id=$1', [f.id])).rows.length, 0);
+    assert.equal(await bucket(f.id, 'unallocated_hold_raw'), '0');
+  }
+  const unknown: typeof withTransaction = async fn => { await withTransaction(fn); throw new Error('SECRET_COMMIT_ACK'); };
+  await assert.rejects(createPortfolioStrategyService({ ...f.deps, transaction: unknown }).funding(f.id, f.owner, f.source), denied('EXECUTION_STORAGE_UNAVAILABLE'));
+  let entered = () => {}, release = () => {};
+  const reading = new Promise<void>(resolve => { entered = resolve; });
+  const proceed = new Promise<void>(resolve => { release = resolve; });
+  const competing = createPortfolioStrategyService({ ...f.deps, walletEvidence: async input => {
+    entered(); await proceed; return readWalletFundingEvidence(input, f.rpc.client);
+  } }).funding(f.id, f.owner, f.source);
+  await reading;
+  try { await assert.rejects(f.service.funding(f.id, f.owner, f.source), denied('PORTFOLIO_BUSY')); }
+  finally { release(); await competing; }
+  const replay = await f.service.funding(f.id, f.owner, f.source); assert.equal(replay.replayed, true);
+  assert.equal((await query('select id from strategy_funding_lots where portfolio_id=$1', [f.id])).rows.length, 1);
+  assert.equal(await bucket(f.id, 'unallocated_hold_raw'), (TEST_AMOUNT / 2n).toString());
+});
+
+test('#151 wallet reorgs freeze the original event without resurrecting it or freeing credited cash', async () => {
+  for (const scenario of ['canonical-block', 'moved-index', 'during-version']) {
+    const f = await walletFixture(); await f.service.funding(f.id, f.owner, f.source);
+    if (scenario === 'canonical-block') f.rpc.state.blockHash = OTHER_HASH;
+    if (scenario === 'moved-index') f.rpc.state.logIndex++;
+    if (scenario === 'during-version') f.rpc.state.reorgAtBlockRead = f.rpc.state.blockReads + 5;
+    await assert.rejects(f.service.funding(f.id, f.owner, f.source), denied('FUNDING_REORGED'));
+    assert.deepEqual((await query('select state from strategy_funding_lots where portfolio_id=$1', [f.id])).rows, [{ state: 'reorged' }]);
+    assert.equal(await bucket(f.id, 'unallocated_hold_raw'), (TEST_AMOUNT / 2n).toString());
+    await assert.rejects(f.service.executionState(f.id, f.owner, { enabled: true }), denied('FUNDING_REORGED'));
+  }
+});
+
+test('#151 a DB failure while freezing a reorg never returns success, leaks details or credits again', async () => {
+  const f = await walletFixture(); await f.service.funding(f.id, f.owner, f.source);
+  f.rpc.state.blockHash = OTHER_HASH;
+  const service = createPortfolioStrategyService({ ...f.deps, transaction: async () => { throw new Error('SECRET_DB'); } });
+  await assert.rejects(service.funding(f.id, f.owner, f.source), error => error instanceof AppError && error.code === 'EXECUTION_STORAGE_UNAVAILABLE' && !error.message.includes('SECRET'));
+  assert.equal(await bucket(f.id, 'unallocated_hold_raw'), (TEST_AMOUNT / 2n).toString());
+  await assert.rejects(f.service.funding(f.id, f.owner, f.source), denied('FUNDING_REORGED'));
+  assert.deepEqual((await query('select state from strategy_funding_lots where portfolio_id=$1', [f.id])).rows, [{ state: 'reorged' }]);
+});
+
+test('#151 wallet transfers bind to receipt-time enrollment and reject a later pinned version or inactive strategy', async () => {
+  for (const scenario of ['version', 'before-active']) {
+    const f = await walletFixture(); f.rpc.state.latestBlockNumber = 131n;
+    if (scenario === 'version') f.rpc.state.historicalPinned = 2; else f.rpc.state.historicalNow--;
+    await assert.rejects(f.service.funding(f.id, f.owner, f.source), denied(scenario === 'version' ? 'CHAIN_VERSION_MISMATCH' : 'VERSION_NOT_ACTIVE'));
+    assert.equal((await query('select id from strategy_funding_lots where portfolio_id=$1', [f.id])).rows.length, 0);
+  }
+});
+
+test('#151 different portfolio logs in one transaction retain separate unique event identities', async () => {
+  const a = await walletFixture(), b = await walletFixture();
+  b.rpc.state.txHash = a.hash;
+  const first = await a.service.funding(a.id, a.owner, a.source);
+  await assert.rejects(b.service.funding(b.id, b.owner, a.source), denied('FUNDING_EVENT_CONFLICT'));
+  assert.equal(await bucket(b.id, 'unallocated_hold_raw'), '0');
+  b.rpc.state.logIndex = 1;
+  const second = await b.service.funding(b.id, b.owner, a.source);
+  assert.notEqual(first.id, second.id); assert.equal(first.logIndex, '0'); assert.equal(second.logIndex, '1');
+  assert.equal(await bucket(a.id, 'unallocated_hold_raw'), (TEST_AMOUNT / 2n).toString());
+  assert.equal(await bucket(b.id, 'unallocated_hold_raw'), (TEST_AMOUNT / 2n).toString());
+});
+
+test('#151 wallet funding HTTP accepts normalized hashes and returns the existing lot shape on first write and retry', async () => {
+  const { createServer } = await import('../src/server.js');
+  const f = await walletFixture();
+  const server = createServer({ portfolioStrategies: f.service, auth: { authenticate: async () => f.owner,
+    issueNonce: () => { throw new Error('unexpected'); }, login: async () => { throw new Error('unexpected'); }, logout: async () => {} } });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address(); assert.ok(address && typeof address !== 'string');
+    let id: unknown;
+    for (const replayed of [false, true]) {
+      const response = await fetch(`http://127.0.0.1:${address.port}/portfolios/${f.id}/funding-lots`, { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ source: { kind: 'wallet_transfer', txHash: `0x${f.hash.slice(2).toUpperCase()}` } }) });
+      assert.equal(response.status, 200);
+      const lot: unknown = await response.json(); assert.ok(lot && typeof lot === 'object');
+      assert.deepEqual(Reflect.get(lot, 'source'), f.source.source); assert.equal(Reflect.get(lot, 'replayed'), replayed);
+      assert.equal(Reflect.get(lot, 'amountRaw'), TEST_AMOUNT.toString()); assert.ok(Reflect.get(lot, 'effectiveSlices'));
+      if (!replayed) id = Reflect.get(lot, 'id'); else assert.equal(Reflect.get(lot, 'id'), id);
+    }
+  } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+});
 
 test('#118 preview and persisted contribution share effective slices, receipt time, minimum and conservative fee bound',async()=>{
   const at=new Date('2026-11-16T13:59:00Z'),cash=TESTNET_97.contracts.usdt,asset=TESTNET_97.assets.AAPLB.token;

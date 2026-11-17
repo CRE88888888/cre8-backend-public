@@ -24,6 +24,15 @@ test('#69 alto 97 requires separate env keys, safe mode and EntryPoint v0.7; inv
   }
 });
 
+test('alto 97 runs without safe mode only with the explicit ALLOW_UNSAFE_TESTNET=1 opt-in', () => {
+  const output = execFileSync('sh', ['alto/entrypoint.sh'], { env: { ...env, CHAIN_ID: '97', UTILITY_PRIVATE_KEY: 'utility-secret', SAFE_MODE: 'false', ALLOW_UNSAFE_TESTNET: '1' }, encoding: 'utf8' });
+  const flags = JSON.parse(output.trim().split('\n').at(-1) ?? 'null') as { safe: boolean };
+  assert.equal(flags.safe, false);
+  assert.doesNotMatch(output, /executor-secret|utility-secret|rpc-secret/);
+  const refused = spawnSync('sh', ['alto/entrypoint.sh'], { env: { ...env, CHAIN_ID: '97', UTILITY_PRIVATE_KEY: 'utility-secret', SAFE_MODE: 'off', ALLOW_UNSAFE_TESTNET: '1' }, encoding: 'utf8' });
+  assert.notEqual(refused.status, 0);
+});
+
 test('#69 alto mainnet defaults preserved; 97 uses v0.7 and bounded logs with env threshold override', () => {
   for (const chain of ['56', '97']) {
     const output = execFileSync('sh', ['alto/entrypoint.sh'], { env: { ...env, CHAIN_ID: chain, ...(chain === '97' ? { UTILITY_PRIVATE_KEY: 'utility-secret' } : {}) }, encoding: 'utf8' });

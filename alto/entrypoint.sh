@@ -26,7 +26,12 @@ MIN_EXECUTOR_BALANCE="${MIN_EXECUTOR_BALANCE:-}"
 if [ "${CHAIN_ID:-56}" = "97" ]; then
   : "${UTILITY_PRIVATE_KEY:?chain 97 requires a distinct UTILITY_PRIVATE_KEY}"
   [ "$UTILITY_PRIVATE_KEY" != "$EXECUTOR_PRIVATE_KEY" ] || { echo "chain 97 executor and utility keys must differ"; exit 1; }
-  [ "$SAFE_MODE" = true ] || { echo "chain 97 requires SAFE_MODE=true"; exit 1; }
+  # 公開 BSC 測試網節點都不支援 safe mode 需要的 debug_traceCall（2026-11-17 實測 publicnode、bnbchain、dataseed）。
+  # 只有明確設 ALLOW_UNSAFE_TESTNET=1 才能在 97 關掉 safe mode；預設照舊強制開。主網（56）不受影響。
+  if [ "$SAFE_MODE" != true ] && [ "${ALLOW_UNSAFE_TESTNET:-0}" != 1 ]; then
+    echo "chain 97 requires SAFE_MODE=true (set ALLOW_UNSAFE_TESTNET=1 to run without it)"; exit 1
+  fi
+  [ "$SAFE_MODE" = true ] || [ "$SAFE_MODE" = false ] || { echo "SAFE_MODE must be true or false"; exit 1; }
   EP=$(echo "${ENTRYPOINTS:-0x0000000071727De22E5E9d8BAf0edAc6f37da032}" | tr '[:upper:]' '[:lower:]')
   [ "$EP" = '0x0000000071727de22e5e9d8baf0edac6f37da032' ] || { echo "chain 97 requires EntryPoint v0.7"; exit 1; }
   MIN_EXECUTOR_BALANCE="${MIN_EXECUTOR_BALANCE:-10000000000000000}"

@@ -14,8 +14,314 @@ import { encodeFunctionData, parseAbi } from 'viem';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
 import { YIELD_EXECUTOR_ABI } from '../src/yield-abi.js';
 import { EXECUTOR_ABI } from '../src/chain.js';
+import { createServer } from 'node:http';
+import { decodeFunctionData, encodeAbiParameters, encodeFunctionResult, toFunctionSelector } from 'viem';
 
 after(closePool);
+
+async function setupRetryFixture(originalNonce = 0n) {
+  const sender = bytesToHex(randomBytes(20));
+  let clock = Math.floor(Date.now() / 1000), timestamp = clock, nonce = originalNonce, mode = 'ok';
+  const blockHash = keccak256(toHex(randomUUID()));
+  const reads: { method: string; params: unknown[] }[] = [];
+  const oracleAbi = parseAbi(['function oracle() view returns(address)', 'function numeraire() view returns(address)',
+    'function previewSwap(address,address,uint256) view returns(uint256,uint256)', 'function decimals() view returns(uint8)']);
+  const server = createServer(async (req, res) => {
+    let body = ''; for await (const part of req) body += String(part);
+    const rpc: { id: number; method: string; params: unknown[] } = JSON.parse(body);
+    reads.push(rpc);
+    if (mode === 'timeout') return;
+    let result: unknown;
+    if (rpc.method === 'eth_chainId') result = mode === 'chain' ? '0x38' : '0x61';
+    else if (rpc.method === 'eth_blockNumber') result = '0x64';
+    else if (rpc.method === 'eth_getCode') result = mode === 'undeployed' ? '0x' : '0x01';
+    else if (rpc.method === 'eth_getBlockByNumber') result = { number: mode === 'missing-block' ? null : '0x64',
+      hash: mode === 'reorg' && rpc.params[0] !== 'latest' ? keccak256(toHex('reorg')) : blockHash, timestamp: toHex(timestamp) };
+    else {
+      assert.equal(rpc.method, 'eth_call');
+      const call = rpc.params[0]; assert.ok(call && typeof call === 'object' && 'data' in call && typeof call.data === 'string');
+      if (call.data.startsWith(toFunctionSelector('getNonce(address,uint192)'))) result = mode === 'missing-nonce' ? '0x' : encodeAbiParameters([{ type: 'uint256' }], [nonce]);
+      else {
+        const decoded = decodeFunctionData({ abi: oracleAbi, data: call.data as `0x${string}` });
+        if (decoded.functionName === 'oracle' || decoded.functionName === 'numeraire') result = encodeFunctionResult({ abi: oracleAbi, functionName: decoded.functionName, result: T.contracts.usdt });
+        else if (decoded.functionName === 'decimals') result = encodeFunctionResult({ abi: oracleAbi, functionName: 'decimals', result: 18 });
+        else result = encodeFunctionResult({ abi: oracleAbi, functionName: 'previewSwap', result: [600n * 10n ** 18n, 590n * 10n ** 18n] });
+      }
+    }
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify(mode === 'rpc' ? { jsonrpc: '2.0', id: rpc.id, error: { code: -32000, message: 'SECRET_RPC' } } : { jsonrpc: '2.0', id: rpc.id, result }));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  const c = sponsorConfig({ PAYMASTER_SIGNER_PRIVATE_KEY: key, CHAIN_ID: '97', RPC_URL: `http://127.0.0.1:${address.port}` });
+  const op = operation({ sender, callData: kernelCall(encodeFunctionData({ abi: parseAbi(['function enroll(address,uint256,uint16)']),
+    functionName: 'enroll', args: [sender, 1n, 1] }), c.registry) });
+  const make = (extra: PaymasterDeps = {}) => createPaymasterService({ config: c, retrySetup: true, now: () => clock,
+    query: async (sql, params) => sql.includes('from smart_accounts') ? { rows: [{ owner: OWNER, user_id: OWNER }] } : query(sql, params),
+    checkChain: async () => {}, ...extra });
+  const rows = () => query('select * from gas_budget_reservations where chain_id=97 and account=$1 order by created_at,execution_key', [sender]);
+  return { sender, c, op: { ...op, nonce: originalNonce }, make, rows, reads,
+    time: (value: number, chainTime = value) => { clock = value; timestamp = chainTime; },
+    nonce: (value: bigint) => { nonce = value; }, mode: (value: string) => { mode = value; },
+    close: async () => { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
+      await query('delete from paymaster_sponsorships where sender=$1', [sender]); },
+  };
+}
+
+test('#150 expired unused setup accepts new gas and calldata atomically while retaining immutable historical costs', async () => {
+  const f = await setupRetryFixture();
+  try {
+    const first = await f.make().sponsor({ userOperation: f.op }, OWNER);
+    const saved = (await f.rows()).rows[0]; assert.ok(saved);
+    f.time(first.validUntil + 1);
+    const changed = { ...f.op, preVerificationGas: f.op.preVerificationGas + 1n,
+      callData: kernelCall(encodeFunctionData({ abi: parseAbi(['function approve(address,uint256)']), functionName: 'approve', args: [f.c.executor, 5n] }), T.contracts.usdt) };
+    const second = await f.make().sponsor({ userOperation: changed }, OWNER);
+    assert.notEqual(second.userOpHash, first.userOpHash);
+    const rows = (await f.rows()).rows;
+    assert.equal(rows.length, 2);
+    assert.deepEqual(rows.find(row => row.execution_key === saved.execution_key), { ...saved, state: 'failed', updated_at: rows.find(row => row.execution_key === saved.execution_key)?.updated_at });
+    assert.equal(rows.filter(row => row.purpose === 'setup' && row.state === 'reserved').length, 1);
+    assert.deepEqual((await query('select state from paymaster_sponsorships where user_op_hash=$1', [first.userOpHash])).rows, [{ state: 'expired' }]);
+    const nonceRead = f.reads.find(r => r.method === 'eth_call' && JSON.stringify(r.params).includes(toFunctionSelector('getNonce(address,uint192)')));
+    assert.equal(nonceRead?.params[1], '0x64');
+  } finally { await f.close(); }
+});
+
+test('#150 gas-only and unchanged-payload retries get separate immutable setup charges, including zero and maximum nonce', async () => {
+  for (const nonce of [0n, (1n << 256n) - 1n]) {
+    const f = await setupRetryFixture(nonce);
+    try {
+      let signed = await f.make().sponsor({ userOperation: f.op }, OWNER);
+      for (const change of [{ preVerificationGas: f.op.preVerificationGas + 1n }, {},
+        { accountGasLimits: toHex(0n, { size: 32 }), preVerificationGas: 0n, gasFees: toHex(0n, { size: 32 }) }]) {
+        f.time(signed.validUntil + 1);
+        const next = await f.make().sponsor({ userOperation: { ...f.op, ...change } }, OWNER);
+        assert.notEqual(next.userOpHash, signed.userOpHash); signed = next;
+      }
+      const rows = (await f.rows()).rows;
+      assert.equal(rows.length, 4); assert.equal(rows.filter(r => r.state === 'failed').length, 3);
+      assert.equal(rows.filter(r => r.purpose === 'setup' && r.state === 'reserved').length, 1);
+      const read = f.reads.find(r => r.method === 'eth_call' && JSON.stringify(r.params).includes(toFunctionSelector('getNonce(address,uint192)')));
+      const call = read?.params[0]; assert.ok(call && typeof call === 'object' && 'data' in call && typeof call.data === 'string');
+      assert.equal(decodeFunctionData({ abi: parseAbi(['function getNonce(address,uint192)']), data: call.data as `0x${string}` }).args[1], nonce >> 64n);
+    } finally { await f.close(); }
+  }
+});
+
+test('#150 a legacy ordinary context cannot bypass a pending setup retry proof', async () => {
+  const f = await setupRetryFixture();
+  try {
+    const first = await f.make().sponsor({ userOperation: f.op }, OWNER);
+    const changed = { ...f.op, preVerificationGas: f.op.preVerificationGas + 1n,
+      callData: kernelCall(encodeFunctionData({ abi: parseAbi(['function approve(address,uint256)']), functionName: 'approve', args: [f.c.executor, 10n] }), T.contracts.usdt) };
+    // Reproduce the pre-#150 classification: a setup calldata variant was ordinary.
+    await f.make({ retrySetup: false, retryOrdinaryGas: true }).sponsor({ userOperation: changed }, OWNER);
+    const saved = (await f.rows()).rows;
+    assert.equal(saved.filter(row => row.purpose === 'ordinary').length, 1);
+    await assert.rejects(f.make({ retryOrdinaryGas: true }).sponsor({ userOperation: changed }, OWNER),
+      e => e instanceof AppError && e.code === 'PAYMASTER_RETRY_TOO_SOON');
+    assert.deepEqual((await f.rows()).rows, saved);
+    f.time(first.validUntil + 1);
+    await f.make({ retryOrdinaryGas: true }).sponsor({ userOperation: changed }, OWNER);
+    const rows = (await f.rows()).rows;
+    assert.equal(rows.filter(row => row.purpose === 'setup' && row.state === 'reserved').length, 1);
+    assert.deepEqual(rows.find(row => row.purpose === 'ordinary'), saved.find(row => row.purpose === 'ordinary'));
+  } finally { await f.close(); }
+});
+
+test('#150 live and exact-boundary setup returns retry time; wall-clock expiry never releases a live on-chain authorization', async () => {
+  const f = await setupRetryFixture();
+  try {
+    const signed = await f.make().sponsor({ userOperation: f.op }, OWNER), saved = (await f.rows()).rows;
+    for (const delta of [-1, 0]) {
+      f.time(signed.validUntil + 1, signed.validUntil + delta);
+      for (const change of [{}, { preVerificationGas: f.op.preVerificationGas + 1n }]) {
+        await assert.rejects(f.make().sponsor({ userOperation: { ...f.op, ...change } }, OWNER), error => error instanceof AppError &&
+          error.code === 'PAYMASTER_RETRY_TOO_SOON' && error.status === 409 && 'retryAt' in error &&
+          error.retryAt === new Date((signed.validUntil + 1) * 1000).toISOString());
+      }
+      assert.deepEqual((await f.rows()).rows, saved);
+    }
+  } finally { await f.close(); }
+});
+
+test('#150 consumed or regressed EntryPoint nonce and a different requested nonce never unlock setup', async () => {
+  const original = (1n << 64n) + 7n, f = await setupRetryFixture(original);
+  try {
+    const signed = await f.make().sponsor({ userOperation: f.op }, OWNER), saved = (await f.rows()).rows;
+    f.time(signed.validUntil + 1);
+    for (const [nonce, code] of [[original + 1n, 'PAYMASTER_SETUP_NONCE_CONSUMED'], [original - 1n, 'PAYMASTER_SETUP_RETRY_UNAVAILABLE']] as const) {
+      f.nonce(nonce);
+      await assert.rejects(f.make().sponsor({ userOperation: f.op }, OWNER), e => e instanceof AppError && e.code === code);
+      assert.deepEqual((await f.rows()).rows, saved);
+    }
+    f.nonce(original);
+    await assert.rejects(f.make().sponsor({ userOperation: { ...f.op, nonce: original + 1n } }, OWNER),
+      e => e instanceof AppError && e.code === 'PAYMASTER_SETUP_NONCE_MISMATCH');
+    assert.deepEqual((await f.rows()).rows, saved);
+  } finally { await f.close(); }
+});
+
+test('#150 legacy setup retains its original UTC day and waits for every authorization bound to its execution', async () => {
+  const f = await setupRetryFixture();
+  try {
+    const first = await f.make({ retrySetup: false, reserve: async r => {
+      const decimals = r.budget.priceDecimals ?? 8;
+      const price = `${r.budget.nativePrice / 10n ** BigInt(decimals)}.${(r.budget.nativePrice % 10n ** BigInt(decimals)).toString().padStart(decimals, '0')}`;
+      await query(`insert into gas_budget_reservations(execution_key,chain_id,account,purpose,gas_limit,max_fee_per_gas,native_price_usd,price_source,created_at)
+        values($1,97,$2,'setup',$3,$4,$5,$6,clock_timestamp()-interval '1 day')`, [r.budget.executionKey, f.sender,
+        r.gasLimit.toString(), r.maxFee.toString(), price, r.budget.priceSource]);
+      return reserveSponsorship(r);
+    } }).sponsor({ userOperation: f.op }, OWNER);
+    const saved = (await f.rows()).rows[0]; assert.ok(saved);
+    assert.equal(saved.execution_key, gasExecutionKey(97, f.op));
+    assert.equal((await query<{ yesterday: boolean }>("select utc_day=(now() at time zone 'UTC')::date-1 as yesterday from gas_budget_reservations where execution_key=$1", [saved.execution_key])).rows[0]?.yesterday, true);
+    f.time(first.validUntil + 1);
+    const last = await f.make({ retrySetup: false }).sponsor({ userOperation: f.op }, OWNER);
+    f.time(first.validUntil + 2);
+    await assert.rejects(f.make().sponsor({ userOperation: f.op }, OWNER), e => e instanceof AppError &&
+      e.code === 'PAYMASTER_RETRY_TOO_SOON' && 'retryAt' in e && e.retryAt === new Date((last.validUntil + 1) * 1000).toISOString());
+    f.time(last.validUntil + 1);
+    await f.make().sponsor({ userOperation: { ...f.op, preVerificationGas: f.op.preVerificationGas + 1n } }, OWNER);
+    const rows = (await f.rows()).rows, old = rows.find(r => r.execution_key === saved.execution_key); assert.ok(old);
+    assert.deepEqual(old, { ...saved, state: 'failed', updated_at: old.updated_at });
+    assert.equal(rows.length, 2);
+    assert.deepEqual((await query("select state from paymaster_sponsorships where user_op_hash=any($1::text[])", [[first.userOpHash, last.userOpHash]])).rows,
+      [{ state: 'expired' }, { state: 'expired' }]);
+  } finally { await f.close(); }
+});
+
+test('#150 proof RPC failures, timeout, chain mismatch, missing data, reorg and stale/future blocks fail closed', async () => {
+  const f = await setupRetryFixture();
+  try {
+    const signed = await f.make().sponsor({ userOperation: f.op }, OWNER), saved = (await f.rows()).rows;
+    const context: PaymasterDeps = { readBudgetContext: async () => ({ purpose: 'setup', nativePrice: 1n, priceSource: 'test:150' }) };
+    for (const mode of ['rpc', 'timeout', 'chain', 'undeployed', 'missing-block', 'missing-nonce', 'reorg', 'stale', 'future']) {
+      f.time(signed.validUntil + 62, mode === 'stale' ? signed.validUntil + 1 : mode === 'future' ? signed.validUntil + 63 : signed.validUntil + 62);
+      f.mode(mode);
+      await assert.rejects(f.make({ ...context, config: { ...f.c, timeoutMs: mode === 'timeout' ? 30 : 1000 } }).sponsor({ userOperation: f.op }, OWNER),
+        e => e instanceof AppError && e.status === 503 && !e.message.includes('SECRET'));
+      assert.deepEqual((await f.rows()).rows, saved, mode);
+    }
+  } finally { await f.close(); }
+});
+
+test('#150 missing or malformed original facts and DB read failures never release setup', async () => {
+  const f = await setupRetryFixture();
+  try {
+    const signed = await f.make().sponsor({ userOperation: f.op }, OWNER), saved = (await f.rows()).rows;
+    f.time(signed.validUntil + 1);
+    for (const mode of ['db', 'missing', 'no-hash', 'nonce', 'until', 'account', 'purpose', 'key', 'chain']) {
+      const service = f.make({ query: async (sql, params) => {
+        if (sql.includes('from smart_accounts')) return { rows: [{ owner: OWNER, user_id: OWNER }] };
+        if (!sql.includes('left join yield_runtime_state')) return query(sql, params);
+        if (mode === 'db') throw new Error('SECRET_DB');
+        if (mode === 'no-hash') return { rows: [] };
+        const rows = (await query<{ value: Record<string, unknown> }>(sql, params)).rows;
+        return { rows: rows.map(row => ({ ...row, value: mode === 'missing' ? null : { ...row.value,
+          ...({ nonce: { nonce: '-1' }, until: { validUntil: signed.validUntil + 1 }, account: { account: OWNER }, purpose: { purpose: 'ordinary' },
+            key: { executionKey: 'wrong' }, chain: { chainId: 56 } }[mode]) } })) };
+      } });
+      await assert.rejects(service.sponsor({ userOperation: f.op }, OWNER), e => e instanceof AppError && e.status === 503 && !e.message.includes('SECRET'));
+      assert.deepEqual((await f.rows()).rows, saved, mode);
+    }
+  } finally { await f.close(); }
+});
+
+test('#150 concurrent setup variants and restarts permit exactly one replacement authorization', async () => {
+  const f = await setupRetryFixture();
+  try {
+    const signed = await f.make().sponsor({ userOperation: f.op }, OWNER);
+    f.time(signed.validUntil + 1);
+    const outcomes = await Promise.allSettled(Array.from({ length: 8 }, (_, index) => f.make().sponsor({ userOperation: {
+      ...f.op, preVerificationGas: f.op.preVerificationGas + BigInt(index) } }, OWNER)));
+    assert.equal(outcomes.filter(r => r.status === 'fulfilled').length, 1);
+    assert.equal(outcomes.filter(r => r.status === 'rejected' && r.reason instanceof AppError && r.reason.code === 'PAYMASTER_RETRY_TOO_SOON').length, 7);
+    const rows = (await f.rows()).rows;
+    assert.equal(rows.length, 2); assert.equal(rows.filter(r => r.state !== 'failed' && r.purpose === 'setup').length, 1);
+    await assert.rejects(f.make().sponsor({ userOperation: f.op }, OWNER), e => e instanceof AppError && e.code === 'PAYMASTER_RETRY_TOO_SOON');
+    assert.deepEqual((await f.rows()).rows, rows);
+  } finally { await f.close(); }
+});
+
+test('#150 lock timeout, stale proof, rollback and unknown commit preserve setup and its complete audit history', async () => {
+  const f = await setupRetryFixture(), blocker = new pg.Client({ connectionString: process.env.DATABASE_URL });
+  await blocker.connect();
+  try {
+    const signed = await f.make().sponsor({ userOperation: f.op }, OWNER), saved = (await f.rows()).rows;
+    f.time(signed.validUntil + 1);
+    await blocker.query('begin');
+    await blocker.query("select pg_advisory_xact_lock(hashtextextended('paymaster_account:97:'||$1::text,0))", [f.sender]);
+    await assert.rejects(f.make({ config: { ...f.c, timeoutMs: 30 } }).sponsor({ userOperation: f.op }, OWNER),
+      e => e instanceof AppError && e.code === 'PAYMASTER_STORAGE_UNAVAILABLE');
+    await blocker.query('rollback'); assert.deepEqual((await f.rows()).rows, saved);
+    await assert.rejects(f.make({ reserve: r => { f.time(signed.validUntil + 62); return reserveSponsorship(r); } }).sponsor({ userOperation: f.op }, OWNER),
+      e => e instanceof AppError && e.code === 'PAYMASTER_SETUP_RETRY_UNAVAILABLE');
+    assert.deepEqual((await f.rows()).rows, saved); f.time(signed.validUntil + 1);
+    await assert.rejects(f.make({ reserve: r => reserveSponsorship(r, fn => withTransaction(async db => {
+      await fn(db); throw new Error('SECRET rollback');
+    })) }).sponsor({ userOperation: f.op }, OWNER), e => e instanceof AppError && e.code === 'PAYMASTER_STORAGE_UNAVAILABLE' && !e.message.includes('SECRET'));
+    assert.deepEqual((await f.rows()).rows, saved);
+    assert.equal((await query("select name from yield_runtime_state where name=$1", [`release-setup-${signed.userOpHash.slice(2)}`])).rows.length, 0);
+    await assert.rejects(f.make({ reserve: r => reserveSponsorship(r, async fn => {
+      await withTransaction(fn); throw new Error('SECRET unknown commit');
+    }) }).sponsor({ userOperation: f.op }, OWNER), e => e instanceof AppError && e.code === 'PAYMASTER_STORAGE_UNAVAILABLE' && !e.message.includes('SECRET'));
+    const charged = (await f.rows()).rows;
+    assert.equal(charged.length, 2); assert.equal(charged.filter(r => r.state === 'failed').length, 1);
+    const audit = (await query('select value from yield_runtime_state where name=$1', [`release-setup-${signed.userOpHash.slice(2)}`])).rows;
+    assert.equal(audit.length, 1); assert.doesNotMatch(JSON.stringify(audit), /signature|paymasterAndData|SECRET|seed|postgres:/);
+    await assert.rejects(f.make().sponsor({ userOperation: f.op }, OWNER), e => e instanceof AppError && e.code === 'PAYMASTER_RETRY_TOO_SOON');
+    assert.deepEqual((await f.rows()).rows, charged);
+  } finally { await blocker.query('rollback'); await blocker.end(); await f.close(); }
+});
+
+test('#150 site limits include failed setup history: zero and one gas below reject atomically, equality accepts', async () => {
+  const f = await setupRetryFixture();
+  try {
+    const signed = await f.make().sponsor({ userOperation: f.op }, OWNER), saved = (await f.rows()).rows;
+    f.time(signed.validUntil + 1);
+    const usage = (await query<{ gas: string }>("select coalesce(sum(gas_limit),0)::text as gas from paymaster_sponsorships where chain_id=97 and utc_day=(now() at time zone 'UTC')::date")).rows[0]; assert.ok(usage);
+    const exact = BigInt(usage.gas) + 450000n;
+    for (const bounds of [{ siteDailyGas: exact - 1n }, { siteDailyGas: 0n }, { siteDailyWei: 0n }]) {
+      await assert.rejects(f.make({ config: { ...f.c, ...bounds } }).sponsor({ userOperation: f.op }, OWNER), denied);
+      assert.deepEqual((await f.rows()).rows, saved);
+    }
+    await f.make({ config: { ...f.c, siteDailyGas: exact } }).sponsor({ userOperation: f.op }, OWNER);
+    const total = (await query<{ gas: string }>('select sum(gas_limit)::text as gas from paymaster_sponsorships where sender=$1', [f.sender])).rows[0];
+    assert.equal(total?.gas, '900000'); assert.equal((await f.rows()).rows.length, 2);
+  } finally { await f.close(); }
+});
+
+test('#150 legacy setup waits for every bound authorization and preserves the old key across UTC days', async () => {
+  const f = await setupRetryFixture();
+  try {
+    const first = await f.make({ retrySetup: false }).sponsor({ userOperation: f.op }, OWNER);
+    f.time(first.validUntil + 1);
+    const last = await f.make({ retrySetup: false }).sponsor({ userOperation: f.op }, OWNER);
+    assert.equal((await f.rows()).rows.length, 1);
+    assert.equal((await f.rows()).rows[0]?.execution_key, gasExecutionKey(97, f.op));
+    f.time(last.validUntil + 1);
+    await f.make().sponsor({ userOperation: f.op }, OWNER);
+    const rows = (await f.rows()).rows;
+    assert.equal(rows.length, 2); assert.equal(rows[0]?.state, 'failed');
+    assert.equal((await query("select user_op_hash from paymaster_sponsorships where sender=$1 and state='expired'", [f.sender])).rows.length, 2);
+  } finally { await f.close(); }
+});
+
+test('#150 a consumed confirmed setup rejects its original nonce while a later approval keeps ordinary policy', async () => {
+  const f = await setupRetryFixture();
+  try {
+    const signed = await f.make().sponsor({ userOperation: f.op }, OWNER);
+    await query("update gas_budget_reservations set state='confirmed',updated_at=clock_timestamp() where account=$1", [f.sender]);
+    await query("update paymaster_sponsorships set state='confirmed',updated_at=clock_timestamp() where sender=$1", [f.sender]);
+    f.nonce(1n); f.time(signed.validUntil + 1);
+    const approval = { ...f.op, callData: kernelCall(encodeFunctionData({ abi: parseAbi(['function approve(address,uint256)']), functionName: 'approve', args: [f.c.executor, 1n] }), T.contracts.usdt) };
+    await assert.rejects(f.make().sponsor({ userOperation: approval }, OWNER), e => e instanceof AppError && e.code === 'PAYMASTER_SETUP_NONCE_CONSUMED');
+    await f.make().sponsor({ userOperation: { ...approval, nonce: 1n } }, OWNER);
+    assert.deepEqual((await f.rows()).rows.map(r => [r.purpose, r.state]), [['setup', 'confirmed'], ['ordinary', 'reserved']]);
+  } finally { await f.close(); }
+});
 
 function retryFixture(overrides: PaymasterDeps = {}) {
   const sender = bytesToHex(randomBytes(20));

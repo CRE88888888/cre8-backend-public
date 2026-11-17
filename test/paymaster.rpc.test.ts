@@ -7,7 +7,9 @@ import type { Hex } from 'viem';
 import { AppError } from '../src/errors.js';
 import { KERNEL_V3_3_ADDRESSES as K } from '../src/addresses.js';
 import { createPaymasterService, estimationPaymaster, paymasterExecutionError, schedulerPaymaster, parsePackedSponsorOperation } from '../src/paymaster.js';
-import { config, operation, OWNER, SENDER, REGISTRY, PM, NOW } from './fixtures/paymaster.js';
+import type { PaymasterDeps, Reservation } from '../src/paymaster.js';
+import { config, kernelCall, operation, OWNER, SENDER, REGISTRY, PM, NOW, TEST_SIGNER } from './fixtures/paymaster.js';
+import { TESTNET_97 as T } from '../src/testnet-profile.js';
 
 const factoryAbi = parseAbi(['function deployWithFactory(address factory,bytes createData,bytes32 salt) returns(address)']);
 const initCode = concatHex([K.kernelMetaFactory, encodeFunctionData({ abi: factoryAbi, functionName: 'deployWithFactory', args: [K.kernelFactoryV33, '0x1234', toHex(0n, { size: 32 })] })]);
@@ -116,4 +118,77 @@ test('#66 viem estimation must use only a paymaster stub, with no premature quot
   assert.equal(prepared.paymaster, PM);
   assert.equal(reservations, 1);
   assert.doesNotMatch(paymasterExecutionError(new Error('secret RPC payload UserOperation')).message, /secret RPC|UserOperation/);
+});
+
+test('#150 setup retry evidence binds a fresh canonical block, exact nonce key and every original expiry before reservation', async () => {
+  const originalNonce = (1n << 192n) + 9n, until = NOW + 300;
+  let timestamp = until + 1, nonce = originalNonce, mode = 'ok', reserved = 0;
+  const blockHash = toHex(123n, { size: 32 });
+  const server = createServer(async (req, res) => {
+    let body = ''; for await (const part of req) body += String(part);
+    const rpc: { id: number; method: string; params: unknown[] } = JSON.parse(body);
+    let result: unknown;
+    if (rpc.method === 'eth_chainId') result = mode === 'chain' ? '0x38' : '0x61';
+    else if (rpc.method === 'eth_getCode') { assert.equal(rpc.params[1], '0x7b'); result = mode === 'undeployed' ? '0x' : '0x01'; }
+    else if (rpc.method === 'eth_call') {
+      assert.equal(rpc.params[1], '0x7b');
+      const call = rpc.params[0]; assert.ok(call && typeof call === 'object' && 'data' in call && typeof call.data === 'string' && 'to' in call);
+      assert.equal(String(call.to).toLowerCase(), T.contracts.entryPoint);
+      assert.equal(call.data, encodeFunctionData({ abi: parseAbi(['function getNonce(address,uint192)']), functionName: 'getNonce', args: [SENDER, originalNonce >> 64n] }));
+      result = mode === 'missing-nonce' ? '0x' : toHex(nonce, { size: 32 });
+    } else {
+      assert.equal(rpc.method, 'eth_getBlockByNumber');
+      assert.ok(rpc.params[0] === 'latest' || rpc.params[0] === '0x7b');
+      result = { number: '0x7b', hash: mode === 'missing-hash' ? null : mode === 'reorg' && rpc.params[0] === '0x7b' ? toHex(124n, { size: 32 }) : blockHash, timestamp: toHex(timestamp) };
+    }
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify(mode === 'rpc' ? { jsonrpc: '2.0', id: rpc.id, error: { code: -32000, message: 'SECRET_RPC' } } : { jsonrpc: '2.0', id: rpc.id, result }));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  const c = config({ CHAIN_ID: '97', PAYMASTER_SIGNER_PRIVATE_KEY: TEST_SIGNER, RPC_URL: `http://127.0.0.1:${address.port}` });
+  const op = operation({ nonce: originalNonce, callData: kernelCall(encodeFunctionData({ abi: parseAbi(['function enroll(address,uint256,uint16)']), functionName: 'enroll', args: [SENDER, 1n, 1] }), c.registry) });
+  let original: Reservation | undefined;
+  const base: PaymasterDeps = { config: c, now: () => NOW, checkChain: async () => {}, readBudgetContext: async () => ({ purpose: 'setup', nativePrice: 1n, priceSource: 'fixture:150' }),
+    query: async () => ({ rows: [{ owner: OWNER, user_id: OWNER }] }), reserve: async r => { original = r; } };
+  try {
+    const first = await createPaymasterService(base).sponsor({ userOperation: op }, OWNER);
+    assert.ok(original); const executionKey = original.budget.executionKey;
+    const service = createPaymasterService({ ...base, retrySetup: true, now: () => until + 1,
+      query: async sql => {
+        if (sql.includes('from smart_accounts')) return { rows: [{ owner: OWNER, user_id: OWNER }] };
+        if (sql.includes('from gas_budget_reservations')) return { rows: [{ execution_key: executionKey, state: 'reserved', day: '2026-11-17' }] };
+        assert.ok(sql.includes('left join yield_runtime_state'));
+        return { rows: [{ user_op_hash: first.userOpHash, valid_until: new Date(until * 1000), state: 'reserved', kind: 'fact', value: {
+          chainId: 97, account: SENDER, userOpHash: first.userOpHash, executionKey, nonce: originalNonce.toString(), validUntil: until, purpose: 'setup' } }] };
+      }, reserve: async r => { reserved++; assert.equal(r.setupGasRetry, true); assert.equal(r.setupRetryProof?.blockHash, blockHash); },
+    });
+    for (const time of [until - 1, until]) {
+      timestamp = time;
+      await assert.rejects(service.sponsor({ userOperation: op }, OWNER), e => e instanceof AppError && e.code === 'PAYMASTER_RETRY_TOO_SOON');
+    }
+    timestamp = until + 1; nonce++;
+    await assert.rejects(service.sponsor({ userOperation: op }, OWNER), e => e instanceof AppError && e.code === 'PAYMASTER_SETUP_NONCE_CONSUMED'); nonce--;
+    for (const failure of ['chain', 'undeployed', 'missing-nonce', 'missing-hash', 'reorg', 'rpc']) {
+      mode = failure;
+      await assert.rejects(service.sponsor({ userOperation: op }, OWNER), e => e instanceof AppError && e.status === 503 && !e.message.includes('SECRET'));
+    }
+    assert.equal(reserved, 0); mode = 'ok';
+    await service.sponsor({ userOperation: op }, OWNER); assert.equal(reserved, 1);
+    await assert.rejects(service.sponsor({ userOperation: op, retrySetup: true }, OWNER), e => e instanceof AppError && e.code === 'PAYMASTER_INVALID_OPERATION');
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+});
+
+test('#150 scheduler chain-97 setup never opts into public retry settlement', async () => {
+  const c = config({ CHAIN_ID: '97', PAYMASTER_SIGNER_PRIVATE_KEY: TEST_SIGNER, RPC_URL: 'http://127.0.0.1:8797' });
+  let reserved = 0;
+  const hooks = schedulerPaymaster(SENDER, { config: c, retrySetup: true, now: () => NOW, checkChain: async () => {},
+    query: async () => ({ rows: [{ owner: OWNER, user_id: OWNER }] }),
+    readBudgetContext: async () => ({ purpose: 'setup', nativePrice: 1n, priceSource: 'fixture:150' }),
+    reserve: async r => { reserved++; assert.equal(r.setupGasRetry, false); assert.equal(r.setupRetryProof, undefined); },
+  }); assert.ok(hooks);
+  await hooks.getPaymasterData({ sender: SENDER, chainId: 97, entryPointAddress: T.contracts.entryPoint, nonce: 0n,
+    callData: kernelCall(encodeFunctionData({ abi: parseAbi(['function enroll(address,uint256,uint16)']), functionName: 'enroll', args: [SENDER, 1n, 1] }), c.registry),
+    callGasLimit: 200000n, verificationGasLimit: 100000n, preVerificationGas: 50000n, maxFeePerGas: 2n, maxPriorityFeePerGas: 1n });
+  assert.equal(reserved, 1);
 });

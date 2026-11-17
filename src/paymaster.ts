@@ -26,6 +26,7 @@ import { applyExpiredExitProofs, expiredExitProofs, rememberExitFacts, unusedExi
 import type { ExpiredExitProof } from './paymaster-exit-reconciliation.js';
 export { reconcileExpiredExitAuthorizations } from './paymaster-exit-reconciliation.js';
 import { fresh } from './yield-domain.js';
+import { writeYieldState } from './yield-runtime-state.js';
 
 export type PackedSponsorOperation = {
   sender: Address; nonce: bigint; initCode: Hex; callData: Hex; accountGasLimits: Hex;
@@ -41,6 +42,9 @@ export type Reservation = {
   expiredAuthorizations?: readonly ExpiredExitProof[];
   /** HTTP ordinary sponsorship only; never an automatic scheduler/journal retry. */
   ordinaryGasRetry?: boolean;
+  /** HTTP setup only; proof is revalidated under the account lock before settlement. */
+  setupGasRetry?: boolean;
+  setupRetryProof?: SetupRetryProof | null;
 };
 export type ConsumedAuthorization = { userOpHash:Hex; executionKey:string; success:boolean };
 export type GasPurpose = 'ordinary' | 'setup' | 'exit';
@@ -58,6 +62,13 @@ export class GasBudgetExceededError extends AppError {
     this.resetAt = new Date(new Date(`${day}T00:00:00.000Z`).getTime() + 86400000).toISOString();
   }
 }
+export class PaymasterRetryTooSoonError extends AppError {
+  readonly retryAt: string;
+  constructor(validUntil: number) {
+    super(409, 'PAYMASTER_RETRY_TOO_SOON', 'setup authorization is still pending; retry after its expiry');
+    this.retryAt = new Date((validUntil + 1) * 1000).toISOString();
+  }
+}
 type Query = (sql: string, params?: readonly unknown[]) => Promise<{ rows: unknown[] }>;
 export type PaymasterDeps = {
   config?: PaymasterConfig | null;
@@ -72,6 +83,8 @@ export type PaymasterDeps = {
   exitCallData?: Hex;
   /** Public chain-97 ordinary requests may reserve up to three distinct gas estimates per nonce. */
   retryOrdinaryGas?: boolean;
+  /** Public chain-97 setup retries require expired, unused authorization evidence. */
+  retrySetup?: boolean;
 };
 export const KERNEL_EXECUTE_ABI = parseAbi(['function execute(bytes32 execMode,bytes executionCalldata) payable']);
 const TOKEN_ABI = parseAbi(['function approve(address spender,uint256 amount)', 'function transfer(address recipient,uint256 amount)']);
@@ -292,22 +305,33 @@ export async function existingBudgetContext(executionKey: string): Promise<Budge
   } catch { throw rejected('GAS_BUDGET_STORAGE_UNAVAILABLE', 503); }
 }
 
-async function readBudgetContext(op: PackedSponsorOperation, c: PaymasterConfig, attemptKey?: string): Promise<BudgetContext> {
+function setupOperation(op: PackedSponsorOperation, c: PaymasterConfig): boolean {
+  return sponsoredCalls(op).every(call => call.callData.startsWith(toFunctionSelector('approve(address,uint256)')) || isAddressEqual(call.target, c.registry));
+}
+
+async function readBudgetContext(op: PackedSponsorOperation, c: PaymasterConfig, attemptKey?: string, retrySetup = false): Promise<BudgetContext> {
   const previous = (attemptKey === undefined ? null : await existingBudgetContext(attemptKey)) ??
     await existingBudgetContext(gasExecutionKey(c.chainId, op));
-  if (previous !== null) return previous;
+  if (previous !== null && (!retrySetup || !setupOperation(op, c))) return previous;
   const client = rpc(c);
-  const price = await readNativeBudgetPrice(client, c.executor, c.chainId);
+  const price = previous ?? await readNativeBudgetPrice(client, c.executor, c.chainId);
   const calls = sponsoredCalls(op);
   if (pureYieldWithdraw(op, c)) return { ...price, purpose: 'exit' };
-  const setup = calls.every((call) => call.callData.startsWith(toFunctionSelector('approve(address,uint256)')) || isAddressEqual(call.target, c.registry));
+  const setup = setupOperation(op, c);
   // Public requests get an exit exemption only when every strategy token balance is fully sold/transferred.
   // A capped close is authorized through the internal scheduler evidence below instead.
   const tokenCalls = calls.every((call) => call.callData.startsWith(toFunctionSelector('transfer(address,uint256)')));
   const rebalance = calls.length === 1 && calls[0] !== undefined && isAddressEqual(calls[0].target, c.executor)
     ? decodeFunctionData({ abi: EXECUTOR_ABI, data: calls[0].callData }) : null;
-  const priorSetup = setup ? await query("select execution_key from gas_budget_reservations where chain_id=$1 and account=$2 and purpose='setup' and state<>'failed'", [c.chainId, op.sender]) : null;
-  let purpose: GasPurpose = setup && priorSetup?.rows.length === 0 ? 'setup' : 'ordinary';
+  const priorSetup = !setup ? null : retrySetup ? await query<{ execution_key: string; state: string; new_nonce: boolean }>(`
+    select g.execution_key,g.state,coalesce((select bool_and(f.value->>'nonce' ~ '^[0-9]+$' and f.value->>'nonce'<>$3::text
+      and f.value @> jsonb_build_object('chainId',$1::bigint,'account',$2::text,'purpose','setup'))
+      from yield_runtime_state f where f.kind='fact' and f.name like 'auth-%' and f.value->>'executionKey'=g.execution_key),false) as new_nonce
+    from gas_budget_reservations g where chain_id=$1 and account=$2 and purpose='setup' and state<>'failed'`, [c.chainId, op.sender, op.nonce.toString()]) :
+    await query<{ execution_key: string; state?: string; new_nonce?: boolean }>("select execution_key from gas_budget_reservations where chain_id=$1 and account=$2 and purpose='setup' and state<>'failed'", [c.chainId, op.sender]);
+  // Pending setup variants must never silently become ordinary and evade reconciliation.
+  // Later approvals after a confirmed setup retain the ordinary policy on a new nonce.
+  let purpose: GasPurpose = setup && (priorSetup?.rows.length === 0 || retrySetup && priorSetup?.rows.some(row => row.state !== 'confirmed' || row.new_nonce !== true)) ? 'setup' : 'ordinary';
   if (tokenCalls || rebalance?.functionName === 'executeRebalance') {
     const blockNumber = await client.getBlockNumber({ cacheTime: 0 });
     const numeraire = await client.readContract({ address: c.executor, abi: BUDGET_ORACLE_ABI, functionName: 'numeraire', blockNumber });
@@ -436,6 +460,96 @@ function priceDecimal(r: GasBudgetRequest): string {
   return decimals === 0 ? r.nativePrice.toString() : `${r.nativePrice / scale}.${(r.nativePrice % scale).toString().padStart(decimals, '0')}`;
 }
 type BudgetClient = Pick<PoolClient, 'query'>;
+type SetupSnapshot = {
+  executionKey: string; state: string; day: string;
+  authorizations: { hash: Hex; nonce: string; validUntil: number; state: string }[];
+};
+type SetupRetryProof = { snapshot: SetupSnapshot; blockNumber: string; blockHash: Hex; blockTimestamp: number; checkedAt: number };
+const setupUnavailable = () => rejected('PAYMASTER_SETUP_RETRY_UNAVAILABLE', 503);
+function setupRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw setupUnavailable();
+  return value as Record<string, unknown>;
+}
+
+/** Opaque/missing legacy hashes cannot prove which nonce was authorized. Never guess. */
+async function setupSnapshot(c: PaymasterConfig, account: Address, db: Query): Promise<SetupSnapshot | null> {
+  const rows = (await db(`select execution_key,state,to_char(utc_day,'YYYY-MM-DD') as day from gas_budget_reservations
+    where chain_id=$1 and account=$2 and purpose='setup' and state<>'failed'`, [c.chainId, account])).rows;
+  if (!rows.length) return null;
+  if (rows.length !== 1) throw setupUnavailable();
+  const reservation = setupRecord(rows[0]);
+  const { execution_key: executionKey, state, day } = reservation;
+  if (typeof executionKey !== 'string' || !executionKey || typeof state !== 'string' ||
+      !['reserved', 'submitted', 'unknown', 'confirmed'].includes(state) || typeof day !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(day)) throw setupUnavailable();
+  const candidates = (await db(`select s.user_op_hash,s.valid_until,s.state,f.kind,f.value from paymaster_sponsorships s
+    left join yield_runtime_state f on f.name='auth-'||substr(s.user_op_hash,3)
+    where s.chain_id=$1 and s.sender=$2 and (f.value->>'executionKey'=$3 or
+      f.name is null and s.state not in ('confirmed','failed','expired')) order by s.user_op_hash`, [c.chainId, account, executionKey])).rows;
+  if (!candidates.length) throw setupUnavailable();
+  const authorizations = candidates.map(item => {
+    const row = setupRecord(item), facts = setupRecord(row.value);
+    const { user_op_hash: hash, valid_until: until, state: authState } = row;
+    if (typeof hash !== 'string' || !/^0x[0-9a-f]{64}$/.test(hash) || row.kind !== 'fact' || facts.chainId !== 97 ||
+        facts.account !== account || facts.userOpHash !== hash || facts.executionKey !== executionKey || facts.purpose !== 'setup' ||
+        typeof facts.nonce !== 'string' || !/^\d+$/.test(facts.nonce) || BigInt(facts.nonce) > MAX_UINT256 ||
+        typeof facts.validUntil !== 'number' || !Number.isSafeInteger(facts.validUntil) || facts.validUntil <= 0 ||
+        !(until instanceof Date) || until.getTime() !== facts.validUntil * 1000 || typeof authState !== 'string') throw setupUnavailable();
+    return { hash: hash as Hex, nonce: facts.nonce, validUntil: facts.validUntil, state: authState };
+  });
+  return { executionKey, state, day, authorizations };
+}
+
+/** Bounded reads happen BEFORE opening the SQL transaction. Apply compares the complete
+ * snapshot again under paymaster_account, so a concurrent authorization invalidates proof.
+ * Chain 97 uses a fresh latest block plus canonical hash recheck, as its other readers do.
+ */
+async function setupRetryProof(op: PackedSponsorOperation, c: PaymasterConfig, db: Query, now: number): Promise<SetupRetryProof | null> {
+  try {
+    const snapshot = await setupSnapshot(c, op.sender, db);
+    if (!snapshot) return null;
+    if (snapshot.authorizations.some(a => BigInt(a.nonce) !== op.nonce)) throw rejected('PAYMASTER_SETUP_NONCE_MISMATCH', 409);
+    const client = rpc(c), block = await client.getBlock({ blockTag: 'latest' });
+    if (await client.getChainId() !== 97 || block.number === null || block.hash === null ||
+        !fresh(new Date(Number(block.timestamp) * 1000), new Date(now * 1000))) throw setupUnavailable();
+    const [nonce, code] = await Promise.all([
+      client.readContract({ address: TESTNET_97.contracts.entryPoint, abi: EXIT_READ, functionName: 'getNonce', args: [op.sender, op.nonce >> 64n], blockNumber: block.number }),
+      client.getCode({ address: op.sender, blockNumber: block.number }),
+    ]);
+    if (!code || code === '0x' || (await client.getBlock({ blockNumber: block.number })).hash !== block.hash) throw setupUnavailable();
+    if (nonce > op.nonce) throw rejected('PAYMASTER_SETUP_NONCE_CONSUMED', 409);
+    if (nonce !== op.nonce || snapshot.state === 'confirmed' || snapshot.authorizations.some(a => a.state === 'confirmed')) throw setupUnavailable();
+    const until = Math.max(...snapshot.authorizations.map(a => a.validUntil));
+    // EntryPoint accepts equality. Wall-clock expiry alone never releases the setup slot.
+    if (block.timestamp <= BigInt(until)) throw new PaymasterRetryTooSoonError(until);
+    return { snapshot, blockNumber: block.number.toString(), blockHash: block.hash, blockTimestamp: Number(block.timestamp), checkedAt: now };
+  } catch (error) {
+    if (error instanceof AppError && (error.code === 'PAYMASTER_RETRY_TOO_SOON' || error.code === 'PAYMASTER_SETUP_NONCE_CONSUMED' || error.code === 'PAYMASTER_SETUP_NONCE_MISMATCH')) throw error;
+    throw setupUnavailable();
+  }
+}
+
+async function applySetupRetry(r: Reservation, client: BudgetClient): Promise<Reservation> {
+  if (r.config.chainId !== 97 || r.budget.purpose !== 'setup' || r.op.initCode !== '0x' || !setupOperation(r.op, r.config)) throw rejected('GAS_BUDGET_CONFLICT', 409);
+  const db: Query = (sql, params) => client.query(sql, params ? [...params] : []);
+  const current = await setupSnapshot(r.config, r.op.sender, db), proof = r.setupRetryProof;
+  if (current) {
+    if (!proof || JSON.stringify(current) !== JSON.stringify(proof.snapshot)) {
+      throw new PaymasterRetryTooSoonError(Math.max(...current.authorizations.map(a => a.validUntil)));
+    }
+    const now = (r.now ?? (() => Math.floor(Date.now() / 1000)))();
+    if (!fresh(new Date(proof.checkedAt * 1000), new Date(now * 1000)) ||
+        !fresh(new Date(proof.blockTimestamp * 1000), new Date(now * 1000)) ||
+        proof.blockTimestamp <= Math.max(...current.authorizations.map(a => a.validUntil))) throw setupUnavailable();
+    // Same settlement transition and original-day lock as settleGasBudget, on THIS client.
+    // The failed slot, audit evidence and both new ledgers must commit or roll back together.
+    await client.query("select pg_advisory_xact_lock(hashtextextended('gas_budget_reservations:'||$1::bigint::text||':'||$2::text||':'||$3::text,0))", [97, r.op.sender, current.day]);
+    await writeYieldState(`release-setup-${current.authorizations[0]?.hash.slice(2)}`, { reason: 'expired_setup_nonce_unchanged', evidence: proof }, db);
+    await client.query("update gas_budget_reservations set state='failed',updated_at=greatest(updated_at,clock_timestamp()) where execution_key=$1 and state in ('reserved','submitted','unknown')", [current.executionKey]);
+    await client.query("update paymaster_sponsorships set state='expired',updated_at=greatest(updated_at,clock_timestamp()) where user_op_hash=any($1::text[]) and state not in ('confirmed','failed','expired')", [current.authorizations.map(a => a.hash)]);
+  } else if (proof) throw setupUnavailable();
+  return { ...r, budget: { ...r.budget, executionKey: `setup-gas:97:${r.op.sender}:${r.hash.slice(2)}` } };
+}
+
 async function reserveBudgetOnClient(r: GasBudgetRequest, client: BudgetClient, day: string, policy: TradingConfig): Promise<void> {
   if (!r.executionKey.trim() || !/^0x[0-9a-f]{40}$/.test(r.account) || r.gasLimit < 0n || r.maxFeePerGas < 0n || r.nativePrice <= 0n || !r.priceSource.trim()) throw rejected('GAS_BUDGET_INVALID', 503);
   await client.query("select pg_advisory_xact_lock(hashtextextended('gas_budget_reservations:' || $1::bigint::text || ':' || $2::text || ':' || to_char($3::date,'YYYY-MM-DD'),0))", [r.chainId, r.account, day]);
@@ -509,6 +623,7 @@ export async function reserveSponsorship(r: Reservation, transaction: typeof wit
       if (!day) throw new Error('missing UTC day');
       await client.query("select pg_advisory_xact_lock(hashtextextended('paymaster_sponsorships:' || $1::bigint::text || ':' || to_char($2::date, 'YYYY-MM-DD'), 0))", [c.chainId, day]);
       if (r.budget.chainId !== c.chainId || !isAddressEqual(r.budget.account, r.op.sender) || r.budget.gasLimit !== r.gasLimit || r.budget.maxFeePerGas !== r.maxFee) throw rejected('GAS_BUDGET_CONFLICT', 409);
+      if (r.setupGasRetry) r = await applySetupRetry(r, client);
       for(const proof of r.consumedAuthorizations??[]){
         const prior=(await client.query<{day:string}>("select to_char(utc_day,'YYYY-MM-DD') as day from gas_budget_reservations where execution_key=$1 and chain_id=$2 and account=$3",[proof.executionKey,c.chainId,r.op.sender])).rows[0];
         if(prior){
@@ -526,7 +641,7 @@ export async function reserveSponsorship(r: Reservation, transaction: typeof wit
         and valid_until>to_timestamp($4::double precision) order by valid_until`,
         [c.chainId, c.address.toLowerCase(), r.op.sender.toLowerCase(), now]);
       let reusable: { until: number; hash: Hex } | undefined;
-      for (const candidate of candidates.rows) {
+      for (const candidate of r.setupGasRetry ? [] : candidates.rows) {
         const until = candidate.valid_until.getTime() / 1000;
         // Matching the complete EntryPoint hash binds every field, including gas and fees.
         if (Number.isSafeInteger(until) && (await authorization(r.op, c, until)).userOpHash === candidate.user_op_hash) {
@@ -711,7 +826,9 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
       if (cost.gasLimit > MAX_USER_OP_GAS) throw rejected('PAYMASTER_USER_OP_CAPACITY', 400);
       await bounded((deps.checkChain ?? checkChain)(op, c), c.timeoutMs);
       const attemptKey = deps.retryOrdinaryGas && c.chainId === 97 ? sponsorshipGasKey(op, c) : undefined;
-      const context = await bounded(deps.readBudgetContext ? deps.readBudgetContext(op, c) : readBudgetContext(op, c, attemptKey), c.timeoutMs);
+      const context = await bounded(deps.readBudgetContext ? deps.readBudgetContext(op, c) : readBudgetContext(op, c, attemptKey, deps.retrySetup && c.chainId === 97), c.timeoutMs);
+      const setupGasRetry = deps.retrySetup === true && c.chainId === 97 && context.purpose === 'setup';
+      const setupProof = setupGasRetry ? await bounded(setupRetryProof(op, c, deps.query ?? query, now), c.timeoutMs) : undefined;
       let consumedAuthorizations:readonly ConsumedAuthorization[]=[];
       let expiredAuthorizations:readonly ExpiredExitProof[]=[];
       if (pureYieldWithdraw(op, c)) context.purpose = 'exit';
@@ -736,7 +853,7 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
       }
       const ordinaryGasRetry = attemptKey !== undefined && context.purpose === 'ordinary';
       const reservedUntil = await (deps.reserve ?? reserveSponsorship)({ hash: signed.userOpHash, op, config: c, validUntil, now: deps.now ?? (() => Math.floor(Date.now() / 1000)), ...cost,
-        consumedAuthorizations,expiredAuthorizations,ordinaryGasRetry,
+        consumedAuthorizations,expiredAuthorizations,ordinaryGasRetry,setupGasRetry,setupRetryProof:setupProof,
         budget: { executionKey: ordinaryGasRetry ? attemptKey : gasExecutionKey(c.chainId, op), chainId: c.chainId, account: op.sender,
           gasLimit: cost.gasLimit, maxFeePerGas: cost.maxFee, ...context } });
       if (reservedUntil !== undefined && reservedUntil !== validUntil) {
@@ -753,7 +870,7 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
     }
   } };
 }
-export async function sponsorUserOperation(input: unknown, wallet: string) { return createPaymasterService({ retryOrdinaryGas: true }).sponsor(input, wallet); }
+export async function sponsorUserOperation(input: unknown, wallet: string) { return createPaymasterService({ retryOrdinaryGas: true, retrySetup: true }).sponsor(input, wallet); }
 
 /** viem's explicit estimate action prepares paymaster data before gas fields exist. Never sign there. */
 export function estimationPaymaster(hooks: ReturnType<typeof schedulerPaymaster>): Pick<PaymasterActions, 'getPaymasterData'> | undefined {
@@ -794,7 +911,7 @@ export function schedulerPaymaster(expectedSender: Address, deps: PaymasterDeps 
         const known = await bounded((deps.query ?? query)('select owner from smart_accounts where chain_id = $1 and address = $2 and account_type = \'KERNEL\'', [c.chainId, expectedSender.toLowerCase()]), c.timeoutMs);
         const owner = known.rows.length === 1 ? object(known.rows[0]).owner : undefined;
         if (typeof owner !== 'string') throw rejected('PAYMASTER_SENDER_FORBIDDEN', 403);
-        const result = await createPaymasterService({ ...deps, config: c }).sponsor({ userOperation: op }, owner);
+        const result = await createPaymasterService({ ...deps, config: c, retrySetup: false }).sponsor({ userOperation: op }, owner);
         return { paymaster: result.paymaster, paymasterData: result.paymasterData,
           paymasterVerificationGasLimit: result.paymasterVerificationGasLimit, paymasterPostOpGasLimit: result.paymasterPostOpGasLimit };
       } catch (error) { throw paymasterExecutionError(error); }

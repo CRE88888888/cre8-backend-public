@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createServer } from '../src/server.js';
 import { UnauthorizedError } from '../src/errors.js';
-import { createPaymasterService } from '../src/paymaster.js';
+import { createPaymasterService, PaymasterRetryTooSoonError } from '../src/paymaster.js';
 import { loadRateLimitConfig } from '../src/config.js';
 import { RequestRateLimiter } from '../src/ratelimit.js';
 import { OWNER, operation, NOW, PM } from './fixtures/paymaster.js';
@@ -59,4 +59,20 @@ test('#66 authenticated sponsor response, method, disabled 503 and #59 shared re
     assert.ok(Number(limited.headers.get('retry-after')) > 0);
     assert.equal(signed, 1);
   } finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
+});
+
+test('#150 HTTP setup retry returns a stable 409 code and machine-readable retry time', async () => {
+  const server = createServer({
+    auth: { authenticate: async () => OWNER, issueNonce: () => { throw new Error('unexpected nonce'); },
+      login: async () => { throw new Error('unexpected login'); }, logout: async () => {} },
+    sponsorUserOperation: async () => { throw new PaymasterRetryTooSoonError(NOW + 300); },
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  try {
+    const response = await fetch(`http://127.0.0.1:${address.port}/paymaster/sponsor`, { method: 'POST', body: '{}' });
+    assert.equal(response.status, 409);
+    assert.deepEqual(await response.json(), { error: { code: 'PAYMASTER_RETRY_TOO_SOON',
+      message: 'setup authorization is still pending; retry after its expiry', retryAt: new Date((NOW + 301) * 1000).toISOString() } });
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
 });

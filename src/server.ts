@@ -19,7 +19,7 @@ export { resolveOperatorWallets } from './waitlist-access.js';
 import { createWaitlistInviteService } from './waitlist-invites.js';
 import { claimFaucetUsdt } from './faucet.js';
 import { claimFaucetGas } from './gas-faucet.js';
-import { sponsorUserOperation } from './paymaster.js';
+import { PaymasterRetryTooSoonError, sponsorUserOperation } from './paymaster.js';
 import { createPointsService } from './points.js';
 import { RateLimitError, RequestRateLimiter } from './ratelimit.js';
 import { getConfig, getSessionKeyConfig } from './config.js';
@@ -1227,7 +1227,8 @@ function sendError(res: ServerResponse, err: unknown): void {
     return;
   }
   if (err instanceof AppError) {
-    sendJson(res, err.status, { error: { code: err.code, message: err.message } });
+    sendJson(res, err.status, { error: { code: err.code, message: err.message,
+      ...(err instanceof PaymasterRetryTooSoonError ? { retryAt: err.retryAt } : {}) } });
     return;
   }
 

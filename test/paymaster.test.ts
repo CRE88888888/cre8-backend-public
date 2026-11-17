@@ -188,3 +188,41 @@ test('#92 C3 chain 97 defaults disable only account wei and keep explicit overri
     assert.equal(config({...base,PAYMASTER_ACCOUNT_DAILY_COUNT:raw}).accountDailyCount,BigInt(raw));
   }
 });
+
+test('#147 only public chain-97 ordinary requests use gas-attempt keys; every gas field is bound, including zero', async () => {
+  const c = config({ PAYMASTER_SIGNER_PRIVATE_KEY: TEST_SIGNER, CHAIN_ID: '97', RPC_URL: 'http://127.0.0.1:8797' });
+  const op = operation({ callData: kernelCall(encodeFunctionData({ abi: parseAbi(['function enroll(address,uint256,uint16)']),
+    functionName: 'enroll', args: [SENDER, 1n, 1] }), c.registry) });
+  const captured: Reservation[] = [];
+  const make = (purpose: 'ordinary' | 'setup' | 'exit', retryOrdinaryGas = true, settings = c) => createPaymasterService({
+    config: settings, retryOrdinaryGas, now: () => NOW,
+    query: async () => ({ rows: [{ owner: OWNER, user_id: OWNER }] }), checkChain: async () => {},
+    readBudgetContext: async () => ({ purpose, nativePrice: 60000000000n, priceSource: 'fixture:oracle' }),
+    reserve: async r => { captured.push(r); },
+  });
+  const keys = new Set<string>();
+  for (const change of [{}, { accountGasLimits: concatHex([toHex(100001n, { size: 16 }), toHex(200000n, { size: 16 })]) },
+    { accountGasLimits: concatHex([toHex(100000n, { size: 16 }), toHex(200001n, { size: 16 })]) },
+    { preVerificationGas: 0n }, { gasFees: toHex(0n, { size: 32 }) },
+    { gasFees: concatHex([toHex(0n, { size: 16 }), toHex(2n, { size: 16 })]) },
+    { gasFees: concatHex([toHex(1n, { size: 16 }), toHex(3n, { size: 16 })]) }] satisfies Partial<PackedSponsorOperation>[]) {
+    await make('ordinary').sponsor({ userOperation: { ...op, ...change } }, OWNER);
+    const r = captured.at(-1); assert.ok(r?.ordinaryGasRetry);
+    keys.add(r.budget.executionKey);
+  }
+  assert.equal(keys.size, 7);
+  for (const settings of [{ ...c, verificationGasLimit: c.verificationGasLimit + 1n }, { ...c, postOpGasLimit: 1n }]) {
+    await make('ordinary', true, settings).sponsor({ userOperation: op }, OWNER);
+    const r = captured.at(-1); assert.ok(r);
+    assert.ok(!keys.has(r.budget.executionKey)); keys.add(r.budget.executionKey);
+  }
+  const { gasExecutionKey } = await import('../src/paymaster.js');
+  for (const purpose of ['setup', 'exit'] as const) {
+    await make(purpose).sponsor({ userOperation: op }, OWNER);
+    assert.equal(captured.at(-1)?.ordinaryGasRetry, false);
+    assert.equal(captured.at(-1)?.budget.executionKey, gasExecutionKey(97, op));
+  }
+  await make('ordinary', false).sponsor({ userOperation: op }, OWNER);
+  assert.equal(captured.at(-1)?.budget.executionKey, gasExecutionKey(97, op));
+  await assert.rejects(make('ordinary').sponsor({ userOperation: op, retryOrdinaryGas: true }, OWNER), errorCode('PAYMASTER_INVALID_OPERATION'));
+});

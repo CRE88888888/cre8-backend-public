@@ -39,6 +39,8 @@ export type Reservation = {
   /** Internal canonical EntryPoint consumption evidence; never accepted from request JSON. */
   consumedAuthorizations?: readonly ConsumedAuthorization[];
   expiredAuthorizations?: readonly ExpiredExitProof[];
+  /** HTTP ordinary sponsorship only; never an automatic scheduler/journal retry. */
+  ordinaryGasRetry?: boolean;
 };
 export type ConsumedAuthorization = { userOpHash:Hex; executionKey:string; success:boolean };
 export type GasPurpose = 'ordinary' | 'setup' | 'exit';
@@ -68,6 +70,8 @@ export type PaymasterDeps = {
   verifyYieldWithdraw?: (op: PackedSponsorOperation, config: PaymasterConfig, now: number, query: Query) => Promise<readonly ConsumedAuthorization[]>;
   /** Internal scheduler evidence, bound to the exact canonical Kernel calldata. Never request input. */
   exitCallData?: Hex;
+  /** Public chain-97 ordinary requests may reserve up to three distinct gas estimates per nonce. */
+  retryOrdinaryGas?: boolean;
 };
 export const KERNEL_EXECUTE_ABI = parseAbi(['function execute(bytes32 execMode,bytes executionCalldata) payable']);
 const TOKEN_ABI = parseAbi(['function approve(address spender,uint256 amount)', 'function transfer(address recipient,uint256 amount)']);
@@ -238,9 +242,19 @@ function gasCost(op: PackedSponsorOperation, c: PaymasterConfig) {
 }
 
 /** Funding-independent execution identity: changing price, paymaster or gas bounds cannot create a new charge. */
-export function gasExecutionKey(chainId: number, op: Pick<PackedSponsorOperation, 'sender' | 'nonce' | 'initCode' | 'callData'>): string {
+export function gasExecutionKey(chainId: number, op: Pick<PackedSponsorOperation, 'sender' | 'nonce' | 'initCode' | 'callData'>): Hex {
   return keccak256(encodeAbiParameters([{ type: 'uint256' }, { type: 'address' }, { type: 'uint256' }, { type: 'bytes32' }, { type: 'bytes32' }],
     [BigInt(chainId), op.sender, op.nonce, keccak256(op.initCode), keccak256(op.callData)]));
+}
+function sponsorshipNoncePrefix(chainId: number, op: PackedSponsorOperation): string {
+  return `sponsor-gas:${chainId}:${op.sender}:${op.nonce}:`;
+}
+/** Gas estimates are separate immutable charges; signatures, expiry and oracle blocks are not new attempts. */
+function sponsorshipGasKey(op: PackedSponsorOperation, c: PaymasterConfig): string {
+  const digest = keccak256(encodeAbiParameters(
+    [{ type: 'bytes32' }, { type: 'bytes32' }, { type: 'uint256' }, { type: 'bytes32' }, { type: 'uint256' }, { type: 'uint256' }],
+    [gasExecutionKey(c.chainId, op), op.accountGasLimits, op.preVerificationGas, op.gasFees, c.verificationGasLimit, c.postOpGasLimit]));
+  return sponsorshipNoncePrefix(c.chainId, op) + digest.slice(2);
 }
 const BUDGET_ORACLE_ABI = parseAbi([
   'function oracle() view returns(address)', 'function numeraire() view returns(address)',
@@ -278,8 +292,9 @@ export async function existingBudgetContext(executionKey: string): Promise<Budge
   } catch { throw rejected('GAS_BUDGET_STORAGE_UNAVAILABLE', 503); }
 }
 
-async function readBudgetContext(op: PackedSponsorOperation, c: PaymasterConfig): Promise<BudgetContext> {
-  const previous = await existingBudgetContext(gasExecutionKey(c.chainId, op));
+async function readBudgetContext(op: PackedSponsorOperation, c: PaymasterConfig, attemptKey?: string): Promise<BudgetContext> {
+  const previous = (attemptKey === undefined ? null : await existingBudgetContext(attemptKey)) ??
+    await existingBudgetContext(gasExecutionKey(c.chainId, op));
   if (previous !== null) return previous;
   const client = rpc(c);
   const price = await readNativeBudgetPrice(client, c.executor, c.chainId);
@@ -504,20 +519,48 @@ export async function reserveSponsorship(r: Reservation, transaction: typeof wit
       }
       await applyExpiredExitProofs(client,c.chainId,r.op.sender,r.expiredAuthorizations??[]);
       const pendingExit=pureYieldWithdraw(r.op,c)&&(await client.query("select execution_key from gas_budget_reservations where chain_id=$1 and account=$2 and purpose='exit' and state in ('reserved','submitted','unknown') limit 1",[c.chainId,r.op.sender])).rows.length>0;
-      await reserveBudgetOnClient(r.budget, client, day, loadTradingConfig(process.env, c.chainId));
       // A request that arrived earlier may acquire the execution lock later. Refresh after waiting.
       const now = (r.now ?? (() => Math.floor(Date.now() / 1000)))();
       const candidates = await client.query<{ user_op_hash: Hex; valid_until: Date; state:string }>(`select user_op_hash,valid_until,state
         from paymaster_sponsorships where chain_id=$1 and paymaster=$2 and sender=$3
         and valid_until>to_timestamp($4::double precision) order by valid_until`,
         [c.chainId, c.address.toLowerCase(), r.op.sender.toLowerCase(), now]);
+      let reusable: { until: number; hash: Hex } | undefined;
       for (const candidate of candidates.rows) {
         const until = candidate.valid_until.getTime() / 1000;
-        // Matching the complete EntryPoint hash binds nonce/calldata/initCode, gas, fees and signer.
-        // Rebuild locally; never persist keys or signatures and never perform RPC in the transaction.
-        if (Number.isSafeInteger(until) &&
-            (await authorization(r.op, c, until)).userOpHash === candidate.user_op_hash) return until;
+        // Matching the complete EntryPoint hash binds every field, including gas and fees.
+        if (Number.isSafeInteger(until) && (await authorization(r.op, c, until)).userOpHash === candidate.user_op_hash) {
+          reusable = { until, hash: candidate.user_op_hash };
+          break;
+        }
       }
+      if (r.ordinaryGasRetry) {
+        if (c.chainId !== 97 || r.budget.purpose !== 'ordinary' || r.budget.executionKey !== sponsorshipGasKey(r.op, c)) throw rejected('GAS_BUDGET_CONFLICT', 409);
+        if (reusable) {
+          // Exact live retries issued before this change retain their original charge too.
+          const bound = (await client.query<{ execution_key: string }>("select value->>'executionKey' as execution_key from yield_runtime_state where name=$1 and kind='fact'",
+            [`auth-${reusable.hash.slice(2)}`])).rows[0];
+          if (bound?.execution_key === gasExecutionKey(c.chainId, r.op)) r = { ...r, budget: { ...r.budget, executionKey: bound.execution_key } };
+        }
+        // The account lock serializes ALL calldata/nonce variants, also across UTC days.
+        // Include legacy keys bound by immutable auth facts, plus the original execution
+        // key for pre-fact reservations. Failed/unknown attempts still count forever.
+        const attempts = await client.query<{ count: string; existing: boolean; authorizations: string }>(`select count(*)::text as count,
+          coalesce(bool_or(execution_key=$3),false) as existing,
+          (select count(*)::text from yield_runtime_state f where f.kind='fact' and f.name like 'auth-%'
+            and f.value @> jsonb_build_object('chainId',$1::bigint,'account',$2::text,'nonce',$6::text)) as authorizations
+          from gas_budget_reservations g
+          where chain_id=$1 and account=$2 and (starts_with(execution_key,$4) or execution_key=$5 or exists (
+            select 1 from yield_runtime_state f where f.kind='fact' and f.name like 'auth-%'
+            and f.value @> jsonb_build_object('chainId',$1::bigint,'account',$2::text,'nonce',$6::text,'executionKey',g.execution_key)))`,
+          [c.chainId, r.op.sender, r.budget.executionKey, sponsorshipNoncePrefix(c.chainId, r.op), gasExecutionKey(c.chainId, r.op), r.op.nonce.toString()]);
+        const usage = attempts.rows[0];
+        if (!usage || typeof usage.count !== 'string' || !/^\d+$/.test(usage.count) || typeof usage.existing !== 'boolean' ||
+            typeof usage.authorizations !== 'string' || !/^\d+$/.test(usage.authorizations)) throw rejected('PAYMASTER_STORAGE_UNAVAILABLE', 503);
+        if ((!usage.existing && BigInt(usage.count) >= 3n) || (!reusable && BigInt(usage.authorizations) >= 3n)) throw rejected('PAYMASTER_GAS_RETRY_LIMIT', 429);
+      }
+      await reserveBudgetOnClient(r.budget, client, day, loadTradingConfig(process.env, c.chainId));
+      if (reusable) return reusable.until;
       const previous = await client.query<{ matches: boolean }>(`select (chain_id = $2 and paymaster = $3 and sender = $4 and
         verification_gas_limit = $5::numeric and call_gas_limit = $6::numeric and pre_verification_gas = $7::numeric and
         paymaster_verification_gas_limit = $8::numeric and paymaster_post_op_gas_limit = $9::numeric and max_fee_per_gas = $10::numeric and
@@ -667,7 +710,8 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
       const cost = gasCost(op, c);
       if (cost.gasLimit > MAX_USER_OP_GAS) throw rejected('PAYMASTER_USER_OP_CAPACITY', 400);
       await bounded((deps.checkChain ?? checkChain)(op, c), c.timeoutMs);
-      const context = await bounded((deps.readBudgetContext ?? readBudgetContext)(op, c), c.timeoutMs);
+      const attemptKey = deps.retryOrdinaryGas && c.chainId === 97 ? sponsorshipGasKey(op, c) : undefined;
+      const context = await bounded(deps.readBudgetContext ? deps.readBudgetContext(op, c) : readBudgetContext(op, c, attemptKey), c.timeoutMs);
       let consumedAuthorizations:readonly ConsumedAuthorization[]=[];
       let expiredAuthorizations:readonly ExpiredExitProof[]=[];
       if (pureYieldWithdraw(op, c)) context.purpose = 'exit';
@@ -690,9 +734,10 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
         consumedAuthorizations=await bounded((deps.verifyYieldWithdraw??verifyYieldWithdraw)({...op,paymasterAndData:signed.paymasterAndData},c,now,deps.query??query),c.timeoutMs);
         if(!deps.verifyYieldWithdraw)expiredAuthorizations=await bounded(expiredExitProofs(c,op.sender,deps.query??query),c.timeoutMs);
       }
+      const ordinaryGasRetry = attemptKey !== undefined && context.purpose === 'ordinary';
       const reservedUntil = await (deps.reserve ?? reserveSponsorship)({ hash: signed.userOpHash, op, config: c, validUntil, now: deps.now ?? (() => Math.floor(Date.now() / 1000)), ...cost,
-        consumedAuthorizations,expiredAuthorizations,
-        budget: { executionKey: gasExecutionKey(c.chainId, op), chainId: c.chainId, account: op.sender,
+        consumedAuthorizations,expiredAuthorizations,ordinaryGasRetry,
+        budget: { executionKey: ordinaryGasRetry ? attemptKey : gasExecutionKey(c.chainId, op), chainId: c.chainId, account: op.sender,
           gasLimit: cost.gasLimit, maxFeePerGas: cost.maxFee, ...context } });
       if (reservedUntil !== undefined && reservedUntil !== validUntil) {
         validUntil = reservedUntil;
@@ -708,7 +753,7 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
     }
   } };
 }
-export async function sponsorUserOperation(input: unknown, wallet: string) { return createPaymasterService().sponsor(input, wallet); }
+export async function sponsorUserOperation(input: unknown, wallet: string) { return createPaymasterService({ retryOrdinaryGas: true }).sponsor(input, wallet); }
 
 /** viem's explicit estimate action prepares paymaster data before gas fields exist. Never sign there. */
 export function estimationPaymaster(hooks: ReturnType<typeof schedulerPaymaster>): Pick<PaymasterActions, 'getPaymasterData'> | undefined {

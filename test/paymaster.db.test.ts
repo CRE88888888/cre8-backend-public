@@ -6,15 +6,150 @@ import pg from 'pg';
 import { bytesToHex, concatHex, keccak256, toHex } from 'viem';
 import { closePool, query, withTransaction } from '../src/db.js';
 import { createPaymasterService, gasExecutionKey, reserveSponsorship, reserveGasBudget } from '../src/paymaster.js';
-import type { Reservation } from '../src/paymaster.js';
+import type { PaymasterDeps, Reservation } from '../src/paymaster.js';
 import { loadPaymasterConfig } from '../src/config.js';
 import { AppError } from '../src/errors.js';
 import { config as sponsorConfig, operation, OWNER, REGISTRY, kernelCall } from './fixtures/paymaster.js';
 import { encodeFunctionData, parseAbi } from 'viem';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
 import { YIELD_EXECUTOR_ABI } from '../src/yield-abi.js';
+import { EXECUTOR_ABI } from '../src/chain.js';
 
 after(closePool);
+
+function retryFixture(overrides: PaymasterDeps = {}) {
+  const sender = bytesToHex(randomBytes(20));
+  const c = sponsorConfig({ PAYMASTER_SIGNER_PRIVATE_KEY: key, CHAIN_ID: '97', RPC_URL: 'http://127.0.0.1:8797' });
+  const buy = (amount: bigint) => kernelCall(encodeFunctionData({ abi: EXECUTOR_ABI, functionName: 'executeRebalance',
+    args: [sender, [{ tokenIn: T.contracts.usdt, tokenOut: T.assets.WBNB.token, amountIn: amount, amountOutMin: 1n,
+      venue: T.contracts.executor, data: '0x' }], BigInt(Math.floor(Date.now() / 1000) + 300)] }), c.executor);
+  const op = operation({ sender, callData: buy(1n) });
+  const deps: PaymasterDeps = { config: c, retryOrdinaryGas: true,
+    query: async () => ({ rows: [{ owner: OWNER, user_id: OWNER }] }), checkChain: async () => {},
+    readBudgetContext: async () => ({ purpose: 'ordinary', nativePrice: 60000000000n, priceSource: 'fixture:retry-oracle' }), ...overrides };
+  const make = (extra: PaymasterDeps = {}) => createPaymasterService({ ...deps, ...extra });
+  const rows = () => query('select * from gas_budget_reservations where chain_id=97 and account=$1 order by execution_key', [sender]);
+  return { sender, c, op, make, rows, buy };
+}
+
+test('#147 ordinary retry after bundler rejection accepts re-estimated gas and retains both immutable charges', async () => {
+  const f = retryFixture();
+  try {
+    // No broadcast or receipt: the first authorization remains unresolved.
+    const first = await f.make().sponsor({ userOperation: f.op }, OWNER);
+    const saved = (await f.rows()).rows[0]; assert.ok(saved);
+    const changed = { ...f.op, accountGasLimits: concatHex([toHex(100001n, { size: 16 }), toHex(200002n, { size: 16 })]),
+      preVerificationGas: 50003n, gasFees: concatHex([toHex(2n, { size: 16 }), toHex(3n, { size: 16 })]) };
+    const second = await f.make().sponsor({ userOperation: changed }, OWNER);
+    assert.notEqual(second.userOpHash, first.userOpHash);
+    assert.deepEqual(await f.make({ readBudgetContext: undefined }).sponsor({ userOperation: changed }, OWNER), second,
+      'restart reuses the original attempt price/source without a fresh RPC');
+    assert.deepEqual((await f.rows()).rows.find(row => row.execution_key === saved.execution_key), saved);
+    const totals = (await query<{ n: string; gas: string; wei: string }>(`select count(*)::text as n,sum(gas_limit)::text as gas,
+      sum(max_cost_wei)::text as wei from gas_budget_reservations where chain_id=97 and account=$1`, [f.sender])).rows[0];
+    assert.deepEqual(totals, { n: '2', gas: '900006', wei: '2250018' });
+    assert.equal((await query('select user_op_hash from paymaster_sponsorships where sender=$1', [f.sender])).rows.length, 2);
+  } finally { await query('delete from paymaster_sponsorships where sender=$1', [f.sender]); }
+});
+
+test('#147 legacy nonce reservation remains charged and permits two new gas estimates, then refuses a fourth attempt', async () => {
+  const f = retryFixture();
+  try {
+    const legacy = await f.make({ retryOrdinaryGas: false }).sponsor({ userOperation: f.op }, OWNER);
+    const old = (await f.rows()).rows[0]; assert.ok(old);
+    assert.deepEqual(await f.make().sponsor({ userOperation: f.op }, OWNER), legacy);
+    assert.equal((await f.rows()).rows.length, 1, 'an identical legacy retry must not add a charge');
+    for (const delta of [1n, 2n]) await f.make().sponsor({ userOperation: { ...f.op, preVerificationGas: f.op.preVerificationGas + delta } }, OWNER);
+    await assert.rejects(f.make().sponsor({ userOperation: { ...f.op, preVerificationGas: f.op.preVerificationGas + 3n } }, OWNER),
+      e => e instanceof AppError && e.code === 'PAYMASTER_GAS_RETRY_LIMIT');
+    assert.equal((await f.rows()).rows.length, 3);
+    assert.deepEqual((await f.rows()).rows.find(row => row.execution_key === old.execution_key), old);
+  } finally { await query('delete from paymaster_sponsorships where sender=$1', [f.sender]); }
+});
+
+test('#147 concurrent estimates share a durable three-attempt nonce limit across calldata, states and service restarts', async () => {
+  const f = retryFixture();
+  try {
+    const estimates = Array.from({ length: 10 }, (_, i) => ({ ...f.op, preVerificationGas: f.op.preVerificationGas + BigInt(i),
+      callData: f.buy(BigInt(i + 1)) }));
+    const outcomes = await Promise.allSettled(estimates.map(op => f.make().sponsor({ userOperation: op }, OWNER)));
+    assert.equal(outcomes.filter(r => r.status === 'fulfilled').length, 3);
+    assert.equal(outcomes.filter(r => r.status === 'rejected' && r.reason instanceof AppError && r.reason.code === 'PAYMASTER_GAS_RETRY_LIMIT').length, 7);
+    const index = outcomes.findIndex(r => r.status === 'fulfilled'), accepted = outcomes[index]; assert.ok(accepted?.status === 'fulfilled');
+    assert.deepEqual(await f.make().sponsor({ userOperation: estimates[index] }, OWNER), accepted.value, 'exact retry still works at the cap');
+    await query("update gas_budget_reservations set state='failed',updated_at=clock_timestamp() where account=$1", [f.sender]);
+    await query("update paymaster_sponsorships set state='failed',created_at=created_at-interval '1 day',updated_at=clock_timestamp() where sender=$1", [f.sender]);
+    await assert.rejects(f.make().sponsor({ userOperation: { ...f.op, preVerificationGas: 60000n } }, OWNER),
+      e => e instanceof AppError && e.code === 'PAYMASTER_GAS_RETRY_LIMIT');
+    assert.equal((await f.rows()).rows.length, 3);
+  } finally { await query('delete from paymaster_sponsorships where sender=$1', [f.sender]); }
+});
+
+test('#147 expired signatures cannot bypass the nonce attempt limit by keeping the gas estimate unchanged', async () => {
+  let clock = Math.floor(Date.now() / 1000);
+  const f = retryFixture({ now: () => clock });
+  try {
+    let prior: string | undefined;
+    for (let i = 0; i < 3; i++) {
+      const result = await f.make().sponsor({ userOperation: f.op }, OWNER);
+      assert.notEqual(result.userOpHash, prior);
+      assert.deepEqual(await f.make().sponsor({ userOperation: f.op }, OWNER), result);
+      prior = result.userOpHash;
+      clock = result.validUntil;
+    }
+    await assert.rejects(f.make().sponsor({ userOperation: f.op }, OWNER), e => e instanceof AppError && e.code === 'PAYMASTER_GAS_RETRY_LIMIT');
+    assert.equal((await f.rows()).rows.length, 1, 'unchanged gas retains its immutable charge');
+    assert.equal((await query('select user_op_hash from paymaster_sponsorships where sender=$1', [f.sender])).rows.length, 3);
+  } finally { await query('delete from paymaster_sponsorships where sender=$1', [f.sender]); }
+});
+
+test('#147 retry charges obey exact shared gas cap, zero and unchanged paymaster quota; rejection is atomic', async () => {
+  const before = process.env.ACCOUNT_DAILY_GAS;
+  const f = retryFixture(), limited = retryFixture(), zero = retryFixture();
+  try {
+    process.env.ACCOUNT_DAILY_GAS = '900001';
+    await f.make().sponsor({ userOperation: f.op }, OWNER);
+    await f.make().sponsor({ userOperation: { ...f.op, preVerificationGas: 50001n } }, OWNER);
+    await assert.rejects(f.make().sponsor({ userOperation: { ...f.op, preVerificationGas: 50002n } }, OWNER),
+      e => e instanceof AppError && e.code === 'GAS_BUDGET_EXCEEDED');
+    assert.equal((await f.rows()).rows.length, 2);
+    const service = limited.make({ config: { ...limited.c, accountDailyCount: 1n } });
+    await service.sponsor({ userOperation: limited.op }, OWNER);
+    await assert.rejects(service.sponsor({ userOperation: { ...limited.op, preVerificationGas: 50001n } }, OWNER), denied);
+    assert.equal((await limited.rows()).rows.length, 1);
+    process.env.ACCOUNT_DAILY_GAS = '0';
+    await assert.rejects(zero.make().sponsor({ userOperation: zero.op }, OWNER), e => e instanceof AppError && e.code === 'GAS_BUDGET_EXCEEDED');
+    assert.equal((await zero.rows()).rows.length, 0);
+  } finally {
+    if (before === undefined) delete process.env.ACCOUNT_DAILY_GAS; else process.env.ACCOUNT_DAILY_GAS = before;
+    await query('delete from paymaster_sponsorships where sender=any($1::text[])', [[f.sender, limited.sender, zero.sender]]);
+  }
+});
+
+test('#147 retry lock timeout, rollback and unknown commit never authorize or erase durable attempts', async () => {
+  const f = retryFixture(), blocker = new pg.Client({ connectionString: process.env.DATABASE_URL }); await blocker.connect();
+  try {
+    await f.make().sponsor({ userOperation: f.op }, OWNER);
+    const next = { ...f.op, preVerificationGas: 50001n };
+    await blocker.query('begin');
+    await blocker.query("select pg_advisory_xact_lock(hashtextextended('paymaster_account:97:'||$1::text,0))", [f.sender]);
+    await assert.rejects(f.make({ config: { ...f.c, timeoutMs: 10 } }).sponsor({ userOperation: next }, OWNER),
+      e => e instanceof AppError && e.code === 'PAYMASTER_STORAGE_UNAVAILABLE');
+    await blocker.query('rollback');
+    assert.equal((await f.rows()).rows.length, 1);
+    await assert.rejects(f.make({ reserve: r => reserveSponsorship(r, fn => withTransaction(async db => {
+      await fn(db); throw new Error('SECRET rollback');
+    })) }).sponsor({ userOperation: next }, OWNER), e => e instanceof AppError && e.code === 'PAYMASTER_STORAGE_UNAVAILABLE' && !e.message.includes('SECRET'));
+    assert.equal((await f.rows()).rows.length, 1);
+    await assert.rejects(f.make({ reserve: r => reserveSponsorship(r, async fn => {
+      await withTransaction(fn); throw new Error('SECRET unknown commit');
+    }) }).sponsor({ userOperation: next }, OWNER), e => e instanceof AppError && e.code === 'PAYMASTER_STORAGE_UNAVAILABLE' && !e.message.includes('SECRET'));
+    assert.equal((await f.rows()).rows.length, 2);
+    const recovered = await f.make().sponsor({ userOperation: next }, OWNER);
+    assert.deepEqual(await f.make().sponsor({ userOperation: next }, OWNER), recovered);
+    assert.equal((await f.rows()).rows.length, 2);
+  } finally { await blocker.query('rollback'); await blocker.end(); await query('delete from paymaster_sponsorships where sender=$1', [f.sender]); }
+});
 
 test('#97 identical sponsorship retries across seconds and service instances reuse one durable authorization', async () => {
   let clock = Math.floor(Date.now() / 1000);

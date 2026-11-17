@@ -9,7 +9,7 @@ import { alertCounts, healthStatusFor, listOpenAlerts } from './alerts.js';
 import type { AlertCounts } from './alerts.js';
 import { listPortfolioActivity, readOperatorActivity, readOperatorOverview, runOperatorClose, runOperatorRedeem } from './operator.js';
 import type { RedeemAmount } from './operator.js';
-import { EXECUTOR_ORACLE_ABI, ORACLE_OF_ABI, listPriceableAssets } from './assets.js';
+import { createTradableProbeCache, EXECUTOR_ORACLE_ABI, ORACLE_OF_ABI, listPriceableAssets } from './assets.js';
 import type { PriceableAsset, TradableProbe } from './assets.js';
 import { authenticate, issueNonce, login, logout, parseLoginBody } from './auth.js';
 import { loginWithPrivy } from './privy.js';
@@ -249,6 +249,12 @@ export type ServerDeps = {
   listAssets: () => Promise<PriceableAsset[]>;
 };
 
+// Keep only the current deployment; changed chain/RPC/executor must never reuse its probe.
+let assetProbeCache: {
+  chainId: number; rpcUrl: string; executor: Address;
+  read: () => Promise<TradableProbe | undefined>;
+} | undefined;
+
 /**
  * `GET /assets` 的預設實作：DB 那一份 + 鏈上的「這個資產有沒有註冊 oracle」。
  *
@@ -271,22 +277,23 @@ async function defaultListAssets(): Promise<PriceableAsset[]> {
       }
     })();
     if (config.rpcUrl !== null && executor !== null) {
-      const client = createPublicClient({ chain: activeChain(), transport: http(config.rpcUrl) });
-      const router = (await client.readContract({
-        address: executor,
-        abi: EXECUTOR_ORACLE_ABI,
-        functionName: 'oracle',
-      })) as Address;
-      probe = {
-        router,
-        oracleOf: async (asset) =>
-          (await client.readContract({
-            address: router,
-            abi: ORACLE_OF_ABI,
-            functionName: 'oracleOf',
-            args: [asset as Address],
-          })) as string,
-      };
+      if (assetProbeCache === undefined || assetProbeCache.chainId !== config.chainId ||
+          assetProbeCache.rpcUrl !== config.rpcUrl || assetProbeCache.executor !== executor) {
+        const client = createPublicClient({ chain: activeChain(), transport: http(config.rpcUrl) });
+        assetProbeCache = {
+          chainId: config.chainId, rpcUrl: config.rpcUrl, executor,
+          read: createTradableProbeCache(async () => {
+            const router = await client.readContract({ address: executor, abi: EXECUTOR_ORACLE_ABI, functionName: 'oracle' });
+            return {
+              router,
+              oracleOf: async (asset) => client.readContract({
+                address: router, abi: ORACLE_OF_ABI, functionName: 'oracleOf', args: [asset as Address],
+              }),
+            };
+          }),
+        };
+      }
+      probe = await assetProbeCache.read();
     }
   } catch {
     // 查不到就回 null：讓 UI 顯示「未知」，而不是謊報可交易。

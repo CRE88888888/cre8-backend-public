@@ -62,6 +62,39 @@ export type TradableProbe = {
   oracleOf: (asset: string) => Promise<string>;
 };
 
+export const TRADABLE_CACHE_TTL_MS = 60_000;
+
+/** One deployment per cache: share router/asset reads, including failures, for 60 seconds. */
+export function createTradableProbeCache(
+  loadProbe: () => Promise<TradableProbe | undefined>,
+  now: () => number = Date.now,
+): () => Promise<TradableProbe | undefined> {
+  let cached: { probe: TradableProbe | undefined; expiresAt: number } | undefined;
+  let pending: Promise<TradableProbe | undefined> | undefined;
+  return () => {
+    if (pending !== undefined) return pending;
+    if (cached !== undefined && now() < cached.expiresAt) return Promise.resolve(cached.probe);
+    pending = Promise.resolve().then(loadProbe).catch(() => undefined).then(probe => {
+      const reads = new Map<string, Promise<string>>();
+      const snapshot = probe === undefined ? undefined : {
+        router: probe.router,
+        oracleOf: (asset: string) => {
+          const key = asset.toLowerCase();
+          let read = reads.get(key);
+          if (read === undefined) {
+            read = Promise.resolve().then(() => probe.oracleOf(asset));
+            reads.set(key, read);
+          }
+          return read;
+        },
+      };
+      cached = { probe: snapshot, expiresAt: now() + TRADABLE_CACHE_TTL_MS };
+      return snapshot;
+    }).finally(() => { pending = undefined; });
+    return pending;
+  };
+}
+
 /**
  * 有 `probe` 就順便問鏈上「這個資產有沒有註冊 oracle」。沒有 probe → `tradable: null`（未知）。
  *
@@ -75,8 +108,8 @@ export async function listPriceableAssets(
 ): Promise<PriceableAsset[]> {
   const rows = chainId === 97 ? testnetAssets() : (await query(SQL_ASSETS)).rows;
 
-  const assets: PriceableAsset[] = [];
-  for (const row of rows) {
+  // These independent view calls must overlap even on the first request after expiry.
+  return Promise.all(rows.map(async (row): Promise<PriceableAsset> => {
     const fields = row as Record<string, unknown>;
     const address = fields.address;
     const symbol = fields.symbol;
@@ -105,7 +138,6 @@ export async function listPriceableAssets(
         }
       }
     }
-    assets.push({ address, symbol, decimals, isNumeraire, tradable });
-  }
-  return assets;
+    return { address, symbol, decimals, isNumeraire, tradable };
+  }));
 }

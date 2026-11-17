@@ -54,6 +54,7 @@ jobs:
           DATABASE_URL: postgres://ci:ci@127.0.0.1:1/unused
         run: >-
           bun test
+          test/assets.test.ts
           test/yield-domain.test.ts
           test/yield-reader.test.ts
           test/yield-snapshot.test.ts

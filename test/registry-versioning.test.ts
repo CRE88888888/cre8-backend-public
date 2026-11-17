@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
+import { createServer as httpServer } from 'node:http';
 import { test } from 'node:test';
-import { createPublicClient, createWalletClient, custom, decodeFunctionData, encodeErrorResult, encodeFunctionResult, parseAbi, toFunctionSelector, zeroHash } from 'viem';
+import { createPublicClient, createWalletClient, custom, decodeFunctionData, encodeErrorResult, encodeFunctionResult, http, parseAbi, toFunctionSelector, zeroHash } from 'viem';
 import { toAccount } from 'viem/accounts';
 import { kernelAddressesForChain } from '../src/addresses.js';
-import { getStrategyWithVersionState } from '../src/strategies.js';
+import { getStrategyWithVersionState, typedVersionInput } from '../src/strategies.js';
 import { REGISTRY_ABI, REGISTRY_VERSION_ABI, readOwnerEnrollment } from '../src/chain.js';
-import { enrollmentApprovalHash, FOLLOW_VERSIONS_TERMS, performanceFee, p11Error, prepareEnrollmentApproval, readBuyVersionWindow, readVersionState, registryConfigHash, typedVersionSettings } from '../src/registry-versioning.js';
+import { defaultPublicationActiveAt, enrollmentApprovalHash, FIRST_VERSION_LEAD_SECONDS, FOLLOW_VERSIONS_TERMS, performanceFee, p11Error, prepareEnrollmentApproval, readBuyVersionWindow, readVersionState, registryConfigHash, typedVersionSettings } from '../src/registry-versioning.js';
 import type { Address, Hex } from 'viem';
 import { AppError } from '../src/errors.js';
 import golden from './fixtures/p11-config-golden.json' with { type: 'json' };
@@ -67,13 +68,15 @@ test('#124 canonical settings bind all execution parameters but fee/time are sep
 });
 
 function stateRpc() {
-  const state = { active: 1, pending: 2, cancelled: false, now: 100n, activeAt: 101n, fail: '', reorg: false, allowLatest: false, enrolled: true, id: 7n, accepted: 1, paused: false };
+  const state = { active: 1, pending: 2, cancelled: false, now: 100n, activeAt: 101n, fail: '', reorg: false, allowLatest: false, enrolled: true, id: 7n, accepted: 1, paused: false, autoActivate: false };
   const reads: string[] = [];
   let blocks = 0;
   const client = createPublicClient({ transport: custom({ request: async ({ method, params }) => {
     if (state.fail === method) throw new Error('private upstream credential');
     if (state.fail === 'timeout') throw new DOMException('private upstream credential', 'TimeoutError');
     if (state.fail === 'missing_block' && method === 'eth_getBlockByNumber') return { number: '0x64', hash: zeroHash, transactions: [] };
+    if (state.fail === 'missing_hash' && method === 'eth_getBlockByNumber') return { number: '0x64', timestamp: '0x64', transactions: [] };
+    if (state.fail === 'missing_number' && method === 'eth_getBlockByNumber') return { number: null, hash: zeroHash, timestamp: '0x64', transactions: [] };
     if (method === 'eth_chainId') return '0x38';
     if (method === 'eth_blockNumber') return '0x64';
     if (method === 'eth_getBlockByNumber') return { number: '0x64', hash: state.reorg && ++blocks > 1 ? FOLLOW_VERSIONS_TERMS : zeroHash, timestamp: `0x${state.now.toString(16)}`, transactions: [] };
@@ -89,8 +92,8 @@ function stateRpc() {
       case 'enrollments': return encodeFunctionResult({ abi: REGISTRY_ABI, functionName: 'enrollments', result: [state.id, state.accepted, state.paused] });
       case 'MAX_STRATEGY_ASSETS': return encodeFunctionResult({ abi: REGISTRY_VERSION_ABI, functionName: 'MAX_STRATEGY_ASSETS', result: 128n });
       case 'version': return encodeFunctionResult({ abi: REGISTRY_VERSION_ABI, functionName: 'version', result: { assets: [asset], weightsBps: [10000], scheduleHash: zeroHash, activeAt: state.activeAt, settingsHash: zeroHash, performanceFeeBps: 500, configHash: zeroHash } });
-      case 'activeVersion': return encodeFunctionResult({ abi: REGISTRY_VERSION_ABI, functionName: 'activeVersion', result: state.active });
-      case 'pendingVersion': return encodeFunctionResult({ abi: REGISTRY_VERSION_ABI, functionName: 'pendingVersion', result: state.pending });
+      case 'activeVersion': return encodeFunctionResult({ abi: REGISTRY_VERSION_ABI, functionName: 'activeVersion', result: state.autoActivate && state.pending !== 0 && state.now >= state.activeAt ? state.pending : state.active });
+      case 'pendingVersion': return encodeFunctionResult({ abi: REGISTRY_VERSION_ABI, functionName: 'pendingVersion', result: state.autoActivate && state.now >= state.activeAt ? 0 : state.pending });
       case 'lastPublishedAt': return encodeFunctionResult({ abi: REGISTRY_VERSION_ABI, functionName: 'lastPublishedAt', result: 1n });
       case 'cancelledVersion': return encodeFunctionResult({ abi: REGISTRY_VERSION_ABI, functionName: 'cancelledVersion', result: state.cancelled });
       default: throw new Error('unexpected read');
@@ -98,6 +101,87 @@ function stateRpc() {
   } }, { retryCount: 0 }) });
   return { state, client, reads };
 }
+
+test('#143 first publication uses canonical chain time plus 60 seconds, including timestamp zero and the Date ceiling', async () => {
+  assert.equal(FIRST_VERSION_LEAD_SECONDS, 60);
+  for (const timestamp of [0n, 100n, 1_800_000_000n, 8_640_000_000_000n - 60n]) {
+    const f = stateRpc(); f.state.active = 0; f.state.now = timestamp;
+    const result = await defaultPublicationActiveAt(f.client, asset, 7, 500_999);
+    assert.equal(BigInt(result.getTime() / 1000) - timestamp, 60n);
+    assert.deepEqual(f.reads, ['activeVersion'], 'read effective state at the observed block, without consulting DB history');
+  }
+});
+
+test('#143 existing effective versions keep the 24-hour wall-clock default, including uint16 maximum', async () => {
+  for (const active of [1, 65535]) {
+    const f = stateRpc(); f.state.active = active;
+    assert.equal((await defaultPublicationActiveAt(f.client, asset, 7, 500_999)).getTime(), 86_960_000);
+  }
+});
+
+test('#143 a just-matured first version requires notice for the next publication at and after activeAt', async () => {
+  const f = stateRpc(); f.state.active = 0; f.state.pending = 1; f.state.activeAt = 160n; f.state.autoActivate = true;
+  for (const [now, expected] of [[159n, 219_000], [160n, 86_960_000], [161n, 86_960_000]] as const) {
+    f.state.now = now;
+    assert.equal((await defaultPublicationActiveAt(f.client, asset, 7, 500_999)).getTime(), expected);
+  }
+});
+
+for (const failure of ['eth_call', 'eth_getBlockByNumber', 'timeout', 'missing_block', 'missing_hash', 'missing_number', 'empty_call', 'reorg', 'overflow'] as const) {
+  test(`#143 activation default fails closed and sanitizes ${failure}`, async () => {
+    const f = stateRpc(); f.state.active = 0;
+    if (failure === 'reorg') f.state.reorg = true;
+    else if (failure === 'overflow') f.state.now = 8_640_000_000_000n - 59n;
+    else f.state.fail = failure;
+    await assert.rejects(defaultPublicationActiveAt(f.client, asset, 7), (error: unknown) =>
+      error instanceof AppError && error.code === 'VERSION_PUBLICATION_UNAVAILABLE' && !error.message.includes('credential'));
+  });
+}
+
+test('#143 activation reads have an actual bounded HTTP timeout', async () => {
+  const server = httpServer(() => {});
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const bound = server.address(); assert.ok(bound && typeof bound !== 'string');
+    const client = createPublicClient({ transport: http(`http://127.0.0.1:${bound.port}`, { timeout: 20, retryCount: 0 }) });
+    await assert.rejects(defaultPublicationActiveAt(client, asset, 7), (error: unknown) =>
+      error instanceof AppError && error.code === 'VERSION_PUBLICATION_UNAVAILABLE');
+  } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+});
+
+test('#143 legacy HTTP normalization preserves omission/null and explicit activation timestamps', () => {
+  const input = { allocation: { assets: [{ address: asset, weightBps: 10000 }] }, schedule: { kind: 'interval', intervalSeconds: 60 } };
+  assert.equal(typedVersionInput(input).activeAt, undefined);
+  assert.equal(typedVersionInput({ ...input, activeAt: null }).activeAt, null);
+  const at = new Date('2026-11-17T00:01:00Z');
+  assert.deepEqual(typedVersionInput({ ...input, activeAt: at.toISOString() }).activeAt, at);
+});
+
+test('#143 first version detail reports pending/active at the exact boundary with its minimum deposit intact', async () => {
+  const f = stateRpc(); f.state.active = 0; f.state.pending = 1; f.state.activeAt = 160n; f.state.autoActivate = true;
+  const detail = () => getStrategyWithVersionState(7, {
+    strategy: async () => ({ id: 7, provider: account, name: 'First version', description: '', isPublic: true, swapFeeBps: 0, onchainId: 7, createdAt: new Date(0).toISOString(),
+      versions: [{ strategyId: 7, version: 1, allocation: { assets: [{ address: asset, weightBps: 10000 }] }, schedule: { kind: 'funding' },
+        executionSchemaVersion: 1, execution: { kind: 'hold' }, executionChainId: 97, configHash: zeroHash, idleYield: { enabled: false }, changeLog: null,
+        activeAt: new Date(160_000).toISOString(), createdAt: new Date(0).toISOString() }] }),
+    state: (id, version) => readVersionState(f.client, asset, id, version),
+  });
+  const server = createServer({ strategyDetail: detail });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const bound = server.address(); assert.ok(bound && typeof bound !== 'string');
+    for (const [now, status] of [[159n, 'pending'], [160n, 'active'], [161n, 'active']] as const) {
+      f.state.now = now;
+      const response = await fetch(`http://127.0.0.1:${bound.port}/strategies/7`);
+      assert.equal(response.status, 200);
+      const body: unknown = await response.json(); assert.ok(typeof body === 'object' && body !== null && 'versions' in body && 'minDepositUsdtWei' in body);
+      assert.equal(body.minDepositUsdtWei, '50000000000000000000'); assert.ok(Array.isArray(body.versions));
+      assert.equal(body.versions[0]?.status, status);
+      assert.equal(body.versions[0]?.activeAt, new Date(160_000).toISOString());
+      assert.equal(body.versions[0]?.minDepositUsdtWei, body.minDepositUsdtWei);
+    }
+  } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+});
 
 test('#124 consent preparation is read-only, pins the effective version and returns only owner sudo calldata', async () => {
   const f = stateRpc();

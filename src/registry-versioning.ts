@@ -7,11 +7,32 @@ import { AppError, ValidationError } from './errors.js';
 
 export const VERSION_NOTICE_SECONDS = 86400;
 export const VERSION_INTERVAL_SECONDS = 604800;
+/** Leave a minute for signing/mining after the observed block; never persist the contract's zero sentinel. */
+export const FIRST_VERSION_LEAD_SECONDS = 60;
 export const FOLLOW_VERSIONS_TEXT = 'I agree to follow future strategy versions; changes require at least 24 hours notice during which I can exit. Fee-only decreases may take effect immediately.';
 export const FOLLOW_VERSIONS_TERMS = keccak256(toHex(FOLLOW_VERSIONS_TEXT));
 export type VersionSettings = { scheduleHash: Hex; settingsHash: Hex; performanceFeeBps: number };
 
 export type BuyVersionWindow = { activeVersion: number; timestamp: bigint; pendingActiveAt: bigint | null };
+
+/** activeVersion includes a pending version that has just matured, even before a keeper writes activation. */
+export async function defaultPublicationActiveAt(client: PublicClient, registry: Address, id: number, now = Date.now()): Promise<Date> {
+  try {
+    if (!Number.isSafeInteger(id) || id < 1) throw new Error('invalid strategy');
+    const block = await client.getBlock({ blockTag: 'latest' });
+    if (typeof block.number !== 'bigint' || block.number < 0n || typeof block.timestamp !== 'bigint' || block.timestamp < 0n ||
+        typeof block.hash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(block.hash)) throw new Error('missing canonical block');
+    const active = await client.readContract({ address: registry, abi: REGISTRY_VERSION_ABI,
+      functionName: 'activeVersion', args: [BigInt(id)], blockNumber: block.number });
+    if (!Number.isInteger(active) || active < 0 || active > 65535) throw new Error('invalid active version');
+    if ((await client.getBlock({ blockNumber: block.number })).hash !== block.hash) throw new Error('reorg');
+    const seconds = active === 0 ? block.timestamp + BigInt(FIRST_VERSION_LEAD_SECONDS)
+      : BigInt(Math.floor(now / 1000) + VERSION_NOTICE_SECONDS + FIRST_VERSION_LEAD_SECONDS);
+    // JavaScript Date has a narrower range than uint64. Reject before converting bigint to number.
+    if (seconds <= 0n || seconds > 8_640_000_000_000n) throw new Error('activation time out of range');
+    return new Date(Number(seconds) * 1000);
+  } catch { throw new AppError(503, 'VERSION_PUBLICATION_UNAVAILABLE', 'publication activation time unavailable; no new version stored'); }
+}
 
 /** Fresh send evidence: every registry read uses the same canonical RPC block. */
 export async function readBuyVersionWindow(client: PublicClient, registry: Address, id: bigint): Promise<BuyVersionWindow> {

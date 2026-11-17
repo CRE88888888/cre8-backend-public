@@ -1,4 +1,4 @@
-import { performanceFee, readVersionState, registryConfigHash, storedVersionSettings, typedVersionSettings, VERSION_NOTICE_SECONDS } from './registry-versioning.js';
+import { defaultPublicationActiveAt, performanceFee, readVersionState, registryConfigHash, storedVersionSettings, typedVersionSettings, VERSION_NOTICE_SECONDS } from './registry-versioning.js';
 import { REGISTRY_ABI, REGISTRY_VERSION_ABI } from './registry-abi.js';
 import type { VersionSettings } from './registry-versioning.js';
 import { withRelayerLock } from './relayer-lock.js';
@@ -90,7 +90,7 @@ export type PublishVersionInput = {
   chainId?: unknown;
   idleYield?: unknown;
   changeLog?: string | null;
-  /** First instant the version may execute; defaults to now. Accepts ISO-8601 or Date. */
+  /** Defaults to chain time + 60s without an effective version, otherwise now + 24h + 60s. */
   activeAt?: string | Date | null;
 };
 
@@ -157,7 +157,7 @@ export function typedVersionInput(input: unknown): PublishVersionInput {
     return { allocation, schedule: validateSchedule(input.schedule),
       ...(input.performanceFeeBps === undefined ? {} : { performanceFeeBps: performanceFee(input.performanceFeeBps) }),
       ...(input.changeLog === undefined ? {} : { changeLog: validateChangeLog(input.changeLog) }),
-      ...(input.activeAt === undefined ? {} : { activeAt: validateActiveAt(input.activeAt) }) };
+      ...(input.activeAt === undefined ? {} : { activeAt: input.activeAt === null ? null : validateActiveAt(input.activeAt) }) };
   }
   return { ...input, allocation, execution: validateAssetConfig(input.execution, allocation, chainId),
     schedule: validateFundingSchedule(input.schedule), idleYield: validateIdleYield(input.idleYield) };
@@ -490,6 +490,19 @@ async function readPublicVersionState(onchainId: number, version: number) {
   }
 }
 
+async function readDefaultPublicationActiveAt(onchainId: number): Promise<Date> {
+  try {
+    const config = getConfig();
+    if (!config.rpcUrl || !config.registryAddress) throw new Error('missing configuration');
+    const client = createPublicClient({ transport: http(config.rpcUrl, { retryCount: 0, timeout: 5000 }) });
+    if (await client.getChainId() !== config.chainId) throw new Error('wrong chain');
+    return await defaultPublicationActiveAt(client, config.registryAddress as Address, onchainId);
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw new AppError(503, 'VERSION_PUBLICATION_UNAVAILABLE', 'publication activation time unavailable; no new version stored');
+  }
+}
+
 export async function strategyVersionState(id: number, version: number) {
   const strategy = await getStrategy(id).catch(error => {
     if (error instanceof AppError) throw error;
@@ -515,6 +528,7 @@ export type TypedPublishDeps = {
   isCancelled: typeof versionCancelledOnchain;
   publishOnchain: typeof publishVersionOnchain;
   relayerLock: typeof withRelayerLock;
+  defaultActiveAt: typeof readDefaultPublicationActiveAt;
 };
 
 export async function publishVersion(
@@ -528,7 +542,7 @@ export async function publishVersion(
   const allocation = validateAllocation(input.allocation);
   const schedule = validateSchedule(input.schedule);
   const changeLog = validateChangeLog(input.changeLog);
-  const activeAt = validateActiveAt(input.activeAt);
+  const suppliedAt = input.activeAt === undefined || input.activeAt === null ? null : validateActiveAt(input.activeAt);
   const versionSettings: VersionSettings = { scheduleHash: canonicalScheduleHash(schedule), settingsHash: `0x${'00'.repeat(32)}`, performanceFeeBps: performanceFee(input.performanceFeeBps) };
 
   const owner = await query<{ provider: string; onchain_id: string | null }>(
@@ -539,15 +553,17 @@ export async function publishVersion(
   if (ownerRow === undefined) throw new NotFoundError(`strategy ${strategyId} not found`);
   assertProviderOwns(ownerRow.provider, provider);
   const onchainId = ownerRow.onchain_id === null ? null : Number(ownerRow.onchain_id);
-  if (onchainId !== null && !isChainConfigured()) throw new AppError(503, 'VERSION_UNAVAILABLE', 'chain mirror configuration unavailable; no new version stored');
+  if (onchainId !== null && !(deps.isChainConfigured ?? isChainConfigured)()) throw new AppError(503, 'VERSION_UNAVAILABLE', 'chain mirror configuration unavailable; no new version stored');
+  const activeAt = suppliedAt ?? (onchainId === null ? validateActiveAt(null)
+    : await (deps.defaultActiveAt ?? readDefaultPublicationActiveAt)(onchainId));
 
   const attempts = 3;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const version = await nextVersion(strategyId);
     try {
       // Mirror to chain when the strategy is already registered on-chain (onchain_id set).
-      if (onchainId !== null && isChainConfigured()) {
-        await publishVersionOnchain(onchainId, {
+      if (onchainId !== null) {
+        await (deps.publishOnchain ?? publishVersionOnchain)(onchainId, {
           assets: allocation.assets.map((a) => a.address as `0x${string}`),
           weightsBps: allocation.assets.map((a) => a.weightBps),
           schedule,
@@ -582,7 +598,7 @@ export async function publishVersion(
 }
 
 async function publishTypedVersion(strategyId: number, raw: PublishVersionInput, provider: string, overrides: Partial<TypedPublishDeps>): Promise<StrategyVersion> {
-  const deps: TypedPublishDeps = { isCancelled: versionCancelledOnchain, validatePublication: validateVersionPublication, isChainConfigured, validateChain: () => { getChain(); }, publishOnchain: publishVersionOnchain, relayerLock: withRelayerLock, ...overrides };
+  const deps: TypedPublishDeps = { defaultActiveAt: readDefaultPublicationActiveAt, isCancelled: versionCancelledOnchain, validatePublication: validateVersionPublication, isChainConfigured, validateChain: () => { getChain(); }, publishOnchain: publishVersionOnchain, relayerLock: withRelayerLock, ...overrides };
   if(raw.chainId!==undefined&&raw.chainId!==configuredChainId())throw new ValidationError('CHAIN_MISMATCH','chainId must match this API deployment');
   if(configuredChainId()!==97)throw new ValidationError('EXECUTION_UNAVAILABLE','per-asset funding is only available on chain 97');
   const input = typedVersionInput(raw);
@@ -635,7 +651,8 @@ async function publishTypedVersion(strategyId: number, raw: PublishVersionInput,
         const cancelled = previous?.config_hash === configHash && owner.onchain_id !== null
           ? await deps.isCancelled(Number(owner.onchain_id), previous.version) : false;
         const retry = !cancelled && suppliedAt === null && retryAt !== undefined && retryAt !== null && previous?.config_hash === configHash;
-        const activeAt = suppliedAt ?? (retry && retryAt ? retryAt : new Date((Math.floor(Date.now() / 1000) + VERSION_NOTICE_SECONDS + 60) * 1000));
+        const activeAt = suppliedAt ?? (retry && retryAt ? retryAt : owner.onchain_id === null ? validateActiveAt(null)
+          : await deps.defaultActiveAt(Number(owner.onchain_id)));
         if (!cancelled && previous?.config_hash === configHash && previous.active_at?.getTime() === activeAt.getTime()) return { row: previous, onchainId: owner.onchain_id, created: false };
         const version = (previous?.version ?? 0) + 1;
         if (version > 65535) throw new ValidationError('VERSION_LIMIT', 'strategy version exceeds uint16');

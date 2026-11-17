@@ -3,12 +3,13 @@ export const TESTNET_97 = {
   "chainId": 97,
   "mode": "public",
   "note": "deployed on public BSC testnet (chain 97)",
-  "verifiedAtBlock": 143098069,
-  "generatedAt": "2026-11-16T16:42:07Z",
-  "gitCommit": "92e6963848d106ab9dc86334928af11b708c1dfa",
+  "verifiedAtBlock": 143191994,
+  "generatedAt": "2026-11-17T04:29:01Z",
+  "gitCommit": "8864bdd46996ef4629cf9ac46ff161b3d3b04d8e",
   "versioning": {
     "enrollAbi": "enroll(address,uint256,uint16)",
     "publicationDelaySeconds": 86400,
+    "firstVersionDelaySeconds": 0,
     "publicationIntervalSeconds": 604800,
     "consent": "account sudo enroll, or account approveEnrollment(uint256,uint16) then operator first enroll",
     "settingsAbi": "publishSettingsVersion(uint256,address[],uint16[],bytes32,bytes32,uint16,uint64)",
@@ -29,10 +30,10 @@ export const TESTNET_97 = {
   },
   "contracts": {
     "ownedDeployer": "0xc92079ccb13ebd608d5cd03f5e302dcde5b37096",
-    "registry": "0x8b970a9c5df5b54ec9db677fd78b6cec77c1631f",
+    "registry": "0x7ff384fc959bf70ff7b2f011c6a84a36244264ea",
     "router": "0x8e9371550fc397144d198a7c159c2da5d143239e",
-    "executor": "0x35477567b09f760c82981612379011edea540451",
-    "yieldRegistry": "0x37bd15e1df1178b07ca5eb223f63d5b51dcecd5d",
+    "executor": "0xb65ec2ec6f5ab0a345b50caa454cf792c1ef2bb9",
+    "yieldRegistry": "0xa234531b1ace7b7106562a5554f1f8b173f7087b",
     "yieldView": "0xc8eeba84f9c74b2d879dfaedb02a0a523aa02657",
     "usdt": "0x7ad6e310b0f6744b66d97cb7cb525bd974501cb5",
     "feed.USDT/USD": "0x1f720990c22c7496eda9156ead91ca334ef097db",
@@ -1205,5 +1206,5 @@ export const TESTNET_97 = {
     }
   ],
   "yieldMarketCountNote": "C3 table heading says 32, but has 30 rows (21 Venus, 4 Lista, 5 Aave); no unspecified markets added",
-  "sourceCommit": "92e6963848d106ab9dc86334928af11b708c1dfa"
+  "sourceCommit": "8864bdd46996ef4629cf9ac46ff161b3d3b04d8e"
 } as const;

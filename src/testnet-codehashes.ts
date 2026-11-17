@@ -1,10 +1,10 @@
 // Generated from deploy/testnet-97-codehashes.json by scripts/sync-testnet-profile.ts.
 export default {
   "ownedDeployer": "0xbf6af3242c601a8b5793e40122a8f0a4fa96587ee5bcd45761f180c41028cdfe",
-  "registry": "0x7616968e7f3f01170c70456ce6048d5a198a37baf0979a526ca3df0096beeddc",
+  "registry": "0x6f693b998d7de6a15b92d106587f4744df32f4ed98f4a8610f3d0b555194326c",
   "router": "0x0ceb82867df709b53136fc010542643d5d9b20be900ff9684ec58b2bfa3d840f",
-  "executor": "0xe932f586892353834c2e3bdb479eb544d758a852e9dd60b31ed242c81327f51f",
-  "yieldRegistry": "0x9160839e71170e4825e221d7c302849e7e42b53bebfe810abc7d1046af1eb0e6",
+  "executor": "0x15261031e6d51f14ba56f5ca924a13f52bc34e4ba66d8a4118d09572476a9a08",
+  "yieldRegistry": "0x2ef7ca0318f7bd470043489176e92289bd96d72b3b6dcaae9cd82a602f78e59d",
   "yieldView": "0x967b2b0026a972d87b984c5604ce1dd883ce1dbfe35f7166cf908fc1975c0116",
   "usdt": "0x92dfa8e215463dfb5889cdb73fd4f1c75edda58ba9b071679d24f39e7fc83dcb",
   "feed.USDT/USD": "0x369788ed93d6095d2b2b4086da379cbffcaddb02861e71d286a6701d3831ae4c",

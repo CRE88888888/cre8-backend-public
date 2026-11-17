@@ -2,10 +2,13 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { custom, http } from 'viem';
+import { readFile } from 'node:fs/promises';
+import { ContractFunctionRevertedError, custom, encodeErrorResult, http, parseAbi, RpcRequestError } from 'viem';
 import { createKeeperChain, parseManifest, signingAccount } from '../src/keeper/chain.js';
 import { keeperChainFixture, manifestInput } from './fixtures/price-keeper.js';
 import { runScript, assertNoSecretSlices } from './fixtures/secret-output.js';
+import { PriceKeeper } from '../src/keeper/engine.js';
+import { parseScenario } from '../src/keeper/scenario.js';
 
 test('keeper manifest: rejects wrong chain, missing/zero/duplicate contracts and unwanted feeds', () => {
   assert.equal(parseManifest(manifestInput()).markets.length, 92);
@@ -61,7 +64,7 @@ test('keeper pool/feed faults and RPC failures prevent an observation set; swap 
     await assert.rejects(chain.io.inspect({ number: 100n, timestamp: 1060n })); assert.equal(state.sends, 0);
   }
   const stale = keeperChainFixture(); stale.state.bad = 'stale feed';
-  await assert.rejects(stale.chain.io.inspect({ number: 100n, timestamp: 3602n }));
+  assert.equal((await stale.chain.io.inspect({ number: 100n, timestamp: 3602n })).length, 92);
   for (const fail of ['eth_getBlockByNumber', 'latestRoundData', 'observations', 'slot0', 'previewSwap']) {
     const { state, chain } = keeperChainFixture(); state.fail = fail;
     await assert.rejects(fail === 'eth_getBlockByNumber' ? chain.io.head() : chain.io.inspect({ number: 100n, timestamp: 1060n }));
@@ -69,6 +72,81 @@ test('keeper pool/feed faults and RPC failures prevent an observation set; swap 
   }
   const f = keeperChainFixture(); const observations = await f.chain.io.inspect({ number: 100n, timestamp: 1060n }); const first = observations[0]; assert.ok(first);
   await assert.rejects(f.chain.io.swap(first, first.spotE18 * 10_001n / 10_000n, 1n), /cannot reach target/); assert.equal(f.state.sends, 0);
+});
+
+const recoveryErrors = parseAbi(['error TwapUnavailable()', 'error InvalidPoolPrice()', 'error StaleFeed(address feed,uint256 updatedAt)']);
+const primaryRevert = (name: 'TwapUnavailable' | 'InvalidPoolPrice') => new ContractFunctionRevertedError({
+  abi: recoveryErrors, functionName: 'previewSwap', data: encodeErrorResult({ abi: recoveryErrors, errorName: name }),
+});
+
+test('#139 adapter distinguishes exact primary TwapUnavailable from other reverts and RPC errors', async () => {
+  const f = keeperChainFixture(); f.state.primaryError = new RpcRequestError({ body: {}, url: 'http://127.0.0.1:1', error: {
+    code: 3, message: 'execution reverted private-token', data: encodeErrorResult({ abi: recoveryErrors, errorName: 'TwapUnavailable' }),
+  } });
+  const observations = await f.chain.io.inspect({ number: 100n, timestamp: 1060n });
+  assert.equal(observations.length, 92); assert.ok(observations.every((o) => o.twapE18 === null && o.spotE18 > 0n));
+  assert.equal(f.state.calls.filter((c) => c.name === 'previewSwap').length, 92); assert.equal(f.state.sends, 0);
+  for (const error of [primaryRevert('InvalidPoolPrice'), new Error('TwapUnavailable private-token'),
+    new ContractFunctionRevertedError({ abi: parseAbi(['error TwapUnavailable(uint256)']), functionName: 'previewSwap',
+      data: encodeErrorResult({ abi: parseAbi(['error TwapUnavailable(uint256)']), errorName: 'TwapUnavailable', args: [1n] }) }),
+    new Error('RPC timeout private-token'), new ContractFunctionRevertedError({ abi: recoveryErrors, functionName: 'previewSwap', data: '0x' })]) {
+    const f = keeperChainFixture(); f.state.primaryError = error;
+    await assert.rejects(f.chain.io.inspect({ number: 100n, timestamp: 1060n })); assert.equal(f.state.sends, 0);
+  }
+  const router = keeperChainFixture(); router.state.routerError = primaryRevert('TwapUnavailable');
+  await assert.rejects(router.chain.io.inspect({ number: 100n, timestamp: 1060n }));
+  for (const bad of ['zero sqrt', 'low sqrt', 'high sqrt', 'locked', 'observation', 'negative feed', 'future feed']) {
+    const f = keeperChainFixture(); f.state.bad = bad; f.state.primaryError = primaryRevert('TwapUnavailable');
+    await assert.rejects(f.chain.io.inspect({ number: 100n, timestamp: 1060n })); assert.equal(f.state.sends, 0);
+  }
+});
+
+test('#139 real inspection recovers all missing TWAPs and expired feeds across two engine rounds without signing', async () => {
+  const f = keeperChainFixture(); f.state.primaryError = primaryRevert('TwapUnavailable');
+  f.state.assetAt = 1n; f.state.cashAt = 1n; f.state.bad = 'router stale asset';
+  const scenario = parseScenario(JSON.parse(await readFile(new URL('../scripts/price-scenarios/gentle-rise.json', import.meta.url), 'utf8')));
+  let head = { number: 100n, timestamp: 200_000n };
+  const swaps: bigint[] = []; const pushes: bigint[] = []; const logs: string[] = [];
+  const budget = 10_000n * 10n ** 18n;
+  const keeper = new PriceKeeper({ ...f.chain.io, head: async () => head,
+    balance: async () => 10n ** 40n, mint: async () => { assert.fail('inventory is already sufficient'); },
+    swap: async (o, target, limit) => {
+      assert.equal(target, o.spotE18 * 10_001n / 10_000n); assert.equal(limit, budget);
+      swaps.push(target); f.state.observedAt = Number(head.timestamp);
+    },
+    push: async (_feed, answer) => { pushes.push(answer); },
+  }, scenario, f.manifest.usdt, f.manifest.cashFeed, { start: 1000n, minimumUsdtE18: budget,
+    inventoryUsdtE18: 10n * budget, swapBudgetUsdtE18: budget, stallSeconds: 90 },
+  (line) => logs.push(line), async () => { assert.fail('recovery must not alert'); }, () => Number(head.timestamp) * 1000);
+  await keeper.round(); assert.equal(swaps.length, 92); assert.equal(pushes.length, 0);
+  f.state.primaryError = null;
+  head = { number: 101n, timestamp: head.timestamp + 60n };
+  // Feeds can refresh with fresh TWAPs while pool swaps are gated by the on-chain timestamp.
+  scenario.timeline = [{ steps: 1, mode: 'closed', stepBps: 0 }];
+  await keeper.round(); assert.equal(swaps.length, 92); assert.equal(pushes.length, 12); assert.equal(f.state.sends, 0);
+  assert.doesNotMatch(logs.join('\n'), /private-token|critical/);
+});
+
+test('#139 adapter tolerates only StaleFeed proven by the pinned, valid expired feed round', async () => {
+  for (const source of ['cash', 'asset'] as const) {
+    const f = keeperChainFixture();
+    if (source === 'cash') { f.state.cashAt = 1n; f.state.assetAt = 200_000n; }
+    else { f.state.assetAt = 1n; f.state.cashAt = 200_000n; f.state.bad = 'router stale asset'; }
+    // Cash is shared by every secondary; use a fresh read to identify each market's feed.
+    if (source === 'cash') f.state.routerError = new ContractFunctionRevertedError({ abi: recoveryErrors, functionName: 'previewSwap',
+      data: encodeErrorResult({ abi: recoveryErrors, errorName: 'StaleFeed', args: [f.manifest.cashFeed, 1n] }) });
+    const observations = await f.chain.io.inspect({ number: 100n, timestamp: 200_000n });
+    assert.equal(observations.length, 92); assert.ok(observations.filter((o) => o.market.feed).every((o) => o.feedUpdatedAt === 1n));
+    assert.equal(f.state.sends, 0);
+  }
+  for (const updatedAt of [1n, 1000n]) {
+    const f = keeperChainFixture(); f.state.routerError = new ContractFunctionRevertedError({ abi: recoveryErrors, functionName: 'previewSwap',
+      data: encodeErrorResult({ abi: recoveryErrors, errorName: 'StaleFeed', args: [f.manifest.cashFeed, updatedAt] }) });
+    await assert.rejects(f.chain.io.inspect({ number: 100n, timestamp: 1060n }));
+  }
+  const unknown = keeperChainFixture(); unknown.state.cashAt = 1n;
+  unknown.state.routerError = primaryRevert('InvalidPoolPrice');
+  await assert.rejects(unknown.chain.io.inspect({ number: 100n, timestamp: 200_000n }));
 });
 
 test('keeper refuses pool movement between inspection and execution before approval or swap', async () => {

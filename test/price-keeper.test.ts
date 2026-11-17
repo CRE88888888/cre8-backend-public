@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { readFile } from 'node:fs/promises';
-import { getAddress } from 'viem';
+import { getAddress, HttpRequestError, RpcRequestError, TimeoutError } from 'viem';
 import { TESTNET_ASSETS } from '../src/keeper/assets.js';
 import { boundedTarget, canSwap, parseScenario, targetAt } from '../src/keeper/scenario.js';
 import { PriceKeeper } from '../src/keeper/engine.js';
@@ -178,7 +178,7 @@ test('keeper delayed replay caps each actual swap and publishes observed TWAP in
   }
   await keeper.round();
   assert.deepEqual(state.targets, observations.map((o) => o.spotE18 * 10_005n / 10_000n));
-  assert.deepEqual(state.pushes, [100_000_000n, ...observations.filter((o) => o.market.feed).map((o) => o.twapE18 / 10n ** 10n)]);
+  assert.deepEqual(state.pushes, [100_000_000n, ...observations.filter((o) => o.market.feed).map((o) => { assert.ok(o.twapE18 !== null); return o.twapE18 / 10n ** 10n; })]);
 });
 
 test('keeper fresh feeds are not republished before their step is due', async () => {
@@ -195,7 +195,7 @@ test('keeper unconfirmed inventory top-up stops before swaps and alerts once', a
   assert.equal(state.swaps.length, 0); assert.equal(state.pushes.length, 0); assert.equal(state.alerts.length, 1);
 });
 
-test('keeper halts on stalled, old, reversed blocks, missing data and zero price', async () => {
+test('keeper halts on old/future blocks, persistent reversed/stalled blocks, missing data and zero price', async () => {
   const old = fixture(); old.state.now += 91_000; await assert.rejects(old.keeper.round(), /halted/);
   const future = fixture(); future.state.head.timestamp += 91n; await assert.rejects(future.keeper.round(), /halted/);
   const boundary = fixture(); boundary.state.now += 90_000; await boundary.keeper.round();
@@ -205,13 +205,117 @@ test('keeper halts on stalled, old, reversed blocks, missing data and zero price
     (head: Head) => head,
   ]) {
     const f = fixture(); await f.keeper.round(); f.state.now += 90_000; f.state.head = update(f.state.head);
+    for (let i = 1; i < 5; i++) await f.keeper.round();
     await assert.rejects(f.keeper.round(), /halted/); assert.equal(f.state.alerts.length, 1);
+    assert.match(f.state.logs.join('\n'), /block progress unavailable/);
   }
   for (const mutate of [(o: Observation[]) => { o.pop(); }, (o: Observation[]) => { const first = o[0]; assert.ok(first); o[1] = first; },
     (o: Observation[]) => { const first = o[0]; assert.ok(first); first.spotE18 = 0n; }]) {
     const f = fixture(); mutate(f.observations); await assert.rejects(f.keeper.round(), /halted/);
     assert.equal(f.state.swaps.length, 0); assert.equal(f.state.mints.length, 0);
   }
+});
+
+test('#139 expired feeds recover at and beyond max age using validated TWAPs', async () => {
+  for (const excess of [0n, 1n, 100_000n]) {
+    const f = fixture(); f.state.head = { number: 200n, timestamp: 200_000n }; f.state.now = 200_000_000;
+    for (const o of f.observations) {
+      o.lastObservation = f.state.head.timestamp - 60n;
+      if (o.market.feed) o.feedUpdatedAt = f.state.head.timestamp - BigInt(o.market.maxFeedAge) - excess;
+    }
+    await f.keeper.round();
+    assert.equal(f.state.pushes.length, 12); assert.equal(f.state.alerts.length, 0);
+    assert.deepEqual(f.state.pushes, [100_000_000n, ...f.observations.filter((o) => o.market.feed).map((o) => { assert.ok(o.twapE18 !== null); return o.twapE18 / 10n ** 10n; })]);
+  }
+});
+
+test('#139 a regressed or repeated head skips all IO until progress resumes and resets the five-round limit', async () => {
+  const f = fixture(); await f.keeper.round();
+  const inspections = f.state.inspections; const swaps = f.state.swaps.length; const pushes = f.state.pushes.length;
+  for (const head of [{ number: 99n, timestamp: 1059n }, { number: 100n, timestamp: 1060n },
+    { number: 101n, timestamp: 1059n }, { number: 99n, timestamp: 1060n }]) {
+    f.state.head = head; await f.keeper.round();
+    assert.equal(f.state.inspections, inspections); assert.equal(f.state.swaps.length, swaps); assert.equal(f.state.pushes.length, pushes);
+  }
+  f.state.head = { number: 101n, timestamp: 1061n }; await f.keeper.round(); // Progress also counts before the scenario step is due.
+  for (let i = 1; i < 5; i++) await f.keeper.round();
+  assert.equal(f.state.alerts.length, 0);
+  await assert.rejects(f.keeper.round(), /halted/); assert.equal(f.state.alerts.length, 1);
+  await assert.rejects(f.keeper.round(), /stopped/); assert.equal(f.state.alerts.length, 1);
+});
+
+test('#139 all 92 unavailable TWAPs receive only a 1 bp recovery swap, then normal validation and feed pushes resume', async () => {
+  const f = fixture(); f.state.head = { number: 200n, timestamp: 200_000n }; f.state.now = 200_000_000;
+  const prices = f.observations.map((o) => o.spotE18);
+  for (const o of f.observations) o.twapE18 = null;
+  await f.keeper.round();
+  assert.equal(f.state.swaps.length, 92); assert.equal(new Set(f.state.swaps).size, 92);
+  assert.deepEqual(f.state.targets, prices.map((p) => p * 10_001n / 10_000n));
+  assert.equal(f.state.pushes.length, 0); assert.equal(f.state.inspections, 1); assert.equal(f.state.alerts.length, 0);
+  await f.keeper.round(); assert.equal(f.state.swaps.length, 92);
+  for (const [i, o] of f.observations.entries()) {
+    const price = prices[i]; assert.ok(price); o.twapE18 = price; o.lastObservation = 200_000n;
+    const target = f.state.targets[i]; assert.ok(target); o.spotE18 = target;
+  }
+  f.state.head = { number: 201n, timestamp: 200_060n }; f.state.now += 60_000;
+  await f.keeper.round(); assert.equal(f.state.pushes.length, 12); assert.equal(f.state.alerts.length, 0);
+});
+
+test('#139 partial TWAP recovery leaves healthy markets alone and validates every market before writes', async () => {
+  const f = fixture(); const first = f.observations[0]; assert.ok(first); first.twapE18 = null;
+  await f.keeper.round(); assert.deepEqual(f.state.swaps, [first.market.symbol]); assert.equal(f.state.pushes.length, 0);
+  for (const bad of ['missing', 'zero spot', 'zero twap', 'future observation', 'missing feed']) {
+    const f = fixture(); const first = f.observations[0]; const last = f.observations.at(-1); assert.ok(first && last);
+    first.twapE18 = null;
+    if (bad === 'missing') f.observations.pop();
+    if (bad === 'zero spot') last.spotE18 = 0n;
+    if (bad === 'zero twap') last.twapE18 = 0n;
+    if (bad === 'future observation') last.lastObservation = 1061n;
+    if (bad === 'missing feed') { const feed = f.observations.find((o) => o.market.feed); assert.ok(feed); feed.feedUpdatedAt = null; }
+    await assert.rejects(f.keeper.round(), /halted/);
+    assert.equal(f.state.mints.length, 0); assert.equal(f.state.swaps.length, 0); assert.equal(f.state.pushes.length, 0);
+  }
+});
+
+test('#139 recovery retains the observation interval, precision, inventory and failed-write guards', async () => {
+  const early = fixture(); for (const o of early.observations) { o.twapE18 = null; o.lastObservation = 1001n; }
+  await early.keeper.round(); assert.equal(early.state.swaps.length, 0); assert.equal(early.state.pushes.length, 0);
+  for (const fault of ['swap', 'cash', 'dust']) {
+    const f = fixture(); const first = f.observations[0]; assert.ok(first); first.twapE18 = null;
+    if (fault === 'swap') f.state.fail = 'swap';
+    if (fault === 'cash') f.state.balances.set(addr(1), 0n);
+    if (fault === 'dust') first.spotE18 = 1n;
+    await assert.rejects(f.keeper.round(), /halted/); assert.equal(f.state.pushes.length, 0); assert.equal(f.state.alerts.length, 1);
+    await assert.rejects(f.keeper.round(), /stopped/); assert.equal(f.state.swaps.length, 0);
+  }
+});
+
+test('#139 stopped logs explain the stage and safe local/RPC reason without upstream secrets', async () => {
+  const local = fixture(); local.observations.pop();
+  await assert.rejects(local.keeper.round(), /halted/);
+  assert.match(local.state.logs.join('\n'), /inspect.*incomplete market observations/);
+  for (const error of [new TimeoutError({ body: {}, url: 'https://private-token.invalid/key' }),
+    new RpcRequestError({ body: {}, url: 'https://private-token.invalid/key', error: { code: -32000, message: 'seed=private-token' } }),
+    new HttpRequestError({ url: 'https://private-token.invalid/key', status: 503, details: 'seed=private-token' })]) {
+    const f = fixture(); f.io.head = async () => { throw error; };
+    await assert.rejects(f.keeper.round(), /halted/);
+    const output = f.state.logs.join('\n') + f.state.alerts.join('\n');
+    assert.match(output, new RegExp(`head.*${error.name}`));
+    if (error instanceof HttpRequestError) assert.match(output, /503/);
+    if (error instanceof RpcRequestError) assert.match(output, /-32000/);
+    assert.doesNotMatch(output, /private-token|https:|seed=/);
+  }
+});
+
+test('#139 TWAP unavailable during the post-swap refresh halts before publishing even the cash feed', async () => {
+  const f = fixture(); const inspect = f.io.inspect;
+  f.io.inspect = async (head) => {
+    const observations = await inspect(head);
+    return f.state.inspections > 1 ? observations.map((o) => ({ ...o, twapE18: null })) : observations;
+  };
+  await assert.rejects(f.keeper.round(), /halted/);
+  assert.equal(f.state.swaps.length, 92); assert.equal(f.state.pushes.length, 0);
+  assert.match(f.state.logs.join('\n'), /refresh inspect.*TWAP unavailable after swaps/);
 });
 
 test('keeper rejects missing/future/stale feed metadata before mint, tolerates alert failure and prohibits concurrent rounds', async () => {
@@ -249,9 +353,11 @@ test('keeper price encoding handles both token orders and 6/8/9/18 decimals', ()
 test('keeper feed health validates exact max age, missing/negative/future/incomplete rounds', () => {
   const round = [1n, 100_000_000n, 1000n, 1000n, 1n] as const;
   validateFeed(round, 4600n, 3600);
+  validateFeed(round, 4601n, 3600, true);
   for (const value of [[0n, 1n, 1000n, 1000n, 1n], [2n, 1n, 1000n, 1000n, 1n], [1n, 0n, 1000n, 1000n, 1n],
     [1n, -1n, 1000n, 1000n, 1n], [1n, 1n, 0n, 0n, 1n], [1n, 1n, 1001n, 1001n, 1n]] as const) {
     assert.throws(() => validateFeed(value, 1000n, 3600));
+    assert.throws(() => validateFeed(value, 1000n, 3600, true));
   }
   assert.throws(() => validateFeed(round, 4601n, 3600));
 });

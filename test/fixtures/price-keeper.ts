@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { custom, decodeFunctionData, encodeFunctionResult, getAddress, isHex, zeroAddress } from 'viem';
+import { custom, decodeFunctionData, encodeErrorResult, encodeFunctionResult, getAddress, isHex, RpcRequestError, zeroAddress } from 'viem';
 import { TESTNET_ASSETS } from '../../src/keeper/assets.js';
 import { createKeeperChain, KEEPER_ABI, parseManifest, signingAccount, sqrtPriceFor } from '../../src/keeper/chain.js';
 
@@ -17,7 +17,8 @@ export function manifestInput() {
 
 export function keeperChainFixture() {
   const manifest = parseManifest(manifestInput());
-  const state = { chainId: 97, fail: '', bad: '', calls: [] as { method: string; name: string; block: unknown }[], sends: 0 };
+  const state = { chainId: 97, fail: '', bad: '', primaryError: null as Error | null, routerError: null as Error | null,
+    assetAt: 1000n, cashAt: 1000n, observedAt: 1000, calls: [] as { method: string; name: string; block: unknown }[], sends: 0 };
   const transport = custom({ request: async ({ method, params }) => {
     if (method === state.fail) throw new Error('secret RPC URL and key');
     if (method === 'eth_chainId') return `0x${state.chainId.toString(16)}`;
@@ -31,7 +32,9 @@ export function keeperChainFixture() {
     const { functionName: name, args } = decodeFunctionData({ abi: KEEPER_ABI, data });
     state.calls.push({ method, name, block: params[1] });
     if (state.fail === name) throw new Error('secret RPC URL and key');
-    const index = manifest.markets.findIndex((m) => [m.token, m.pool, m.oracle, m.feed, m.secondary].some((a) => a?.toLowerCase() === to));
+    const index = manifest.markets.findIndex((m) => to === manifest.router.toLowerCase()
+      ? args?.some((a) => typeof a === 'string' && a.toLowerCase() === m.token.toLowerCase())
+      : [m.token, m.pool, m.oracle, m.feed, m.secondary].some((a) => a?.toLowerCase() === to));
     const market = manifest.markets[Math.max(0, index)]; const spec = TESTNET_ASSETS[Math.max(0, index)]; assert.ok(market && spec);
     const result = (value: Parameters<typeof encodeFunctionResult<typeof KEEPER_ABI, typeof name>>[0]['result']) => encodeFunctionResult({ abi: KEEPER_ABI, functionName: name, result: value });
     switch (name) {
@@ -54,12 +57,22 @@ export function keeperChainFixture() {
       case 'assetFeed': assert.ok(market.feed); return result(state.bad === name ? zeroAddress : market.feed);
       case 'numeraireFeed': return result(state.bad === name ? zeroAddress : manifest.cashFeed);
       case 'maxAge': return result(state.bad === name ? 0 : market.maxFeedAge);
-      case 'slot0': return result([sqrtPriceFor(BigInt(spec.priceE18) * (state.bad === 'pool moved' ? 2n : 1n), market.decimals, true), 1, 0, state.bad === 'cardinality' ? 1 : 600, state.bad === 'capacity' ? 599 : 600, 0, state.bad !== 'locked']);
+      case 'slot0': return result([state.bad === 'zero sqrt' ? 0n : state.bad === 'low sqrt' ? 4_295_128_738n :
+        state.bad === 'high sqrt' ? 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_342n :
+        sqrtPriceFor(BigInt(spec.priceE18) * (state.bad === 'pool moved' ? 2n : 1n), market.decimals, true),
+        1, 0, state.bad === 'cardinality' ? 1 : 600, state.bad === 'capacity' ? 599 : 600, 0, state.bad !== 'locked']);
       case 'token0': return result(market.token);
-      case 'observations': return result([1000, 1n, 1n, state.bad !== 'observation']);
+      case 'observations': return result([state.observedAt, 1n, 1n, state.bad !== 'observation']);
       case 'latestRoundData': return result([1n, state.bad === 'negative feed' ? -1n : state.bad === 'cash price' ? 99_000_000n : 100_000_000n,
-        1000n, state.bad === 'stale feed' ? 1n : state.bad === 'future feed' ? 1061n : 1000n, 1n]);
-      case 'previewSwap': return result([BigInt(spec.priceE18), BigInt(spec.priceE18) * 99n / 100n]);
+        1000n, state.bad === 'stale feed' ? 1n : state.bad === 'future feed' ? 1061n : to === manifest.cashFeed.toLowerCase() ? state.cashAt : state.assetAt, 1n]);
+      case 'previewSwap':
+        if (to === market.oracle.toLowerCase() && state.primaryError) throw state.primaryError;
+        if (to === manifest.router.toLowerCase() && market.feed && state.routerError) throw state.routerError;
+        if (to === manifest.router.toLowerCase() && market.feed && state.bad === 'router stale asset') {
+          throw new RpcRequestError({ body: {}, url: 'http://127.0.0.1:1', error: { code: 3, message: 'execution reverted private-token',
+            data: encodeErrorResult({ abi: KEEPER_ABI, errorName: 'StaleFeed', args: [market.feed, state.assetAt] }) } });
+        }
+        return result([BigInt(spec.priceE18), BigInt(spec.priceE18) * 99n / 100n]);
       case 'balanceOf': return result(0n);
       case 'quoteExactInputSingle': return result([1n, 1n, 0, 1n]);
       default: assert.fail(`unexpected contract read ${name}`);

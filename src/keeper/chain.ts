@@ -1,4 +1,4 @@
-import { createPublicClient, createWalletClient, getAddress, http, isAddress, isHex, parseAbi, size, zeroAddress } from 'viem';
+import { BaseError, ContractFunctionRevertedError, createPublicClient, createWalletClient, decodeErrorResult, getAddress, http, isAddress, isHex, parseAbi, size, zeroAddress } from 'viem';
 import type { Account, Address, Hex, Transport } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { bscTestnet } from 'viem/chains';
@@ -12,6 +12,8 @@ export const QUOTER = getAddress('0xbC203d7f83677c7ed3F7acEc959963E7F4ECC5C2');
 const FACTORY = getAddress('0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865');
 
 export const KEEPER_ABI = parseAbi([
+  'error TwapUnavailable()',
+  'error StaleFeed(address feed,uint256 updatedAt)',
   'function factory() view returns (address)',
   'function getPool(address,address,uint24) view returns (address)',
   'function token0() view returns (address)',
@@ -97,9 +99,20 @@ export function spotPrice(sqrt: bigint, decimals: number, assetIsToken0: boolean
   return assetIsToken0 ? sqrt * sqrt * unit / Q192 : unit * Q192 / (sqrt * sqrt);
 }
 
-export function validateFeed(round: readonly [bigint, bigint, bigint, bigint, bigint], timestamp: bigint, maxAge: number): void {
+export function validateFeed(round: readonly [bigint, bigint, bigint, bigint, bigint], timestamp: bigint, maxAge: number, allowStale = false): void {
   const [id, answer, , updatedAt, answeredIn] = round;
-  if (id === 0n || answeredIn < id || answer <= 0n || updatedAt <= 0n || updatedAt > timestamp || timestamp - updatedAt > BigInt(maxAge)) throw new Error('feed unavailable');
+  if (id === 0n || answeredIn < id || answer <= 0n || updatedAt <= 0n || updatedAt > timestamp ||
+    (!allowStale && timestamp - updatedAt > BigInt(maxAge))) throw new Error('feed unavailable');
+}
+
+function revertData(error: unknown) {
+  if (!(error instanceof BaseError)) return undefined;
+  const cause = error.walk((cause) => cause instanceof ContractFunctionRevertedError);
+  if (!(cause instanceof ContractFunctionRevertedError) || !cause.raw) return undefined;
+  try {
+    // Decode our exact ABI; an identically named error with different arguments is unrelated.
+    return decodeErrorResult({ abi: KEEPER_ABI, data: cause.raw });
+  } catch { return undefined; }
 }
 
 export function createKeeperChain(rpcUrl: string, account: Account, manifest: Manifest, log: (line: string) => void, transport?: Transport) {
@@ -163,28 +176,50 @@ export function createKeeperChain(rpcUrl: string, account: Account, manifest: Ma
     head,
     async inspect(block) {
       const cash = await client.readContract({ address: manifest.cashFeed, abi: KEEPER_ABI, functionName: 'latestRoundData', blockNumber: block.number });
-      validateFeed(cash, block.timestamp, 3600);
+      // These are keeper-owned feeds: age makes them due for a push, not invalid input.
+      validateFeed(cash, block.timestamp, 3600, true);
       if (cash[1] !== 100_000_000n) throw new Error('unexpected mock USDT/USD');
       const result: Observation[] = [];
       for (const market of manifest.markets) {
         const blockNumber = block.number;
         const slot = await client.readContract({ address: market.pool, abi: KEEPER_ABI, functionName: 'slot0', blockNumber });
         if (!slot[6] || slot[3] < 2 || slot[4] < 600) throw new Error('pool observation capacity unavailable');
+        // A stale primary reverts before its own spot sanity gate. Keep that gate during recovery too.
+        if (slot[0] < 4_295_128_739n || slot[0] >= 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_342n) throw new Error('invalid pool price');
         const observation = await client.readContract({ address: market.pool, abi: KEEPER_ABI, functionName: 'observations', args: [BigInt(slot[2])], blockNumber });
         if (!observation[3]) throw new Error('missing observation');
         const token0 = await client.readContract({ address: market.pool, abi: KEEPER_ABI, functionName: 'token0', blockNumber });
-        const primary = await client.readContract({ address: market.oracle, abi: KEEPER_ABI, functionName: 'previewSwap', args: [market.token, manifest.usdt, 10n ** BigInt(market.decimals)], blockNumber });
-        // Router health includes secondary consistency in both token directions.
-        for (const [tokenIn, tokenOut, amountIn] of [[market.token, manifest.usdt, 10n ** BigInt(market.decimals)], [manifest.usdt, market.token, 10n ** 18n]] as const) {
-          await client.readContract({ address: manifest.router, abi: KEEPER_ABI, functionName: 'previewSwap', args: [tokenIn, tokenOut, amountIn], blockNumber });
-        }
+        const expired = new Map<string, bigint>();
+        if (block.timestamp - cash[3] > 3600n) expired.set(manifest.cashFeed.toLowerCase(), cash[3]);
         let feedUpdatedAt: bigint | null = null;
         if (market.feed) {
           const feed = await client.readContract({ address: market.feed, abi: KEEPER_ABI, functionName: 'latestRoundData', blockNumber });
-          validateFeed(feed, block.timestamp, market.maxFeedAge);
+          validateFeed(feed, block.timestamp, market.maxFeedAge, true);
+          if (block.timestamp - feed[3] > BigInt(market.maxFeedAge)) expired.set(market.feed.toLowerCase(), feed[3]);
           feedUpdatedAt = feed[3] < cash[3] ? feed[3] : cash[3];
         }
-        result.push({ market, spotE18: spotPrice(slot[0], market.decimals, same(token0, market.token)), twapE18: primary[0], lastObservation: BigInt(observation[0]), feedUpdatedAt });
+        let twapE18: bigint | null = null;
+        try {
+          const primary = await client.readContract({ address: market.oracle, abi: KEEPER_ABI, functionName: 'previewSwap', args: [market.token, manifest.usdt, 10n ** BigInt(market.decimals)], blockNumber });
+          twapE18 = primary[0];
+        } catch (error) {
+          if (revertData(error)?.errorName !== 'TwapUnavailable') throw error;
+        }
+        if (twapE18 !== null) {
+          // A missing primary needs a maintenance swap first; router validation resumes next round.
+          for (const [tokenIn, tokenOut, amountIn] of [[market.token, manifest.usdt, 10n ** BigInt(market.decimals)], [manifest.usdt, market.token, 10n ** 18n]] as const) {
+            try {
+              await client.readContract({ address: manifest.router, abi: KEEPER_ABI, functionName: 'previewSwap', args: [tokenIn, tokenOut, amountIn], blockNumber });
+            } catch (error) {
+              const data = revertData(error);
+              const args = data?.args;
+              // Do not swallow any other revert, or StaleFeed for an unverified feed/timestamp.
+              if (data?.errorName !== 'StaleFeed' || !args || typeof args[0] !== 'string' ||
+                expired.get(args[0].toLowerCase()) !== args[1]) throw error;
+            }
+          }
+        }
+        result.push({ market, spotE18: spotPrice(slot[0], market.decimals, same(token0, market.token)), twapE18, lastObservation: BigInt(observation[0]), feedUpdatedAt });
       }
       return result;
     },

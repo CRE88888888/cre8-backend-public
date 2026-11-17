@@ -18,6 +18,7 @@ import { resolveOperatorWallets } from './waitlist-access.js';
 export { resolveOperatorWallets } from './waitlist-access.js';
 import { createWaitlistInviteService } from './waitlist-invites.js';
 import { claimFaucetUsdt } from './faucet.js';
+import { claimFaucetGas } from './gas-faucet.js';
 import { sponsorUserOperation } from './paymaster.js';
 import { createPointsService } from './points.js';
 import { RateLimitError, RequestRateLimiter } from './ratelimit.js';
@@ -170,6 +171,7 @@ export type ServerDeps = {
   portfolioStrategies: ReturnType<typeof createPortfolioStrategyService>;
   points: ReturnType<typeof createPointsService>;
   claimFaucetUsdt: typeof claimFaucetUsdt;
+  claimFaucetGas: typeof claimFaucetGas;
   sponsorUserOperation: typeof sponsorUserOperation;
   privyLogin: typeof loginWithPrivy;
   waitlist: ReturnType<typeof createWaitlistService>;
@@ -299,6 +301,7 @@ const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
   portfolioStrategies: createPortfolioStrategyService(),
   points: createPointsService(),
   claimFaucetUsdt,
+  claimFaucetGas,
   sponsorUserOperation,
   privyLogin: loginWithPrivy,
   waitlist: createWaitlistService(),
@@ -509,6 +512,13 @@ async function route(
   if (root === 'health' && segments.length === 1) {
     if (method !== 'GET') return methodNotAllowed(res, ['GET']);
     return health(res);
+  }
+
+  if (root === 'faucet' && segments.length === 2 && segments[1] === 'gas') {
+    if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    sendJson(res, 200, await deps.claimFaucetGas(await readJsonBody(req), wallet));
+    return;
   }
 
   if (root === 'faucet' && segments.length === 2 && segments[1] === 'usdt') {

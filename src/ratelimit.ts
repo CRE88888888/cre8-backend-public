@@ -132,6 +132,7 @@ export async function pruneDailyOperationCounts(): Promise<void> {
 
 export class RequestRateLimiter {
   readonly #trustedProxies: Set<string>;
+  readonly #gasFaucet = new MemoryRateLimitStore();
   constructor(
     readonly config: RateLimitConfig = loadRateLimitConfig(),
     readonly store: RateLimitStore = new PersistentRateLimitStore(),
@@ -158,6 +159,13 @@ export class RequestRateLimiter {
   }
   async auth(ip: string): Promise<void> {
     await this.#consume('auth:' + ip, this.config.authPerMinute, MINUTE_MS);
+  }
+  /** C3 #149: testnet-only attempt budget; restarting the process resets it.
+   * Kept separate from all persistent production and USDT/paymaster budgets.
+   */
+  async gasFaucet(wallet: string): Promise<void> {
+    const result = await this.#gasFaucet.consume('gas-faucet:' + wallet.toLowerCase(), { limit: 1, windowMs: DAY_MS }, this.now());
+    if (!result.allowed) throw new AppError(429, 'GAS_FAUCET_QUOTA', 'gas faucet daily quota reached; retry next UTC day');
   }
   async wallet(action: WalletAction, wallet: string): Promise<void> {
     const limits: Record<WalletAction, RateLimitPolicy> = {

@@ -310,6 +310,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     configuredAddress(env, 'PAYMASTER_MOCK_USDT_ADDRESS');
   }
   loadFaucetConfig(env);
+  loadGasFaucetConfig(env);
   loadWelcomeConfig(env);
   // API 與 scheduler 的啟動都走這裡；不要等第一則警示才發現只填了一半。
   loadTelegramConfig(env);
@@ -524,6 +525,20 @@ function configuredAddress(env: NodeJS.ProcessEnv, name: string): Address | null
 }
 
 export type FaucetConfig = { chainId: 97; amountWei: bigint; siteDailyWei: bigint; timeoutMs: number };
+
+export type GasFaucetConfig = { chainId: 97; thresholdWei: bigint; targetWei: bigint; siteDailyWei: bigint; timeoutMs: number };
+
+/** Explicit opt-in, testnet only. Zero threshold/site cap pauses new transfers. */
+export function loadGasFaucetConfig(env: NodeJS.ProcessEnv = process.env): GasFaucetConfig | null {
+  if (env.GAS_FAUCET_ENABLED?.trim() !== '1' || parseInteger(env, 'CHAIN_ID', DEFAULT_CHAIN_ID, { min: 1 }) !== 97) return null;
+  const thresholdWei = parseBigInt(env, 'GAS_FAUCET_THRESHOLD_WEI', 200_000_000_000_000n);
+  const targetWei = parseBigInt(env, 'GAS_FAUCET_TARGET_WEI', 500_000_000_000_000n);
+  const siteDailyWei = parseBigInt(env, 'GAS_FAUCET_SITE_DAILY_WEI', 50_000_000_000_000_000n);
+  if ([thresholdWei, targetWei, siteDailyWei].some(value => value >= 1n << 256n) || targetWei <= thresholdWei) {
+    throw new ConfigurationError('GAS_FAUCET wei amounts must fit uint256 and target must exceed threshold');
+  }
+  return { chainId: 97, thresholdWei, targetWei, siteDailyWei, timeoutMs: 30_000 };
+}
 
 export const WELCOME_AMOUNT_WEI = 10_000n * 10n ** 18n;
 export type WelcomeConfig = { chainId: 97; siteDailyWei: bigint; timeoutMs: number };

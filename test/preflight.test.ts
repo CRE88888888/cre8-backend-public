@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { test } from 'node:test';
 import { mnemonicToAccount } from 'viem/accounts';
-import { createPublicClient, custom, getAddress, encodeAbiParameters, encodeEventTopics, encodeFunctionResult, zeroAddress } from 'viem';
+import { BaseError, createPublicClient, custom, getAddress, encodeAbiParameters, encodeEventTopics, encodeFunctionResult, zeroAddress } from 'viem';
 import { EXECUTOR_ABI, PANCAKE_UR } from '../src/chain.js';
 import type { Address } from 'viem';
 import { checkSecondarySources, checkVenues, checkBuyConfig, checkGlobalPaused, checkOwnership, checkRegistryOperator, checkRoleSeparation, checkSessionKeySeed, operatorAddress } from '../scripts/preflight.js';
@@ -355,20 +355,39 @@ for (const strict of [false, true]) {
 }
 
 function venuePreflightFixture() {
-  const state = { urKind: 1, urSpender: PANCAKE_UR, otherKind: 2, wrongDeployment: false, fail: '', blocks: [] as unknown[] };
+  const state = {
+    urKind: 1, urSpender: PANCAKE_UR, otherKind: 2, wrongDeployment: false, fail: '', blocks: new Array<unknown>(),
+    head: 42n, deployed: 40n, codeErrors: new Map<bigint, unknown>(), codeReads: new Array<bigint>(),
+    emptyCode: new Set<bigint>(), logErrors: new Map<bigint, unknown>(),
+    ranges: new Array<{ from: bigint; to: bigint }>(), malformedLogs: false,
+    events: [PANCAKE_UR, OTHER, OTHER].map((target) => ({ target, block: 41n })),
+  };
   const client = createPublicClient({ transport: custom({ request: async ({ method, params }) => {
     if (state.fail === method) throw new Error('RPC secret-token');
-    if (method === 'eth_blockNumber') return '0x2a';
+    if (method === 'eth_blockNumber') return `0x${state.head.toString(16)}`;
     if (method === 'eth_getCode') {
       assert.ok(Array.isArray(params));
-      return params[1] === '0x27' && !state.wrongDeployment ? '0x' : '0x1234';
+      const block = params[1]; assert.equal(typeof block, 'string');
+      const height = BigInt(block); state.codeReads.push(height);
+      if (state.codeErrors.has(height)) throw state.codeErrors.get(height);
+      return state.emptyCode.has(height) || (height < state.deployed && !state.wrongDeployment) ? '0x' : '0x1234';
     }
-    if (method === 'eth_getLogs') return [PANCAKE_UR, OTHER, OTHER].map((target, index) => ({
-      address: SAFE, blockNumber: '0x29', blockHash: `0x${'a'.repeat(64)}`, transactionHash: `0x${'b'.repeat(64)}`,
-      transactionIndex: '0x0', logIndex: `0x${index}`, removed: false,
-      topics: encodeEventTopics({ abi: EXECUTOR_ABI, eventName: 'VenueSet', args: { target } }),
-      data: encodeAbiParameters([{ type: 'uint8' }, { type: 'address' }], [2, OTHER]),
-    }));
+    if (method === 'eth_getLogs') {
+      assert.ok(Array.isArray(params));
+      const filter: unknown = params[0]; assert.ok(typeof filter === 'object' && filter !== null);
+      const from: unknown = Reflect.get(filter, 'fromBlock'), to: unknown = Reflect.get(filter, 'toBlock');
+      assert.ok(typeof from === 'string'); assert.ok(typeof to === 'string');
+      const range = { from: BigInt(from), to: BigInt(to) }; state.ranges.push(range);
+      if (state.logErrors.has(range.from)) throw state.logErrors.get(range.from);
+      if (range.to - range.from >= 5000n) throw new Error('block range limit exceeded');
+      if (state.malformedLogs) return null;
+      return state.events.filter(({ block }) => block >= range.from && block <= range.to).map(({ target, block }, index) => ({
+        address: SAFE, blockNumber: `0x${block.toString(16)}`, blockHash: `0x${'a'.repeat(64)}`, transactionHash: `0x${'b'.repeat(64)}`,
+        transactionIndex: '0x0', logIndex: `0x${index}`, removed: false,
+        topics: encodeEventTopics({ abi: EXECUTOR_ABI, eventName: 'VenueSet', args: { target } }),
+        data: encodeAbiParameters([{ type: 'uint8' }, { type: 'address' }], [2, OTHER]),
+      }));
+    }
     assert.equal(method, 'eth_call'); assert.ok(Array.isArray(params));
     const call: unknown = params[0]; assert.ok(typeof call === 'object' && call !== null);
     const data: unknown = Reflect.get(call, 'data');
@@ -411,6 +430,7 @@ for (const method of ['eth_blockNumber', 'eth_getCode', 'eth_getLogs', 'eth_call
 
 test('#47 preflight deployment block accepts zero and rejects negative or future heights', async () => {
   const f = venuePreflightFixture();
+  f.state.deployed = 0n;
   assert.ok((await checkVenues(f.client, getAddress(SAFE.toLowerCase()), 0n)).every((check) => check.level === 'ok'));
   for (const block of [-1n, 43n]) {
     assert.equal((await checkVenues(f.client, getAddress(SAFE.toLowerCase()), block))[0]?.level, 'fail');
@@ -420,6 +440,115 @@ test('#47 preflight deployment block accepts zero and rejects negative or future
 test('#47 preflight rejects a scan starting after deployment to avoid omitting old venues', async () => {
   const f = venuePreflightFixture(); f.state.wrongDeployment = true;
   assert.equal((await checkVenues(f.client, getAddress(SAFE.toLowerCase()), 40n))[0]?.level, 'fail');
+});
+
+for (const count of [1n, 5000n, 5001n, 10001n, 50001n]) {
+  test(`#140 venue scan covers exactly ${count} blocks in bounded contiguous ranges`, async () => {
+    const f = venuePreflightFixture();
+    f.state.head = f.state.deployed + count - 1n;
+    f.state.events = [
+      { target: PANCAKE_UR, block: f.state.deployed },
+      { target: OTHER, block: f.state.head },
+      { target: OTHER, block: f.state.head },
+    ];
+    const checks = await checkVenues(f.client, getAddress(SAFE.toLowerCase()), f.state.deployed);
+    assert.equal(checks.length, 2); assert.ok(checks.every((check) => check.level === 'ok'));
+    assert.equal(f.state.ranges.length, Number((count + 4999n) / 5000n));
+    let next = f.state.deployed;
+    for (const range of f.state.ranges) {
+      assert.equal(range.from, next);
+      assert.equal(range.to, next + 4999n < f.state.head ? next + 4999n : f.state.head);
+      next = range.to + 1n;
+    }
+    assert.equal(next, f.state.head + 1n);
+    assert.deepEqual(f.state.blocks, [`0x${f.state.head.toString(16)}`, `0x${f.state.head.toString(16)}`]);
+  });
+}
+
+test('#140 empty event pages still check the canonical router', async () => {
+  const f = venuePreflightFixture(); f.state.events = []; f.state.head = 5040n;
+  const checks = await checkVenues(f.client, getAddress(SAFE.toLowerCase()), 40n);
+  assert.equal(checks.length, 1); assert.equal(checks[0]?.level, 'ok');
+  assert.equal(f.state.ranges.length, 2);
+  f.state.urKind = 0;
+  assert.equal((await checkVenues(f.client, getAddress(SAFE.toLowerCase()), 40n))[0]?.level, 'fail');
+});
+
+test('#140 targets from every page are deduplicated and all states are read at the pinned head', async () => {
+  const f = venuePreflightFixture(); f.state.head = 10040n;
+  f.state.events = [
+    { target: OTHER, block: 40n }, { target: OPERATOR, block: 5040n },
+    { target: BUNDLER, block: 10040n }, { target: OTHER, block: 10040n },
+  ];
+  const checks = await checkVenues(f.client, getAddress(SAFE.toLowerCase()), 40n);
+  assert.equal(checks.length, 4); assert.ok(checks.every((check) => check.level === 'ok'));
+  for (const target of [PANCAKE_UR, OTHER, OPERATOR, BUNDLER]) {
+    assert.equal(checks.filter((check) => check.name.toLowerCase().endsWith(target.toLowerCase())).length, 1);
+  }
+  assert.deepEqual(f.state.blocks, new Array<string>(4).fill(`0x${f.state.head.toString(16)}`));
+});
+
+for (const block of [40n, 39n]) {
+  for (const reason of ['missing trie node', 'header not found', 'historical state is not available', 'state has been pruned', 'Archive requests require a personal token']) {
+    test(`#140 ${reason} at ${block} falls back to current code and preserves the deployment start`, async () => {
+      const f = venuePreflightFixture();
+      f.state.codeErrors.set(block, new BaseError('RPC request failed', { cause: new Error(`${reason}: https://rpc.invalid/private-token`) }));
+      const checks = await checkVenues(f.client, getAddress(SAFE.toLowerCase()), 40n);
+      assert.equal(checks.length, 2); assert.ok(checks.every((check) => check.level === 'ok'));
+      assert.ok(f.state.codeReads.includes(42n));
+      assert.deepEqual(f.state.ranges, [{ from: 40n, to: 42n }]);
+      assert.match(checks[0]?.detail ?? '', /歷史狀態.*40/);
+      assert.doesNotMatch(JSON.stringify(checks), /rpc.invalid|private-token/);
+    });
+  }
+}
+
+test('#140 fallback cannot hide empty current code, a current RPC failure or an observed deployment mismatch', async () => {
+  for (const mode of ['empty-current', 'current-rpc', 'empty-deployment', 'wrong-deployment']) {
+    const f = venuePreflightFixture();
+    f.state.codeErrors.set(mode === 'empty-deployment' ? 39n : 40n, new Error('missing trie node'));
+    if (mode === 'empty-current') f.state.emptyCode.add(42n);
+    if (mode === 'current-rpc') f.state.codeErrors.set(42n, new Error('timeout private-token'));
+    if (mode === 'empty-deployment') f.state.emptyCode.add(40n);
+    if (mode === 'wrong-deployment') {
+      f.state.codeErrors.clear(); f.state.wrongDeployment = true;
+    }
+    const checks = await checkVenues(f.client, getAddress(SAFE.toLowerCase()), 40n);
+    assert.equal(checks[0]?.level, 'fail', mode);
+    assert.equal(f.state.ranges.length, 0, mode);
+    assert.doesNotMatch(JSON.stringify(checks), /private-token/);
+  }
+});
+
+for (const reason of ['timeout', 'connection refused', 'method not found', 'rate limit exceeded', 'limit exceeded']) {
+  test(`#140 ordinary historical getCode failure (${reason}) never falls back`, async () => {
+    const f = venuePreflightFixture(); f.state.codeErrors.set(40n, new Error(`${reason} private-token`));
+    const checks = await checkVenues(f.client, getAddress(SAFE.toLowerCase()), 40n);
+    assert.equal(checks[0]?.level, 'fail'); assert.deepEqual(f.state.codeReads, [40n]);
+    assert.equal(f.state.ranges.length, 0);
+    assert.match(checks[0]?.detail ?? '', /getCode/);
+    if (reason === 'limit exceeded') assert.match(checks[0]?.detail ?? '', /節點限制/);
+    assert.doesNotMatch(JSON.stringify(checks), /private-token/);
+  });
+}
+
+for (const from of [40n, 5040n, 10040n]) {
+  test(`#140 failed event page at ${from} fails the whole scan with a safe cause and range`, async () => {
+    const f = venuePreflightFixture(); f.state.head = 10040n;
+    f.state.logErrors.set(from, new BaseError('RPC request failed', { cause: new Error('block range limit exceeded https://rpc.invalid/private-token') }));
+    const checks = await checkVenues(f.client, getAddress(SAFE.toLowerCase()), 40n);
+    assert.equal(checks.length, 1); assert.equal(checks[0]?.level, 'fail');
+    assert.match(checks[0]?.detail ?? '', /getLogs.*block range limit exceeded/);
+    assert.ok(checks[0]?.detail.includes(String(from)));
+    assert.equal(f.state.blocks.length, 0, 'partial events must not be validated as a complete whitelist');
+    assert.doesNotMatch(JSON.stringify(checks), /rpc.invalid|private-token/);
+  });
+}
+
+test('#140 malformed event response fails instead of becoming an empty successful page', async () => {
+  const f = venuePreflightFixture(); f.state.malformedLogs = true;
+  const checks = await checkVenues(f.client, getAddress(SAFE.toLowerCase()), 40n);
+  assert.equal(checks[0]?.level, 'fail'); assert.match(checks[0]?.detail ?? '', /getLogs/);
 });
 
 // #52 regression: a structured secondary revert must survive the pre-send quote boundary.

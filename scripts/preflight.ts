@@ -83,24 +83,67 @@ export function checkBuyConfig(maxBuyBps: number | null, numeraire: Address | nu
   ];
 }
 
-/** Enumerate targets from events, then read current state (including removals) at one block. */
+/** Classify diagnostics only; upstream messages can contain URLs, tokens and request bodies. */
+function venueRpcReason(cause: unknown): string {
+  const messages: string[] = [];
+  const seen = new Set<unknown>();
+  for (let current = cause; typeof current === 'object' && current !== null && !seen.has(current);) {
+    seen.add(current);
+    if (current instanceof BaseError) messages.push(current.shortMessage, current.details);
+    else if ('message' in current && typeof current.message === 'string') messages.push(current.message);
+    current = 'cause' in current ? current.cause : undefined;
+  }
+  const diagnostic = messages.join('\n');
+  if (/missing trie node|header not found|historical state (?:is )?(?:not available|unavailable)|state (?:has been |is )?pruned|archive requests require a personal token/i.test(diagnostic)) {
+    return '歷史狀態不可用';
+  }
+  if (/timeout|timed out|took too long/i.test(diagnostic)) return 'RPC 逾時';
+  if (/block range|range limit|too many (?:blocks|results)|query returned more than/i.test(diagnostic)) return 'block range limit exceeded（事件查詢範圍或結果超限）';
+  if (/rate limit|too many requests|\b429\b/i.test(diagnostic)) return 'RPC 限流';
+  if (/limit exceeded|exceeds defined limit/i.test(diagnostic)) return 'RPC 節點限制（limit exceeded）';
+  if (/method (?:not found|not supported)|method .*does not exist/i.test(diagnostic)) return 'RPC 方法不支援';
+  if (/network|connection refused|fetch failed|HTTP request failed/i.test(diagnostic)) return 'RPC 連線失敗';
+  return 'RPC 讀取失敗或資料格式錯誤（上游原文不輸出）';
+}
+
+/** Enumerate all event pages, then read current state (including removals) at one block. */
 export async function checkVenues(client: PublicClient, executor: Address, deploymentBlock: bigint): Promise<Check[]> {
+  let stage = 'getBlockNumber';
+  const failed = (reason: string): Check[] => [{ name: 'executor venues', level: 'fail',
+    detail: `無法完整讀取 venue 事件與白名單；${stage}：${reason}` }];
   try {
     const pancakeRouter = pancakeRouterForChain(client.chain?.id);
     const blockNumber = await client.getBlockNumber({ cacheTime: 0 });
-    if (deploymentBlock < 0n || deploymentBlock > blockNumber) throw new Error('invalid deployment block');
-    const deployedCode = await client.getCode({ address: executor, blockNumber: deploymentBlock });
-    const priorCode = deploymentBlock === 0n ? undefined
-      : await client.getCode({ address: executor, blockNumber: deploymentBlock - 1n });
-    if (deployedCode === undefined || deployedCode === '0x' || (priorCode !== undefined && priorCode !== '0x')) {
-      throw new Error('deployment block does not match code creation');
+    if (deploymentBlock < 0n || deploymentBlock > blockNumber) return failed('部署區塊必須介於 0 與目前 head 之間');
+    let deploymentNote = '';
+    try {
+      stage = `getCode 部署區塊 ${deploymentBlock}`;
+      const deployedCode = await client.getCode({ address: executor, blockNumber: deploymentBlock });
+      if (deployedCode === undefined || deployedCode === '0x') return failed('部署區塊沒有 executor code');
+      if (deploymentBlock > 0n) {
+        stage = `getCode 部署前區塊 ${deploymentBlock - 1n}`;
+        const priorCode = await client.getCode({ address: executor, blockNumber: deploymentBlock - 1n });
+        if (priorCode !== undefined && priorCode !== '0x') return failed('部署前已存在 executor code，部署區塊不符');
+      }
+    } catch (cause) {
+      if (venueRpcReason(cause) !== '歷史狀態不可用') throw cause;
+      stage = `getCode 目前區塊 ${blockNumber}`;
+      const currentCode = await client.getCode({ address: executor, blockNumber });
+      if (currentCode === undefined || currentCode === '0x') return failed('目前沒有 executor code');
+      deploymentNote = `；歷史狀態不可用，已確認目前 code，沿用部署區塊 ${deploymentBlock}`;
     }
-    const events = await client.getContractEvents({ address: executor, abi: EXECUTOR_ABI,
-      eventName: 'VenueSet', fromBlock: deploymentBlock, toBlock: blockNumber, strict: true });
     const targets = new Map<string, Address>([[pancakeRouter.toLowerCase(), pancakeRouter]]);
-    for (const event of events) targets.set(event.args.target.toLowerCase(), event.args.target);
+    const pageSize = 5_000n;
+    for (let fromBlock = deploymentBlock; fromBlock <= blockNumber; fromBlock += pageSize) {
+      const toBlock = fromBlock + pageSize - 1n < blockNumber ? fromBlock + pageSize - 1n : blockNumber;
+      stage = `getLogs 區塊 ${fromBlock}–${toBlock}`;
+      const events = await client.getContractEvents({ address: executor, abi: EXECUTOR_ABI,
+        eventName: 'VenueSet', fromBlock, toBlock, strict: true });
+      for (const event of events) targets.set(event.args.target.toLowerCase(), event.args.target);
+    }
     const checks: Check[] = [];
     for (const target of targets.values()) {
+      stage = `venues(${target}) 區塊 ${blockNumber}`;
       const [kind, spender] = await client.readContract({ address: executor, abi: EXECUTOR_ABI,
         functionName: 'venues', args: [target], blockNumber });
       const pancake = sameAddress(target, pancakeRouter);
@@ -108,11 +151,11 @@ export async function checkVenues(client: PublicClient, executor: Address, deplo
       const valid = pancake ? kind === 1 && sameAddress(spender, pancakeRouter)
         : client.chain?.id !== 97 && (kind === 2 || kind === 3) && !sameAddress(spender, zeroAddress);
       checks.push({ name: `executor venue ${target}`, level: valid ? 'ok' : 'fail',
-        detail: `kind=${['NONE', 'PANCAKE_UR', 'ERC20_APPROVE', 'PERMIT2'][kind] ?? 'UNKNOWN'} spender=${spender}` });
+        detail: `kind=${['NONE', 'PANCAKE_UR', 'ERC20_APPROVE', 'PERMIT2'][kind] ?? 'UNKNOWN'} spender=${spender}${deploymentNote}` });
     }
     return checks;
-  } catch {
-    return [{ name: 'executor venues', level: 'fail', detail: '無法完整讀取 venue 事件與白名單；確認 A11 executor 與 RPC' }];
+  } catch (cause) {
+    return failed(venueRpcReason(cause));
   }
 }
 

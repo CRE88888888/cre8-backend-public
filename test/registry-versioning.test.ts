@@ -166,7 +166,9 @@ test('#143 first version detail reports pending/active at the exact boundary wit
         activeAt: new Date(160_000).toISOString(), createdAt: new Date(0).toISOString() }] }),
     state: (id, version) => readVersionState(f.client, asset, id, version),
   });
-  const server = createServer({ strategyDetail: detail });
+  const server = createServer({ strategyDetail: detail, strategyExposure: async (_id, _chain, assets) => assets.map(address => ({
+    address, buyPaused: false, exposureCapUsdtWei: null, currentExposureUsdtWei: '0',
+  })) });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   try {
     const bound = server.address(); assert.ok(bound && typeof bound !== 'string');

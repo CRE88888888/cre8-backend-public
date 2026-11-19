@@ -4,6 +4,21 @@ CRE8 ATP 的鏈下後端（第一刀）。Bun + TypeScript + Postgres，直接�
 預設鏈是 BNB Chain mainnet（chain 56）。目前做策略資料層、版本發布、SIWE（EIP-4361）錢包簽章 auth、
 portfolio 續期，以及 **bundler relay**（`POST /bundler`：瀏覽器不能直連 alto，見 §bundler relay）。
 
+## 基金成分持有上限（#160，0051／0052）
+
+上限只在**新投入建立 schema 2 lot 時**判斷，是軟上限：按同 strategy、同鏈所有 smart account 的即時持倉（含暫停帳戶），以同一區塊的 NAV 持倉／TWAP 價格來源加總；已達上限（含等於）才排除該成分。未達上限不裁切投入金額，既有 lot、已排期次、買賣與再平衡均不重寫，因此之後可能超過上限，也不因超額自動賣出。
+
+上限在各鏈刻意按 **symbol** 共用 DB `priceable_assets` 的設定；chain 97 的地址與 symbol 以 manifest 為準，不採客戶端顯示名稱。manifest 有但 DB 沒有該 symbol＝不設上限。RPC／持倉／定價／DB 不可用則拒絕新配置；無上限的投入不增加 RPC 讀取。持倉聚合最多等待 10 秒，單次 RPC 最多 5 秒、不重試。
+
+排除後按其餘版本正權重（含原本正權重的 USDT）比例分配，整數 bps 採最大餘數法、同餘數按地址排序，總和恰為 10000；不提升原 0 權重現金。全部非現金成分都已滿時回 HTTP 409、`FUND_FULL`、`這檔基金暫時額滿`，不建立 lot。純現金基金沿用原行為。原最低投入不降低；實際改配仍須符合現有最低投入、每批 10 USDT、非末期每成分 1 USDT、費用與縮期／小額累積規則。
+
+lot 的 `effectiveAllocation`／`allocationReason`／`cappedAssets` 與實際來源及現金桶同交易保存；未改配用 SQL NULL 沿用原版權重。重試返回原 lot，持倉、上限或價格變動不會重算它。
+
+- `GET /strategies/:id`：每個 `versions[].allocation.assets[]` 增加 `buyPaused`（boolean 或 null＝未知）、`exposureCapUsdtWei`、`currentExposureUsdtWei`（USDT 18 位最小單位字串或 null）。只讀有上限成分的持倉；沒設上限（含 DB 沒有該 symbol）回 `buyPaused: false`，其餘兩欄 null，不打持倉 RPC。有上限但持倉／價格／帳戶讀取失敗或逾時，仍回 200 並保留上限，`buyPaused`／`currentExposureUsdtWei` 回 null。上限目錄本身讀不到時，全部成分狀態未知、三欄 null；其餘詳情欄位照常。此降級只限詳情，新投入讀取失敗仍拒絕配置。
+- `POST /operator/assets/:symbol/exposure-cap`：SIWE ＋ `OPERATOR_WALLETS`，與 rebalance 開關獨立。Body 為 `{ "exposureCapUsdtWei": "4000000000000000000000", "source": "池深快照的 10%" }`；清除時金額填 null，source 仍必填（1..500 字元）。金額是 1..38 位正整數字串。只更新已有 symbol 的金額、來源、DB 時間；未知 symbol 404，USDT 不接受非 null 上限。
+
+例如池深 $40,000，上限 $4,000，基金 $80,000、A 佔 5% 時持有剛好 $4,000。B／C 原權重 57%／38%，新投入 $100 排除 A，固定 B／C＝60%／40%；原本建立的 A 分期仍可繼續買。另有手續費預留時，執行金額依原規則從來源預算扣除。
+
 ## 架構
 
 ```

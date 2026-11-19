@@ -9,6 +9,7 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { alertCounts, healthStatusFor, listOpenAlerts } from './alerts.js';
 import type { AlertCounts } from './alerts.js';
 import { listPortfolioActivity, readOperatorActivity, readOperatorOverview, runOperatorClose, runOperatorRedeem } from './operator.js';
+import { readAssetExposureStatus, setAssetExposureCap } from './asset-exposure.js';
 import type { RedeemAmount } from './operator.js';
 import { createTradableProbeCache, EXECUTOR_ORACLE_ABI, ORACLE_OF_ABI, listPriceableAssets } from './assets.js';
 import type { PriceableAsset, TradableProbe } from './assets.js';
@@ -188,6 +189,8 @@ export type ServerDeps = {
   preparePortfolioEnrollment: typeof preparePortfolioEnrollment;
   strategyVersionState: typeof strategyVersionState;
   strategyDetail: typeof getStrategyWithVersionState;
+  strategyExposure: typeof readAssetExposureStatus;
+  setExposureCap: typeof setAssetExposureCap;
   listPortfolios: typeof listPortfolios;
   buildRenewalParams: typeof buildRenewalParams;
   recordRenewalResult: typeof recordRenewalResult;
@@ -321,6 +324,7 @@ const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
   createStrategy,
   publishVersion,
   enrollPortfolio, preparePortfolioEnrollment, strategyVersionState, strategyDetail: getStrategyWithVersionState,
+  strategyExposure: readAssetExposureStatus, setExposureCap: setAssetExposureCap,
   listPortfolios,
   buildRenewalParams,
   recordRenewalResult,
@@ -495,6 +499,12 @@ async function route(
     const wallets = deps.operatorWallets ?? resolveOperatorWallets();
     if (!wallets.some((allowed) => allowed.toLowerCase() === wallet.toLowerCase())) {
       throw new AppError(403, 'OPERATOR_FORBIDDEN', 'wallet is not authorized to use operator endpoints');
+    }
+    if (segments.length === 4 && segments[1] === 'assets' && segments[3] === 'exposure-cap') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      await deps.rateLimiter.wallet('plan', wallet);
+      sendJson(res, 200, await deps.setExposureCap(segments[2] ?? '', await readJsonBody(req)));
+      return;
     }
     if (segments.length === 5 && segments[1] === 'info' && segments[2] === 'events' && segments[4] === 'review') {
       if (method !== 'POST') return methodNotAllowed(res, ['POST']);
@@ -845,7 +855,12 @@ async function listRoute(res: ServerResponse, url: URL): Promise<void> {
 /** GET /strategies/:id — metadata plus version history (newest first). */
 async function detailRoute(res: ServerResponse, id: number, deps: ServerDeps): Promise<void> {
   const strategy = await deps.strategyDetail(id);
-  const versions = strategy.versions.map((version) => ({ ...version, minDepositUsdtWei: version.executionSchemaVersion !== 0 ? typedMinimumDeposit(version) : allocationMinimumDeposit(version.allocation) }));
+  const exposure = await deps.strategyExposure(id, getConfig().chainId, strategy.versions.flatMap(v => v.allocation.assets.map(a => a.address)), { cappedOnly: true });
+  const versions = strategy.versions.map((version) => ({ ...version,
+    allocation: { assets: version.allocation.assets.map(a => {
+      const state = exposure.find(e => e.address === a.address.toLowerCase());
+      return { ...a, buyPaused: state?.buyPaused ?? null, exposureCapUsdtWei: state?.exposureCapUsdtWei ?? null, currentExposureUsdtWei: state?.currentExposureUsdtWei ?? null };
+    }) }, minDepositUsdtWei: version.executionSchemaVersion !== 0 ? typedMinimumDeposit(version) : allocationMinimumDeposit(version.allocation) }));
   sendJson(res, 200, { ...strategy, versions, minDepositUsdtWei: versions[0]?.minDepositUsdtWei ?? null });
 }
 

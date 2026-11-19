@@ -1,4 +1,5 @@
 import { cashDifference } from './yield-domain.js';
+import { allocateExposure, readAssetExposure } from './asset-exposure.js';
 import { planFundingContribution } from './asset-plan.js';
 import { minimumFeeReserve } from './rebalance-plan.js';
 import { getConfig, loadSessionKeyConfig } from './config.js';
@@ -63,6 +64,7 @@ function fundingHash(value: unknown): Hex {
   return `0x${value.slice(2).toLowerCase()}`;
 }
 type LotRow = { id: string; chain_id: string; portfolio_id: string; strategy_id: string; version: number; kind: 'hold' | 'stack' | 'asset'; effective_slices?: Record<string,number>; created_at: Date;
+  effective_allocation: Record<string, number> | null; allocation_reason: 'version' | 'exposure_cap'; capped_assets: string[];
   tx_hash: Hex; log_index: string; block_number: string; block_hash: Hex; amount_raw: string; state: string; claim_id?: string | null;
   source_kind: 'faucet_claim' | 'welcome_grant' | null; faucet_claim_id: string | null; welcome_grant_id: string | null };
 type InstructionRow = { revision: string; strategy_id: string; version: number; authorized_by: string; amount_raw: string;
@@ -86,6 +88,7 @@ export type PortfolioStrategyDeps = {
   chainId: () => number;
   now: () => Date;
   feeReserve: (portfolio: OwnedPortfolio, version: StrategyVersion) => Promise<bigint>;
+  exposure: typeof readAssetExposure;
 };
 
 function positiveId(value: unknown, zero = false): string {
@@ -125,6 +128,7 @@ function mapLot(row: LotRow) {
   return { id: row.id, chainId: Number(row.chain_id), portfolioId: Number(row.portfolio_id), strategyId: Number(row.strategy_id),
     version: row.version, kind: row.kind, txHash: row.tx_hash, logIndex: row.log_index,
     effectiveSlices: row.effective_slices ?? null, confirmedAt: row.created_at.toISOString(), blockNumber: row.block_number, blockHash: row.block_hash, amountRaw: row.amount_raw, state: row.state,
+    effectiveAllocation: row.effective_allocation, allocationReason: row.allocation_reason, cappedAssets: row.capped_assets,
     source: row.source_kind === 'welcome_grant' ? { kind: 'welcome_grant', grantId: row.welcome_grant_id }
       : row.faucet_claim_id || row.claim_id ? { kind: 'faucet_claim', claimId: row.faucet_claim_id ?? row.claim_id } : null };
 }
@@ -136,7 +140,7 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
   const deps: PortfolioStrategyDeps = { query, transaction: withTransaction, lock: withPortfolioLock, owned: requireOwnedPortfolio,
     version: requireTypedVersion, evidence: readFaucetFundingEvidence, walletEvidence: readWalletFundingEvidence, cash: readAccountCash, settleClaim: settleFaucetClaim,
     welcome: createWelcomeService(), welcomeGrant: findWelcomeGrant, welcomeEvidence: readWelcomeFundingEvidence, settleWelcome: settleWelcomeGrant,
-    chainId: configuredChainId, now: () => new Date(), feeReserve: async (p) => {
+    chainId: configuredChainId, now: () => new Date(), exposure: readAssetExposure, feeReserve: async (p) => {
       const chain = getChain();
       const block = await chain.publicClient.getBlockNumber({cacheTime:0});
       const sid = (await query<{onchain_id:string}>('select onchain_id from strategies where id=$1',[p.strategyId])).rows[0];
@@ -261,16 +265,25 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
         if(Number(original.portfolio_id)!==id||Number(original.strategy_id)!==p.strategyId||original.version!==p.version||original.kind!==kind||original.amount_raw!==evidence.amountRaw||original.state!=='confirmed')throw new AppError(409,'FUNDING_EVENT_CONFLICT','funding event conflicts with its original authorization');
         return { ...mapLot(original), source, replayed:true, fundingStatus:'recorded' };
       }
-      const standalone = version.execution.kind === 'per_asset' ? planFundingContribution(BigInt(evidence.amountRaw),version.execution,confirmedAt,p.chainId) : null;
+      const allocation = version.execution.kind === 'per_asset' ? allocateExposure(version.execution,
+        await deps.exposure(p.strategyId, p.chainId, version.execution.assets.map(a => a.asset), {
+          query: (sql, params) => client.query(sql, params === undefined ? [] : [...params]), cappedOnly: true,
+        })) : null;
+      const execution = allocation?.execution;
+      const standalone = execution ? planFundingContribution(BigInt(evidence.amountRaw),execution,confirmedAt,p.chainId) : null;
       // Subscription minimum is distinct from the eventual account/time batch.
       // An individually small source may join another lot at the same creator slot.
-      const minimum=version.execution.kind==='per_asset'?minimumAssetContribution(version.execution):0n;
+      // Preserve the signed subscription minimum, even if redistribution would lower it.
+      const originalMinimum=version.execution.kind==='per_asset'?minimumAssetContribution(version.execution):0n;
+      const effectiveMinimum=execution?minimumAssetContribution(execution):0n;
+      const minimum=originalMinimum>effectiveMinimum?originalMinimum:effectiveMinimum;
       if(kind==='asset'&&BigInt(evidence.amountRaw)<minimum)throw new ValidationError('BELOW_MINIMUM_ALLOCATION',`minimum total contribution is ${formatUnits(minimum,18)} USDT including fees`);
-      const contribution=standalone??(version.execution.kind==='per_asset'?{minimum,effectiveSlices:Object.fromEntries(version.execution.assets.filter(a=>a.asset!==numeraireFor(p.chainId)).map(a=>[a.asset,1]))}:null);
+      const contribution=standalone?{...standalone,minimum}:(execution?{minimum,effectiveSlices:Object.fromEntries(execution.assets.filter(a=>a.asset!==numeraireFor(p.chainId)).map(a=>[a.asset,1]))}:null);
       const inserted = await client.query<LotRow>(`insert into strategy_funding_lots
-        (chain_id,portfolio_id,strategy_id,version,kind,tx_hash,log_index,block_number,block_hash,amount_raw,minimum_contribution_raw,effective_slices,created_at,updated_at,source_kind,faucet_claim_id,welcome_grant_id)
-        values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13,$14,$15,$16) on conflict(chain_id,tx_hash,log_index) do nothing returning *`,
-        [p.chainId, id, p.strategyId, p.version, kind, evidence.txHash, evidence.logIndex, evidence.blockNumber.toString(), evidence.blockHash, evidence.amountRaw, contribution?.minimum.toString() ?? null, contribution ? JSON.stringify(contribution.effectiveSlices) : null, confirmedAt, source.kind === 'wallet_transfer' ? null : source.kind, source.kind === 'faucet_claim' ? source.claimId : null, source.kind === 'welcome_grant' ? source.grantId : null]);
+        (chain_id,portfolio_id,strategy_id,version,kind,tx_hash,log_index,block_number,block_hash,amount_raw,minimum_contribution_raw,effective_slices,created_at,updated_at,source_kind,faucet_claim_id,welcome_grant_id,effective_allocation,allocation_reason,capped_assets)
+        values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13,$14,$15,$16,$17,$18,$19) on conflict(chain_id,tx_hash,log_index) do nothing returning *`,
+        [p.chainId, id, p.strategyId, p.version, kind, evidence.txHash, evidence.logIndex, evidence.blockNumber.toString(), evidence.blockHash, evidence.amountRaw, contribution?.minimum.toString() ?? null, contribution ? JSON.stringify(contribution.effectiveSlices) : null, confirmedAt, source.kind === 'wallet_transfer' ? null : source.kind, source.kind === 'faucet_claim' ? source.claimId : null, source.kind === 'welcome_grant' ? source.grantId : null,
+          allocation?.effectiveAllocation ? JSON.stringify(allocation.effectiveAllocation) : null, allocation?.allocationReason ?? 'version', JSON.stringify(allocation?.cappedAssets ?? [])]);
       const lot = (await client.query<LotRow>('select * from strategy_funding_lots where chain_id=$1 and tx_hash=$2 and log_index=$3',
         [p.chainId, evidence.txHash, evidence.logIndex])).rows[0];
       if (!lot || Number(lot.portfolio_id) !== id || Number(lot.strategy_id) !== p.strategyId || lot.version !== p.version || lot.kind !== kind ||

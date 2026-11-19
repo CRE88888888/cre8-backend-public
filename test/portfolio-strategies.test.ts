@@ -2,8 +2,10 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { after, afterEach, test } from 'node:test';
 import type { Address, Hex } from 'viem';
+import { createPublicClient, custom } from 'viem';
 import { closePool, getPool, migrate, query, withConnection, withTransaction } from '../src/db.js';
 import { createPortfolioStrategyService, readWalletFundingEvidence } from '../src/portfolio-strategies.js';
+import { setAssetExposureCap, readAssetExposure } from '../src/asset-exposure.js';
 import type { PortfolioStrategyDeps } from '../src/portfolio-strategies.js';
 import { createStrategy, getStrategy, publishVersion, requireTypedVersion, validateAllocation, previewContribution } from '../src/strategies.js';
 import { assertVersionOnchain, readAccountCash } from '../src/chain.js';
@@ -80,6 +82,136 @@ async function onTestnet<T>(fn:()=>Promise<T>):Promise<T>{
   try{return await fn();}finally{if(previous===undefined)delete process.env.CHAIN_ID;else process.env.CHAIN_ID=previous;}
 }
 const future=()=>new Date(Date.now()+86400_000).toISOString();
+
+test('#160 all noncash components full rejects even with a positive cash weight, without creating a lot', async () => {
+  const f = await fixture('hold');
+  const service = createPortfolioStrategyService({ ...f.deps, exposure: async () => [
+    { address: TESTNET_97.assets.AAPLB.token, buyPaused: true, exposureCapUsdtWei: '4000', currentExposureUsdtWei: '4000' },
+    { address: TESTNET_97.contracts.usdt, buyPaused: false, exposureCapUsdtWei: null, currentExposureUsdtWei: '0' },
+  ] });
+  await assert.rejects(service.funding(f.id, f.owner, f.source), denied('FUND_FULL'));
+  assert.equal((await query('select id from strategy_funding_lots where portfolio_id=$1', [f.id])).rows.length, 0);
+});
+
+function exposureService(f: Awaited<ReturnType<typeof fixture>>, paused: Set<string>) {
+  return createPortfolioStrategyService({ ...f.deps, exposure: async () => f.execution.assets.map(a => ({ address:a.asset,
+    exposureCapUsdtWei:a.asset===f.execution.numeraire?null:'4000',currentExposureUsdtWei:paused.has(a.asset)?'4000':'0',buyPaused:paused.has(a.asset),
+  })) });
+}
+function capConfig(mode:'hold'|'stack'='hold',weights=[5000,3000,2000,0]): AssetExecution {
+  const tokens=[TESTNET_97.assets.AAPLB.token,TESTNET_97.assets.MSFTB.token,TESTNET_97.assets.NVDAB.token,TESTNET_97.contracts.usdt];
+  return assetConfig(mode,validateAllocation({assets:tokens.map((address,i)=>({address,weightBps:weights[i]})).filter(a=>a.weightBps!==0||a.address===TESTNET_97.contracts.usdt)},97));
+}
+const assetSources = async (lotId:string) => (await query<{asset:string;budget_raw:string;effective_slices:number;first_slot_at:Date|null}>(
+  'select asset,budget_raw::text,effective_slices,first_slot_at from strategy_lot_assets where lot_id=$1 order by asset',[lotId])).rows;
+
+test('#160 DB new hold/stack lots freeze proportional certificates, preserve calendars, seed only retained sources and balance exact cash dust',async()=>{
+  const a=TESTNET_97.assets.AAPLB.token,b=TESTNET_97.assets.MSFTB.token,c=TESTNET_97.assets.NVDAB.token,cash=TESTNET_97.contracts.usdt;
+  for(const mode of ['hold','stack'] as const){
+    const f=await fixture(mode,0,100n*10n**18n+1n,capConfig(mode));
+    const lot=await exposureService(f,new Set([a])).funding(f.id,f.owner,f.source);
+    assert.deepEqual(lot.effectiveAllocation,{[b]:6000,[c]:4000});assert.deepEqual(lot.cappedAssets,[a]);assert.equal(lot.allocationReason,'exposure_cap');
+    const sources=await assetSources(lot.id);
+    assert.ok(!sources.some(s=>s.asset===a));
+    assert.equal(sources.find(s=>s.asset===b)?.budget_raw,(60n*10n**18n).toString());
+    assert.equal(sources.find(s=>s.asset===c)?.budget_raw,(40n*10n**18n).toString());
+    assert.equal(sources.find(s=>s.asset===cash)?.budget_raw,'1');
+    assert.equal(await bucket(f.id,mode==='hold'?'unallocated_hold_raw':'stack_prefund_raw'),(100n*10n**18n).toString());
+    if(mode==='stack')assert.ok(sources.filter(s=>s.asset!==cash).every(s=>s.first_slot_at?.toISOString()==='2026-11-15T14:00:00.000Z'));
+    assert.deepEqual(Object.keys(lot.effectiveSlices??{}).sort(),[b,c].sort());
+    const read=await exposureService(f,new Set([a,b,c])).read(f.id,f.owner);
+    assert.equal(read.lots[0]?.allocationReason,'exposure_cap');assert.deepEqual(read.lots[0]?.effectiveAllocation,lot.effectiveAllocation);
+    const replay=await createPortfolioStrategyService({...f.deps,exposure:async()=>{throw new Error('must not recalculate an existing lot');}}).funding(f.id,f.owner,f.source);
+    assert.equal(replay.replayed,true);assert.deepEqual(replay.effectiveAllocation,lot.effectiveAllocation);assert.deepEqual(await assetSources(lot.id),sources);
+  }
+});
+
+test('#160 DB two capped components give the remaining component all new money; all full leaves the prior source untouched',async()=>{
+  const a=TESTNET_97.assets.AAPLB.token,b=TESTNET_97.assets.MSFTB.token,c=TESTNET_97.assets.NVDAB.token;
+  const f=await fixture('hold',0,TEST_AMOUNT,capConfig());
+  const paused=new Set<string>([a,b]);const service=exposureService(f,paused);
+  const lot=await service.funding(f.id,f.owner,f.source);assert.deepEqual(lot.effectiveAllocation,{[c]:10000});
+  assert.equal((await assetSources(lot.id)).find(s=>s.asset===c)?.budget_raw,TEST_AMOUNT.toString());
+  const before=await bucket(f.id,'unallocated_hold_raw');const source=await f.secondClaim();paused.add(c);
+  await assert.rejects(service.funding(f.id,f.owner,source),denied('FUND_FULL'));
+  assert.equal(await bucket(f.id,'unallocated_hold_raw'),before);assert.equal((await query('select id from strategy_funding_lots where portfolio_id=$1',[f.id])).rows.length,1);
+});
+
+test('#160 DB contribution minimum is never lowered and an increased effective cash weight must still fund a ten-USDT batch',async()=>{
+  const a=TESTNET_97.assets.AAPLB.token;
+  const f=await fixture('hold',9900,1000n*10n**18n,capConfig('hold',[50,50,0,9900]));
+  const service=exposureService(f,new Set([a]));
+  await assert.rejects(service.funding(f.id,f.owner,f.source),denied('BELOW_MINIMUM_ALLOCATION'));
+  assert.equal((await query('select id from strategy_funding_lots where portfolio_id=$1',[f.id])).rows.length,0);
+  const minimum=2000n*10n**18n;
+  await assert.rejects(service.funding(f.id,f.owner,await f.secondClaim(minimum-1n)),denied('BELOW_MINIMUM_ALLOCATION'));
+  const lot=await service.funding(f.id,f.owner,await f.secondClaim(minimum));
+  assert.equal(lot.amountRaw,minimum.toString());
+  assert.equal((await query('select minimum_contribution_raw::text as minimum from strategy_funding_lots where id=$1',[lot.id])).rows[0]?.minimum,minimum.toString());
+});
+
+test('#160 DB exposure RPC/DB failure, timeout and rollback create no lot or cash; competing requests and lost acknowledgement credit once',async()=>{
+  const f=await fixture('hold',0,TEST_AMOUNT,capConfig());
+  for(const exposure of [async()=>{throw new Error('SECRET_DB');},async()=>{throw new AppError(503,'EXPOSURE_UNAVAILABLE','fund exposure unavailable');}]){
+    await assert.rejects(createPortfolioStrategyService({...f.deps,exposure}).funding(f.id,f.owner,f.source),error=>error instanceof AppError&&error.status===503&&!error.message.includes('SECRET'));
+    assert.equal((await query('select id from strategy_funding_lots where portfolio_id=$1',[f.id])).rows.length,0);
+  }
+  const paused=new Set<string>([TESTNET_97.assets.AAPLB.token]);
+  const exposure:PortfolioStrategyDeps['exposure']=async()=>f.execution.assets.map(a=>({address:a.asset,buyPaused:paused.has(a.asset),exposureCapUsdtWei:paused.has(a.asset)?'1':null,currentExposureUsdtWei:'1'}));
+  const transactions:typeof withTransaction[]=[
+    fn=>withTransaction(async client=>{await fn(client);throw new Error('SECRET_ROLLBACK');}),
+    fn=>withTransaction(async client=>{const result=await fn(client);await client.query("set local statement_timeout='20ms'");await client.query('select pg_sleep(1)');return result;}),
+  ];
+  for(const transaction of transactions){
+    await assert.rejects(createPortfolioStrategyService({...f.deps,exposure,transaction}).funding(f.id,f.owner,f.source),denied('EXECUTION_STORAGE_UNAVAILABLE'));
+    assert.equal((await query('select id from strategy_funding_lots where portfolio_id=$1',[f.id])).rows.length,0);
+    assert.equal(await bucket(f.id,'unallocated_hold_raw'),'0');
+  }
+  const unknown:typeof withTransaction=async fn=>{await withTransaction(fn);throw new Error('SECRET_ACK');};
+  await assert.rejects(createPortfolioStrategyService({...f.deps,exposure,transaction:unknown}).funding(f.id,f.owner,f.source),denied('EXECUTION_STORAGE_UNAVAILABLE'));
+  const results=await Promise.allSettled([createPortfolioStrategyService({...f.deps,exposure}).funding(f.id,f.owner,f.source),createPortfolioStrategyService({...f.deps,exposure}).funding(f.id,f.owner,f.source)]);
+  assert.ok(results.some(r=>r.status==='fulfilled'&&r.value.replayed));
+  for(const r of results)if(r.status==='rejected')assert.ok(r.reason instanceof AppError&&r.reason.code==='PORTFOLIO_BUSY');
+  assert.equal((await query('select id from strategy_funding_lots where portfolio_id=$1',[f.id])).rows.length,1);
+  assert.equal(await bucket(f.id,'unallocated_hold_raw'),TEST_AMOUNT.toString());
+});
+
+test('#160 DB operator cap update/clear is atomic with provenance; unknown symbols and USDT are rejected',async()=>{
+  await migrate();
+  const rollback=new Error('test rollback');
+  await assert.rejects(withTransaction(async client=>{
+    const scoped=(sql:string,params?:readonly unknown[])=>client.query(sql,params===undefined?[]:[...params]);
+    for(const cap of ['1',null]){
+      await setAssetExposureCap('AAPLB',{exposureCapUsdtWei:cap,source:'test snapshot'},scoped);
+      const row=(await scoped('select max_fund_exposure_usdt::text as cap,max_fund_exposure_source as source,max_fund_exposure_updated_at as updated from priceable_assets where symbol=$1',['AAPLB'])).rows[0];
+      assert.equal(row.cap,cap);assert.equal(row.source,'test snapshot');assert.ok(row.updated instanceof Date);
+    }
+    await assert.rejects(setAssetExposureCap('USDT',{exposureCapUsdtWei:'1',source:'test'},scoped),denied('INVALID_EXPOSURE_CAP'));
+    await assert.rejects(setAssetExposureCap('NOT_A_CATALOG_SYMBOL_160',{exposureCapUsdtWei:null,source:'test'},scoped),denied('NOT_FOUND'));
+    throw rollback;
+  }),error=>error===rollback);
+});
+
+test('#160 DB exposure aggregates only the same strategy and chain, including paused portfolios without session keys',async()=>{
+  const f=await fixture('hold');const foreign=await fixture('hold');
+  const p=(await query<{id:string}>("insert into portfolios(user_id,strategy_id,version,schedule_state) values($1,$2,1,'paused') returning id",[address(),f.strategyId])).rows[0];assert.ok(p);
+  await query("insert into smart_accounts(portfolio_id,chain_id,address,owner,account_type) values($1,97,$2,$3,'KERNEL'),($1,56,$4,$3,'KERNEL')",[p.id,address(),address(),address()]);
+  const client=createPublicClient({transport:custom({request:async({method})=>{
+    if(method==='eth_chainId')return '0x61';if(method==='eth_blockNumber')return '0x82';throw new Error('unexpected RPC');
+  }},{retryCount:0})});
+  const rollback=new Error('test rollback');const seen:number[]=[];
+  await assert.rejects(withTransaction(async db=>{
+    const scoped=(sql:string,params?:readonly unknown[])=>db.query(sql,params===undefined?[]:[...params]);
+    await setAssetExposureCap('AAPLB',{exposureCapUsdtWei:(1000n*10n**18n).toString(),source:'test snapshot'},scoped);
+    const result=await readAssetExposure(f.strategyId,97,[TESTNET_97.assets.AAPLB.token],{query:scoped,client,positions:async(_client,args)=>{
+      assert.equal(args.block,130n);assert.ok(args.portfolioId===f.id||args.portfolioId===Number(p.id));assert.notEqual(args.portfolioId,foreign.id);seen.push(args.portfolioId);
+      return {portfolioId:args.portfolioId,block:130n,nativeBalanceWei:0n,holdings:[{asset:TESTNET_97.assets.AAPLB.token,amountWei:500n*10n**18n,decimals:18,usdPriceE8:100_000_000n,priceSource:'pancakeswap-v3'}],unpriced:[]};
+    }});
+    assert.deepEqual(result,[{address:TESTNET_97.assets.AAPLB.token,buyPaused:true,exposureCapUsdtWei:(1000n*10n**18n).toString(),currentExposureUsdtWei:(1000n*10n**18n).toString()}]);
+    assert.deepEqual(seen,[f.id,Number(p.id)]);
+    throw rollback;
+  }),error=>error===rollback);
+});
 
 async function walletFixture(kind: 'hold' | 'stack' = 'hold', amount = TEST_AMOUNT, cashWeight = 5000) {
   const f = await fixture(kind, cashWeight, amount === 0n ? TEST_AMOUNT : amount);

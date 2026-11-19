@@ -52,11 +52,12 @@ async function fixture(kind:'hold'|'stack'='hold',cashWeight=0,slices=4,rebalanc
     values($1,$2,$3,'active','2030-01-01')`,[id,`m/44'/60'/0'/0/${id}`,JSON.stringify({permissionId:'0x12345678',sessionKeyAddress:owner,timestamp:{validUntil:1893456000}})]);
   const context:JobContext={chainId:97,portfolioId:id,strategyId,version,kind:'asset',execution,account,allocation,cash,now:new Date(start),reserve:R,
     caps:new Map(allocation.assets.filter(x=>x.address!==cash).map(x=>[x.address,null])),buyLimit:UINT256_MAX,observedCash:1000000n*U,enabled:true,marketOpen:true};
-  async function fund(amount:bigint,confirmedAt=new Date(start.getTime()-60000),effectiveOverride?:Record<string,number>){
+  async function fund(amount:bigint,confirmedAt=new Date(start.getTime()-60000),effectiveOverride?:Record<string,number>,allocationOverride?:{weights:Record<string,number>;capped:string[]}){
     const certificate=effectiveOverride?{minimum:50n*U,effectiveSlices:effectiveOverride}:planContribution(amount,execution,confirmedAt,R);assert.ok(certificate,'fixture contribution must meet the actual calendar minimum');
     return withTransaction(async client=>{
-      const lot=(await client.query<{id:string}>(`insert into strategy_funding_lots(chain_id,portfolio_id,strategy_id,version,kind,tx_hash,log_index,block_number,block_hash,amount_raw,minimum_contribution_raw,effective_slices,created_at,updated_at)
-        values(97,$1,$2,$9,'asset',$3,0,10,$4,$5,$6,$7,$8,$8) returning id`,[id,sid,hash(),hash(),amount.toString(),certificate.minimum.toString(),JSON.stringify(certificate.effectiveSlices),confirmedAt,version])).rows[0];assert.ok(lot);
+      const lot=(await client.query<{id:string}>(`insert into strategy_funding_lots(chain_id,portfolio_id,strategy_id,version,kind,tx_hash,log_index,block_number,block_hash,amount_raw,minimum_contribution_raw,effective_slices,created_at,updated_at,effective_allocation,allocation_reason,capped_assets)
+        values(97,$1,$2,$9,'asset',$3,0,10,$4,$5,$6,$7,$8,$8,$10,$11,$12) returning id`,[id,sid,hash(),hash(),amount.toString(),certificate.minimum.toString(),JSON.stringify(certificate.effectiveSlices),confirmedAt,version,
+          allocationOverride?JSON.stringify(allocationOverride.weights):null,allocationOverride?'exposure_cap':'version',JSON.stringify(allocationOverride?.capped??[])])).rows[0];assert.ok(lot);
       const amounts=(await client.query<{asset:string;budget_raw:string}>('select asset,budget_raw::text from strategy_lot_assets where lot_id=$1',[lot.id])).rows;
       let hold=0n,stack=0n,cashTotal=0n;
       for(const row of amounts)if(row.asset===cash)cashTotal+=BigInt(row.budget_raw);else if(execution.assets.find(asset=>asset.asset===row.asset)?.execution?.kind==='hold')hold+=BigInt(row.budget_raw);else stack+=BigInt(row.budget_raw);
@@ -84,6 +85,44 @@ async function complete(f:Fixture,j:StrategyJob,input=j.remaining_input,feePaid=
   });
   await settleStrategyBatch(settlementRun,f.context,op,{received:Object.fromEntries(Object.keys(input).map(a=>[a,'100'])),fees:{},feePaid,blockNumber:11n,blockHash:hash()});
 }
+test('#160 DB an exposure cap reached between installments never retargets old sources, while new source weights remain fixed across restart',async()=>{
+  const f=await fixture('stack',0,4);
+  const old=await f.fund(100n*U);
+  const oldSources=(await query('select * from strategy_lot_assets where lot_id=$1 order by asset',[old])).rows;
+  const first=(await f.reserve())?.job;assert.ok(first);assert.deepEqual(Object.keys(first.remaining_input).sort(),[a,b].sort());
+  await complete(f,first,first.remaining_input,R);
+  // At the next admission A is full; 0052 only changes this new lot's sources.
+  const fresh=await f.fund(100n*U,new Date(+start+60000),{[b]:4},{weights:{[b]:10000},capped:[a]});
+  assert.equal((await query('select asset from strategy_lot_assets where lot_id=$1 and asset=$2',[fresh,a])).rows.length,0);
+  for(let day=1;day<4;day++){
+    const result=(await f.reserve({...f.context,now:new Date(+start+day*86400000)}))?.job;assert.ok(result);
+    assert.ok(BigInt(result.remaining_input[a]??'0')>0n,'old A installment still buys under the soft cap');
+    assert.ok(BigInt(result.remaining_input[b]??'0')>BigInt(result.remaining_input[a]??'0'),'new money goes only to B');
+    assert.equal((await f.reserve({...f.context,now:new Date(+start+day*86400000)}))?.job?.id,result.id,'restart resumes the same immutable job');
+    await complete(f,result,result.remaining_input,R);
+  }
+  const oldAfter=(await query('select * from strategy_lot_assets where lot_id=$1 order by asset',[old])).rows;
+  assert.deepEqual(oldAfter.map(({state,updated_at,...rest})=>rest),oldSources.map(({state,updated_at,...rest})=>rest));
+  assert.equal((await query('select effective_allocation from strategy_funding_lots where id=$1',[old])).rows[0]?.effective_allocation,null);
+  assert.deepEqual((await query('select effective_allocation from strategy_funding_lots where id=$1',[fresh])).rows[0]?.effective_allocation,{[b]:10000});
+});
+test('#160 DB redistributed small installments carry below one USDT, merge later, and reconcile the exact effective source budget',async()=>{
+  const f=await fixture('stack',0,4,'none',undefined,[5000,4900,100],3);
+  const risky=f.allocation.assets.filter(x=>x.address!==cash);const excluded=risky[0],large=risky[1],small=risky[2];assert.ok(excluded&&large&&small);
+  const lot=await f.fund(100n*U,new Date(+start-60000),{[large.address]:4,[small.address]:4},
+    {weights:{[large.address]:9800,[small.address]:200},capped:[excluded.address]});
+  for(let day=0;day<4;day++){
+    const result=(await f.reserve({...f.context,now:new Date(+start+day*86400000)}))?.job;assert.ok(result);
+    assert.ok(!Object.hasOwn(result.original_input,excluded.address));
+    const smallSlice: {state:string;budget_raw:string}|undefined=(await query<{state:string;budget_raw:string}>('select state,budget_raw::text from strategy_asset_slices where lot_id=$1 and asset=$2 and slice_index=$3',[lot,small.address,day])).rows[0];assert.ok(smallSlice);
+    assert.equal(smallSlice.state,day<2?'deferred_min_asset':'reserved');
+    assert.equal(Object.hasOwn(result.original_input,small.address),day>=2);
+    await complete(f,result,result.remaining_input,R);
+  }
+  const audited=(await query(`select sum(amount_raw+fee_reserve_raw)::text as spent from strategy_asset_slices
+    where lot_id=$1 and asset=$2 and state='completed'`,[lot,small.address])).rows[0];
+  assert.equal(audited?.spent,(2n*U).toString());
+});
 test('#100 DB 100-USDT capacity split spends one reserve, resumes at zero reserve and never rebuys released cash',async()=>{
   const f=await fixture();await f.fund(100n*U);const s=scheduler(f);assert.ok(s.deps.newMoney);
   s.deps.newMoney.policy=async()=>({reserve:s.sends.length===0?R:0n,caps:new Map([[a,25n*U],[b,25n*U]]),buyLimit:50n*U,cash:10000n*U});

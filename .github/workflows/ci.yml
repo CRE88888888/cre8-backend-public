@@ -57,6 +57,7 @@ jobs:
           test/info-collectors.test.ts
           test/info-http.test.ts
           test/assets.test.ts
+          test/asset-exposure.test.ts
           test/yield-domain.test.ts
           test/yield-reader.test.ts
           test/yield-snapshot.test.ts

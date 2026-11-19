@@ -1,4 +1,5 @@
 import { configuredChainId } from './testnet-profile.js';
+import { createInfoService, parseInfoFilters } from './info/service.js';
 import { createYieldService } from './yield-service.js';
 import { createServer as createHttpServer } from 'node:http';
 import { createPublicClient, http, toHex } from 'viem';
@@ -166,6 +167,7 @@ export const BUNDLER_TIMEOUT_MS = 30_000;
  * merged over the defaults, so a test can stub one dependency and leave the rest real.
  */
 export type ServerDeps = {
+  info: ReturnType<typeof createInfoService>;
   previewContribution: typeof previewContributionAsync;
   yieldService: ReturnType<typeof createYieldService>;
   portfolioStrategies: ReturnType<typeof createPortfolioStrategyService>;
@@ -303,6 +305,7 @@ async function defaultListAssets(): Promise<PriceableAsset[]> {
 }
 
 const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
+  info: createInfoService(),
   previewContribution: previewContributionAsync,
   yieldService: createYieldService(),
   portfolioStrategies: createPortfolioStrategyService(),
@@ -404,6 +407,19 @@ async function route(
   const segments = url.pathname.split('/').filter((segment) => segment.length > 0);
   const [root] = segments;
 
+  if (root === 'info' && segments.length === 2 && ['events', 'markets'].includes(segments[1] ?? '')) {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    if (segments[1] === 'markets') { sendJson(res, 200, await deps.info.markets()); return; }
+    const filters = parseInfoFilters(url.searchParams);
+    if (filters.includeCollected) {
+      const wallet = await deps.auth.authenticate(req.headers.authorization);
+      const wallets = deps.operatorWallets ?? resolveOperatorWallets();
+      if (!wallets.some(allowed => allowed.toLowerCase() === wallet.toLowerCase())) throw new AppError(403, 'OPERATOR_FORBIDDEN', 'wallet is not authorized to review information');
+    }
+    sendJson(res, 200, await deps.info.events(filters));
+    return;
+  }
+
   if(root==='yield'&&segments.length===2&&segments[1]==='markets'){
     if(method!=='GET')return methodNotAllowed(res,['GET']);
     const chainId=parsePositiveInteger(url.searchParams.get('chainId')??String(getConfig().chainId),'chainId');
@@ -479,6 +495,12 @@ async function route(
     const wallets = deps.operatorWallets ?? resolveOperatorWallets();
     if (!wallets.some((allowed) => allowed.toLowerCase() === wallet.toLowerCase())) {
       throw new AppError(403, 'OPERATOR_FORBIDDEN', 'wallet is not authorized to use operator endpoints');
+    }
+    if (segments.length === 5 && segments[1] === 'info' && segments[2] === 'events' && segments[4] === 'review') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      await deps.rateLimiter.wallet('plan', wallet);
+      sendJson(res, 200, await deps.info.review(segments[3] ?? '', await readJsonBody(req), wallet));
+      return;
     }
     if (segments[1] === 'waitlist') {
       if (segments[2] === 'invites') {

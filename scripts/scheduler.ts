@@ -25,6 +25,7 @@ import { pruneDailyOperationCounts } from '../src/ratelimit.js';
 import { DEFAULT_THRESHOLD_BPS } from '../src/snapshot.js';
 import type { PortfolioOutcome, SchedulerRound } from '../src/scheduler.js';
 import { startWorkerHealth } from '../src/worker-health.js';
+import { createInfoWorker } from '../src/info/job.js';
 
 // `.env` 只補沒設的變數（override: false）：CLI 前面 inline 帶的 env 優先。
 loadDotenv({ override: false });
@@ -185,6 +186,7 @@ async function listAlerts(): Promise<void> {
 }
 
 let stopHealth: () => Promise<void> = async () => {};
+let stopInfo: () => Promise<void> = async () => {};
 
 async function main(): Promise<number> {
   const args = parseArgs(process.argv.slice(2));
@@ -201,7 +203,11 @@ async function main(): Promise<number> {
   if (args.mode === 'loop') stopHealth = await startWorkerHealth();
 
   const startedAt = new Date();
+  const infoWorker = createInfoWorker();
+  stopInfo = () => infoWorker.stop();
   const runRound = async (): Promise<SchedulerRound> => {
+    // Independent, opt-in data collection also runs in trading dry-run mode.
+    infoWorker.tick();
     if (getConfig().chainId === 97) {
       try {
         const result = await reconcileRelayerTransactions({ replay: args.live });
@@ -297,6 +303,7 @@ try {
   console.error(`\n失敗：${error instanceof Error ? error.message : String(error)}`);
   exitCode = 1;
 } finally {
+  await stopInfo();
   await stopHealth();
   await closePool().catch(() => undefined);
 }

@@ -1,5 +1,6 @@
 node_modules/
 .bun-cache/
+.info-collectors/
 dist/
 coverage/
 .env

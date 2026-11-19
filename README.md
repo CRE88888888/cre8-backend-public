@@ -413,6 +413,49 @@ bun run preflight --strict                                 # 0 warn · 0 fail
 
 ## API
 
+### 資訊收集與審核（#159）
+
+`INFO_COLLECTORS_ENABLED=1` 才啟用 scheduler 中的資訊 job；預設關閉。
+`INFO_COLLECTORS_INTERVAL_SECONDS` 預設 1800（60..86400 秒）。資訊收集不依賴交易 `--live`，
+在背景只對官方來源送 GET、寫 `info_events` / `market_snapshots`，不送鏈上交易，也不等待來源 IO 才執行交易輪次。
+每來源 GET 最長 15 秒、同輪同來源總網路時間最長 30 秒；關機時等待正在執行的資訊輪次收尾後關閉 DB。
+單獨驗收一輪可執行 `INFO_COLLECTORS_ENABLED=1 bun scripts/info-collectors.ts`。
+每個來源一行計數：取得的 events/markets、實際新增/修正筆數與固定錯誤碼；失敗不會中斷其他來源。
+
+`SEC_USER_AGENT` 由營運設定，不在程式碼或 fixture 放聯絡信箱；未設時 SEC 停用並每輪記錄一行。
+SEC 只查 catalogue 成分對應的 issuer recent submissions，並非完整內部人交易資料；
+Form 4 不推論買賣方向，修訂保留獨立 accession。基金/ETF 與無 CIK 的資產略過。
+Strategy press 若回 403 就略過；本機成功抓取與資料完整性必須分開驗證。
+
+`INFO_COLLECTORS_STATE_DIR` 預設 `.info-collectors`（git 忽略）。BLS 每 4 小時查三個 series，通常一天 18 次 GET；每個 UTC 日硬上限 25 次，
+以原子名額檔記錄，逾時/403/429 同樣計次；目錄不可寫時拒絕 BLS 請求。
+**必須保留該目錄；同一出口 IP 的 scheduler 必須共用它**，不同磁碟/容器的目錄不會自動共享。
+整輪以 Postgres advisory lock 避免同 DB 同時抓取；30 分鐘節奏在進程記憶體中，重啟可提早重跑，
+BLS 的檔案名額仍保留。沒有自動重試或繞過來源封鎖。
+
+公開 API 免登入：
+
+- `GET /info/events?category=economy|company|person&from=2026-11-20&to=2026-11-21&fund=1&limit=50`：
+  只回 published；`from/to` 為包含端點的 ISO 日期/帶時區時間，日期代表 UTC 午夜；limit 為 1..100。
+  fund 為 catalogue 的策略 ID，每筆 `affectedFunds` 列出匹配資產的公開、目前生效基金 id/名稱。
+  `?include=collected` 需要 SIWE 營運錢包（`OPERATOR_WALLETS`），供營運檢視所有狀態與審核紀錄。
+- `GET /info/markets`：每個 series 最近兩筆實際觀測，缺值不補零；值與變化都是 decimal 字串。
+  美債變化單位為百分點；`usd_broad` 是 DTWEXBGS 廣義貿易加權美元指數，**不是 DXY**。
+  只有一筆時 change 為 null；非當日資料保留 observedOn，不能當作即時報價。
+
+營運審核 `POST /operator/info/events/:id/review`：SIWE bearer token + `OPERATOR_WALLETS`，
+body 為 `{"title_zh":"人工確認的中文標題","status":"reviewed"}`，status 可為 reviewed/published/rejected，
+中文標題 1..500 字元；寫入 controlling wallet、reviewed_at、updated_at。此端點不需開再平衡開關。
+重抓只更新仍為 collected 的來源欄位，人工處理過的事件不會被自動覆寫或發布。
+
+Fed 區分 statement/minutes/projections；BEA 僅收全國 GDP 和 Personal Income and Outlays。
+BLS 保存 CPI SA 指數、非農就業總量（千人）、失業率（%），**不是自行計算的 CPI 年增或新增非農人數**。
+BLS API 沒有發布時間，`occurredAt` 使用觀測月份末日，API 明示 `timeBasis=reference_period_end`、`referencePeriod`、`releaseDateAvailable=false`；
+不偽造發布日程、預期值或共識。所有事件先 collected，人工審核後才公開。
+
+fixtures/HTTP 測試可離線執行；`test/info.db.test.ts` 必須對可拋棄 Postgres 執行，驗證真實 SQL、
+每個來源重跑去重、審核保留、基金對應、篩選邊界、decimal 變化、rollback 與工作鎖。
+
 P11 新 registry／executor 的加入同意、三參數 enroll、24 小時版本生效與版本狀態，見
 [P11 後端版本介面](docs/versioning-p11.zh-TW.md)。該文件的版本跟隨語意取代本文舊有的 enrollment 版本釘選說明。
 

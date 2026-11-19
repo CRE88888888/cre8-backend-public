@@ -1,0 +1,120 @@
+<rss version="2.0"><channel><item name="GDP (Advance Estimate)">
+      <dbId>
+      </dbId>
+      <title>GDP (Advance Estimate), 4th Quarter and Year 2025</title>
+      <link>www.bea.gov/news/2026/gdp-advance-estimate-4th-quarter-and-year-2025</link>
+      <guid isPermaLink="true">www.bea.gov/news/2026/gdp-advance-estimate-4th-quarter-and-year-2025</guid>
+      <description>Real gross domestic product (GDP) increased at an annual rate of 1.4 percent in the fourth quarter of 2025 (October, November, and December), according to the advance estimate released today by the U.S. Bureau of Economic Analysis. In the third quarter, real GDP increased 4.4 percent. The contributors to the increase in real GDP in the fourth quarter were increases in consumer spending and investment. These movements were partly offset by decreases in government spending and exports. Imports, which are a subtraction in the calculation of GDP, decreased.     &lt;!--Full Text Link--&gt;&lt;a href='www.bea.gov/news/2026/gdp-advance-estimate-4th-quarter-and-year-2025'&gt;Full Text&lt;/a&gt;&lt;!--Full Text Link--&gt;</description>
+      <vintage>
+      </vintage>
+      <data>
+        <main>
+          <current>
+            <infoDate>Q4 2025</infoDate>
+            <percentChange>+1.4</percentChange>
+            <rateChange>
+            </rateChange>
+          </current>
+          <previous>
+            <infoDate>Q3 2025</infoDate>
+            <percentChange>+4.4</percentChange>
+          </previous>
+        </main>
+      </data>
+      <NextReleaseDate>March 13, 2026</NextReleaseDate>
+      <unitsOfMeasure>BLN$</unitsOfMeasure>
+      <changeUnit>PCT</changeUnit>
+      <linkHistoric>https://apps.bea.gov/histdata/</linkHistoric>
+      <linkArchive>https://www.bea.gov/news/archive</linkArchive>
+      <pdf>https://www.bea.gov/sites/default/files/2026-02/gdp4q25-adv.pdf</pdf>
+      <pubDate>Fri, 20 Feb 2026 08:30:00 EST</pubDate>
+    </item>
+    <item name="Gross Domestic Product for Puerto Rico">
+      <dbId>
+      </dbId>
+      <title>Gross Domestic Product for Puerto Rico, 2023</title>
+      <link>https://www.bea.gov/news/2025/gross-domestic-product-puerto-rico-2023</link>
+      <guid isPermaLink="true">https://www.bea.gov/news/2025/gross-domestic-product-puerto-rico-2023</guid>
+      <description>Real gross domestic product for Puerto Rico increased 3.0 percent in 2023 after decreasing 2.1 percent in 2022. The increase in real gross domestic product (GDP) in 2023 primarily reflected an increase in exports. Personal consumption expenditures, government spending, and private fixed investment also increased. These increases were partly offset by a decrease in private inventory investment. Imports, which are a subtraction in the calculation of GDP, increased.    &lt;!--Full Text Link--&gt;&lt;a href='https://www.bea.gov/news/2025/gross-domestic-product-puerto-rico-2023'&gt;Full Text&lt;/a&gt;&lt;!--Full Text Link--&gt;</description>
+      <data>
+        <main>
+          <current>
+            <infoDate>2023</infoDate>
+            <percentChange>
+            </percentChange>
+            <rateChange>
+            </rateChange>
+          </current>
+          <previous>
+            <infoDate>2022</infoDate>
+            <percentChange>
+            </percentChange>
+          </previous>
+        </main>
+      </data>
+      <NextReleaseDate>
+      </NextReleaseDate>
+      <unitsOfMeasure>BLN$</unitsOfMeasure>
+      <changeUnit>PCT</changeUnit>
+      <linkHistoric>https://apps.bea.gov/histdata/</linkHistoric>
+      <linkArchive>https://www.bea.gov/news/archive</linkArchive>
+      <pdf>https://www.bea.gov/sites/default/files/2025-09/prgdp0925.pdf</pdf>
+      <pubDate>Tue, 16 Sep 2025 10:00:00 EDT</pubDate>
+    </item>
+    <item name="Gross Domestic Product by Industry">
+      <dbId>107</dbId>
+      <title>Gross Domestic Product by Industry, 2nd Quarter 2023 and Comprehensive Update</title>
+      <link>https://www.bea.gov/news/2023/gross-domestic-product-industry-2nd-quarter-2023-and-comprehensive-update</link>
+      <guid isPermaLink="true">https://www.bea.gov/news/2023/gross-domestic-product-industry-2nd-quarter-2023-and-comprehensive-update</guid>
+      <description>In the second quarter, the value added of private goods-producing industries increased 7.7 percent, private services-producing industries increased 1.0 percent, and government increased 1.0 percent. Overall, 13 of 22 industry groups contributed to the 2.1 percent increase in second-quarter real GDP.    &lt;!--Full Text Link--&gt;&lt;a href='https://www.bea.gov/news/2023/gross-domestic-product-industry-2nd-quarter-2023-and-comprehensive-update'&gt;Full Text&lt;/a&gt;&lt;!--Full Text Link--&gt;</description>
+      <infoDate>2nd Quarter 2023</infoDate>
+      <percentChange>
+      </percentChange>
+      <rateChange>
+      </rateChange>
+      <displaySymbol>
+      </displaySymbol>
+      <infoDatePrevious>1st Quarter 2023</infoDatePrevious>
+      <percentChangePrevious>
+      </percentChangePrevious>
+      <NextReleaseDate>December 21, 2023</NextReleaseDate>
+      <unitsOfMeasure>BLN$</unitsOfMeasure>
+      <changeUnit>PCT</changeUnit>
+      <linkTimeSeries>
+      </linkTimeSeries>
+      <linkHistoric>https://apps.bea.gov/histdata/</linkHistoric>
+      <linkArchive>https://www.bea.gov/news/archive</linkArchive>
+      <pdf>https://www.bea.gov/sites/default/files/2023-12/gdpind2q23.pdf</pdf>
+      <iCalFile>
+      </iCalFile>
+      <pubDate>Tue, 05 Dec 2023 08:30:00 EST</pubDate>
+    </item>
+    <item name="Gross Domestic Product by Metropolitan Area">
+      <dbId>112</dbId>
+      <title>Gross Domestic Product by Metropolitan Area, 2016</title>
+      <link>https://apps.bea.gov/newsreleases/regional/gdp_metro/2017/gdp_metro0917.htm</link>
+      <guid isPermaLink="true">https://apps.bea.gov/newsreleases/regional/gdp_metro/2017/gdp_metro0917.htm</guid>
+      <description>Real gross domestic product (GDP) increased in 267 out of 382 metropolitan areas in 2016.  Real GDP by metropolitan area growth ranged from 8.1 percent in Lake Charles, LA and Bend-Redmond, OR to -13.3 percent in Odessa, TX. Real GDP for U.S. metropolitan areas grew 1.7 percent in 2016, led by growth in professional and business services; information services; and finance, insurance, real estate, rental, and leasing.    &lt;!--Full Text Link--&gt;&lt;a href='https://apps.bea.gov/newsreleases/regional/gdp_metro/2017/gdp_metro0917.htm'&gt;Full Text&lt;/a&gt;&lt;!--Full Text Link--&gt;</description>
+      <infoDate>2016</infoDate>
+      <percentChange>
+      </percentChange>
+      <rateChange>
+      </rateChange>
+      <displaySymbol>
+      </displaySymbol>
+      <infoDatePrevious>2015</infoDatePrevious>
+      <percentChangePrevious>
+      </percentChangePrevious>
+      <NextReleaseDate>September 2018</NextReleaseDate>
+      <unitsOfMeasure>BLN$</unitsOfMeasure>
+      <changeUnit>PCT</changeUnit>
+      <linkTimeSeries>
+      </linkTimeSeries>
+      <linkHistoric>https://apps.bea.gov/histdata/</linkHistoric>
+      <linkArchive>https://www.bea.gov/news/archive</linkArchive>
+      <pdf>https://apps.bea.gov/newsreleases/regional/gdp_metro/2017/pdf/Gdp_metro0917.pdf</pdf>
+      <iCalFile>
+      </iCalFile>
+      <pubDate>Wed, 20 Sep 2017 08:30:00 EDT</pubDate>
+    </item>
+    </channel></rss>

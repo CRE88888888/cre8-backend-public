@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { readFile } from 'node:fs/promises';
-import { getAddress, HttpRequestError, RpcRequestError, TimeoutError } from 'viem';
+import { ContractFunctionRevertedError, getAddress, HttpRequestError, parseAbi, RpcRequestError, SocketClosedError, TimeoutError } from 'viem';
 import { TESTNET_ASSETS } from '../src/keeper/assets.js';
 import { boundedTarget, canSwap, parseScenario, targetAt } from '../src/keeper/scenario.js';
-import { PriceKeeper } from '../src/keeper/engine.js';
+import { isTransientRpcError, PriceKeeper, RpcRetry, safeReason } from '../src/keeper/engine.js';
 import type { Head, KeeperIO, Observation } from '../src/keeper/engine.js';
 import { loadKeeperSettings } from '../src/keeper/run.js';
 import { sqrtPriceFor, spotPrice, validateFeed, signingAccount } from '../src/keeper/chain.js';
@@ -17,7 +17,7 @@ function rawScenario() {
     timeline: [{ steps: 120, mode: 'rise', stepBps: 5 }], overrides: {} };
 }
 
-function fixture() {
+function fixture(rpcFailureTimeoutSeconds = 1800) {
   const scenario = parseScenario(rawScenario());
   const state = { head: { number: 100n, timestamp: 1060n }, now: 1_060_000, fail: '', refreshMissing: false, inspections: 0,
     swaps: [] as string[], targets: [] as bigint[], pushes: [] as bigint[], mints: [] as string[], logs: [] as string[], alerts: [] as string[], balances: new Map<string, bigint>([[addr(1), 2_000_000n * unit]]) };
@@ -43,7 +43,7 @@ function fixture() {
   };
   const keeper = new PriceKeeper(io, scenario, addr(1), addr(2), {
     start: 1000n, minimumUsdtE18: 10_000n * unit, inventoryUsdtE18: 100_000n * unit,
-    swapBudgetUsdtE18: 10_000n * unit, stallSeconds: 90,
+    swapBudgetUsdtE18: 10_000n * unit, stallSeconds: 90, rpcFailureTimeoutSeconds,
   }, (line) => state.logs.push(line), async (line) => { state.alerts.push(line); fail('alert'); }, () => state.now);
   return { scenario, state, observations, keeper, io };
 }
@@ -157,6 +157,195 @@ test('keeper RPC/read/write failures halt permanently, alert once and redact ups
     assert.equal(state.alerts.length, 1); assert.doesNotMatch(state.logs.join('\n') + state.alerts.join('\n'), /secret|credential/);
     await assert.rejects(keeper.round(), /stopped/); assert.equal(state.alerts.length, 1);
     if (failure === 'head' || failure === 'inspect') { assert.equal(state.mints.length, 0); assert.equal(state.swaps.length, 0); }
+  }
+});
+
+test('#162 one transient market inventory failure skips that market and recovers next round', async () => {
+  const f = fixture();
+  const market = f.observations.find((o) => o.market.symbol === 'COHRB'); assert.ok(market);
+  const balance = f.io.balance;
+  let failed = false;
+  f.io.balance = async (token) => {
+    if (token === market.market.token && !failed) {
+      failed = true;
+      throw new HttpRequestError({ url: 'https://private-token.invalid/key', status: 503 });
+    }
+    return balance(token);
+  };
+  // Model confirmed on-chain observations so a retry cannot duplicate healthy swaps.
+  const swap = f.io.swap;
+  f.io.swap = async (o, target, budget) => { await swap(o, target, budget); o.lastObservation = f.state.head.timestamp; };
+  await f.keeper.round();
+  assert.equal(f.state.swaps.length, 91); assert.ok(!f.state.swaps.includes('COHRB'));
+  assert.equal(f.state.alerts.length, 0);
+  f.state.now += 60_000; f.state.head = { number: 101n, timestamp: 1120n };
+  await f.keeper.round();
+  assert.ok(f.state.swaps.includes('COHRB')); assert.equal(f.state.alerts.length, 0);
+  assert.doesNotMatch(f.state.logs.join('\n'), /private-token|https:/);
+});
+
+test('#162 transient RPC failure window starts at zero, survives equality and halts only beyond 30 minutes', async () => {
+  const f = fixture(); f.state.now = 0;
+  let reads = 0;
+  f.io.head = async () => { reads++; throw new HttpRequestError({ url: 'http://127.0.0.1:1', status: 503 }); };
+  await f.keeper.round(); assert.equal(f.state.alerts.length, 0);
+  f.state.now = 1_799_999; await f.keeper.round(); assert.equal(f.state.alerts.length, 0);
+  f.state.now = 1_800_000; await f.keeper.round(); assert.equal(f.state.alerts.length, 0);
+  const before = reads;
+  f.state.now = 1_800_001; await assert.rejects(f.keeper.round(), /halted/);
+  assert.equal(reads, before); assert.equal(f.state.alerts.length, 1);
+  assert.match(f.state.logs.join('\n'), /RPC failure timeout exceeded/);
+  await assert.rejects(f.keeper.round(), /stopped/); assert.equal(f.state.alerts.length, 1);
+});
+
+test('#162 backoff prevents early RPC calls, grows exponentially to 60 seconds and resets after full success', async () => {
+  const f = fixture(); const head = f.io.head;
+  let failing = true; let reads = 0;
+  f.io.head = async () => {
+    reads++;
+    if (failing) throw new TimeoutError({ body: {}, url: 'http://127.0.0.1:1' });
+    return head();
+  };
+  for (const delay of [2000, 4000, 8000, 16_000, 32_000, 60_000, 60_000]) {
+    await f.keeper.round(); assert.equal(f.keeper.retryDelayMs, delay);
+    const before = reads;
+    f.state.now += delay - 1; await f.keeper.round(); assert.equal(reads, before);
+    f.state.now++;
+  }
+  failing = false;
+  f.state.head = { number: 101n, timestamp: BigInt(f.state.now / 1000) };
+  await f.keeper.round(); assert.equal(f.keeper.retryDelayMs, 0); assert.equal(f.state.alerts.length, 0);
+  failing = true;
+  f.state.now += 1_800_001; // A successful round starts a new outage even after the old deadline.
+  await f.keeper.round(); assert.equal(f.keeper.retryDelayMs, 2000); assert.equal(f.state.alerts.length, 0);
+});
+
+test('#162 partial market success and a skipped repeated head cannot reset the outage window', async () => {
+  const f = fixture();
+  const failed = f.observations.find((o) => o.market.symbol === 'COHRB'); assert.ok(failed);
+  f.io.balance = async (token) => {
+    if (token === failed.market.token) throw new HttpRequestError({ url: 'http://127.0.0.1:1', status: 429 });
+    return 10n ** 40n;
+  };
+  await f.keeper.round(); assert.equal(f.state.swaps.length, 91);
+  f.state.now += 2000; await f.keeper.round(); // Repeated head: no successful round.
+  f.state.now += 1_798_000;
+  f.state.head = { number: 101n, timestamp: BigInt(f.state.now / 1000) };
+  await f.keeper.round(); assert.equal(f.state.swaps.length, 182); assert.equal(f.state.alerts.length, 0);
+  f.state.now++; await assert.rejects(f.keeper.round(), /halted/); assert.equal(f.state.alerts.length, 1);
+});
+
+test('#162 transient recovery retries fresh observations before the script step without duplicate swaps', async () => {
+  const f = fixture(); const first = f.observations[0]; assert.ok(first); first.twapE18 = null;
+  const second = f.observations[1]; assert.ok(second); second.twapE18 = null;
+  const balance = f.io.balance; let failed = false;
+  f.io.balance = async (token) => {
+    if (token === first.market.token && !failed) { failed = true; throw new SocketClosedError(); }
+    return balance(token);
+  };
+  const swap = f.io.swap;
+  f.io.swap = async (o, target, budget) => { await swap(o, target, budget); o.lastObservation = f.state.head.timestamp; };
+  await f.keeper.round(); assert.deepEqual(f.state.swaps, [second.market.symbol]);
+  f.state.now += 2000; f.state.head = { number: 101n, timestamp: 1062n };
+  await f.keeper.round(); assert.deepEqual(f.state.swaps, [second.market.symbol, first.market.symbol]);
+  assert.equal(f.state.alerts.length, 0); assert.equal(f.state.pushes.length, 0);
+});
+
+test('#162 transient faults across read stages resume from fresh inspection without repeating completed swaps', async () => {
+  for (const fault of ['head', 'inspect', 'cash', 'mint preflight', 'swap preflight', 'refresh head', 'refresh inspect', 'push preflight']) {
+    const f = fixture(); let failed = false; let heads = 0; let inspections = 0;
+    const fail = (at: string) => {
+      if (fault === at && !failed) { failed = true; throw new HttpRequestError({ url: 'http://127.0.0.1:1', status: 503 }); }
+    };
+    const { head, inspect, balance, mint, swap, push } = f.io;
+    f.io.head = async () => { fail(++heads === 1 ? 'head' : 'refresh head'); return head(); };
+    f.io.inspect = async (block) => { fail(++inspections === 1 ? 'inspect' : 'refresh inspect'); return inspect(block); };
+    f.io.balance = async (token) => { if (token === addr(1)) fail('cash'); return balance(token); };
+    f.io.mint = async (token, amount) => { fail('mint preflight'); await mint(token, amount); };
+    f.io.swap = async (o, target, budget) => {
+      fail('swap preflight'); await swap(o, target, budget); o.lastObservation = f.state.head.timestamp;
+    };
+    f.io.push = async (feed, answer) => { fail('push preflight'); await push(feed, answer); };
+    await f.keeper.round(); assert.ok(failed, fault); assert.equal(f.state.alerts.length, 0, fault);
+    f.state.now += 2000; f.state.head = { number: 101n, timestamp: 1062n };
+    await f.keeper.round(); assert.equal(f.keeper.retryDelayMs, 0, fault);
+    assert.equal(f.state.swaps.length, 92, fault); assert.equal(new Set(f.state.swaps).size, 92, fault);
+    assert.equal(f.state.alerts.length, 0, fault);
+  }
+});
+
+test('#162 long partial rounds stop new writes once the first failure exceeds the deadline', async () => {
+  const f = fixture(1); const first = f.observations[0]; assert.ok(first);
+  f.io.balance = async (token) => {
+    if (token === first.market.token) throw new HttpRequestError({ url: 'http://127.0.0.1:1', status: 503 });
+    return 10n ** 40n;
+  };
+  let swaps = 0;
+  f.io.swap = async () => { swaps++; f.state.now += 2000; };
+  await assert.rejects(f.keeper.round(), /halted/);
+  assert.equal(swaps, 1, 'no new swaps after the outage deadline');
+  assert.match(f.state.logs.join('\n'), /RPC failure timeout exceeded/); assert.equal(f.state.alerts.length, 1);
+});
+
+test('#162 a failed post-mint balance check halts instead of losing the exact target validation', async () => {
+  const f = fixture(); const first = f.observations[0]; assert.ok(first);
+  const balance = f.io.balance;
+  f.io.balance = async (token) => {
+    if (token === first.market.token && f.state.mints.includes(token)) throw new HttpRequestError({ url: 'https://private-token.invalid/key', status: 503 });
+    return balance(token);
+  };
+  await assert.rejects(f.keeper.round(), /halted/);
+  assert.equal(f.state.mints.length, 1); assert.equal(f.state.swaps.length, 0); assert.equal(f.state.alerts.length, 1);
+  await assert.rejects(f.keeper.round(), /stopped/);
+  assert.match(f.state.logs.join('\n'), /mint balance verification unavailable/);
+  assert.doesNotMatch(f.state.logs.join('\n'), /private-token|https:/);
+});
+
+test('#162 classification retries only transport/node faults, traverses wrappers and never hides a permanent cause', async () => {
+  const rpc = (code: number, message: string, data?: string) => new RpcRequestError({ body: {}, url: 'https://private-token.invalid/key', error: { code, message, ...(data ? { data } : {}) } });
+  const transient = [new TimeoutError({ body: {}, url: 'http://127.0.0.1:1' }), new SocketClosedError(),
+    ...[undefined, 408, 429, 500, 599].map((status) => new HttpRequestError({ url: 'http://127.0.0.1:1', ...(status ? { status } : {}) })),
+    ...[-32603, -32002, -32005].map((code) => rpc(code, 'private-token')),
+    rpc(-32000, 'rate limit private-token'), rpc(-32000, 'node unavailable private-token'),
+    Object.assign(new Error('private-token'), { code: 'ECONNRESET' })];
+  for (const error of transient) {
+    assert.equal(isTransientRpcError(new Error('private-token wrapper', { cause: error })), true);
+    const f = fixture(); f.io.head = async () => { throw error; };
+    await f.keeper.round(); assert.equal(f.state.alerts.length, 0); assert.equal(f.keeper.retryDelayMs, 2000);
+    assert.doesNotMatch(f.state.logs.join('\n'), /private-token|https:/);
+  }
+  const permanent = [new Error('private-token'),
+    ...[400, 401, 403, 404].map((status) => new HttpRequestError({ url: 'http://127.0.0.1:1', status })),
+    rpc(-32000, 'invalid input'), rpc(-32602, 'invalid params'), rpc(3, 'execution reverted'),
+    rpc(-32603, 'execution reverted'), rpc(-32005, 'rate limit', '0x12345678'),
+    new ContractFunctionRevertedError({ abi: parseAbi(['function fail()']), functionName: 'fail', data: '0x' }),
+    new Error('transaction not confirmed', { cause: transient[0] }),
+    ...['swap result mismatch', 'feed unavailable', 'market configuration mismatch', 'invalid timeline'].map((message) => new Error(message))];
+  for (const error of permanent) {
+    assert.equal(isTransientRpcError(error), false);
+    const f = fixture(); f.io.head = async () => { throw error; };
+    await assert.rejects(f.keeper.round(), /halted/); assert.equal(f.state.alerts.length, 1);
+    await assert.rejects(f.keeper.round(), /stopped/); assert.equal(f.state.alerts.length, 1);
+  }
+  const wrapped = new HttpRequestError({ url: 'http://127.0.0.1:1', cause: new Error('swap result mismatch') });
+  assert.equal(isTransientRpcError(wrapped), false);
+  assert.doesNotMatch(safeReason(new Error('private-token')), /private-token/);
+});
+
+test('#162 RPC outage settings validate zero, exact limits and invalid input without echoing values', () => {
+  const env = { PRICE_KEEPER_ENABLED: '1', PRICE_KEEPER_RPC_URL: 'http://127.0.0.1:8562', PRICE_KEEPER_MANIFEST: 'manifest.json',
+    PRICE_KEEPER_SCENARIO: 'scenario.json', PRICE_KEEPER_START_TIMESTAMP: '1000', PRICE_KEEPER_PRIVATE_KEY: `0x${'0'.repeat(63)}1` };
+  assert.equal(loadKeeperSettings(env)?.settings.rpcFailureTimeoutSeconds, 1800);
+  for (const value of [1, 86_400]) {
+    assert.equal(loadKeeperSettings({ ...env, PRICE_KEEPER_RPC_FAILURE_TIMEOUT_SECONDS: String(value) })?.settings.rpcFailureTimeoutSeconds, value);
+    const retry = new RpcRetry(value, () => 0); assert.equal(retry.fail(), 2000);
+  }
+  for (const value of [0, -1, 86_401, 1.5, NaN, Infinity]) assert.throws(() => new RpcRetry(value));
+  for (const value of ['', '0', '-1', '86401', '1.5', 'Infinity', '1e3', 'private-token']) {
+    assert.throws(() => loadKeeperSettings({ ...env, PRICE_KEEPER_RPC_FAILURE_TIMEOUT_SECONDS: value }), (error: unknown) => {
+      assert.ok(error instanceof Error); assert.match(error.message, /PRICE_KEEPER_RPC_FAILURE_TIMEOUT_SECONDS/);
+      assert.doesNotMatch(error.message, /private-token/); return true;
+    });
   }
 });
 
@@ -294,14 +483,15 @@ test('#139 stopped logs explain the stage and safe local/RPC reason without upst
   const local = fixture(); local.observations.pop();
   await assert.rejects(local.keeper.round(), /halted/);
   assert.match(local.state.logs.join('\n'), /inspect.*incomplete market observations/);
-  for (const error of [new TimeoutError({ body: {}, url: 'https://private-token.invalid/key' }),
+  for (const error of [new Error('transaction not confirmed', { cause: new TimeoutError({ body: {}, url: 'https://private-token.invalid/key' }) }),
     new RpcRequestError({ body: {}, url: 'https://private-token.invalid/key', error: { code: -32000, message: 'seed=private-token' } }),
-    new HttpRequestError({ url: 'https://private-token.invalid/key', status: 503, details: 'seed=private-token' })]) {
+    new HttpRequestError({ url: 'https://private-token.invalid/key', status: 401, details: 'seed=private-token' })]) {
     const f = fixture(); f.io.head = async () => { throw error; };
     await assert.rejects(f.keeper.round(), /halted/);
     const output = f.state.logs.join('\n') + f.state.alerts.join('\n');
-    assert.match(output, new RegExp(`head.*${error.name}`));
-    if (error instanceof HttpRequestError) assert.match(output, /503/);
+    assert.match(output, /head/);
+    if (error instanceof HttpRequestError) assert.match(output, /HttpRequestError.*401/);
+    if (error.cause instanceof TimeoutError) assert.match(output, /transaction not confirmed.*TimeoutError/);
     if (error instanceof RpcRequestError) assert.match(output, /-32000/);
     assert.doesNotMatch(output, /private-token|https:|seed=/);
   }

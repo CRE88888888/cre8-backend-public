@@ -4,6 +4,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { bscTestnet } from 'viem/chains';
 import { TESTNET_ASSETS } from './assets.js';
 import type { Head, KeeperIO, Market, Observation } from './engine.js';
+import { isTransientRpcError } from './engine.js';
 import { positiveAmount, record } from './scenario.js';
 
 // Official chain-97 periphery: https://developer.pancakeswap.finance/contracts/v3/addresses
@@ -129,12 +130,18 @@ export function createKeeperChain(rpcUrl: string, account: Account, manifest: Ma
 
   async function landed(submit: () => Promise<Hex>, action: string): Promise<void> {
     await head();
-    const hash = await submit();
-    log(`[price-keeper] submitted ${action} tx=${hash}`);
-    const receipt = await client.waitForTransactionReceipt({ hash, timeout: 30_000, pollingInterval: 250, retryCount: 0 });
-    if (receipt.transactionHash.toLowerCase() !== hash.toLowerCase() || receipt.status !== 'success' ||
-      (await client.getBlock({ blockNumber: receipt.blockNumber })).hash !== receipt.blockHash) throw new Error('transaction not confirmed');
-    log(`[price-keeper] confirmed ${action} block=${receipt.blockNumber}`);
+    try {
+      const hash = await submit();
+      log(`[price-keeper] submitted ${action} tx=${hash}`);
+      const receipt = await client.waitForTransactionReceipt({ hash, timeout: 30_000, pollingInterval: 250, retryCount: 0 });
+      if (receipt.transactionHash.toLowerCase() !== hash.toLowerCase() || receipt.status !== 'success' ||
+        (await client.getBlock({ blockNumber: receipt.blockNumber })).hash !== receipt.blockHash) throw new Error('transaction not confirmed');
+      log(`[price-keeper] confirmed ${action} block=${receipt.blockNumber}`);
+    } catch (error) {
+      // A lost broadcast/receipt response may already have changed the chain. Never retry it.
+      if (isTransientRpcError(error)) throw new Error('transaction not confirmed', { cause: error });
+      throw error;
+    }
   }
 
   async function verify(): Promise<void> {
@@ -253,10 +260,16 @@ export function createKeeperChain(rpcUrl: string, account: Account, manifest: Ma
       const block = await head();
       // SwapRouter pays only the input needed to reach sqrtPriceLimitX96, including initialized tick crossings.
       await landed(() => wallet.writeContract({ address: SWAP_ROUTER, abi: KEEPER_ABI, functionName: 'exactInputSingle', args: [{ tokenIn, tokenOut, amountIn, fee: market.fee, recipient: account.address, deadline: block.timestamp + 60n, amountOutMinimum: quote[0] * 9999n / 10_000n, sqrtPriceLimitX96: limit }] }), 'swap');
-      const after = await client.readContract({ address: market.pool, abi: KEEPER_ABI, functionName: 'slot0' });
-      const spent = before - await io.balance(tokenIn);
-      if (after[0] !== limit || spent <= 0n || spent > amountIn) throw new Error('swap result mismatch');
-      log(`[price-keeper] spent ${market.symbol} tokenIn=${tokenIn} amountRaw=${spent}`);
+      try {
+        const after = await client.readContract({ address: market.pool, abi: KEEPER_ABI, functionName: 'slot0' });
+        const spent = before - await io.balance(tokenIn);
+        if (after[0] !== limit || spent <= 0n || spent > amountIn) throw new Error('swap result mismatch');
+        log(`[price-keeper] spent ${market.symbol} tokenIn=${tokenIn} amountRaw=${spent}`);
+      } catch (error) {
+        // A later round cannot substitute for this transaction's result checks.
+        if (isTransientRpcError(error)) throw new Error('swap result verification unavailable', { cause: error });
+        throw error;
+      }
     },
   };
   return { io, verify };

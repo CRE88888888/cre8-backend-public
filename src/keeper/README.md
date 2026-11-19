@@ -17,6 +17,7 @@
 | `PRICE_KEEPER_MIN_INVENTORY_E18` | 每個代幣的 USDT 計價補貨門檻；預設 10,000 × 10^18 |
 | `PRICE_KEEPER_INVENTORY_E18` | 補貨後庫存價值；預設 100,000 × 10^18，必須大於門檻 |
 | `PRICE_KEEPER_SWAP_BUDGET_E18` | 單筆 input 價值上限；預設 10,000 × 10^18，不能大於門檻 |
+| `PRICE_KEEPER_RPC_FAILURE_TIMEOUT_SECONDS` | 連續 RPC 故障的停止門檻；預設 1,800 秒，只接受 1–86,400 的整數；超過門檻才發 critical 並停止 |
 | `TELEGRAM_BOT_TOKEN`／`TELEGRAM_CHAT_ID` | 沿用 `src/notify.ts`；留空停用通知 |
 
 這次驗收只允許 `http://127.0.0.1:8562` anvil fork。金鑰只能在本機驗收時由
@@ -56,10 +57,24 @@ USDT 在連續買入間逐筆檢查；所有 mint／approve／swap／push 都記
 休市或暫停期間仍推 feed，避免過期。feed 剛更新、未滿一步時不重複推送。
 第一次啟動前，部署池必須已有完整 30 分鐘歷史，且 feed 尚未 stale。
 
-RPC 讀寫或確認逾時、區塊倒退／超過 90 秒未前進／時鐘異常、feed 或 oracle 異常、
-庫存／成交驗證失敗都會永久停止當前實例，透過既有 Telegram sender 發一則 critical。
-不自動重送未知交易、不自動修復 stale feed；營運者檢查 receipt／nonce、來源與權限後手動重啟。
-錯誤原文不進 log 或通知。這個獨立程序不新增 DB alert kind，也不提供 `/health` 的 DB alert 列。
+暫時性 RPC 讀取故障（連線中斷、timeout、HTTP 408／429／5xx，以及限流或節點暫不可用的 RPC 錯誤）
+先記 warning，以 2、4、8、16、32、60 秒退避，之後維持最多 60 秒。啟動時的鏈上核對也用同樣策略。
+市場庫存／成交前讀取失敗時跳過該市場，繼續其他市場；全體 inspection、回合開頭的 USDT 庫存或 feed 刷新讀取失敗則結束當輪。
+重試從新的 head 與全體 inspection 開始，仍由鏈上 observation 時間限制成交頻率，不重播原本的 swap 指令。
+單一市場持續失敗也算未完成回合；略過區塊與其他市場成功都不清除故障窗。
+只有完整成功的正常／TWAP 恢復回合才重設故障窗；從第一次故障起超過上述秒數才停止並發一則 critical。
+回合內跨市場與發起 mint／swap／push 前也會檢查門檻，避免長回合在故障逾時後持續發起寫入。
+`--once` 仍只嘗試一輪，暫時性故障記 warning 後退出；常駐模式才持續重試。
+
+合約 revert、HTTP 權限／設定錯誤、劇本／manifest／鏈上權限錯誤、區塊停滯／時鐘異常、feed／oracle 異常、
+庫存／成交驗證失敗仍立即永久停止，透過既有 Telegram sender 發一則 critical。
+廣播或確認階段的失敗可能已改變鏈上狀態，包含 HTTP／timeout 也立即停止；不自動重送未知交易。
+mint／swap 確認後若餘額或池價核對讀取失敗，也立即停止，避免下一輪略過原交易的結果驗證。
+營運者檢查 receipt／nonce、來源與權限後手動重啟。本次未增加多 RPC 備援，仍只使用 `PRICE_KEEPER_RPC_URL`。
+無法確認為暫時性故障的 RPC 錯誤仍停止；例如帶有非空 `data` 的 RPC 回應可能包含 revert 資料，不自動重試。
+啟動與停止 log 記錄階段、白名單本機原因、HTTP status／RPC code 或檔案錯誤 code；
+上游原文、檔案內容／路徑、私鑰與 RPC URL 不進 log 或通知。
+這個獨立程序不新增 DB alert kind，也不提供 `/health` 的 DB alert 列。
 
 ## 驗收
 

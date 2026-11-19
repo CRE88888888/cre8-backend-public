@@ -595,7 +595,7 @@ async function loginOverHttp(
   return loginTestWallet(baseUrl, account.address);
 }
 
-test('HTTP: approved Privy login → POST /strategies creates a strategy owned by the wallet', async () => {
+test('HTTP: approved Privy operator login → POST /strategies creates a strategy owned by the wallet', async () => {
   const account = newAccount();
   const calls: Array<{ provider: string; body: unknown }> = [];
 
@@ -637,7 +637,7 @@ test('HTTP: approved Privy login → POST /strategies creates a strategy owned b
       assert.equal(calls.length, 1);
       assert.equal(calls[0]?.provider, account.address.toLowerCase());
     },
-    { createStrategy: fakeCreate },
+    { createStrategy: fakeCreate, operatorWallets: [account.address] },
   );
 });
 
@@ -662,7 +662,7 @@ test('HTTP: POST /strategies without a token is 401 and never reaches the domain
   );
 });
 
-test('HTTP: POST /strategies/:id/versions without a token is 401, with a token it is 201', async () => {
+test('HTTP: POST /strategies/:id/versions without a token is 401, with an operator token it is 201', async () => {
   const published: StrategyVersion = {
     strategyId: 1,
     version: 1,
@@ -674,13 +674,13 @@ test('HTTP: POST /strategies/:id/versions without a token is 401, with a token i
     executionSchemaVersion: 0, execution: { kind: 'target_weight' }, executionChainId: null, configHash: null, idleYield: { enabled: false },
   };
   const providers: string[] = [];
+  const account = newAccount();
 
   await withServer(
     async (baseUrl) => {
       const unauthorized = await postJson(baseUrl, '/strategies/1/versions', PUBLISH_BODY);
       assert.equal(unauthorized.status, 401);
 
-      const account = newAccount();
       const session = await loginOverHttp(baseUrl, account);
       const authorized = await postJson(baseUrl, '/strategies/1/versions', PUBLISH_BODY, session.token);
       assert.equal(authorized.status, 201);
@@ -688,6 +688,7 @@ test('HTTP: POST /strategies/:id/versions without a token is 401, with a token i
       assert.deepEqual(providers, [account.address.toLowerCase()]);
     },
     {
+      operatorWallets: [account.address],
       publishVersion: async (_id: number, _input: PublishVersionInput, provider: string) => {
         providers.push(provider);
         return published;
@@ -746,12 +747,12 @@ test('HTTP: replaying a used nonce is 400 INVALID_NONCE', async () => {
   }));
 });
 
-test('HTTP: an authenticated non-owner publishing a version is 403 FORBIDDEN', async () => {
+test('HTTP: an authenticated operator who is not the owner publishing a version is 403 FORBIDDEN', async () => {
   const ownerAddress = '0x1111111111111111111111111111111111111111';
+  const stranger = newAccount();
 
   await withServer(
     async (baseUrl) => {
-      const stranger = newAccount();
       const session = await loginOverHttp(baseUrl, stranger);
 
       const response = await postJson(baseUrl, '/strategies/7/versions', PUBLISH_BODY, session.token);
@@ -761,6 +762,7 @@ test('HTTP: an authenticated non-owner publishing a version is 403 FORBIDDEN', a
       assert.equal(payload.error.code, 'FORBIDDEN');
     },
     {
+      operatorWallets: [stranger.address],
       // Mirrors what the real publishVersion does after loading the strategy row.
       publishVersion: async (_id: number, _input: PublishVersionInput, provider: string) => {
         assertProviderOwns(ownerAddress, provider);
@@ -821,7 +823,7 @@ test('DB: provider ownership is enforced end to end over HTTP', { skip: skipDbCh
       );
       assert.equal(denied.status, 403);
       assert.equal(((await denied.json()) as { error: { code: string } }).error.code, 'FORBIDDEN');
-    });
+    }, { operatorWallets: [owner.address, stranger.address] });
   } finally {
     await query('delete from strategies where id = $1', [strategy.id]);
   }

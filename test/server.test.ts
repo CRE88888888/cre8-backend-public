@@ -18,7 +18,7 @@ import { loadRateLimitConfig, loadRelayerGasConfig } from '../src/config.js';
 import { MemoryRateLimitStore, RateLimitError, RequestRateLimiter } from '../src/ratelimit.js';
 import type { RateLimitStore, WalletAction } from '../src/ratelimit.js';
 import type { ServerDeps } from '../src/server.js';
-import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
+import { generatePrivateKey, mnemonicToAccount, privateKeyToAccount } from 'viem/accounts';
 import { createSiweMessage } from 'viem/siwe';
 
 import { execFile } from 'node:child_process';
@@ -36,6 +36,7 @@ import { assertNoSecretSlices, runScript } from './fixtures/secret-output.js';
 import { loadPrivyConfig } from '../src/config.js';
 import { SESSION_TTL_MS, sha256Hex } from '../src/auth.js';
 import { AppError } from '../src/errors.js';
+import { validateAllocation } from '../src/strategies.js';
 import { createPrivyLogin, MAX_PRIVY_TOKEN_LENGTH } from '../src/privy.js';
 import { privyFixture, privyMemory } from './fixtures/privy.js';
 
@@ -51,12 +52,15 @@ test('#97 bundler errors and strategy RPC failures never expose upstream credent
     bundlerUrl: 'https://SECRETKEY.example/path/SECRETKEY?apiKey=SECRETKEY',
     bundlerFetch: async () => { throw new Error('network failure https://SECRETKEY.example/SECRETKEY'); },
     createStrategy: async () => { throw new Error('RPC stack https://rpc.example/SECRETKEY'); },
+    publishVersion: async () => { throw new Error('RPC stack https://rpc.example/SECRETKEY'); },
+    operatorWallets: ['0x1000000000000000000000000000000000000001'],
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   try {
     const address = server.address(); assert.ok(address && typeof address !== 'string');
     for (const [path, body, status] of [['/bundler', { method: 'eth_chainId', id: 1, jsonrpc: '2.0', params: [] }, 502],
-      ['/strategies', { name: 'fund' }, 500]] as const) {
+      ['/strategies', { name: 'fund' }, 500],
+      ['/strategies/1/versions', { allocation: { assets: [{ address: '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c', weightBps: 10000 }] }, schedule: { kind: 'interval', intervalSeconds: 60 } }, 500]] as const) {
       const response = await fetch(`http://127.0.0.1:${address.port}${path}`, { method: 'POST', body: JSON.stringify(body) });
       assert.equal(response.status, status);
       bodies.push(await response.text());
@@ -672,6 +676,137 @@ const budgetActions: { action: WalletAction; path: string; method: string; body?
   { action: 'close', path: '/portfolios/1/close', method: 'POST' },
   { action: 'assets', path: '/assets', method: 'GET' },
 ];
+
+const strategyOperatorKey = mnemonicToAccount('test test test test test test test test test test test junk', { addressIndex: 4 }).getHdKey().privateKey;
+assert.ok(strategyOperatorKey);
+const STRATEGY_OPERATOR = privateKeyToAccount(toHex(strategyOperatorKey));
+const strategyWrites = budgetActions.filter(entry => entry.action === 'strategies' || entry.action === 'versions');
+
+async function responseErrorCode(response: Response): Promise<string> {
+  const body: unknown = await response.json();
+  assert.ok(body && typeof body === 'object' && 'error' in body);
+  const error = body.error;
+  assert.ok(error && typeof error === 'object' && 'code' in error && typeof error.code === 'string');
+  return error.code;
+}
+
+function strategyWriteStubs(calls: string[]): Partial<ServerDeps> {
+  return {
+    createStrategy: async (_body, provider) => {
+      calls.push(provider);
+      return { id: 1, provider, name: 'fund', description: '', isPublic: true, swapFeeBps: 0,
+        onchainId: null, createdAt: new Date().toISOString() };
+    },
+    publishVersion: async (strategyId, input, provider) => {
+      calls.push(provider);
+      return { strategyId, version: 1, allocation: validateAllocation(input.allocation),
+        schedule: { kind: 'interval', intervalSeconds: 60 }, changeLog: input.changeLog ?? null,
+        activeAt: null, createdAt: new Date().toISOString(), executionSchemaVersion: 0,
+        execution: { kind: 'target_weight' }, executionChainId: null, configHash: null, idleYield: { enabled: false } };
+    },
+  };
+}
+
+for (const entry of strategyWrites) {
+  test('#157 ' + entry.path + ': non-operators are rejected before body validation, rate limits or domain writes', async () => {
+    const calls: string[] = [];
+    await withBudgetServer(async base => {
+      const token = await budgetToken(base);
+      // Neither a claimed provider nor malformed JSON can bypass the session-wallet gate.
+      for (const body of [JSON.stringify(entry.body), JSON.stringify({ provider: STRATEGY_OPERATOR.address }), 'null', '{']) {
+        const response = await fetch(base + entry.path, { method: 'POST', body,
+          headers: { authorization: 'Bearer ' + token, origin: 'http://localhost:5173' } });
+        assert.equal(response.status, 403);
+        assert.deepEqual(await response.json(), { error: { code: 'OPERATOR_ONLY', message: 'only operator wallets may create strategies or publish versions' } });
+        assert.equal(response.headers.get('cache-control'), 'no-store');
+        assert.equal(response.headers.get('access-control-allow-origin'), 'http://localhost:5173');
+      }
+      assert.deepEqual(calls, []);
+    }, { ...strategyWriteStubs(calls), operatorWallets: [STRATEGY_OPERATOR.address],
+      rateLimiter: new RequestRateLimiter({ ...loadRateLimitConfig({}), strategiesPerDay: 0, versionsPerDay: 0 }, new MemoryRateLimitStore()) });
+  });
+
+  test('#157 ' + entry.path + ': authenticates first and reads the current complete operator environment on every request', async () => {
+    const previous = process.env.OPERATOR_WALLETS;
+    const calls: string[] = [];
+    try {
+      await withBudgetServer(async base => {
+        const token = await budgetToken(base, STRATEGY_OPERATOR);
+        const request = (bearer?: string) => fetch(base + entry.path, { method: 'POST', body: JSON.stringify(entry.body),
+          headers: bearer === undefined ? {} : { authorization: 'Bearer ' + bearer } });
+        process.env.OPERATOR_WALLETS = `${STRATEGY_OPERATOR.address},*`;
+        for (const bearer of [undefined, 'unknown-token']) {
+          const response = await request(bearer);
+          assert.equal(response.status, 401);
+          assert.equal(await responseErrorCode(response), 'UNAUTHORIZED');
+        }
+        for (const value of [undefined, '', '   ', `${STRATEGY_OPERATOR.address},*`, `${STRATEGY_OPERATOR.address},${zeroAddress}`, `${STRATEGY_OPERATOR.address},`]) {
+          if (value === undefined) delete process.env.OPERATOR_WALLETS;
+          else process.env.OPERATOR_WALLETS = value;
+          const response = await request(token);
+          const invalid = value !== undefined && value.trim() !== '';
+          assert.equal(response.status, invalid ? 503 : 403);
+          assert.equal(await responseErrorCode(response), invalid ? 'INVALID_OPERATOR_WALLETS' : 'OPERATOR_ONLY');
+          assert.deepEqual(calls, []);
+        }
+        process.env.OPERATOR_WALLETS = ` ${STRATEGY_OPERATOR.address.toUpperCase()} `;
+        const allowed = await request(token);
+        assert.equal(allowed.status, 201);
+        assert.deepEqual(calls, [STRATEGY_OPERATOR.address.toLowerCase()]);
+        process.env.OPERATOR_WALLETS = '';
+        assert.equal((await request(token)).status, 403);
+        assert.equal(calls.length, 1);
+      }, { ...strategyWriteStubs(calls), operatorRebalanceEnabled: () => false,
+        rateLimiter: new RequestRateLimiter(loadRateLimitConfig({}), new MemoryRateLimitStore()) });
+    } finally {
+      if (previous === undefined) delete process.env.OPERATOR_WALLETS;
+      else process.env.OPERATOR_WALLETS = previous;
+    }
+  });
+
+  test('#157 ' + entry.path + ': injected allowlists compare case-insensitively and an empty list denies access', async () => {
+    const previous = process.env.OPERATOR_WALLETS;
+    process.env.OPERATOR_WALLETS = STRATEGY_OPERATOR.address;
+    try {
+      for (const wallets of [[], [STRATEGY_OPERATOR.address], [STRATEGY_OPERATOR.address.toLowerCase()],
+        ['0x1000000000000000000000000000000000000001', STRATEGY_OPERATOR.address.toUpperCase()]]) {
+        const calls: string[] = [];
+        await withBudgetServer(async base => {
+          const token = await budgetToken(base, STRATEGY_OPERATOR);
+          const response = await fetch(base + entry.path, { method: 'POST', body: JSON.stringify(entry.body),
+            headers: { authorization: 'Bearer ' + token } });
+          assert.equal(response.status, wallets.length === 0 ? 403 : 201);
+          assert.deepEqual(calls, wallets.length === 0 ? [] : [STRATEGY_OPERATOR.address.toLowerCase()]);
+        }, { ...strategyWriteStubs(calls), operatorWallets: wallets, operatorRebalanceEnabled: () => false,
+          rateLimiter: new RequestRateLimiter(loadRateLimitConfig({}), new MemoryRateLimitStore()) });
+      }
+    } finally {
+      if (previous === undefined) delete process.env.OPERATOR_WALLETS;
+      else process.env.OPERATOR_WALLETS = previous;
+    }
+  });
+
+  test('#157 ' + entry.path + ': authentication and domain storage failures or timeouts fail closed', async () => {
+    for (const code of ['ECONNREFUSED', 'ETIMEDOUT']) {
+      for (const source of ['auth', 'domain']) {
+        const calls: string[] = [];
+        const failure = async (): Promise<never> => { throw Object.assign(new Error('sensitive storage failure'), { code }); };
+        await withBudgetServer(async base => {
+          const response = await fetch(base + entry.path, { method: 'POST', body: JSON.stringify(entry.body),
+            headers: { authorization: 'Bearer test-session' } });
+          assert.equal(response.status, 503);
+          assert.deepEqual(await response.json(), { error: { code: 'DB_UNAVAILABLE', message: 'database unavailable' } });
+          assert.deepEqual(calls, []);
+        }, { ...strategyWriteStubs(calls), operatorWallets: [STRATEGY_OPERATOR.address],
+          ...(source === 'domain' ? { createStrategy: failure, publishVersion: failure } : {}),
+          rateLimiter: new RequestRateLimiter(loadRateLimitConfig({}), new MemoryRateLimitStore()),
+          auth: { authenticate: source === 'auth' ? failure : async () => STRATEGY_OPERATOR.address,
+            issueNonce: () => { throw new Error('unexpected nonce'); }, login: failure, logout: failure } });
+      }
+    }
+  });
+}
+
 for (const entry of budgetActions) {
   test('#59 HTTP ' + entry.action + ': authenticated wallet limit, other wallet, parallel calls and reset', async () => {
     let now = 1_000;
@@ -679,11 +814,12 @@ for (const entry of budgetActions) {
     const touch = async () => { calls++; return {}; };
     const limiter = new RequestRateLimiter({ ...loadRateLimitConfig({}), strategiesPerDay: 2, versionsPerDay: 2,
       portfoliosPerDay: 2, planPerMinute: 2, redeemPerMinute: 2, closePerMinute: 2, assetsPerMinute: 2 }, new MemoryRateLimitStore(), () => now);
+    const account = privateKeyToAccount(generatePrivateKey());
+    const otherAccount = privateKeyToAccount(generatePrivateKey());
     await withBudgetServer(async (base) => {
-      const account = privateKeyToAccount(generatePrivateKey());
       const firstToken = await budgetToken(base, account);
       const secondToken = await budgetToken(base, account);
-      const otherToken = await budgetToken(base);
+      const otherToken = await budgetToken(base, otherAccount);
       const request = (token?: string) => fetch(base + entry.path, { method: entry.method,
         headers: { ...(token ? { authorization: 'Bearer ' + token } : {}), 'content-type': 'application/json', origin: 'http://localhost:5173' },
         ...(entry.body === undefined ? {} : { body: JSON.stringify(entry.body) }) });
@@ -699,7 +835,7 @@ for (const entry of budgetActions) {
       now = 86_400_000;
       assert.ok((await request(firstToken)).status < 300);
       assert.equal(calls, 4);
-    }, { rateLimiter: limiter,
+    }, { rateLimiter: limiter, operatorWallets: [account.address, otherAccount.address],
       createStrategy: async (_body, provider) => { calls++; return { id: 1, provider, name: 'fund', description: '', isPublic: false, swapFeeBps: 0, onchainId: null, createdAt: new Date().toISOString() }; },
       publishVersion: async () => { calls++; return { strategyId: 1, version: 1, allocation: { assets: [{ address: '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c', weightBps: 10000 }] }, schedule: { kind: 'interval', intervalSeconds: 60 }, executionSchemaVersion: 0, execution: { kind: 'target_weight' }, executionChainId: null, configHash: null, idleYield: { enabled: false }, changeLog: null, activeAt: null, createdAt: new Date().toISOString() }; },
       enrollPortfolio: async (_id, userId) => { calls++; return { minDepositUsdtWei: '50000000000000000000', id: 1, userId, strategyId: 1, strategyName: 'fund', version: 1, scheduleState: 'active', createdAt: new Date().toISOString(), smartAccounts: [], gas: null }; },

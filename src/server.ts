@@ -829,9 +829,8 @@ async function detailRoute(res: ServerResponse, id: number, deps: ServerDeps): P
 
 /**
  * POST /strategies — create metadata only; versions are published separately.
- * Requires a bearer token: the provider is the session wallet, and any `provider` in the body is
- * ignored (authenticate() runs before the body is read, so an unauthenticated call is 401 even
- * when the payload is invalid).
+ * Requires an operator's bearer token: the provider is the session wallet, and any `provider`
+ * in the body is ignored. Authentication and operator authorization run before reading the body.
  */
 async function createRoute(
   req: IncomingMessage,
@@ -839,6 +838,7 @@ async function createRoute(
   deps: ServerDeps,
 ): Promise<void> {
   const provider = await deps.auth.authenticate(req.headers.authorization);
+  requireStrategyOperator(provider, deps);
   await deps.rateLimiter.wallet('strategies', provider);
   const body = await readJsonBody(req);
   const strategy = await deps.createStrategy(body, provider);
@@ -847,7 +847,7 @@ async function createRoute(
 
 /**
  * POST /strategies/:id/versions — append a version; the created version record is the response.
- * Requires a bearer token; publishVersion enforces that the session wallet owns the strategy.
+ * Requires an operator's bearer token; publishVersion still enforces ownership of the strategy.
  */
 async function publishVersionRoute(
   req: IncomingMessage,
@@ -856,6 +856,7 @@ async function publishVersionRoute(
   deps: ServerDeps,
 ): Promise<void> {
   const provider = await deps.auth.authenticate(req.headers.authorization);
+  requireStrategyOperator(provider, deps);
   await deps.rateLimiter.wallet('versions', provider);
   const body = await readJsonBody(req);
   // publishVersion expects an object; without this guard a JSON `null` body would be a 500.
@@ -864,6 +865,13 @@ async function publishVersionRoute(
   }
   const version = await deps.publishVersion(id, typedVersionInput(body), provider);
   sendJson(res, 201, { ...version, minDepositUsdtWei: version.executionSchemaVersion !== 0 ? typedMinimumDeposit(version) : allocationMinimumDeposit(version.allocation) });
+}
+
+function requireStrategyOperator(wallet: string, deps: ServerDeps): void {
+  const wallets = deps.operatorWallets ?? resolveOperatorWallets();
+  if (!wallets.some(allowed => allowed.toLowerCase() === wallet.toLowerCase())) {
+    throw new AppError(403, 'OPERATOR_ONLY', 'only operator wallets may create strategies or publish versions');
+  }
 }
 
 /**

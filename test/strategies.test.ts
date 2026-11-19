@@ -3,7 +3,7 @@ import { TESTNET_97 } from '../src/testnet-profile.js';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, test } from 'node:test';
-import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
+import { generatePrivateKey, mnemonicToAccount, privateKeyToAccount } from 'viem/accounts';
 import { loadConfig } from '../src/config.js';
 import { closePool, migrate, query } from '../src/db.js';
 import { ForbiddenError, NotFoundError, ValidationError } from '../src/errors.js';
@@ -339,7 +339,7 @@ async function withServer<T>(
   run: (baseUrl: string) => Promise<T>,
   deps?: Partial<ServerDeps>,
 ): Promise<T> {
-  const server = createServer({ privyLogin: testPrivyLogin, ...deps });
+  const server = createServer({ privyLogin: testPrivyLogin, operatorWallets: [ROUTE_WALLET.address], ...deps });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
 
   const address = server.address();
@@ -504,6 +504,28 @@ test('DB: migrate records 0001_init.sql', { skip: skipDb }, async () => {
     "select filename from schema_migrations where filename = '0001_init.sql'",
   );
   assert.equal(rows.length, 1);
+});
+
+test('#157 HTTP: an operator cannot publish another provider\'s strategy or store a version', async () => {
+  await migrate();
+  const { rows } = await query<{ id: string }>(
+    'insert into strategies (provider, name) values ($1, $2) returning id',
+    [mnemonicToAccount('test test test test test test test test test test test junk', { addressIndex: 7 }).address.toLowerCase(), `operator-ownership-${randomUUID()}`],
+  );
+  const row = rows[0];
+  assert.ok(row);
+  try {
+    await withServer(async baseUrl => {
+      const token = await loginToken(baseUrl);
+      const response = await postJson(baseUrl, `/strategies/${row.id}/versions`, PUBLISH_BODY, token);
+      assert.equal(response.status, 403);
+      assert.deepEqual(await response.json(), { error: { code: 'FORBIDDEN', message: 'strategy belongs to another provider' } });
+      const versions = await query('select 1 from strategy_versions where strategy_id = $1', [row.id]);
+      assert.equal(versions.rows.length, 0);
+    });
+  } finally {
+    await query('delete from strategies where id = $1', [row.id]);
+  }
 });
 
 test('DB: strategy and version round trip', { skip: skipChainWrites }, async () => {

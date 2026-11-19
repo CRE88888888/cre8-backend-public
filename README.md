@@ -52,7 +52,7 @@ HTTP → src/index.ts（啟動：config → migrate → listen）
 | `SESSION_KEY_MASTER_SEED` | 續期／enroll 時 ✅ | 空 | 派生 session key 的 HD master seed（`0x` + 64 hex）。私鑰永不落 DB，DB 只存派生路徑 `m/44'/60'/0'/0/<index>`。 |
 | `BUNDLER_URL` | | `http://127.0.0.1:3001` | `POST /bundler` 轉發的上游（alto）。`renewal-params` 也把它回給前端當**資訊**顯示。留空 = 這個預設值。 |
 | `CORS_ALLOWED_ORIGINS` | | `http://localhost:5173,http://127.0.0.1:5173` | 逗號分隔的允許 origin（完整 origin，不分大小寫）。未設定 = dev 預設；不支援 `*`。 |
-| `OPERATOR_WALLETS` | 營運 HTTP 端點時 ✅ | 空（全部拒絕） | `/operator/*` 的 SIWE 登入錢包白名單，逗號分隔的非零 EVM 公開地址；比對不分大小寫。與 backend 的 relayer 私鑰獨立，這裡不填私鑰。 |
+| `OPERATOR_WALLETS` | 營運 HTTP 端點、建立基金／發版時 ✅ | 空（全部拒絕） | `/operator/*`、`POST /strategies` 與 `POST /strategies/:id/versions` 的登入錢包白名單，逗號分隔的非零 EVM 公開地址；比對不分大小寫，支援 SIWE 或 Privy session。與 backend 的 relayer 私鑰獨立，這裡不填私鑰。 |
 | `ENABLE_OPERATOR_REBALANCE` | | 關閉 | 只有字面值 `true` 才開啟 `POST /portfolios/:id/rebalance` 與 `POST /operator/portfolios/:id/{rebalance,close}`；後兩支另需營運白名單。 |
 | `TELEGRAM_BOT_TOKEN` | 與 chat id 成對 | 空 | BotFather 給的 bot 密碼；只放本機 `.env` 或服務的 secret 設定。 |
 | `TELEGRAM_CHAT_ID` | 與 token 成對 | 空 | 收件私訊或群組的 id（保留負號）；設定方式見下方。 |
@@ -427,8 +427,8 @@ P11 新 registry／executor 的加入同意、三參數 enroll、24 小時版本
 | `GET` | `/strategies/:id` | 單一策略 + 版本歷史（新到舊） | 200 |
 | `POST` | `/auth/nonce` | 取得一次性 nonce 與 SIWE 欄位（`domain`／`chainId`／`uri`／`statement`／`issuedAt`，TTL 5 分鐘）；不需 body | 200 |
 | `POST` | `/auth/login` | body `{message, signature}`（完整 EIP-4361 訊息）；回 `{token, expiresAt}` | 200 |
-| `POST` | `/strategies` | 建立策略 metadata；**需** `Authorization: Bearer <token>` | 201 + `Location` |
-| `POST` | `/strategies/:id/versions` | 發布新版本；**需** token 且必須是該策略的 provider | 201 |
+| `POST` | `/strategies` | 建立策略 metadata；**需** `Authorization: Bearer <token>`，session 錢包必須在 `OPERATOR_WALLETS` | 201 + `Location` |
+| `POST` | `/strategies/:id/versions` | 發布新版本；**需**營運錢包 token 且必須是該策略的 provider | 201 |
 | `GET` | `/portfolios` | 目前登入錢包的 portfolio 列表（含 gas 狀態與現行 session key）；**需** token | 200 |
 | `POST` | `/portfolios` | enroll 一個策略；**需** token，body `{strategyId}` | 201 + `Location` |
 | `GET` | `/portfolios/:id/renewal-params` | 派生一把新的 session key，回傳前端組續期 UserOp 所需的全部材料；**需** token 且必須是擁有者 | 200 |
@@ -525,6 +525,12 @@ nonce 是單一 process 的 in-memory Map；session 的 token hash、錢包、Pr
 `auth_sessions`（需 db 0049），跨實例與重啟可用。operator SIWE 的 Privy ID 為 NULL；舊的 NULL session
 只允許目前仍在白名單的 operator 使用，一般使用者需重新以 Privy 登入。每次使用有效 Privy session 都只查該身分的 waitlist 核准狀態。
 
+基金由平台上架：`POST /strategies` 與 `POST /strategies/:id/versions` 先驗登入（未登入／無效 token 回
+401），再驗 session 錢包是否在 `OPERATOR_WALLETS`（一般登入用戶回 403 `OPERATOR_ONLY`），之後才限流及
+解析 body。白名單未設或空白時拒絕所有人；設定含無效項目時整份拒絕，回 503 `INVALID_OPERATOR_WALLETS`。
+發版仍限基金原 provider，營運錢包替別人的基金發版回 403 `FORBIDDEN`。兩個端點不受
+`ENABLE_OPERATOR_REBALANCE` 影響。以下寫入範例的 `$TOKEN` 必須屬於營運錢包。
+
 ```bash
 curl -s "$API/health"
 # {"status":"ok","service":"cre8-atp-backend","chainId":56,"rpcConfigured":false,"db":"ok","uptimeSeconds":3}
@@ -583,13 +589,13 @@ curl -s -X POST "$API/strategies/1/versions" -H "authorization: Bearer $TOKEN" -
 - chain 97 新 HTTP `execution` 僅 hold／stack、`schedule` 僅 `{"kind":"funding"}`；省略時明示回預設值。chain 56 HTTP 保留 schema 0 的 interval／cron，拒絕新 per_asset／funding，含 USDT 最多 16 個資產。逐資產不足跳期與可去重的 pending 使用者通知同交易落庫（需 db 0038），資料契約見 [策略 API](docs/strategy-api.zh-TW.md#不足跳期通知事件db-0038)。
 - canonical config hash放既有Version.scheduleHash。BE-2接入前，typed版本的funding標記使舊漂移scheduler blocked；個人投入／指令與hash golden見 [API契約](docs/strategy-api.zh-TW.md)。
 - `changeLog` 選填，≤ 2000 字；typed `activeAt`為含時區的整秒時間，省略固定第一次發版時間。已存設定重試只核對原鏈上版本，不重送未知publish交易。
-- 必須帶 token，且該策略 DB 的 `provider` 必須等於 session 錢包（不分大小寫），否則 403 `FORBIDDEN`。
+- 必須帶營運錢包 token（非白名單回 403 `OPERATOR_ONLY`），且該策略 DB 的 `provider` 必須等於 session 錢包（不分大小寫），否則 403 `FORBIDDEN`。
 
 錯誤碼：`INVALID_ALLOCATION`、`ALLOCATION_EMPTY`、`INVALID_ASSET`、
 `DUPLICATE_ASSET`、`WEIGHT_OUT_OF_RANGE`、`WEIGHT_SUM`、`INVALID_SCHEDULE`、`INVALID_VERSION`、
 `INVALID_STRATEGY`、`INVALID_SWAP_FEE`、`INVALID_ID`、`INVALID_QUERY`、`INVALID_JSON`、`NOT_FOUND`、
 `METHOD_NOT_ALLOWED`、`PAYLOAD_TOO_LARGE`、`DB_UNAVAILABLE`、`INTERNAL`、`UNAUTHORIZED`、
-`FORBIDDEN`、`INVALID_AUTH`、`INVALID_NONCE`、`NONCE_EXPIRED`、`INVALID_SIGNATURE`、
+`FORBIDDEN`、`OPERATOR_ONLY`、`INVALID_OPERATOR_WALLETS`、`INVALID_AUTH`、`INVALID_NONCE`、`NONCE_EXPIRED`、`INVALID_SIGNATURE`、
 `INVALID_SIWE_MESSAGE`、`SIWE_EXPIRED`、`INVALID_RENEWAL`、`KEY_REF_CONFLICT`、`SESSION_KEY_CONFIG`、
 `BUNDLER_METHOD_NOT_ALLOWED`、`BUNDLER_UNAVAILABLE`。
 

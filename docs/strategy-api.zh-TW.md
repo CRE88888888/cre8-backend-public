@@ -4,6 +4,12 @@
 
 ## 發版
 
+`POST /strategies` 與 `POST /strategies/:id/versions` 僅限平台營運錢包：先驗 bearer session
+（未登入／無效 token 回 401），再以 `OPERATOR_WALLETS` 比對 session 錢包（不分大小寫），一般登入用戶回
+403 `OPERATOR_ONLY`。白名單未設或空白時拒絕所有人；任一項格式錯誤時回 503 `INVALID_OPERATOR_WALLETS`，
+不部分放行。授權先於限流及 body 校驗；不受 `ENABLE_OPERATOR_REBALANCE` 影響。
+發版仍要求 session 錢包是基金原 provider，營運錢包也不能替其他 provider 發版（403 `FORBIDDEN`）。
+
 `POST /strategies` 建立 metadata。`POST /strategies/:id/versions` 接受：
 
 ```json

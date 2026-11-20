@@ -26,7 +26,7 @@ import type { GasStatus } from './funding.js';
 import { getAccountGasBalance, getGasPriceWei, pauseSources, REGISTRY_ABI, decodePriceSourceError, describePriceSourceError } from './chain.js';
 import type { PauseSource } from './chain.js';
 import { getGasConfig } from './config.js';
-import { countSwapExecuted, PARTIAL_FOLLOW_UP_SECONDS, runSchedulerOnce, SCHEDULER_ACTIVE_PREDICATE } from './scheduler.js';
+import { countSwapExecuted, PARTIAL_FOLLOW_UP_SECONDS, runSchedulerOnce, SCHEDULER_ACTIVE_PREDICATE, SCHEDULER_LEGACY_ACTIVE_PREDICATE } from './scheduler.js';
 import type { ExecutionOutcome, PortfolioRunResult, WithTransactionFn } from './scheduler.js';
 import { planPortfolio } from './snapshot.js';
 import { buildRoutedStep, capAssetLeg, DEFAULT_DEADLINE_SECONDS, minGrossFor, nominalSellQuote, numeraireDecimals, readMaxLegUsdE8 } from './rebalance-plan.js';
@@ -717,6 +717,7 @@ const DUE_PREDICATE = 'and (p.next_run_at is null or p.next_run_at <= $1)';
 export function narrowClaimToPortfolio(text: string, portfolioId: number, allowPaused = false): string {
   if (!text.includes(CLAIM_LOCK_MARKER)) return text;
   if(text.includes(SCHEDULER_ACTIVE_PREDICATE))text=text.replace(SCHEDULER_ACTIVE_PREDICATE,ACTIVE_PREDICATE);
+  if(text.includes(SCHEDULER_LEGACY_ACTIVE_PREDICATE))text=text.replace(SCHEDULER_LEGACY_ACTIVE_PREDICATE,ACTIVE_PREDICATE);
   if (!text.includes(ACTIVE_PREDICATE) || !text.includes(DUE_PREDICATE)) {
     throw new Error(
       'scheduler 的認領 SQL 換了形狀（找不到 schedule_state / next_run_at 條件）：' +

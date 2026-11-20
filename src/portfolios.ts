@@ -67,8 +67,9 @@ export type SmartAccount = {
   accountType: string;
 };
 
-type StrategyOnchainRow = { onchain_id: string | null; active_version: number | null; execution_schema_version?: number; execution_chain_id?: string | null };
+type StrategyOnchainRow = { provider?: string; is_personal_mix?: boolean; onchain_id: string | null; active_version: number | null; execution_schema_version?: number; execution_chain_id?: string | null };
 type PortfolioRow = {
+  is_personal_mix?: boolean;
   allocation?: Allocation | null;
   execution_schema_version?: number;
   execution_chain_id?: string | null;
@@ -140,6 +141,9 @@ export type ResolveValidUntil = (userId: string, strategyId: bigint, chainId: bi
  * `enrollPortfolio(strategyId, wallet)`; unit tests inject fakes instead of a chain plus database.
  */
 export type EnrollDeps = {
+  /** Internal My mix first enrollment only; all later segments reuse the saved account/key. */
+  personalMixOwner: string;
+  afterWrite: (client: import('pg').PoolClient, portfolioId: number) => Promise<void>;
   /** Sponsorship may only observe deployed code for the persisted owner intent; it must never broadcast. */
   verifyAccountDeployment: boolean;
   accountParams: typeof getKernelAccountParams;
@@ -187,7 +191,7 @@ const ACTIVE_ENROLLMENT_SQL = `select p.id, p.user_id, p.strategy_id, p.version,
      left join strategy_versions sv on sv.strategy_id = p.strategy_id and sv.version = p.version
     where p.user_id = $1 and p.strategy_id = $2
       and (p.schedule_state = 'active' or (p.schedule_state = 'paused' and sv.execution_schema_version in (1,2)))
-      and s.account_type = 'KERNEL' and s.chain_id=$3
+      and s.account_type = 'KERNEL' and s.chain_id=$3 and s.retired_at is null
     order by p.id
     limit 1`;
 
@@ -271,7 +275,7 @@ async function prepareOrEnroll(
   };
 
   const strategy = await find<StrategyOnchainRow>(
-    `select s.onchain_id, coalesce(max(v.version), 0) as active_version,
+    `select s.onchain_id,s.provider,s.is_personal_mix, coalesce(max(v.version), 0) as active_version,
        (select execution_schema_version from strategy_versions where strategy_id=s.id order by version desc limit 1) as execution_schema_version,
        (select execution_chain_id from strategy_versions where strategy_id=s.id order by version desc limit 1) as execution_chain_id
        from strategies s
@@ -282,6 +286,9 @@ async function prepareOrEnroll(
   );
   const row = strategy.rows[0];
   if (row === undefined) throw new NotFoundError(`strategy ${strategyId} not found`);
+  if (row.is_personal_mix && (deps.personalMixOwner?.toLowerCase() !== wallet.toLowerCase() || row.provider?.toLowerCase() !== wallet.toLowerCase())) {
+    throw new AppError(409, 'MIX_ENROLLMENT_REQUIRED', '請從私人組合頁確認變更，沿用原本的帳戶。');
+  }
 
   if (row.onchain_id === null) {
     throw new ValidationError('STRATEGY_NOT_ON_CHAIN', `strategy ${strategyId} is not yet mirrored to chain`);
@@ -432,6 +439,8 @@ async function prepareOrEnroll(
       [portfolioId],
     );
 
+    await deps.afterWrite?.(client, portfolioId);
+
     return { portfolioRow, accounts: accounts.rows };
   });
 
@@ -506,8 +515,8 @@ export async function listPortfolios(
        from portfolios p
        left join strategies st on st.id = p.strategy_id
        left join strategy_versions sv on sv.strategy_id=p.strategy_id and sv.version=p.version
-       left join smart_accounts sa on sa.portfolio_id = p.id
-      where lower(p.user_id) = $1
+       left join smart_accounts sa on sa.portfolio_id = p.id and sa.retired_at is null
+      where lower(p.user_id) = $1 and not exists(select 1 from smart_accounts old where old.portfolio_id=p.id and old.retired_at is not null)
       order by p.id, sa.chain_id`,
     [wallet.toLowerCase()],
   );
@@ -606,6 +615,7 @@ async function readGasStatus(account: Address, deps: Partial<ListPortfoliosDeps>
  * 以及既有 session key 的 `key_ref` 清單（新索引必須跟它們都不同）。
  */
 export type OwnedPortfolio = {
+  personalMix?: boolean;
   id: number;
   userId: string;
   strategyId: number;
@@ -640,7 +650,8 @@ export async function requireOwnedPortfolio(
   const find = deps.query ?? query;
 
   const portfolios = await find<PortfolioRow>(
-    `select id, user_id, strategy_id, version, schedule_state, created_at
+    `select id, user_id, strategy_id, version, schedule_state, created_at,
+       (select is_personal_mix from strategies where id=portfolios.strategy_id) as is_personal_mix
        from portfolios
       where id = $1`,
     [portfolioId],
@@ -654,7 +665,7 @@ export async function requireOwnedPortfolio(
   const accounts = await find<SmartAccountRow>(
     `select chain_id, address, owner, account_type
        from smart_accounts
-      where portfolio_id = $1
+      where portfolio_id = $1 and retired_at is null
       order by chain_id`,
     [portfolioId],
   );
@@ -672,6 +683,7 @@ export async function requireOwnedPortfolio(
   );
 
   return {
+    ...(row.is_personal_mix ? { personalMix: true } : {}),
     id: Number(row.id),
     userId: row.user_id,
     strategyId: Number(row.strategy_id),

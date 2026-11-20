@@ -160,6 +160,15 @@ export class RequestRateLimiter {
   async auth(ip: string): Promise<void> {
     await this.#consume('auth:' + ip, this.config.authPerMinute, MINUTE_MS);
   }
+  async mixPreview(ip: string): Promise<void> {
+    await this.#consume('mix-preview:' + ip, 30, MINUTE_MS);
+  }
+  async mixCreate(wallet: string, ip = 'unknown'): Promise<void> {
+    await this.#consume('mix-create-ip:' + ip, 10, 3600000);
+    await this.#consume('mix-create-global', this.config.mixCreateGlobalPerHour, 3600000);
+    await this.#consume('mix-create:' + wallet.toLowerCase(), 3, MINUTE_MS);
+    await this.#consume('wallet:' + wallet.toLowerCase() + ':strategies', 20, DAY_MS);
+  }
   /** C3 #149: testnet-only attempt budget; restarting the process resets it.
    * Kept separate from all persistent production and USDT/paymaster budgets.
    */

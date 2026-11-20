@@ -112,6 +112,9 @@ export async function prepareAssetJob(run:WithTransactionFn,c:JobContext,config:
   if(earliestStack)due=due.map(s=>s.mode.kind==='hold'&&s.created_at<=earliestStack?{...s,slot:earliestStack,end:new Date(earliestStack.getTime()+assetPeriod(s.mode))}:s);
   const slot=due.reduce((a,b)=>a.slot<b.slot?a:b).slot;
   due=due.filter(s=>s.slot.getTime()===slot.getTime());
+  // A private basket keeps closed source budgets intact while open legs proceed.
+  if(c.personalMix&&c.marketOpenFor)due=due.filter(s=>c.marketOpenFor?.([s.asset]));
+  if(due.length===0)return {job:null,reason:'[MARKET_CLOSED] 股票部分等待下一個開盤時段'};
   if(!(c.marketOpenFor?.(due.map(s=>s.asset))??c.marketOpen))return {job:null,reason:'[MARKET_CLOSED] 同一批等待所有資產交易時段'};
   const balance=(await query(`select unallocated_hold_raw::text,stack_prefund_raw::text,(unallocated_hold_raw+stack_prefund_raw+allocated_cash_raw+reserved_input_raw+reserved_fee_raw+withdrawal_raw+yield_raw)::text as total from strategy_cash_balances where chain_id=$1 and portfolio_id=$2`,[c.chainId,c.portfolioId])).rows[0] as {total:string;unallocated_hold_raw:string;stack_prefund_raw:string}|undefined;
   if(!balance)throw new Error('missing cash row');

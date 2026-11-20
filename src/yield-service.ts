@@ -57,7 +57,7 @@ export function createYieldService(overrides:Partial<YieldServiceDeps>={}){
   const store={query:deps.query,transaction:deps.transaction};
   async function safe<T>(fn:()=>Promise<T>):Promise<T>{try{return await fn();}catch(e){if(e instanceof AppError)throw e;throw unavailable();}}
   function profile(){const p=deps.profile();if(!p)throw new AppError(404,'YIELD_NOT_CONFIGURED','此鏈尚未開放生息');return p;}
-  async function owned(id:number,wallet:string){const p=await deps.owned(id,wallet);if(p.chainId!==97||address(p.ownerAddress)!==address(wallet))throw new AppError(403,'FORBIDDEN','只能操作本人於這條鏈的帳戶');return p;}
+  async function owned(id:number,wallet:string){const p=await deps.owned(id,wallet);if(p.personalMix)throw new AppError(409,'MIX_NO_YIELD','私人組合目前不提供生息。');if(p.chainId!==97||address(p.ownerAddress)!==address(wallet))throw new AppError(403,'FORBIDDEN','只能操作本人於這條鏈的帳戶');return p;}
   async function locked<T>(id:number,fn:()=>Promise<T>){const result=await deps.lock(id,fn);if(result===null)throw new AppError(409,'PORTFOLIO_BUSY','帳戶處理中，請以原請求重試');return result;}
   async function read(p:YieldAccount,at?:bigint){return deps.read(deps.client(),profile(),p.account,{now:deps.now,...(at===undefined?{}:{block:at})});}
   async function verifyHistory(p:YieldAccount,persist=true){
@@ -160,6 +160,7 @@ export function createYieldService(overrides:Partial<YieldServiceDeps>={}){
     }),
     status:(id:number,wallet:string)=>safe(async()=>{
       if(deps.profile()===null)return null;
+      if((await deps.owned(id,wallet)).personalMix)return null;
       const p=await owned(id,wallet),f=profile(),a={chainId:97,portfolioId:id,account:address(p.accountAddress)};
       const rows=await deps.query<{market_id:Hex;exit_state:string;exit_reason:string|null;receipt_raw:string}>(`select market_id,exit_state,exit_reason,receipt_raw::text from yield_positions where chain_id=97 and portfolio_id=$1`,[id]);
       const consents=await deps.query<{market_id:Hex}>('select market_id from yield_consents where chain_id=97 and portfolio_id=$1 and strategy_id=$2 and version=$3 and opted_out_at is null',[id,p.strategyId,p.version]);
@@ -377,7 +378,8 @@ export async function runYieldRound(options:{dryRun:boolean;limit:number},overri
           or exists(select 1 from yield_positions yp where yp.portfolio_id=p.id and (yp.receipt_raw>0 or yp.tracked_units_raw>0 or yp.exit_state in ('exiting','retry'))) then case when exists(select 1 from yield_exit_requests e where e.portfolio_id=p.id and e.state<>'completed') then 1 else 2 end
         else 3 end as queue
     from smart_accounts sa join portfolios p on p.id=sa.portfolio_id
-    where $1::int>0 and sa.chain_id=97 and sa.account_type='KERNEL'
+    where $1::int>0 and sa.chain_id=97 and sa.account_type='KERNEL' and sa.retired_at is null
+      and not exists(select 1 from strategies ms where ms.id=p.strategy_id and ms.is_personal_mix)
       and (exists(select 1 from strategy_versions v,jsonb_array_elements(case when jsonb_typeof(v.execution->'assets')='array' then v.execution->'assets' else '[]'::jsonb end) a where (v.strategy_id,v.version)=(p.strategy_id,p.version) and a.value->'yield'<>'null'::jsonb)
         or exists(select 1 from yield_positions yp where yp.portfolio_id=p.id and (yp.receipt_raw>0 or yp.tracked_units_raw>0 or yp.exit_state in ('exiting','retry')))
         or exists(select 1 from yield_actions ya where ya.portfolio_id=p.id and ya.state in ('reserved','submitted','unknown'))

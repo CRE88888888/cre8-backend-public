@@ -1122,3 +1122,16 @@ for (const phase of ['quote', 'refresh', 'sign'] as const) {
     assert.deepEqual(await versionTransitionEvidence(f), stopped, 'retry cannot consume or rewrite old sources');
   });
 }
+
+
+test('My mix reserves only open asset sources and retains closed source budgets; ordinary funds keep their common market guard', async () => {
+  const f = await fixture('hold'); await f.fund(100n * U);
+  const marketOpenFor = (assets: readonly string[]) => assets.every(asset => asset !== b);
+  assert.equal((await f.reserve({ ...f.context, marketOpen: false, marketOpenFor }))?.job, null);
+  const mixed = (await f.reserve({ ...f.context, personalMix: true, marketOpen: false, marketOpenFor }))?.job;
+  assert.ok(mixed); assert.deepEqual(Object.keys(mixed.remaining_input), [a]);
+  const balance = await balances(f); assert.equal(balance?.unallocated_hold_raw, (50n * U).toString());
+  const closed = (await query<{ state: string; n: string }>(`select a.state,(select count(*) from strategy_asset_slices s where s.lot_id=a.lot_id and s.asset=a.asset)::text as n
+    from strategy_lot_assets a join strategy_funding_lots l on l.id=a.lot_id where l.portfolio_id=$1 and a.asset=$2`, [f.id, b])).rows[0];
+  assert.deepEqual(closed, { state: 'active', n: '0' });
+});

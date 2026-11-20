@@ -6,6 +6,14 @@ import { ConfigurationError, loadPointsConfig } from '../src/config.js';
 import { bindInvite, createPointsService, freezePoints, pointsHistory, pointsLeaderboard, pointsMetrics, receiptOperations, scanPoints } from '../src/points.js';
 import { TESTNET_97 } from '../src/testnet-profile.js';
 import { ACCOUNT, OWNER, OCCURRED, address, catalog, config, enrolled, hash, jsonObject, operation, reader, receipt, registered, swapped, transfer } from './fixtures/points.js';
+
+test('My mix StrategyRegistered never awards create_fund while public funds still do', () => {
+  const known = catalog();
+  known.strategies.set('1', { owner: OWNER, name: 'Test fund', personalMix: true });
+  assert.deepEqual(receiptOperations(receipt([registered()]), config(), known), []);
+  known.strategies.set('1', { owner: OWNER, name: 'Test fund', personalMix: false });
+  assert.equal(receiptOperations(receipt([registered()]), config(), known)[0]?.kind, 'create_fund');
+});
 import { loadRateLimitConfig } from '../src/config.js';
 import { RequestRateLimiter } from '../src/ratelimit.js';
 import { createServer as createHttpServer } from 'node:http';

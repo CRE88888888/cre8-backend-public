@@ -54,6 +54,17 @@ jobs:
           DATABASE_URL: postgres://ci:ci@127.0.0.1:1/unused
         run: >-
           bun test
+          test/mix-publication.test.ts
+          test/mix-registration.test.ts
+          test/mix-chain.test.ts
+          test/mix-flows.test.ts
+          test/mix-scheduler.test.ts
+          test/mix-runtime.test.ts
+          test/mix-sponsorship.test.ts
+          test/mix-approval.test.ts
+          test/mix-domain.test.ts
+          test/mix-preview.test.ts
+          test/mix-http.test.ts
           test/model-returns.test.ts
           test/info-drafter.test.ts
           test/info-collectors.test.ts
@@ -87,6 +98,7 @@ jobs:
           test/sync-testnet-profile.test.ts
           test/funding.test.ts
           test/faucet.test.ts
+          test/gas-faucet.test.ts
           test/paymaster.test.ts
           test/paymaster-allowlist.test.ts
           test/paymaster.rpc.test.ts

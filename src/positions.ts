@@ -59,7 +59,7 @@ export const NUMERAIRE_PRICE_E8 = 100_000_000n;
 /** `positions_snapshots.price_source` 的值：一筆 USD 值要能追回它是怎麼來的（見 0005）。 */
 export const TWAP_PRICE_SOURCE = 'pancakeswap-v3';
 export const NUMERAIRE_PRICE_SOURCE = 'numeraire';
-export type PriceSource = typeof TWAP_PRICE_SOURCE | typeof NUMERAIRE_PRICE_SOURCE;
+export type PriceSource = typeof TWAP_PRICE_SOURCE | typeof NUMERAIRE_PRICE_SOURCE | 'oracle';
 
 /** 一個資產的價格從哪裡來。三種情況，沒有第四種。 */
 export type AssetPrice =
@@ -178,6 +178,7 @@ export type ReadPositionsArgs = {
    */
   block?: bigint;
   priceToken?: PriceTokenFn;
+  priceSource?: PriceSource;
   /** Multicall3 地址。預設 `MULTICALL3_ADDRESS`；測試與非標準鏈可以換掉。 */
   multicall3?: Address;
 };
@@ -446,7 +447,7 @@ export async function readPositions(
       unpriced.push({ asset, symbol: token.symbol, amountWei, decimals, reason: pricingFailureReason(quote.reason) });
       continue;
     }
-    holdings.push({ asset, amountWei, decimals, usdPriceE8: quote.value.priceE8, priceSource: TWAP_PRICE_SOURCE });
+    holdings.push({ asset, amountWei, decimals, usdPriceE8: quote.value.priceE8, priceSource: args.priceSource ?? TWAP_PRICE_SOURCE });
   }
 
   return { portfolioId: args.portfolioId, block, nativeBalanceWei, holdings, unpriced };

@@ -306,7 +306,7 @@ export const POINTS_ABI = parseAbi([
 const OWNER_ABI = parseAbi(['function rootValidator() view returns(bytes21)', 'function ecdsaValidatorStorage(address) view returns(address)']);
 export type PointsCatalog = {
   accounts: Map<string, { owner: string; strategy: string }>;
-  strategies: Map<string, { owner: string; name: string }>;
+  strategies: Map<string, { owner: string; name: string; personalMix?: boolean }>;
   tokens: Set<string>;
 };
 export type PointsReader = {
@@ -333,15 +333,15 @@ function chainReader(c: PointsConfig): PointsReader {
     },
   };
 }
-async function catalog(c: PointsConfig): Promise<PointsCatalog> {
+export async function loadPointsCatalog(c: PointsConfig, find = query): Promise<PointsCatalog> {
   return read(async () => {
-    const accounts = await query<{ address: string; owner: string; user_id: string; onchain_id: string }>(`select a.address,a.owner,p.user_id,s.onchain_id::text
+    const accounts = await find<{ address: string; owner: string; user_id: string; onchain_id: string }>(`select a.address,a.owner,p.user_id,s.onchain_id::text
       from smart_accounts a join portfolios p on p.id=a.portfolio_id join strategies s on s.id=p.strategy_id
-      where a.chain_id=$1 and a.account_type='KERNEL'`, [c.chainId]);
-    const strategies = await query<{ onchain_id: string; provider: string; name: string }>('select onchain_id::text,provider,name from strategies where onchain_id is not null');
-    const tokens = c.chainId === 97 ? testnetAssets().map((a) => a.address) : (await query<{ address: string }>('select address from priceable_assets')).rows.map((a) => a.address);
+      where a.chain_id=$1 and a.account_type='KERNEL' and a.retired_at is null`, [c.chainId]);
+    const strategies = await find<{ onchain_id: string; provider: string; name: string; is_personal_mix: boolean }>('select onchain_id::text,provider,name,is_personal_mix from strategies where onchain_id is not null');
+    const tokens = c.chainId === 97 ? testnetAssets().map((a) => a.address) : (await find<{ address: string }>('select address from priceable_assets')).rows.map((a) => a.address);
     return { accounts: new Map(accounts.rows.filter((a) => a.owner.toLowerCase() === a.user_id.toLowerCase()).map((a) => [a.address, { owner: ownerOf(a.owner), strategy: a.onchain_id }])),
-      strategies: new Map(strategies.rows.map((s) => [s.onchain_id, { owner: ownerOf(s.provider), name: s.name }])), tokens: new Set([...tokens, c.token]) };
+      strategies: new Map(strategies.rows.map((s) => [s.onchain_id, { owner: ownerOf(s.provider), name: s.name, personalMix: s.is_personal_mix }])), tokens: new Set([...tokens, c.token]) };
   });
 }
 
@@ -359,7 +359,7 @@ export function receiptOperations(receipt: ReceiptEvidence, c: PointsConfig, kno
     let kind: Task; let owner: string; let account: Address | null = null;
     if (address === c.registry && event.eventName === 'StrategyRegistered') {
       const strategy = known.strategies.get(String(event.args.id));
-      if (!strategy || strategy.name !== event.args.name) continue;
+      if (!strategy || strategy.personalMix || strategy.name !== event.args.name) continue;
       kind = 'create_fund'; owner = strategy.owner;
     } else if (address === c.registry && event.eventName === 'Enrolled') {
       account = event.args.account.toLowerCase() as Address;
@@ -517,7 +517,7 @@ export function createPointsService(deps: PointsDeps = {}) {
     tasks: () => { const c = configured(); return { delaySeconds: c.delaySeconds, confirmations: c.confirmations.toString(),
       tasks: POINTS_TASKS.map((kind) => ({ kind, points: c.rules[kind].points.toString(), dailyCount: c.rules[kind].dailyCount.toString(), dailyPoints: c.rules[kind].dailyPoints.toString() })) }; },
     metrics: async () => {
-      const c = configured(); const known = await (deps.catalog ?? (() => catalog(c)))();
+      const c = configured(); const known = await (deps.catalog ?? (() => loadPointsCatalog(c)))();
       const scan = await scanPoints(c, known, deps.reader ?? chainReader(c));
       if (!scan.timestamp) throw rpc();
       return { ...pointsMetrics(scan.operations, scan.timestamp), throughBlock: scan.to.toString() };
@@ -534,7 +534,7 @@ export function createPointsService(deps: PointsDeps = {}) {
       try {
         held = (await client.query<{ held: boolean }>("select pg_try_advisory_lock(hashtextextended('points_sync:'||$1::text,0)) as held", [c.chainId])).rows[0]?.held === true;
         if (!held) throw new AppError(409, 'POINTS_SYNC_BUSY', 'points sync already running');
-        const known = await (deps.catalog ?? (() => catalog(c)))(); const reader = deps.reader ?? chainReader(c);
+        const known = await (deps.catalog ?? (() => loadPointsCatalog(c)))(); const reader = deps.reader ?? chainReader(c);
         const scan = await scanPoints(c, known, reader);
         requireLock();
         if (!scan.timestamp) return { throughBlock: scan.to.toString(), operations: 0, capped: 0 };

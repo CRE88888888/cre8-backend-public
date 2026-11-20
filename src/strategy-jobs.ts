@@ -1,3 +1,4 @@
+import { recordMixExecution } from './mix-store.js';
 import { reconcileCashWithdrawals } from './cash-reconciliation.js';
 import type { CashWithdrawal } from './cash-reconciliation.js';
 import { prepareAssetJob, completeAssetSchedules, recordAssetInflight } from './asset-jobs.js';
@@ -18,7 +19,7 @@ export type StrategyJob = { id: string; chain_id: string; portfolio_id: string; 
 export type FundingLot = { id: string; tx_hash: Hex; block_number: string; block_hash: Hex; amount_raw: string };
 type Instruction = { revision: string; amount_raw: string; start_at: Date; end_at: Date | null; period_seconds: number;
   next_slot_index: string; state: string };
-export type JobContext = { chainId: number; portfolioId: number; strategyId: number; version: number; kind: 'hold' | 'stack' | 'asset'; asset_started_at?:Date|null;
+export type JobContext = { personalMix?: boolean; chainId: number; portfolioId: number; strategyId: number; version: number; kind: 'hold' | 'stack' | 'asset'; asset_started_at?:Date|null;
   withdrawals?:readonly CashWithdrawal[]; finalAssets?:ReadonlySet<string>; batchStepLimit?: number; account: Address; allocation: Allocation; cash: Address; now: Date; reserve: bigint; caps: ReadonlyMap<string,bigint|null>;
   buyLimit: bigint; observedCash: bigint; enabled: boolean; marketOpen: boolean; execution?:AssetExecution; marketOpenFor?:(assets:readonly string[])=>boolean };
 export type BatchEvidence = { received: InputVector; fees: InputVector; feePaid: bigint; blockNumber: bigint; blockHash: Hex };
@@ -225,7 +226,7 @@ export async function cancelJob(query:SchedulerQueryFn,c:Pick<JobContext,'chainI
   await query("update strategy_jobs set state='cancelled',updated_at=clock_timestamp() where id=$1",[j.id]);
 }
 /** Operation + business evidence + remaining vector + cash settle in one commit (0031 deferred constraints). */
-export async function settleStrategyBatch(run:WithTransactionFn,c:Pick<JobContext,'chainId'|'portfolioId'>,operationId:string,e:BatchEvidence){
+export async function settleStrategyBatch(run:WithTransactionFn,c:Pick<JobContext,'chainId'|'portfolioId'|'personalMix'>,operationId:string,e:BatchEvidence){
   await run(async({query})=>{
     await lockCash(query,c);
     const op=(await query('select * from operations where id=$1 for update',[operationId])).rows[0] as {strategy_job_id:string;strategy_batch_index:number;state:string}|undefined;
@@ -247,5 +248,6 @@ export async function settleStrategyBatch(run:WithTransactionFn,c:Pick<JobContex
       allocated_cash_raw=allocated_cash_raw+$5::numeric,updated_at=clock_timestamp() where chain_id=$1 and portfolio_id=$2`,
       [c.chainId,c.portfolioId,sumInputs(b.input_raw).toString(),(done?BigInt(j.remaining_fee_raw):e.feePaid).toString(),done?fee.toString():'0']);
     if(done&&j.kind==='asset')await completeAssetSchedules(query,c.portfolioId);
+    if(c.personalMix)await recordMixExecution(query,c.portfolioId,operationId,'new_money');
   });
 }

@@ -6,7 +6,7 @@ import { getConfig, loadGasFaucetConfig } from './config.js';
 import type { Config, GasFaucetConfig } from './config.js';
 import { AppError } from './errors.js';
 import { RequestRateLimiter } from './ratelimit.js';
-import { withRelayerLock } from './relayer-lock.js';
+import { withRelayerLock, relayerNonce } from './relayer-lock.js';
 
 type PreparedTransfer = { hash: Hex; broadcast: () => Promise<void>;
   receipt: () => Promise<{ status: string; transactionHash: string }> };
@@ -28,7 +28,7 @@ export function createGasFaucetChain(c: GasFaucetConfig,
   const wallet = createWalletClient({ account: operator, chain: bscTestnet, transport });
   return { chainId: () => client.getChainId(), balance: owner => client.getBalance({ address: owner }),
     prepare: async (owner, amountWei) => {
-      const request = await wallet.prepareTransactionRequest({ to: owner, value: amountWei, data: '0x' });
+      const request = await wallet.prepareTransactionRequest({ to: owner, value: amountWei, data: '0x', ...(await relayerNonce(client, operator.address)) });
       const raw = await wallet.signTransaction(request);
       const hash = keccak256(raw);
       return { hash,

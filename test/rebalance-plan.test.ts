@@ -3282,3 +3282,53 @@ test('#96 all-hold 1-USDT policy is independent of a legacy 5-USDT override',asy
     tradingConfig:loadTradingConfig({MIN_STEP_USD_E8:'500000000'}),inclusiveFeeReserveRaw:0n});
   const result=expectReady(await planRebalance(args));assert.equal(result.steps.length,2);assert.ok(result.steps.some(step=>step.amountIn===4n*10n**18n));
 });
+
+
+test('My mix exit sells sub-dollar assets below ordinary minimums; the exemption rejects buy targets', async () => {
+  for (const raw of [10n ** 10n, 5n * 10n ** 17n, 15n * 10n ** 18n]) {
+    const holdings = [holding(TOKEN3, raw, 18, PRICE_1_USD), holding(USDT, 0n, 18, PRICE_1_USD)];
+    const targets = [{ asset: TOKEN3, weightBps: 0 }, { asset: USDT, weightBps: 10000 }];
+    const chain = hubChain({ quotes: { [`${TOKEN3}:${USDT}`]: { minimum: raw } } });
+    const plan = expectReady(await planRebalance(hubArgs(chain, { holdings, targets, thresholdBps: 0, purpose: 'exit', maxImpactBps: null })));
+    assert.equal(plan.purpose, 'exit'); assert.equal(plan.steps.length, 1);
+    assert.equal(plan.steps[0]?.tokenOut, getAddress(USDT)); assert.equal(plan.steps[0]?.amountIn, raw);
+  }
+  const holdings = [holding(USDT, 100n * 10n ** 18n, 18, PRICE_1_USD)];
+  const targets = [{ asset: TOKEN3, weightBps: 10000 }, { asset: USDT, weightBps: 0 }];
+  const invalid = await planRebalance(hubArgs(hubChain(), { holdings, targets, thresholdBps: 0, purpose: 'exit' }));
+  assert.equal(invalid.kind, 'blocked');
+});
+
+test('My mix permits crypto legs while a stock is closed and never buys an underweight exit component', async () => {
+  const { holdings, targets } = threeAssetCase();
+  const chain = hubChain({ quotes: { [`${WBNB}:${USDT}`]: { minimum: 200n * 10n ** 18n },
+    [`${USDT}:${TOKEN3}`]: { minimum: 100n * 10n ** 18n } } });
+  for (const flags of [{ canTradeAsset: (asset: string) => asset.toLowerCase() !== TOKEN3.toLowerCase() },
+    { sellOnlyAssets: new Set([TOKEN3.toLowerCase()]) }]) {
+    const result = expectReady(await planRebalance(hubArgs(chain, { holdings, targets, thresholdBps: 0, ...flags })));
+    assert.ok(result.steps.every(step => step.tokenIn.toLowerCase() !== TOKEN3.toLowerCase() && step.tokenOut.toLowerCase() !== TOKEN3.toLowerCase()));
+    assert.ok(result.steps.some(step => step.tokenIn === getAddress(WBNB)));
+  }
+});
+
+test('My mix calendar threshold zero compares exact value improvement when rounded drift is zero', async () => {
+  const holdings = [holding(TOKEN3, 5_000_050n * 10n ** 18n, 18, PRICE_1_USD), holding(USDT, 4_999_950n * 10n ** 18n, 18, PRICE_1_USD)];
+  const targets = [{ asset: TOKEN3, weightBps: 5000 }, { asset: USDT, weightBps: 5000 }];
+  const chain = hubChain({ quotes: { [`${TOKEN3}:${USDT}`]: { minimum: 50n * 10n ** 18n } } });
+  const args = hubArgs(chain, { holdings, targets, thresholdBps: 0, maxImpactBps: null });
+  assert.equal(args.drift.grossDriftBps, 0);
+  assert.equal((await planRebalance(args)).kind, 'ready');
+  const publicArgs = hubArgs(chain, { holdings, targets, thresholdBps: 100, maxImpactBps: null });
+  assert.equal((await planRebalance(publicArgs)).kind, 'noop', 'public fund keeps its 100bps threshold');
+});
+
+test('My mix target pass never spends cash held for closed asset sources', async () => {
+  const holdings = [holding(USDT, 100n * 10n ** 18n, 18, PRICE_1_USD), holding(TOKEN3, 0n, 18, PRICE_1_USD)];
+  const targets = [{ asset: USDT, weightBps: 0 }, { asset: TOKEN3, weightBps: 10000 }];
+  const chain = hubChain({ quotes: { [`${USDT}:${TOKEN3}`]: { minimum: 50n * 10n ** 18n } } });
+  const args = hubArgs(chain, { holdings, targets, thresholdBps: 0 });
+  assert.equal((await planRebalance({ ...args, cashBudgetRaw: 0n })).kind, 'noop');
+  const ready = expectReady(await planRebalance({ ...args, cashBudgetRaw: 50n * 10n ** 18n }));
+  assert.equal(ready.steps[0]?.amountIn, 50n * 10n ** 18n);
+  for (const raw of [-1n, 101n * 10n ** 18n]) assert.equal((await planRebalance({ ...args, cashBudgetRaw: raw })).kind, 'blocked');
+});

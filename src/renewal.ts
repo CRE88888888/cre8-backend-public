@@ -1,3 +1,4 @@
+import { withMixPortfolioLock, mixBusy } from './mix-store.js';
 import type { Address, Hex, PublicClient } from 'viem';
 import { KERNEL_V3_3_ADDRESSES, KERNEL_VERSION_STRING } from './addresses.js';
 import { getChain } from './chain.js';
@@ -296,6 +297,7 @@ export type RenewalResultRecorded = {
 };
 
 export type RenewalResultDeps = {
+  lock: typeof withMixPortfolioLock;
   requireOwnedPortfolio: typeof requireOwnedPortfolio;
   query: typeof query;
 };
@@ -324,7 +326,9 @@ export async function recordRenewalResult(
   const runQuery = deps.query ?? query;
 
   // 擁有者與存在性先驗：後面所有的寫入都以「這是你的 portfolio」為前提。
-  await find(portfolioId, wallet);
+  const portfolio = await find(portfolioId, wallet);
+  const write = async (): Promise<RenewalResultRecorded> => {
+  if (portfolio.personalMix) await find(portfolioId, wallet);
 
   const keyRef = requireString(body.keyRef, 'keyRef');
   const permissionId = requireString(body.permissionId, 'permissionId');
@@ -356,6 +360,11 @@ export async function recordRenewalResult(
   }
 
   return { ok: true, recorded: { keyRef, permissionId } };
+  };
+  if (!portfolio.personalMix) return write();
+  const result = await (deps.lock ?? withMixPortfolioLock)(portfolioId, write);
+  if (result === null) throw mixBusy();
+  return result;
 }
 
 function requireString(value: unknown, name: string): string {

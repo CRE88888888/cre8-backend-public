@@ -1,4 +1,4 @@
-import { withRelayerLock } from './relayer-lock.js';
+import { withRelayerLock, relayerNonce } from './relayer-lock.js';
 import { createPublicClient, createWalletClient, decodeEventLog, encodeFunctionData, http, isAddress, keccak256, parseAbi } from 'viem';
 import type { Address, Hex, PublicClient, TransactionReceipt } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
@@ -107,7 +107,7 @@ async function prepareClaim(claim: FaucetClaim, c: FaucetConfig): Promise<Prepar
   await checkFaucetRecipient(client, operator.address, claim);
   const token = TESTNET_97.contracts.usdt;
   const data = encodeFunctionData({ abi: FAUCET_ABI, functionName: 'claimFor', args: [claim.account, claim.amountWei] });
-  const request = await wallet.prepareTransactionRequest({ to: token, data });
+  const request = await wallet.prepareTransactionRequest({ to: token, data, ...(await relayerNonce(client, operator.address)) });
   const signed = await wallet.signTransaction(request);
   const hash = keccak256(signed);
   return { hash, raw: signed,
@@ -216,7 +216,7 @@ export function createFaucetService(deps: FaucetDeps = {}) {
     }
     try {
       const known = await bounded((deps.query ?? query)(`select s.owner,p.user_id from smart_accounts s join portfolios p on p.id=s.portfolio_id
-        where s.chain_id=$1 and s.address=$2 and s.account_type='KERNEL'`, [c.chainId, account.toLowerCase()]), c.timeoutMs);
+        where s.chain_id=$1 and s.address=$2 and s.account_type='KERNEL' and s.retired_at is null`, [c.chainId, account.toLowerCase()]), c.timeoutMs);
       if (known.rows.length !== 1) throw new AppError(403, 'FAUCET_ACCOUNT_FORBIDDEN', 'account does not belong to this owner');
       const row = known.rows[0];
       if (typeof row !== 'object' || row === null || Reflect.get(row, 'owner') !== wallet.toLowerCase() || Reflect.get(row, 'user_id') !== wallet.toLowerCase()) {

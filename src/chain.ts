@@ -1,5 +1,5 @@
 import { deployAccount97 } from './account-deployment.js';
-import { withRelayerLock } from './relayer-lock.js';
+import { withRelayerLock, relayerNonce } from './relayer-lock.js';
 import {
   createPublicClient,
   createWalletClient,
@@ -357,7 +357,8 @@ export async function registerStrategyOnchain(meta: {
 }): Promise<number> {
   const { wallet, publicClient, registryAddress, account: operator } = getChain();
 
-  const hash = await withRelayerLock(getConfig().chainId, () => wallet.writeContract({
+  const hash = await withRelayerLock(getConfig().chainId, async () => wallet.writeContract({
+    ...(await relayerNonce(publicClient, operator.address, getConfig().chainId)),
     account: operator,
     chain: activeChain(),
     address: registryAddress,
@@ -412,7 +413,7 @@ export async function publishVersionOnchain(
           // Crossing activeAt while mining can add historical-array/mapping SSTOREs absent
           // from an estimate against the parent block (especially an immediate fee decrease).
           const gas = estimate * 3n / 2n + 100_000n + BigInt(version.assets.length) * 50_000n;
-          const hash = await wallet.writeContract({ ...request, gas });
+          const hash = await wallet.writeContract({ ...request, gas, ...(await relayerNonce(publicClient, operator.address, chainConfig.chainId)) });
           const receipt = await publicClient.waitForTransactionReceipt({ hash, timeout: 30_000 });
           if (receipt.status !== 'success' || decodeReturnedId(receipt.logs, 'VersionPublished', 'version') !== expectedVersion) throw new Error('publish not confirmed');
         }
@@ -434,7 +435,8 @@ export async function publishVersionOnchain(
   if (version.schedule.kind === 'funding') throw new AppError(400, 'CONFIG_HASH_REQUIRED', 'funding schedule requires a canonical config hash');
   const scheduleHash = canonicalScheduleHash(version.schedule);
 
-  const hash = await withRelayerLock(getConfig().chainId, () => wallet.writeContract({
+  const hash = await withRelayerLock(getConfig().chainId, async () => wallet.writeContract({
+    ...(await relayerNonce(publicClient, operator.address, getConfig().chainId)),
     account: operator,
     chain: activeChain(),
     address: registryAddress,
@@ -547,7 +549,8 @@ export async function enrollOnchain(account: Address, onchainId: number, chain?:
       throw new AppError(409, 'ENROLLMENT_CONSENT_REQUIRED', 'owner must call approveEnrollment through account sudo for the effective version before operator enrollment');
     }
 
-    const hash = await withRelayerLock(chainId, () => wallet.writeContract({
+    const hash = await withRelayerLock(chainId, async () => wallet.writeContract({
+      ...(await relayerNonce(publicClient, operator.address, chainId)),
       account: operator,
       chain: activeChain(),
       address: registryAddress,

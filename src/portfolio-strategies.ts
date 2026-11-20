@@ -1,4 +1,5 @@
 import { cashDifference } from './yield-domain.js';
+import { excludeMixExitBudgets, withMixPortfolioLock } from './mix-store.js';
 import { allocateExposure, readAssetExposure } from './asset-exposure.js';
 import { planFundingContribution } from './asset-plan.js';
 import { minimumFeeReserve } from './rebalance-plan.js';
@@ -137,7 +138,7 @@ const storageUnavailable = () => new AppError(503, 'EXECUTION_STORAGE_UNAVAILABL
 const conflict = () => new AppError(409, 'REVISION_CONFLICT', 'instruction changed; read the current revision before confirming again');
 
 export function createPortfolioStrategyService(overrides: Partial<PortfolioStrategyDeps> = {}) {
-  const deps: PortfolioStrategyDeps = { query, transaction: withTransaction, lock: withPortfolioLock, owned: requireOwnedPortfolio,
+  const deps: PortfolioStrategyDeps = { query, transaction: withTransaction, lock: withMixPortfolioLock, owned: requireOwnedPortfolio,
     version: requireTypedVersion, evidence: readFaucetFundingEvidence, walletEvidence: readWalletFundingEvidence, cash: readAccountCash, settleClaim: settleFaucetClaim,
     welcome: createWelcomeService(), welcomeGrant: findWelcomeGrant, welcomeEvidence: readWelcomeFundingEvidence, settleWelcome: settleWelcomeGrant,
     chainId: configuredChainId, now: () => new Date(), exposure: readAssetExposure, feeReserve: async (p) => {
@@ -249,6 +250,18 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
     const result = await deps.transaction(async (client) => {
       await cashLock(client, p);
       await checkReorg(client, p);
+      if (p.personalMix) {
+        if ((await client.query(`select 1 from mix_switch_intents i join mix_portfolio_history h on h.mix_id=i.mix_id
+          where h.portfolio_id=$1 and h.ended_at is null and i.state in ('prepared','submitted','unknown')`, [id])).rows.length) {
+          throw new AppError(409, 'MIX_SWITCH_PENDING', '組合變更確認後，這筆入金會在新組合處理。');
+        }
+        const segment = (await client.query<{ previous_history_id: string | null; enroll_block_number: string }>(
+          'select previous_history_id,enroll_block_number::text from mix_portfolio_history where portfolio_id=$1 and ended_at is null', [id])).rows[0];
+        if (!segment) throw new AppError(503, 'MIX_HISTORY_UNAVAILABLE', '目前無法確認私人組合的入金期間。');
+        if (segment.previous_history_id !== null && evidence.blockNumber <= BigInt(segment.enroll_block_number)) {
+          throw new AppError(409, 'MIX_FUNDING_ALREADY_CARRIED', '這筆入金已包含在改比例的承接現金，不會重複計入。');
+        }
+      }
       const original = (source.kind === 'wallet_transfer'
         ? await client.query<LotRow>(`select * from strategy_funding_lots where chain_id=$1 and tx_hash=$2
             and (log_index=$3 or portfolio_id=$4) order by (log_index=$3) desc limit 1`, [p.chainId, evidence.txHash, evidence.logIndex, id])
@@ -312,6 +325,7 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
           [p.chainId, id, evidence.amountRaw]);
         }
       }
+      if (inserted.rows.length === 1 && p.personalMix) await excludeMixExitBudgets(client, id);
       return { ...mapLot(lot), source, replayed: inserted.rows.length === 0, fundingStatus:standalone===null?'waiting_for_merged_budget':'scheduled' };
     });
     if (result === null) throw new AppError(409, 'FUNDING_REORGED', 'original funding event moved; reconciliation required');

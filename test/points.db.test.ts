@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import pg from 'pg';
 import { closePool, query, withTransaction } from '../src/db.js';
 import { AppError } from '../src/errors.js';
-import { bindInvite, createPointsService, freezePoints, inviteCode, inviteStats, pointsBalance, pointsHistory, pointsLeaderboard,
+import { bindInvite, createPointsService, freezePoints, inviteCode, inviteStats, pointsBalance, pointsHistory, pointsLeaderboard, loadPointsCatalog,
   recordPointsOperation, rewardInvite, settlePointsEvent } from '../src/points.js';
 import { OWNER, ACCOUNT, address, catalog, config, enrolled, hash, jsonObject, OCCURRED, operation, reader, receipt, registered, swapped, transfer } from './fixtures/points.js';
 import { createServer } from '../src/server.js';
@@ -389,6 +389,20 @@ test('#67 production catalog joins actual portfolios, accounts and funds; all fi
   assert.equal((await pointsBalance(OWNER)).totalPoints, '50');
   assert.deepEqual((await service.metrics()).kinds, { enroll: 1, deposit: 1, rebalance: 1, create_fund: 1, withdraw: 1 });
   assert.equal((await query('select * from points_events')).rows.length, 5);
+});
+
+test('points catalog excludes retired mappings and marks private mix registrations', async () => {
+  const s = (await query<{ id: string }>("insert into strategies(provider,name,is_public,is_personal_mix) values($1,'CRE8 mix',false,true) returning id::text", [OWNER])).rows[0]; assert.ok(s);
+  const id = s.id;
+  await query('update strategies set onchain_id=$1 where id=$1', [id]);
+  const p = (await query<{ id: string }>('insert into portfolios(user_id,strategy_id,version) values($1,$2,1) returning id::text', [OWNER, id])).rows[0]; assert.ok(p);
+  await query("insert into smart_accounts(portfolio_id,chain_id,address,owner,account_type) values($1,1337,$2,$3,'KERNEL')", [p.id, ACCOUNT, OWNER]);
+  const known = await loadPointsCatalog(c);
+  assert.equal(known.accounts.get(ACCOUNT)?.strategy, String(id));
+  assert.equal(known.strategies.get(String(id))?.personalMix, true);
+  await query("update portfolios set schedule_state='paused' where id=$1", [p.id]);
+  await query('update smart_accounts set retired_at=clock_timestamp() where portfolio_id=$1', [p.id]);
+  assert.equal((await loadPointsCatalog(c)).accounts.has(ACCOUNT), false);
 });
 
 test('#67 a lost sync lock connection returns a sanitized error and never starts ledger writes', () => {

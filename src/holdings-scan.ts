@@ -546,6 +546,7 @@ export async function touchCandidates(
 // ---------------------------------------------------------------------------
 
 export type ScanDeps = {
+  beforeAdvance?: (range: { fromBlock: bigint; toBlock: bigint }) => Promise<void>;
   client: PublicClient;
   query: QueryFn;
   portfolioId: number;
@@ -652,6 +653,7 @@ export async function scanPortfolioHoldings(deps: ScanDeps): Promise<HoldingScan
   // 只有「掃描成功」才寫游標。失敗時連失敗前已成功的那幾個塊都不寫（見檔頭 ②）。
   let advanced = cursor;
   if (scan !== null && scan.failure === null && scan.coveredRange !== null) {
+    await deps.beforeAdvance?.(scan.coveredRange);
     advanced = { ...cursor, lastScannedBlock: scan.coveredRange.toBlock };
     await saveCursor(deps.query, advanced);
   }

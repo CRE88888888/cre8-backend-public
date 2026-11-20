@@ -3,7 +3,7 @@ import type { Address, Hex } from 'viem';
 import type { ChainConfig } from './chain.js';
 import { activeChain } from './chain-object.js';
 import { AppError } from './errors.js';
-import { withRelayerLock } from './relayer-lock.js';
+import { withRelayerLock, relayerNonce } from './relayer-lock.js';
 import { consumeAccountDeploymentBudget } from './ratelimit.js';
 import { loadAccountDeploymentConfig } from './config.js';
 
@@ -30,7 +30,7 @@ export async function deployAccount97(intent: DeploymentIntent, chain: ChainConf
       if (await client.getBalance({ address: operator.address, blockTag: 'pending' }) < loadAccountDeploymentConfig().minBalanceWei) {
         throw new AppError(503, 'ACCOUNT_DEPLOYMENT_LOW_BALANCE', 'operator balance is below the account deployment threshold');
       }
-      const request = await wallet.prepareTransactionRequest({ account: operator, chain: client.chain ?? activeChain(), to: intent.factory, data: intent.factoryData });
+      const request = await wallet.prepareTransactionRequest({ account: operator, chain: client.chain ?? activeChain(), to: intent.factory, data: intent.factoryData, ...(await relayerNonce(client, operator.address)) });
       const serializedTransaction = await wallet.signTransaction(request);
       assertHeld();
       await (deps.budget ?? consumeAccountDeploymentBudget)(intent.owner);

@@ -473,6 +473,10 @@ bun run preflight --strict                                 # 0 warn · 0 fail
 
 ## API
 
+### 私人組合（My mix，#178）
+
+chain 97 的 1–10 資產私人組合、preview、分享／Import、owner 簽名切換與整籃停利停損，見 [API 範例與資金契約](docs/my-mix.zh-TW.md)。依賴 db#77 的 0056；本機 fork 驗證不代表已部署。
+
 ### 資訊收集與審核（#159）
 
 `INFO_COLLECTORS_ENABLED=1` 才啟用 scheduler 中的資訊 job；預設關閉。
@@ -885,8 +889,8 @@ proof-file 含可提交的簽署資料，雖無私鑰，仍須保護並在演練
 `src/server.ts` 回答：
 
 - 允許的 origin 來自 `CORS_ALLOWED_ORIGINS`（逗號分隔的**完整 origin**；未設定 = 上面那組 dev 預設）。
-- `OPTIONS` → `204`，帶 `Access-Control-Allow-Methods`（`GET, POST, OPTIONS`）、
-  `Access-Control-Allow-Headers`（`authorization, content-type`）、`Access-Control-Max-Age`（600）、
+- `OPTIONS` → `204`，帶 `Access-Control-Allow-Methods`（`GET, POST, PATCH, OPTIONS`）、
+  `Access-Control-Allow-Headers`（`authorization, content-type, idempotency-key`）、`Access-Control-Max-Age`（600）、
   `Access-Control-Allow-Origin`（**回具體 origin**）與 `Access-Control-Allow-Credentials: true`。
 - 每個回應（含 401／404／405）都帶 `Access-Control-Allow-Origin` 與 `Vary: Origin`：同一條 URL 會因為
   Origin 不同而回應不同標頭，快取必須按 Origin 分開。

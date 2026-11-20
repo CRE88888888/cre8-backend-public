@@ -1,4 +1,7 @@
 import { verifyEnrollmentSponsorship } from './enrollment-sponsorship.js';
+import { verifyMixOwnerCalls } from './mix-chain.js';
+import { MIX_COLUMNS, pendingMixSql, withMixLock, checkMixLock } from './mix-store.js';
+import type { MixRow, MixIntent } from './mix-store.js';
 import {
   concatHex, createPublicClient, decodeAbiParameters, decodeFunctionData, encodeAbiParameters,
   encodeFunctionData, http, isAddressEqual, keccak256, pad, parseAbi, parseAbiItem, slice, toHex, toFunctionSelector, zeroAddress,
@@ -71,6 +74,8 @@ export class PaymasterRetryTooSoonError extends AppError {
 }
 type Query = (sql: string, params?: readonly unknown[]) => Promise<{ rows: unknown[] }>;
 export type PaymasterDeps = {
+  mixSetup?: typeof verifyMixOwnerCalls;
+  mixLock?: typeof withMixLock;
   config?: PaymasterConfig | null;
   enrollmentSetup?: typeof verifyEnrollmentSponsorship;
   now?: () => number;
@@ -781,7 +786,7 @@ async function authorization(op: PackedSponsorOperation, c: PaymasterConfig, val
   return { paymasterAndData, paymaster: c.address, paymasterData, paymasterVerificationGasLimit: c.verificationGasLimit,
     paymasterPostOpGasLimit: c.postOpGasLimit, validUntil, validAfter: 0, userOpHash };
 }
-function packedOperationHash(op:PackedSponsorOperation,chainId:number):Hex{
+export function packedOperationHash(op:PackedSponsorOperation,chainId:number):Hex{
   const packedHash = keccak256(encodeAbiParameters(
     [{ type: 'address' }, { type: 'uint256' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'uint256' }, { type: 'bytes32' }, { type: 'bytes32' }],
     [op.sender, op.nonce, keccak256(op.initCode), keccak256(op.callData), op.accountGasLimits, op.preVerificationGas, op.gasFees, keccak256(op.paymasterAndData)]));
@@ -802,8 +807,11 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
       if (requestedUntil !== undefined && (typeof requestedUntil !== 'number' || !Number.isSafeInteger(requestedUntil) || requestedUntil <= now)) throw rejected('PAYMASTER_EXPIRED');
       if (op.paymasterAndData !== '0x') throw rejected('PAYMASTER_INVALID_OPERATION');
       const calls = sponsoredCalls(op);
-      const known = await bounded((deps.query ?? query)(`select s.owner, p.user_id from smart_accounts s join portfolios p on p.id = s.portfolio_id
-        where s.chain_id = $1 and s.address = $2 and s.account_type = 'KERNEL'`, [c.chainId, op.sender]), c.timeoutMs);
+      const known = await bounded((deps.query ?? query)(`select s.owner,p.user_id,m.id as mix_id from smart_accounts s join portfolios p on p.id=s.portfolio_id
+        left join mixes m on (m.chain_id,m.account)=(s.chain_id,s.address)
+        where s.chain_id=$1 and s.address=$2 and s.account_type='KERNEL' and s.retired_at is null
+        union all select m.owner,m.owner as user_id,m.id as mix_id from mixes m where m.chain_id=$1 and m.account=$2
+          and not exists(select 1 from smart_accounts s where s.chain_id=$1 and s.address=$2 and s.retired_at is null)`, [c.chainId, op.sender]), c.timeoutMs);
       let owner = known.rows.length === 1 ? object(known.rows[0]) : null;
       if (known.rows.length === 0 && c.chainId === 97) {
         await bounded((deps.enrollmentSetup ?? verifyEnrollmentSponsorship)(op, c, wallet), c.timeoutMs);
@@ -811,6 +819,52 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
       }
       if (!owner || typeof owner.owner !== 'string' || typeof owner.user_id !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(wallet) ||
           owner.owner.toLowerCase() !== wallet.toLowerCase() || owner.user_id.toLowerCase() !== wallet.toLowerCase()) throw rejected('PAYMASTER_SENDER_FORBIDDEN', 403);
+      const authorize = async () => {
+      let intentToSubmit: MixIntent | null = null;
+      if (owner.mix_id !== null && owner.mix_id !== undefined) {
+        const m = (await bounded((deps.query ?? query)(`select ${MIX_COLUMNS} from mixes m where m.id=$1 and m.owner=$2 and m.deleted_at is null`,
+          [owner.mix_id, wallet.toLowerCase()]), c.timeoutMs)).rows[0] as MixRow | undefined;
+        if (!m || c.chainId !== 97) throw rejected('PAYMASTER_SENDER_FORBIDDEN', 403);
+        if (calls.some(call => isAddressEqual(call.target, TESTNET_97.contracts.yieldRegistry) ||
+            call.callData.startsWith(toFunctionSelector('executeSupply(address,bytes32,uint256,uint256,uint256)')) ||
+            call.callData.startsWith(toFunctionSelector('executeWithdraw(address,bytes32,uint256,uint256,uint256)')))) throw rejected('PAYMASTER_CALL_FORBIDDEN', 403);
+        const ownerChange = calls.some(call => isAddressEqual(call.target, c.registry) || call.callData.startsWith(toFunctionSelector('approve(address,uint256)')));
+        const onlyOwnerCash = calls.length > 0 && calls.every(call => isAddressEqual(call.target, TESTNET_97.contracts.usdt) &&
+          call.callData.startsWith(toFunctionSelector('transfer(address,uint256)')));
+        for (const call of calls) {
+          if (call.callData.startsWith(toFunctionSelector('transfer(address,uint256)')) && !isAddressEqual(call.target, TESTNET_97.contracts.usdt)) {
+            throw rejected('PAYMASTER_CALL_FORBIDDEN', 403);
+          }
+        }
+        const intent = (await bounded((deps.query ?? query)(`select * from mix_switch_intents where mix_id=$1 and ${pendingMixSql}`, [m.id]), c.timeoutMs)).rows[0] as MixIntent | undefined;
+        if (ownerChange) {
+          if (!intent || op.initCode !== '0x') throw rejected('PAYMASTER_CALL_FORBIDDEN', 403);
+          await bounded((deps.mixSetup ?? verifyMixOwnerCalls)(m, intent, calls, op.nonce), c.timeoutMs);
+          intentToSubmit = intent;
+        } else {
+          if (intent && !onlyOwnerCash) throw rejected('PAYMASTER_CALL_FORBIDDEN', 403);
+          if (!onlyOwnerCash) {
+          const settings = (await bounded((deps.query ?? query)(`select ms.exit_assets from mix_strategy_settings ms
+            join mix_portfolio_history h on h.strategy_id=ms.strategy_id where h.mix_id=$1 and h.ended_at is null`, [m.id]), c.timeoutMs)).rows[0];
+          if (settings === undefined) throw rejected('PAYMASTER_DEPENDENCY_UNAVAILABLE', 503);
+          const exits = object(settings).exit_assets;
+          if (!Array.isArray(exits) || !exits.every(a => typeof a === 'string')) throw rejected('PAYMASTER_DEPENDENCY_UNAVAILABLE', 503);
+          for (let i = 0; i < calls.length; i++) {
+            const call = calls[i];
+            if (!call) throw rejected('PAYMASTER_CALL_FORBIDDEN', 403);
+            if (isAddressEqual(call.target, op.sender)) {
+              const grant = calls[++i];
+              if (!grant || !isAddressEqual(grant.target, op.sender) || grant.value !== 0n) throw rejected('PAYMASTER_CALL_FORBIDDEN', 403);
+              validateRenewal(call.callData, grant.callData, c, op.sender);
+            } else if (isAddressEqual(call.target, c.executor)) {
+              const decoded = decodeFunctionData({ abi: EXECUTOR_ABI, data: call.callData });
+              if (decoded.functionName !== 'executeRebalance' || decoded.args[1].some(step => exits.includes(step.tokenOut.toLowerCase()) ||
+                  (m.triggered_at !== null || m.status === 'exited') && !isAddressEqual(step.tokenOut, TESTNET_97.contracts.usdt))) throw rejected('PAYMASTER_CALL_FORBIDDEN', 403);
+            }
+          }
+          }
+        }
+      }
       // Chain 97 never falls back to mainnet's DB seed. Local forks use the existing enabled address book.
       let assets: Address[] = [];
       if (c.chainId !== 97 && calls.some((call) => TOKEN_ABI.some((fn) => call.callData.startsWith(toFunctionSelector(fn))))) {
@@ -845,8 +899,18 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
       // minutes; live retries below still reuse the original hash without extension.
       const lifetime=exit?600:300;
       let validUntil=requestedUntil??now+lifetime;
+      if (intentToSubmit?.user_op_hash) {
+        const previous = (await bounded((deps.query ?? query)(`select valid_until from paymaster_sponsorships
+          where user_op_hash=$1 and sender=$2 and chain_id=97`, [intentToSubmit.user_op_hash, op.sender]), c.timeoutMs)).rows[0];
+        const at = previous === undefined ? undefined : object(previous).valid_until;
+        if (!(at instanceof Date) || !Number.isSafeInteger(at.getTime() / 1000)) throw rejected('PAYMASTER_DEPENDENCY_UNAVAILABLE', 503);
+        validUntil = at.getTime() / 1000;
+        if (requestedUntil !== undefined && requestedUntil !== validUntil) throw rejected('PAYMASTER_CALL_FORBIDDEN', 403);
+      }
       if(validUntil>now+lifetime||exit&&validUntil<now+600)throw rejected('PAYMASTER_EXPIRED');
+      await checkMixLock();
       let signed=await authorization(op,c,validUntil);
+      if (intentToSubmit?.user_op_hash && intentToSubmit.user_op_hash !== signed.userOpHash) throw rejected('PAYMASTER_CALL_FORBIDDEN', 403);
       if (pureYieldWithdraw(op, c)) {
         consumedAuthorizations=await bounded((deps.verifyYieldWithdraw??verifyYieldWithdraw)({...op,paymasterAndData:signed.paymasterAndData},c,now,deps.query??query),c.timeoutMs);
         if(!deps.verifyYieldWithdraw)expiredAuthorizations=await bounded(expiredExitProofs(c,op.sender,deps.query??query),c.timeoutMs);
@@ -861,7 +925,20 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
         signed = await authorization(op, c, validUntil);
       }
       if ((deps.now ?? (() => Math.floor(Date.now() / 1000)))() >= validUntil) throw rejected('PAYMASTER_EXPIRED');
+      await checkMixLock();
+      if (intentToSubmit) {
+        if (intentToSubmit.user_op_hash && intentToSubmit.user_op_hash !== signed.userOpHash ||
+            intentToSubmit.nonce === null || BigInt(intentToSubmit.nonce) !== op.nonce) throw rejected('PAYMASTER_CALL_FORBIDDEN', 403);
+        const saved = await bounded((deps.query ?? query)(`update mix_switch_intents set state=case when state='prepared' then 'submitted' else state end,
+          user_op_hash=$2,nonce=$3,updated_at=clock_timestamp() where id=$1 and state in ('prepared','submitted','unknown')
+          and (user_op_hash is null or user_op_hash=$2) and nonce=$3::numeric returning id`,
+          [intentToSubmit.id, signed.userOpHash, op.nonce.toString()]), c.timeoutMs);
+        if (saved.rows.length !== 1) throw rejected('PAYMASTER_DEPENDENCY_UNAVAILABLE', 503);
+      }
       return signed;
+      };
+      return owner.mix_id !== null && owner.mix_id !== undefined
+        ? await (deps.mixLock ?? withMixLock)(String(owner.mix_id), authorize) : await authorize();
     } catch (error) {
       const safe = error instanceof AppError ? error : rejected('PAYMASTER_DEPENDENCY_UNAVAILABLE', 503);
       // Never print request bytes, signatures, keys, RPC/DB exception text or connection strings.
@@ -908,7 +985,7 @@ export function schedulerPaymaster(expectedSender: Address, deps: PaymasterDeps 
           initCode: args.factory ? concatHex([args.factory, args.factoryData ?? '0x']) : '0x',
           accountGasLimits: concatHex([toHex(args.verificationGasLimit, { size: 16 }), toHex(args.callGasLimit, { size: 16 })]),
           preVerificationGas: args.preVerificationGas, gasFees: concatHex([toHex(args.maxPriorityFeePerGas, { size: 16 }), toHex(args.maxFeePerGas, { size: 16 })]) };
-        const known = await bounded((deps.query ?? query)('select owner from smart_accounts where chain_id = $1 and address = $2 and account_type = \'KERNEL\'', [c.chainId, expectedSender.toLowerCase()]), c.timeoutMs);
+        const known = await bounded((deps.query ?? query)('select owner from smart_accounts where chain_id = $1 and address = $2 and account_type = \'KERNEL\' and retired_at is null', [c.chainId, expectedSender.toLowerCase()]), c.timeoutMs);
         const owner = known.rows.length === 1 ? object(known.rows[0]).owner : undefined;
         if (typeof owner !== 'string') throw rejected('PAYMASTER_SENDER_FORBIDDEN', 403);
         const result = await createPaymasterService({ ...deps, config: c, retrySetup: false }).sponsor({ userOperation: op }, owner);

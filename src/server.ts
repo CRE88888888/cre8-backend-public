@@ -1,4 +1,6 @@
 import { configuredChainId } from './testnet-profile.js';
+import { createMixPreview } from './mix-preview.js';
+import { createMixService } from './mixes.js';
 import { createInfoService, parseInfoFilters } from './info/service.js';
 import { createYieldService } from './yield-service.js';
 import { createServer as createHttpServer } from 'node:http';
@@ -70,11 +72,11 @@ const DB_DOWN_CODES = new Set([
 /** `CORS_ALLOWED_ORIGINS` 未設定時的預設值：vite dev server 的兩個常見 origin。 */
 export const DEFAULT_CORS_ALLOWED_ORIGINS: readonly string[] = ['http://localhost:5173', 'http://127.0.0.1:5173'];
 
-/** preflight 允許的方法：本 API 只有這兩個（OPTIONS 是 preflight 本身）。 */
-export const CORS_ALLOWED_METHODS = 'GET, POST, OPTIONS';
+/** preflight 允許的方法：GET、POST 與私人組合的 PATCH（OPTIONS 是 preflight 本身）。 */
+export const CORS_ALLOWED_METHODS = 'GET, POST, PATCH, OPTIONS';
 
-/** preflight 允許的請求標頭：`content-type` 給 JSON body，`authorization` 給 bearer token。 */
-export const CORS_ALLOWED_HEADERS = 'authorization, content-type';
+/** preflight 允許的請求標頭：`content-type` 給 JSON body，`authorization` 給 bearer token，`idempotency-key` 給私人組合建立重試。 */
+export const CORS_ALLOWED_HEADERS = 'authorization, content-type, idempotency-key';
 
 /** preflight 結果可以快取多久（秒）。10 分鐘：夠久到不做多餘的 preflight，夠短到改設定會生效。 */
 export const CORS_MAX_AGE_SECONDS = 600;
@@ -170,6 +172,8 @@ export const BUNDLER_TIMEOUT_MS = 30_000;
  * merged over the defaults, so a test can stub one dependency and leave the rest real.
  */
 export type ServerDeps = {
+  mixes: ReturnType<typeof createMixService>;
+  mixPreview: ReturnType<typeof createMixPreview>;
   modelReturns: ReturnType<typeof createModelReader>;
   info: ReturnType<typeof createInfoService>;
   previewContribution: typeof previewContributionAsync;
@@ -313,6 +317,8 @@ async function defaultListAssets(): Promise<PriceableAsset[]> {
 }
 
 const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
+  mixes: createMixService(),
+  mixPreview: createMixPreview(),
   modelReturns: createModelReader(),
   info: createInfoService(),
   previewContribution: previewContributionAsync,
@@ -416,6 +422,47 @@ async function route(
   const method = req.method ?? 'GET';
   const segments = url.pathname.split('/').filter((segment) => segment.length > 0);
   const [root] = segments;
+
+  if (root === 'me' && segments[1] === 'mixes' && segments.length >= 2 && segments.length <= 4) {
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    if (segments.length === 2) {
+      if (method === 'GET') { await deps.rateLimiter.wallet('plan', wallet); sendJson(res, 200, await deps.mixes.list(wallet)); return; }
+      if (method === 'POST') {
+        sendJson(res, 201, await deps.mixes.create(await readJsonBody(req), wallet, req.headers['idempotency-key'],
+          () => deps.rateLimiter.mixCreate(wallet, deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for'])))); return;
+      }
+      return methodNotAllowed(res, ['GET', 'POST']);
+    }
+    const id = parsePositiveInteger(segments[2] ?? '', 'mixId');
+    await deps.rateLimiter.wallet('plan', wallet);
+    if (segments.length === 3) {
+      if (method === 'GET') { sendJson(res, 200, await deps.mixes.get(id, wallet)); return; }
+      if (method === 'PATCH') {
+        const body = await readJsonBody(req);
+        if (typeof body === 'object' && body !== null && 'assets' in body) await deps.rateLimiter.mixCreate(wallet, deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
+        sendJson(res, 200, await deps.mixes.patch(id, wallet, body)); return;
+      }
+      return methodNotAllowed(res, ['GET', 'PATCH']);
+    }
+    if (['restart', 'confirm', 'enrollment-params'].includes(segments[3] ?? '')) {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      const result = segments[3] === 'restart' ? await deps.mixes.restart(id, wallet)
+        : segments[3] === 'confirm' ? await deps.mixes.confirm(id, wallet, await readJsonBody(req)) : await deps.mixes.prepare(id, wallet);
+      sendJson(res, 200, result); return;
+    }
+  }
+  if (root === 'mixes' && segments[1] === 'shared' && segments.length === 3) {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    await deps.rateLimiter.mixPreview(deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
+    sendJson(res, 200, await deps.mixes.shared(segments[2] ?? '')); return;
+  }
+
+  if (root === 'mixes' && segments.length === 2 && segments[1] === 'preview') {
+    if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+    await deps.rateLimiter.mixPreview(deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
+    sendJson(res, 200, await deps.mixPreview(await readJsonBody(req)));
+    return;
+  }
 
   if (root === 'info' && segments.length === 2 && ['events', 'markets'].includes(segments[1] ?? '')) {
     if (method !== 'GET') return methodNotAllowed(res, ['GET']);
@@ -688,6 +735,11 @@ async function route(
       const wallet = await deps.auth.authenticate(req.headers.authorization);
       await deps.rateLimiter.wallet(configuredChainId() === 97 ? segments[1] : 'portfolios', wallet);
       const body = await readJsonBody(req);
+      if (typeof body === 'object' && body !== null && !Array.isArray(body) && 'mixId' in body) {
+        const id = parsePositiveInteger(String(body.mixId), 'mixId');
+        sendJson(res, 200, segments[1] === 'enrollment-confirm' ? await deps.mixes.confirm(id, wallet, { txHash: 'txHash' in body ? body.txHash : undefined }) : await deps.mixes.prepare(id, wallet));
+        return;
+      }
       if (typeof body !== 'object' || body === null || Array.isArray(body) || !('strategyId' in body)) throw new ValidationError('INVALID_PORTFOLIO', 'strategyId is required');
       const strategyId = parsePositiveInteger(String(body.strategyId), 'strategyId');
       sendJson(res, 200, segments[1] === 'enrollment-confirm' ? await deps.enrollPortfolio(strategyId, wallet) : await deps.preparePortfolioEnrollment(strategyId, wallet));
@@ -931,6 +983,10 @@ async function enrollRoute(req: IncomingMessage, res: ServerResponse, deps: Serv
   const body = await readJsonBody(req);
   if (typeof body !== 'object' || body === null || Array.isArray(body)) {
     throw new ValidationError('INVALID_PORTFOLIO', 'request body must be a JSON object');
+  }
+  if ('mixId' in body) {
+    sendJson(res, 200, await deps.mixes.prepare(parsePositiveInteger(String(body.mixId), 'mixId'), provider));
+    return;
   }
   const strategyId = parsePositiveInteger(String((body as Record<string, unknown>).strategyId ?? ''), 'strategyId');
   if (configuredChainId() === 97) {

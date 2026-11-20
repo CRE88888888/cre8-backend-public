@@ -1,3 +1,8 @@
+import { mixCashWithdrawals } from './mix-flows.js';
+import { loadMixRuntime, decideMixTick, prepareMixTick, mixAvailableCash, mixBelowExecutorMinimum, recordMixExitFailure, MIX_EXIT_MAX_RETRIES, MIX_EXIT_COOLDOWN_MS } from './mix-runtime.js';
+import { withMixPortfolioLock, excludeMixExitBudgets, checkMixLock, recordMixExecution } from './mix-store.js';
+import { createMixService, reconcilePendingMixes } from './mixes.js';
+import { mixAnchor, saveMixValuation } from './mix-valuation.js';
 import { assetsMarketOpen } from './trading-calendar.js';
 import { runYieldRound } from './yield-service.js';
 import { assertUserOpCapacity, boundedCallGasLimit, executionBatchSize, MAX_USER_OP_STEPS, userOpGasOverhead } from './execution-batch.js';
@@ -334,7 +339,8 @@ export function judgeRebalanceOutcome(evidence: RebalanceEvidence): ExecutionOut
   const secondary = decodePriceSourceError({ data: evidence.revertReason });
   if (secondary !== null) failures.push(secondary.detail);
   const spent = evidence.gasUsed === null ? '' : `，gas ${evidence.gasUsed} 已經花掉`;
-  return { status: 'reverted', ...base, error: `上鏈但 op 沒有成功（${failures.join('；')}）${spent}` };
+  return { status: 'reverted', ...base, ...(secondary === null ? {} : { priceSourceFailure: secondary }),
+    error: `上鏈但 op 沒有成功（${failures.join('；')}）${spent}` };
 }
 
 /** `AtpRegistry.effectiveFeeBps(strategyId)`：`minGross` 的放大倍率（＝平台抽成的 bps）。 */
@@ -365,6 +371,7 @@ export type WithTransactionFn = <T>(fn: (client: { query: SchedulerQueryFn }) =>
  * 那種 portfolio 一定會帶著 `unsupportedReason` 回來，不可能被執行。
  */
 export type DuePortfolio = {
+  personalMix?: boolean;
   executionKind?: 'hold' | 'stack' | 'per_asset';
   version?: number;
   scheduleState?: string;
@@ -529,7 +536,7 @@ export type ExecutionOutcome = {
 };
 
 /** 決策所需的輸入：portfolio 與它的 drift 計畫（`planPortfolio` 的產物）。 */
-export type RebalancePlanningInput = { portfolioId: number; account: Address; plan: PortfolioPlan; inclusiveFeeReserveRaw?:bigint };
+export type RebalancePlanningInput = { cashBudgetRaw?: bigint; purpose?: 'exit'; sellOnlyAssets?: ReadonlySet<string>; canTradeAsset?: (asset: string) => boolean; portfolioId: number; account: Address; plan: PortfolioPlan; inclusiveFeeReserveRaw?:bigint };
 
 /** 送出前重問地板的輸入。`executor` 是 chain 上 `oracle()` 的讀取點，`strategyId` 是 `effectiveFeeBps` 的 key。 */
 export type FloorRefreshInput = {
@@ -542,16 +549,24 @@ export type FloorRefreshInput = {
 };
 
 export type SchedulerDeps = {
+  mixExitFailure?: typeof recordMixExitFailure;
+  mixExitMinimum?: typeof mixBelowExecutorMinimum;
+  reconcileMix?: (portfolioId: number, exit?: boolean) => Promise<boolean>;
+  cacheMix?: (id: string, due: DuePortfolio, plan: PortfolioPlan) => Promise<void>;
+  mixRuntime?: typeof loadMixRuntime;
+  prepareMixTick?: typeof prepareMixTick;
   readBuyVersionWindow?: (strategyId: bigint) => Promise<BuyVersionWindow>;
   yieldRound?: typeof runYieldRound;
   clock?:()=>Date;
   withDexLock?: typeof withDexLock;
   dexGate?: (chainId:number,portfolioId:number)=>Promise<string|null>;
   newMoney?: Partial<NewMoneyDeps>;
+  prepareNewMoney?: typeof prepareNewMoney;
   checkTradingMinimums?: (steps: readonly PlannedStep[], purpose: 'ordinary' | 'exit', blockNumber: bigint, assetBudgetRaw?:bigint, finalAssets?:ReadonlySet<string>, rebalanceReserveRaw?:bigint) => Promise<string | null>;
   hasBoughtBefore?: (account: Address, executor: Address, blockNumber: bigint) => Promise<boolean>;
   /** Must hold exclusion from the first snapshot through settlement. null means busy. */
   withPortfolioLock?: typeof withPortfolioLock;
+  withMixPortfolioLock?: typeof withMixPortfolioLock;
   priceSourceChecks?: () => Promise<PriceSourceObservation[]>;
   priceSourceTracker?: PriceSourceTracker;
   /** Checked once before each round. An unavailable RPC blocks every claimed portfolio. */
@@ -704,24 +719,32 @@ export function idempotencyKeyFor(portfolioId: number, planHash: Hex): string {
  * 到期判定 + 認領。
  *
  * 條件：`schedule_state = 'active'` 且（`next_run_at is null` 或 `next_run_at <= now`）。
- * `idle`／`paused` 一律不會被選到；`next_run_at` 為 NULL 的 active = 立刻到期（新 portfolio 不被漏掉）。
+ * `idle`／一般 `paused` 不會被選到；退出冷卻已滿或有待對帳工作者例外。`next_run_at` 為 NULL 的 active = 立刻到期（新 portfolio 不被漏掉）。
  *
  * `FOR UPDATE OF p SKIP LOCKED`：兩個排程器行程同時跑也不會認領到同一列——後到的那個直接跳過
  * 被鎖住的列，而不是等它。鎖在 transaction 結束時釋放，而 `next_run_at` 已經在**commit 之前**
  * 推進，所以「認領」與「已經排到下一輪」是同一個原子事件。
  */
-export const SCHEDULER_ACTIVE_PREDICATE = `where (p.schedule_state = 'active' or (sv.execution_schema_version in (1,2) and p.schedule_state = 'paused'
+export const SCHEDULER_LEGACY_ACTIVE_PREDICATE = `where (p.schedule_state = 'active' or (sv.execution_schema_version in (1,2) and p.schedule_state = 'paused'
      and exists(select 1 from strategy_jobs j where j.portfolio_id=p.id and j.state in ('reserved','running','unknown','paused'))))`;
+export const SCHEDULER_ACTIVE_PREDICATE = `where (p.schedule_state = 'active' or (sv.execution_schema_version in (1,2) and p.schedule_state = 'paused'
+     and (exists(select 1 from strategy_jobs j where j.portfolio_id=p.id and j.state in ('reserved','running','unknown','paused'))
+       or exists(select 1 from mixes m join mix_portfolio_history h on h.mix_id=m.id and h.ended_at is null
+         where h.portfolio_id=p.id and m.status='active' and m.deleted_at is null and m.triggered_at is not null
+           and m.exit_alerted_at is not null and (m.exit_last_attempt_at<=$1::timestamptz-interval '${MIX_EXIT_COOLDOWN_MS} milliseconds'
+             or exists(select 1 from operations o where o.portfolio_id=p.id and (o.state in ('pending','submitted')
+               or o.state='failed' and (o.tx_hash is not null or o.user_op_hash is not null))))))))`;
 const SQL_CLAIM_DUE = `
   select p.id as portfolio_id,
          p.strategy_id,
          sa.address,
          sa.account_type,
-         sv.schedule, sv.execution, sv.execution_schema_version, p.version, p.schedule_state
+         sv.schedule, sv.execution, sv.execution_schema_version, p.version, p.schedule_state,
+         (select (to_jsonb(s)->>'is_personal_mix')::boolean from strategies s where s.id=p.strategy_id) as personal_mix
     from portfolios p
     join smart_accounts sa
       on sa.portfolio_id = p.id
-     and sa.chain_id = $2
+     and sa.chain_id = $2 and to_jsonb(sa)->>'retired_at' is null
     left join strategy_versions sv
       on sv.strategy_id = p.strategy_id
      and sv.version = p.version
@@ -812,10 +835,21 @@ export async function claimDuePortfolios(
 
   return run(async (client) => {
     const claimed: DuePortfolio[] = [];
-    const rows = (await client.query(SQL_CLAIM_DUE, [now, chainId, limit])).rows;
+    let sql = SQL_CLAIM_DUE;
+    let mixSchema = false;
+    if (chainId === 97) {
+      let metadata: unknown;
+      try { metadata = (await client.query("select to_regclass('mixes') is not null and to_regclass('mix_portfolio_history') is not null as ready")).rows[0]; }
+      catch { throw new Error('mix schema metadata unavailable'); }
+      if (typeof metadata !== 'object' || metadata === null || !('ready' in metadata) || typeof metadata.ready !== 'boolean') throw new Error('mix schema metadata unavailable');
+      mixSchema = metadata.ready;
+    }
+    if (!mixSchema) sql = sql.replace(SCHEDULER_ACTIVE_PREDICATE, SCHEDULER_LEGACY_ACTIVE_PREDICATE);
+    const rows = (await client.query(sql, [now, chainId, limit])).rows;
 
     for (const row of rows) {
       const typed = row as {
+        personal_mix?: unknown;
         portfolio_id?: unknown;
         strategy_id?: unknown;
         address?: unknown;
@@ -833,6 +867,7 @@ export async function claimDuePortfolios(
         schedule.kind === 'interval' ? schedule.intervalSeconds : UNSUPPORTED_SCHEDULE_BACKOFF_SECONDS;
 
       claimed.push({
+        ...(typed.personal_mix === true ? { personalMix: true } : {}),
         ...(executionKind === undefined ? {} : { executionKind, version: toInteger(typed.version,'portfolios.version'), scheduleState: String(typed.schedule_state) }),
         portfolioId,
         strategyId,
@@ -1062,7 +1097,7 @@ const SQL_ACTIVE_SESSION_KEYS = `
     from session_keys k
     join smart_accounts sa
       on sa.portfolio_id = k.portfolio_id
-     and sa.chain_id = $2
+     and sa.chain_id = $2 and to_jsonb(sa)->>'retired_at' is null
    where k.portfolio_id = $1
      and k.status = 'active'
      and k.expires_at > now()
@@ -1639,6 +1674,17 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
 
   return {
     query,
+    mixExitFailure: provided.mixExitFailure ?? recordMixExitFailure,
+    mixExitMinimum: provided.mixExitMinimum ?? mixBelowExecutorMinimum,
+    reconcileMix: provided.reconcileMix ?? ((id, exit) => createMixService().reconcilePortfolio(id, exit)),
+    cacheMix: provided.cacheMix ?? (async (id, due, plan) => {
+      const anchor = await mixAnchor(plan.snapshot.block);
+      if ((await mixAnchor(plan.snapshot.block)).hash !== anchor.hash) throw new Error('[MIX_VALUATION_UNAVAILABLE] 組合估值區塊已改變。');
+      await saveMixValuation(query, id, due.portfolioId, plan, anchor);
+    }),
+    mixRuntime: provided.mixRuntime ?? loadMixRuntime,
+    prepareMixTick: provided.prepareMixTick ?? prepareMixTick,
+    prepareNewMoney: provided.prepareNewMoney ?? prepareNewMoney,
     readBuyVersionWindow: provided.readBuyVersionWindow ?? (id => readBuyVersionWindow(defaultPublicClient(), registryAddress(), id)),
     clock:provided.clock??(()=>new Date()),
     withDexLock: provided.withDexLock ?? withDexLock,
@@ -1655,6 +1701,7 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
       return start > 0n;
     }),
     withPortfolioLock: provided.withPortfolioLock ?? withPortfolioLock,
+    withMixPortfolioLock: provided.withMixPortfolioLock ?? withMixPortfolioLock,
     chainId,
     priceSourceTracker: provided.priceSourceTracker ?? (() => {
       const key = `${chainId}:${provided.executor?.toLowerCase() ?? process.env.EXECUTOR_ADDRESS?.trim().toLowerCase() ?? 'unconfigured'}:${process.env.ORACLE_UNAVAILABLE_ROUNDS ?? '6'}`;
@@ -1695,7 +1742,7 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
         })),
     planRebalance:
       provided.planRebalance ??
-      (async ({ account, plan, inclusiveFeeReserveRaw }: RebalancePlanningInput) => {
+      (async ({ account, plan, inclusiveFeeReserveRaw, sellOnlyAssets, canTradeAsset, purpose, cashBudgetRaw }: RebalancePlanningInput) => {
         const publicClient = defaultPublicClient();
         const executor = executorAddress();
         const oracle = await publicClient.readContract({
@@ -1708,7 +1755,11 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
           throw new Error('planPortfolio 沒有漂移報告（blocked）：不該進到規劃器');
         }
         return planRebalance({
+          ...(cashBudgetRaw === undefined ? {} : { cashBudgetRaw }),
+          ...(purpose === undefined ? {} : { purpose }),
           ...(inclusiveFeeReserveRaw===undefined?{}:{inclusiveFeeReserveRaw}),
+          ...(sellOnlyAssets === undefined ? {} : { sellOnlyAssets }),
+          ...(canTradeAsset === undefined ? {} : { canTradeAsset }),
           maxLegUsdE8: await readMaxLegUsdE8(plan.targets.map((target) => target.asset), query, chainId),
           publicClient,
           account,
@@ -1855,6 +1906,10 @@ export async function runSchedulerOnce(
   const limit = assertLimit(args.limit ?? DEFAULT_ROUND_LIMIT);
   const thresholdBps = args.thresholdBps ?? DEFAULT_THRESHOLD_BPS;
   const resolved = resolveDeps({ thresholdBps }, {...deps,clock:deps.clock??(args.now?()=>new Date(now):()=>new Date())});
+  if (!dryRun && resolved.chainId === 97) {
+    try { await reconcilePendingMixes(resolved.query, limit); }
+    catch { resolved.log('[mix] 意圖對帳未完成，保留原排他與證據。'); }
+  }
 
   // Yield exits/recovery have their own account lock and precede DEX queues, buy throttles and price gates.
   try { const result=await (deps.yieldRound??runYieldRound)({dryRun,limit}); resolved.log('[yield] '+JSON.stringify(result)); } catch { resolved.log('[yield] 生息讀值／對帳未完成，保留原部位與預留'); }
@@ -2141,7 +2196,7 @@ async function runOne(
     } else if (ctx.dryRun) {
       result = await decideAndMaybeExecute(due, ctx, base);
     } else {
-      result = await ctx.deps.withPortfolioLock(due.portfolioId, async () =>
+      result = await (due.personalMix ? ctx.deps.withMixPortfolioLock : ctx.deps.withPortfolioLock)(due.portfolioId, async () =>
         await ctx.deps.withDexLock(ctx.deps.chainId, () => decideAndMaybeExecute(due, ctx, base))
           ?? { ...base, outcome: 'blocked' as const, reason: '[DEX_QUEUED] 共用市場正處理另一基金，稍後重報價' })
         ?? { ...base, outcome: 'blocked', reason: '[PORTFOLIO_LOCK_BUSY] 投組已被另一輪鎖定，這一輪不規劃、不送交易' };
@@ -2256,11 +2311,13 @@ async function decideAndMaybeExecute(
     }
     const execution = reconciliation.outcome;
     if(due.executionKind==='per_asset'&&execution.status==='success'){
-      await settleAllocatedCash(ctx.deps,due.portfolioId,op.idempotency_key,execution);
+      await settleAllocatedCash(ctx.deps,due.portfolioId,op.idempotency_key,execution,due.personalMix);
       return {...base,outcome:'executed',execution,reason:'原再平衡收據與已配置現金已原子對帳，本輪無重送'};
     }
-    const settled = await ctx.deps.query(SQL_SETTLE_OPERATION, [op.idempotency_key,
-      execution.status === 'success' ? 'confirmed' : 'reverted', execution.txHash, execution.userOpHash, execution.error]);
+    const settled = due.personalMix && execution.status === 'reverted'
+      ? await settleMixFailedOperation(ctx.deps, due.portfolioId, op.idempotency_key, execution, ctx.now)
+      : await ctx.deps.query(SQL_SETTLE_OPERATION, [op.idempotency_key,
+        execution.status === 'success' ? 'confirmed' : 'reverted', execution.txHash, execution.userOpHash, execution.error]);
     if (settled.rows.length !== 1) {
       return { ...base, outcome: 'blocked', reason: '先對帳：操作已安全釋放或不存在，不覆寫 expired，這一輪不送交易' };
     }
@@ -2281,7 +2338,10 @@ async function decideAndMaybeExecute(
   }
 
   if(!ctx.dryRun){const queued=await ctx.deps.dexGate(ctx.deps.chainId,due.portfolioId);if(queued!==null)return {...base,outcome:'blocked',reason:queued};}
-  const plan = await ctx.deps.planPortfolio(due.portfolioId);
+  if (due.personalMix && !ctx.dryRun && await ctx.deps.reconcileMix(due.portfolioId)) {
+    return { ...base, outcome: 'noop', reason: '組合變更已對帳，下輪使用最新組合處理交易。' };
+  }
+  let plan = await ctx.deps.planPortfolio(due.portfolioId);
 
   // Legacy drift portfolios mirror the effective target version for display.
   // Typed funding lots keep their immutable source/version identities: a changed active
@@ -2313,6 +2373,33 @@ async function decideAndMaybeExecute(
   if (plan.report === null) {
     return { ...base, outcome: 'blocked', reason: 'planPortfolio 沒有漂移報告，也沒有 blocked 原因：拒絕在不明狀態下執行' };
   }
+  const mix = due.personalMix ? await ctx.deps.mixRuntime(due, ctx.deps.query, plan.snapshot.block) : null;
+  if (due.personalMix && mix === null) return { ...base, outcome: 'blocked', reason: '[MIX_HISTORY_UNAVAILABLE] 組合資料尚未確認，暫不交易。' };
+  const mixTick = mix === null ? null : decideMixTick(mix, plan, ctx.now);
+  if (mix && mixTick) {
+    if (!ctx.dryRun) await ctx.deps.cacheMix(mix.id, due, plan);
+    if (mix.pending) {
+      if (!ctx.dryRun && mixTick.mode === 'exit') {
+        await ctx.deps.prepareMixTick(mix, { ...mixTick, complete: false }, due, ctx.now, ctx.deps.withTransaction);
+        await ctx.deps.reconcileMix(due.portfolioId, true);
+      }
+      return { ...base, outcome: 'blocked', reason: '組合變更對帳中；停利停損已評估，待確認後退出。' };
+    }
+    if (mixTick.mode === 'exit' && mix.retries >= MIX_EXIT_MAX_RETRIES &&
+        (mix.lastExitAttempt === null || ctx.now.getTime() - mix.lastExitAttempt.getTime() < MIX_EXIT_COOLDOWN_MS)) {
+      return { ...base, outcome: 'blocked', reason: '退出連續失敗已告警，冷卻五分鐘後重新確認條件並續作。' };
+    }
+    if (ctx.forcePlan !== true && mixTick.mode === 'wait') return { ...base, outcome: 'noop', reason: mixTick.reason };
+    if (ctx.forcePlan !== true) {
+      plan = mixTick.plan;
+      if (!ctx.dryRun) await ctx.deps.prepareMixTick(mix, mixTick, due, ctx.now, ctx.deps.withTransaction, await mixCashWithdrawals(due.portfolioId, ctx.deps.query, plan.snapshot.block));
+      if (mixTick.complete) return { ...base, outcome: 'noop', reason: mixTick.mode === 'exit' ? '組合已退出，剩餘為現金與低於最小交易額的尾差。' : '偏離低於最小交易額，本次再平衡檢查完成。' };
+    }
+    if (!ctx.dryRun && mixTick.mode === 'new_money') await ctx.deps.withTransaction(async db => {
+      await excludeMixExitBudgets(db, due.portfolioId);
+    });
+  }
+  if (plan.report === null) return { ...base, outcome: 'blocked', reason: '[MIX_VALUATION_UNAVAILABLE] 無法確認組合價值，不送交易。' };
   // `forcePlan`：呼叫端要用**同一條送出管線**做別的事（例如 redeem 按比例賣成 numeraire）。
   // 那種動作不會讓漂移變大，所以「不需要再平衡」不代表「什麼都不用做」。
   if (due.executionKind === undefined && !plan.report.needsRebalance && ctx.forcePlan !== true) {
@@ -2325,14 +2412,46 @@ async function decideAndMaybeExecute(
     };
   }
 
-  const money = due.executionKind === undefined || ctx.forcePlan === true ? null : await prepareNewMoney({due,plan,query:ctx.deps.query,
+  const money = due.executionKind === undefined || ctx.forcePlan === true || mixTick !== null && mixTick.mode !== 'new_money' ? null : await ctx.deps.prepareNewMoney({due,plan,query:ctx.deps.query,
     run:ctx.deps.withTransaction,chainId:ctx.deps.chainId,now:ctx.now,dryRun:ctx.dryRun,deps:ctx.deps.newMoney});
+  let waitingSourceTarget = false;
+  let cashBudgetRaw: bigint | undefined;
+  if (mix && mixTick?.mode === 'new_money' && money?.job === null && money.rebalance.kind === 'noop' &&
+      /\[(MARKET_CLOSED|BASKET_WAITING|DEFERRED_MIN_ASSET|NO_DUE_SLOT|SLOT_RECORDED)\]/.test(money.rebalance.reason)) {
+    const targetTick = decideMixTick({ ...mix, newMoney: false }, plan, ctx.now);
+    if (targetTick.mode === 'rebalance' && !targetTick.complete) {
+      cashBudgetRaw = await mixAvailableCash(due, plan, ctx.deps.query);
+      plan = targetTick.plan;
+      waitingSourceTarget = true;
+    }
+  }
+  if (plan.report === null) return { ...base, outcome: 'blocked', reason: '[MIX_VALUATION_UNAVAILABLE] 無法確認組合價值，不送交易。' };
   const yieldRebalance=money?.useTargetWeights===true&&plan.snapshot.yieldPositions?.some(p=>p.receipt===null||p.receipt>0n)===true;
   // This projection is only for quoting capped inputs. Actual balances remain authoritative for withdrawal and execution.
   const quotePlan=yieldRebalance?await ctx.deps.newMoney.yieldHoldings(plan):plan;
-  let rebalance = (money?.useTargetWeights?null:money?.rebalance) ?? await ctx.deps.planRebalance({ portfolioId: due.portfolioId, account: due.account, plan:quotePlan,
+  let rebalance = (waitingSourceTarget || money?.useTargetWeights?null:money?.rebalance) ?? await ctx.deps.planRebalance({ portfolioId: due.portfolioId, account: due.account, plan:quotePlan,
+    ...(mixTick?.mode === 'exit' ? { purpose: 'exit' } : {}),
+    ...(cashBudgetRaw === undefined ? {} : { cashBudgetRaw }),
+    ...(mix ? { sellOnlyAssets: mix.exits, canTradeAsset: (asset: string) => assetsMarketOpen(ctx.deps.chainId, [asset], ctx.now) } : {}),
     ...(money?.useTargetWeights?{inclusiveFeeReserveRaw:money.context.reserve}:{}) });
+  if (mix && mixTick?.mode === 'exit' && !ctx.dryRun && (rebalance.kind === 'noop' || rebalance.kind === 'blocked')) {
+    let minimum = false;
+    try { minimum = await ctx.deps.mixExitMinimum(plan); } catch { /* RPC failure never proves dust. */ }
+    if (minimum) {
+      const anchor = await mixAnchor(plan.snapshot.block);
+      if ((await mixAnchor(plan.snapshot.block)).hash !== anchor.hash) throw new Error('[MIX_VALUATION_UNAVAILABLE] 退出證據已改變。');
+      await ctx.deps.prepareMixTick(mix, { ...mixTick, complete: true }, due, ctx.now, ctx.deps.withTransaction, [],
+        { reason: 'below_executor_minimum', anchor });
+      return { ...base, outcome: 'noop', reason: '剩餘持倉低於執行器最小步，已記錄殘留並完成退出。' };
+    }
+    // Quote/oracle/RPC/market deferrals are not failed executable sell attempts.
+  }
+  if (mixTick?.mode === 'rebalance' && rebalance.kind === 'blocked' && rebalance.retryable === false &&
+      /^\[BELOW_MIN_(STEP|BATCH)\]/.test(rebalance.reason)) rebalance = { kind: 'noop', reason: rebalance.reason };
   if (rebalance.kind === 'noop') {
+    if (mix && mixTick?.mode === 'rebalance' && rebalance.retryable !== true && !ctx.dryRun) {
+      await ctx.deps.query('update mixes set last_rebalanced_at=$2 where id=$1 and triggered_at is null', [mix.id, ctx.now]);
+    }
     return { ...base, outcome: 'noop', ...(money?.useTargetWeights&&plan.report.maxAbsDeltaBps<=plan.report.thresholdBps?{rebalanceComplete:true}:{}), reason: `Planner returned noop: ${rebalance.reason}` };
   }
   if (rebalance.kind === 'blocked') {
@@ -2361,6 +2480,11 @@ async function decideAndMaybeExecute(
     };
   }
 
+  if (mix && rebalance.steps.some(step => mix.exits.has(step.tokenOut.toLowerCase()) ||
+      (mix.triggered || mix.status === 'exited' || mixTick?.mode === 'exit') && step.tokenOut.toLowerCase() !== TESTNET_97.contracts.usdt)) {
+    return { ...base, outcome: 'blocked', reason: '[MIX_BUY_FORBIDDEN] 出口成分與已退出組合不能買入。' };
+  }
+  if (mixTick?.mode === 'exit') rebalance = { ...rebalance, purpose: 'exit' };
   const batchCash = ctx.deps.chainId === 97 ? TESTNET_97.contracts.usdt : '0x55d398326f99059ff775485246999027b3197955';
   const buys = rebalance.steps.some(step => !isAddressEqual(step.tokenOut,batchCash));
   const heldCount = plan.snapshot.holdings.filter(h=>h.amountWei>0n&&!isAddressEqual(getAddress(h.asset),batchCash)&&plan.targets.some(t=>t.asset.toLowerCase()===h.asset.toLowerCase())).length;
@@ -2516,13 +2640,16 @@ async function decideAndMaybeExecute(
   } catch {
     return { ...withPlan, outcome: 'blocked', reason: '[USER_OP_EVIDENCE_UNAVAILABLE] 無法取得有效的原 nonce／deadline，不寫 pending、不送交易' };
   }
-  const beforeSending = hasBuy ? async () => {
+  const beforeSending = async () => {
+    await checkMixLock();
+    if (!hasBuy) return;
     const bounded = buyDeadline(await ctx.deps.readBuyVersionWindow(BigInt(plan.pinnedVersion.onchainStrategyId)),
       plan.pinnedVersion.version, rebalance.deadline, ctx.deps.clock());
     // A newly scheduled earlier activation needs a new quote/hash, never a mutated signed payload.
     if (bounded !== rebalance.deadline) throw activationImminent();
-  } : undefined;
-  await beforeSending?.();
+    await checkMixLock();
+  };
+  await beforeSending();
   let gate: OperationGate;
   try {
     gate = await ctx.deps.withTransaction(async (client) => {
@@ -2563,6 +2690,7 @@ async function decideAndMaybeExecute(
     valuationAssets,
     idempotencyKey,
     trackAllocatedCash:due.executionKind==='per_asset',
+    ...(due.personalMix ? { personalMix: true } : {}),
     ...(money?.job ? { strategy: { context: money.context, job: money.job } } : {}),
   });
   if (execution.errorCode === 'PINNED_VERSION_CHANGED' || execution.errorCode === 'VERSION_ACTIVATION_IMMINENT' || execution.errorCode === 'VERSION_STATE_UNAVAILABLE') {
@@ -2620,6 +2748,7 @@ async function decideAndMaybeExecute(
     return { ...withPlan, outcome: 'blocked', execution,
       reason: `送出結果未知，保留在途，下一輪先對帳，不重送：${execution.error ?? '(沒有診斷訊息)'}` };
   }
+  // Pre-broadcast failures (including RPC timeouts) have no canonical failed sell.
   return {
     ...withPlan,
     outcome: execution.priceSourceFailure === undefined ? 'failed' : 'blocked',
@@ -2749,7 +2878,25 @@ export function receiptCashDelta(receipt:UserOperationReceipt,account:Address,ca
   }
   return delta;
 }
-async function settleAllocatedCash(deps:ResolvedDeps,portfolioId:number,key:string,outcome:ExecutionOutcome):Promise<void>{
+/** Receipt settlement and its consecutive exit failure commit together. A late
+ * receipt follows the same path and cannot count again after the state transition. */
+async function settleMixFailedOperation(deps: ResolvedDeps, portfolioId: number, key: string, outcome: ExecutionOutcome, now: Date) {
+  return deps.withTransaction(async ({ query }) => {
+    const original = (await query('select state from operations where idempotency_key=$1 for update', [key])).rows[0];
+    if (typeof original !== 'object' || original === null || !('state' in original) ||
+        !['pending','submitted','failed'].includes(String(original.state))) return { rows: [] };
+    const result = await query(SQL_SETTLE_OPERATION, [key, 'reverted', outcome.txHash, outcome.userOpHash, outcome.error]);
+    if (result.rows.length === 1 && outcome.priceSourceFailure === undefined) {
+      const row = (await query(`select m.id from mixes m join mix_portfolio_history h on h.mix_id=m.id and h.ended_at is null
+        where h.portfolio_id=$1 and m.status='active' and m.triggered_at is not null`, [portfolioId])).rows[0];
+      if (typeof row === 'object' && row !== null && 'id' in row && typeof row.id === 'string') {
+        await deps.mixExitFailure({ id: row.id }, { portfolioId }, now, work => work({ query }));
+      }
+    }
+    return result;
+  });
+}
+async function settleAllocatedCash(deps:ResolvedDeps,portfolioId:number,key:string,outcome:ExecutionOutcome,personalMix=false):Promise<void>{
   if(outcome.cashDeltaRaw===undefined||!/^(-?)(0|[1-9][0-9]*)$/.test(outcome.cashDeltaRaw))throw new Error('missing cash evidence');
   await deps.withTransaction(async({query})=>{
     await lockCash(query,{chainId:deps.chainId,portfolioId});
@@ -2759,6 +2906,7 @@ async function settleAllocatedCash(deps:ResolvedDeps,portfolioId:number,key:stri
     const result=await query(SQL_SETTLE_OPERATION,[key,'confirmed',outcome.txHash,outcome.userOpHash,null]);
     if(result.rows.length!==1)throw new Error('operation changed');
     await query(`update strategy_cash_balances set allocated_cash_raw=allocated_cash_raw+$3::numeric,updated_at=clock_timestamp() where chain_id=$1 and portfolio_id=$2`,[deps.chainId,portfolioId,outcome.cashDeltaRaw]);
+    if(personalMix)await recordMixExecution(query,portfolioId,key,'rebalance');
   });
 }
 
@@ -2803,6 +2951,7 @@ async function executeAndSettle(
   deps: ResolvedDeps,
   args: {
     beforeSending?: () => Promise<void>;
+    personalMix?: boolean;
     strategy?: {context:JobContext;job:StrategyJob};
     trackAllocatedCash?:boolean;
     gasPurpose: 'ordinary' | 'exit';
@@ -2844,9 +2993,11 @@ async function executeAndSettle(
       const cash=(deps.chainId===97?TESTNET_97.contracts.usdt:'0x55d398326f99059ff775485246999027b3197955') as Address;
       const verified=await deps.reconcileRebalance({account:args.account,executor:args.executor,chainId:deps.chainId,userOpHash:outcome.userOpHash,txHash:outcome.txHash,payloadHash:planHashFor(args.steps,args.deadline),trackCash:cash});
       if(verified.kind!=='found'||verified.outcome.status!=='success')throw new Error('cash receipt incomplete');
-      await settleAllocatedCash(deps,args.portfolioId,args.idempotencyKey,verified.outcome);Object.assign(outcome,verified.outcome);return;
+      await settleAllocatedCash(deps,args.portfolioId,args.idempotencyKey,verified.outcome,args.personalMix);Object.assign(outcome,verified.outcome);return;
     }
-    const result = await deps.query(SQL_SETTLE_OPERATION, [args.idempotencyKey, state, outcome.txHash, outcome.userOpHash, error]);
+    const result = args.personalMix && state === 'reverted'
+      ? await settleMixFailedOperation(deps, args.portfolioId, args.idempotencyKey, outcome, deps.clock())
+      : await deps.query(SQL_SETTLE_OPERATION, [args.idempotencyKey, state, outcome.txHash, outcome.userOpHash, error]);
     if (result.rows.length !== 1) throw new Error('操作已安全釋放或不存在，不覆寫 expired');
   };
 
@@ -2980,7 +3131,7 @@ async function reconcileStrategyOperation(due:DuePortfolio,ctx:{dryRun:boolean;n
     userOpHash:op.user_op_hash,txHash:op.tx_hash,payloadHash:op.payload_hash,expectedInputs:b.input_raw,cash});
   if(result.kind==='not_found')return blocked('[PREVIOUS_INFLIGHT] 原業務收據查無；不能排除過去成交，保留預算待對帳');
   if(result.kind!=='found')return blocked('receipt／原 UserOp 證據缺漏，保留在途');
-  const outcome=result.outcome,c={chainId:ctx.deps.chainId,portfolioId:due.portfolioId};
+  const outcome=result.outcome,c={chainId:ctx.deps.chainId,portfolioId:due.portfolioId,...(due.personalMix ? { personalMix: true } : {})};
   if(outcome.status==='success'&&outcome.batchEvidence){
     await ctx.deps.query(SQL_MARK_SUBMITTED,[op.idempotency_key,outcome.userOpHash,outcome.txHash]);
     const row=(await ctx.deps.query('select id from operations where idempotency_key=$1',[op.idempotency_key])).rows[0] as {id:string}|undefined;

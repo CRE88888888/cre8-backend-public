@@ -255,14 +255,14 @@ export type PlannedStep = {
 };
 
 export type RebalancePlan =
-  | { kind: 'noop'; reason: string }
-  | { kind: 'blocked'; reason: string; buyWindowEndsAt?: bigint }
+  | { kind: 'noop'; reason: string; retryable?: boolean }
+  | { kind: 'blocked'; reason: string; buyWindowEndsAt?: bigint; retryable?: boolean }
   | {
       kind: 'ready';
       steps: PlannedStep[];
       deadline: bigint;
       rationale: string;
-      /** Only the server's close/redeem planner may grant the sales-only exit exception. */
+      /** Only server close/redeem or whole-mix exit planning may grant the sales-only exit exception. */
       purpose?: 'exit';
       /**
        * 依這份 `steps` 執行之後，**預估漂移仍高於門檻**（＝還有事要做，下一輪要接著做）。
@@ -309,6 +309,12 @@ export type PlanPartial = {
 
 
 export type PlanRebalanceArgs = {
+  /** Free cash ceiling while other source budgets remain reserved for closed assets. */
+  cashBudgetRaw?: bigint;
+  /** Sales-only server exit; every noncash target must be zero. */
+  purpose?: 'exit';
+  sellOnlyAssets?: ReadonlySet<string>;
+  canTradeAsset?: (asset: string) => boolean;
   /** Only typed all-hold rebalances count the saved fee reserve in the 50 USDT batch. */
   inclusiveFeeReserveRaw?:bigint;
   tradingConfig?: TradingConfig;
@@ -1820,6 +1826,9 @@ async function planHub(
     };
   }
 
+  if (args.purpose === 'exit' && targets.some(t => t.weightBps !== (t.asset.toLowerCase() === hubKey ? 10000 : 0))) {
+    return { kind: 'blocked', reason: '[INVALID_EXIT] 退出配置必須全部賣成現金。' };
+  }
   const holdingsByAsset = new Map<string, Holding>();
   for (const holding of holdings) holdingsByAsset.set(holding.asset.toLowerCase(), holding);
   const driftByAsset = new Map<string, (typeof drift.assets)[number]>();
@@ -1854,7 +1863,7 @@ async function planHub(
   const needsDecimals = targets.some((target) => !sameAsset(target.asset, hub) && limitOf(args.maxLegUsdE8, target.asset) !== null);
   const cashDecimals = needsDecimals || hubHolding === undefined ? await numeraireDecimals(publicClient, hub, holdings, blockNumber) : hubHolding.decimals;
   const cashScale = pow10(cashDecimals);
-  const minimumStepRaw = ceilDiv(policy.minStepUsdE8 * cashScale, USD_E8);
+  const minimumStepRaw = args.purpose === 'exit' ? 0n : ceilDiv(policy.minStepUsdE8 * cashScale, USD_E8);
   const priced: PricedLeg[] = [];
   let head: Head | null = null;
   const ensureHead = async (): Promise<{ blocked: string } | Head> => {
@@ -1994,6 +2003,7 @@ async function planHub(
   // ---- ① 先所有賣 ----
   for (const leg of legs) {
     if (leg.deltaUsdE8 <= 0n) continue;
+    if (args.canTradeAsset?.(leg.asset) === false) { notes.push(`${short(leg.asset)} 收盤中，等待開盤賣出`); continue; }
     const holding = holdingsByAsset.get(leg.asset.toLowerCase());
     if (holding === undefined) {
       notes.push(`${short(leg.asset)} 超配 ${leg.deltaUsdE8} E8 USD，但 holdings 裡沒有它（沒有 decimals／價格），跳過這一步`);
@@ -2065,12 +2075,17 @@ async function planHub(
   try {
     if (legs.some((leg) => leg.deltaUsdE8 < 0n) && buySourceBlock === null) feeReserve = await minimumFeeReserve(publicClient, executor, strategyId, blockNumber,args.account);
   } catch { return { kind: 'blocked', reason: '[MIN_FEE_UNAVAILABLE] 無法確認最低費預留，不買入' }; }
-  const availableCash = (hubHolding?.amountWei ?? 0n) + sellProceeds;
+  if (args.cashBudgetRaw !== undefined && (args.cashBudgetRaw < 0n || args.cashBudgetRaw > (hubHolding?.amountWei ?? 0n))) {
+    return { kind: 'blocked', reason: '[CASH_BUDGET_INVALID] 可用現金預算與持倉不一致。' };
+  }
+  const availableCash = (args.cashBudgetRaw ?? hubHolding?.amountWei ?? 0n) + sellProceeds;
   const spendable = availableCash > feeReserve ? availableCash - feeReserve : 0n;
   let spent = 0n;
 
   for (const leg of legs) {
     if (leg.deltaUsdE8 >= 0n) continue;
+    if (args.sellOnlyAssets?.has(leg.asset.toLowerCase())) { notes.push(`${short(leg.asset)} 為只賣不買的出口`); continue; }
+    if (args.canTradeAsset?.(leg.asset) === false) { notes.push(`${short(leg.asset)} 收盤中，等待開盤買入`); continue; }
     // An unavailable buyAllowance cannot authorize a buy. A sales-only batch needs no buy
     // valuation, so keep independent healthy sells without inventing a buy allowance.
     if (buySourceBlock !== null) continue;
@@ -2138,6 +2153,7 @@ async function planHub(
   if (priced.length === 0) {
     return {
       kind: maxLegBlocked || notes.some((note) => /StaleFeed|SourcesDisagree|InvalidAnswer/.test(note)) ? 'blocked' : 'noop',
+      ...(args.thresholdBps === 0 ? { retryable: notes.some(note => !note.startsWith('[BELOW_MIN_STEP]')) } : {}),
       reason:
         `Hub mode (numeraire ${short(hub)}) produced no executable step: ` +
         `${notes.length === 0 ? 'no non-numeraire target assets, or every deltaUsd is 0' : notes.join('; ')}. Not sending empty steps.`,
@@ -2152,10 +2168,11 @@ async function planHub(
 
   const steps = priced.map((leg) => leg.routed);
   const nominal=priced.map((leg)=>sameAsset(leg.tokenIn,hub)?leg.amountIn:leg.oracleQuoted);
-  const minimumReason = args.inclusiveFeeReserveRaw===undefined?tradeMinimumReason(nominal,'ordinary',policy,cashDecimals):
+  const minimumReason = args.inclusiveFeeReserveRaw===undefined?tradeMinimumReason(nominal,args.purpose ?? 'ordinary',policy,cashDecimals):
     cashDecimals!==18||args.inclusiveFeeReserveRaw<0n?'[TRADE_MINIMUM_UNAVAILABLE] 含費批次單位或預留無效':
     assetTradeMinimumReason(nominal,nominal.reduce((n,value)=>n+value,0n)+args.inclusiveFeeReserveRaw);
-  if (minimumReason !== null) return { kind: 'blocked', reason: minimumReason };
+  if (minimumReason !== null) return { kind: 'blocked', reason: minimumReason,
+    ...(args.thresholdBps === 0 ? { retryable: notes.some(note => !note.startsWith('[BELOW_MIN_STEP]')) } : {}) };
 
   const legNotes = priced.map((leg, index) => {
     const row = driftByAsset.get(
@@ -2175,9 +2192,17 @@ async function planHub(
   const postDrift = driftAfterSteps(holdings, targets, steps, args.thresholdBps);
   // `null` = 算不出來（要買進現在沒有持倉的資產）→ **不套用**不改善守衛。誤擋一個正常的新建倉
   // 比多付一次 gas 貴得多；rationale 會說出來，所以這個放行是可觀測的。
-  if (postDrift !== null && postDrift.grossDriftBps >= drift.grossDriftBps) {
+  const deviation = (report: DriftReport): bigint => report.assets.reduce((sum, row) => {
+    const delta = row.usdValueE8 * BPS_BIG - report.totalUsdE8 * BigInt(row.targetBps);
+    return sum + (delta < 0n ? -delta : delta);
+  }, 0n);
+  const noImprovement = postDrift !== null && (args.thresholdBps === 0
+    ? deviation(postDrift) * drift.totalUsdE8 >= deviation(drift) * postDrift.totalUsdE8
+    : postDrift.grossDriftBps >= drift.grossDriftBps);
+  if (postDrift !== null && noImprovement) {
     return {
       kind: 'noop',
+      ...(args.thresholdBps === 0 ? { retryable: notes.some(note => !note.startsWith('[BELOW_MIN_STEP]')) } : {}),
       reason: noImprovementReason(
         drift,
         postDrift,
@@ -2213,7 +2238,7 @@ async function planHub(
     describePostDrift(drift, postDrift, partial),
   ].join('；');
 
-  return { kind: 'ready', steps, deadline, rationale, ...(batchPartial === null ? {} : { partial: batchPartial }) };
+  return { kind: 'ready', steps, deadline, rationale, ...(args.purpose === undefined ? {} : { purpose: args.purpose }), ...(batchPartial === null ? {} : { partial: batchPartial }) };
 }
 
 /** pinned 路徑裡「已算好、只差問鏈」的那一筆：全部是純算術的結果，不含任何鏈上讀取。 */
@@ -2385,6 +2410,7 @@ export async function planRebalance(
   const { publicClient, executor, oracle, registry, strategyId, holdings, targets, drift, blockNumber } = args;
   const PANCAKE_UR = pancakeRouterForChain(publicClient.chain?.id);
   const thresholdBps = args.thresholdBps;
+  if (args.purpose === 'exit' && args.inclusiveFeeReserveRaw !== undefined) return { kind: 'blocked', reason: '[INVALID_EXIT] 退出不能使用買入預算。' };
   const deadlineSeconds = args.deadlineSeconds ?? DEFAULT_DEADLINE_SECONDS;
 
   if (!Number.isInteger(deadlineSeconds) || deadlineSeconds < 1 || deadlineSeconds > MAX_DEADLINE_SECONDS) {
@@ -2426,7 +2452,7 @@ export async function planRebalance(
   // ---- 兩資產的單池前置：賣方與賣出量都是純算術。**先算完才問鏈**：算不出來的輸入
   // （量是 0、超過 uint160、沒有超配）不該花任何一次鏈上讀取，這在舊 oracle 上是既有行為。
   const preflight = targets.length === 2 ? preflightPinned({ holdings, targets, drift }) : null;
-  if (preflight !== null && preflight.kind === 'reply') return preflight.plan;
+  if (preflight !== null && preflight.kind === 'reply' && !(thresholdBps === 0 && drift.grossDriftBps === 0)) return preflight.plan;
 
   if (new Set(targets.map((target) => target.asset.toLowerCase())).size !== targets.length) {
     return { kind: 'blocked', reason: '目標資產包含同一個地址，不能在同一輪產生多步交易' };
@@ -2458,6 +2484,8 @@ export async function planRebalance(
     }
   }
 
+  if (args.purpose !== undefined || args.cashBudgetRaw !== undefined) return { kind: 'blocked', reason: '[UNSUPPORTED_MIX_ROUTE] 私人組合需要 numeraire 路由。' };
+
   // pinned：oracle 真的只釘一個 pool（D-23）。結構上做不到的事先講清楚，不要用「沒事可做」蓋過去：
   // 一個 3 資產的策略在這種 oracle 上**永遠**不能動，operator 需要知道的是這件事。
   if (preflight === null) {
@@ -2469,6 +2497,7 @@ export async function planRebalance(
         '— that oracle is AtpMultiPoolOracle, and wiring it in makes this path use hub mode automatically.',
     };
   }
+  if (preflight.kind === 'reply') return preflight.plan;
   const leg = preflight.leg;
   const { tokenIn, tokenOut, requested, clamped } = leg;
   let amountIn = leg.amountIn;
@@ -2633,7 +2662,7 @@ export async function planRebalance(
     const minimumReason = args.inclusiveFeeReserveRaw===undefined?tradeMinimumReason([nominal],'ordinary',policy,decimals):
       decimals!==18||args.inclusiveFeeReserveRaw<0n?'[TRADE_MINIMUM_UNAVAILABLE] 含費批次單位或預留無效':
       assetTradeMinimumReason([nominal],nominal+args.inclusiveFeeReserveRaw);
-    if (minimumReason !== null) return { kind: 'blocked', reason: minimumReason };
+    if (minimumReason !== null) return { kind: 'blocked', reason: minimumReason, ...(args.thresholdBps === 0 ? { retryable: false } : {}) };
   }
 
 

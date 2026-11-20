@@ -198,6 +198,7 @@ export type RateLimitConfig = {
   closePerMinute: number;
   assetsPerMinute: number;
   enrollmentPerMinute: number;
+  mixCreateGlobalPerHour: number;
   maxNonces: number;
   trustedProxyIps: string[];
 };
@@ -220,6 +221,7 @@ export function loadRateLimitConfig(env: NodeJS.ProcessEnv = process.env): RateL
     closePerMinute: budget('RATE_LIMIT_CLOSE_PER_MINUTE', 30),
     assetsPerMinute: budget('RATE_LIMIT_ASSETS_PER_MINUTE', 120),
     enrollmentPerMinute: budget('RATE_LIMIT_ENROLLMENT_PER_MINUTE', 30),
+    mixCreateGlobalPerHour: budget('RATE_LIMIT_MIX_CREATE_GLOBAL_PER_HOUR', 300),
     maxNonces: parseInteger(env, 'AUTH_MAX_NONCES', 10_000, { min: 1, max: 1_000_000 }),
     trustedProxyIps,
   };

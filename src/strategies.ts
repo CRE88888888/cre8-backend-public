@@ -46,6 +46,7 @@ export type RebalanceSchedule =
 
 export type StrategyCategory = 'theme' | 'person' | 'leveraged';
 export type Strategy = {
+  personalMix?: true;
   id: number;
   provider: string;
   name: string;
@@ -113,11 +114,12 @@ export type StrategyPage = {
   offset: number;
 };
 
-const STRATEGY_COLUMNS = 'id, provider, name, description, is_public, category, catalog_key, swap_fee_bps, onchain_id, created_at';
+const STRATEGY_COLUMNS = 'id, provider, name, description, is_public, category, catalog_key, swap_fee_bps, onchain_id, created_at, is_personal_mix';
 const VERSION_COLUMNS =
   'strategy_id, version, allocation, schedule, change_log, active_at, created_at, execution_schema_version, execution, execution_chain_id, config_hash';
 
 type StrategyRow = {
+  is_personal_mix?: boolean;
   id: string;
   provider: string;
   name: string;
@@ -444,6 +446,7 @@ export async function listStrategies(params: ListStrategiesParams = {}): Promise
     `select ${STRATEGY_COLUMNS}, count(*) over() as total_count
        from strategies
       where ($1::text is null or provider = $1)
+        and not is_personal_mix
         and ($2::boolean is null or is_public = $2)
       order by created_at desc, id desc
       limit $3 offset $4`,
@@ -484,6 +487,7 @@ export async function getStrategyWithVersionState(id: number, deps: {
   state?: (onchainId: number, version: number) => ReturnType<typeof readVersionState>;
 } = {}) {
   const strategy = await (deps.strategy ?? getStrategy)(id);
+  if (strategy.personalMix) throw new NotFoundError('找不到公開基金。');
   const readState = deps.state ?? readPublicVersionState;
   return { ...strategy, versions: await Promise.all(strategy.versions.map(async version => {
     if (strategy.onchainId === null) return { ...version, status: 'unmirrored' as const, canCancel: false };
@@ -523,6 +527,7 @@ export async function strategyVersionState(id: number, version: number) {
     if (error instanceof AppError) throw error;
     throw new AppError(503, 'VERSION_STATE_UNAVAILABLE', 'strategy version storage unavailable');
   });
+  if (strategy.personalMix) throw new NotFoundError('找不到公開基金。');
   if (strategy.onchainId === null) throw new AppError(409, 'STRATEGY_NOT_ON_CHAIN', 'strategy has no chain identity');
   return readPublicVersionState(strategy.onchainId, version);
 }
@@ -746,6 +751,7 @@ export function previewContribution(input: unknown, confirmedAt = new Date()) {
 
 function mapStrategy(row: StrategyRow): Strategy {
   return {
+    ...(row.is_personal_mix ? { personalMix: true as const } : {}),
     id: Number(row.id),
     provider: row.provider,
     name: row.name,

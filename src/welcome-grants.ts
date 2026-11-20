@@ -6,7 +6,7 @@ import { getConfig, loadWelcomeConfig, WELCOME_AMOUNT_WEI } from './config.js';
 import type { WelcomeConfig } from './config.js';
 import { query, withTransaction } from './db.js';
 import { AppError } from './errors.js';
-import { withRelayerLock } from './relayer-lock.js';
+import { withRelayerLock, relayerNonce } from './relayer-lock.js';
 import { TESTNET_97 } from './testnet-profile.js';
 import type { FaucetFundingEvidence } from './faucet.js';
 import { saveRelayerTransaction } from './relayer-outbox.js';
@@ -135,7 +135,7 @@ async function prepareWelcome(grant: WelcomeGrant, c: WelcomeConfig): Promise<Pr
   const client = createPublicClient({ chain: bscTestnet, transport });
   if (await client.getChainId() !== 97 || !await client.readContract({ address: TESTNET_97.contracts.usdt, abi: WELCOME_ABI, functionName: 'isFaucet', args: [operator.address] })) throw new Error('operator not authorized');
   const wallet = createWalletClient({ account: operator, chain: bscTestnet, transport });
-  const signed = await wallet.signTransaction(await wallet.prepareTransactionRequest({ to: TESTNET_97.contracts.usdt,
+  const signed = await wallet.signTransaction(await wallet.prepareTransactionRequest({ to: TESTNET_97.contracts.usdt, ...(await relayerNonce(client, operator.address)),
     data: encodeFunctionData({ abi: WELCOME_ABI, functionName: 'welcomeFor', args: [grant.account] }) }));
   const hash = keccak256(signed);
   return { hash, raw: signed, broadcast: async () => { if (await client.sendRawTransaction({ serializedTransaction: signed }) !== hash) throw new Error('unexpected hash'); },

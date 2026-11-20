@@ -126,7 +126,7 @@ export async function prepareNewMoney(args:{due:DuePortfolio;plan:PortfolioPlan;
     cash:plan.snapshot.holdings.find(h=>h.asset.toLowerCase()===cash)?.amountWei??0n}:await deps.policy(due,plan,assets);
   const batchStepLimit=executionBatchSize(plan.historicalAssetCount ?? version.allocation.assets.filter(a=>a.address!==cash).length);
   if(batchStepLimit===0)throw new Error('[USER_OP_CAPACITY] 無可行買入批次');
-  const context:JobContext={batchStepLimit,chainId,portfolioId:due.portfolioId,strategyId:due.strategyId,version:due.version,kind:version.execution.kind==='per_asset'?'asset':version.execution.kind,
+  const context:JobContext={...(due.personalMix ? { personalMix: true } : {}),batchStepLimit,chainId,portfolioId:due.portfolioId,strategyId:due.strategyId,version:due.version,kind:version.execution.kind==='per_asset'?'asset':version.execution.kind,
     ...(version.execution.kind==='per_asset'?{execution:version.execution,marketOpenFor:(selected:readonly string[])=>deps.marketOpen({...version,allocation:{assets:version.allocation.assets.filter(a=>selected.includes(a.address))}},now)}:{}),
     account:due.account,allocation:version.allocation,cash,now,reserve:policy.reserve,caps:policy.caps,buyLimit:policy.buyLimit,
     observedCash:policy.cash,enabled:due.scheduleState!=='paused',marketOpen:deps.marketOpen(version,now)};

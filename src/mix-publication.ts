@@ -1,0 +1,330 @@
+import { decodeEventLog, encodeFunctionData, keccak256, parseAbiItem, parseTransaction, recoverTransactionAddress, serializeTransaction, TransactionReceiptNotFoundError } from 'viem';
+import type { Address, Hex, PublicClient, TransactionReceipt } from 'viem';
+import { bscTestnet } from 'viem/chains';
+import type { ChainConfig } from './chain.js';
+import { query, withTransaction } from './db.js';
+import { withMixCreationLock, mixRequestHash } from './mix-creation.js';
+import { mixUnavailable } from './mix-store.js';
+import { withRelayerLock, relayerNonce } from './relayer-lock.js';
+import { REGISTRY_ABI, REGISTRY_VERSION_ABI } from './registry-abi.js';
+import { registryConfigHash, typedVersionSettings } from './registry-versioning.js';
+import type { VersionSettings } from './registry-versioning.js';
+import { validateAssetConfig } from './strategy-execution.js';
+import type { AssetExecution } from './strategy-execution.js';
+import type { Allocation } from './strategies.js';
+import { TESTNET_97 as T } from './testnet-profile.js';
+import { AppError } from './errors.js';
+import { recordAlerts } from './alerts.js';
+
+export type MixPublication = {
+  strategy_id: string; chain_id: string; registry: Address; onchain_strategy_id: string; creation_request_id: string | null;
+  allocation: Allocation & { p11: VersionSettings }; schedule: { kind: 'funding' }; execution: AssetExecution; config_hash: Hex; calldata: Hex;
+  state: 'prepared' | 'submitted' | 'confirmed' | 'quarantined'; created_at: Date; alerted_at: Date | null;
+  published_tx_hash: Hex | null; published_block_number: string | null; published_block_hash: Hex | null;
+};
+type Attempt = { strategy_id: string; attempt: number; signer: Address; nonce: string; tx_hash: Hex; signed_raw_tx: Hex;
+  checked_block_number: string; checked_block_hash: Hex; checked_block_time: Date; status: 'success' | 'reverted' | null;
+  block_number: string | null; block_hash: Hex | null };
+type Anchor = { number: bigint; hash: Hex; at: Date };
+export type PublicationDeps = { client: PublicClient; chain?: ChainConfig; operator?: Address; query: typeof query; transaction: typeof withTransaction;
+  lock?: typeof withRelayerLock; jobLock?: typeof withMixCreationLock; timeoutMs?: number; nonceLockMs?: number; deadlineAt?: number; now?: () => Date };
+export const PUBLICATION_ALERT_MS = 60_000;
+const jobColumns = `strategy_id,chain_id,registry,onchain_strategy_id,creation_request_id,allocation,schedule,execution,config_hash,calldata,state,
+  created_at,alerted_at,published_tx_hash,published_block_number,published_block_hash`;
+const event = parseAbiItem('event VersionPublished(uint256 indexed id,uint16 version,bytes32 scheduleHash)');
+async function bounded<R>(work: Promise<R>, deps: PublicationDeps): Promise<R> {
+  const requested = deps.timeoutMs ?? 5000;
+  const ms = deps.deadlineAt === undefined ? requested : Math.min(requested, deps.deadlineAt - Date.now());
+  if (!Number.isSafeInteger(ms) || ms < 1 || ms > 30000) throw mixUnavailable();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try { return await Promise.race([work, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(mixUnavailable()), ms); })]); }
+  finally { clearTimeout(timer); }
+}
+async function load(id: string, deps: PublicationDeps): Promise<MixPublication> {
+  const row = (await deps.query<MixPublication>(`select ${jobColumns} from mix_publication_jobs where strategy_id=$1`, [id])).rows[0];
+  if (!row) throw mixUnavailable();
+  validatePublication(row); return row;
+}
+/** Recompute the complete immutable public payload, never trusting a stored hash alone. */
+export function validatePublication(job: MixPublication): void {
+  try {
+    if (job.chain_id !== '97' || job.registry !== T.contracts.registry || !/^[1-9][0-9]*$/.test(job.onchain_strategy_id) ||
+        BigInt(job.onchain_strategy_id) > BigInt(Number.MAX_SAFE_INTEGER) || mixRequestHash(job.schedule) !== mixRequestHash({ kind: 'funding' })) throw mixUnavailable();
+    const allocation = { assets: job.allocation.assets }, execution = validateAssetConfig(job.execution, allocation, 97);
+    if (execution.rebalance !== 'none' || execution.assets.some(a => a.yield !== null || a.asset !== T.contracts.usdt && a.execution?.kind !== 'hold')) throw mixUnavailable();
+    const settings = typedVersionSettings({ chainId: 97, allocation, execution, schedule: job.schedule, activeAt: new Date(0) });
+    const expected = { ...allocation, p11: settings };
+    if (mixRequestHash(job.allocation) !== mixRequestHash(expected) || mixRequestHash(job.execution) !== mixRequestHash(execution) ||
+        job.config_hash !== registryConfigHash(allocation.assets.map(a => a.address as Address), allocation.assets.map(a => a.weightBps), settings) ||
+        job.calldata !== encodeFunctionData({ abi: REGISTRY_ABI, functionName: 'publishSettingsVersion', args: [BigInt(job.onchain_strategy_id),
+          allocation.assets.map(a => a.address as Address), allocation.assets.map(a => a.weightBps), settings.scheduleHash, settings.settingsHash, settings.performanceFeeBps, 0n] })) throw mixUnavailable();
+  } catch { throw mixUnavailable(); }
+}
+export async function validatePublicationTransaction(job: MixPublication, attempt: Pick<Attempt, 'tx_hash' | 'signed_raw_tx' | 'signer' | 'nonce'>): Promise<void> {
+  try {
+    validatePublication(job);
+    if (!/^0x[0-9a-f]{64}$/.test(attempt.tx_hash) || !/^0x([0-9a-f]{2})+$/.test(attempt.signed_raw_tx) || keccak256(attempt.signed_raw_tx) !== attempt.tx_hash) throw mixUnavailable();
+    const tx = parseTransaction(attempt.signed_raw_tx);
+    if ((tx.type !== 'legacy' && tx.type !== 'eip1559') || tx.chainId !== 97 || !Number.isSafeInteger(tx.nonce) || tx.nonce === undefined || tx.nonce < 0 ||
+        tx.nonce.toString() !== attempt.nonce || !tx.gas || tx.gas <= 0n || (tx.value ?? 0n) !== 0n || tx.to?.toLowerCase() !== job.registry ||
+        tx.data !== job.calldata || !tx.r || !tx.s) throw mixUnavailable();
+    const raw = serializeTransaction(tx, { r: tx.r, s: tx.s, v: tx.v ?? BigInt(27 + (tx.yParity ?? 0)) });
+    if (keccak256(raw) !== attempt.tx_hash || (await recoverTransactionAddress({ serializedTransaction: raw })).toLowerCase() !== attempt.signer.toLowerCase()) throw mixUnavailable();
+  } catch { throw mixUnavailable(); }
+}
+async function anchor(deps: PublicationDeps, number?: bigint): Promise<Anchor> {
+  const block = await bounded(deps.client.getBlock(number === undefined ? { blockTag: 'latest' } : { blockNumber: number }), deps);
+  if (block.number === null || number !== undefined && block.number !== number || block.number < 0n || block.hash === null || block.timestamp < 0n || block.timestamp > 8_640_000_000_000n) throw mixUnavailable();
+  return { number: block.number, hash: block.hash, at: new Date(Number(block.timestamp) * 1000) };
+}
+async function state(job: MixPublication, deps: PublicationDeps) {
+  if (await bounded(deps.client.getChainId(), deps) !== 97) throw mixUnavailable();
+  const block = await anchor(deps);
+  const count = await bounded(deps.client.readContract({ address: job.registry, abi: REGISTRY_VERSION_ABI,
+    functionName: 'versionCount', args: [BigInt(job.onchain_strategy_id)], blockNumber: block.number }), deps);
+  if ((await anchor(deps, block.number)).hash !== block.hash) throw mixUnavailable();
+  return { block, count };
+}
+async function mark(job: MixPublication, deps: PublicationDeps, code: string, quarantine = false) {
+  const alert = quarantine || (deps.now?.() ?? new Date()).getTime() - job.created_at.getTime() >= PUBLICATION_ALERT_MS;
+  await deps.transaction(async db => {
+    await db.query("set local statement_timeout='5s'");
+    await db.query("set local lock_timeout='3s'");
+    await db.query(`update mix_publication_jobs set last_error_code=$2,updated_at=clock_timestamp(),
+      state=case when $3 then 'quarantined' else state end,alerted_at=case when $4 then coalesce(alerted_at,clock_timestamp()) else alerted_at end
+      where strategy_id=$1`, [job.strategy_id, code, quarantine, alert]);
+    if (alert) await recordAlerts((sql, params) => db.query(sql, params ? [...params] : []), [{ kind: 'portfolio_stuck', severity: 'critical', portfolioId: null,
+      detail: `私人組合首版發布待營運確認，strategy ${job.strategy_id}，代碼 ${code}；其他組合與已占用 nonce 的證據保持獨立。` }], deps.now?.() ?? new Date());
+  });
+}
+async function attempt(job: MixPublication, deps: PublicationDeps): Promise<Attempt | null> {
+  return (await deps.query<Attempt>(`select o.strategy_id,o.attempt,o.signer,o.nonce::text,o.tx_hash,o.signed_raw_tx,
+    o.checked_block_number::text,o.checked_block_hash,o.checked_block_time,r.status,r.block_number::text,r.block_hash
+    from mix_publication_outbox o left join mix_publication_receipts r using(strategy_id,attempt)
+    where o.strategy_id=$1 order by o.attempt desc limit 1`, [job.strategy_id])).rows[0] ?? null;
+}
+async function receipt(job: MixPublication, current: Attempt, deps: PublicationDeps) {
+  await validatePublicationTransaction(job, current);
+  if (current.signer.toLowerCase() !== (deps.operator ?? deps.chain?.account.address ?? T.roles.operator).toLowerCase()) throw mixUnavailable();
+  let result: TransactionReceipt;
+  try { result = await bounded(deps.client.getTransactionReceipt({ hash: current.tx_hash }), deps); }
+  catch (error) { if (error instanceof TransactionReceiptNotFoundError) return null; throw error; }
+  const [block, tx] = await Promise.all([anchor(deps, result.blockNumber), bounded(deps.client.getTransaction({ hash: current.tx_hash }), deps)]);
+  if (result.from.toLowerCase() !== current.signer.toLowerCase() || result.to?.toLowerCase() !== job.registry ||
+      result.transactionHash !== current.tx_hash || block.hash !== result.blockHash || tx.hash !== current.tx_hash || tx.blockNumber !== block.number ||
+      tx.blockHash !== block.hash || tx.from.toLowerCase() !== current.signer.toLowerCase() || tx.nonce.toString() !== current.nonce ||
+      tx.to?.toLowerCase() !== job.registry || tx.input !== job.calldata || tx.value !== 0n ||
+      !['success','reverted'].includes(result.status) || (await anchor(deps, block.number)).hash !== block.hash) throw mixUnavailable();
+  return { receipt: result, block };
+}
+function publicationLog(job: MixPublication, result: TransactionReceipt) {
+  const matches = result.logs.filter(log => {
+    if (log.address.toLowerCase() !== job.registry || log.removed || log.transactionHash !== result.transactionHash || log.blockNumber !== result.blockNumber ||
+        log.blockHash !== result.blockHash || log.logIndex === null || !Number.isSafeInteger(log.logIndex) || log.logIndex < 0) return false;
+    try { const e = decodeEventLog({ abi: REGISTRY_ABI, data: log.data, topics: log.topics });
+      return e.eventName === 'VersionPublished' && e.args.id.toString() === job.onchain_strategy_id && e.args.version === 1 && e.args.scheduleHash === job.allocation.p11.scheduleHash;
+    } catch { return false; }
+  });
+  const log = matches[0]; if (matches.length !== 1 || !log || log.logIndex === null) throw mixUnavailable();
+  return log;
+}
+async function complete(job: MixPublication, current: Attempt | null, proof: { receipt: TransactionReceipt; block: Anchor }, observed: Anchor, deps: PublicationDeps) {
+  if (proof.receipt.status !== 'success' || observed.number < proof.block.number) throw mixUnavailable();
+  const log = publicationLog(job, proof.receipt);
+  const params = { address: job.registry, abi: REGISTRY_VERSION_ABI, blockNumber: observed.number };
+  const version = await bounded(deps.client.readContract({ ...params, functionName: 'version', args: [BigInt(job.onchain_strategy_id), 1] }), deps);
+  if (version.configHash !== job.config_hash || version.activeAt > BigInt(Math.floor(observed.at.getTime() / 1000)) ||
+      registryConfigHash(version.assets, version.weightsBps, version) !== job.config_hash ||
+      await bounded(deps.client.readContract({ ...params, functionName: 'activeVersion', args: [BigInt(job.onchain_strategy_id)] }), deps) !== 1 ||
+      (await anchor(deps, observed.number)).hash !== observed.hash || (await anchor(deps, proof.block.number)).hash !== proof.block.hash) {
+    await mark(job, deps, 'PUBLICATION_CONFIG_CONFLICT', true); throw mixUnavailable();
+  }
+  await deps.transaction(async db => {
+    await db.query("set local statement_timeout='5s'");
+    await db.query("set local lock_timeout='3s'");
+    const locked = (await db.query<{ state: string }>('select state from mix_publication_jobs where strategy_id=$1 for update', [job.strategy_id])).rows[0];
+    if (locked?.state === 'confirmed') return;
+    if (!locked || locked.state === 'quarantined') throw mixUnavailable();
+    if (current) await db.query(`insert into mix_publication_receipts(strategy_id,attempt,status,block_number,block_hash,block_time)
+      values($1,$2,'success',$3,$4,$5)`, [job.strategy_id, current.attempt, proof.block.number.toString(), proof.block.hash, proof.block.at]);
+    await db.query(`insert into strategy_versions(strategy_id,version,allocation,schedule,execution_schema_version,execution,execution_chain_id,config_hash,active_at)
+      values($1,1,$2,$3,2,$4,97,$5,$6)`, [job.strategy_id, JSON.stringify(job.allocation), JSON.stringify(job.schedule), JSON.stringify(job.execution), job.config_hash, new Date(Number(version.activeAt) * 1000)]);
+    await db.query(`update mix_publication_jobs set state='confirmed',last_error_code=null,published_tx_hash=$2,published_log_index=$3,
+      published_block_number=$4,published_block_hash=$5,published_block_time=$6,verified_block_number=$7,verified_block_hash=$8,verified_block_time=$9,
+      published_active_at=$10,resolved_at=clock_timestamp(),updated_at=clock_timestamp() where strategy_id=$1`,
+      [job.strategy_id, proof.receipt.transactionHash, log.logIndex, proof.block.number.toString(), proof.block.hash, proof.block.at,
+        observed.number.toString(), observed.hash, observed.at, new Date(Number(version.activeAt) * 1000)]);
+    if (job.creation_request_id) await db.query('update mix_creation_requests set last_error_code=null,updated_at=clock_timestamp() where id=$1', [job.creation_request_id]);
+  });
+}
+
+/** One job lock; shared nonce exclusion covers preparation+commit+broadcast only.
+ * An ambiguous COMMIT returns before broadcast. A restart reads this same attempt. */
+export async function reconcileMixPublication(id: string, deps: PublicationDeps, replay = false): Promise<'confirmed' | 'replayed' | 'reverted' | 'unresolved'> {
+  return (deps.jobLock ?? withMixCreationLock)('publication:' + id, async () => {
+    let job = await load(id, deps);
+    try {
+      const observed = await state(job, deps);
+      if (observed.count > 1n) { await mark(job, deps, 'PUBLICATION_VERSION_CONFLICT', true); job = await load(id, deps); }
+      let current = await attempt(job, deps);
+      if (current?.status && current.block_number !== null && (await anchor(deps, BigInt(current.block_number))).hash !== current.block_hash) {
+        await mark(job, deps, 'PUBLICATION_RECEIPT_REORG', true); return 'unresolved';
+      }
+      if (job.state === 'quarantined') {
+        if (current && current.status === null) {
+          const pending = current, proof = await receipt(job, pending, deps);
+          if (proof) await deps.transaction(async db => {
+            await db.query("set local statement_timeout='5s'");
+            await db.query("set local lock_timeout='3s'");
+            await db.query('select strategy_id from mix_publication_jobs where strategy_id=$1 for update', [id]);
+            if (!(await db.query('select 1 from mix_publication_receipts where strategy_id=$1 and attempt=$2', [id, pending.attempt])).rows.length) {
+              await db.query(`insert into mix_publication_receipts(strategy_id,attempt,status,block_number,block_hash,block_time)
+                values($1,$2,$3,$4,$5,$6)`, [id, pending.attempt, proof.receipt.status, proof.block.number.toString(), proof.block.hash, proof.block.at]);
+            }
+          });
+        }
+        return 'unresolved';
+      }
+      if (job.state === 'confirmed') {
+        if (observed.count !== 1n || job.published_block_number === null ||
+            (await anchor(deps, BigInt(job.published_block_number))).hash !== job.published_block_hash) {
+          await mark(job, deps, 'PUBLICATION_RECEIPT_REORG', true); return 'unresolved';
+        }
+        const confirmed = await bounded(deps.client.readContract({ address: job.registry, abi: REGISTRY_VERSION_ABI, functionName: 'version',
+          args: [BigInt(job.onchain_strategy_id), 1], blockNumber: observed.block.number }), deps);
+        if (confirmed.configHash !== job.config_hash || registryConfigHash(confirmed.assets, confirmed.weightsBps, confirmed) !== job.config_hash ||
+            await bounded(deps.client.readContract({ address: job.registry, abi: REGISTRY_VERSION_ABI, functionName: 'activeVersion',
+              args: [BigInt(job.onchain_strategy_id)], blockNumber: observed.block.number }), deps) !== 1 ||
+            (await anchor(deps, observed.block.number)).hash !== observed.block.hash) { await mark(job, deps, 'PUBLICATION_CONFIG_CONFLICT', true); return 'unresolved'; }
+        return 'confirmed';
+      }
+      if (current && current.status === null) {
+        const pending = current;
+        const proof = await receipt(job, pending, deps);
+        if (proof) {
+          if (proof.receipt.status === 'success') { if (observed.count !== 1n) throw mixUnavailable(); await complete(job, pending, proof, observed.block, deps); return 'confirmed'; }
+          await deps.transaction(async db => {
+            await db.query("set local statement_timeout='5s'");
+            await db.query("set local lock_timeout='3s'");
+            await db.query('select strategy_id from mix_publication_jobs where strategy_id=$1 for update', [id]);
+            await db.query(`insert into mix_publication_receipts(strategy_id,attempt,status,block_number,block_hash,block_time)
+              values($1,$2,'reverted',$3,$4,$5)`, [id, pending.attempt, proof.block.number.toString(), proof.block.hash, proof.block.at]);
+            await db.query("update mix_publication_jobs set state='prepared',last_error_code='PUBLICATION_REVERTED',updated_at=clock_timestamp() where strategy_id=$1", [id]);
+          });
+          return 'reverted';
+        }
+        if (!replay || observed.count !== 0n) { await mark(job, deps, 'PUBLICATION_RECEIPT_PENDING'); return 'unresolved'; }
+        await (deps.lock ?? withRelayerLock)(97, async held => {
+          await validatePublicationTransaction(job, pending);
+          held();
+          if (await bounded(deps.client.sendRawTransaction({ serializedTransaction: pending.signed_raw_tx }), deps) !== pending.tx_hash) throw mixUnavailable();
+        }, { reconcile: true });
+        await mark(job, deps, 'PUBLICATION_RECEIPT_PENDING'); return 'replayed';
+      }
+      if (observed.count === 1n) {
+        // No unresolved local nonce: recover a matching independently published first version.
+        const logs = await bounded(deps.client.getLogs({ address: job.registry, event, args: { id: BigInt(job.onchain_strategy_id) },
+          fromBlock: current ? BigInt(current.checked_block_number) : 0n, toBlock: observed.block.number }), deps);
+        const matching = logs.filter(log => log.args.version === 1 && !log.removed && log.transactionHash !== null);
+        if (matching.length !== 1 || !matching[0]?.transactionHash) throw mixUnavailable();
+        const txHash = matching[0].transactionHash;
+        const result = await bounded(deps.client.getTransactionReceipt({ hash: txHash }), deps);
+        const tx = await bounded(deps.client.getTransaction({ hash: txHash }), deps);
+        if (tx.from.toLowerCase() !== (deps.operator ?? deps.chain?.account.address ?? T.roles.operator).toLowerCase() || tx.to?.toLowerCase() !== job.registry ||
+            tx.input !== job.calldata || tx.value !== 0n || tx.blockHash !== result.blockHash || tx.blockNumber !== result.blockNumber || tx.hash !== result.transactionHash) throw mixUnavailable();
+        await complete(job, null, { receipt: result, block: await anchor(deps, result.blockNumber) }, observed.block, deps); return 'confirmed';
+      }
+      if (!replay || !deps.chain) { await mark(job, deps, 'PUBLICATION_PENDING'); return 'unresolved'; }
+      await (deps.lock ?? withRelayerLock)(97, async lockHeld => {
+        const duration = deps.nonceLockMs ?? 15000;
+        if (!Number.isSafeInteger(duration) || duration < 1 || duration > 30000) throw mixUnavailable();
+        const critical = { ...deps, deadlineAt: Date.now() + duration };
+        const held = () => { lockHeld(); if (Date.now() >= critical.deadlineAt) throw mixUnavailable(); };
+        held();
+        job = await load(id, deps);
+        const checked = await state(job, critical);
+        if (job.state !== 'prepared' || checked.count !== 0n) throw mixUnavailable();
+        current = await attempt(job, deps);
+        if (current && current.status !== 'reverted') throw mixUnavailable();
+        if (current?.block_number !== null && current?.block_number !== undefined && (await anchor(critical, BigInt(current.block_number))).hash !== current.block_hash) throw mixUnavailable();
+        const chain = deps.chain; if (!chain) throw mixUnavailable();
+        const request = await bounded(chain.wallet.prepareTransactionRequest({ account: chain.account, chain: bscTestnet, to: job.registry,
+          data: job.calldata, value: 0n, ...(await relayerNonce(deps.client, chain.account.address)) }), critical);
+        const raw = await bounded(chain.wallet.signTransaction(request), critical), hash = keccak256(raw);
+        const fresh = { signer: chain.account.address.toLowerCase() as Address, nonce: request.nonce.toString(), tx_hash: hash, signed_raw_tx: raw };
+        await validatePublicationTransaction(job, fresh);
+        held();
+        await deps.transaction(async db => {
+          await db.query("set local statement_timeout='5s'");
+          await db.query("set local lock_timeout='3s'");
+          const locked = (await db.query<{ state: string }>('select state from mix_publication_jobs where strategy_id=$1 for update', [id])).rows[0];
+          if (locked?.state !== 'prepared') throw mixUnavailable();
+          held();
+          const index = (current?.attempt ?? 0) + 1;
+          await db.query(`insert into mix_publication_outbox(strategy_id,attempt,chain_id,signer,nonce,tx_hash,signed_raw_tx,checked_block_number,checked_block_hash,checked_block_time)
+            values($1,$2,97,$3,$4,$5,$6,$7,$8,$9)`, [id, index, fresh.signer, fresh.nonce, hash, raw, checked.block.number.toString(), checked.block.hash, checked.block.at]);
+          held();
+          await db.query("update mix_publication_jobs set state='submitted',last_attempt_at=clock_timestamp(),updated_at=clock_timestamp() where strategy_id=$1", [id]);
+          held();
+        });
+        held();
+        if (await bounded(deps.client.sendRawTransaction({ serializedTransaction: raw }), critical) !== hash) throw mixUnavailable();
+      });
+      // Receipt work runs after releasing the shared EOA lock.
+      const sent = await attempt(job, deps); if (!sent) throw mixUnavailable();
+      let proof = await receipt(job, sent, deps);
+      if (!proof) {
+        try { await bounded(deps.client.waitForTransactionReceipt({ hash: sent.tx_hash, timeout: deps.timeoutMs ?? 5000, pollingInterval: 100 }), deps); }
+        catch { await mark(job, deps, 'PUBLICATION_RECEIPT_PENDING'); return 'unresolved'; }
+        proof = await receipt(job, sent, deps);
+      }
+      if (!proof) { await mark(job, deps, 'PUBLICATION_RECEIPT_PENDING'); return 'unresolved'; }
+      if (proof.receipt.status === 'reverted') return 'unresolved'; // next tick records the original revert before a fresh attempt
+      const after = await state(job, deps);
+      if (after.count !== 1n) throw mixUnavailable();
+      await complete(job, sent, proof, after.block, deps); return 'confirmed';
+    } catch {
+      try { const latest = await load(id, deps); if (latest.state !== 'quarantined') await mark(latest, deps, 'PUBLICATION_UNAVAILABLE'); }
+      catch { /* A lost DB connection preserves the durable attempt for the next worker. */ }
+      return 'unresolved';
+    }
+  }).catch(error => {
+    if (error instanceof AppError && ['MIX_CREATE_BUSY','MIX_UNAVAILABLE'].includes(error.code)) throw error;
+    throw mixUnavailable();
+  });
+}
+
+export async function publishMixStrategy(strategyId: string, onchainId: number, creationId: string | undefined,
+  allocation: Allocation, execution: AssetExecution, deps: PublicationDeps): Promise<void> {
+  const schedule = { kind: 'funding' as const };
+  const settings = typedVersionSettings({ chainId: 97, allocation, execution, schedule, activeAt: new Date(0) });
+  const hash = registryConfigHash(allocation.assets.map(a => a.address as Address), allocation.assets.map(a => a.weightBps), settings);
+  const calldata = encodeFunctionData({ abi: REGISTRY_ABI, functionName: 'publishSettingsVersion', args: [BigInt(onchainId), allocation.assets.map(a => a.address as Address),
+    allocation.assets.map(a => a.weightBps), settings.scheduleHash, settings.settingsHash, settings.performanceFeeBps, 0n] });
+  await deps.query(`insert into mix_publication_jobs(strategy_id,chain_id,registry,onchain_strategy_id,creation_request_id,allocation,schedule,execution,config_hash,calldata)
+    values($1,97,$2,$3,$4,$5,$6,$7,$8,$9) on conflict(strategy_id) do nothing`, [strategyId, T.contracts.registry, onchainId, creationId ?? null,
+      JSON.stringify({ ...allocation, p11: settings }), JSON.stringify(schedule), JSON.stringify(execution), hash, calldata]);
+  const saved = await load(strategyId, deps);
+  if (saved.calldata !== calldata || saved.config_hash !== hash) { await mark(saved, deps, 'PUBLICATION_CONFIG_CONFLICT', true); throw mixUnavailable(); }
+  if (await reconcileMixPublication(strategyId, deps, true) !== 'confirmed') throw mixUnavailable();
+}
+
+
+/** Called inside the shared nonce lock, without acquiring another lock or signing.
+ * Replay only immutable, unresolved originals whose first version is still absent.
+ * This fills gaps before ordinary entry points ask the node for their next nonce. */
+export async function replayPublicationNonceGap(client: PublicClient, signer: Address, from: bigint, held: () => void): Promise<void> {
+  const deps: PublicationDeps = { client, query, transaction: withTransaction, deadlineAt: Date.now() + 5000 };
+  const rows = (await query<{ strategy_id: string }>(`select o.strategy_id from mix_publication_outbox o
+    join mix_publication_jobs j using(strategy_id) left join mix_publication_receipts r using(strategy_id,attempt)
+    where o.chain_id=97 and o.signer=$1 and o.nonce>=$2::numeric and r.strategy_id is null and j.state='submitted'
+    order by o.nonce limit 20`, [signer.toLowerCase(), from.toString()])).rows;
+  for (const row of rows) {
+    const job = await load(row.strategy_id, deps), current = await attempt(job, deps);
+    if (!current || current.status !== null || current.signer.toLowerCase() !== signer.toLowerCase()) throw mixUnavailable();
+    await validatePublicationTransaction(job, current);
+    if ((await state(job, deps)).count !== 0n) continue;
+    held();
+    if (await bounded(client.sendRawTransaction({ serializedTransaction: current.signed_raw_tx }), deps) !== current.tx_hash) throw mixUnavailable();
+  }
+}

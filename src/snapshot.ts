@@ -66,11 +66,11 @@ import { REGISTRY_ABI as ENROLLMENT_ABI, REGISTRY_VERSION_ABI } from './registry
 const REGISTRY_ABI = [...ENROLLMENT_ABI, ...REGISTRY_VERSION_ABI] as const;
 
 const SQL_PORTFOLIO = `
-  select p.id as portfolio_id, p.strategy_id, s.onchain_id, sa.address
+  select p.id as portfolio_id, p.strategy_id, s.onchain_id, sa.address, s.is_personal_mix
     from portfolios p
     join strategies s on s.id = p.strategy_id
     join smart_accounts sa on sa.portfolio_id = p.id
-   where p.id = $1 and sa.chain_id = $2
+   where p.id = $1 and sa.chain_id = $2 and sa.retired_at is null
 `;
 
 const SQL_ALLOCATION = 'select allocation from strategy_versions where strategy_id = $1 and version = $2';
@@ -205,14 +205,15 @@ async function loadPortfolioContext(
   query: QueryFn,
   portfolioId: number,
   chainId: number,
-): Promise<{ strategyId: number; onchainStrategyId: number | null; account: Address }> {
+): Promise<{ strategyId: number; onchainStrategyId: number | null; account: Address; personalMix: boolean }> {
   const result = await query(SQL_PORTFOLIO, [portfolioId, chainId]);
   const row = result.rows[0];
   if (row === undefined) {
     throw new Error(`portfolio ${portfolioId} 在 chain ${chainId} 上沒有 smart account，索引器無從讀取持倉`);
   }
-  const typed = row as { strategy_id?: unknown; onchain_id?: unknown; address?: unknown };
+  const typed = row as { strategy_id?: unknown; onchain_id?: unknown; address?: unknown; is_personal_mix?: unknown };
   return {
+    personalMix: typed.is_personal_mix === true,
     strategyId: toInteger(typed.strategy_id, 'portfolios.strategy_id'),
     onchainStrategyId: typed.onchain_id === null || typed.onchain_id === undefined ? null : toInteger(typed.onchain_id, 'strategies.onchain_id'),
     account: asAddress(typed.address, 'smart_accounts.address'),
@@ -287,7 +288,8 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
   // head，同一塊重跑得到不同價格——一個看起來正常、其實每次都不一樣的漂移數字。
   const block = deps.block ?? (await client.getBlockNumber());
 
-  const { strategyId, onchainStrategyId, account } = await loadPortfolioContext(query, portfolioId, chainId);
+  const { strategyId, onchainStrategyId, account, personalMix } = await loadPortfolioContext(query, portfolioId, chainId);
+  const mixBlockHash = personalMix ? (await client.getBlock({ blockNumber: block })).hash : null;
   if (onchainStrategyId === null) {
     throw new Error(`strategy ${strategyId} 沒有 onchain_id：它還沒鏡像到鏈上，索引器沒有目標權重可對齊`);
   }
@@ -422,9 +424,18 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
       // 報價仍然要除以 USDT。少了這一欄，那種策略一持有有池資產就會拋錯。
       quoteTable: [...priceTable.values()],
       block,
-      priceToken: deps.priceToken,
+      priceToken: deps.priceToken ?? (personalMix ? async (reader, args) => {
+        const { priceMixFlowAsset } = await import('./mix-flows.js');
+        const quote = await priceMixFlowAsset(reader, args.token, block);
+        return { priceE8: quote.priceUsdE8, decimals: quote.decimals };
+      } : undefined),
+      ...(personalMix ? { priceSource: 'oracle' as const } : {}),
     }),
     scanPortfolioHoldings({
+      ...(personalMix ? { beforeAdvance: async (range: { fromBlock: bigint; toBlock: bigint }) => {
+        const { syncMixFlowRange } = await import('./mix-flows.js');
+        await syncMixFlowRange(client, portfolioId, range);
+      } } : {}),
       client,
       query,
       portfolioId,
@@ -435,7 +446,17 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
     }),
   ]);
 
-  const yieldConfig = chainId===97 ? yieldProfile() : null;
+  if (personalMix && (scan.scannedRange === null || scan.cursor.lastScannedBlock < block)) {
+    const { syncMixFlowRange } = await import('./mix-flows.js');
+    const fromBlock = scan.cursor.lastScannedBlock < block ? scan.cursor.lastScannedBlock + 1n : block;
+    await syncMixFlowRange(client, portfolioId, { fromBlock, toBlock: block });
+  }
+
+  if (personalMix) {
+    const { verifyMixBlock } = await import('./mix-flows.js');
+    await verifyMixBlock(mixBlockHash, async () => (await client.getBlock({ blockNumber: block })).hash);
+  }
+  const yieldConfig = chainId===97 && !personalMix ? yieldProfile() : null;
   if(yieldConfig!==null){
     const lending=await readYieldAccount(client,yieldConfig,account,{block});
     snapshot.yieldPositions=lending.positions;

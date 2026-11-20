@@ -7,11 +7,16 @@ import { withRelayerLock } from './relayer-lock.js';
 import { validateRelayerTransaction } from './relayer-outbox.js';
 import { findWelcomeGrant, readWelcomeFundingEvidence, settleWelcomeGrant } from './welcome-grants.js';
 import { readFaucetFundingEvidence, settleFaucetClaim } from './faucet.js';
+import { reconcileMixRegistration } from './mix-registration.js';
+import { withTransaction } from './db.js';
+import { reconcileMixPublication } from './mix-publication.js';
+import { getChain } from './chain.js';
+import type { ChainConfig } from './chain.js';
 import { TESTNET_97 } from './testnet-profile.js';
 
 type Pending = { kind: 'welcome' | 'faucet'; id: string; chain_id: string; day: string; owner: Address; account: Address;
   amount_wei: string; state: 'submitted' | 'unknown'; tx_hash: Hex; signed_raw_tx: Hex | null };
-type Options = { client?: PublicClient; operator?: Address; replay?: boolean; timeoutMs?: number };
+type Options = { chain?: ChainConfig; client?: PublicClient; operator?: Address; replay?: boolean; timeoutMs?: number };
 async function bounded<T>(work: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try { return await Promise.race([work, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('relayer reconciliation timeout')), ms); })]); }
@@ -28,7 +33,8 @@ export async function reconcileRelayerTransactions(options: Options = {}) {
   if (!options.client && config.chainId !== 97) return counts;
   const timeoutMs = options.timeoutMs ?? 5000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new Error('invalid reconciliation timeout');
-  return withRelayerLock(97, async held => {
+  const client = options.client ?? options.chain?.publicClient ?? createPublicClient({ transport: http(config.rpcUrl ?? undefined, { timeout: timeoutMs, retryCount: 0 }) });
+  await withRelayerLock(97, async held => {
     const rows = (await query<Pending>(`select 'welcome' as kind,g.id,g.chain_id,to_char(g.utc_day,'YYYY-MM-DD') as day,
         g.owner,g.account,g.amount_wei,g.state,g.tx_hash,o.signed_raw_tx
       from welcome_grants g left join relayer_transaction_outbox o on o.welcome_grant_id=g.id and o.tx_hash=g.tx_hash and o.chain_id=g.chain_id
@@ -36,7 +42,6 @@ export async function reconcileRelayerTransactions(options: Options = {}) {
       union all select 'faucet',g.id,g.chain_id,to_char(g.utc_day,'YYYY-MM-DD'),g.owner,g.account,g.amount_wei,g.state,g.tx_hash,o.signed_raw_tx
       from faucet_claims g left join relayer_transaction_outbox o on o.faucet_claim_id=g.id and o.tx_hash=g.tx_hash and o.chain_id=g.chain_id
       where g.chain_id=97 and g.state in ('submitted','unknown') and g.tx_hash is not null limit 20`)).rows;
-    const client = options.client ?? createPublicClient({ transport: http(config.rpcUrl ?? undefined, { timeout: timeoutMs, retryCount: 0 }) });
     for (const row of rows) {
       try {
         held();
@@ -79,6 +84,33 @@ export async function reconcileRelayerTransactions(options: Options = {}) {
         counts[state]++;
       } catch { counts.unresolved++; }
     }
+    const mixes = (await query<{ id: string; state: string }>(`select id,state from mix_creation_requests where chain_id=97 and registration_tx_hash is not null
+      and (state='submitted' or state='registered' and last_error_code='VERSION_PUBLICATION_PENDING') order by id limit 20`)).rows;
+    for (const mix of mixes) {
+      // A confirmed registration must not be replayed to resolve a different publication.
+      if (mix.state === 'registered') { counts.unresolved++; continue; }
+      try {
+        held();
+        const result = await reconcileMixRegistration(mix.id, { client, query, transaction: withTransaction,
+          operator: options.operator, assertHeld: held, timeoutMs }, options.replay);
+        if (result === 'registered') counts.confirmed++;
+        else { counts.unresolved++; if (result === 'replayed') counts.replayed++; }
+      } catch { counts.unresolved++; }
+    }
     return counts;
   }, { reconcile: true }).catch(() => { throw new AppError(503, 'RELAYER_RECONCILIATION_UNAVAILABLE', 'relayer reconciliation unavailable; original transactions retained'); });
+  // Each publication owns only its job lock during RPC/receipt work. One bad mix
+  // cannot keep the faucet's shared nonce lock while waiting for a receipt.
+  const jobs = (await query<{ strategy_id: string }>("select strategy_id from mix_publication_jobs where chain_id=97 and state<>'confirmed' order by updated_at,strategy_id limit 20")).rows;
+  for (const job of jobs) {
+    try {
+      const chain = options.chain ?? (options.client ? undefined : getChain());
+      const result = await reconcileMixPublication(job.strategy_id, { client, chain, operator: options.operator,
+        query, transaction: withTransaction, timeoutMs }, options.replay);
+      if (result === 'confirmed') counts.confirmed++;
+      else if (result === 'reverted') counts.failed++;
+      else { counts.unresolved++; if (result === 'replayed') counts.replayed++; }
+    } catch { counts.unresolved++; }
+  }
+  return counts;
 }

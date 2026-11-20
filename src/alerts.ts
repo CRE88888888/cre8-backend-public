@@ -241,6 +241,30 @@ export async function detectAlerts(
   }
 
   const stuck=await detectPortfolioStuck(query,thresholds.stuckHours);
+  if (chainIdFromEnv(env) === 97) {
+    const mixes = await query(`select h.portfolio_id,m.exit_retry_count from mixes m join mix_portfolio_history h
+      on h.mix_id=m.id and h.ended_at is null where m.chain_id=97 and m.deleted_at is null
+      and m.status='active' and m.triggered_at is not null and m.exit_alerted_at is not null`);
+    for (const row of mixes.rows) {
+      const fields = row as Record<string, unknown>;
+      const portfolioId = toInteger(fields.portfolio_id, 'portfolio_id');
+      const count = toInteger(fields.exit_retry_count, 'exit_retry_count');
+      const detail = `私人組合退出已失敗 ${count} 次，已告警並進入五分鐘冷卻，系統將重新確認條件後續作；持倉與原始證據仍保留。`;
+      const prior = stuck.find(finding => finding.portfolioId === portfolioId);
+      if (prior) { prior.severity = 'critical'; prior.detail += '；' + detail; }
+      else stuck.push({ kind: 'portfolio_stuck', severity: 'critical', portfolioId, detail });
+    }
+    const publications = (await query(`select strategy_id::text,last_error_code from mix_publication_jobs
+      where chain_id=97 and state<>'confirmed' and alerted_at is not null order by strategy_id`)).rows;
+    if (publications.length > 0) {
+      const ids = publications.map(row => {
+        if (typeof row !== 'object' || row === null || !('strategy_id' in row) || typeof row.strategy_id !== 'string' || !/^[1-9][0-9]*$/.test(row.strategy_id)) throw new Error('publication alert identity unavailable');
+        return row.strategy_id;
+      });
+      stuck.push({ kind: 'portfolio_stuck', severity: 'critical', portfolioId: null,
+        detail: `私人組合首版發布待營運確認，strategy ${ids.join(', ')}；未決原簽保留，其他組合獨立對帳。` });
+    }
+  }
   if(chainIdFromEnv(env)===97&&yieldProfile()!==null)for(const finding of await detectYieldAttention(query)){
     const prior=stuck.find(s=>s.portfolioId===finding.portfolioId);if(prior)prior.detail+='；'+finding.detail;else stuck.push(finding);
   }

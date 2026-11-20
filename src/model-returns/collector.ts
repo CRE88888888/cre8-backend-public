@@ -9,7 +9,7 @@ import { DAY_MS, lastClosedDay, price } from './calculation.js';
 
 export function klineUrl(pair: string, start: number, end: number): string {
   if (!/^[A-Z0-9]{2,24}USDT$/.test(pair)) throw new InfoSourceError('invalid_pair');
-  return `https://api.binance.com/api/v3/klines?symbol=${pair}&interval=1d&timeZone=0&startTime=${start}&endTime=${end}&limit=1000`;
+  return `https://data-api.binance.vision/api/v3/klines?symbol=${pair}&interval=1d&timeZone=0&startTime=${start}&endTime=${end}&limit=1000`;
 }
 /** A 1d candle must close inside its own UTC day. Binance halts (live BTCUSDT/BNBUSDT 2018-02-08) end a candle early;
  * its close is still that day's last traded price. Candles past `end` (today, in progress) are rejected. */
@@ -52,7 +52,9 @@ export function loadCloseConfig(env: NodeJS.ProcessEnv = process.env): boolean {
   if (flag !== '0' && flag !== '1') throw new ConfigurationError('MODEL_RETURNS_ENABLED must be 0 or 1');
   return flag === '1';
 }
-const getBinance = () => createInfoGet(fetch, 15_000, 60_000, Date.now, ['api.binance.com']);
+// Binance's main REST host returns HTTP 451 from US data centres (Railway US West, verified 2026-11-20);
+// data-api.binance.vision is Binance's public market-data-only host and serves the same klines/ticker endpoints.
+const getBinance = () => createInfoGet(fetch, 15_000, 60_000, Date.now, ['data-api.binance.vision']);
 export function createCloseJob(deps: { env?: NodeJS.ProcessEnv; now?: () => Date; get?: () => InfoGet;
   assets?: readonly { symbol: string; pair: string }[]; save?: (batch: InfoBatch) => Promise<{ events: number; markets: number }>;
   lock?: (action: () => Promise<void>) => Promise<void>; log?: (result: InfoCollectorResult) => void } = {}) {
@@ -69,7 +71,7 @@ export function createCloseJob(deps: { env?: NodeJS.ProcessEnv; now?: () => Date
         nextRun = now.getTime() + DAY_MS;
         // Unfiltered exchangeInfo is ~18 MB (over MAX_SOURCE_BYTES); the all-symbol price list is ~160 KB and
         // also lists pairs in BREAK status (SNDKBUSDT on 2026-11-20); klines alone decide which closes exist.
-        const pairs = new Set(list(json(await (deps.get ?? getBinance)()('https://api.binance.com/api/v3/ticker/price')))
+        const pairs = new Set(list(json(await (deps.get ?? getBinance)()('https://data-api.binance.vision/api/v3/ticker/price')))
           .map(value => text(object(value).symbol)));
         results = await runInfoCollectors((deps.assets ?? MODEL_ASSETS).map(asset => ({ name: `close:${asset.symbol}`, collect: async () => {
           if (!pairs.has(asset.pair)) throw new InfoSourceError('pair_not_found');

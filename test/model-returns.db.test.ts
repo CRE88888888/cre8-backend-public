@@ -16,7 +16,7 @@ const asset = MODEL_ASSETS.find(a => a.symbol === 'AAPLB'); assert.ok(asset);
 const now = new Date(), asOf = lastClosedDay(now);
 const batch: InfoBatch = { events: [], markets: Array.from({ length: 8 }, (_, i) => ({ series: 'close:AAPLB',
   observedOn: new Date(Date.parse(asOf) + (i - 7) * DAY_MS).toISOString().slice(0, 10), value: i === 7 ? '120.12345678' : '100.00000000',
-  source: 'binance', sourceUrl: 'https://api.binance.com/api/v3/klines?symbol=AAPLBUSDT&interval=1d' })) };
+  source: 'binance', sourceUrl: 'https://data-api.binance.vision/api/v3/klines?symbol=AAPLBUSDT&interval=1d' })) };
 
 test('#173 actual market_snapshots SQL upserts idempotently, preserves decimals and rolls back failed batches', async () => {
   await migrate();

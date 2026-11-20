@@ -196,7 +196,7 @@ test('#173 pair listing fits the real source byte cap (unfiltered exchangeInfo i
   };
   const results = await createCloseJob({ env: { MODEL_RETURNS_ENABLED: '1' }, now: () => now, lock: action => action(), log: () => {},
     assets: [{ symbol: 'AAPLB', pair: 'AAPLBUSDT' }, { symbol: 'GONEB', pair: 'GONEBUSDT' }, { symbol: 'BTCB', pair: 'BTCUSDT' }],
-    get: () => createInfoGet(send, 1000, 5000, Date.now, ['api.binance.com']),
+    get: () => createInfoGet(send, 1000, 5000, Date.now, ['data-api.binance.vision']),
     save: async batch => ({ events: 0, markets: batch.markets.length }) })();
   assert.deepEqual(results.map(r => [r.collector, r.error, r.savedMarkets]),
     [['close:AAPLB', null, 1], ['close:GONEB', 'pair_not_found', 0], ['close:BTCB', null, 1]]);
@@ -210,7 +210,7 @@ test('#173 pair listing fits the real source byte cap (unfiltered exchangeInfo i
 });
 
 test('#173 Binance GET uses HTTPS host boundary, bounds bytes/time and never exposes upstream bodies', async () => {
-  const make = (send: (url: string, init: RequestInit) => Promise<Response>, timeout = 15) => createInfoGet(send, timeout, 1000, Date.now, ['api.binance.com']);
+  const make = (send: (url: string, init: RequestInit) => Promise<Response>, timeout = 15) => createInfoGet(send, timeout, 1000, Date.now, ['data-api.binance.vision']);
   const url = klineUrl('AAPLBUSDT', 0, Date.now());
   for (const status of [400, 403, 429, 500]) await assert.rejects(make(async () => new Response('SECRET', { status }))(url), new RegExp(`http_${status}`));
   await assert.rejects(make(async () => { throw new Error('SECRET'); })(url), /network_unavailable/);

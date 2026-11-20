@@ -471,6 +471,29 @@ BLS API 沒有發布時間，`occurredAt` 使用觀測月份末日，API 明示 
 fixtures/HTTP 測試可離線執行；`test/info.db.test.ts` 必須對可拋棄 Postgres 執行，驗證真實 SQL、
 每個來源重跑去重、審核保留、基金對應、篩選邊界、decimal 變化、rollback 與工作鎖。
 
+資訊 AI 初稿（#165）：`INFO_DRAFT_ENABLED=1` 且有 `ANTHROPIC_API_KEY` 才啟用，缺 key 直接停用。
+和收集器各自開關；scheduler 背景 worker 或 `bun scripts/info-collectors.ts` 先收集再起草，一方失敗仍會執行另一方。
+起草每 60 秒檢查一次，只讀 `collected` 且沒有中文/審核紀錄的事件，依 ID 分頁；每輪最多
+`INFO_DRAFT_BATCH_SIZE=10` 筆（1..100），每日最多 `INFO_DRAFT_DAILY_LIMIT=100` 次（0..10000，0 停用）。
+模型為 `INFO_DRAFT_MODEL=claude-haiku-5-5`，直接呼叫 Anthropic Messages API；單次最多 15 秒、輸出最多 1024 tokens。
+測試只用 mock，不會呼叫真 API。
+
+只送事件的 title_en、actual、expected、unit、source、asset_symbols 及收集器已知的公開 payload 欄位；
+未識別欄位、巢狀憑證、DB 審核資料不會送出。提示要求繁中、台灣用語、一句中立文字，且把來源文字當資料而非指令。
+回應須為單一 `title_zh` JSON，1..500 字元；拒絕截斷、額外欄位、未出現於來源的阿拉伯數字、常見簡體與買賣宣傳。
+實際值與預期值必須用 `實際：原值` / `預期：原值`，不換算精度；缺預期值時明寫「預期查不到」。
+這些檢查不能取代人工查核語意、語言及原文，AI 成功只改成 `drafted`，不寫 reviewed_by/reviewed_at、不會自動公開。
+營運沿用 `GET /info/events?include=collected`（SIWE + `OPERATOR_WALLETS`）看 `drafted` 的 titleZh 和原文 titleEn/actual/expected/sourceUrl，
+再經既有 review 端點修改並發布；公開讀取仍僅 published。AI 寫回會重查狀態、審核紀錄、時間戳與來源欄位，避免覆蓋人工修改或重抓修正。
+初稿亦沿用既有來源凍結規則，重抓不會覆寫 drafted 的事實。
+
+`INFO_DRAFT_STATE_DIR` 預設 `.info-collectors`，其中 `drafts/` 的原子名額檔保存 UTC 日呼叫上限，
+包括失敗/中斷與保守預留；重試只存事件識別雜湊、次數及時間，不存 prompt、key 或 AI 原始回應。
+重試間隔為 60 秒、120 秒、240 秒，指數增加到最多 1 小時；下輪才重試。
+429 停止當輪，並共用持久冷卻時間，至少遵守退避及 Retry-After（最多 24 小時）。
+同一 API key/DB 的 scheduler 必須共用持久目錄；不同磁碟/容器不會自動共享，刪除目錄會重置額度與退避。
+狀態目錄損壞/不可寫、DB 或 API 失敗都保留 collected，不洩漏上游本文或憑證，且不影響收集 job。
+
 P11 新 registry／executor 的加入同意、三參數 enroll、24 小時版本生效與版本狀態，見
 [P11 後端版本介面](docs/versioning-p11.zh-TW.md)。該文件的版本跟隨語意取代本文舊有的 enrollment 版本釘選說明。
 

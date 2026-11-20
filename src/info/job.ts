@@ -13,6 +13,7 @@ import { reserveBlsRequest } from './quota.js';
 import { createInfoGet } from './source.js';
 import { saveInfoBatch } from './store.js';
 import { failureCode } from './types.js';
+import { createInfoDraftJob } from './draft-job.js';
 import type { InfoBatch, InfoCollector } from './types.js';
 
 export function loadInfoConfig(env: NodeJS.ProcessEnv = process.env) {
@@ -96,8 +97,21 @@ export function createInfoJob(deps: { env?: NodeJS.ProcessEnv; now?: () => Date;
   };
 }
 
-/** Trading ticks never await source IO. Stop drains the single in-flight round before closing DB. */
-export function createInfoWorker(run = createInfoJob(), onError = () => console.error('[info_collectors] job unavailable; retry on next due round')) {
+/** Collection and drafting have independent switches; either failure leaves the other job runnable. */
+export function createInfoBackgroundJob(collect: () => Promise<unknown> = createInfoJob(),
+  draft: () => Promise<unknown> = createInfoDraftJob({ lock: withInfoJobLock }),
+  onError = () => console.error('[info] job unavailable; retry on next due round')) {
+  return async (): Promise<boolean> => {
+    let successful = true;
+    for (const run of [collect, draft]) {
+      try { await run(); } catch { successful = false; onError(); }
+    }
+    return successful;
+  };
+}
+
+/** Trading ticks never await information IO. Stop drains the single in-flight round before closing DB. */
+export function createInfoWorker(run: () => Promise<unknown> = createInfoBackgroundJob(), onError = () => console.error('[info_collectors] job unavailable; retry on next due round')) {
   let pending: Promise<void> | null = null;
   return {
     tick(): void {

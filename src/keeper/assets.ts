@@ -1,4 +1,6 @@
-// Fixed raw prices from cre8-contracts b767bf6b22bb697a0b86abf8ed683916fe81502d, script/testnet/TestnetAssets.sol.
+// Fixed raw prices from cre8-contracts cbc671d395e89357b7bf3726c37775ba1f42ef35, script/testnet/TestnetAssets.sol.
+// New launch prices match docs/research/2026-11-20-launch-lineup/新增模擬資產.csv.
+// ANTB is a pure test constant (300 USDT), not a market price. No UI multiplier is applied.
 export const TESTNET_ASSETS = [
   {
     "symbol": "AAPLB",
@@ -733,6 +735,110 @@ export const TESTNET_ASSETS = [
     "decimals": 18,
     "fee": 2500,
     "priceE18": "1280000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "AMCB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "2920000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "ANTB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "300000000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "BMNRB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "15710000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "BNCB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "3530000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "COINB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "112370000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "CYPHB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "1850000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "GMEB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "26310000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "MRVLB",
+    "decimals": 18,
+    "fee": 10000,
+    "priceE18": "147983000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "PDDB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "86360000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "PENGB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "45030000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "RDDTB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "92970000000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "SOXLB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "50872500000000000000",
+    "hasFeed": false,
+    "maxFeedAge": 0
+  },
+  {
+    "symbol": "TQQQB",
+    "decimals": 18,
+    "fee": 2500,
+    "priceE18": "53091500000000000000",
     "hasFeed": false,
     "maxFeedAge": 0
   }

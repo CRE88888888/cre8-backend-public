@@ -18,13 +18,13 @@ async function local(method: string, params: readonly unknown[] = []) {
 }
 const eventAbi = parseAbi(['event Swap(address indexed sender,address indexed recipient,int256 amount0,int256 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick,uint128 protocolFeesToken0,uint128 protocolFeesToken1)']);
 
-test('#87 all 92 pools trade, then held/paused/exhausted pools maintain observations across restart', { timeout: 600000 }, async () => {
+test('#87 all 105 pools trade, then held/paused/exhausted pools maintain observations across restart', { timeout: 600000 }, async () => {
   assert.equal(process.env.PRICE_KEEPER_RPC_URL, rpc);
   await local('anvil_nodeInfo'); assert.equal(await client.getChainId(), 97);
   const manifestPath = process.env.PRICE_KEEPER_MANIFEST; assert.ok(manifestPath);
   const manifest = parseManifest(JSON.parse(await readFile(manifestPath, 'utf8')));
   const chain = createKeeperChain(rpc, signingAccount(process.env.PRICE_KEEPER_PRIVATE_KEY), manifest, () => {});
-  await chain.verify(); assert.equal(manifest.markets.length, 92);
+  await chain.verify(); assert.equal(manifest.markets.length, 105);
   const snapshot = await local('evm_snapshot');
   let swaps = 0; let previews = 0;
   const alerts: string[] = [];
@@ -53,7 +53,7 @@ test('#87 all 92 pools trade, then held/paused/exhausted pools maintain observat
     const keeper = (scenario = moving) => new PriceKeeper(io, scenario, manifest.usdt, manifest.cashFeed, settings,
       (line) => { if (line.includes('] swap ')) swaps++; }, async (line) => { alerts.push(line); }, () => Number(clock) * 1000);
     const firstBlock = await client.getBlockNumber();
-    await advance(start + 60n); await keeper().round(); assert.equal(swaps, 92);
+    await advance(start + 60n); await keeper().round(); assert.equal(swaps, 105);
     const frozen = parseScenario({ ...base, timeline: [{ steps: 120, mode: 'closed', stepBps: 0 }], overrides: {
       ETH: [{ steps: 120, mode: 'paused', stepBps: 0 }],
       TONCOIN: [{ steps: 1, mode: 'rise', stepBps: 0 }],
@@ -61,10 +61,10 @@ test('#87 all 92 pools trade, then held/paused/exhausted pools maintain observat
     const anchors = manifest.markets.map((m) => targetAt(frozen, m.symbol, start, clock).price);
     for (let round = 1; round <= 2; round++) {
       await advance(start + 60n + BigInt(round * 1800 - 1));
-      await keeper(frozen).round(); assert.equal(swaps, round * 92, 'no maintenance before 1800 seconds');
+      await keeper(frozen).round(); assert.equal(swaps, round * 105, 'no maintenance before 1800 seconds');
       await advance(clock + 1n);
       // A brand-new instance at the exact boundary must use on-chain timestamps/direction.
-      await keeper(frozen).round(); assert.equal(swaps, (round + 1) * 92);
+      await keeper(frozen).round(); assert.equal(swaps, (round + 1) * 105);
       const observations = await chain.io.inspect(await chain.io.head());
       observations.forEach((o, i) => {
         assert.equal(o.lastObservation, clock, o.market.symbol + ' actual observation refreshed');
@@ -85,7 +85,7 @@ test('#87 all 92 pools trade, then held/paused/exhausted pools maintain observat
       assert.notEqual(logs[2]?.args.tick, logs[1]?.args.tick);
     }
     assert.equal(alerts.length, 0);
-    console.log(`#87 acceptance: markets=92; swaps=${swaps}; bidirectional previews=${previews}; maintenance rounds=2; source errors=0; alerts=0`);
+    console.log(`#87 acceptance: markets=105; swaps=${swaps}; bidirectional previews=${previews}; maintenance rounds=2; source errors=0; alerts=0`);
   } finally {
     await local('anvil_removeBlockTimestampInterval'); assert.equal(await local('evm_revert', [snapshot]), true);
   }

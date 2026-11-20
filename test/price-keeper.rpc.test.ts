@@ -12,7 +12,7 @@ import { isTransientRpcError, PriceKeeper, safeReason } from '../src/keeper/engi
 import { parseScenario } from '../src/keeper/scenario.js';
 
 test('keeper manifest: rejects wrong chain, missing/zero/duplicate contracts and unwanted feeds', () => {
-  assert.equal(parseManifest(manifestInput()).markets.length, 92);
+  assert.equal(parseManifest(manifestInput()).markets.length, 105);
   const wrongChain = manifestInput(); wrongChain.chainId = 56; assert.throws(() => parseManifest(wrongChain));
   const missing = manifestInput(); delete missing.assets.ETH; assert.throws(() => parseManifest(missing));
   const duplicate = manifestInput(); const eth = duplicate.assets.ETH; const btc = duplicate.assets.BTCB; assert.ok(eth && btc);
@@ -28,7 +28,7 @@ test('keeper manifest: rejects wrong chain, missing/zero/duplicate contracts and
 
 test('keeper chain verifies all pools, minters, keeper permissions and oracle/feed wiring before writes', async () => {
   const { chain, state } = keeperChainFixture(); await chain.verify(); assert.equal(state.sends, 0);
-  assert.equal(state.calls.filter((c) => c.name === 'isMinter').length, 92);
+  assert.equal(state.calls.filter((c) => c.name === 'isMinter').length, 105);
   assert.equal(state.calls.filter((c) => c.name === 'keeper').length, 12);
   for (const bad of ['missing code', 'factory', 'numeraire', 'symbol', 'decimals', 'isMinter', 'keeper', 'getPool',
     'oracleOf', 'pool', 'twapWindow', 'RECENT_WINDOW', 'secondaryOf', 'assetFeed', 'numeraireFeed', 'maxAge']) {
@@ -52,10 +52,10 @@ test('#97 keeper chain refuses every USDT mint without a write, including zero a
   assert.equal(state.sends, 0);
 });
 
-test('keeper inspects 92 markets and both oracle directions at one pinned block', async () => {
+test('keeper inspects 105 markets and both oracle directions at one pinned block', async () => {
   const { state, chain } = keeperChainFixture(); const observations = await chain.io.inspect({ number: 100n, timestamp: 1060n });
-  assert.equal(observations.length, 92); assert.equal(observations.filter((o) => o.feedUpdatedAt !== null).length, 11);
-  assert.equal(state.calls.filter((c) => c.name === 'previewSwap').length, 92 * 3);
+  assert.equal(observations.length, 105); assert.equal(observations.filter((o) => o.feedUpdatedAt !== null).length, 11);
+  assert.equal(state.calls.filter((c) => c.name === 'previewSwap').length, 105 * 3);
   assert.ok(state.calls.every((c) => c.block === '0x64')); assert.equal(state.sends, 0);
 });
 
@@ -65,7 +65,7 @@ test('keeper pool/feed faults and RPC failures prevent an observation set; swap 
     await assert.rejects(chain.io.inspect({ number: 100n, timestamp: 1060n })); assert.equal(state.sends, 0);
   }
   const stale = keeperChainFixture(); stale.state.bad = 'stale feed';
-  assert.equal((await stale.chain.io.inspect({ number: 100n, timestamp: 3602n })).length, 92);
+  assert.equal((await stale.chain.io.inspect({ number: 100n, timestamp: 3602n })).length, 105);
   for (const fail of ['eth_getBlockByNumber', 'latestRoundData', 'observations', 'slot0', 'previewSwap']) {
     const { state, chain } = keeperChainFixture(); state.fail = fail;
     await assert.rejects(fail === 'eth_getBlockByNumber' ? chain.io.head() : chain.io.inspect({ number: 100n, timestamp: 1060n }));
@@ -85,8 +85,8 @@ test('#139 adapter distinguishes exact primary TwapUnavailable from other revert
     code: 3, message: 'execution reverted private-token', data: encodeErrorResult({ abi: recoveryErrors, errorName: 'TwapUnavailable' }),
   } });
   const observations = await f.chain.io.inspect({ number: 100n, timestamp: 1060n });
-  assert.equal(observations.length, 92); assert.ok(observations.every((o) => o.twapE18 === null && o.spotE18 > 0n));
-  assert.equal(f.state.calls.filter((c) => c.name === 'previewSwap').length, 92); assert.equal(f.state.sends, 0);
+  assert.equal(observations.length, 105); assert.ok(observations.every((o) => o.twapE18 === null && o.spotE18 > 0n));
+  assert.equal(f.state.calls.filter((c) => c.name === 'previewSwap').length, 105); assert.equal(f.state.sends, 0);
   for (const error of [primaryRevert('InvalidPoolPrice'), new Error('TwapUnavailable private-token'),
     new ContractFunctionRevertedError({ abi: parseAbi(['error TwapUnavailable(uint256)']), functionName: 'previewSwap',
       data: encodeErrorResult({ abi: parseAbi(['error TwapUnavailable(uint256)']), errorName: 'TwapUnavailable', args: [1n] }) }),
@@ -119,12 +119,12 @@ test('#139 real inspection recovers all missing TWAPs and expired feeds across t
   }, scenario, f.manifest.usdt, f.manifest.cashFeed, { start: 1000n, minimumUsdtE18: budget,
     inventoryUsdtE18: 10n * budget, swapBudgetUsdtE18: budget, stallSeconds: 90 },
   (line) => logs.push(line), async () => { assert.fail('recovery must not alert'); }, () => Number(head.timestamp) * 1000);
-  await keeper.round(); assert.equal(swaps.length, 92); assert.equal(pushes.length, 0);
+  await keeper.round(); assert.equal(swaps.length, 105); assert.equal(pushes.length, 0);
   f.state.primaryError = null;
   head = { number: 101n, timestamp: head.timestamp + 60n };
   // Feeds can refresh with fresh TWAPs while pool swaps are gated by the on-chain timestamp.
   scenario.timeline = [{ steps: 1, mode: 'closed', stepBps: 0 }];
-  await keeper.round(); assert.equal(swaps.length, 92); assert.equal(pushes.length, 12); assert.equal(f.state.sends, 0);
+  await keeper.round(); assert.equal(swaps.length, 105); assert.equal(pushes.length, 12); assert.equal(f.state.sends, 0);
   assert.doesNotMatch(logs.join('\n'), /private-token|critical/);
 });
 
@@ -137,7 +137,7 @@ test('#139 adapter tolerates only StaleFeed proven by the pinned, valid expired 
     if (source === 'cash') f.state.routerError = new ContractFunctionRevertedError({ abi: recoveryErrors, functionName: 'previewSwap',
       data: encodeErrorResult({ abi: recoveryErrors, errorName: 'StaleFeed', args: [f.manifest.cashFeed, 1n] }) });
     const observations = await f.chain.io.inspect({ number: 100n, timestamp: 200_000n });
-    assert.equal(observations.length, 92); assert.ok(observations.filter((o) => o.market.feed).every((o) => o.feedUpdatedAt === 1n));
+    assert.equal(observations.length, 105); assert.ok(observations.filter((o) => o.market.feed).every((o) => o.feedUpdatedAt === 1n));
     assert.equal(f.state.sends, 0);
   }
   for (const updatedAt of [1n, 1000n]) {

@@ -3,9 +3,9 @@ export const TESTNET_97 = {
   "chainId": 97,
   "mode": "public",
   "note": "deployed on public BSC testnet (chain 97)",
-  "verifiedAtBlock": 143191994,
-  "generatedAt": "2026-11-17T04:29:01Z",
-  "gitCommit": "8864bdd46996ef4629cf9ac46ff161b3d3b04d8e",
+  "verifiedAtBlock": 143775403,
+  "generatedAt": "2026-11-20T05:37:10Z",
+  "gitCommit": "cc53e91a833c62d3efe3c8e4c76d3dde2ab8ecf7",
   "versioning": {
     "enrollAbi": "enroll(address,uint256,uint16)",
     "publicationDelaySeconds": 86400,
@@ -811,6 +811,110 @@ export const TESTNET_97 = {
       "decimals": 18,
       "poolFee": 2500,
       "maxLegUsdt": "5000"
+    },
+    "AMCB": {
+      "token": "0x4aaf0123b58892d1fb6b5fec38a9bf778049b94a",
+      "pool": "0xa103ab1524ac7b0bfa9793178cc51483f7b8b482",
+      "oracle": "0xb4438cf14fc83c497151eb354d346f9245890d43",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "ANTB": {
+      "token": "0x4d6c73bc22f83074aba8601d919cfea744899798",
+      "pool": "0xddd410a38626da560b49ec44d4dbf4b5c20106a9",
+      "oracle": "0x31291e814474815bed1024e53ff53513062b2792",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "BMNRB": {
+      "token": "0xd416e9e9699a0150d2a5b3aa8dbd416058bdbc7e",
+      "pool": "0x73b1fe21d4be8724c28b0cd719f7136f38cf01c9",
+      "oracle": "0x404a248eca83fca35568914ace6bb94258c49d88",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "BNCB": {
+      "token": "0x4b761cafbdaba93d23e1e7fe07b2fad5a6106713",
+      "pool": "0x7abd3c8f284e64d25a8a58f03a688d90ee7d2db2",
+      "oracle": "0xb2ee6e04f7963d7ece5d7aed3b64a34ba89c115e",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "COINB": {
+      "token": "0x585173422c84d80481fd260cdc20e68dfd7099d7",
+      "pool": "0xb6cf3487debcba25c77328cb5538023d3a3220f1",
+      "oracle": "0x4fb3ce3696c7109037b1c1902dd5947ee22af863",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "CYPHB": {
+      "token": "0x7584deddeabd63ebe33a641b4dbb81ca41e8a603",
+      "pool": "0xba42ae3aa3cf0eac84c76873a6fea84f61eebe5a",
+      "oracle": "0xb207e2cdd6832c180b2c9573ba17b70346330145",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "GMEB": {
+      "token": "0x7036c9bcb891291d5ba68c70536b99dcb6d529de",
+      "pool": "0x5a6d6ff05a6991278a1d071aec146985b293b917",
+      "oracle": "0x1675d024a6616f57b7ac0e05a600509cce7d6ecf",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "MRVLB": {
+      "token": "0x53fab7d8a7c53403c2cc315499d19320911c4da7",
+      "pool": "0x56040029bc662215becb8f79682bc7b4c641d775",
+      "oracle": "0xe714714c12a288df18cc277a89adb10c7d99f6bd",
+      "decimals": 18,
+      "poolFee": 10000,
+      "maxLegUsdt": "5000"
+    },
+    "PDDB": {
+      "token": "0x73d9908eded64f0b6674164269bf61fe7f2279e8",
+      "pool": "0xe44a4e9ceb38a04800180a40f79058b637fbba7f",
+      "oracle": "0x6bcb19e99354af3123af694c22603e5131453201",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "PENGB": {
+      "token": "0x854798edf972e627908e8c98e5ff69588fe8e644",
+      "pool": "0x5707ca049b6a423662fe34a9358895f3a1080374",
+      "oracle": "0x2357d66d82b97a9760276af05e9d818bb3bba16c",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "RDDTB": {
+      "token": "0xbd7d0075c8a4a1f2335461bb5b04f983a8b56932",
+      "pool": "0x4a951e58efaf9032eb9b5921bb3a840ea328b6ed",
+      "oracle": "0x49ce9523ecfc89d050227409f2105bba49bd435a",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "SOXLB": {
+      "token": "0xd54d97fc8861a8dbb0f59ff1b79492c270159595",
+      "pool": "0x1758639c470dd7fb90147de884a95401606992a9",
+      "oracle": "0xc10588cd5eb031534337f5089f5256c3ba155c46",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
+    },
+    "TQQQB": {
+      "token": "0xb82d787d3cebaa1d8410c262fb062c31076816f8",
+      "pool": "0xe425151662d075823152a250b28c758923c45894",
+      "oracle": "0xf4cf6b466de47ce98059984f77a9ac6ec9cf4824",
+      "decimals": 18,
+      "poolFee": 2500,
+      "maxLegUsdt": "5000"
     }
   },
   "yieldMarkets": [
@@ -1206,5 +1310,5 @@ export const TESTNET_97 = {
     }
   ],
   "yieldMarketCountNote": "C3 table heading says 32, but has 30 rows (21 Venus, 4 Lista, 5 Aave); no unspecified markets added",
-  "sourceCommit": "8864bdd46996ef4629cf9ac46ff161b3d3b04d8e"
+  "sourceCommit": "cc53e91a833c62d3efe3c8e4c76d3dde2ab8ecf7"
 } as const;

@@ -7,6 +7,22 @@ import publicManifest from '../deploy/testnet-97.json' with { type: 'json' };
 // Keep fork-mode rejection coverage after the production input becomes public.
 const manifest = { ...publicManifest, mode: 'fork' };
 
+test('#167 exactly 105 named assets are required; missing, extra and substituted launch assets fail closed', () => {
+  assert.equal(Object.keys(profileFromManifest(manifest).assets).length, 105);
+  const assets: Record<string, unknown> = { ...manifest.assets };
+  const last = assets.TQQQB; assert.ok(last);
+  delete assets.TQQQB;
+  assert.throws(() => profileFromManifest({ ...manifest, assets }), /requires 105 assets/);
+  assert.throws(() => profileFromManifest({ ...manifest, assets: { ...manifest.assets, UNKNOWN: last } }), /requires 105 assets/);
+  assert.throws(() => profileFromManifest({ ...manifest, assets: { ...assets, UNKNOWN: last } }));
+  for (const field of ['token', 'pool', 'oracle']) {
+    const incomplete = { ...manifest.assets.TQQQB };
+    Reflect.deleteProperty(incomplete, field);
+    assert.throws(() => profileFromManifest({ ...manifest, assets: { ...manifest.assets, TQQQB: incomplete } }), /incomplete manifest asset/);
+    assert.throws(() => profileFromManifest({ ...manifest, assets: { ...manifest.assets, TQQQB: { ...incomplete, [field]: 'invalid' } } }), /invalid manifest address/);
+  }
+});
+
 test('#136 public deployment requires explicit public mode and preserves every manifest field', () => {
   assert.equal(publicManifest.mode, 'public');
   assert.throws(() => profileFromManifest(publicManifest), /metadata \/ mode/);
@@ -45,7 +61,7 @@ test('#106 artifact provenance rejects a rebuild from different or missing sourc
 test('#85 identical manifest produces identical full profile; all markets and roles are retained without hand-copied addresses', () => {
   const profile = profileFromManifest(manifest);
   assert.deepEqual(profileFromManifest(structuredClone(manifest)), profile);
-  assert.equal(Object.keys(profile.assets).length, 92); assert.equal(profile.yieldMarkets.length, 30);
+  assert.equal(Object.keys(profile.assets).length, 105); assert.equal(profile.yieldMarkets.length, 30);
   assert.equal(profile.contracts.executor, manifest.contracts.executor.toLowerCase());
   assert.equal(profile.contracts.yieldRegistry, manifest.contracts.yieldRegistry.toLowerCase());
   for (const [key, value] of Object.entries(manifest.roles)) assert.equal(profile.roles[key], value.toLowerCase());

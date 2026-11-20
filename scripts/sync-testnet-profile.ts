@@ -37,7 +37,7 @@ export function profileFromManifest(input: unknown, expectedMode: 'fork' | 'publ
   }
   for (const key of Object.keys(TESTNET_97.roles)) if (!roles[key]) throw new Error('missing manifest role: ' + key);
   const rawAssets = record(m.assets);
-  if (Object.keys(rawAssets).length !== 92) throw new Error('manifest requires 92 assets');
+  if (Object.keys(rawAssets).length !== TESTNET_ASSETS.length) throw new Error(`manifest requires ${TESTNET_ASSETS.length} assets`);
   const assets = Object.fromEntries(TESTNET_ASSETS.map(spec => {
     const asset = addresses(rawAssets[spec.symbol]);
     if (!asset.token || !asset.pool || !asset.oracle || spec.hasFeed && (!asset.feed || !asset.secondary)) throw new Error('incomplete manifest asset');
@@ -164,7 +164,7 @@ export async function syncProfile(root: string, rpcUrl: string, mode: 'fork' | '
   writeFileSync('src/testnet-codehashes.ts', '// Generated from deploy/testnet-97-codehashes.json by scripts/sync-testnet-profile.ts.\nexport default ' + JSON.stringify(hashes, null, 2) + ' as const;\n');
   writeFileSync('src/yield-abi.ts', '// Generated from forge artifacts; source contracts ' + profile.sourceCommit + '.\nexport const YIELD_EXECUTOR_ABI = ' + JSON.stringify(executorAbi) + ' as const;\nexport const YIELD_REGISTRY_ABI = ' + JSON.stringify(registryAbi) + ' as const;\nexport const YIELD_VIEW_ABI = ' + JSON.stringify(viewAbi) + ' as const;\n');
   execFileSync('bun', ['scripts/gen-yield-golden.ts']);
-  console.log('generated chain 97 profile: 92 assets, 30 yield markets, ' + targets.length + ' runtime pins');
+  console.log(`generated chain 97 profile: ${Object.keys(profile.assets).length} assets, ${profile.yieldMarkets.length} yield markets, ${targets.length} runtime pins`);
 }
 
 if (resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url)) {

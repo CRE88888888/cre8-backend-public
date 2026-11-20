@@ -11,6 +11,69 @@ import hashes from '../src/testnet-codehashes.js';
 import { testnetProfileTargets } from '../src/testnet-preflight.js';
 import manifest from '../deploy/testnet-97.json' with { type: 'json' };
 
+const MOCK_PROFILE_SIGNATURES = ['deployWithFactory(address,bytes,bytes32)', 'enroll(address,uint256,uint16)', 'approveEnrollment(uint256,uint16)', 'cancelVersion(uint256)', 'activeVersion(uint256)', 'historicalAssets(uint256)', 'MAX_STRATEGY_ASSETS()', 'operator()', 'owner()', 'executeRebalance(address,(address,address,uint256,uint256,address,bytes)[],uint256)',
+    'executeSupply(address,bytes32,uint256,uint256,uint256)', 'executeWithdraw(address,bytes32,uint256,uint256,uint256)', 'yieldRegistry()', 'quoteSupply(bytes32,address,uint256)', 'quoteWithdraw(bytes32,uint256)', 'market(bytes32)', 'setYieldPolicy(bytes32,uint256,bool)', 'numeraire()', 'oracle()', 'venues(address)', 'oracleOf(address)', 'previewSwap(address,address,uint256)', 'claimFor(address,uint256)', 'claimable(address)', 'isFaucet(address)', 'welcomeFor(address)', 'decimals()', 'getDeposit()', 'verifyingSigner()'];
+
+test('#167 launch assets expose the 5000 USDT cap and inherit stock session boundaries without DB reads', async () => {
+  const { assetsMarketOpen } = await import('../src/trading-calendar.js');
+  const added = TESTNET_ASSETS.slice(92);
+  assert.equal(added.length, 13);
+  const noDb = async () => { throw new Error('testnet caps must not query DB'); };
+  for (const spec of added) {
+    const asset = TESTNET_97.assets[spec.symbol];
+    assert.equal(asset.maxLegUsdt, '5000', spec.symbol);
+    assert.equal((await readMaxLegUsdE8([asset.token], noDb, 97)).get(asset.token), 5000n * 100_000_000n);
+    for (const [time, open] of [
+      ['2026-11-20T14:29:59Z', false], ['2026-11-20T14:30:00Z', true],
+      ['2026-11-20T21:00:00Z', false], ['2026-11-21T16:00:00Z', false],
+    ] as const) assert.equal(assetsMarketOpen(97, [asset.token], new Date(time)), open, spec.symbol);
+  }
+});
+
+test('#167 every new token/pool/oracle has a pin; isolated missing/hash/RPC/timeout faults fail safely', async () => {
+  const { createPublicClient, custom, keccak256, toFunctionSelector, TimeoutError } = await import('viem');
+  const { checkTestnetProfile } = await import('../src/testnet-preflight.js');
+  const added = new Set<string>(TESTNET_ASSETS.slice(92).map(spec => spec.symbol));
+  const targets = testnetProfileTargets();
+  const addedTargets = targets.filter(target => added.has(target.name.split('.')[1] ?? ''));
+  assert.equal(addedTargets.length, 39);
+  assert.ok(addedTargets.every(target => Object.hasOwn(hashes, target.name)));
+  const code = `0x${MOCK_PROFILE_SIGNATURES.map(signature => '63' + toFunctionSelector(signature).slice(2)).join('')}` as const;
+  for (const target of addedTargets) {
+    const client = createPublicClient({ transport: custom({ request: async ({ method, params }) => {
+      if (method === 'eth_chainId') return '0x61';
+      if (method === 'eth_blockNumber') return '0x69';
+      assert.equal(method, 'eth_getCode'); assert.equal(params?.[1], '0x69');
+      return code;
+    } }, { retryCount: 0 }) });
+    const expected = Object.fromEntries(targets.map(t => [t.name, keccak256(code)]));
+    delete expected[target.name];
+    const checks = await checkTestnetProfile(client, expected);
+    assert.equal(checks.find(check => check.name === '97 ' + target.name)?.level, 'fail');
+    assert.equal(checks.filter(check => check.level === 'fail').length, 1);
+    assert.equal(checks.filter(check => check.level === 'ok').length, 419);
+  }
+  const last = addedTargets.at(-1); assert.ok(last);
+  for (const fault of ['missing code', 'wrong hash', 'RPC', 'timeout']) {
+    const client = createPublicClient({ transport: custom({ request: async ({ method, params }) => {
+      if (method === 'eth_chainId') return '0x61';
+      if (method === 'eth_blockNumber') return '0x69';
+      assert.equal(method, 'eth_getCode'); assert.equal(params?.[1], '0x69');
+      if (String(params?.[0]).toLowerCase() === last.address.toLowerCase()) {
+        if (fault === 'RPC') throw new Error('private-token');
+        if (fault === 'timeout') throw new TimeoutError({ body: {}, url: 'https://private-token.invalid' });
+        return fault === 'missing code' ? '0x' : '0x6001';
+      }
+      return code;
+    } }, { retryCount: 0 }) });
+    const checks = await checkTestnetProfile(client, Object.fromEntries(targets.map(t => [t.name, keccak256(code)])));
+    assert.equal(checks.find(check => check.name === '97 ' + last.name)?.level, 'fail', fault);
+    assert.equal(checks.filter(check => check.level === 'fail').length, 1);
+    assert.equal(checks.filter(check => check.level === 'ok').length, 419);
+    assert.doesNotMatch(JSON.stringify(checks), /private-token/);
+  }
+});
+
 test('#79 profile matches every address in contracts yield manifest, retaining admission caps', () => {
   assert.equal(TESTNET_97.sourceCommit, manifest.gitCommit);
   assert.equal(TESTNET_97.gitCommit, manifest.gitCommit);
@@ -38,15 +101,15 @@ test('#69 chain 97 resolves its manifest without mainnet env overrides', async (
   }
 });
 
-test('#69 93 profile assets and max-leg never query the mainnet seed; unknown assets fail closed', async () => {
+test('#69 106 profile assets and max-leg never query the mainnet seed; unknown assets fail closed', async () => {
   const noDb = async () => { throw new Error('mainnet seed must not be read'); };
   const assets = await listPriceableAssets(noDb, undefined, 97);
-  assert.equal(assets.length, 93);
+  assert.equal(assets.length, 106);
   assert.equal(assets.filter((asset) => asset.isNumeraire).length, 1);
   assert.equal(assets.find((asset) => asset.isNumeraire)?.address, TESTNET_97.contracts.usdt);
   assert.equal(testnetAssets().find((asset) => asset.symbol === 'DOGE')?.decimals, 8);
   const limits = await readMaxLegUsdE8(assets.map((asset) => asset.address), noDb, 97);
-  assert.equal(limits.size, 93);
+  assert.equal(limits.size, 106);
   await assert.rejects(readMaxLegUsdE8(['0x55d398326f99059ff775485246999027b3197955'], noDb, 97), /MAX_LEG_UNAVAILABLE/);
 });
 
@@ -72,8 +135,7 @@ test('#69 allocation inserts mock USDT, accepts zero cash weight, rejects foreig
 test('#69 profile preflight verifies every codehash and selector; wrong chain, empty code/hash, RPC and block errors fail closed', async () => {
   const { createPublicClient, custom, keccak256, toFunctionSelector } = await import('viem');
   const { checkTestnetProfile, testnetProfileTargets } = await import('../src/testnet-preflight.js');
-  const signatures = ['deployWithFactory(address,bytes,bytes32)', 'enroll(address,uint256,uint16)', 'approveEnrollment(uint256,uint16)', 'cancelVersion(uint256)', 'activeVersion(uint256)', 'historicalAssets(uint256)', 'MAX_STRATEGY_ASSETS()', 'operator()', 'owner()', 'executeRebalance(address,(address,address,uint256,uint256,address,bytes)[],uint256)',
-    'executeSupply(address,bytes32,uint256,uint256,uint256)', 'executeWithdraw(address,bytes32,uint256,uint256,uint256)', 'yieldRegistry()', 'quoteSupply(bytes32,address,uint256)', 'quoteWithdraw(bytes32,uint256)', 'market(bytes32)', 'setYieldPolicy(bytes32,uint256,bool)', 'numeraire()', 'oracle()', 'venues(address)', 'oracleOf(address)', 'previewSwap(address,address,uint256)', 'claimFor(address,uint256)', 'claimable(address)', 'isFaucet(address)', 'welcomeFor(address)', 'decimals()', 'getDeposit()', 'verifyingSigner()'];
+  const signatures = MOCK_PROFILE_SIGNATURES;
   const code = `0x${signatures.map((s) => '63' + toFunctionSelector(s).slice(2)).join('')}` as const;
   const hashes = Object.fromEntries(testnetProfileTargets().map((t) => [t.name, keccak256(code)]));
   for (const mode of ['ok', 'chain', 'chain-rpc', 'block', 'code-rpc', 'empty', 'wrong-hash', 'missing-hash', 'selector']) {
@@ -90,7 +152,7 @@ test('#69 profile preflight verifies every codehash and selector; wrong chain, e
     const checks = await checkTestnetProfile(client, expected);
     assert.equal(checks.some((c) => c.level === 'fail'), mode !== 'ok', mode);
     assert.doesNotMatch(JSON.stringify(checks), /secret-rpc/);
-    if (mode === 'ok') assert.equal(checks.length, 381);
+    if (mode === 'ok') assert.equal(checks.length, 420);
   }
 });
 
@@ -134,8 +196,8 @@ test('#69 chain 56 keeps its existing address-format diagnostics', () => {
 });
 
 
-test('#87 all 92 raw specs/caps align, original caps stay fixed and every runtime target is pinned', async () => {
-  assert.equal(TESTNET_ASSETS.length, 92);
+test('#87 all 105 raw specs/caps align, original caps stay fixed and every runtime target is pinned', async () => {
+  assert.equal(TESTNET_ASSETS.length, 105);
   assert.equal(Object.keys(launchCaps).length, 38);
   let extensions = 0;
   const noDb = async () => { throw new Error('testnet must not query mainnet caps'); };
@@ -155,23 +217,23 @@ test('#87 all 92 raw specs/caps align, original caps stay fixed and every runtim
       assert.ok(!Object.hasOwn(asset, 'secondary') && !spec.hasFeed);
     }
   }
-  assert.equal(extensions, 54);
+  assert.equal(extensions, 67);
   assert.deepEqual(Object.keys(hashes).sort(), testnetProfileTargets().map((t) => t.name).sort());
-  assert.equal(testnetProfileTargets().length, 381);
+  assert.equal(testnetProfileTargets().length, 420);
   assert.ok(testnetProfileTargets().some(t => t.name === 'yieldView' && t.address === TESTNET_97.contracts.yieldView));
   assert.equal(TESTNET_97.assets.TONCOIN.decimals, 9);
   assert.ok(Object.hasOwn(TESTNET_97.assets, 'Cake'));
 });
 
-test('#92 all 92 admitted assets and automatic USDT validate as one immutable per-asset config', async () => {
+test('#92 all 105 admitted assets and automatic USDT validate as one immutable per-asset config', async () => {
   const {validateAllocation}=await import('../src/strategies.js');
   const {validateAssetConfig}=await import('../src/strategy-execution.js');
-  const assets=Object.values(TESTNET_97.assets).map((a,i)=>({address:a.token,weightBps:i===0?172:108}));
+  const assets=Object.values(TESTNET_97.assets).map((a,i)=>({address:a.token,weightBps:i===0?120:95}));
   const allocation=validateAllocation({assets},97);
-  assert.equal(allocation.assets.length,93);
-  assert.equal(validateAssetConfig(undefined,allocation,97).assets.length,93);
+  assert.equal(allocation.assets.length,106);
+  assert.equal(validateAssetConfig(undefined,allocation,97).assets.length,106);
   const first=assets[0];assert.ok(first);
-  const duplicate=structuredClone(assets);duplicate[91]={...first,weightBps:108};
+  const duplicate=structuredClone(assets);duplicate[104]={...first,weightBps:95};
   assert.throws(()=>validateAllocation({assets:duplicate},97),/duplicate/i);
 });
 
@@ -181,8 +243,7 @@ test('#97 strict profile also verifies paymaster signing/deposit, minter and non
   const { checkTestnetProfile, testnetProfileTargets } = await import('../src/testnet-preflight.js');
   const key = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
   const env = { CHAIN_ID: '97', RPC_URL: 'http://127.0.0.1:8577', PAYMASTER_SIGNER_PRIVATE_KEY: key };
-  const signatures = ['deployWithFactory(address,bytes,bytes32)', 'enroll(address,uint256,uint16)', 'approveEnrollment(uint256,uint16)', 'cancelVersion(uint256)', 'activeVersion(uint256)', 'historicalAssets(uint256)', 'MAX_STRATEGY_ASSETS()', 'operator()', 'owner()', 'executeRebalance(address,(address,address,uint256,uint256,address,bytes)[],uint256)',
-    'executeSupply(address,bytes32,uint256,uint256,uint256)', 'executeWithdraw(address,bytes32,uint256,uint256,uint256)', 'yieldRegistry()', 'quoteSupply(bytes32,address,uint256)', 'quoteWithdraw(bytes32,uint256)', 'market(bytes32)', 'setYieldPolicy(bytes32,uint256,bool)', 'numeraire()', 'oracle()', 'venues(address)', 'oracleOf(address)', 'previewSwap(address,address,uint256)', 'claimFor(address,uint256)', 'claimable(address)', 'isFaucet(address)', 'welcomeFor(address)', 'decimals()', 'getDeposit()', 'verifyingSigner()'];
+  const signatures = MOCK_PROFILE_SIGNATURES;
   const code = `0x${signatures.map(s => '63' + toFunctionSelector(s).slice(2)).join('')}` as const;
   const expected = Object.fromEntries(testnetProfileTargets().map(t => [t.name, keccak256(code)]));
   for (const mode of ['ok', 'wrong-numeraire', 'missing-signer', 'wrong-signer', 'wrong-operator', 'deposit-zero', 'deposit-below', 'deposit-equal', 'factory-unstaked', 'factory-zero', 'factory-delay-zero', 'minter', 'rpc', 'missing-data', 'timeout',

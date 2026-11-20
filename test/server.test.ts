@@ -1256,8 +1256,9 @@ test('#118 contribution preview is public, bounded, rate limited and rejects inv
     }
     for(const amountRaw of ['-1','01','1.0','1e20',100,null,((1n<<256n)).toString()])assert.equal((await post({...body,amountRaw})).status,400);
     for(const extra of [{unknown:1},{chainId:'97'},{chainId:56},{execution:{...execution,unexpected:1}},{execution:null}])assert.equal((await post({...body,...extra})).status,400);
-    const impossible={...execution,assets:[...Object.values(TESTNET_97.assets).map((a,i)=>({asset:a.token,weightBps:i===0?81:109,execution:{kind:'hold'},yield:null})),{asset:cash,weightBps:0,yield:null}]};
-    // 92 assets / 16-step children cannot fit in a 50-USDT complete budget.
+    const profileAssets=Object.values(TESTNET_97.assets),weight=Math.floor(10000/profileAssets.length);
+    const impossible={...execution,assets:[...profileAssets.map((a,i)=>({asset:a.token,weightBps:weight+(i===0?10000%profileAssets.length:0),execution:{kind:'hold'},yield:null})),{asset:cash,weightBps:0,yield:null}]};
+    // 105 assets / 16-step children cannot fit in a 50-USDT complete budget.
     const noPlan=await post({...body,execution:impossible,amountRaw:(50n*U).toString()});assert.equal(noPlan.status,422);
     assert.equal((await fetch(url)).status,405);
     const limited=createServer({rateLimiter:new RequestRateLimiter({...loadRateLimitConfig({}),authPerMinute:0},new MemoryRateLimitStore())});

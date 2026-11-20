@@ -94,7 +94,20 @@
     "AAVE": "105860000000000000000",
     "Cake": "1615720000000000000",
     "FIL": "614694000000000000",
-    "ATOM": "1280000000000000000"
+    "ATOM": "1280000000000000000",
+    "AMCB": "2920000000000000000",
+    "ANTB": "300000000000000000000",
+    "BMNRB": "15710000000000000000",
+    "BNCB": "3530000000000000000",
+    "COINB": "112370000000000000000",
+    "CYPHB": "1850000000000000000",
+    "GMEB": "26310000000000000000",
+    "MRVLB": "147983000000000000000",
+    "PDDB": "86360000000000000000",
+    "PENGB": "45030000000000000000",
+    "RDDTB": "92970000000000000000",
+    "SOXLB": "50872500000000000000",
+    "TQQQB": "53091500000000000000"
   },
   "timeline": [
     {
@@ -577,6 +590,97 @@
       }
     ],
     "Von": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "AMCB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "ANTB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "BMNRB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "BNCB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "COINB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "CYPHB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "GMEB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "MRVLB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "PDDB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "PENGB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "RDDTB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "SOXLB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "TQQQB": [
       {
         "steps": 120,
         "mode": "closed",

@@ -20,7 +20,7 @@ function rawScenario() {
 function fixture(rpcFailureTimeoutSeconds = 1800) {
   const scenario = parseScenario(rawScenario());
   const state = { head: { number: 100n, timestamp: 1060n }, now: 1_060_000, fail: '', refreshMissing: false, inspections: 0,
-    swaps: [] as string[], targets: [] as bigint[], pushes: [] as bigint[], mints: [] as string[], logs: [] as string[], alerts: [] as string[], balances: new Map<string, bigint>([[addr(1), 2_000_000n * unit]]) };
+    swaps: [] as string[], targets: [] as bigint[], pushes: [] as bigint[], mints: [] as string[], logs: [] as string[], alerts: [] as string[], balances: new Map<string, bigint>([[addr(1), BigInt(TESTNET_ASSETS.length) * 20_000n * unit]]) };
   const observations: Observation[] = TESTNET_ASSETS.map((spec, index) => ({
     market: { symbol: spec.symbol, token: addr(index + 10), pool: addr(index + 1000), oracle: addr(index + 2000),
       fee: spec.fee, decimals: spec.decimals, maxFeedAge: spec.maxFeedAge,
@@ -48,12 +48,59 @@ function fixture(rpcFailureTimeoutSeconds = 1800) {
   return { scenario, state, observations, keeper, io };
 }
 
-test('keeper examples: exact 92 baselines, 11 secondary feeds and three valid scenarios', async () => {
-  assert.equal(TESTNET_ASSETS.length, 92);
+// docs/research/2026-11-20-launch-lineup/新增模擬資產.csv raw-token prices;
+// ANTB has no quote: TestnetAssets.sol deliberately uses a 300 USDT test constant.
+const launchPrices = {
+  AMCB: '2.92', ANTB: '300', BMNRB: '15.71', BNCB: '3.53', COINB: '112.37',
+  CYPHB: '1.85', GMEB: '26.31', MRVLB: '147.983', PDDB: '86.36', PENGB: '45.03',
+  RDDTB: '92.97', SOXLB: '50.8725', TQQQB: '53.0915',
+};
+
+test('#167 all 13 launch baselines use raw prices, including ANTB and multiplied stock/ETF prices', () => {
+  for (const [symbol, price] of Object.entries(launchPrices)) {
+    const [whole, fraction = ''] = price.split('.');
+    const expected = BigInt(whole + fraction.padEnd(18, '0'));
+    const spec = TESTNET_ASSETS.find((asset) => asset.symbol === symbol);
+    assert.ok(spec, symbol);
+    assert.deepEqual(spec, { symbol, decimals: 18, fee: symbol === 'MRVLB' ? 10000 : 2500,
+      priceE18: String(expected), hasFeed: false, maxFeedAge: 0 });
+  }
+});
+
+test('#167 launch stocks/ETFs rise and fall, but remain frozen throughout the holiday scenario', async () => {
+  for (const file of ['gentle-rise', 'gentle-fall', 'market-holiday']) {
+    const scenario = parseScenario(JSON.parse(await readFile(new URL(`../scripts/price-scenarios/${file}.json`, import.meta.url), 'utf8')));
+    for (const symbol of Object.keys(launchPrices)) {
+      const baseline = scenario.assets[symbol]; assert.ok(baseline, symbol);
+      if (file === 'market-holiday') {
+        for (const step of [0, 1, 120, 121]) {
+          assert.deepEqual(targetAt(scenario, symbol, 1000n, 1000n + BigInt(step * 60)), { price: baseline, mode: 'closed' });
+        }
+      } else {
+        assert.equal(targetAt(scenario, symbol, 1000n, 1000n).price, baseline);
+        assert.equal(targetAt(scenario, symbol, 1000n, 1060n).price, baseline * (file === 'gentle-rise' ? 10001n : 9999n) / 10000n);
+      }
+    }
+  }
+});
+
+test('#167 launch scenario prices reject zero, missing, substituted and out-of-range amounts', () => {
+  for (const symbol of Object.keys(launchPrices)) {
+    const baseline = rawScenario();
+    delete baseline.assets[symbol];
+    assert.throws(() => parseScenario(baseline), /unexpected or missing fields/);
+    for (const price of ['0', '1', String(1n << 255n)]) {
+      assert.throws(() => parseScenario({ ...rawScenario(), assets: { ...rawScenario().assets, [symbol]: price } }));
+    }
+  }
+});
+
+test('keeper examples: exact 105 baselines, 11 secondary feeds and three valid scenarios', async () => {
+  assert.equal(TESTNET_ASSETS.length, 105);
   assert.equal(TESTNET_ASSETS.filter((s) => s.hasFeed).length, 11);
   for (const file of ['gentle-rise', 'gentle-fall', 'market-holiday']) {
     const value: unknown = JSON.parse(await readFile(new URL(`../scripts/price-scenarios/${file}.json`, import.meta.url), 'utf8'));
-    assert.equal(Object.keys(parseScenario(value).assets).length, 92);
+    assert.equal(Object.keys(parseScenario(value).assets).length, 105);
   }
 });
 
@@ -110,10 +157,10 @@ test('keeper bounds and frequency: exact thresholds, zero movement, dust and del
 test('keeper uses prefunded USDT and never exceeds one swap per asset per round', async () => {
   const { state, keeper } = fixture(); state.balances.set(addr(1), 2_000_000n * unit);
   await keeper.round();
-  assert.equal(state.swaps.length, 92); assert.equal(new Set(state.swaps).size, 92);
+  assert.equal(state.swaps.length, 105); assert.equal(new Set(state.swaps).size, 105);
   assert.ok(state.mints.length >= 4); assert.equal(state.pushes.length, 12);
   assert.ok(!state.mints.includes(addr(1)));
-  await keeper.round(); assert.equal(state.swaps.length, 92); assert.equal(state.pushes.length, 12);
+  await keeper.round(); assert.equal(state.swaps.length, 105); assert.equal(state.pushes.length, 12);
 });
 
 test('#97 keeper never mints USDT: zero and below minimum halt; equality covers the next swap', async () => {
@@ -135,7 +182,7 @@ test('keeper closed/paused assets keep their pool price while their secondary fe
   const { state, keeper, scenario } = fixture();
   for (const [symbol, mode] of [['AAPLB', 'closed'], ['ETH', 'paused']] as const) scenario.overrides[symbol] = [{ steps: 120, mode, stepBps: 0 }];
   await keeper.round();
-  assert.equal(state.swaps.length, 90); assert.ok(!state.swaps.includes('AAPLB')); assert.ok(!state.swaps.includes('ETH'));
+  assert.equal(state.swaps.length, 103); assert.ok(!state.swaps.includes('AAPLB')); assert.ok(!state.swaps.includes('ETH'));
   assert.equal(state.pushes.length, 12);
 });
 
@@ -176,7 +223,7 @@ test('#162 one transient market inventory failure skips that market and recovers
   const swap = f.io.swap;
   f.io.swap = async (o, target, budget) => { await swap(o, target, budget); o.lastObservation = f.state.head.timestamp; };
   await f.keeper.round();
-  assert.equal(f.state.swaps.length, 91); assert.ok(!f.state.swaps.includes('COHRB'));
+  assert.equal(f.state.swaps.length, 104); assert.ok(!f.state.swaps.includes('COHRB'));
   assert.equal(f.state.alerts.length, 0);
   f.state.now += 60_000; f.state.head = { number: 101n, timestamp: 1120n };
   await f.keeper.round();
@@ -227,11 +274,11 @@ test('#162 partial market success and a skipped repeated head cannot reset the o
     if (token === failed.market.token) throw new HttpRequestError({ url: 'http://127.0.0.1:1', status: 429 });
     return 10n ** 40n;
   };
-  await f.keeper.round(); assert.equal(f.state.swaps.length, 91);
+  await f.keeper.round(); assert.equal(f.state.swaps.length, 104);
   f.state.now += 2000; await f.keeper.round(); // Repeated head: no successful round.
   f.state.now += 1_798_000;
   f.state.head = { number: 101n, timestamp: BigInt(f.state.now / 1000) };
-  await f.keeper.round(); assert.equal(f.state.swaps.length, 182); assert.equal(f.state.alerts.length, 0);
+  await f.keeper.round(); assert.equal(f.state.swaps.length, 208); assert.equal(f.state.alerts.length, 0);
   f.state.now++; await assert.rejects(f.keeper.round(), /halted/); assert.equal(f.state.alerts.length, 1);
 });
 
@@ -269,7 +316,7 @@ test('#162 transient faults across read stages resume from fresh inspection with
     await f.keeper.round(); assert.ok(failed, fault); assert.equal(f.state.alerts.length, 0, fault);
     f.state.now += 2000; f.state.head = { number: 101n, timestamp: 1062n };
     await f.keeper.round(); assert.equal(f.keeper.retryDelayMs, 0, fault);
-    assert.equal(f.state.swaps.length, 92, fault); assert.equal(new Set(f.state.swaps).size, 92, fault);
+    assert.equal(f.state.swaps.length, 105, fault); assert.equal(new Set(f.state.swaps).size, 105, fault);
     assert.equal(f.state.alerts.length, 0, fault);
   }
 });
@@ -354,7 +401,7 @@ test('keeper observes frequency across restart via on-chain timestamps and bound
   for (const o of observations) o.lastObservation = 1001n;
   await keeper.round(); assert.equal(state.swaps.length, 0);
   state.head = { number: 101n, timestamp: 1120n }; state.now += 60_000;
-  await keeper.round(); assert.equal(state.swaps.length, 92);
+  await keeper.round(); assert.equal(state.swaps.length, 105);
 });
 
 test('keeper delayed replay caps each actual swap and publishes observed TWAP instead of scenario targets', async () => {
@@ -374,7 +421,7 @@ test('keeper fresh feeds are not republished before their step is due', async ()
   const { observations, keeper, state } = fixture();
   for (const observation of observations) if (observation.market.feed) observation.feedUpdatedAt = 1001n;
   await keeper.round();
-  assert.equal(state.swaps.length, 92); assert.equal(state.pushes.length, 0); assert.equal(state.inspections, 1);
+  assert.equal(state.swaps.length, 105); assert.equal(state.pushes.length, 0); assert.equal(state.inspections, 1);
 });
 
 test('keeper unconfirmed inventory top-up stops before swaps and alerts once', async () => {
@@ -433,15 +480,15 @@ test('#139 a regressed or repeated head skips all IO until progress resumes and 
   await assert.rejects(f.keeper.round(), /stopped/); assert.equal(f.state.alerts.length, 1);
 });
 
-test('#139 all 92 unavailable TWAPs receive only a 1 bp recovery swap, then normal validation and feed pushes resume', async () => {
+test('#139 all 105 unavailable TWAPs receive only a 1 bp recovery swap, then normal validation and feed pushes resume', async () => {
   const f = fixture(); f.state.head = { number: 200n, timestamp: 200_000n }; f.state.now = 200_000_000;
   const prices = f.observations.map((o) => o.spotE18);
   for (const o of f.observations) o.twapE18 = null;
   await f.keeper.round();
-  assert.equal(f.state.swaps.length, 92); assert.equal(new Set(f.state.swaps).size, 92);
+  assert.equal(f.state.swaps.length, 105); assert.equal(new Set(f.state.swaps).size, 105);
   assert.deepEqual(f.state.targets, prices.map((p) => p * 10_001n / 10_000n));
   assert.equal(f.state.pushes.length, 0); assert.equal(f.state.inspections, 1); assert.equal(f.state.alerts.length, 0);
-  await f.keeper.round(); assert.equal(f.state.swaps.length, 92);
+  await f.keeper.round(); assert.equal(f.state.swaps.length, 105);
   for (const [i, o] of f.observations.entries()) {
     const price = prices[i]; assert.ok(price); o.twapE18 = price; o.lastObservation = 200_000n;
     const target = f.state.targets[i]; assert.ok(target); o.spotE18 = target;
@@ -504,7 +551,7 @@ test('#139 TWAP unavailable during the post-swap refresh halts before publishing
     return f.state.inspections > 1 ? observations.map((o) => ({ ...o, twapE18: null })) : observations;
   };
   await assert.rejects(f.keeper.round(), /halted/);
-  assert.equal(f.state.swaps.length, 92); assert.equal(f.state.pushes.length, 0);
+  assert.equal(f.state.swaps.length, 105); assert.equal(f.state.pushes.length, 0);
   assert.match(f.state.logs.join('\n'), /refresh inspect.*TWAP unavailable after swaps/);
 });
 
@@ -580,8 +627,8 @@ test('#87 held, paused and completed markets refresh at 30 minutes and retain re
       swapBudgetUsdtE18: 10_000n * unit, stallSeconds: 90,
     }, () => {}, async () => {}, () => f.state.now);
     await restarted.round();
-    assert.equal(f.state.swaps.length, 92, mode + ' exact threshold');
-    assert.equal(new Set(f.state.swaps).size, 92);
+    assert.equal(f.state.swaps.length, 105, mode + ' exact threshold');
+    assert.equal(new Set(f.state.swaps).size, 105);
     f.state.targets.forEach((price, i) => {
       const o = f.observations[i]; assert.ok(o);
       assert.ok(price < o.spotE18);
@@ -589,11 +636,11 @@ test('#87 held, paused and completed markets refresh at 30 minutes and retain re
       o.spotE18 = price; o.lastObservation = 2800n;
     });
     f.state.head = { number: 103n, timestamp: 4599n }; f.state.now = 4_599_000;
-    await restarted.round(); assert.equal(f.state.swaps.length, 92, mode + ' no early maintenance');
+    await restarted.round(); assert.equal(f.state.swaps.length, 105, mode + ' no early maintenance');
     for (const o of f.observations) if (o.market.feed) o.feedUpdatedAt = 4599n;
     f.state.head = { number: 104n, timestamp: 4660n }; f.state.now = 4_660_000;
-    await restarted.round(); assert.equal(f.state.swaps.length, 184);
-    f.state.targets.slice(92).forEach((price, i) => { const o = f.observations[i]; assert.ok(o); assert.ok(price > o.spotE18); });
+    await restarted.round(); assert.equal(f.state.swaps.length, 210);
+    f.state.targets.slice(105).forEach((price, i) => { const o = f.observations[i]; assert.ok(o); assert.ok(price > o.spotE18); });
     assert.equal(f.state.alerts.length, 0);
   }
 });
@@ -618,8 +665,8 @@ test('#87 active flat targets use maintenance only once the on-chain observation
       swapBudgetUsdtE18: 10_000n * unit, stallSeconds: 90,
     }, () => {}, async () => {}, () => f.state.now);
     f.state.head = { number: 102n, timestamp: 2800n }; f.state.now = 2_800_000;
-    await keeper.round(); assert.equal(f.state.swaps.length, 92);
-    await keeper.round(); assert.equal(f.state.swaps.length, 92);
+    await keeper.round(); assert.equal(f.state.swaps.length, 105);
+    await keeper.round(); assert.equal(f.state.swaps.length, 105);
     f.state.targets.forEach((p, i) => { const o = f.observations[i]; assert.ok(o); assert.ok(p < o.spotE18); assert.ok((o.spotE18 - p) * 10_000n <= o.spotE18 * BigInt(maxStepBps)); });
   }
 });

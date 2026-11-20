@@ -607,6 +607,7 @@ test('HTTP: approved Privy operator login → POST /strategies creates a strateg
       name: 'Index 500',
       description: '',
       isPublic: true,
+      category: null, catalogKey: null,
       swapFeeBps: 0,
       onchainId: null,
       createdAt: '2026-01-01T00:00:00.000Z',

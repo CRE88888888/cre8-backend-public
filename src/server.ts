@@ -847,7 +847,7 @@ async function listRoute(res: ServerResponse, url: URL): Promise<void> {
     limit: parseQueryInteger(url.searchParams.get('limit'), 'limit'),
     offset: parseQueryInteger(url.searchParams.get('offset'), 'offset'),
     provider: provider === '' ? undefined : provider,
-    isPublic: parseBoolean(url.searchParams.get('public'), 'public'),
+    isPublic: parseBoolean(url.searchParams.get('public'), 'public') ?? true,
   });
   sendJson(res, 200, { ...page, items: await Promise.all(page.items.map(async (item) => ({ ...item, minDepositUsdtWei: await strategyMinimumDeposit(item.id) }))) });
 }

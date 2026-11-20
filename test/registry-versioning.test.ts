@@ -160,7 +160,7 @@ test('#143 legacy HTTP normalization preserves omission/null and explicit activa
 test('#143 first version detail reports pending/active at the exact boundary with its minimum deposit intact', async () => {
   const f = stateRpc(); f.state.active = 0; f.state.pending = 1; f.state.activeAt = 160n; f.state.autoActivate = true;
   const detail = () => getStrategyWithVersionState(7, {
-    strategy: async () => ({ id: 7, provider: account, name: 'First version', description: '', isPublic: true, swapFeeBps: 0, onchainId: 7, createdAt: new Date(0).toISOString(),
+    strategy: async () => ({ id: 7, provider: account, name: 'First version', description: '', isPublic: true, category: null, catalogKey: null, swapFeeBps: 0, onchainId: 7, createdAt: new Date(0).toISOString(),
       versions: [{ strategyId: 7, version: 1, allocation: { assets: [{ address: asset, weightBps: 10000 }] }, schedule: { kind: 'funding' },
         executionSchemaVersion: 1, execution: { kind: 'hold' }, executionChainId: 97, configHash: zeroHash, idleYield: { enabled: false }, changeLog: null,
         activeAt: new Date(160_000).toISOString(), createdAt: new Date(0).toISOString() }] }),
@@ -225,7 +225,7 @@ test('#124 owner enrollment confirmation is read-only and rejects missing, forei
 test('#124 public strategy detail combines execution metadata with chain-authoritative assets and pending state', async () => {
   const f = stateRpc();
   const detail = await getStrategyWithVersionState(7, {
-    strategy: async () => ({ id: 7, provider: account, name: 'P11', description: '', isPublic: true, swapFeeBps: 0, onchainId: 7, createdAt: new Date(0).toISOString(),
+    strategy: async () => ({ id: 7, provider: account, name: 'P11', description: '', isPublic: true, category: null, catalogKey: null, swapFeeBps: 0, onchainId: 7, createdAt: new Date(0).toISOString(),
       versions: [{ strategyId: 7, version: 2, allocation: { assets: [{ address: account, weightBps: 10000 }] }, schedule: { kind: 'interval', intervalSeconds: 60 },
         executionSchemaVersion: 0, execution: { kind: 'target_weight' }, executionChainId: null, configHash: null, idleYield: { enabled: false }, changeLog: null, activeAt: null, createdAt: new Date(0).toISOString() }] }),
     state: (id, version) => readVersionState(f.client, asset, id, version),

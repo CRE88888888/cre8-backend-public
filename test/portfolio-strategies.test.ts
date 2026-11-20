@@ -11,7 +11,7 @@ import { createStrategy, getStrategy, publishVersion, requireTypedVersion, valid
 import { assertVersionOnchain, readAccountCash } from '../src/chain.js';
 import { enrollPortfolio, requireOwnedPortfolio, strategyMinimumDeposit } from '../src/portfolios.js';
 import { readFaucetFundingEvidence } from '../src/faucet.js';
-import { canonicalConfigHash, UINT256_MAX, usdtRaw } from '../src/strategy-execution.js';
+import { canonicalConfigHash, UINT256_MAX, usdtRaw, validateAssetConfig } from '../src/strategy-execution.js';
 import type { AssetExecution, AssetSetting } from '../src/strategy-execution.js';
 import { AppError } from '../src/errors.js';
 import { TESTNET_97 } from '../src/testnet-profile.js';
@@ -21,6 +21,8 @@ import { previewContributionAsync } from '../src/contribution-preview.js';
 import { fundingLots, prepareStrategyJob } from '../src/strategy-jobs.js';
 import type { JobContext } from '../src/strategy-jobs.js';
 import type { WithTransactionFn } from '../src/scheduler.js';
+import launchLineup from './fixtures/launch-lineup.json' with { type: 'json' };
+import { launchFunds } from '../scripts/testnet-launch-funds.js';
 
 const address = (): Address => `0x${randomBytes(20).toString('hex')}`;
 const txHash = (): Hex => `0x${randomBytes(32).toString('hex')}`;
@@ -81,6 +83,37 @@ async function onTestnet<T>(fn:()=>Promise<T>):Promise<T>{
   const previous=process.env.CHAIN_ID;process.env.CHAIN_ID='97';
   try{return await fn();}finally{if(previous===undefined)delete process.env.CHAIN_ID;else process.env.CHAIN_ID=previous;}
 }
+
+test('#168 DB $50 contributions persist and reserve every launch hold component, including every 5% satellite', async () => {
+  const run: WithTransactionFn = fn => withTransaction(client => fn({ query: (sql, params) => client.query(sql, params === undefined ? [] : [...params]) }));
+  let componentCount = 0;
+  for (const fund of launchFunds(launchLineup)) {
+    const basket = validateAllocation(fund.input.allocation, 97);
+    const execution = validateAssetConfig(fund.input.execution, basket, 97);
+    const f = await fixture('hold', 0, 50n * 10n ** 18n, execution);
+    const lot = await f.service.funding(f.id, f.owner, f.source);
+    const sources = await assetSources(lot.id);
+    for (const a of basket.assets.filter(a => a.weightBps > 0)) {
+      const source = sources.find(s => s.asset === a.address); assert.ok(source);
+      assert.equal(source.budget_raw, (50n * 10n ** 18n * BigInt(a.weightBps) / 10000n).toString());
+      assert.equal(source.effective_slices, 1);
+      if (a.weightBps === 500) assert.equal(source.budget_raw, usdtRaw('2.5').toString());
+    }
+    const c: JobContext = { chainId: 97, portfolioId: f.id, strategyId: f.strategyId, version: 1, kind: 'asset', execution,
+      account: f.account, allocation: basket, cash: TESTNET_97.contracts.usdt, now: new Date('2026-11-15T14:00:00Z'),
+      reserve: 27n * 10n ** 16n, caps: new Map(basket.assets.filter(a => a.weightBps > 0).map(a => [a.address, null])),
+      buyLimit: UINT256_MAX, observedCash: 50n * 10n ** 18n, enabled: true, marketOpen: true };
+    const { job } = await prepareStrategyJob(run, c, await fundingLots(query, c));
+    assert.ok(job);
+    const expected = basket.assets.filter(a => a.weightBps > 0).map(a => a.address).sort();
+    assert.deepEqual(Object.keys(job.remaining_input).sort(), expected);
+    assert.ok(Object.values(job.remaining_input).every(raw => BigInt(raw) > 0n));
+    assert.equal((await query("select 1 from strategy_asset_slices where lot_id=$1 and state='deferred_min_asset'", [lot.id])).rows.length, 0);
+    componentCount += expected.length;
+    assert.deepEqual(f.rpc.state.broadcasts, []);
+  }
+  assert.equal(componentCount, 80);
+});
 const future=()=>new Date(Date.now()+86400_000).toISOString();
 
 test('#160 all noncash components full rejects even with a positive cash weight, without creating a lot', async () => {

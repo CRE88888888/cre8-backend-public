@@ -24,6 +24,53 @@ const ASSET_A = '0x00000000000000000000000000000000000000a1';
 const ASSET_B = '0x00000000000000000000000000000000000000b2';
 const USDT = '0x55d398326f99059ff775485246999027b3197955';
 
+test('#168 DB catalogue fields round-trip through create/detail/list; old funds stay readable when hidden', async () => {
+  await migrate();
+  const owner = `catalog-${randomUUID()}`;
+  const catalogKey = `launch-${randomUUID()}`;
+  try {
+    const created = await createStrategy({ name: '首發基金', category: 'theme', catalogKey }, owner);
+    assert.equal(created.category, 'theme'); assert.equal(created.catalogKey, catalogKey);
+    const detail = await getStrategy(created.id);
+    assert.equal(detail.category, 'theme'); assert.equal(detail.catalogKey, catalogKey);
+    assert.equal((await listStrategies({ provider: owner })).items[0]?.catalogKey, catalogKey);
+    await assert.rejects(createStrategy({ name: '重複識別碼', catalogKey }, owner), (error: unknown) =>
+      typeof error === 'object' && error !== null && 'code' in error && error.code === '23505');
+    await query('update strategies set is_public=false where id=$1', [created.id]);
+    assert.equal((await listStrategies({ provider: owner, isPublic: true })).items.length, 0);
+    assert.equal((await getStrategy(created.id)).id, created.id);
+    const legacy = await createStrategy({ name: '舊基金' }, owner);
+    assert.equal(legacy.category, null); assert.equal(legacy.catalogKey, null);
+    await withServer(async baseUrl => {
+      const response = await fetch(baseUrl + '/strategies?provider=' + encodeURIComponent(owner));
+      assert.equal(response.status, 200);
+      const page: unknown = await response.json();
+      assert.ok(typeof page === 'object' && page !== null && 'items' in page && Array.isArray(page.items));
+      assert.deepEqual(page.items.map((item: unknown) => {
+        assert.ok(typeof item === 'object' && item !== null && 'id' in item);
+        return item.id;
+      }), [legacy.id], 'the public API default must hide is_public=false rows');
+    });
+  } finally { await query('delete from strategies where provider=$1', [owner]); }
+});
+
+test('#168 catalogue metadata validates category and stable key without accepting arbitrary fields', () => {
+  for (const category of ['theme', 'person', 'leveraged']) {
+    const input = validateCreateStrategyInput({ name: '首發基金', category, catalogKey: 'ai-chips' }, ASSET_A);
+    assert.equal(input.category, category);
+    assert.equal(input.catalogKey, 'ai-chips');
+  }
+  assert.equal(validateCreateStrategyInput({ name: '舊基金' }, ASSET_A).category, null);
+  assert.equal(validateCreateStrategyInput({ name: '舊基金', category: null, catalogKey: null }, ASSET_A).catalogKey, null);
+  assert.equal(validateCreateStrategyInput({ name: '邊界', catalogKey: 'a'.repeat(64) }, ASSET_A).catalogKey?.length, 64);
+  for (const category of ['', 'other', 0, {}, []]) {
+    assert.throws(() => validateCreateStrategyInput({ name: '基金', category }, ASSET_A), ValidationError);
+  }
+  for (const catalogKey of ['', 'A', 'a_b', 'a'.repeat(65), 0, {}, []]) {
+    assert.throws(() => validateCreateStrategyInput({ name: '基金', catalogKey }, ASSET_A), ValidationError);
+  }
+});
+
 /** DB-backed tests only run when DATABASE_URL is present; otherwise node:test reports them as skipped. */
 const skipDb: boolean | string = process.env.DATABASE_URL
   ? false
@@ -226,6 +273,8 @@ test('validateCreateStrategyInput applies defaults and trims strings', () => {
     name: 'Index 500',
     description: '',
     isPublic: true,
+    category: null,
+    catalogKey: null,
     swapFeeBps: 0,
   });
 });

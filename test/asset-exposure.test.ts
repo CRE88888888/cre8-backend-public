@@ -161,7 +161,7 @@ test('#160 operator cap validation accepts null/one/max, requires provenance and
 });
 
 const detailFixture: ServerDeps['strategyDetail'] = async id => getStrategyWithVersionState(id, {
-  strategy: async () => ({ id, provider: owner, name: 'Exposure detail', description: 'Keep metadata available', isPublic: true,
+  strategy: async () => ({ id, provider: owner, name: 'Exposure detail', description: 'Keep metadata available', isPublic: true, category: null, catalogKey: null,
     swapFeeBps: 0, onchainId: null, createdAt: new Date(0).toISOString(), versions: [1, 2].map(version => ({
       strategyId: id, version, allocation: { assets: [{ address: a, weightBps: 6000 }, { address: b, weightBps: 4000 }, { address: cash, weightBps: 0 }] },
       schedule: { kind: 'funding' }, executionSchemaVersion: 2, execution: config([6000, 4000, 0, 0]), executionChainId: 97,
@@ -294,7 +294,7 @@ test('#160 HTTP detail annotates every version; cap write requires SIWE operator
   const api=createServer({ operatorWallets:[owner],operatorRebalanceEnabled:()=>false,
     auth:{authenticate:async token=>{if(!token)throw new UnauthorizedError();return token==='operator'?owner:other;},issueNonce:()=>{throw new Error('unused');},login:async()=>{throw new Error('unused');},logout:async()=>{}},
     rateLimiter:new RequestRateLimiter(loadRateLimitConfig({}),new MemoryRateLimitStore()),
-    strategyDetail:async id=>getStrategyWithVersionState(id,{strategy:async()=>({id,provider:owner,name:'Cap',description:'',isPublic:true,swapFeeBps:0,onchainId:null,createdAt:new Date(0).toISOString(),versions:[1,2].map(version=>({
+    strategyDetail:async id=>getStrategyWithVersionState(id,{strategy:async()=>({id,provider:owner,name:'Cap',description:'',isPublic:true, category: null, catalogKey: null,swapFeeBps:0,onchainId:null,createdAt:new Date(0).toISOString(),versions:[1,2].map(version=>({
       strategyId:id,version,allocation:{assets:[{address:a,weightBps:10000}]},schedule:{kind:'funding'},executionSchemaVersion:2,execution:config([10000,0,0,0]),executionChainId:97,configHash:null,idleYield:{enabled:false},changeLog:null,activeAt:null,createdAt:new Date(0).toISOString(),
     }))})}),
     strategyExposure:async()=>[failed ? { ...state(a,4000n*U,4000n*U), buyPaused: null, currentExposureUsdtWei: null } : state(a,4000n*U,4000n*U)],

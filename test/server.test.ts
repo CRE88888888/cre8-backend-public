@@ -694,7 +694,7 @@ function strategyWriteStubs(calls: string[]): Partial<ServerDeps> {
   return {
     createStrategy: async (_body, provider) => {
       calls.push(provider);
-      return { id: 1, provider, name: 'fund', description: '', isPublic: true, swapFeeBps: 0,
+      return { id: 1, provider, name: 'fund', description: '', isPublic: true, category: null, catalogKey: null, swapFeeBps: 0,
         onchainId: null, createdAt: new Date().toISOString() };
     },
     publishVersion: async (strategyId, input, provider) => {
@@ -836,7 +836,7 @@ for (const entry of budgetActions) {
       assert.ok((await request(firstToken)).status < 300);
       assert.equal(calls, 4);
     }, { rateLimiter: limiter, operatorWallets: [account.address, otherAccount.address],
-      createStrategy: async (_body, provider) => { calls++; return { id: 1, provider, name: 'fund', description: '', isPublic: false, swapFeeBps: 0, onchainId: null, createdAt: new Date().toISOString() }; },
+      createStrategy: async (_body, provider) => { calls++; return { id: 1, provider, name: 'fund', description: '', isPublic: false, category: null, catalogKey: null, swapFeeBps: 0, onchainId: null, createdAt: new Date().toISOString() }; },
       publishVersion: async () => { calls++; return { strategyId: 1, version: 1, allocation: { assets: [{ address: '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c', weightBps: 10000 }] }, schedule: { kind: 'interval', intervalSeconds: 60 }, executionSchemaVersion: 0, execution: { kind: 'target_weight' }, executionChainId: null, configHash: null, idleYield: { enabled: false }, changeLog: null, activeAt: null, createdAt: new Date().toISOString() }; },
       enrollPortfolio: async (_id, userId) => { calls++; return { minDepositUsdtWei: '50000000000000000000', id: 1, userId, strategyId: 1, strategyName: 'fund', version: 1, scheduleState: 'active', createdAt: new Date().toISOString(), smartAccounts: [], gas: null }; },
       planPreview: async (portfolioId) => { calls++; return { portfolioId, outcome: 'noop', reason: 'aligned', steps: [], rationale: null }; },

@@ -376,6 +376,51 @@ RUN_CHAIN_TESTS=1 bun test --timeout=120000
 `test/snapshot.integration.test.ts`）不受這個開關影響：它們不送交易、不佔 nonce，可以安全並行，
 skip 條件只看 fork 可不可用。
 
+### 測試網首發 21 檔上架工具（backend#168）
+
+先套用 db migration **0054**。`category`（`theme`／`person`／`leveraged`）與
+`catalogKey`（lineup id，唯一）可由建立輸入傳入，列表與詳情都會回傳；舊資料回 `null`。
+`GET /strategies` 預設只列公開基金；明確的 `public=false` 篩選與原策略詳情入口維持可用。
+上架工具讀取隔壁 docs 的 `research/2026-11-20-launch-lineup/lineup.json`，逐字沿用核准權重，
+地址使用 backend 的測試網 profile；所有非現金成分均為 hold、生息關閉。
+再平衡模式集中在腳本的 `LAUNCH_REBALANCE_MODE`，依 C3 最新裁定預設 `monthly`；之後若選 `drift`，只改這一處。
+
+設定 chain 97 的 RPC、DB、以及**單一**核准營運地址 `OPERATOR_WALLETS`。預設只印 inventory
+與計畫；從 inventory 人工核對既有 Mag7 的 DB id，以及要隱藏的舊示範基金 id，再帶入：
+
+```bash
+bun run scripts/testnet-launch-funds.ts --mag7-id <Mag7的DB_ID> --hide-ids <舊DB_ID,舊DB_ID>
+```
+
+第一次 inventory 尚未指定舊 ID 時會列出 inventory 後拒絕繼續；不根據名稱猜測 Mag7 身分。
+全新的空 DB 不需指定這兩項。`--lineup <path>` 可指定相同 schema 的核准檔案。
+實際上架需在同一命令另加 `--execute`，簽名者只從環境變數 `OPERATOR_PRIVATE_KEY` 讀取，
+且必須同時符合白名單與鏈上 `registry.operator()`。公開鏈執行仍須 C3 審核與部署授權。
+
+工具沿用 `createStrategy`／`publishVersion` 及既有 canonical hash。Mag7 補上
+`catalog_key='mag7'`／`category='theme'`；配置不同則發新版，保留原策略、既有持倉與通知期。
+舊基金只設 **`strategies.is_public=false`**，不刪策略、版本或用戶資料，原持有人仍可讀詳情與賣出。
+新基金先以非公開 metadata 建立，公開目錄以 DB 欄位為準（不修改鏈上的 metadata）。
+全部發版確認後，才在單一 DB transaction 公開 21 檔並隱藏指定舊基金；重跑依 `catalog_key`
+核對鏈上版本，配置已一致者不再註冊或發版。績效費填合約最低限制 **500 bps**；這只是版本欄位，
+不部署或啟用績效費 ledger。
+
+`createStrategy` 是先上鏈、後寫 DB。工具在註冊前把 intent 寫到
+`.bun-cache/testnet-launch-97/`（可用 `--journal <directory>` 指定），只含 catalogue key、狀態與 DB id。
+請保留同一份 journal 重跑；遇到結果不明或 DB 失敗時，若找不到已存的 catalogue row，工具拒絕重送。
+由 C3 核對鏈／DB 後再恢復，不能把刪 journal 當成一般重試方式。
+
+現行 schema 2 的 hold 已能讓 $50 的 5% 衛星（**含費預算 2.5 USDT**）進入同一完整批次，
+費用預留按比例扣除，實際 swap input 會略少。最後一期的正數零頭原本就允許，因此 2.5 USDT
+及少 1 wei 均不被額外阻擋。這次**沒有調整任何交易門檻或最低投入公式**：最少存入仍為 $50，
+stack 每批仍為 $10；app `minimumDepositFor` 無需同步公式。
+
+自足的本機 fork 驗收使用獨立 anvil `127.0.0.1:8568`（chain 97）與空的
+`cre8_x1_168_fork`，執行 `bun run test/testnet-launch-funds.fork.ts`。
+只使用公開 anvil 金鑰；會在本機 fork 設定營運角色、模擬一檔超過七天的舊 Mag7，
+驗證 dry-run、上架、隱藏、Mag7 v2、重跑，以及經真實 Kernel／EntryPoint／oracle／router／executor
+的 $50 買入；用本機原生幣預存 EntryPoint gas，不使用 bundler 或 paymaster。
+
 ### Fork 鏈上整合測試（Anvil fork BSC mainnet）
 
 ATP v2 的部署與串接步驟統一維護在

@@ -44,12 +44,15 @@ export type RebalanceSchedule =
   | { kind: 'interval'; intervalSeconds: number }
   | { kind: 'cron'; cron: string };
 
+export type StrategyCategory = 'theme' | 'person' | 'leveraged';
 export type Strategy = {
   id: number;
   provider: string;
   name: string;
   description: string;
   isPublic: boolean;
+  category: StrategyCategory | null;
+  catalogKey: string | null;
   swapFeeBps: number;
   /** On-chain AtpRegistry id; null until registerStrategyOnchain() succeeds. */
   onchainId: number | null;
@@ -80,6 +83,8 @@ export type CreateStrategyInput = {
   description?: string;
   isPublic?: boolean;
   swapFeeBps?: number;
+  category?: StrategyCategory | null;
+  catalogKey?: string | null;
 };
 
 export type PublishVersionInput = {
@@ -108,7 +113,7 @@ export type StrategyPage = {
   offset: number;
 };
 
-const STRATEGY_COLUMNS = 'id, provider, name, description, is_public, swap_fee_bps, onchain_id, created_at';
+const STRATEGY_COLUMNS = 'id, provider, name, description, is_public, category, catalog_key, swap_fee_bps, onchain_id, created_at';
 const VERSION_COLUMNS =
   'strategy_id, version, allocation, schedule, change_log, active_at, created_at, execution_schema_version, execution, execution_chain_id, config_hash';
 
@@ -118,6 +123,8 @@ type StrategyRow = {
   name: string;
   description: string;
   is_public: boolean;
+  category: StrategyCategory | null;
+  catalog_key: string | null;
   swap_fee_bps: number;
   onchain_id: string | null;
   created_at: Date;
@@ -313,7 +320,15 @@ export function validateCreateStrategyInput(
   if (!isRecord(input)) {
     throw new ValidationError('INVALID_STRATEGY', 'request body must be a JSON object');
   }
-  exactKeys(input, ['provider', 'name', 'description', 'isPublic', 'swapFeeBps'], 'INVALID_STRATEGY');
+  exactKeys(input, ['provider', 'name', 'description', 'isPublic', 'swapFeeBps', 'category', 'catalogKey'], 'INVALID_STRATEGY');
+  const category = input.category ?? null;
+  if (category !== null && category !== 'theme' && category !== 'person' && category !== 'leveraged') {
+    throw new ValidationError('INVALID_STRATEGY', 'category must be theme, person, leveraged or null');
+  }
+  const catalogKey = input.catalogKey ?? null;
+  if (catalogKey !== null && (typeof catalogKey !== 'string' || !/^[a-z0-9-]{1,64}$/.test(catalogKey))) {
+    throw new ValidationError('INVALID_STRATEGY', 'catalogKey must use 1..64 lowercase letters, digits or hyphens');
+  }
 
   const owner = requireString(provider, 'provider', MAX_PROVIDER_LENGTH).toLowerCase();
   const name = requireString(input.name, 'name', MAX_NAME_LENGTH);
@@ -356,7 +371,7 @@ export function validateCreateStrategyInput(
     swapFeeBps = input.swapFeeBps;
   }
 
-  return { provider: owner, name, description, isPublic, swapFeeBps };
+  return { provider: owner, name, description, isPublic, swapFeeBps, category, catalogKey };
 }
 
 // ---------------------------------------------------------------------------
@@ -395,10 +410,10 @@ export async function createStrategy(rawInput: unknown, provider: string): Promi
   }
 
   const { rows } = await query<StrategyRow>(
-    `insert into strategies (provider, name, description, is_public, swap_fee_bps, onchain_id)
-     values ($1, $2, $3, $4, $5, $6)
+    `insert into strategies (provider, name, description, is_public, swap_fee_bps, onchain_id, category, catalog_key)
+     values ($1, $2, $3, $4, $5, $6, $7, $8)
      returning ${STRATEGY_COLUMNS}`,
-    [input.provider, input.name, input.description, input.isPublic, input.swapFeeBps, onchainId],
+    [input.provider, input.name, input.description, input.isPublic, input.swapFeeBps, onchainId, input.category, input.catalogKey],
   );
 
   const row = rows[0];
@@ -736,6 +751,8 @@ function mapStrategy(row: StrategyRow): Strategy {
     name: row.name,
     description: row.description,
     isPublic: row.is_public,
+    category: row.category,
+    catalogKey: row.catalog_key,
     swapFeeBps: row.swap_fee_bps,
     onchainId: row.onchain_id === null ? null : Number(row.onchain_id),
     createdAt: row.created_at.toISOString(),

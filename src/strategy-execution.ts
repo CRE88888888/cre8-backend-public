@@ -7,7 +7,7 @@ import { TESTNET_97 } from './testnet-profile.js';
 export type LegacyExecution = { kind: 'hold' } | { kind: 'stack' };
 export type AssetMode = { kind: 'hold' } | { kind: 'stack'; every: 'daily' | 'weekly'; weekday: number | null; timeUtc: string; slices: number };
 export type AssetSetting = { asset: string; weightBps: number; execution?: AssetMode; yield: null | { market: string } };
-export type AssetExecution = { kind: 'per_asset'; numeraire: string; rebalance: 'none' | 'monthly' | 'drift'; assets: AssetSetting[] };
+export type AssetExecution = { kind: 'per_asset'; numeraire: string; rebalance: 'none' | 'monthly' | 'drift' | 'monthly_drift'; assets: AssetSetting[] };
 export type TypedExecution = LegacyExecution | AssetExecution;
 /** Funding/slot scheduler marker; never interpreted as a legacy drift interval. */
 export type FundingSchedule = { kind: 'funding' };
@@ -142,7 +142,7 @@ export function validateAssetConfig(value: unknown, allocation: Allocation, chai
   exactKeys(value, ['kind','numeraire','rebalance','assets'], 'INVALID_EXECUTION');
   if (value.numeraire !== cash || !Array.isArray(value.assets) || value.assets.length < 1 || value.assets.length !== allocation.assets.length) throw new ValidationError('INVALID_EXECUTION', 'execution must match the chain numeraire and complete allocation');
   const rebalance = value.rebalance === undefined ? 'none' : value.rebalance;
-  if (rebalance !== 'none' && rebalance !== 'monthly' && rebalance !== 'drift') throw new ValidationError('INVALID_EXECUTION', 'rebalance must be none, monthly or drift');
+  if (rebalance !== 'none' && rebalance !== 'monthly' && rebalance !== 'drift' && rebalance !== 'monthly_drift') throw new ValidationError('INVALID_EXECUTION', 'rebalance must be none, monthly, drift or monthly_drift');
   const seen = new Set<string>();
   const assets: AssetSetting[] = value.assets.map((entry: unknown) => {
     if (!record(entry) || typeof entry.asset !== 'string') throw new ValidationError('INVALID_EXECUTION', 'invalid asset setting');

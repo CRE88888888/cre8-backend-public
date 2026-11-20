@@ -11,6 +11,7 @@ import { AppError } from '../src/errors.js';
 import type { YieldRead } from '../src/yield-domain.js';
 import type { YieldPlan, YieldPrepare, YieldEvidence } from '../src/yield-port.js';
 import type { AssetExecution } from '../src/strategy-execution.js';
+import type { PortfolioPlan } from '../src/snapshot.js';
 import type { JobContext } from '../src/strategy-jobs.js';
 import { fundingLots, prepareStrategyJob } from '../src/strategy-jobs.js';
 import { createYieldService } from '../src/yield-service.js';
@@ -23,7 +24,7 @@ import { config, kernelCall, operation } from './fixtures/paymaster.js';
 
 const paymasters:string[]=[];
 after(async()=>{if(paymasters.length)await query('delete from paymaster_sponsorships where chain_id=97 and paymaster=any($1::text[])',[paymasters]);await closePool();});
-async function fixture(read?:YieldRead,rebalance:'none'|'monthly'|'drift'='none',f=yieldFixture(['venus']),stackSlices=0){
+async function fixture(read?:YieldRead,rebalance:AssetExecution['rebalance']='none',f=yieldFixture(['venus']),stackSlices=0){
   await migrate();const r=read??f.read;
   await syncYieldCatalog(r);const market=r.profile.markets[0];assert.ok(market);
   const owner=address(),account=f.account;
@@ -633,10 +634,52 @@ test('#104 reorg of a confirmed source freezes rebalance and keeps consent and i
   assert.equal((await query<{receipt:string}>('select receipt_raw::text as receipt from yield_positions where portfolio_id=$1',[f.context.portfolioId])).rows[0]?.receipt,(50n*WAD).toString());
 });
 
-test('#104 monthly/drift pending survives a new service and suppresses re-supply until the persisted anchor / fresh drift clears',async()=>{
+test('#171 monthly_drift yield supply checks both triggers, unknown drift and missing/failed anchor reads before supplying', async () => {
+  const { yieldRebalancePlan } = await import('./fixtures/yield.js');
+  const f = await fixture(undefined, 'monthly_drift'), plan = yieldRebalancePlan(f, f.context.portfolioId);
+  assert.ok(plan.report);
+  f.state.proofSid = BigInt(f.strategyId) + 84000000n;
+  const previousMonth = new Date(Date.UTC(f.at.getUTCFullYear(), f.at.getUTCMonth() - 1, 1));
+  let plans = 0, sends = 0;
+  const overrides = { profile: () => f.profile, client: () => f.client, read: async () => structuredClone(f.read), now: () => f.at,
+    plan: async () => { plans++; return plan; }, canSend: () => false,
+    port: async () => { sends++; throw new Error('execution disabled'); } };
+  for (const [last, delta, due] of [
+    [previousMonth, 0, true], [previousMonth, 500, true], [f.at, 0, false],
+    [f.at, 500, false], [f.at, 501, true], [null, 0, false], [null, 500, false], [null, 501, true],
+  ] as const) {
+    await query('update portfolios set last_rebalance_at=$2 where id=$1', [f.context.portfolioId, last]);
+    plan.report.maxAbsDeltaBps = delta;
+    const result = await locked(f.context.portfolioId, () => createYieldService(overrides).tick(f.context, false));
+    assert.match(result ?? '', due ? /暫緩新供給/ : /執行開關尚未啟用/);
+  }
+  assert.equal(plans, 8, 'each service reads fresh drift, even with a missing or expired monthly anchor');
+  for (const failure of ['rpc', 'timeout', 'anchor_db', 'missing_anchor', 'missing_report', 'blocked']) {
+    const marker = 'PRIVATE_TEST_UPSTREAM';
+    const failPlan: PortfolioPlan = { ...plan, report: failure === 'missing_report' ? null : plan.report,
+      blocked: failure === 'blocked' ? [{ code: 'UNPRICED_HOLDINGS', detail: 'missing data' }] : [] };
+    const service = createYieldService({ ...overrides,
+      query: async <T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly unknown[]) => {
+        if (sql.includes('coalesce(last_rebalance_at')) {
+          if (failure === 'anchor_db') throw new Error(marker);
+          if (failure === 'missing_anchor') return { command: 'SELECT', rowCount: 0, oid: 0, fields: [], rows: [] };
+        }
+        return query<T>(sql, params);
+      },
+      plan: async () => { if (failure === 'rpc') throw new Error(marker); if (failure === 'timeout') throw new DOMException(marker, 'TimeoutError'); return failPlan; },
+    });
+    const tick = () => locked(f.context.portfolioId, () => service.tick(f.context, false));
+    if (failure === 'missing_report' || failure === 'blocked') assert.match(await tick() ?? '', /暫緩新供給/);
+    else await assert.rejects(tick(), error => error instanceof AppError && error.code === 'YIELD_UNAVAILABLE' && !error.message.includes(marker));
+  }
+  assert.equal(sends, 0);
+  assert.equal((await query('select execution_key from yield_actions where portfolio_id=$1', [f.context.portfolioId])).rows.length, 0);
+});
+
+test('#104 monthly/drift and #171 monthly_drift pending survive a new service and suppress re-supply until the persisted anchor / fresh drift clears',async()=>{
   const {createYieldService}=await import('../src/yield-service.js');
   const {yieldRebalancePlan}=await import('./fixtures/yield.js');
-  for(const mode of ['monthly','drift'] as const){
+  for(const mode of ['monthly','drift','monthly_drift'] as const){
     const f=await fixture(undefined,mode),plan=yieldRebalancePlan(f,f.context.portfolioId);assert.ok(plan.report);
     const {buildSessionPermissions}=await import('../src/permissions.js');
     const session=await buildSessionPermissions({publicClient:f.client,sessionKeyAddress:f.owner,executorAddress:f.read.profile.executor,
@@ -644,7 +687,7 @@ test('#104 monthly/drift pending survives a new service and suppresses re-supply
     await query(`insert into session_keys(portfolio_id,key_ref,permissions,status,expires_at) values($1,$2,$3,'active',$4)`,
       [f.context.portfolioId,`m/44'/60'/0'/0/${f.context.portfolioId}`,JSON.stringify(session.policySnapshot),session.expiresAt]);
     f.state.proofSid=BigInt(f.strategyId)+84000000n;
-    const last=new Date(f.at);last.setUTCMonth(last.getUTCMonth()-1);
+    const last=new Date(Date.UTC(f.at.getUTCFullYear(),f.at.getUTCMonth()-1,1));
     await query('update portfolios set last_rebalance_at=$2 where id=$1',[f.context.portfolioId,last]);
     let sends=0;
     const overrides={profile:()=>f.read.profile,client:()=>f.client,read:async()=>structuredClone(f.read),plan:async()=>plan,canSend:()=>true,
@@ -654,7 +697,7 @@ test('#104 monthly/drift pending survives a new service and suppresses re-supply
     plan.report.maxAbsDeltaBps=501;
     assert.match(await locked(f.context.portfolioId,()=>createYieldService(overrides).tick(f.context,false))??'',/暫緩新供給/);
     assert.equal(sends,0);
-    if(mode==='drift'){
+    if(mode==='drift'||mode==='monthly_drift'){
       await assert.rejects(locked(f.context.portfolioId,()=>createYieldService({...overrides,plan:async()=>{throw new Error('SECRET_RPC_TIMEOUT');}}).tick(f.context,false)),(e:unknown)=>e instanceof Error&&!e.message.includes('SECRET'));
       assert.equal(sends,0);
     }

@@ -110,6 +110,20 @@ test('#168 dry-run prints 21 planned funds without authorizing, journaling or wr
   for (const args of [['--execute', '--execute'], ['--private-key', 'secret'], ['--mag7-id', '0'], ['--hide-ids', '1,0'], ['--lineup']]) assert.throws(() => launchArgs(args));
 });
 
+test('#171 launch dry-run includes monthly_drift in every reviewed fund and performs no writes', async () => {
+  assert.equal(LAUNCH_REBALANCE_MODE, 'monthly_drift');
+  const f = fixture(), plan = planLaunch(funds, [], owner, options);
+  const summary = launchSummary(plan);
+  assert.equal(summary.funds.length, lineup.funds.length);
+  for (const fund of summary.funds) {
+    const allocation = validateAllocation(fund.input.allocation, 97);
+    assert.equal(validateAssetConfig(fund.input.execution, allocation, 97).rebalance, 'monthly_drift');
+  }
+  assert.equal(JSON.stringify(summary).match(/"rebalance":"monthly_drift"/g)?.length, lineup.funds.length);
+  await executeLaunch(plan, options, f.deps);
+  assert.deepEqual(f.writes, []);
+});
+
 test('#168 successful rerun skips registrations and version publishing; Mag7 updates in place and old rows hide', async () => {
   const f = fixture();
   f.state.push(strategy(1), strategy(2));

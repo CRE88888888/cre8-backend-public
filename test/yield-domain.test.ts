@@ -11,6 +11,31 @@ const p: YieldPosition = { market, block: 1n, blockHash: h, at: now, source: 'rp
   claim: 2n, value: 2n, maxWithdraw: 1n, maxRedeem: 1n, rate: WAD * 2n, scale: WAD, aprBps: 500n, supplyOpen: true, exiting: false, underlyingDecimals: 18, receiptDecimals: 8 };
 const r: YieldRisk = { block: 1n, blockHash: h, at: now, source: 'rpc', key: 'k', protocol: 'venus', asset: a, riskSource: a, underlyingMarketId: null,
   configuration: h, state: 'known', reason: null, supply: 10000n, liquidity: 1000n, exposure: 20n, externalReserved: 10n, headroom: 200n, utilizationBps: 8000 };
+test('#171 monthly_drift combines UTC calendar changes with a strict 500 bps threshold, including missing anchors', async () => {
+  const { yieldRebalanceDue } = await import('../src/yield-rebalance.js');
+  const at = new Date('2026-12-01T00:00:00Z');
+  const sameMonth = new Date('2026-12-01T00:00:00Z');
+  const priorMonth = new Date('2026-11-30T23:59:59.999Z');
+  for (const delta of [0, 499, 500, 501, 10000, null]) {
+    const driftDue = delta === null || delta > 500;
+    for (const last of [sameMonth, null]) assert.equal(yieldRebalanceDue('monthly_drift', last, delta, at), driftDue);
+    assert.equal(yieldRebalanceDue('monthly_drift', priorMonth, delta, at), true);
+  }
+  assert.equal(yieldRebalanceDue('monthly_drift', new Date('2025-12-01T00:00:00Z'), 0, at), true, 'same month in a different year');
+  assert.equal(yieldRebalanceDue('monthly_drift', new Date('2026-12-31T23:59:59.999Z'), 0, new Date('2027-01-01T00:00:00Z')), true);
+  assert.equal(yieldRebalanceDue('monthly_drift', new Date('2026-11-30T23:00:00Z'), 500, new Date('2026-12-01T07:59:59+08:00')), false, 'local month alone does not trigger');
+});
+test('#171 none/monthly/drift retain their calendar, first-run and unknown-drift behavior', async () => {
+  const { yieldRebalanceDue } = await import('../src/yield-rebalance.js');
+  const at = new Date('2026-12-01T00:00:00Z');
+  const prior = new Date('2026-11-30T23:59:59Z');
+  for (const last of [null, prior, at]) for (const delta of [0, 500, 501, 10000, null]) {
+    assert.equal(yieldRebalanceDue('none', last, delta, at), false);
+    assert.equal(yieldRebalanceDue('monthly', last, delta, at), last !== null && last !== at);
+    assert.equal(yieldRebalanceDue('drift', last, delta, at), delta === null || delta > 500);
+  }
+  for (const mode of [undefined, null, '', 'annual', 'monthly+drift']) assert.equal(yieldRebalanceDue(mode, prior, 10000, at), false);
+});
 test('yield freshness includes 60s; future, missing and stale data fail closed', () => {
   assert.equal(fresh(new Date(+now - 60000), now), true);
   for (const at of [new Date(+now - 60001), new Date(+now + 1), new Date('invalid')]) assert.equal(fresh(at, now), false);

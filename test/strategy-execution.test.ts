@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createServer as httpServer } from 'node:http';
-import { createPublicClient, createWalletClient, custom, decodeFunctionData, encodeFunctionData, formatUnits, http } from 'viem';
+import { createPublicClient, createWalletClient, custom, decodeFunctionData, encodeFunctionData, formatUnits, http, keccak256, toHex } from 'viem';
 import { toAccount } from 'viem/accounts';
 import type { Hex } from 'viem';
 import golden from './fixtures/strategy-config-golden.json' with { type: 'json' };
@@ -18,6 +18,7 @@ import { AppError, UnauthorizedError } from '../src/errors.js';
 import { createServer } from '../src/server.js';
 import { strategyRpc, BLOCK_HASH, OTHER_HASH, TEST_ACCOUNT, TEST_AMOUNT, TEST_OWNER } from './fixtures/strategy-rpc.js';
 import { TESTNET_97 } from '../src/testnet-profile.js';
+import { typedVersionSettings } from '../src/registry-versioning.js';
 const cash = TESTNET_97.contracts.usdt;
 const risky = TESTNET_97.assets.AAPLB.token;
 const allocation = validateAllocation({ assets: [{ address: risky, weightBps: 5000 }, { address: cash, weightBps: 5000 }] }, 97);
@@ -217,7 +218,7 @@ test('#83 per-asset creator calendars validate daily/weekly bounds and reject ho
     {kind:'stack',every:'monthly',weekday:1,timeUtc:'09:00',slices:12}, {kind:'stack'}, {kind:'dips'}, {kind:'hold',stopLoss:1}]) {
     assert.throws(()=>validateAssetConfig({...base,assets:[{...base.assets[0],execution},base.assets[1]]},allocation,97));
   }
-  for (const rebalance of ['monthly','drift']) assert.throws(()=>validateAssetConfig({...base,rebalance},allocation,97));
+  for (const rebalance of ['monthly','drift','monthly_drift']) assert.throws(()=>validateAssetConfig({...base,rebalance},allocation,97));
   for (const value of ['2026-02-30T09:00:00Z','2026-11-16T09:00:00','2026-11-16','2026-11-16T24:00:00Z','infinity']) assert.throws(()=>utcDate(value,'startAt'));
   const service=createPortfolioStrategyService();
   await assert.rejects(service.instruct(82,TEST_OWNER,{expectedRevision:'0',enabled:true}),denied('STACK_INSTRUCTIONS_RETIRED'));
@@ -354,6 +355,7 @@ test('#83 schema 2 canonical goldens bind every creator execution/yield/rebalanc
     const execution=validateAssetConfig(vector.config.execution,vector.config.allocation,vector.config.chainId);
     const value={chainId:vector.config.chainId,execution,allocation:vector.config.allocation,schedule:{kind:'funding' as const},activeAt:new Date(Number(vector.config.activeAt)*1000)};
     assert.equal(canonicalConfig(value),vector.canonical);assert.equal(canonicalConfigHash(value),vector.hash);
+    assert.equal(typedVersionSettings(value).settingsHash, keccak256(toHex(vector.canonical.replace(/"activeAt":"[0-9]+"/, '"activeAt":"0"'))));
     assert.equal(canonicalConfigHash({...value,execution:{...execution,assets:[...execution.assets].reverse()},allocation:{assets:[...value.allocation.assets].reverse()}}),vector.hash);
     const changed={...execution,rebalance:execution.rebalance==='none'?'monthly' as const:'none' as const};
     if (!execution.assets.some(a=>a.execution?.kind==='stack')) assert.notEqual(canonicalConfigHash({...value,execution:changed}),vector.hash);
@@ -362,6 +364,25 @@ test('#83 schema 2 canonical goldens bind every creator execution/yield/rebalanc
     assert.notEqual(canonicalConfigHash({...value,activeAt:new Date(value.activeAt.getTime()+1000)}),vector.hash);
     assert.notEqual(canonicalConfigHash({...value,chainId:1337}),vector.hash);
   }
+});
+
+test('#171 monthly_drift is preserved in typed API input and canonical settings without relaxing validation', () => {
+  const execution = validateAssetConfig({ ...validateAssetConfig(undefined, allocation, 97), rebalance: 'monthly_drift' }, allocation, 97);
+  assert.equal(execution.rebalance, 'monthly_drift');
+  assert.deepEqual(typedVersionInput({ allocation, chainId: 97, execution }).execution, execution);
+  const value = { ...config, execution };
+  const canonical = canonicalConfig(value);
+  assert.equal(JSON.parse(canonical).execution.rebalance, 'monthly_drift');
+  const modes = ['none', 'monthly', 'drift', 'monthly_drift'] as const;
+  assert.equal(new Set(modes.map(rebalance => canonicalConfigHash({ ...value, execution: validateAssetConfig({ ...execution, rebalance }, allocation, 97) }))).size, modes.length);
+  assert.equal(canonicalConfigHash({ ...value, execution: { ...execution, assets: [...execution.assets].reverse() } }), canonicalConfigHash(value));
+  assert.equal(typedVersionSettings({ ...value, activeAt: new Date(0) }).settingsHash, typedVersionSettings(value).settingsHash);
+  for (const rebalance of [null, false, 0, '', 'monthly+drift', 'MONTHLY_DRIFT', 'monthly_drift ']) {
+    assert.throws(() => validateAssetConfig({ ...execution, rebalance }, allocation, 97), denied('INVALID_EXECUTION'));
+  }
+  assert.throws(() => validateAssetConfig({ ...execution, thresholdBps: 501 }, allocation, 97), denied('INVALID_EXECUTION'));
+  const riskyEntry = execution.assets.find(a => a.asset === risky); assert.ok(riskyEntry);
+  assert.throws(() => validateAssetConfig({ ...execution, assets: [riskyEntry, riskyEntry] }, allocation, 97), denied('INVALID_EXECUTION'));
 });
 
 test('#83 per-asset full configuration rejects cash execution, tampered weights, duplicate/missing assets and unknown fields', () => {

@@ -289,10 +289,10 @@ export function createYieldService(overrides:Partial<YieldServiceDeps>={}){
       if(!current||!current.onchain_id||current.schedule_state!=='active')return '帳戶停止新供給';
       const execution=object(current.execution);if(execution.kind!=='per_asset'||!Array.isArray(execution.assets))return '此版本未選生息市場';
       // Persisted monthly anchor / fresh drift survive restarts. Do not re-supply redeemed inputs before the swap round.
-      if(execution.rebalance==='monthly'||execution.rebalance==='drift'){
+      if(execution.rebalance==='monthly'||execution.rebalance==='drift'||execution.rebalance==='monthly_drift'){
         const last=(await deps.query<{last_rebalance_at:Date|null}>("select coalesce(last_rebalance_at,(select min(created_at) from strategy_funding_lots where portfolio_id=$1 and state='confirmed')) as last_rebalance_at from portfolios where id=$1",[p.portfolioId])).rows[0];
         if(!last)throw unavailable();
-        const plan=execution.rebalance==='drift'?await deps.plan(p.portfolioId,{publicClient:client}):null;
+        const plan=execution.rebalance==='monthly'?null:await deps.plan(p.portfolioId,{publicClient:client});
         if((plan!==null&&(plan.blocked.length>0||plan.report===null))||yieldRebalanceDue(execution.rebalance,last.last_rebalance_at,plan?.report?.maxAbsDeltaBps??null,deps.now()))return '再平衡尚待完成，暫緩新供給';
       }
       for(const selected of execution.assets){

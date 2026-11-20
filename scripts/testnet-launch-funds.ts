@@ -28,8 +28,8 @@ export type LaunchEntry = { fund: LaunchFund; existing: StrategyDetail | null; p
 export type LaunchPlan = { entries: LaunchEntry[]; hide: StrategyDetail[]; inventory: StrategyDetail[] };
 const CATEGORIES = ['theme', 'person', 'leveraged'];
 const MIN_PERFORMANCE_FEE_BPS = 500; // Registry constraint only; this does not deploy/enable the fee ledger.
-/** C3 #168: the launch funds rebalance; change this one setting after monthly/drift is finalized. */
-export const LAUNCH_REBALANCE_MODE: Exclude<AssetExecution['rebalance'], 'none'> = 'monthly';
+/** C3 #171: rebalance on a new UTC month or a maximum deviation strictly above 500 bps. */
+export const LAUNCH_REBALANCE_MODE: Exclude<AssetExecution['rebalance'], 'none'> = 'monthly_drift';
 
 /** Addresses always come from the merged backend testnet profile, not stale research snapshots. */
 export function launchFunds(value: unknown): LaunchFund[] {

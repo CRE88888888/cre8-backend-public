@@ -6,7 +6,7 @@ import {after,test} from 'node:test';
 import type {Address,Hex} from 'viem';
 import {query,withTransaction,withPortfolioLock,migrate,closePool,getPool,MIGRATIONS_DIR} from '../src/db.js';
 import {canonicalConfigHash,UINT256_MAX,validateAssetConfig} from '../src/strategy-execution.js';
-import type {AssetMode} from '../src/strategy-execution.js';
+import type {AssetMode,AssetExecution} from '../src/strategy-execution.js';
 import {planContribution} from '../src/asset-plan.js';
 import {prepareStrategyJob,fundingLots,readJob,settleStrategyBatch} from '../src/strategy-jobs.js';
 import type {JobContext,StrategyJob} from '../src/strategy-jobs.js';
@@ -25,7 +25,7 @@ const hash=():Hex=>`0x${randomBytes(32).toString('hex')}`;
 const cash=TESTNET_97.contracts.usdt,a=TESTNET_97.assets.WBNB.token,b=TESTNET_97.assets.ETH.token;
 const R=27n*U/100n,start=new Date('2026-11-15T13:00:00Z');
 const run:WithTransactionFn=fn=>withTransaction(client=>fn({query:(s,p)=>client.query(s,p===undefined?[]:[...p])}));
-async function fixture(kind:'hold'|'stack'='hold',cashWeight=0,slices=4,rebalance:'none'|'monthly'|'drift'='none',otherMode?:AssetMode,weights?:readonly number[],assetCount=2,version=1){
+async function fixture(kind:'hold'|'stack'='hold',cashWeight=0,slices=4,rebalance:AssetExecution['rebalance']='none',otherMode?:AssetMode,weights?:readonly number[],assetCount=2,version=1){
   await migrate();
   const owner=address(),account=address();
   const sid=(await query<{id:string}>("insert into strategies(provider,name) values($1,'be83-isolated') returning id",[owner])).rows[0]?.id;assert.ok(sid);
@@ -407,8 +407,57 @@ test('#83 all-hold monthly rebalancing waits for a new UTC month after the previ
   await s.once(new Date('2026-12-01T00:00:00Z'));assert.equal(calls,1);assert.equal(s.sends.length,0);
 });
 
-test('#104 monthly rebalance withdraws yield before swaps and resumes without revoking consent',async()=>{
-  const f=await fixture('hold',0,4,'monthly');await f.fund(100n*U);
+test('#171 monthly_drift scheduler uses either trigger and preserves the funding anchor across service restarts', async () => {
+  const f = await fixture('hold', 0, 4, 'monthly_drift');
+  await f.fund(100n * U, start);
+  const initial = (await f.reserve())?.job; assert.ok(initial); await complete(f, initial);
+  for (const [at, delta, expected] of [
+    ['2026-11-30T23:59:59Z', 0, 0], ['2026-11-30T23:59:59Z', 500, 0],
+    ['2026-11-30T23:59:59Z', 501, 1], ['2026-12-01T00:00:00Z', 0, 1],
+    ['2026-12-01T00:00:00Z', 500, 1], ['2026-12-01T00:00:00Z', 501, 1],
+  ] as const) for (const dryRun of [false, true]) {
+    // last_rebalance_at remains null: the confirmed first funding is the monthly anchor.
+    let calls = 0;
+    const p = plan(f); assert.ok(p.report);
+    p.report = { ...p.report, maxAbsDeltaBps: delta, grossDriftBps: delta, needsRebalance: delta > 100 };
+    const s = scheduler(f, { planPortfolio: async () => p, planRebalance: async () => { calls++; return { kind: 'blocked', reason: 'quote unavailable' }; } });
+    const result = await s.once(new Date(at), dryRun);
+    assert.equal(result.results[0]?.outcome, dryRun || expected ? 'blocked' : 'noop');
+    assert.equal(calls, dryRun ? 0 : expected, `${at}: ${delta} bps, dryRun=${dryRun}`); assert.equal(s.sends.length, 0);
+  }
+  assert.equal((await query('select last_rebalance_at from portfolios where id=$1', [f.id])).rows[0]?.last_rebalance_at, null);
+});
+
+test('#171 monthly_drift with no funding/previous rebalance uses drift and blocks unavailable RPC/DB/plan data', async () => {
+  const f = await fixture('hold', 0, 4, 'monthly_drift');
+  for (const delta of [0, 500, 501, 10000]) {
+    let calls = 0;
+    const p = plan(f); assert.ok(p.report);
+    p.report = { ...p.report, maxAbsDeltaBps: delta, grossDriftBps: delta, needsRebalance: delta > 100 };
+    const s = scheduler(f, { planPortfolio: async () => p, planRebalance: async () => { calls++; return { kind: 'blocked', reason: 'quote unavailable' }; } });
+    await s.once(); assert.equal(calls, delta > 500 ? 1 : 0); assert.equal(s.sends.length, 0);
+  }
+  for (const failure of ['rpc', 'timeout', 'missing_report', 'blocked', 'anchor_db']) {
+    const p = plan(f); assert.ok(p.report); p.report.maxAbsDeltaBps = 501;
+    if (failure === 'missing_report') p.report = null;
+    if (failure === 'blocked') p.blocked.push({ code: 'UNPRICED_HOLDINGS', detail: 'missing pricing data' });
+    let calls = 0; const marker = 'PRIVATE_TEST_UPSTREAM', logs: string[] = [];
+    const s = scheduler(f, {
+      log: line => logs.push(line),
+      planPortfolio: async () => { if (failure === 'rpc') throw new Error(marker); if (failure === 'timeout') throw new DOMException(marker, 'TimeoutError'); return p; },
+      query: async (sql, params) => { if (failure === 'anchor_db' && sql.includes('coalesce(last_rebalance_at')) throw new Error(marker); return query(sql, params); },
+      planRebalance: async () => { calls++; throw new Error('unavailable data cannot authorize quotes'); },
+    });
+    const result = await s.once();
+    assert.equal(result.results[0]?.outcome, 'blocked');
+    assert.equal(calls, 0); assert.equal(s.sends.length, 0); assert.ok(!JSON.stringify(result).includes(marker));
+    assert.ok(!logs.join('\n').includes(marker));
+  }
+  assert.equal((await query('select id from operations where portfolio_id=$1', [f.id])).rows.length, 0);
+});
+
+for (const mode of ['monthly', 'monthly_drift'] as const) test(`#104 / #171 ${mode} rebalance withdraws yield before swaps and resumes without revoking consent`,async()=>{
+  const f=await fixture('hold',0,4,mode);await f.fund(100n*U);
   const initial=(await f.reserve())?.job;assert.ok(initial);await complete(f,initial);
   await query('update portfolios set last_rebalance_at=$2 where id=$1',[f.id,start]);
   const {yieldFixture}=await import('./fixtures/yield.js');
@@ -472,8 +521,8 @@ for(const stage of ['quote','refresh'] as const)test(`#83 ${stage} crossing the 
 });
 
 
-for(const direction of ['buy','sell'] as const)test(`#83 all-hold ${direction} rebalancing settles authoritative USDT deltas with its operation`,async()=>{
-  const f=await fixture('hold',5000,4,'drift');await f.fund(200n*U);const initial=(await f.reserve())?.job;assert.ok(initial);await complete(f,initial);
+for (const mode of ['drift', 'monthly_drift'] as const) for(const direction of ['buy','sell'] as const)test(`#83 / #171 all-hold ${mode} ${direction} rebalancing settles authoritative USDT deltas with its operation`,async()=>{
+  const f=await fixture('hold',5000,4,mode);await f.fund(200n*U);const initial=(await f.reserve())?.job;assert.ok(initial);await complete(f,initial);
   const before=await balances(f);assert.ok(before);
   const delta=direction==='buy'?-20n*U-R:30n*U;
   const s=scheduler(f,{planPortfolio:async()=>{const p=plan(f);assert.ok(p.report);return {...p,report:{...p.report,maxAbsDeltaBps:501,needsRebalance:true}};},
@@ -483,6 +532,11 @@ for(const direction of ['buy','sell'] as const)test(`#83 all-hold ${direction} r
   assert.equal((await balances(f))?.allocated_cash_raw,(BigInt(before.allocated_cash_raw)+delta).toString());
   assert.equal((await query<{state:string}>('select state from operations where portfolio_id=$1 and strategy_job_id is null',[f.id])).rows[0]?.state,'confirmed');
   assert.equal((await query('select id from strategy_jobs where portfolio_id=$1',[f.id])).rows.length,1,'price rebalance must use the shared target_weight pipeline, without manufacturing a funding job');
+  const anchor=(await query<{last_rebalance_at:Date|null}>('select last_rebalance_at from portfolios where id=$1',[f.id])).rows[0];
+  assert.equal(anchor?.last_rebalance_at?.getTime(),start.getTime());
+  const restarted=scheduler(f);
+  assert.equal((await restarted.once()).results[0]?.outcome,'noop');assert.equal(restarted.sends.length,0);
+  assert.equal((await balances(f))?.allocated_cash_raw,(BigInt(before.allocated_cash_raw)+delta).toString());
 });
 
 test('#83 all-hold unknown rebalance restores USDT cash once after an atomic settlement rollback',async()=>{

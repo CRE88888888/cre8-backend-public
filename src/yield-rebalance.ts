@@ -5,9 +5,9 @@ import { fresh, raw, unavailable } from './yield-domain.js';
 import type { YieldPosition } from './yield-domain.js';
 
 export function yieldRebalanceDue(mode: unknown, last: Date | null, delta: number | null, now: Date): boolean {
-  if (mode === 'monthly') return last !== null &&
-    (last.getUTCFullYear() !== now.getUTCFullYear() || last.getUTCMonth() !== now.getUTCMonth());
-  return mode === 'drift' && (delta === null || delta > 500);
+  if ((mode === 'monthly' || mode === 'monthly_drift') && last !== null &&
+    (last.getUTCFullYear() !== now.getUTCFullYear() || last.getUTCMonth() !== now.getUTCMonth())) return true;
+  return (mode === 'drift' || mode === 'monthly_drift') && (delta === null || delta > 500);
 }
 
 export type RebalanceWithdrawal = { marketId: Hex; amount: bigint; blocked: boolean };

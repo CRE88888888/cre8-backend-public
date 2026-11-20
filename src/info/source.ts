@@ -15,10 +15,10 @@ export function sourceUrl(raw: string, hosts: readonly string[] = [...HOSTS]): s
 }
 
 export function createInfoGet(send: (url: string, init: RequestInit) => Promise<Response> = fetch,
-  timeoutMs = 15_000, budgetMs = 30_000, clock = Date.now): InfoGet {
+  timeoutMs = 15_000, budgetMs = 30_000, clock = Date.now, hosts: readonly string[] = [...HOSTS]): InfoGet {
   let deadline: number | undefined;
   return async (raw, headers = {}) => {
-    let url = sourceUrl(raw);
+    let url = sourceUrl(raw, hosts);
     deadline ??= clock() + budgetMs;
     const remaining = deadline - clock();
     if (remaining <= 0) throw new InfoSourceError('source_deadline');

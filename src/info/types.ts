@@ -13,7 +13,7 @@ export type InfoEvent = {
 };
 
 export type MarketSnapshot = {
-  series: 'ust_2y' | 'ust_10y' | 'usd_broad';
+  series: 'ust_2y' | 'ust_10y' | 'usd_broad' | `close:${string}`;
   observedOn: string;
   value: string;
   source: string;

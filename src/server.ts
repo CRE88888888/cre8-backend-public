@@ -29,6 +29,8 @@ import { createPlatformStatusReader } from './chain.js';
 import { query } from './db.js';
 import { AppError, ValidationError } from './errors.js';
 import { strategyVersionState, getStrategyWithVersionState, createStrategy, getStrategy, listStrategies, publishVersion, typedVersionInput, typedMinimumDeposit } from './strategies.js';
+import { createModelReader, dbModelStrategy } from './model-returns/service.js';
+import { emptyModel } from './model-returns/calculation.js';
 import { previewContributionAsync } from './contribution-preview.js';
 import { createPortfolioStrategyService } from './portfolio-strategies.js';
 import { listPortfolios, enrollPortfolio, preparePortfolioEnrollment, allocationMinimumDeposit, strategyMinimumDeposit } from './portfolios.js';
@@ -168,6 +170,7 @@ export const BUNDLER_TIMEOUT_MS = 30_000;
  * merged over the defaults, so a test can stub one dependency and leave the rest real.
  */
 export type ServerDeps = {
+  modelReturns: ReturnType<typeof createModelReader>;
   info: ReturnType<typeof createInfoService>;
   previewContribution: typeof previewContributionAsync;
   yieldService: ReturnType<typeof createYieldService>;
@@ -189,6 +192,8 @@ export type ServerDeps = {
   preparePortfolioEnrollment: typeof preparePortfolioEnrollment;
   strategyVersionState: typeof strategyVersionState;
   strategyDetail: typeof getStrategyWithVersionState;
+  /** DB-only strategy + versions (no chain reads); the list's model returns use this. */
+  strategyRecord: typeof getStrategy;
   strategyExposure: typeof readAssetExposureStatus;
   setExposureCap: typeof setAssetExposureCap;
   listPortfolios: typeof listPortfolios;
@@ -308,6 +313,7 @@ async function defaultListAssets(): Promise<PriceableAsset[]> {
 }
 
 const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
+  modelReturns: createModelReader(),
   info: createInfoService(),
   previewContribution: previewContributionAsync,
   yieldService: createYieldService(),
@@ -323,7 +329,7 @@ const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
   platformStatus: createPlatformStatusReader(),
   createStrategy,
   publishVersion,
-  enrollPortfolio, preparePortfolioEnrollment, strategyVersionState, strategyDetail: getStrategyWithVersionState,
+  enrollPortfolio, preparePortfolioEnrollment, strategyVersionState, strategyDetail: getStrategyWithVersionState, strategyRecord: getStrategy,
   strategyExposure: readAssetExposureStatus, setExposureCap: setAssetExposureCap,
   listPortfolios,
   buildRenewalParams,
@@ -648,7 +654,7 @@ async function route(
       return;
     }
     if (segments.length === 1) {
-      if (method === 'GET') return listRoute(res, url);
+      if (method === 'GET') return listRoute(res, url, deps);
       if (method === 'POST') return createRoute(req, res, deps);
       return methodNotAllowed(res, ['GET', 'POST']);
     }
@@ -841,7 +847,7 @@ async function loginRoute(req: IncomingMessage, res: ServerResponse, deps: Serve
 }
 
 /** GET /strategies?limit=50&offset=0&provider=0x…&public=true */
-async function listRoute(res: ServerResponse, url: URL): Promise<void> {
+async function listRoute(res: ServerResponse, url: URL, deps: ServerDeps): Promise<void> {
   const provider = url.searchParams.get('provider')?.trim() ?? '';
   const page = await listStrategies({
     limit: parseQueryInteger(url.searchParams.get('limit'), 'limit'),
@@ -849,19 +855,23 @@ async function listRoute(res: ServerResponse, url: URL): Promise<void> {
     provider: provider === '' ? undefined : provider,
     isPublic: parseBoolean(url.searchParams.get('public'), 'public') ?? true,
   });
-  sendJson(res, 200, { ...page, items: await Promise.all(page.items.map(async (item) => ({ ...item, minDepositUsdtWei: await strategyMinimumDeposit(item.id) }))) });
+  const records = await Promise.all(page.items.map(item => deps.strategyRecord(item.id).then(dbModelStrategy, () => null)));
+  const models = await deps.modelReturns(records.filter(record => record !== null)).catch(() => null);
+  sendJson(res, 200, { ...page, items: await Promise.all(page.items.map(async (item) => ({ ...item,
+    modelReturns: models?.get(item.id)?.modelReturns ?? null, minDepositUsdtWei: await strategyMinimumDeposit(item.id) }))) });
 }
 
 /** GET /strategies/:id — metadata plus version history (newest first). */
 async function detailRoute(res: ServerResponse, id: number, deps: ServerDeps): Promise<void> {
   const strategy = await deps.strategyDetail(id);
+  const model = (await deps.modelReturns([strategy]).catch(() => null))?.get(id) ?? emptyModel();
   const exposure = await deps.strategyExposure(id, getConfig().chainId, strategy.versions.flatMap(v => v.allocation.assets.map(a => a.address)), { cappedOnly: true });
   const versions = strategy.versions.map((version) => ({ ...version,
     allocation: { assets: version.allocation.assets.map(a => {
       const state = exposure.find(e => e.address === a.address.toLowerCase());
       return { ...a, buyPaused: state?.buyPaused ?? null, exposureCapUsdtWei: state?.exposureCapUsdtWei ?? null, currentExposureUsdtWei: state?.currentExposureUsdtWei ?? null };
     }) }, minDepositUsdtWei: version.executionSchemaVersion !== 0 ? typedMinimumDeposit(version) : allocationMinimumDeposit(version.allocation) }));
-  sendJson(res, 200, { ...strategy, versions, minDepositUsdtWei: versions[0]?.minDepositUsdtWei ?? null });
+  sendJson(res, 200, { ...strategy, ...model, versions, minDepositUsdtWei: versions[0]?.minDepositUsdtWei ?? null });
 }
 
 /**

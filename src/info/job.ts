@@ -14,6 +14,7 @@ import { createInfoGet } from './source.js';
 import { saveInfoBatch } from './store.js';
 import { failureCode } from './types.js';
 import { createInfoDraftJob } from './draft-job.js';
+import { createCloseJob } from '../model-returns/collector.js';
 import type { InfoBatch, InfoCollector } from './types.js';
 
 export function loadInfoConfig(env: NodeJS.ProcessEnv = process.env) {
@@ -100,10 +101,11 @@ export function createInfoJob(deps: { env?: NodeJS.ProcessEnv; now?: () => Date;
 /** Collection and drafting have independent switches; either failure leaves the other job runnable. */
 export function createInfoBackgroundJob(collect: () => Promise<unknown> = createInfoJob(),
   draft: () => Promise<unknown> = createInfoDraftJob({ lock: withInfoJobLock }),
-  onError = () => console.error('[info] job unavailable; retry on next due round')) {
+  onError = () => console.error('[info] job unavailable; retry on next due round'),
+  closes: () => Promise<unknown> = createCloseJob()) {
   return async (): Promise<boolean> => {
     let successful = true;
-    for (const run of [collect, draft]) {
+    for (const run of [collect, draft, closes]) {
       try { await run(); } catch { successful = false; onError(); }
     }
     return successful;

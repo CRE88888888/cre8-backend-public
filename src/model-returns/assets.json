@@ -1,0 +1,202 @@
+[
+  {
+    "symbol": "AAPLB",
+    "address": "0x431a3bee82e2ca41e49895cbece5bb0f76a89b7a",
+    "pair": "AAPLBUSDT"
+  },
+  {
+    "symbol": "AMCB",
+    "address": "0x96e7d606e229448ef817a7f35fd7394c3e15d00c",
+    "pair": "AMCBUSDT"
+  },
+  {
+    "symbol": "AMZNB",
+    "address": "0x1a4b499833a79a09ad7cf1d42d7dacf71e92eb00",
+    "pair": "AMZNBUSDT"
+  },
+  {
+    "symbol": "ANTB",
+    "address": "0x38dd26788cf2d901e3abf04efe3007d459d0fc53",
+    "pair": "ANTBUSDT"
+  },
+  {
+    "symbol": "AVGOB",
+    "address": "0x76682c454467b3a1150ad8b6a92fc5ee2c21d7ed",
+    "pair": "AVGOBUSDT"
+  },
+  {
+    "symbol": "BABAB",
+    "address": "0x4ef9d3062c7f6eba4aae4990c5036598c6eff4ec",
+    "pair": "BABABUSDT"
+  },
+  {
+    "symbol": "BMNRB",
+    "address": "0x3548da95a9effe481e8604664d75e95821e557f5",
+    "pair": "BMNRBUSDT"
+  },
+  {
+    "symbol": "BNCB",
+    "address": "0x4902c5ebc598265ed2212b559b042de8a5eeec3f",
+    "pair": "BNCBUSDT"
+  },
+  {
+    "symbol": "BTCB",
+    "address": "0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c",
+    "pair": "BTCUSDT"
+  },
+  {
+    "symbol": "COINB",
+    "address": "0x585bde7c54abb5ccd7791f923d6c2187635f3952",
+    "pair": "COINBUSDT"
+  },
+  {
+    "symbol": "CRCLB",
+    "address": "0x80f3d493ebce97e343c53d29a137942416b4ffc0",
+    "pair": "CRCLBUSDT"
+  },
+  {
+    "symbol": "CYPHB",
+    "address": "0x0393c28065c54e48b45bdb05eff5c401cf891da1",
+    "pair": "CYPHBUSDT"
+  },
+  {
+    "symbol": "DJTB",
+    "address": "0xf2ec508422174ee564de98187db9359d318afb6b",
+    "pair": "DJTBUSDT"
+  },
+  {
+    "symbol": "DOGE",
+    "address": "0xba2ae424d960c26247dd6c32edc70b295c744c43",
+    "pair": "DOGEUSDT"
+  },
+  {
+    "symbol": "EWYB",
+    "address": "0xbe82f76637dba2c114c41df856c2c51e522e2cb8",
+    "pair": "EWYBUSDT"
+  },
+  {
+    "symbol": "GMEB",
+    "address": "0x46ceefda28dd7207059ed19b0acdc026955bb15c",
+    "pair": "GMEBUSDT"
+  },
+  {
+    "symbol": "GOOGLB",
+    "address": "0x3f53de71c126bdabae20f9cd64848d317f6c3238",
+    "pair": "GOOGLBUSDT"
+  },
+  {
+    "symbol": "HOODB",
+    "address": "0xa394dcea3fd3847fd793afbfd163e2e3858b7c65",
+    "pair": "HOODBUSDT"
+  },
+  {
+    "symbol": "INTCB",
+    "address": "0xe614e2fc6c787035ff51f452e8e826bfd32d5283",
+    "pair": "INTCBUSDT"
+  },
+  {
+    "symbol": "METAB",
+    "address": "0x7425889fe94f9d693e8daefe88bcced6acfef4c0",
+    "pair": "METABUSDT"
+  },
+  {
+    "symbol": "MRVLB",
+    "address": "0x16cd4fe7e8880ecc3ba222795229e20489fc2c76",
+    "pair": "MRVLBUSDT"
+  },
+  {
+    "symbol": "MSFTB",
+    "address": "0x80106cb3ead06659a5ad19df39d9b4733863b9b0",
+    "pair": "MSFTBUSDT"
+  },
+  {
+    "symbol": "MSTRB",
+    "address": "0xe87afb3076aeb0f9b14e368de8145ae6a2826a14",
+    "pair": "MSTRBUSDT"
+  },
+  {
+    "symbol": "MUB",
+    "address": "0xcdf2f3e0fa43c47a6662a91c9e4a7c5f69762699",
+    "pair": "MUBUSDT"
+  },
+  {
+    "symbol": "NFLXB",
+    "address": "0xd6829ea836b6fa224d099d40e54b31262f874631",
+    "pair": "NFLXBUSDT"
+  },
+  {
+    "symbol": "NVDAB",
+    "address": "0x02fca66c1d1afb4e2a7884261eb00f63598a7436",
+    "pair": "NVDABUSDT"
+  },
+  {
+    "symbol": "PDDB",
+    "address": "0x95b0409679b55c31772daa2fb4bee7b125b77521",
+    "pair": "PDDBUSDT"
+  },
+  {
+    "symbol": "PENGB",
+    "address": "0x7f732f9d2f2ea3e7e223c2e737e5257007f90e01",
+    "pair": "PENGBUSDT"
+  },
+  {
+    "symbol": "QQQB",
+    "address": "0x205812cdbed920aff76c6580abd681a46d11efc7",
+    "pair": "QQQBUSDT"
+  },
+  {
+    "symbol": "RDDTB",
+    "address": "0x41622a9125a22767df8c1dc79fc17299bac4bd0b",
+    "pair": "RDDTBUSDT"
+  },
+  {
+    "symbol": "SKHYB",
+    "address": "0xca750ef65f295bbecd685abf54e82caf297bdb61",
+    "pair": "SKHYBUSDT"
+  },
+  {
+    "symbol": "SNDKB",
+    "address": "0x3ee4df61bd4f867e349beae8bfe07bc31b4850fb",
+    "pair": "SNDKBUSDT"
+  },
+  {
+    "symbol": "SOXLB",
+    "address": "0xd97d097a89113fa59b76c572e5b2eb647e8eefaf",
+    "pair": "SOXLBUSDT"
+  },
+  {
+    "symbol": "SPCXB",
+    "address": "0xbe9d156892e55e7154bcd3cb0fea677f9d3103e1",
+    "pair": "SPCXBUSDT"
+  },
+  {
+    "symbol": "SPYB",
+    "address": "0x7138b48df7d98d7e3cc221bfe7192d0a178182d8",
+    "pair": "SPYBUSDT"
+  },
+  {
+    "symbol": "TQQQB",
+    "address": "0x462b5f13b7c7748279358962925c5de83bb9e598",
+    "pair": "TQQQBUSDT"
+  },
+  {
+    "symbol": "TSLAB",
+    "address": "0x5b1910eaad6450e50f816082aa078c41f10c292f",
+    "pair": "TSLABUSDT"
+  },
+  {
+    "symbol": "TSMB",
+    "address": "0xab78b89b5bb00236be0b4b20704cbfa04efc711c",
+    "pair": "TSMBUSDT"
+  },
+  {
+    "symbol": "WBNB",
+    "address": "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",
+    "pair": "BNBUSDT"
+  },
+  {
+    "symbol": "XAUT",
+    "address": "0x21caef8a43163eea865baee23b9c2e327696a3bf",
+    "pair": "XAUTUSDT"
+  }
+]

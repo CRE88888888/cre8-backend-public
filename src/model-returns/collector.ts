@@ -1,11 +1,13 @@
 import { ConfigurationError } from '../config.js';
-import { createInfoGet, json, list, object, text } from '../info/source.js';
+import { json, list, object, text } from '../info/source.js';
 import { runInfoCollectors, withInfoJobLock } from '../info/job.js';
 import type { InfoCollectorResult } from '../info/job.js';
 import type { InfoBatch, InfoGet } from '../info/types.js';
 import { InfoSourceError } from '../info/types.js';
-import { MODEL_ASSETS } from './catalogue.js';
+import { MODEL_ASSETS, closeSeries, checkedSeries } from './catalogue.js';
+import type { ModelAsset } from './catalogue.js';
 import { DAY_MS, lastClosedDay, price } from './calculation.js';
+import { backfillStart, createMarketGet, inDollars, parseYahoo, yahooUrl } from './yahoo.js';
 
 export function klineUrl(pair: string, start: number, end: number): string {
   if (!/^[A-Z0-9]{2,24}USDT$/.test(pair)) throw new InfoSourceError('invalid_pair');
@@ -32,12 +34,12 @@ export function parseKlines(raw: string, start: number, end: number): { date: st
 export async function collectCloses(asset: { symbol: string; pair: string }, get: InfoGet, now = new Date()): Promise<InfoBatch> {
   const end = Date.parse(lastClosedDay(now)) + DAY_MS - 1;
   const markets: InfoBatch['markets'] = [];
-  let start = 0;
-  // Full backfill on each daily round repairs old gaps/corrections and preserves true ALL history.
+  let start = Date.parse(backfillStart(now));
+  // Refresh two years each day; retained older snapshots preserve the original admission dates.
   for (let page = 0; page < 100; page++) {
     const url = klineUrl(asset.pair, start, end);
     const points = parseKlines(await get(url), start, end);
-    markets.push(...points.map(point => ({ series: `close:${asset.symbol}` as const, observedOn: point.date,
+    markets.push(...points.map(point => ({ series: closeSeries(asset), observedOn: point.date,
       value: point.value, source: 'binance', sourceUrl: url })));
     if (points.length < 1000) return { events: [], markets };
     const last = points.at(-1);
@@ -54,9 +56,8 @@ export function loadCloseConfig(env: NodeJS.ProcessEnv = process.env): boolean {
 }
 // Binance's main REST host returns HTTP 451 from US data centres (Railway US West, verified 2026-11-20);
 // data-api.binance.vision is Binance's public market-data-only host and serves the same klines/ticker endpoints.
-const getBinance = () => createInfoGet(fetch, 15_000, 60_000, Date.now, ['data-api.binance.vision']);
 export function createCloseJob(deps: { env?: NodeJS.ProcessEnv; now?: () => Date; get?: () => InfoGet;
-  assets?: readonly { symbol: string; pair: string }[]; save?: (batch: InfoBatch) => Promise<{ events: number; markets: number }>;
+  assets?: readonly ModelAsset[]; save?: (batch: InfoBatch) => Promise<{ events: number; markets: number }>;
   lock?: (action: () => Promise<void>) => Promise<void>; log?: (result: InfoCollectorResult) => void } = {}) {
   let busy = false, nextRun = 0;
   return async (): Promise<InfoCollectorResult[]> => {
@@ -69,13 +70,43 @@ export function createCloseJob(deps: { env?: NodeJS.ProcessEnv; now?: () => Date
       let results: InfoCollectorResult[] = [];
       await (deps.lock ?? withInfoJobLock)(async () => {
         nextRun = now.getTime() + DAY_MS;
-        // Unfiltered exchangeInfo is ~18 MB (over MAX_SOURCE_BYTES); the all-symbol price list is ~160 KB and
-        // also lists pairs in BREAK status (SNDKBUSDT on 2026-11-20); klines alone decide which closes exist.
-        const pairs = new Set(list(json(await (deps.get ?? getBinance)()('https://data-api.binance.vision/api/v3/ticker/price')))
-          .map(value => text(object(value).symbol)));
+        const get = (deps.get ?? createMarketGet)();
+        let pairs: Promise<Set<string>> | undefined;
+        const yahoo = new Map<string, Promise<string>>();
+        const yahooGet = (ticker: string) => {
+          const url = yahooUrl(ticker);
+          let pending = yahoo.get(url);
+          if (!pending) { pending = get(url); yahoo.set(url, pending); }
+          return pending;
+        };
         results = await runInfoCollectors((deps.assets ?? MODEL_ASSETS).map(asset => ({ name: `close:${asset.symbol}`, collect: async () => {
-          if (!pairs.has(asset.pair)) throw new InfoSourceError('pair_not_found');
-          return collectCloses(asset, (deps.get ?? getBinance)(), now);
+          let series = closeSeries(asset), batch: InfoBatch;
+          const source = asset.source;
+          if (source?.kind === 'yahoo') {
+            const collect = async (ticker: string): Promise<InfoBatch> => {
+              let points = parseYahoo(await yahooGet(ticker), ticker, source.currency, lastClosedDay(now));
+              if (!points.length) throw new InfoSourceError('missing_history');
+              if (source.fx) points = inDollars(points, parseYahoo(await yahooGet(source.fx), source.fx, source.currency, lastClosedDay(now)));
+              return { events: [], markets: points.map(p => ({ series, observedOn: p.date, value: p.value, source: 'yahoo', sourceUrl: yahooUrl(ticker) })) };
+            };
+            try { batch = await collect(source.ticker); }
+            catch (error) {
+              if (!source.fallback) throw error;
+              series = closeSeries(asset, true); batch = await collect(source.fallback);
+            }
+          } else {
+            // The lightweight price list includes halted pairs; klines alone decide which closes exist.
+            pairs ??= get('https://data-api.binance.vision/api/v3/ticker/price').then(raw => new Set(list(json(raw)).map(value => text(object(value).symbol))));
+            if (!(await pairs).has(asset.pair)) {
+              if (source?.kind !== 'binance' || !source.seasoned) throw new InfoSourceError('pair_not_found');
+              batch = { events: [], markets: [] }; // An explicitly unlisted constituent is a known absence, not a source failure.
+            } else batch = await collectCloses(asset, get, now);
+          }
+          // A successfully checked closed day is separate evidence from a carried holiday close.
+          // Missing evidence on a failed round makes that fund unavailable, rather than inventing flat returns.
+          batch.markets.push({ series: checkedSeries(series), observedOn: lastClosedDay(now), value: '1',
+            source: source?.kind === 'yahoo' ? 'yahoo' : 'binance', sourceUrl: batch.markets[0]?.sourceUrl ?? klineUrl(asset.pair, Date.parse(backfillStart(now)), now.getTime()) });
+          return batch;
         } })), deps.save, deps.log);
       });
       return results;

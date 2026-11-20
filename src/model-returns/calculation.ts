@@ -7,10 +7,11 @@ export type ClosePoint = { date: string; value: string };
 export type ModelWeight = { symbol: string; weightBps: number };
 export type ModelReturns = { asOf: string; d7: string | null; d30: string | null; d90: string | null; y1: string | null; all: string | null;
   annualized: string | null };
-/** Minimum modelNav head-to-tail span for `annualized`; pending a user decision (30 or 90). Change only here. */
+/** Minimum modelNav head-to-tail span for `annualized`; retained at 30 calendar days by #176. */
 export const MODEL_ANNUALIZED_MIN_DAYS = 30;
-export type ModelResult = { modelReturns: ModelReturns | null; modelNav: ClosePoint[] };
-export const emptyModel = (): ModelResult => ({ modelReturns: null, modelNav: [] });
+export type ModelComponent = { symbol: string; includedFrom: string | null };
+export type ModelResult = { modelReturns: ModelReturns | null; modelNav: ClosePoint[]; modelComponents: ModelComponent[] };
+export const emptyModel = (): ModelResult => ({ modelReturns: null, modelNav: [], modelComponents: [] });
 
 /** Bounded exact decimal input. Zero/negative prices are missing data, never a flat return. */
 export function price(raw: unknown): bigint {
@@ -49,12 +50,17 @@ export function lastClosedDay(now = new Date()): string {
   return new Date(Math.floor(now.getTime() / DAY_MS) * DAY_MS - DAY_MS).toISOString().slice(0, 10);
 }
 
-/** Independent windows: an old gap invalidates ALL, but never invalidates a complete recent 7D. */
+/**
+ * Origin is the earliest retained backfill date across the catalogue, never the moving display cutoff.
+ * Available components share their original target weights proportionally. An admission rebalances at that
+ * day's close; only the next day's return includes the newcomer (no pre-admission price jump).
+ */
 export function calculateModel(weights: readonly ModelWeight[], history: ReadonlyMap<string, readonly ClosePoint[]>, asOf: string): ModelResult {
   day(asOf);
   if (!weights.length || weights.some(w => !Number.isInteger(w.weightBps) || w.weightBps <= 0 || w.weightBps > 10_000) ||
       weights.reduce((sum, w) => sum + w.weightBps, 0) !== 10_000 || new Set(weights.map(w => w.symbol)).size !== weights.length) return emptyModel();
-  const series: { weight: bigint; points: Map<string, bigint>; first: string }[] = [];
+  const origin = [...history.values()].flatMap(points => points.filter(p => p.date <= asOf).map(p => p.date)).sort()[0];
+  const series: { symbol: string; weight: bigint; points: Map<string, bigint>; includedFrom: string | null }[] = [];
   for (const weight of weights) {
     const points = new Map<string, bigint>();
     for (const point of history.get(weight.symbol) ?? []) {
@@ -66,45 +72,50 @@ export function calculateModel(weights: readonly ModelWeight[], history: Readonl
       } catch { return emptyModel(); }
     }
     const first = [...points.keys()].sort()[0];
-    if (!first || !points.has(asOf)) return emptyModel();
-    series.push({ weight: BigInt(weight.weightBps), points, first });
+    const needsSeasoning = weight.symbol === 'ANTB' || weight.symbol === 'SPCXB' || (first !== undefined && origin !== undefined && first > origin);
+    const eligible = first ? new Date(Date.parse(first) + (needsSeasoning ? 30 : 0) * DAY_MS).toISOString().slice(0, 10) : null;
+    series.push({ symbol: weight.symbol, weight: BigInt(weight.weightBps), points, includedFrom: eligible && eligible <= asOf ? eligible : null });
   }
-  const first = series.reduce((latest, s) => s.first > latest ? s.first : latest, '1970-01-01');
-  if (first >= asOf) return emptyModel();
+  const modelComponents = series.map(s => ({ symbol: s.symbol, includedFrom: s.includedFrom }));
+  const first = series.flatMap(s => s.includedFrom ? [s.includedFrom] : []).sort()[0];
+  if (!first) return { ...emptyModel(), modelComponents };
   const end = Date.parse(asOf);
-  const nav = (start: string): { date: string; value: bigint }[] | null => {
-    if (start < first) return null;
-    let previous: bigint[] | null = null, value = SCALE;
-    const result: { date: string; value: bigint }[] = [];
-    for (let at = Date.parse(start); at <= end; at += DAY_MS) {
-      const date = new Date(at).toISOString().slice(0, 10);
-      const prices = series.map(s => s.points.get(date));
-      if (prices.some(p => p === undefined)) return null;
-      const current: bigint[] = [];
-      let factor = 0n;
-      for (const [index, s] of series.entries()) {
-        const close = prices[index], before = previous?.[index];
-        if (close === undefined) return null;
-        current.push(close);
-        if (before !== undefined) factor += rounded(close * s.weight * SCALE, before);
-      }
-      if (previous) value = rounded(value * factor, 10_000n * SCALE);
-      if (value <= 0n) return null;
-      result.push({ date, value }); previous = current;
+  let value = SCALE;
+  const previous = new Map<string, bigint>();
+  let active: typeof series = [];
+  const all: { date: string; value: bigint }[] = [];
+  // Read prices before the first admission as well, so an IPO admitted on a holiday uses its last actual close.
+  const start = [...series.flatMap(s => [...s.points.keys()])].sort()[0];
+  if (!start) return { ...emptyModel(), modelComponents };
+  for (let at = Date.parse(start); at <= end; at += DAY_MS) {
+    const date = new Date(at).toISOString().slice(0, 10);
+    const current = new Map(previous);
+    for (const s of series) {
+      const close = s.points.get(date);
+      if (close !== undefined) current.set(s.symbol, close);
     }
-    return result;
+    if (active.length) {
+      let factor = 0n, total = 0n;
+      for (const s of active) {
+        const close = current.get(s.symbol), before = previous.get(s.symbol);
+        if (close === undefined || before === undefined) return { ...emptyModel(), modelComponents };
+        factor += rounded(close * s.weight * SCALE, before); total += s.weight;
+      }
+      value = rounded(value * factor, total * SCALE);
+      if (value <= 0n) return { ...emptyModel(), modelComponents };
+    }
+    active = series.filter(s => s.includedFrom !== null && s.includedFrom <= date);
+    if (active.length) all.push({ date, value });
+    previous.clear(); for (const [symbol, close] of current) previous.set(symbol, close);
+  }
+  const returns = (startDate: string): string | null => {
+    const head = all.find(point => point.date === startDate), tail = all.at(-1);
+    return head && tail ? format(rounded((tail.value - head.value) * SCALE * 100n, head.value), 8) : null;
   };
-  const returns = (points: ReturnType<typeof nav>): string | null => {
-    const last = points?.at(-1);
-    return last ? format((last.value - SCALE) * 100n, 8) : null;
-  };
-  const all = nav(first);
-  const period = (days: number) => returns(nav(new Date(end - days * DAY_MS).toISOString().slice(0, 10)));
-  const cutoff = new Date(asOf);
-  cutoff.setUTCFullYear(cutoff.getUTCFullYear() - 2);
-  // Feb 29 normalizes to Mar 1 in a non-leap start year, keeping the range within two years.
-  const modelNav = (all ?? []).filter(p => p.date >= cutoff.toISOString().slice(0, 10)).slice(-MAX_NAV_POINTS)
+  const period = (days: number) => returns(new Date(end - days * DAY_MS).toISOString().slice(0, 10));
+  const cutoff = new Date(asOf); cutoff.setUTCFullYear(cutoff.getUTCFullYear() - 2);
+  const modelNav = all.filter(p => p.date >= cutoff.toISOString().slice(0, 10)).slice(-MAX_NAV_POINTS)
     .map(p => ({ date: p.date, value: format(p.value, 12) }));
-  return { modelReturns: { asOf, d7: period(7), d30: period(30), d90: period(90), y1: period(365), all: returns(all),
-    annualized: annualizedReturn(modelNav) }, modelNav };
+  return { modelReturns: { asOf, d7: period(7), d30: period(30), d90: period(90), y1: period(365), all: returns(first),
+    annualized: annualizedReturn(modelNav) }, modelNav, modelComponents };
 }

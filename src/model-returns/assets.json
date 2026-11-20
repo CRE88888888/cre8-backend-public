@@ -2,201 +2,403 @@
   {
     "symbol": "AAPLB",
     "address": "0x431a3bee82e2ca41e49895cbece5bb0f76a89b7a",
-    "pair": "AAPLBUSDT"
+    "pair": "AAPLBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "AAPL",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "AMCB",
     "address": "0x96e7d606e229448ef817a7f35fd7394c3e15d00c",
-    "pair": "AMCBUSDT"
+    "pair": "AMCBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "AMC",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "AMZNB",
     "address": "0x1a4b499833a79a09ad7cf1d42d7dacf71e92eb00",
-    "pair": "AMZNBUSDT"
+    "pair": "AMZNBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "AMZN",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "ANTB",
     "address": "0x38dd26788cf2d901e3abf04efe3007d459d0fc53",
-    "pair": "ANTBUSDT"
+    "pair": "ANTBUSDT",
+    "source": {
+      "kind": "binance",
+      "pair": "ANTBUSDT",
+      "seasoned": true
+    }
   },
   {
     "symbol": "AVGOB",
     "address": "0x76682c454467b3a1150ad8b6a92fc5ee2c21d7ed",
-    "pair": "AVGOBUSDT"
+    "pair": "AVGOBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "AVGO",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "BABAB",
     "address": "0x4ef9d3062c7f6eba4aae4990c5036598c6eff4ec",
-    "pair": "BABABUSDT"
+    "pair": "BABABUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "BABA",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "BMNRB",
     "address": "0x3548da95a9effe481e8604664d75e95821e557f5",
-    "pair": "BMNRBUSDT"
+    "pair": "BMNRBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "BMNR",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "BNCB",
     "address": "0x4902c5ebc598265ed2212b559b042de8a5eeec3f",
-    "pair": "BNCBUSDT"
+    "pair": "BNCBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "BNC",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "BTCB",
     "address": "0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c",
-    "pair": "BTCUSDT"
+    "pair": "BTCUSDT",
+    "source": {
+      "kind": "binance",
+      "pair": "BTCUSDT",
+      "seasoned": false
+    }
   },
   {
     "symbol": "COINB",
     "address": "0x585bde7c54abb5ccd7791f923d6c2187635f3952",
-    "pair": "COINBUSDT"
+    "pair": "COINBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "COIN",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "CRCLB",
     "address": "0x80f3d493ebce97e343c53d29a137942416b4ffc0",
-    "pair": "CRCLBUSDT"
+    "pair": "CRCLBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "CRCL",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "CYPHB",
     "address": "0x0393c28065c54e48b45bdb05eff5c401cf891da1",
-    "pair": "CYPHBUSDT"
+    "pair": "CYPHBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "CYPH",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "DJTB",
     "address": "0xf2ec508422174ee564de98187db9359d318afb6b",
-    "pair": "DJTBUSDT"
+    "pair": "DJTBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "DJT",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "DOGE",
     "address": "0xba2ae424d960c26247dd6c32edc70b295c744c43",
-    "pair": "DOGEUSDT"
+    "pair": "DOGEUSDT",
+    "source": {
+      "kind": "binance",
+      "pair": "DOGEUSDT",
+      "seasoned": false
+    }
   },
   {
     "symbol": "EWYB",
     "address": "0xbe82f76637dba2c114c41df856c2c51e522e2cb8",
-    "pair": "EWYBUSDT"
+    "pair": "EWYBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "EWY",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "GMEB",
     "address": "0x46ceefda28dd7207059ed19b0acdc026955bb15c",
-    "pair": "GMEBUSDT"
+    "pair": "GMEBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "GME",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "GOOGLB",
     "address": "0x3f53de71c126bdabae20f9cd64848d317f6c3238",
-    "pair": "GOOGLBUSDT"
+    "pair": "GOOGLBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "GOOGL",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "HOODB",
     "address": "0xa394dcea3fd3847fd793afbfd163e2e3858b7c65",
-    "pair": "HOODBUSDT"
+    "pair": "HOODBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "HOOD",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "INTCB",
     "address": "0xe614e2fc6c787035ff51f452e8e826bfd32d5283",
-    "pair": "INTCBUSDT"
+    "pair": "INTCBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "INTC",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "METAB",
     "address": "0x7425889fe94f9d693e8daefe88bcced6acfef4c0",
-    "pair": "METABUSDT"
+    "pair": "METABUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "META",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "MRVLB",
     "address": "0x16cd4fe7e8880ecc3ba222795229e20489fc2c76",
-    "pair": "MRVLBUSDT"
+    "pair": "MRVLBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "MRVL",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "MSFTB",
     "address": "0x80106cb3ead06659a5ad19df39d9b4733863b9b0",
-    "pair": "MSFTBUSDT"
+    "pair": "MSFTBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "MSFT",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "MSTRB",
     "address": "0xe87afb3076aeb0f9b14e368de8145ae6a2826a14",
-    "pair": "MSTRBUSDT"
+    "pair": "MSTRBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "MSTR",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "MUB",
     "address": "0xcdf2f3e0fa43c47a6662a91c9e4a7c5f69762699",
-    "pair": "MUBUSDT"
+    "pair": "MUBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "MU",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "NFLXB",
     "address": "0xd6829ea836b6fa224d099d40e54b31262f874631",
-    "pair": "NFLXBUSDT"
+    "pair": "NFLXBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "NFLX",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "NVDAB",
     "address": "0x02fca66c1d1afb4e2a7884261eb00f63598a7436",
-    "pair": "NVDABUSDT"
+    "pair": "NVDABUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "NVDA",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "PDDB",
     "address": "0x95b0409679b55c31772daa2fb4bee7b125b77521",
-    "pair": "PDDBUSDT"
+    "pair": "PDDBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "PDD",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "PENGB",
     "address": "0x7f732f9d2f2ea3e7e223c2e737e5257007f90e01",
-    "pair": "PENGBUSDT"
+    "pair": "PENGBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "PENG",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "QQQB",
     "address": "0x205812cdbed920aff76c6580abd681a46d11efc7",
-    "pair": "QQQBUSDT"
+    "pair": "QQQBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "QQQ",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "RDDTB",
     "address": "0x41622a9125a22767df8c1dc79fc17299bac4bd0b",
-    "pair": "RDDTBUSDT"
+    "pair": "RDDTBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "RDDT",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "SKHYB",
     "address": "0xca750ef65f295bbecd685abf54e82caf297bdb61",
-    "pair": "SKHYBUSDT"
+    "pair": "SKHYBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "000660.KS",
+      "currency": "KRW",
+      "fx": "KRW=X"
+    }
   },
   {
     "symbol": "SNDKB",
     "address": "0x3ee4df61bd4f867e349beae8bfe07bc31b4850fb",
-    "pair": "SNDKBUSDT"
+    "pair": "SNDKBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "SNDK",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "SOXLB",
     "address": "0xd97d097a89113fa59b76c572e5b2eb647e8eefaf",
-    "pair": "SOXLBUSDT"
+    "pair": "SOXLBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "SOXL",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "SPCXB",
     "address": "0xbe9d156892e55e7154bcd3cb0fea677f9d3103e1",
-    "pair": "SPCXBUSDT"
+    "pair": "SPCXBUSDT",
+    "source": {
+      "kind": "binance",
+      "pair": "SPCXBUSDT",
+      "seasoned": true
+    }
   },
   {
     "symbol": "SPYB",
     "address": "0x7138b48df7d98d7e3cc221bfe7192d0a178182d8",
-    "pair": "SPYBUSDT"
+    "pair": "SPYBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "SPY",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "TQQQB",
     "address": "0x462b5f13b7c7748279358962925c5de83bb9e598",
-    "pair": "TQQQBUSDT"
+    "pair": "TQQQBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "TQQQ",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "TSLAB",
     "address": "0x5b1910eaad6450e50f816082aa078c41f10c292f",
-    "pair": "TSLABUSDT"
+    "pair": "TSLABUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "TSLA",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "TSMB",
     "address": "0xab78b89b5bb00236be0b4b20704cbfa04efc711c",
-    "pair": "TSMBUSDT"
+    "pair": "TSMBUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "TSM",
+      "currency": "USD"
+    }
   },
   {
     "symbol": "WBNB",
     "address": "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",
-    "pair": "BNBUSDT"
+    "pair": "BNBUSDT",
+    "source": {
+      "kind": "binance",
+      "pair": "BNBUSDT",
+      "seasoned": false
+    }
   },
   {
     "symbol": "XAUT",
     "address": "0x21caef8a43163eea865baee23b9c2e327696a3bf",
-    "pair": "XAUTUSDT"
+    "pair": "XAUTUSDT",
+    "source": {
+      "kind": "yahoo",
+      "ticker": "XAUT-USD",
+      "currency": "USD",
+      "fallback": "GC=F"
+    }
   }
 ]

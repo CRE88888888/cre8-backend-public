@@ -1,4 +1,4 @@
-// Public Binance GETs and market_snapshots only. No trading or signing configuration is needed.
+// Public Yahoo/Binance GETs and market_snapshots only. No trading or signing configuration is needed.
 import { config as loadDotenv } from 'dotenv';
 import { closePool } from '../src/db.js';
 import { createCloseJob } from '../src/model-returns/collector.js';

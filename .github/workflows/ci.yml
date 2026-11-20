@@ -54,6 +54,7 @@ jobs:
           DATABASE_URL: postgres://ci:ci@127.0.0.1:1/unused
         run: >-
           bun test
+          test/mix-publication-nonce.test.ts
           test/mix-publication.test.ts
           test/mix-registration.test.ts
           test/mix-chain.test.ts

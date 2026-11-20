@@ -18,7 +18,7 @@ import { UnauthorizedError } from '../src/errors.js';
 import { RequestRateLimiter, MemoryRateLimitStore } from '../src/ratelimit.js';
 import { loadRateLimitConfig } from '../src/config.js';
 import { syncMixAccountFlows, syncMixEnrollmentFlows } from '../src/mix-flows.js';
-import { loadMixRuntime, decideMixTick, prepareMixTick } from '../src/mix-runtime.js';
+import { loadMixRuntime, decideMixTick, prepareMixTick, recordMixSwitchResidual } from '../src/mix-runtime.js';
 import { recordMixExitFailure, MIX_EXIT_MAX_RETRIES } from '../src/mix-runtime.js';
 import { claimDuePortfolios } from '../src/scheduler.js';
 import { RateLimitError } from '../src/ratelimit.js';
@@ -274,7 +274,7 @@ test('backend reconciles a lost App switch response; unsigned timeout/cancel rel
   });
 });
 
-test('restart rejects unavailable valuation; exit failures stop at five attempts and create one durable alert', async () => {
+test('restart rejects unavailable valuation; persistent exit backoff and alert throttling use the same exact boundaries', async () => {
   await fixture(async (service, db, deps) => {
     const made = await service.create({ assets: [{ assetId: T.assets.NVDAB.token, weightBps: 10000 }] }, owner, randomUUID());
     const joined = await service.confirm(made.mixId, owner, { txHash: toHex(54n, { size: 32 }) }); assert.ok(joined.portfolioId);
@@ -307,6 +307,19 @@ test('restart rejects unavailable valuation; exit failures stop at five attempts
     assert.equal((await db.query('select * from scheduler_alerts where portfolio_id=$1 and resolved_at is null', [joined.portfolioId])).rows.length, 1,
       'the normal alert round must preserve a paused mix exit requiring attention');
     assert.equal((await db.query("select * from user_notifications where portfolio_id=$1 and kind='mix_exit_stuck'", [joined.portfolioId])).rows.length, 1);
+    let at = mixClock.getTime();
+    for (const [index, delay] of [300000, 900000, 3600000, 21600000].entries()) {
+      at += delay;
+      await recordMixExitFailure({ id: String(made.mixId) }, due, new Date(at), work => work({ query: find }));
+      const state = await loadMixRuntime(due, find, undefined, async () => ({ hash: zeroHash, at: mixClock })); assert.ok(state);
+      assert.equal(state.retries, Math.min(8, 6 + index));
+      const nextDelay = [900000, 3600000, 21600000, 21600000][index]; assert.ok(nextDelay);
+      assert.equal((await claim(new Date(at + nextDelay - 1))).some(p => p.portfolioId === joined.portfolioId), false);
+      assert.equal((await claim(new Date(at + nextDelay))).some(p => p.portfolioId === joined.portfolioId), true);
+      assert.equal((await db.query("select * from user_notifications where portfolio_id=$1 and kind='mix_exit_stuck'", [joined.portfolioId])).rows.length, index < 3 ? 1 : 2);
+    }
+    await recordMixExecution(find, joined.portfolioId, 'recovered-after-backoff', 'rebalance');
+    const reset = await loadMixRuntime(due, find, undefined, async () => ({ hash: zeroHash, at: mixClock })); assert.equal(reset?.retries, 0); assert.equal(reset?.lastExitAttempt, null);
   });
 });
 
@@ -595,5 +608,52 @@ test('a switched mix settles its real handover funding job and still owes an exi
     assert.equal(tick.plan.targets.find(a => a.asset === T.assets.NVDAB.token)?.weightBps, 0);
     assert.equal(tick.plan.targets.find(a => a.asset === T.assets.TSLAB.token)?.weightBps, 5000);
     await db.query('set constraints all immediate');
+  });
+});
+
+test('a switched mix keeps its forced pass after a crypto batch until its closed stock exits are resolved', async () => {
+  await fixture(async (service, db) => {
+    const made = await service.create({ assets: [{ assetId: T.assets.NVDAB.token, weightBps: 10000 }] }, owner, randomUUID());
+    await service.confirm(made.mixId, owner, { txHash: toHex(80n, { size: 32 }) });
+    await service.patch(made.mixId, owner, { assets: [{ assetId: T.assets.TSLAB.token, weightBps: 10000 }] });
+    const switched = await service.confirm(made.mixId, owner, { txHash: toHex(81n, { size: 32 }) }); assert.ok(switched.portfolioId);
+    const find: import('../src/scheduler.js').SchedulerQueryFn = (sql, args) => db.query(sql, args ? [...args] : []);
+    await recordMixExecution(find, switched.portfolioId, 'crypto-sold-stock-closed', 'rebalance');
+    assert.equal((await db.query('select last_rebalanced_at from mixes where id=$1', [made.mixId])).rows[0]?.last_rebalanced_at, null);
+    await db.query('update mixes set last_rebalanced_at=$2 where id=$1', [made.mixId, mixClock]);
+    await recordMixExecution(find, switched.portfolioId, 'ordinary-period-batch', 'rebalance');
+    const ordinary = (await db.query('select last_rebalanced_at from mixes where id=$1', [made.mixId])).rows[0]?.last_rebalanced_at;
+    assert.ok(ordinary instanceof Date, 'ordinary period still completes on one batch');
+  });
+});
+
+test('a below-batch switch residue and completion are atomic, immutable and idempotent after an unknown response', async () => {
+  await fixture(async (service, db) => {
+    const made = await service.create({ assets: [{ assetId: T.assets.NVDAB.token, weightBps: 10000 }] }, owner, randomUUID());
+    await service.confirm(made.mixId, owner, { txHash: toHex(82n, { size: 32 }) });
+    await service.patch(made.mixId, owner, { assets: [{ assetId: T.assets.TSLAB.token, weightBps: 10000 }] });
+    const switched = await service.confirm(made.mixId, owner, { txHash: toHex(83n, { size: 32 }) }); assert.ok(switched.portfolioId);
+    const find: import('../src/scheduler.js').SchedulerQueryFn = (sql, args) => db.query(sql, args ? [...args] : []);
+    const due = { portfolioId: switched.portfolioId, strategyId: made.strategyId, account: made.account, accountType: 'KERNEL', intervalSeconds: 60, unsupportedReason: null, nextRunAt: mixClock };
+    const state = await loadMixRuntime(due, find); assert.ok(state);
+    const { plan } = mixRuntimeFixture(); plan.account = made.account; plan.portfolioId = switched.portfolioId; plan.snapshot.portfolioId = switched.portfolioId;
+    for (const h of plan.snapshot.holdings) h.amountWei = h.asset === T.assets.NVDAB.token ? 2n * WAD : 0n;
+    const at = new Date('2026-11-23T15:00Z'), anchor = async () => ({ hash: zeroHash, at: mixClock });
+    await db.query('savepoint residual_rollback');
+    await assert.rejects(recordMixSwitchResidual(state, due, plan, at, async work => {
+      try { await work({ query: find }); throw new Error('fixture commit failure'); }
+      finally { await db.query('rollback to savepoint residual_rollback'); }
+    }, anchor));
+    assert.equal((await db.query("select * from user_notifications where portfolio_id=$1 and kind='mix_switch_residual'", [switched.portfolioId])).rows.length, 0);
+    assert.equal((await db.query('select last_rebalanced_at from mixes where id=$1', [made.mixId])).rows[0]?.last_rebalanced_at, null);
+    assert.equal(await recordMixSwitchResidual(state, due, plan, at, work => work({ query: find }), anchor), true);
+    assert.equal(await recordMixSwitchResidual(state, due, plan, at, work => work({ query: find }), anchor), false);
+    const audit = (await db.query("select id,payload from user_notifications where portfolio_id=$1 and kind='mix_switch_residual'", [switched.portfolioId])).rows[0]; assert.ok(audit);
+    assert.equal(audit.payload.residuals[0]?.quantityRaw, (2n * WAD).toString());
+    assert.equal(audit.payload.blockHash, zeroHash); assert.equal(audit.payload.reason, 'below_batch_minimum');
+    assert.deepEqual((await db.query('select last_rebalanced_at from mixes where id=$1', [made.mixId])).rows[0]?.last_rebalanced_at, at);
+    await db.query('savepoint immutable_residual');
+    await assert.rejects(db.query("update user_notifications set payload='{}' where id=$1", [audit.id]));
+    await db.query('rollback to savepoint immutable_residual');
   });
 });

@@ -34,7 +34,7 @@ async function prepareSwitchIntent() {
       data: encodeFunctionData({ abi: REGISTRY_ABI, functionName: 'enroll', args: [account, BigInt(target.strategy_id), 1] }) }])]);
 }
 async function sandbox(work: (lane: <R>(fn: () => Promise<R>) => Promise<R>) => Promise<void>, pending = true) {
-  assert.equal((await getPool().query<{ name: string }>('select current_database() as name')).rows[0]?.name, 'cre8_x1_178');
+  assert.ok(['cre8_x1_178', 'cre8_x1_180'].includes((await getPool().query<{ name: string }>('select current_database() as name')).rows[0]?.name ?? ''));
   const schema = 'mix178_' + randomBytes(8).toString('hex');
   await getPool().query(`create schema ${schema}`);
   const lane = <R>(fn: () => Promise<R>): Promise<R> => withConnection(async (client, discard) => {

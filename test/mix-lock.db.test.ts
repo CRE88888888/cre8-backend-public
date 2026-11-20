@@ -24,7 +24,7 @@ test('stable mix exclusion covers RPC waits, independent workers, different port
   assert.equal(attempted, 3);
 });
 test('lost stable lock prevents sending after an RPC wait and discards the dead connection', async () => {
-  assert.equal((await query<{ name: string }>('select current_database() as name')).rows[0]?.name, 'cre8_x1_178');
+  assert.ok(['cre8_x1_178', 'cre8_x1_180'].includes((await query<{ name: string }>('select current_database() as name')).rows[0]?.name ?? ''));
   const entered = barrier(), remote = barrier();
   let pid: number | undefined, sent = 0;
   const first = withMixLock('178000000003', async () => {
@@ -36,7 +36,7 @@ test('lost stable lock prevents sending after an RPC wait and discards the dead 
   try {
     await entered.promise; assert.ok(pid);
     const result = await getPool().query<{ stopped: boolean }>(`select pg_terminate_backend(pid) as stopped from pg_stat_activity
-      where pid=$1 and datname='cre8_x1_178' and application_name='cre8-atp-backend'`, [pid]);
+      where pid=$1 and datname=current_database() and application_name='cre8-atp-backend'`, [pid]);
     assert.equal(result.rows[0]?.stopped, true);
     // A round trip on another connection gives the server's disconnect notification
     // a chance to arrive before the simulated RPC completes.

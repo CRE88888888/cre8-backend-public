@@ -2,6 +2,9 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { withConnection } from './db.js';
 import { AppError } from './errors.js';
 import type { Address, PublicClient } from 'viem';
+import { recordAlerts } from './alerts.js';
+
+export const PUBLICATION_NONCE_GUARD_MS = 10 * 60_000;
 
 const relayerScope = new AsyncLocalStorage<{ floors: Map<string, bigint>; assertHeld: () => void }>();
 
@@ -13,22 +16,34 @@ export async function relayerNonce(client: PublicClient, signer: Address, chainI
   const floor = scope.floors.get(signer.toLowerCase());
   if (floor === undefined) return {};
   scope.assertHeld();
-  const read = async () => {
+  const deadlineAt = Date.now() + 5000;
+  const read = async (blockTag: 'pending' | 'latest') => {
+    const ms = deadlineAt - Date.now();
+    if (ms < 1) throw new Error('nonce unavailable');
     let timer: ReturnType<typeof setTimeout> | undefined;
-    try { return await Promise.race([client.getTransactionCount({ address: signer, blockTag: 'pending' }),
-      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('nonce unavailable')), 5000); })]); }
+    try { return await Promise.race([client.getTransactionCount({ address: signer, blockTag }),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('nonce unavailable')), ms); })]); }
     finally { clearTimeout(timer); }
   };
   try {
-    let pending = await read();
+    let pending: number;
+    try { pending = await read('pending'); } catch { pending = await read('pending'); }
+    const latest = await read('latest');
+    if (!Number.isSafeInteger(latest) || latest < 0 || !Number.isSafeInteger(pending) || pending < 0) throw new Error('invalid relayer nonce');
+    pending = Math.max(pending, latest);
     if (!Number.isSafeInteger(pending) || pending < 0) throw new Error('invalid relayer nonce');
     if (BigInt(pending) <= floor) {
       // Queued transactions above a gap are absent from some pending-nonce replies.
       // Fill the original publication gap before admitting a fresh transaction.
-      try { await (await import('./mix-publication.js')).replayPublicationNonceGap(client, signer, BigInt(pending), scope.assertHeld); }
-      catch { /* Recheck even if an identical original was already known to the node. */ }
-      pending = await read();
-      if (!Number.isSafeInteger(pending) || pending < 0 || BigInt(pending) <= floor) throw new Error('relayer nonce gap remains occupied');
+      const replayed = await (await import('./mix-publication.js')).replayPublicationNonceGap(client, signer, BigInt(pending), scope.assertHeld, deadlineAt);
+      pending = await read('pending');
+      if (!Number.isSafeInteger(pending) || pending < 0) throw new Error('invalid relayer nonce');
+      // Some nodes omit queued originals from pending. A contiguous range of
+      // validated, acknowledged originals supplies our own floor under this lock.
+      if (BigInt(pending) <= floor) {
+        if (replayed === null || replayed < floor || floor >= BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('relayer nonce gap remains occupied');
+        pending = Number(floor + 1n);
+      }
     }
     scope.assertHeld();
     return { nonce: pending };
@@ -39,7 +54,7 @@ export async function relayerNonce(client: PublicClient, signer: Address, chainI
  * across API processes; reject busy work before reserving quota. Never wait holding pool clients.
  * This is a session lock, not a transaction: quota transactions contain no RPC.
  */
-export async function withRelayerLock<T>(chainId: number, action: (assertHeld: () => void) => Promise<T>, options: { reconcile?: boolean } = {}): Promise<T> {
+export async function withRelayerLock<T>(chainId: number, action: (assertHeld: () => void) => Promise<T>, options: { reconcile?: boolean; now?: Date } = {}): Promise<T> {
   if (chainId !== 97) return action(() => {});
   const unavailable = () => new AppError(503, 'RELAYER_BUSY', 'testnet relayer unavailable; retry later');
   if (relayerScope.getStore()) throw unavailable();
@@ -65,8 +80,19 @@ export async function withRelayerLock<T>(chainId: number, action: (assertHeld: (
         .catch(() => { throw unavailable(); });
       if (unresolved.rows.length > 0 && !options.reconcile) throw unavailable();
       assertHeld();
-      const publications = await client.query<{ signer: string; nonce: string }>(`select signer,max(nonce)::text as nonce
-        from mix_publication_outbox where chain_id=97 group by signer`).catch(() => { throw unavailable(); });
+      const now = options.now ?? new Date();
+      const expired = await client.query<{ strategy_id: string }>(`select j.strategy_id from mix_publication_jobs j
+        where j.chain_id=97 and j.state<>'confirmed' and j.alerted_at is null and exists
+          (select 1 from mix_publication_outbox o where o.strategy_id=j.strategy_id and o.created_at<=$1::timestamptz-interval '${PUBLICATION_NONCE_GUARD_MS} milliseconds')`, [now]).catch(() => { throw unavailable(); });
+      if (expired.rows.length) {
+        await recordAlerts((sql, params) => client.query(sql, params ? [...params] : []), [{ kind: 'portfolio_stuck', severity: 'critical', portfolioId: null,
+          detail: '私人組合發布 nonce 等待已達十分鐘；停止以該原簽阻擋共用 relayer，請營運對帳及補洞。原簽與證據保留。' }], now);
+        await client.query('update mix_publication_jobs set alerted_at=coalesce(alerted_at,$2) where strategy_id=any($1::bigint[])', [expired.rows.map(row => row.strategy_id), now]);
+      }
+      const publications = await client.query<{ signer: string; nonce: string }>(`select o.signer,max(o.nonce)::text as nonce
+        from mix_publication_outbox o left join mix_publication_nonce_consumptions c using(strategy_id,attempt)
+        where o.chain_id=97 and c.strategy_id is null and o.created_at>$1::timestamptz-interval '${PUBLICATION_NONCE_GUARD_MS} milliseconds'
+        group by o.signer`, [now]).catch(() => { throw unavailable(); });
       const floors = new Map<string, bigint>();
       for (const row of publications.rows) {
         if (!/^0x[0-9a-f]{40}$/.test(row.signer) || !/^(0|[1-9][0-9]*)$/.test(row.nonce)) throw unavailable();

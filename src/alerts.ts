@@ -249,7 +249,7 @@ export async function detectAlerts(
       const fields = row as Record<string, unknown>;
       const portfolioId = toInteger(fields.portfolio_id, 'portfolio_id');
       const count = toInteger(fields.exit_retry_count, 'exit_retry_count');
-      const detail = `私人組合退出已失敗 ${count} 次，已告警並進入五分鐘冷卻，系統將重新確認條件後續作；持倉與原始證據仍保留。`;
+      const detail = `私人組合退出已連續失敗至少 ${count} 次，已告警並依 5 分鐘、15 分鐘、1 小時至每 6 小時上限退避，系統將重新確認條件後續作；持倉與原始證據仍保留。`;
       const prior = stuck.find(finding => finding.portfolioId === portfolioId);
       if (prior) { prior.severity = 'critical'; prior.detail += '；' + detail; }
       else stuck.push({ kind: 'portfolio_stuck', severity: 'critical', portfolioId, detail });

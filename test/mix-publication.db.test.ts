@@ -326,8 +326,8 @@ test('the native gas faucet also signs above a durable unpublished mix nonce', a
       const config = loadGasFaucetConfig({ CHAIN_ID: '97', GAS_FAUCET_ENABLED: '1' }); assert.ok(config);
       const chain = createGasFaucetChain(config, { chainId: 97, rpcUrl: `http://127.0.0.1:${address.port}`,
         operatorPrivateKey: '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80' });
-      await assert.rejects(withRelayerLock(97, async held => { const prepared = await chain.prepare(T.roles.keeper, config.targetWei); held(); await prepared.broadcast(); }), { code: 'RELAYER_BUSY' });
-      assert.equal(nonce, -1, 'an unfilled gap cannot authorize a fresh native transaction');
+      await withRelayerLock(97, async held => { const prepared = await chain.prepare(T.roles.keeper, config.targetWei); held(); await prepared.broadcast(); });
+      assert.equal(nonce, Number(saved.nonce) + 1, 'an acknowledged original supplies a local floor despite a lagging pending reply');
       acknowledge = true;
       await withRelayerLock(97, async held => { const prepared = await chain.prepare(T.roles.keeper, config.targetWei); held(); await prepared.broadcast(); });
       assert.equal(replayed, true); assert.equal(nonce, Number(saved.nonce) + 1);
@@ -344,5 +344,207 @@ test('an RPC block-number mismatch cannot authorize a publication signature or b
     await assert.rejects(publishMixStrategy(source.id, Number(f.state.id), undefined, allocation, payload.execution, pubDeps(f)));
     assert.equal(f.state.broadcasts.length, 0);
     assert.equal((await query('select attempt from mix_publication_outbox')).rows.length, 0);
+  }));
+});
+
+test('a stored receipt reorg still replays the quarantined original before admitting fresh relayer work', async () => {
+  await mixDbSandbox(async lane => lane(async () => {
+    const id = await reserve(), f = registrationRpc();
+    await registerMixStrategy(T.roles.keeper, 'reorg gap', allocation, id, { chain: f.chain });
+    const sid = await jobId();
+    const saved = (await query<{ nonce: string; signed_raw_tx: `0x${string}` }>('select nonce::text,signed_raw_tx from mix_publication_outbox')).rows[0]; assert.ok(saved);
+    f.state.mode = 'reorg'; f.state.publicationCount = 0n;
+    assert.equal(await reconcileMixPublication(sid, pubDeps(f), false), 'unresolved');
+    const before = f.state.broadcasts.length;
+    f.state.pendingNonce = Number(saved.nonce); f.state.latestNonce = Number(saved.nonce);
+    await withRelayerLock(97, async () => {
+      const next = await relayerNonce(f.client, relayerSigner.address); assert.ok(next.nonce !== undefined && next.nonce > Number(saved.nonce));
+    });
+    assert.equal(f.state.broadcasts.length, before + 1, 'quarantine and a noncanonical stored receipt cannot hide the gap');
+    assert.equal(f.state.broadcasts.at(-1), saved.signed_raw_tx);
+  }));
+});
+
+test('publication nonce guard expires exactly at ten minutes, retains original audit and alerts without stopping ordinary relayer work', async () => {
+  await mixDbSandbox(async lane => lane(async () => {
+    const id = await reserve(), f = registrationRpc(); f.state.publicationSendFail = true;
+    await assert.rejects(registerMixStrategy(T.roles.keeper, 'guard bound', allocation, id, { chain: f.chain }));
+    const saved = (await query<{ nonce: string; created_at: Date; signed_raw_tx: string }>('select nonce::text,created_at,signed_raw_tx from mix_publication_outbox')).rows[0]; assert.ok(saved);
+    f.state.pendingNonce = Number(saved.nonce); f.state.latestNonce = Number(saved.nonce);
+    const select = () => relayerNonce(f.client, relayerSigner.address);
+    await assert.rejects(withRelayerLock(97, select, { now: new Date(saved.created_at.getTime() + 599999) }), { code: 'RELAYER_BUSY' });
+    assert.deepEqual(await withRelayerLock(97, select, { now: new Date(saved.created_at.getTime() + 600001) }), {});
+    assert.deepEqual(await withRelayerLock(97, select, { now: new Date(saved.created_at.getTime() + 600002) }), {});
+    assert.deepEqual((await query('select nonce::text,created_at,signed_raw_tx from mix_publication_outbox')).rows[0], saved);
+    assert.ok((await query('select alerted_at from mix_publication_jobs')).rows[0]?.alerted_at instanceof Date);
+    assert.equal((await query('select * from scheduler_alerts where portfolio_id is null')).rows.length, 1);
+  }));
+});
+
+test('a transient pending-nonce RPC failure retries, and a lagging pending nonce uses validated local originals', async () => {
+  await mixDbSandbox(async lane => lane(async () => {
+    const id = await reserve(), f = registrationRpc(); f.state.publicationSendFail = true;
+    await assert.rejects(registerMixStrategy(T.roles.keeper, 'lagging pending', allocation, id, { chain: f.chain }));
+    const saved = (await query<{ nonce: string; signed_raw_tx: string }>('select nonce::text,signed_raw_tx from mix_publication_outbox')).rows[0]; assert.ok(saved);
+    f.state.publicationSendFail = false; f.state.pendingNonceFailures = 1;
+    f.state.pendingNonce = Number(saved.nonce); f.state.latestNonce = Number(saved.nonce);
+    assert.deepEqual(await withRelayerLock(97, () => relayerNonce(f.client, relayerSigner.address)), { nonce: Number(saved.nonce) + 1 });
+    assert.equal(f.state.broadcasts.at(-1), saved.signed_raw_tx);
+    f.state.mode = 'rpc';
+    await assert.rejects(withRelayerLock(97, () => relayerNonce(f.client, relayerSigner.address)), error =>
+      error instanceof Error && !error.message.includes('private') && 'code' in error && error.code === 'RELAYER_BUSY');
+  }));
+});
+
+test('a publication mined between the initial version read and receipt read refreshes canonical state before completing', async () => {
+  await mixDbSandbox(async lane => lane(async () => {
+    const id = await reserve(), f = registrationRpc(); f.state.publicationFail = true;
+    await assert.rejects(registerMixStrategy(T.roles.keeper, 'receipt visibility race', allocation, id, { chain: f.chain }));
+    f.state.publicationFail = false; f.state.publicationCountLagReads = 1;
+    assert.equal(await reconcileMixPublication(await jobId(), pubDeps(f), true), 'confirmed');
+    assert.equal((await query('select attempt from mix_publication_outbox')).rows.length, 1);
+    assert.equal((await query('select version from strategy_versions')).rows.length, 1);
+  }));
+});
+
+test('a canonical foreign nonce consumption preserves original bytes and permits one fresh publication attempt', async () => {
+  const { foreignNonceRpc } = await import('./fixtures/mix-publication-nonce.js');
+  await mixDbSandbox(async lane => lane(async () => {
+    const id = await reserve(), base = registrationRpc(); base.state.publicationSendFail = true;
+    await assert.rejects(registerMixStrategy(T.roles.keeper, 'foreign nonce recovery', allocation, id, { chain: base.chain }));
+    const sid = await jobId(), original = (await query<{ nonce: string; signed_raw_tx: string; tx_hash: string }>('select nonce::text,signed_raw_tx,tx_hash from mix_publication_outbox')).rows[0]; assert.ok(original);
+    const raw = await relayerSigner.signTransaction({ chainId: 97, type: 'eip1559', nonce: Number(original.nonce), gas: 21000n, maxFeePerGas: 2n, maxPriorityFeePerGas: 1n, to: relayerSigner.address, value: 1n });
+    base.state.publicationSendFail = false; const f = foreignNonceRpc(base, raw); f.foreignState.originalReceiptError = true;
+    assert.equal(await reconcileMixPublication(sid, pubDeps(f), true), 'consumed');
+    const evidence = (await query('select foreign_tx_hash from mix_publication_nonce_consumptions')).rows[0]; assert.equal(evidence?.foreign_tx_hash, f.foreignHash);
+    assert.equal(await reconcileMixPublication(sid, pubDeps(f), true), 'confirmed');
+    assert.deepEqual((await query('select nonce::text,signed_raw_tx,tx_hash from mix_publication_outbox order by attempt')).rows[0], original);
+    assert.equal((await query('select attempt from mix_publication_outbox')).rows.length, 2);
+    assert.equal((await query('select version from strategy_versions')).rows.length, 1);
+    assert.equal((await query('select status from mix_publication_receipts')).rows[0]?.status, 'success');
+    assert.equal(f.state.broadcasts.filter(raw => raw === original.signed_raw_tx).length, 0);
+  }));
+});
+
+for (const cut of ['before', 'after'] as const) test(`foreign nonce resolution interrupted ${cut} COMMIT cannot authorize a fresh signature until durable recovery`, async () => {
+  const { foreignNonceRpc } = await import('./fixtures/mix-publication-nonce.js');
+  await mixDbSandbox(async lane => lane(async () => {
+    const id = await reserve(), base = registrationRpc(); base.state.publicationSendFail = true;
+    await assert.rejects(registerMixStrategy(T.roles.keeper, 'foreign commit cut', allocation, id, { chain: base.chain }));
+    const sid = await jobId(), original = (await query<{ nonce: string }>('select nonce::text from mix_publication_outbox')).rows[0]; assert.ok(original);
+    const raw = await relayerSigner.signTransaction({ chainId: 97, type: 'eip1559', nonce: Number(original.nonce), gas: 21000n, maxFeePerGas: 2n, maxPriorityFeePerGas: 1n, to: relayerSigner.address, value: 1n });
+    base.state.publicationSendFail = false; const f = foreignNonceRpc(base, raw), calls = f.state.prepareCalls;
+    let interrupted = false;
+    const transaction: typeof withTransaction = async work => {
+      let committed = false;
+      const result = await withTransaction(async db => {
+        const value = await work(db);
+        if (!interrupted && (await db.query('select 1 from mix_publication_nonce_consumptions')).rows.length) {
+          interrupted = true; committed = true;
+          if (cut === 'before') throw new Error('fixture consumption rollback');
+        }
+        return value;
+      });
+      if (committed && cut === 'after') throw new Error('fixture consumption COMMIT response lost');
+      return result;
+    };
+    assert.equal(await reconcileMixPublication(sid, { ...pubDeps(f), transaction }, true), 'unresolved');
+    assert.equal(f.state.prepareCalls, calls);
+    assert.equal((await query('select attempt from mix_publication_outbox')).rows.length, 1);
+    assert.equal((await query('select * from mix_publication_nonce_consumptions')).rows.length, cut === 'after' ? 1 : 0);
+    if (cut === 'before') assert.equal(await reconcileMixPublication(sid, pubDeps(f), true), 'consumed');
+    assert.equal(await reconcileMixPublication(sid, pubDeps(f), true), 'confirmed');
+    assert.equal((await query('select attempt from mix_publication_outbox')).rows.length, 2);
+  }));
+});
+
+test('a saved external nonce proof reorg quarantines without re-signing or replaying the consumed original', async () => {
+  const { foreignNonceRpc } = await import('./fixtures/mix-publication-nonce.js');
+  await mixDbSandbox(async lane => lane(async () => {
+    const id = await reserve(), base = registrationRpc(); base.state.publicationSendFail = true;
+    await assert.rejects(registerMixStrategy(T.roles.keeper, 'external proof reorg', allocation, id, { chain: base.chain }));
+    const sid = await jobId(), original = (await query<{ nonce: string }>('select nonce::text from mix_publication_outbox')).rows[0]; assert.ok(original);
+    const raw = await relayerSigner.signTransaction({ chainId: 97, type: 'eip1559', nonce: Number(original.nonce), gas: 21000n, maxFeePerGas: 2n, maxPriorityFeePerGas: 1n, to: relayerSigner.address, value: 1n });
+    base.state.publicationSendFail = false; const f = foreignNonceRpc(base, raw); f.foreignState.originalReceiptError = true;
+    assert.equal(await reconcileMixPublication(sid, pubDeps(f), true), 'consumed');
+    const evidence = (await query('select * from mix_publication_nonce_consumptions')).rows;
+    f.foreignState.reorg = true;
+    assert.equal(await reconcileMixPublication(sid, pubDeps(f), true), 'unresolved');
+    assert.equal((await query('select state from mix_publication_jobs')).rows[0]?.state, 'quarantined');
+    assert.deepEqual((await query('select * from mix_publication_nonce_consumptions')).rows, evidence);
+    assert.equal((await query('select attempt from mix_publication_outbox')).rows.length, 1);
+    assert.equal(f.state.broadcasts.length, 1, 'only the original registration, never a consumed original or replacement');
+  }));
+});
+
+test('a different canonical hash that already published matching version one is mirrored instead of signed again', async () => {
+  const { foreignNonceRpc } = await import('./fixtures/mix-publication-nonce.js');
+  await mixDbSandbox(async lane => lane(async () => {
+    const id = await reserve(), base = registrationRpc(); base.state.publicationSendFail = true;
+    await assert.rejects(registerMixStrategy(T.roles.keeper, 'matching foreign publication', allocation, id, { chain: base.chain }));
+    const sid = await jobId(), original = (await query<{ nonce: string; signed_raw_tx: `0x${string}` }>('select nonce::text,signed_raw_tx from mix_publication_outbox')).rows[0]; assert.ok(original);
+    const transaction = parseTransaction(original.signed_raw_tx); assert.ok(transaction.data);
+    const raw = await relayerSigner.signTransaction({ chainId: 97, type: 'eip1559', nonce: Number(original.nonce), gas: 500000n,
+      maxFeePerGas: 3n, maxPriorityFeePerGas: 1n, to: T.contracts.registry, data: transaction.data, value: 0n });
+    base.state.publicationSendFail = false; const f = foreignNonceRpc(base, raw), calls = f.state.prepareCalls;
+    assert.equal(await reconcileMixPublication(sid, pubDeps(f), true), 'consumed');
+    assert.equal(await reconcileMixPublication(sid, pubDeps(f), true), 'confirmed');
+    assert.equal(f.state.prepareCalls, calls);
+    assert.equal((await query('select attempt from mix_publication_outbox')).rows.length, 1);
+    assert.equal((await query('select * from mix_publication_receipts')).rows.length, 0, 'never invent a receipt for the consumed original');
+    assert.equal((await query('select published_tx_hash from mix_publication_jobs')).rows[0]?.published_tx_hash, f.foreignHash);
+    assert.equal((await query('select version from strategy_versions')).rows.length, 1);
+  }));
+});
+
+test('foreign nonce resolution and gap replay share exclusion, and two job workers cannot consume or rebuild twice', async () => {
+  const { foreignNonceRpc } = await import('./fixtures/mix-publication-nonce.js');
+  await mixDbSandbox(async lane => {
+    const base = registrationRpc(); let sid = '', raw: `0x${string}` = '0x';
+    await lane(async () => {
+      const id = await reserve(); base.state.publicationSendFail = true;
+      await assert.rejects(registerMixStrategy(T.roles.keeper, 'foreign exclusion', allocation, id, { chain: base.chain }));
+      sid = await jobId(); const original = (await query<{ nonce: string }>('select nonce::text from mix_publication_outbox')).rows[0]; assert.ok(original);
+      raw = await relayerSigner.signTransaction({ chainId: 97, type: 'eip1559', nonce: Number(original.nonce), gas: 21000n, maxFeePerGas: 2n, maxPriorityFeePerGas: 1n, to: relayerSigner.address, value: 1n });
+    });
+    base.state.publicationSendFail = false; const f = foreignNonceRpc(base, raw);
+    let release = () => {}, entered = () => {};
+    const gate = new Promise<void>(resolve => { release = resolve; }), ready = new Promise<void>(resolve => { entered = resolve; });
+    const replay = lane(() => withRelayerLock(97, async () => { entered(); await gate; }));
+    await ready;
+    try {
+      assert.equal(await lane(() => reconcileMixPublication(sid, pubDeps(f), true)), 'unresolved');
+      await lane(async () => assert.equal((await query('select * from mix_publication_nonce_consumptions')).rows.length, 0));
+    } finally { release(); await replay; }
+    const { withMixCreationLock } = await import('../src/mix-creation.js');
+    let releaseJob = () => {}, enteredJob = () => {};
+    const jobGate = new Promise<void>(resolve => { releaseJob = resolve; }), jobReady = new Promise<void>(resolve => { enteredJob = resolve; });
+    const first = lane(() => reconcileMixPublication(sid, { ...pubDeps(f), jobLock: (id, work) => withMixCreationLock(id, async () => {
+      enteredJob(); await jobGate; return work();
+    }) }, true));
+    await jobReady;
+    try { await lane(() => assert.rejects(reconcileMixPublication(sid, pubDeps(f), true), { code: 'MIX_CREATE_BUSY' })); }
+    finally { releaseJob(); }
+    assert.equal(await first, 'consumed');
+    await lane(async () => {
+      assert.equal(await reconcileMixPublication(sid, pubDeps(f), true), 'confirmed');
+      assert.equal((await query('select * from mix_publication_nonce_consumptions')).rows.length, 1);
+      assert.equal((await query('select attempt from mix_publication_outbox')).rows.length, 2);
+      assert.equal((await query('select version from strategy_versions')).rows.length, 1);
+    });
+  });
+});
+
+test('an already-known original plus a lagging pending reply supplies a floor only after independent exact transaction validation', async () => {
+  await mixDbSandbox(async lane => lane(async () => {
+    const id = await reserve(), f = registrationRpc(); f.state.publicationFail = true;
+    await assert.rejects(registerMixStrategy(T.roles.keeper, 'known original', allocation, id, { chain: f.chain }));
+    const original = (await query<{ nonce: string }>('select nonce::text from mix_publication_outbox')).rows[0]; assert.ok(original);
+    f.state.publicationFail = false; f.state.publicationCount = 0n; f.state.publicationAlreadyKnown = true;
+    f.state.pendingNonce = Number(original.nonce); f.state.latestNonce = Number(original.nonce);
+    assert.deepEqual(await withRelayerLock(97, () => relayerNonce(f.client, relayerSigner.address)), { nonce: Number(original.nonce) + 1 });
+    f.state.mode = 'nonce';
+    await assert.rejects(withRelayerLock(97, () => relayerNonce(f.client, relayerSigner.address)), { code: 'RELAYER_BUSY' });
+    assert.equal((await query('select attempt from mix_publication_outbox')).rows.length, 1);
   }));
 });

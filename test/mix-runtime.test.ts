@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { decideMixTick, loadMixRuntime, mixAvailableCash, mixBelowExecutorMinimum } from '../src/mix-runtime.js';
+import { decideMixTick, loadMixRuntime, mixAvailableCash, mixBelowExecutorMinimum, mixExitCooldownMs, mixSwitchExitsPending, recordMixSwitchResidual } from '../src/mix-runtime.js';
 import { mixRuntimeFixture, mixClock, WAD } from './fixtures/mix.js';
+import { zeroHash, toHex } from 'viem';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
 
 test('mix stops at the exact oracle return threshold on a non-rebalance day, including a closed stock', () => {
@@ -109,4 +110,67 @@ test('mix uses the saved user allocation as its rebalance target and drives a 1b
   assert.equal(tick.mode, 'rebalance'); assert.equal(tick.plan.targets.find(t => t.asset === old.asset)?.weightBps, 0);
   assert.equal(tick.plan.targets.find(t => t.asset === stock.asset)?.weightBps, 10000);
   assert.equal(old.weightBps, 1);
+});
+
+test('fresh switch cannot complete a below-batch-minimum noop while a 1bp exit remains at the per-step minimum', () => {
+  const { state, plan } = mixRuntimeFixture();
+  state.last = null; state.takeProfit = null; state.stopLoss = null;
+  state.exits = new Set([T.assets.WBNB.token]); state.userAllocation = { [T.assets.NVDAB.token]: 10000 };
+  const old = plan.snapshot.holdings.find(h => h.asset === T.assets.WBNB.token); assert.ok(old);
+  old.amountWei = WAD;
+  assert.equal(decideMixTick(state, plan, mixClock).complete, false);
+  old.amountWei--;
+  assert.equal(decideMixTick(state, plan, mixClock).complete, true);
+  old.amountWei = 0n;
+  assert.equal(decideMixTick(state, plan, mixClock).complete, true);
+});
+
+test('exit backoff validates persisted counts and caps arbitrarily long failure streaks', () => {
+  for (const [count, delay] of [[0, 0], [4, 0], [5, 300000], [6, 900000], [7, 3600000], [8, 21600000], [Number.MAX_SAFE_INTEGER, 21600000]] as const) {
+    assert.equal(mixExitCooldownMs(count), delay);
+  }
+  for (const count of [-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) assert.throws(() => mixExitCooldownMs(count));
+});
+
+test('forced switch exit thresholds follow the configured step minimum, including equality and a disabled minimum', () => {
+  const previous = process.env.MIN_STEP_USD_E8;
+  try {
+    const { state, plan } = mixRuntimeFixture(); state.last = null; state.takeProfit = null; state.stopLoss = null;
+    state.exits = new Set([T.assets.WBNB.token]); state.userAllocation = { [T.assets.NVDAB.token]: 10000 };
+    const old = plan.snapshot.holdings.find(h => h.asset === T.assets.WBNB.token); assert.ok(old);
+    process.env.MIN_STEP_USD_E8 = '200000000'; old.amountWei = 2n * WAD - 1n;
+    assert.equal(mixSwitchExitsPending(state, plan), false);
+    old.amountWei++; assert.equal(mixSwitchExitsPending(state, plan), true);
+    process.env.MIN_STEP_USD_E8 = '0'; old.amountWei = 1n;
+    assert.equal(mixSwitchExitsPending(state, plan), true);
+    assert.equal(decideMixTick(state, plan, mixClock).complete, false);
+    old.amountWei = 0n; assert.equal(mixSwitchExitsPending(state, plan), false);
+  } finally { if (previous === undefined) delete process.env.MIN_STEP_USD_E8; else process.env.MIN_STEP_USD_E8 = previous; }
+});
+
+test('switch residuals require open markets, complete same-account valuation and a total strictly below the batch minimum', async () => {
+  const open = new Date('2026-11-23T15:00Z');
+  for (const mode of ['closed', 'unpriced', 'blocked', 'report', 'account', 'equal', 'zero'] as const) {
+    const { state, plan } = mixRuntimeFixture(); state.last = null; state.exits = new Set([T.assets.NVDAB.token]);
+    for (const h of plan.snapshot.holdings) h.amountWei = h.asset === T.assets.NVDAB.token ? 2n * WAD : 0n;
+    if (mode === 'unpriced') plan.snapshot.unpriced.push({ asset: T.assets.TSLAB.token, amountWei: 1n, decimals: 18, symbol: 'TSLA', reason: 'fixture unavailable' });
+    if (mode === 'blocked') plan.blocked.push({ code: 'UNPRICED_HOLDINGS', detail: 'unavailable' });
+    if (mode === 'report') plan.report = null;
+    if (mode === 'account') plan.account = T.roles.operator;
+    if (mode === 'equal' || mode === 'zero') { const h = plan.snapshot.holdings[0]; assert.ok(h); h.amountWei = mode === 'equal' ? 50n * WAD : 0n; }
+    const due = { portfolioId: 1, strategyId: 1, account: T.roles.keeper, accountType: 'KERNEL', intervalSeconds: 60, unsupportedReason: null, nextRunAt: open };
+    assert.equal(await recordMixSwitchResidual(state, due, plan, mode === 'closed' ? mixClock : open,
+      async () => { throw new Error('unexpected DB write'); }, async () => { throw new Error('unexpected RPC'); }), false);
+  }
+  const { state, plan } = mixRuntimeFixture(); state.last = null; state.exits = new Set([T.assets.NVDAB.token]);
+  for (const h of plan.snapshot.holdings) h.amountWei = h.asset === T.assets.NVDAB.token ? 2n * WAD : 0n;
+  const due = { portfolioId: 1, strategyId: 1, account: T.roles.keeper, accountType: 'KERNEL', intervalSeconds: 60, unsupportedReason: null, nextRunAt: open };
+  for (const fault of ['rpc', 'db', 'reorg'] as const) {
+    let reads = 0, writes = 0;
+    await assert.rejects(recordMixSwitchResidual(state, due, plan, open, async () => { writes++; throw new Error('private DB'); }, async () => {
+      if (fault === 'rpc') throw new Error('private RPC');
+      return { hash: fault === 'reorg' && reads++ > 0 ? toHex(1n, { size: 32 }) : zeroHash, at: mixClock };
+    }), error => error instanceof Error && !error.message.includes('private'));
+    assert.equal(writes, fault === 'db' ? 1 : 0);
+  }
 });

@@ -13,6 +13,8 @@ import type { MixAnchor } from './mix-valuation.js';
 import { recordAlerts } from './alerts.js';
 import { getChain, PRICE_SOURCE_ABI } from './chain.js';
 import type { Address } from 'viem';
+import { loadTradingConfig } from './config.js';
+import { assetsMarketOpen } from './trading-calendar.js';
 
 export type MixRuntime = { id: string; owner: string; status: 'active' | 'exited'; triggered: boolean;
   userAllocation: Record<string, number>; frequency: MixFrequency; startDate: string; last: Date | null; takeProfit: number | null; stopLoss: number | null;
@@ -25,6 +27,67 @@ export const MIX_MIN_TRADE_RAW = 10n ** 18n;
 export const MIX_EXIT_DUST_RAW = 10n ** 16n;
 export const MIX_EXIT_MAX_RETRIES = 5;
 export const MIX_EXIT_COOLDOWN_MS = 5 * 60_000;
+export const MIX_EXIT_MAX_COOLDOWN_MS = 6 * 60 * 60_000;
+export const MIX_EXIT_RETRY_COUNT_CAP = MIX_EXIT_MAX_RETRIES + 3;
+export function mixExitCooldownMs(retries: number): number {
+  if (!Number.isSafeInteger(retries) || retries < 0) throw mixUnavailable();
+  if (retries < MIX_EXIT_MAX_RETRIES) return 0;
+  return [MIX_EXIT_COOLDOWN_MS, 15 * 60_000, 60 * 60_000][retries - MIX_EXIT_MAX_RETRIES] ?? MIX_EXIT_MAX_COOLDOWN_MS;
+}
+// The claim predicate and in-lock admission must use the same persisted streak.
+export const MIX_EXIT_COOLDOWN_SQL = `(case when m.exit_retry_count<${MIX_EXIT_MAX_RETRIES} then 0
+  when m.exit_retry_count=${MIX_EXIT_MAX_RETRIES} then ${MIX_EXIT_COOLDOWN_MS}
+  when m.exit_retry_count=${MIX_EXIT_MAX_RETRIES + 1} then 900000
+  when m.exit_retry_count=${MIX_EXIT_MAX_RETRIES + 2} then 3600000 else ${MIX_EXIT_MAX_COOLDOWN_MS} end)`;
+
+export function mixSwitchExitsPending(m: Pick<MixRuntime, 'last' | 'exits'>, plan: PortfolioPlan): boolean {
+  if (m.last !== null || m.exits.size === 0) return false;
+  const minimum = loadTradingConfig().minStepUsdE8 * 10n ** 10n;
+  return plan.snapshot.holdings.some(h => h.amountWei > 0n && m.exits.has(h.asset.toLowerCase()) &&
+    h.amountWei * h.usdPriceE8 * 10n ** 10n / 10n ** BigInt(h.decimals) >= minimum);
+}
+
+/** Called under the stable mix lock only after a non-retryable minimum noop.
+ * A closed/unpriced exit is never residual. Audit and completion commit together. */
+export async function recordMixSwitchResidual(m: MixRuntime, due: DuePortfolio, plan: PortfolioPlan, now: Date,
+  run: WithTransactionFn, anchor = mixAnchor): Promise<boolean> {
+  try {
+    if (m.last !== null || plan.chainId !== 97 || plan.portfolioId !== due.portfolioId || plan.snapshot.portfolioId !== due.portfolioId ||
+        plan.account.toLowerCase() !== due.account.toLowerCase() || plan.blocked.length || plan.report === null ||
+        plan.snapshot.unpriced.some(h => h.amountWei > 0n)) return false;
+    const held = plan.snapshot.holdings.filter(h => m.exits.has(h.asset.toLowerCase()) && h.amountWei > 0n);
+    if (held.length === 0 || !assetsMarketOpen(97, held.map(h => h.asset), now) ||
+        held.some(h => h.usdPriceE8 <= 0n || !Number.isInteger(h.decimals) || h.decimals < 0 || h.decimals > 255 ||
+          typeof h.priceSource !== 'string' || h.priceSource.length === 0)) return false;
+    const policy = loadTradingConfig();
+    const residuals = held.map(h => ({ asset: h.asset.toLowerCase(), quantityRaw: h.amountWei.toString(), decimals: h.decimals,
+      priceUsdE8: h.usdPriceE8.toString(), priceSource: h.priceSource,
+      valueRaw: (h.amountWei * h.usdPriceE8 * 10n ** 10n / 10n ** BigInt(h.decimals)).toString() }));
+    if (residuals.reduce((sum, h) => sum + BigInt(h.valueRaw), 0n) >= policy.minBatchUsdE8 * 10n ** 10n) return false;
+    const proof = await anchor(plan.snapshot.block);
+    const checked = await anchor(plan.snapshot.block);
+    if (!/^0x[0-9a-f]{64}$/.test(proof.hash) || !Number.isFinite(proof.at.getTime()) ||
+        checked.hash !== proof.hash || checked.at.getTime() !== proof.at.getTime()) throw mixUnavailable();
+    const payload = { message: '移除成分的剩餘持倉低於批次最小額，已記錄殘留並完成本次檢查；下期仍會檢查。',
+      reason: 'below_batch_minimum', blockNumber: plan.snapshot.block.toString(), blockHash: proof.hash, pricedAt: proof.at.toISOString(),
+      minimumStepUsdE8: policy.minStepUsdE8.toString(), minimumBatchUsdE8: policy.minBatchUsdE8.toString(), residuals };
+    return await run(async db => {
+      const locked = (await db.query(`select id from mixes where id=$1 and status='active' and triggered_at is null
+        and last_rebalanced_at is null for update`, [m.id])).rows[0];
+      if (!locked) return false;
+      const history = (await db.query('select id,enroll_block_number::text from mix_portfolio_history where mix_id=$1 and portfolio_id=$2 and ended_at is null', [m.id, due.portfolioId])).rows[0];
+      if (!record(history) || typeof history.id !== 'string' || typeof history.enroll_block_number !== 'string' ||
+          plan.snapshot.block < BigInt(history.enroll_block_number)) throw mixUnavailable();
+      const saved = await db.query(`insert into user_notifications(chain_id,portfolio_id,owner,kind,dedup_key,payload)
+        select 97,$2,owner,'mix_switch_residual',$3,$4 from mixes where id=$1
+        on conflict(chain_id,kind,dedup_key) do nothing returning id`, [m.id, due.portfolioId,
+          `${history.id}:${plan.snapshot.block}`, JSON.stringify(payload)]);
+      if (saved.rows.length !== 1) throw mixUnavailable();
+      await db.query('update mixes set last_rebalanced_at=$2 where id=$1', [m.id, now]);
+      return true;
+    });
+  } catch { throw mixUnavailable(); }
+}
 
 /** All values are oracle-priced, from the same snapshot. A closed stock remains
  * in the valuation and target; the quote planner decides which legs can trade.
@@ -58,7 +121,7 @@ export function decideMixTick(m: MixRuntime, plan: PortfolioPlan, now: Date): Mi
   if (at > now && m.last !== null) return { ...base, mode: 'wait', reason: `下一次再平衡為 ${at.toISOString()}。` };
   // A freshly confirmed switch/restart has last=null and always gets an immediate pass.
   const report = computeDrift(plan.snapshot.holdings, plan.targets, 0);
-  const complete = report.assets.every(a => {
+  const complete = !mixSwitchExitsPending(m, plan) && report.assets.every(a => {
     const delta = a.usdValueE8 * 10000n - report.totalUsdE8 * BigInt(a.targetBps);
     return (delta < 0n ? -delta : delta) * 10n ** 10n < MIX_MIN_TRADE_RAW * 10000n;
   });
@@ -168,14 +231,16 @@ export async function mixBelowExecutorMinimum(plan: PortfolioPlan, floor: (asset
 
 export async function recordMixExitFailure(m: Pick<MixRuntime, 'id'>, due: Pick<DuePortfolio, 'portfolioId'>, now: Date, run: WithTransactionFn): Promise<void> {
   await run(async db => {
-    const row = (await db.query(`update mixes set exit_retry_count=least(exit_retry_count+1,$3),exit_last_attempt_at=$2
+    const row = (await db.query(`update mixes set exit_retry_count=least(exit_retry_count,$3-1)+1,exit_last_attempt_at=$2
       where id=$1 and triggered_at is not null and status='active'
-      returning exit_retry_count,exit_alerted_at`, [m.id, now, MIX_EXIT_MAX_RETRIES])).rows[0];
+      returning exit_retry_count,exit_alerted_at`, [m.id, now, MIX_EXIT_RETRY_COUNT_CAP])).rows[0];
     if (!record(row) || typeof row.exit_retry_count !== 'number') throw mixUnavailable();
-    if (row.exit_retry_count >= MIX_EXIT_MAX_RETRIES && row.exit_alerted_at === null) {
-      const message = '組合退出連續遇到交易問題，已告警並冷卻五分鐘；系統會重新確認交易條件後續作退出。';
-      await db.query('update mixes set exit_alerted_at=$2 where id=$1', [m.id, now]);
+    if (row.exit_retry_count >= MIX_EXIT_MAX_RETRIES) {
       await db.query("update portfolios set schedule_state='paused' where id=$1", [due.portfolioId]);
+      if (row.exit_alerted_at !== null && (!(row.exit_alerted_at instanceof Date) ||
+          now.getTime() - row.exit_alerted_at.getTime() < MIX_EXIT_MAX_COOLDOWN_MS)) return;
+      const message = '組合退出連續遇到交易問題，已告警並逐次延長重試間隔（5 分、15 分、1 小時，最多每 6 小時一次）；系統會重新確認條件後續作退出。';
+      await db.query('update mixes set exit_alerted_at=$2 where id=$1', [m.id, now]);
       await db.query(`insert into user_notifications(chain_id,portfolio_id,owner,kind,dedup_key,payload)
         select 97,$1,owner,'mix_exit_stuck',$2,$3 from mixes where id=$4
         on conflict(chain_id,kind,dedup_key) do nothing`,

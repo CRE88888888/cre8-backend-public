@@ -15,6 +15,8 @@ import type { Allocation } from './strategies.js';
 import { TESTNET_97 as T } from './testnet-profile.js';
 import { AppError } from './errors.js';
 import { recordAlerts } from './alerts.js';
+import { findPublicationNonceConsumption, verifyPublicationNonceConsumption } from './mix-publication-nonce.js';
+import type { NonceConsumption } from './mix-publication-nonce.js';
 
 export type MixPublication = {
   strategy_id: string; chain_id: string; registry: Address; onchain_strategy_id: string; creation_request_id: string | null;
@@ -24,7 +26,8 @@ export type MixPublication = {
 };
 type Attempt = { strategy_id: string; attempt: number; signer: Address; nonce: string; tx_hash: Hex; signed_raw_tx: Hex;
   checked_block_number: string; checked_block_hash: Hex; checked_block_time: Date; status: 'success' | 'reverted' | null;
-  block_number: string | null; block_hash: Hex | null };
+  block_number: string | null; block_hash: Hex | null; foreign_tx_hash: Hex | null;
+  consumed_block_number: string | null; consumed_block_hash: Hex | null; consumed_block_time: Date | null };
 type Anchor = { number: bigint; hash: Hex; at: Date };
 export type PublicationDeps = { client: PublicClient; chain?: ChainConfig; operator?: Address; query: typeof query; transaction: typeof withTransaction;
   lock?: typeof withRelayerLock; jobLock?: typeof withMixCreationLock; timeoutMs?: number; nonceLockMs?: number; deadlineAt?: number; now?: () => Date };
@@ -99,9 +102,43 @@ async function mark(job: MixPublication, deps: PublicationDeps, code: string, qu
 }
 async function attempt(job: MixPublication, deps: PublicationDeps): Promise<Attempt | null> {
   return (await deps.query<Attempt>(`select o.strategy_id,o.attempt,o.signer,o.nonce::text,o.tx_hash,o.signed_raw_tx,
-    o.checked_block_number::text,o.checked_block_hash,o.checked_block_time,r.status,r.block_number::text,r.block_hash
+    o.checked_block_number::text,o.checked_block_hash,o.checked_block_time,r.status,r.block_number::text,r.block_hash,
+    c.foreign_tx_hash,c.block_number::text as consumed_block_number,c.block_hash as consumed_block_hash,c.block_time as consumed_block_time
     from mix_publication_outbox o left join mix_publication_receipts r using(strategy_id,attempt)
+    left join mix_publication_nonce_consumptions c using(strategy_id,attempt)
     where o.strategy_id=$1 order by o.attempt desc limit 1`, [job.strategy_id])).rows[0] ?? null;
+}
+function consumption(current: Attempt): NonceConsumption | null {
+  if (current.foreign_tx_hash === null) return null;
+  if (current.consumed_block_number === null || current.consumed_block_hash === null || !(current.consumed_block_time instanceof Date)) throw mixUnavailable();
+  return { foreign_tx_hash: current.foreign_tx_hash, block_number: current.consumed_block_number, block_hash: current.consumed_block_hash, block_time: current.consumed_block_time };
+}
+async function saveConsumption(job: MixPublication, current: Attempt, proof: NonceConsumption, deps: PublicationDeps): Promise<void> {
+  await (deps.lock ?? withRelayerLock)(97, async held => deps.transaction(async db => {
+    held();
+    await db.query("set local statement_timeout='5s'");
+    await db.query("set local lock_timeout='3s'");
+    const locked = (await db.query<{ state: string }>('select state from mix_publication_jobs where strategy_id=$1 for update', [job.strategy_id])).rows[0];
+    if (!locked || !['submitted','quarantined'].includes(locked.state)) throw mixUnavailable();
+    await db.query(`insert into mix_publication_nonce_consumptions(strategy_id,attempt,chain_id,signer,nonce,foreign_tx_hash,block_number,block_hash,block_time)
+      values($1,$2,97,$3,$4,$5,$6,$7,$8)`, [job.strategy_id, current.attempt, current.signer.toLowerCase(), current.nonce,
+        proof.foreign_tx_hash, proof.block_number, proof.block_hash, proof.block_time]);
+    await db.query(`update mix_publication_jobs set state=case when state='submitted' then 'prepared' else state end,
+      last_error_code='PUBLICATION_NONCE_CONSUMED',updated_at=clock_timestamp() where strategy_id=$1`, [job.strategy_id]);
+    held();
+  }), { reconcile: true });
+}
+async function findConsumption(current: Attempt, observed: Anchor, deps: PublicationDeps) {
+  const lookup = { ...deps, deadlineAt: Math.min(deps.deadlineAt ?? Infinity, Date.now() + 5000) };
+  return findPublicationNonceConsumption(deps.client, current, observed, work => bounded(work, lookup), number => anchor(lookup, number));
+}
+async function historyCanonical(job: MixPublication, deps: PublicationDeps): Promise<boolean> {
+  const rows = (await deps.query<{ block_number: string; block_hash: Hex }>(`select coalesce(r.block_number,c.block_number)::text as block_number,
+    coalesce(r.block_hash,c.block_hash) as block_hash from mix_publication_outbox o
+    left join mix_publication_receipts r using(strategy_id,attempt) left join mix_publication_nonce_consumptions c using(strategy_id,attempt)
+    where o.strategy_id=$1 and (r.strategy_id is not null or c.strategy_id is not null)`, [job.strategy_id])).rows;
+  for (const row of rows) if ((await anchor(deps, BigInt(row.block_number))).hash !== row.block_hash) return false;
+  return true;
 }
 async function receipt(job: MixPublication, current: Attempt, deps: PublicationDeps) {
   await validatePublicationTransaction(job, current);
@@ -116,6 +153,18 @@ async function receipt(job: MixPublication, current: Attempt, deps: PublicationD
       tx.to?.toLowerCase() !== job.registry || tx.input !== job.calldata || tx.value !== 0n ||
       !['success','reverted'].includes(result.status) || (await anchor(deps, block.number)).hash !== block.hash) throw mixUnavailable();
   return { receipt: result, block };
+}
+async function resolution(job: MixPublication, current: Attempt, observed: Anchor, deps: PublicationDeps) {
+  let proof: Awaited<ReturnType<typeof receipt>> = null, unavailable = false;
+  try { proof = await receipt(job, current, deps); }
+  catch { unavailable = true; }
+  if (proof) return { proof, foreign: null };
+  // Some RPCs error on an unknown original hash rather than returning null.
+  // Independent canonical same-nonce evidence remains authoritative; an RPC
+  // error alone still cannot release the original or permit a fresh signature.
+  const foreign = await findConsumption(current, observed, deps);
+  if (unavailable && !foreign) throw mixUnavailable();
+  return { proof: null, foreign };
 }
 function publicationLog(job: MixPublication, result: TransactionReceipt) {
   const matches = result.logs.filter(log => {
@@ -160,19 +209,35 @@ async function complete(job: MixPublication, current: Attempt | null, proof: { r
 
 /** One job lock; shared nonce exclusion covers preparation+commit+broadcast only.
  * An ambiguous COMMIT returns before broadcast. A restart reads this same attempt. */
-export async function reconcileMixPublication(id: string, deps: PublicationDeps, replay = false): Promise<'confirmed' | 'replayed' | 'reverted' | 'unresolved'> {
+export async function reconcileMixPublication(id: string, deps: PublicationDeps, replay = false): Promise<'confirmed' | 'replayed' | 'reverted' | 'consumed' | 'unresolved'> {
   return (deps.jobLock ?? withMixCreationLock)('publication:' + id, async () => {
     let job = await load(id, deps);
     try {
       const observed = await state(job, deps);
       if (observed.count > 1n) { await mark(job, deps, 'PUBLICATION_VERSION_CONFLICT', true); job = await load(id, deps); }
       let current = await attempt(job, deps);
-      if (current?.status && current.block_number !== null && (await anchor(deps, BigInt(current.block_number))).hash !== current.block_hash) {
-        await mark(job, deps, 'PUBLICATION_RECEIPT_REORG', true); return 'unresolved';
+      if (current) {
+        await validatePublicationTransaction(job, current);
+        if (current.signer.toLowerCase() !== (deps.operator ?? deps.chain?.account.address ?? T.roles.operator).toLowerCase()) throw mixUnavailable();
       }
+      if (current && consumption(current)) {
+        const proof = consumption(current); if (!proof) throw mixUnavailable();
+        if ((await anchor(deps, BigInt(proof.block_number))).hash !== proof.block_hash) {
+          await mark(job, deps, 'PUBLICATION_NONCE_PROOF_REORG', true); return 'unresolved';
+        }
+        await verifyPublicationNonceConsumption(deps.client, current, proof, work => bounded(work, deps), number => anchor(deps, number));
+      }
+      if (current?.status && current.block_number !== null && (await anchor(deps, BigInt(current.block_number))).hash !== current.block_hash) {
+        const orphan = current;
+        await mark(job, deps, 'PUBLICATION_RECEIPT_REORG', true);
+        if (replay && observed.count === 0n) await (deps.lock ?? withRelayerLock)(97, held =>
+          replayPublicationNonceGap(deps.client, orphan.signer, BigInt(orphan.nonce), held).then(() => {}), { reconcile: true });
+        return 'unresolved';
+      }
+      if (!await historyCanonical(job, deps)) { await mark(job, deps, 'PUBLICATION_HISTORY_REORG', true); return 'unresolved'; }
       if (job.state === 'quarantined') {
-        if (current && current.status === null) {
-          const pending = current, proof = await receipt(job, pending, deps);
+        if (current && current.status === null && !consumption(current)) {
+          const pending = current, { proof, foreign } = await resolution(job, pending, observed.block, deps);
           if (proof) await deps.transaction(async db => {
             await db.query("set local statement_timeout='5s'");
             await db.query("set local lock_timeout='3s'");
@@ -182,6 +247,11 @@ export async function reconcileMixPublication(id: string, deps: PublicationDeps,
                 values($1,$2,$3,$4,$5,$6)`, [id, pending.attempt, proof.receipt.status, proof.block.number.toString(), proof.block.hash, proof.block.at]);
             }
           });
+          else {
+            if (foreign) await saveConsumption(job, pending, foreign, deps);
+            else if (replay && observed.count === 0n) await (deps.lock ?? withRelayerLock)(97, held =>
+              replayPublicationNonceGap(deps.client, pending.signer, BigInt(pending.nonce), held).then(() => {}), { reconcile: true });
+          }
         }
         return 'unresolved';
       }
@@ -198,11 +268,15 @@ export async function reconcileMixPublication(id: string, deps: PublicationDeps,
             (await anchor(deps, observed.block.number)).hash !== observed.block.hash) { await mark(job, deps, 'PUBLICATION_CONFIG_CONFLICT', true); return 'unresolved'; }
         return 'confirmed';
       }
-      if (current && current.status === null) {
+      if (current && current.status === null && !consumption(current)) {
         const pending = current;
-        const proof = await receipt(job, pending, deps);
+        const { proof, foreign } = await resolution(job, pending, observed.block, deps);
         if (proof) {
-          if (proof.receipt.status === 'success') { if (observed.count !== 1n) throw mixUnavailable(); await complete(job, pending, proof, observed.block, deps); return 'confirmed'; }
+          if (proof.receipt.status === 'success') {
+            const after = await state(job, deps);
+            if (after.count !== 1n) throw mixUnavailable();
+            await complete(job, pending, proof, after.block, deps); return 'confirmed';
+          }
           await deps.transaction(async db => {
             await db.query("set local statement_timeout='5s'");
             await db.query("set local lock_timeout='3s'");
@@ -213,6 +287,7 @@ export async function reconcileMixPublication(id: string, deps: PublicationDeps,
           });
           return 'reverted';
         }
+        if (foreign) { await saveConsumption(job, pending, foreign, deps); return 'consumed'; }
         if (!replay || observed.count !== 0n) { await mark(job, deps, 'PUBLICATION_RECEIPT_PENDING'); return 'unresolved'; }
         await (deps.lock ?? withRelayerLock)(97, async held => {
           await validatePublicationTransaction(job, pending);
@@ -244,9 +319,14 @@ export async function reconcileMixPublication(id: string, deps: PublicationDeps,
         job = await load(id, deps);
         const checked = await state(job, critical);
         if (job.state !== 'prepared' || checked.count !== 0n) throw mixUnavailable();
+        if (!await historyCanonical(job, critical)) throw mixUnavailable();
         current = await attempt(job, deps);
-        if (current && current.status !== 'reverted') throw mixUnavailable();
+        if (current && current.status !== 'reverted' && !consumption(current)) throw mixUnavailable();
         if (current?.block_number !== null && current?.block_number !== undefined && (await anchor(critical, BigInt(current.block_number))).hash !== current.block_hash) throw mixUnavailable();
+        if (current) {
+          const proof = consumption(current);
+          if (proof) await verifyPublicationNonceConsumption(deps.client, current, proof, work => bounded(work, critical), number => anchor(critical, number));
+        }
         const chain = deps.chain; if (!chain) throw mixUnavailable();
         const request = await bounded(chain.wallet.prepareTransactionRequest({ account: chain.account, chain: bscTestnet, to: job.registry,
           data: job.calldata, value: 0n, ...(await relayerNonce(deps.client, chain.account.address)) }), critical);
@@ -313,18 +393,37 @@ export async function publishMixStrategy(strategyId: string, onchainId: number, 
 /** Called inside the shared nonce lock, without acquiring another lock or signing.
  * Replay only immutable, unresolved originals whose first version is still absent.
  * This fills gaps before ordinary entry points ask the node for their next nonce. */
-export async function replayPublicationNonceGap(client: PublicClient, signer: Address, from: bigint, held: () => void): Promise<void> {
-  const deps: PublicationDeps = { client, query, transaction: withTransaction, deadlineAt: Date.now() + 5000 };
-  const rows = (await query<{ strategy_id: string }>(`select o.strategy_id from mix_publication_outbox o
-    join mix_publication_jobs j using(strategy_id) left join mix_publication_receipts r using(strategy_id,attempt)
-    where o.chain_id=97 and o.signer=$1 and o.nonce>=$2::numeric and r.strategy_id is null and j.state='submitted'
+export async function replayPublicationNonceGap(client: PublicClient, signer: Address, from: bigint, held: () => void, deadlineAt = Date.now() + 5000): Promise<bigint | null> {
+  const deps: PublicationDeps = { client, query, transaction: withTransaction, deadlineAt };
+  const rows = (await query<Attempt>(`select o.*,o.nonce::text,r.status,r.block_number::text,r.block_hash from mix_publication_outbox o
+    left join mix_publication_receipts r using(strategy_id,attempt)
+    left join mix_publication_nonce_consumptions c using(strategy_id,attempt)
+    where o.chain_id=97 and o.signer=$1 and o.nonce>=$2::numeric and c.strategy_id is null
     order by o.nonce limit 20`, [signer.toLowerCase(), from.toString()])).rows;
-  for (const row of rows) {
-    const job = await load(row.strategy_id, deps), current = await attempt(job, deps);
-    if (!current || current.status !== null || current.signer.toLowerCase() !== signer.toLowerCase()) throw mixUnavailable();
+  let next = from;
+  for (const current of rows) {
+    if (BigInt(current.nonce) !== next) break;
+    const job = await load(current.strategy_id, deps);
     await validatePublicationTransaction(job, current);
-    if ((await state(job, deps)).count !== 0n) continue;
+    // Quarantine does not invalidate immutable bytes. A stored receipt may have
+    // been orphaned; never let that receipt hide a now-empty canonical nonce.
+    if (current.status !== null && (current.block_number === null ||
+        (await anchor(deps, BigInt(current.block_number))).hash === current.block_hash)) break;
+    if ((await state(job, deps)).count !== 0n) break;
     held();
-    if (await bounded(client.sendRawTransaction({ serializedTransaction: current.signed_raw_tx }), deps) !== current.tx_hash) throw mixUnavailable();
+    let accepted: Hex;
+    try { accepted = await bounded(client.sendRawTransaction({ serializedTransaction: current.signed_raw_tx }), deps); }
+    catch {
+      // Do not trust an RPC error's wording (including "already known"). The
+      // exact original must independently be visible at the node before it
+      // can supply a local pending floor.
+      const known = await bounded(client.getTransaction({ hash: current.tx_hash }), deps);
+      if (known.hash !== current.tx_hash || known.from.toLowerCase() !== current.signer.toLowerCase() || known.nonce.toString() !== current.nonce ||
+          known.to?.toLowerCase() !== job.registry || known.input !== job.calldata || known.value !== 0n) throw mixUnavailable();
+      accepted = known.hash;
+    }
+    if (accepted !== current.tx_hash) throw mixUnavailable();
+    next++;
   }
+  return next === from ? null : next - 1n;
 }

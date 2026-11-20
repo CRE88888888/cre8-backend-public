@@ -22,7 +22,7 @@ import { refreshP11Markets } from './fixtures/p11-kernel.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
 
 // All writes are pinned to this lane's local anvil, with public test accounts.
-const rpc = 'http://127.0.0.1:8578';
+const rpc = 'http://127.0.0.1:8580';
 const transport = http(rpc, { timeout: 30000, retryCount: 0 });
 const client = createPublicClient({ chain: bscTestnet, transport, cacheTime: 0, pollingInterval: 20 });
 const local = createTestClient({ chain: bscTestnet, mode: 'anvil', transport });
@@ -80,7 +80,7 @@ async function setup() {
   // substituted through constructor immutables. Copy into the pinned address so
   // production GasPolicy enforcePaymaster/allowedPaymaster remain unchanged.
   // Registry/executor/oracle/Kernel/policies are neither replaced nor patched.
-  const artifact: unknown = JSON.parse(await readFile(new URL('../.bun-cache/issue-178/contracts-cbc671d/out/VerifyingPaymaster.sol/VerifyingPaymaster.json', import.meta.url), 'utf8'));
+  const artifact: unknown = JSON.parse(await readFile(new URL('../.bun-cache/issue-180/contracts-cbc671d/out/VerifyingPaymaster.sol/VerifyingPaymaster.json', import.meta.url), 'utf8'));
   assert.ok(artifact && typeof artifact === 'object'); const bytecode: unknown = Reflect.get(artifact, 'bytecode');
   assert.ok(bytecode && typeof bytecode === 'object'); const code: unknown = Reflect.get(bytecode, 'object');
   assert.ok(isHex(code) && /^0x(?:[0-9a-f]{2})+$/i.test(code));

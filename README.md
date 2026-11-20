@@ -475,7 +475,7 @@ bun run preflight --strict                                 # 0 warn · 0 fail
 
 ### 私人組合（My mix，#178）
 
-chain 97 的 1–10 資產私人組合、preview、分享／Import、owner 簽名切換與整籃停利停損，見 [API 範例與資金契約](docs/my-mix.zh-TW.md)。依賴 db#77 的 0056；本機 fork 驗證不代表已部署。
+chain 97 的 1–10 資產私人組合、preview、分享／Import、owner 簽名切換與整籃停利停損，見 [API 範例與資金契約](docs/my-mix.zh-TW.md)。依賴 db#77 的 0056 與 db#79 的 0057（先 migration 再 backend#180）；共用 operator 手動腳本的停機／對帳規則也在該文件。本機 fork 驗證不代表已部署。
 
 ### 資訊收集與審核（#159）
 

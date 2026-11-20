@@ -1,5 +1,5 @@
 import { mixCashWithdrawals } from './mix-flows.js';
-import { loadMixRuntime, decideMixTick, prepareMixTick, mixAvailableCash, mixBelowExecutorMinimum, recordMixExitFailure, MIX_EXIT_MAX_RETRIES, MIX_EXIT_COOLDOWN_MS } from './mix-runtime.js';
+import { loadMixRuntime, decideMixTick, prepareMixTick, mixAvailableCash, mixBelowExecutorMinimum, recordMixExitFailure, MIX_EXIT_MAX_RETRIES, mixExitCooldownMs, MIX_EXIT_COOLDOWN_SQL, mixSwitchExitsPending, recordMixSwitchResidual } from './mix-runtime.js';
 import { withMixPortfolioLock, excludeMixExitBudgets, checkMixLock, recordMixExecution } from './mix-store.js';
 import { createMixService, reconcilePendingMixes } from './mixes.js';
 import { mixAnchor, saveMixValuation } from './mix-valuation.js';
@@ -551,6 +551,7 @@ export type FloorRefreshInput = {
 export type SchedulerDeps = {
   mixExitFailure?: typeof recordMixExitFailure;
   mixExitMinimum?: typeof mixBelowExecutorMinimum;
+  mixSwitchResidual?: typeof recordMixSwitchResidual;
   reconcileMix?: (portfolioId: number, exit?: boolean) => Promise<boolean>;
   cacheMix?: (id: string, due: DuePortfolio, plan: PortfolioPlan) => Promise<void>;
   mixRuntime?: typeof loadMixRuntime;
@@ -731,7 +732,7 @@ export const SCHEDULER_ACTIVE_PREDICATE = `where (p.schedule_state = 'active' or
      and (exists(select 1 from strategy_jobs j where j.portfolio_id=p.id and j.state in ('reserved','running','unknown','paused'))
        or exists(select 1 from mixes m join mix_portfolio_history h on h.mix_id=m.id and h.ended_at is null
          where h.portfolio_id=p.id and m.status='active' and m.deleted_at is null and m.triggered_at is not null
-           and m.exit_alerted_at is not null and (m.exit_last_attempt_at<=$1::timestamptz-interval '${MIX_EXIT_COOLDOWN_MS} milliseconds'
+           and m.exit_alerted_at is not null and (m.exit_last_attempt_at<=$1::timestamptz-${MIX_EXIT_COOLDOWN_SQL}*interval '1 millisecond'
              or exists(select 1 from operations o where o.portfolio_id=p.id and (o.state in ('pending','submitted')
                or o.state='failed' and (o.tx_hash is not null or o.user_op_hash is not null))))))))`;
 const SQL_CLAIM_DUE = `
@@ -1676,6 +1677,7 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
     query,
     mixExitFailure: provided.mixExitFailure ?? recordMixExitFailure,
     mixExitMinimum: provided.mixExitMinimum ?? mixBelowExecutorMinimum,
+    mixSwitchResidual: provided.mixSwitchResidual ?? recordMixSwitchResidual,
     reconcileMix: provided.reconcileMix ?? ((id, exit) => createMixService().reconcilePortfolio(id, exit)),
     cacheMix: provided.cacheMix ?? (async (id, due, plan) => {
       const anchor = await mixAnchor(plan.snapshot.block);
@@ -2386,8 +2388,8 @@ async function decideAndMaybeExecute(
       return { ...base, outcome: 'blocked', reason: '組合變更對帳中；停利停損已評估，待確認後退出。' };
     }
     if (mixTick.mode === 'exit' && mix.retries >= MIX_EXIT_MAX_RETRIES &&
-        (mix.lastExitAttempt === null || ctx.now.getTime() - mix.lastExitAttempt.getTime() < MIX_EXIT_COOLDOWN_MS)) {
-      return { ...base, outcome: 'blocked', reason: '退出連續失敗已告警，冷卻五分鐘後重新確認條件並續作。' };
+        (mix.lastExitAttempt === null || ctx.now.getTime() - mix.lastExitAttempt.getTime() < mixExitCooldownMs(mix.retries))) {
+      return { ...base, outcome: 'blocked', reason: '退出連續失敗已告警，等待退避間隔結束後重新確認條件並續作。' };
     }
     if (ctx.forcePlan !== true && mixTick.mode === 'wait') return { ...base, outcome: 'noop', reason: mixTick.reason };
     if (ctx.forcePlan !== true) {
@@ -2446,10 +2448,15 @@ async function decideAndMaybeExecute(
     }
     // Quote/oracle/RPC/market deferrals are not failed executable sell attempts.
   }
-  if (mixTick?.mode === 'rebalance' && rebalance.kind === 'blocked' && rebalance.retryable === false &&
-      /^\[BELOW_MIN_(STEP|BATCH)\]/.test(rebalance.reason)) rebalance = { kind: 'noop', reason: rebalance.reason };
+  if ((mixTick?.mode === 'rebalance' || waitingSourceTarget) && rebalance.kind === 'blocked' && rebalance.retryable === false &&
+      /^\[BELOW_MIN_(STEP|BATCH)\]/.test(rebalance.reason)) rebalance = { kind: 'noop', reason: rebalance.reason, retryable: false };
   if (rebalance.kind === 'noop') {
-    if (mix && mixTick?.mode === 'rebalance' && rebalance.retryable !== true && !ctx.dryRun) {
+    if (mix && (mixTick?.mode === 'rebalance' || waitingSourceTarget) && rebalance.retryable === false && !ctx.dryRun &&
+        /^\[BELOW_MIN_(STEP|BATCH)\]/.test(rebalance.reason) && mixSwitchExitsPending(mix, plan) &&
+        await ctx.deps.mixSwitchResidual(mix, due, plan, ctx.now, ctx.deps.withTransaction)) {
+      return { ...base, outcome: 'noop', reason: '出口低於批次最小額，已保存殘留證據並完成本次強制檢查。' };
+    }
+    if (mix && (mixTick?.mode === 'rebalance' || waitingSourceTarget) && rebalance.retryable !== true && !ctx.dryRun && !mixSwitchExitsPending(mix, plan)) {
       await ctx.deps.query('update mixes set last_rebalanced_at=$2 where id=$1 and triggered_at is null', [mix.id, ctx.now]);
     }
     return { ...base, outcome: 'noop', ...(money?.useTargetWeights&&plan.report.maxAbsDeltaBps<=plan.report.thresholdBps?{rebalanceComplete:true}:{}), reason: `Planner returned noop: ${rebalance.reason}` };

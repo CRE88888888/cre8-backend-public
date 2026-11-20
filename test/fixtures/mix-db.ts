@@ -5,7 +5,7 @@ import path from 'node:path';
 import { getPool, withConnection, query, MIGRATIONS_DIR } from '../../src/db.js';
 /** Real commits and separate lock connections; no rows or authority survive the sandbox. */
 export async function mixDbSandbox(work: (lane: <R>(fn: () => Promise<R>) => Promise<R>) => Promise<void>) {
-  assert.equal((await getPool().query<{ name: string }>('select current_database() as name')).rows[0]?.name, 'cre8_x1_178');
+  assert.ok(['cre8_x1_178', 'cre8_x1_180'].includes((await getPool().query<{ name: string }>('select current_database() as name')).rows[0]?.name ?? ''));
   const schema = 'mix178_' + randomBytes(8).toString('hex');
   await getPool().query(`create schema ${schema}`);
   const lane = <R>(fn: () => Promise<R>) => withConnection(async (client, discard) => {

@@ -18,12 +18,19 @@ function decodePublicationSchedule(data: Hex) {
 }
 export function registrationRpc() {
   const transactions = new Map<Hex, { raw: Hex; publication: boolean; reverted: boolean }>();
-  const state = { blockNumberMismatch: false, prepareCalls: 0, prepareDelayMs: 0, publicationDelayMs: 0, publicationMissing: false, publicationSendFail: false, publicationReverted: false, publicationConfigConflict: false, publicationCount: 0n, publicationRaw: '0x' as Hex, publicationFail: false, publicationData: '0x' as Hex, mode: 'healthy', raw: '0x' as Hex, broadcasts: [] as Hex[], nonces: 0, delayMs: 0, id: 178000001n };
+  const state = { publicationAlreadyKnown: false, publicationCountLagReads: 0, pendingNonceFailures: 0, pendingNonce: null as number | null, latestNonce: null as number | null, blockNumberMismatch: false, prepareCalls: 0, prepareDelayMs: 0, publicationDelayMs: 0, publicationMissing: false, publicationSendFail: false, publicationReverted: false, publicationConfigConflict: false, publicationCount: 0n, publicationRaw: '0x' as Hex, publicationFail: false, publicationData: '0x' as Hex, mode: 'healthy', raw: '0x' as Hex, broadcasts: [] as Hex[], nonces: 0, delayMs: 0, id: 178000001n };
   const transport = custom({ request: async ({ method, params }) => {
     if (state.mode === 'rpc') throw new Error('private RPC failure');
     if (method === 'eth_blockNumber') return '0x1';
     if (method === 'eth_chainId') return state.mode === 'chain' ? '0x38' : '0x61';
-    if (method === 'eth_getTransactionCount') return toHex(state.nonces++);
+    if (method === 'eth_getTransactionCount') {
+      if (Array.isArray(params) && params[1] === 'pending' && state.pendingNonceFailures > 0) { state.pendingNonceFailures--; throw new Error('fixture pending nonce unavailable'); }
+      if (Array.isArray(params) && typeof params[1] === 'string' && params[1].startsWith('0x')) {
+        return toHex(Math.max(0, ...[...transactions.values()].map(tx => (parseTransaction(tx.raw).nonce ?? -1) + 1)));
+      }
+      const override = Array.isArray(params) && params[1] === 'latest' ? state.latestNonce : state.pendingNonce;
+      return toHex(override ?? state.nonces++);
+    }
     if (method === 'eth_maxPriorityFeePerGas' || method === 'eth_gasPrice') return '0x1';
     if (method === 'eth_estimateGas') { state.prepareCalls++; if (state.prepareDelayMs) await new Promise(resolve => setTimeout(resolve, state.prepareDelayMs)); return '0x493e0'; }
     if (method === 'eth_getBlockByNumber') return { number: state.blockNumberMismatch && Array.isArray(params) && params[0] === '0x1' ? '0x2' : '0x1', hash: state.mode === 'reorg' ? toHex(2n, { size: 32 }) : zeroHash,
@@ -35,6 +42,7 @@ export function registrationRpc() {
       const tx = parseTransaction(signed);
       const hash = keccak256(signed), publication = !tx.data?.startsWith(MIX_REGISTRATION_DATA.slice(0, 10));
       if (publication && state.publicationSendFail) throw new Error('private publication send failure');
+      if (publication && state.publicationAlreadyKnown && transactions.has(hash)) throw new Error('fixture already known');
       if (!transactions.has(hash)) {
         transactions.set(hash, { raw: signed, publication, reverted: publication && state.publicationReverted });
         if (publication && !state.publicationReverted) state.publicationCount++;
@@ -50,7 +58,7 @@ export function registrationRpc() {
       if (!call || typeof call !== 'object' || !('data' in call) || typeof call.data !== 'string') throw new Error('invalid fixture call');
       const data: Hex = `0x${call.data.slice(2)}`;
       const decoded = decodeFunctionData({ abi: REGISTRY_VERSION_ABI, data });
-      if (decoded.functionName === 'versionCount') return encodeFunctionResult({ abi: REGISTRY_VERSION_ABI, functionName: 'versionCount', result: state.publicationCount });
+      if (decoded.functionName === 'versionCount') return encodeFunctionResult({ abi: REGISTRY_VERSION_ABI, functionName: 'versionCount', result: state.publicationCountLagReads > 0 ? (state.publicationCountLagReads--, 0n) : state.publicationCount });
       if (decoded.functionName === 'activeVersion') return encodeFunctionResult({ abi: REGISTRY_VERSION_ABI, functionName: 'activeVersion', result: state.publicationCount === 1n ? 1 : 0 });
       if (decoded.functionName === 'version') {
         const publication = decodeFunctionData({ abi: REGISTRY_ABI, data: state.publicationData });
@@ -100,7 +108,7 @@ export function registrationRpc() {
     throw new Error('unexpected fixture method ' + method);
   } }, { retryCount: 0 });
   const client = createPublicClient({ chain: bscTestnet, transport, cacheTime: 0, pollingInterval: 1 });
-  const chain = { chainId: 97, rpcUrl: 'http://127.0.0.1:8578', registryAddress: T.contracts.registry, account: relayerSigner,
+  const chain = { chainId: 97, rpcUrl: 'http://127.0.0.1:8580', registryAddress: T.contracts.registry, account: relayerSigner,
     kernel: kernelAddressesForChain(97), wallet: createWalletClient({ chain: bscTestnet, account: relayerSigner, transport }), publicClient: client };
   return { state, client, chain };
 }

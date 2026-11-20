@@ -166,7 +166,7 @@ function tradableExit() {
   };
   const tradeQuery = f.deps.query;
   f.deps.withTransaction = work => work({ query: tradeQuery });
-  f.deps.mixExitFailure = async (_m, _due, now) => { f.state.retries = Math.min(MIX_EXIT_MAX_RETRIES, f.state.retries + 1); f.state.lastExitAttempt = now; };
+  f.deps.mixExitFailure = async (_m, _due, now) => { f.state.retries++; f.state.lastExitAttempt = now; };
   f.deps.planRebalance = async () => ({ kind: 'ready', steps: [{ tokenIn: T.assets.WBNB.token, tokenOut: T.contracts.usdt,
     amountIn: 10n ** 18n, amountOutMin: 1n, oracleFloor: 1n, venue: T.contracts.router, data: '0x' }],
     deadline: 2000000000n, rationale: 'fixture exit', purpose: 'exit' });
@@ -255,4 +255,48 @@ test('mix exit recovery requires schema readiness; historical and non-testnet cl
   await assert.rejects(claimDuePortfolios(1, mixClock, { chainId: 97, withTransaction: work => work({
     query: async () => { throw new Error('private DB credential'); },
   }) }), error => error instanceof Error && /metadata unavailable/.test(error.message) && !error.message.includes('private'));
+});
+
+test('continued canonical sell failures back off through 5m, 15m, 1h and capped 6h, then reset on success', async () => {
+  const f = tradableExit();
+  for (let i = 0; i < 5; i++) await runSchedulerOnce({ dryRun: false, now: mixClock, skipAlerts: true }, f.deps);
+  let at = mixClock.getTime(), sends = 5;
+  f.deps.clock = () => new Date(at);
+  for (const delay of [300000, 900000, 3600000, 21600000, 21600000]) {
+    await runSchedulerOnce({ dryRun: false, now: new Date(at + delay - 1), skipAlerts: true }, f.deps);
+    assert.equal(f.sends(), sends, `no sponsored attempt before ${delay}ms`);
+    at += delay;
+    await runSchedulerOnce({ dryRun: false, now: new Date(at), skipAlerts: true }, f.deps);
+    assert.equal(f.sends(), ++sends, 'the exact boundary permits one retry');
+  }
+  f.setOutcome({ status: 'success', txHash: zeroHash, userOpHash: zeroHash, gasUsed: '1', error: null });
+  await runSchedulerOnce({ dryRun: false, now: new Date(at + 21600000), skipAlerts: true }, f.deps);
+  assert.equal(f.state.retries, 0);
+});
+
+test('a forced switch noop cannot consume the period while a closed 1bp stock exit remains sellable', async () => {
+  const f = fixture(); f.state.last = null; f.state.takeProfit = null; f.state.stopLoss = null;
+  f.state.exits = new Set([T.assets.NVDAB.token, T.assets.WBNB.token]);
+  f.state.userAllocation = { [T.contracts.usdt]: 10000 };
+  const crypto = f.plan.snapshot.holdings.find(h => h.asset === T.assets.WBNB.token); assert.ok(crypto); crypto.amountWei = 0n;
+  const query = f.deps.query; assert.ok(query); let completed = 0;
+  f.deps.query = async (sql, params) => { if (sql.startsWith('update mixes set last_rebalanced_at')) completed++; return query(sql, params); };
+  f.deps.planRebalance = async () => ({ kind: 'noop', reason: '[BELOW_MIN_BATCH] closed stock excluded', retryable: false });
+  await runSchedulerOnce({ dryRun: false, now: mixClock, skipAlerts: true }, f.deps);
+  assert.equal(completed, 0);
+  f.state.last = new Date('2026-11-01Z');
+  await runSchedulerOnce({ dryRun: false, now: new Date('2026-12-01Z'), skipAlerts: true }, f.deps);
+  assert.equal(completed, 1, 'a general calendar pass still completes after its executable batch/noop');
+});
+
+test('a forced switch records a proven below-batch residual instead of leaving a tradable-sized tail due forever', async () => {
+  const f = fixture(); f.state.last = null; f.state.takeProfit = null; f.state.stopLoss = null;
+  f.state.exits = new Set([T.assets.NVDAB.token]); f.state.userAllocation = { [T.contracts.usdt]: 10000 };
+  for (const h of f.plan.snapshot.holdings) h.amountWei = h.asset === T.assets.NVDAB.token ? 2n * 10n ** 18n : 0n;
+  f.deps.planRebalance = async () => ({ kind: 'blocked', reason: '[BELOW_MIN_BATCH] 不足批次門檻', retryable: false });
+  let recorded = 0;
+  f.deps.mixSwitchResidual = async () => { recorded++; return true; };
+  const result = await runSchedulerOnce({ dryRun: false, now: new Date('2026-11-23T15:00Z'), skipAlerts: true }, f.deps);
+  assert.equal(recorded, 1);
+  assert.match(result.results[0]?.reason ?? '', /殘留/);
 });

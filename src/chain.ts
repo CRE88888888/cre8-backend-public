@@ -312,23 +312,31 @@ export function getChain(): ChainConfig {
   if (!config.rpcUrl) {
     throw new Error('chain is not configured: RPC_URL is required for on-chain operations');
   }
-  if (!config.operatorPrivateKey) {
-    throw new Error('chain is not configured: OPERATOR_PRIVATE_KEY is required for on-chain operations');
-  }
   if (!config.registryAddress) {
     throw new Error('chain is not configured: REGISTRY_ADDRESS is required for on-chain operations');
   }
 
-  const account = privateKeyToAccount(ensureHex(config.operatorPrivateKey));
   const publicClient = createPublicClient({ chain: activeChain(), transport: http(config.rpcUrl) });
-  const wallet = createWalletClient({ chain: activeChain(), transport: http(config.rpcUrl), account });
+  // operator 只在真的要用 `account`／`wallet` 送交易時才需要。scheduler 刻意不放 OPERATOR_PRIVATE_KEY，
+  // 但私人組合的對帳只讀鏈（publicClient、registryAddress），之前一律要求金鑰，組合每輪都被擋（tst 2026-11-21）。
+  const operatorKey = config.operatorPrivateKey;
+  const rpcUrl = config.rpcUrl;
+  let operator: { account: Account; wallet: WalletClient } | null = null;
+  const signer = () => {
+    if (!operatorKey) throw new Error('chain is not configured: OPERATOR_PRIVATE_KEY is required for on-chain operations');
+    if (operator === null) {
+      const account = privateKeyToAccount(ensureHex(operatorKey));
+      operator = { account, wallet: createWalletClient({ chain: activeChain(), transport: http(rpcUrl), account }) };
+    }
+    return operator;
+  };
 
   cached = {
     chainId: config.chainId,
     rpcUrl: config.rpcUrl,
     registryAddress: config.registryAddress as Address,
-    account,
-    wallet,
+    get account() { return signer().account; },
+    get wallet() { return signer().wallet; },
     publicClient,
     kernel: kernelAddressesForChain(config.chainId),
   };

@@ -11,6 +11,10 @@ import { TESTNET_97 } from './testnet-profile.js';
 import type { FaucetFundingEvidence } from './faucet.js';
 import { saveRelayerTransaction } from './relayer-outbox.js';
 import type { SignedSubmission } from './relayer-outbox.js';
+import { validateRelayerTransaction } from './relayer-outbox.js';
+import { outboxIdentity, saveOutboxIdentity, saveOutboxConsumption } from './relayer-nonce-consumption.js';
+import type { FundingNonceConsumption } from './relayer-nonce-consumption.js';
+import { recordAlerts, welcomeNonceConsumedAlert } from './alerts.js';
 
 export const WELCOME_ABI = parseAbi([
   'function welcomeFor(address to)',
@@ -66,7 +70,7 @@ export async function reserveWelcomeGrant(recipient: Recipient, c: WelcomeConfig
 
 /** Every update locks the original reservation day, then reads FOR UPDATE and applies a state/hash CAS. */
 export async function settleWelcomeGrant(grant: WelcomeGrant, state: WelcomeState, hash: Hex | null,
-  evidence?: FaucetFundingEvidence, transaction = withTransaction, signed?: SignedSubmission): Promise<void> {
+  evidence?: FaucetFundingEvidence, transaction = withTransaction, signed?: SignedSubmission, consumption?: FundingNonceConsumption): Promise<void> {
   try {
     await transaction(async client => {
       await client.query('set transaction isolation level read committed');
@@ -76,6 +80,13 @@ export async function settleWelcomeGrant(grant: WelcomeGrant, state: WelcomeStat
       const old = (await client.query<GrantRow>(`select ${columns} from welcome_grants where id=$1 for update`, [grant.id])).rows[0];
       if (!old || old.state !== grant.state || old.tx_hash !== grant.txHash || old.day !== grant.day || old.owner !== grant.owner ||
           old.account !== grant.account || Number(old.portfolio_id) !== grant.portfolioId || old.chain_id !== '97' || BigInt(old.amount_wei) !== grant.amountWei) throw storage();
+      if (consumption) {
+        if (!hash || hash !== old.tx_hash || !['submitted','unknown'].includes(old.state) || state !== 'failed' || evidence !== undefined) throw storage();
+        await validateRelayerTransaction({ ...grant, kind: 'welcome' }, hash, consumption.raw, consumption.operator);
+        const original = await outboxIdentity(hash, consumption.raw, consumption.operator);
+        await saveOutboxIdentity(client, original, { fundingTxHash: hash });
+        await saveOutboxConsumption(client, original, consumption.proof);
+      }
       if (state === 'submitted') {
         if (!hash || !signed || grant.state !== 'reserved' || grant.txHash !== null) throw storage();
         await saveRelayerTransaction(client, { ...grant, kind: 'welcome' }, hash, signed);
@@ -84,6 +95,13 @@ export async function settleWelcomeGrant(grant: WelcomeGrant, state: WelcomeStat
         where id=$1 and state=$7 returning id`, [grant.id, state, hash, evidence?.logIndex ?? null, evidence?.blockNumber.toString() ?? null, evidence?.blockHash ?? null, grant.state]);
       if (result.rows.length !== 1) throw storage();
     });
+    // Auxiliary alert storage must not roll back proven consumption or hold the
+    // shared nonce hostage. The scheduler can retry from the durable source,
+    // including when a lost COMMIT response interrupts this immediate attempt.
+    if (consumption && hash) {
+      try { await recordAlerts(query, [welcomeNonceConsumedAlert({ ...grant, txHash: hash })]); }
+      catch { console.warn('[welcome] 外部 nonce 消耗補發告警儲存失敗，保留持久來源待排程重試。'); }
+    }
   } catch { throw storage(); }
 }
 

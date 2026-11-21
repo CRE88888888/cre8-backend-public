@@ -5,6 +5,27 @@ import type { Address, PublicClient } from 'viem';
 import { recordAlerts } from './alerts.js';
 
 export const PUBLICATION_NONCE_GUARD_MS = 10 * 60_000;
+export const PUBLICATION_ALERT_RETRY_MS = 60_000;
+let publicationAlertFailedAt: number | null = null;
+
+async function recordExpiredPublicationAlerts(client: import('pg').PoolClient, now: Date): Promise<void> {
+  const at = now.getTime();
+  if (publicationAlertFailedAt !== null && at >= publicationAlertFailedAt && at - publicationAlertFailedAt < PUBLICATION_ALERT_RETRY_MS) return;
+  try {
+    const expired = await client.query<{ strategy_id: string }>(`select j.strategy_id from mix_publication_jobs j
+      where j.chain_id=97 and j.state<>'confirmed' and j.alerted_at is null and exists
+        (select 1 from mix_publication_outbox o where o.strategy_id=j.strategy_id and o.created_at<=$1::timestamptz-interval '${PUBLICATION_NONCE_GUARD_MS} milliseconds')`, [now]);
+    if (expired.rows.length) {
+      await recordAlerts((sql, params) => client.query(sql, params ? [...params] : []), [{ kind: 'portfolio_stuck', severity: 'critical', portfolioId: null,
+        detail: '私人組合發布 nonce 等待已達十分鐘；停止以該原簽阻擋共用 relayer，請營運對帳及補洞。原簽與證據保留。' }], now);
+      await client.query('update mix_publication_jobs set alerted_at=coalesce(alerted_at,$2) where strategy_id=any($1::bigint[])', [expired.rows.map(row => row.strategy_id), now]);
+    }
+    publicationAlertFailedAt = null;
+  } catch {
+    publicationAlertFailedAt = at;
+    console.warn('[relayer] publication nonce 告警儲存失敗，保留待重試；不影響 nonce admission。');
+  }
+}
 
 const relayerScope = new AsyncLocalStorage<{ floors: Map<string, bigint>; assertHeld: () => void }>();
 
@@ -74,25 +95,23 @@ export async function withRelayerLock<T>(chainId: number, action: (assertHeld: (
       // another nonce for these legacy sources until their durable hash is reconciled.
       // Publications instead reserve explicit nonces below, independently of job status.
       const unresolved = await client.query(`select id from faucet_claims where chain_id=97 and state in ('submitted','unknown') and tx_hash is not null
+          and not exists(select 1 from relayer_outbox_nonce_consumptions c where c.tx_hash=faucet_claims.tx_hash)
         union all select id from welcome_grants where chain_id=97 and state in ('submitted','unknown') and tx_hash is not null
+          and not exists(select 1 from relayer_outbox_nonce_consumptions c where c.tx_hash=welcome_grants.tx_hash)
         union all select id from mix_creation_requests where chain_id=97 and registration_tx_hash is not null
-          and state='submitted' limit 1`)
+          and state='submitted' and not exists(select 1 from relayer_outbox_nonce_consumptions c where c.tx_hash=registration_tx_hash) limit 1`)
         .catch(() => { throw unavailable(); });
       if (unresolved.rows.length > 0 && !options.reconcile) throw unavailable();
       assertHeld();
       const now = options.now ?? new Date();
-      const expired = await client.query<{ strategy_id: string }>(`select j.strategy_id from mix_publication_jobs j
-        where j.chain_id=97 and j.state<>'confirmed' and j.alerted_at is null and exists
-          (select 1 from mix_publication_outbox o where o.strategy_id=j.strategy_id and o.created_at<=$1::timestamptz-interval '${PUBLICATION_NONCE_GUARD_MS} milliseconds')`, [now]).catch(() => { throw unavailable(); });
-      if (expired.rows.length) {
-        await recordAlerts((sql, params) => client.query(sql, params ? [...params] : []), [{ kind: 'portfolio_stuck', severity: 'critical', portfolioId: null,
-          detail: '私人組合發布 nonce 等待已達十分鐘；停止以該原簽阻擋共用 relayer，請營運對帳及補洞。原簽與證據保留。' }], now);
-        await client.query('update mix_publication_jobs set alerted_at=coalesce(alerted_at,$2) where strategy_id=any($1::bigint[])', [expired.rows.map(row => row.strategy_id), now]);
-      }
-      const publications = await client.query<{ signer: string; nonce: string }>(`select o.signer,max(o.nonce)::text as nonce
+      await recordExpiredPublicationAlerts(client, now);
+      const publications = await client.query<{ signer: string; nonce: string }>(`select signer,max(nonce)::text as nonce from (
+        select o.signer,o.nonce
         from mix_publication_outbox o left join mix_publication_nonce_consumptions c using(strategy_id,attempt)
         where o.chain_id=97 and c.strategy_id is null and o.created_at>$1::timestamptz-interval '${PUBLICATION_NONCE_GUARD_MS} milliseconds'
-        group by o.signer`, [now]).catch(() => { throw unavailable(); });
+        union all select n.signer,n.nonce from relayer_outbox_nonce_consumptions c
+          join relayer_outbox_nonce_identities n using(tx_hash) where n.chain_id=97
+        ) occupied group by signer`, [now]).catch(() => { throw unavailable(); });
       const floors = new Map<string, bigint>();
       for (const row of publications.rows) {
         if (!/^0x[0-9a-f]{40}$/.test(row.signer) || !/^(0|[1-9][0-9]*)$/.test(row.nonce)) throw unavailable();

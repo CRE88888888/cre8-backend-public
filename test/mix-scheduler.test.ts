@@ -300,3 +300,55 @@ test('a forced switch records a proven below-batch residual instead of leaving a
   assert.equal(recorded, 1);
   assert.match(result.results[0]?.reason ?? '', /殘留/);
 });
+
+for (const late of [false, true]) test(`a ${late ? 'late' : 'fresh'} canonical batch completes a switch once its crypto exits are gone while its target stock is closed`, async () => {
+  const f = tradableExit();
+  f.state.last = null; f.state.takeProfit = null; f.state.stopLoss = null;
+  f.state.exits = new Set([T.assets.BTCB.token]);
+  f.plan.targets.push({ asset: T.assets.BTCB.token, weightBps: 1, symbol: 'BTCB' });
+  f.plan.snapshot.holdings.push({ asset: T.assets.BTCB.token, amountWei: 0n, decimals: 18, usdPriceE8: 100000000n, priceSource: 'numeraire' });
+  const crypto = f.plan.snapshot.holdings.find(h => h.asset === T.assets.WBNB.token); assert.ok(crypto);
+  crypto.amountWei *= 2n;
+  const query = f.deps.query; assert.ok(query);
+  let completed = 0, unresolved = late;
+  f.deps.query = async (sql, params) => {
+    if (sql.includes('select idempotency_key, payload_hash')) return { rows: unresolved ? [{ idempotency_key: 'late-switch',
+      payload_hash: zeroHash, state: 'submitted', user_op_hash: zeroHash, tx_hash: zeroHash, strategy_job_id: null }] : [] };
+    if (sql.startsWith('update mixes set last_rebalanced_at') && params?.[1] === false) { completed++; f.state.last = mixClock; }
+    if (sql.includes('update operations')) unresolved = false;
+    return query(sql, params);
+  };
+  const settlementQuery = f.deps.query;
+  f.deps.withTransaction = work => work({ query: settlementQuery });
+  f.setOutcome({ status: 'success', txHash: zeroHash, userOpHash: zeroHash, gasUsed: '1', error: null });
+  const result = await runSchedulerOnce({ dryRun: false, now: mixClock, skipAlerts: true }, f.deps);
+  assert.equal(result.results[0]?.outcome, 'executed', result.results[0]?.reason);
+  assert.equal(completed, 1);
+  const sends = f.sends();
+  await runSchedulerOnce({ dryRun: false, now: new Date(mixClock.getTime() + 60000), skipAlerts: true }, f.deps);
+  assert.equal(f.sends(), sends, 'no second trade in the completed calendar period');
+});
+
+for (const failure of ['rpc', 'db', 'missing', 'unpriced', 'blocked'] as const) test(`late switch settlement retains its operation when refreshed exit valuation is ${failure}`, async () => {
+  const f = tradableExit(); f.state.last = null;
+  const query = f.deps.query; assert.ok(query);
+  let settled = 0;
+  f.deps.query = async (sql, params) => {
+    if (sql.includes('select idempotency_key, payload_hash')) return { rows: [{ idempotency_key: 'late-switch', payload_hash: zeroHash,
+      state: 'submitted', user_op_hash: zeroHash, tx_hash: zeroHash, strategy_job_id: null }] };
+    if (sql.includes('update operations')) settled++;
+    return query(sql, params);
+  };
+  const settlementQuery = f.deps.query;
+  f.deps.withTransaction = work => work({ query: settlementQuery });
+  if (failure === 'rpc') f.deps.planPortfolio = async () => { throw new Error('private RPC credential'); };
+  if (failure === 'db') f.deps.mixRuntime = async () => { throw new Error('private DB credential'); };
+  if (failure === 'missing') f.deps.mixRuntime = async () => null;
+  if (failure === 'unpriced') f.plan.snapshot.unpriced.push({ asset: T.assets.WBNB.token, symbol: 'WBNB', decimals: 18, amountWei: 1n, reason: 'pricing_failed' });
+  if (failure === 'blocked') f.plan.report = null;
+  f.setOutcome({ status: 'success', txHash: zeroHash, userOpHash: zeroHash, gasUsed: '1', error: null });
+  const result = await runSchedulerOnce({ dryRun: false, now: mixClock, skipAlerts: true }, f.deps);
+  assert.equal(result.results[0]?.outcome, 'blocked');
+  assert.doesNotMatch(result.results[0]?.reason ?? '', /private|credential/);
+  assert.equal(settled, 0); assert.equal(f.state.last, null); assert.equal(f.sends(), 0);
+});

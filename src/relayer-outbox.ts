@@ -3,6 +3,7 @@ import type { Address, Hex } from 'viem';
 import type { PoolClient } from 'pg';
 import { TESTNET_97 } from './testnet-profile.js';
 import { WELCOME_AMOUNT_WEI } from './config.js';
+import { outboxIdentity, saveOutboxIdentity } from './relayer-nonce-consumption.js';
 
 export type RelayerSource = { kind: 'welcome' | 'faucet'; id: string; chainId: number; account: Address; amountWei: bigint };
 export type SignedSubmission = { raw: Hex; operator?: Address };
@@ -34,4 +35,5 @@ export async function saveRelayerTransaction(client: PoolClient, source: Relayer
   await validateRelayerTransaction(source, hash, signed.raw, signed.operator);
   await client.query(`insert into relayer_transaction_outbox(tx_hash,chain_id,signed_raw_tx,welcome_grant_id,faucet_claim_id)
     values($1,$2,$3,$4,$5)`, [hash, source.chainId, signed.raw, source.kind === 'welcome' ? source.id : null, source.kind === 'faucet' ? source.id : null]);
+  await saveOutboxIdentity(client, await outboxIdentity(hash, signed.raw, signed.operator ?? TESTNET_97.roles.operator), { fundingTxHash: hash });
 }

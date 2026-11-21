@@ -10,9 +10,10 @@ export type MixCreation = {
   registration_tx_hash: `0x${string}` | null; onchain_strategy_id: string | null;
   registration_block_number: string | null; registration_block_hash: `0x${string}` | null;
   strategy_id: string | null; mix_id: string | null;
+  registration_attempt: number;
 };
 // Deliberately excludes outbox authority; safe request data never includes raw transactions.
-export const MIX_CREATION_COLUMNS = `id,owner,chain_id,request_hash,settings,state,registration_tx_hash,
+export const MIX_CREATION_COLUMNS = `id,owner,chain_id,request_hash,settings,state,registration_attempt,registration_tx_hash,
   onchain_strategy_id,registration_block_number,registration_block_hash,strategy_id,mix_id`;
 export function mixRequestKey(key: unknown): string {
   if (typeof key !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(key)) {

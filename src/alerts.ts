@@ -135,6 +135,12 @@ export type AlertFinding = {
   detail: string;
 };
 
+/** Uses an existing DB kind; grant identity survives failure and manual repair. */
+export function welcomeNonceConsumedAlert(grant: { id: string; portfolioId: number; owner: Address; account: Address; amountWei: bigint; txHash: Hex }): AlertFinding {
+  return { kind: 'portfolio_stuck', severity: 'critical', portfolioId: grant.portfolioId,
+    detail: `WELCOME_NONCE_CONSUMED：welcome 原簽 nonce 被外部交易消耗，grant ${grant.id}，owner ${grant.owner}，account ${grant.account}，amount ${grant.amountWei} wei，原 hash ${grant.txHash}。終生資格已保留且不會自動重領；請營運核對 canonical 原交易與消耗證據，確認未發放後手動補發，再手動解除此告警。` };
+}
+
 /** 未解決警示的一列（`GET /health` 的計數與 `--alerts` 的清單都來自它）。 */
 export type OpenAlert = {
   kind: AlertKind;
@@ -242,6 +248,23 @@ export async function detectAlerts(
 
   const stuck=await detectPortfolioStuck(query,thresholds.stuckHours);
   if (chainIdFromEnv(env) === 97) {
+    // Recover even if the immediate alert failed or its COMMIT response was
+    // lost. Only a manually resolved matching alert acknowledges the repair.
+    const welcomes = await query(`select g.id::text,g.portfolio_id,g.owner,g.account,g.amount_wei::text,g.tx_hash
+      from welcome_grants g join relayer_outbox_nonce_consumptions c on c.tx_hash=g.tx_hash
+      where g.chain_id=97 and g.state='failed' and not exists(select 1 from scheduler_alerts a
+        where a.portfolio_id=g.portfolio_id and a.kind='portfolio_stuck' and a.resolved_at is not null
+          and a.detail like '%WELCOME_NONCE_CONSUMED%')`);
+    for (const row of welcomes.rows) {
+      const fields = row as Record<string, unknown>;
+      if (typeof fields.id !== 'string' || !/^[1-9][0-9]*$/.test(fields.id) || typeof fields.amount_wei !== 'string' || !/^[1-9][0-9]*$/.test(fields.amount_wei) ||
+          typeof fields.tx_hash !== 'string' || !/^0x[0-9a-f]{64}$/.test(fields.tx_hash)) throw new Error('welcome alert identity unavailable');
+      const finding = welcomeNonceConsumedAlert({ id: fields.id, portfolioId: toInteger(fields.portfolio_id, 'portfolio_id'),
+        owner: asAddress(fields.owner, 'owner'), account: asAddress(fields.account, 'account'), amountWei: BigInt(fields.amount_wei), txHash: fields.tx_hash as Hex });
+      const prior = stuck.find(item => item.portfolioId === finding.portfolioId);
+      if (prior) { prior.severity = 'critical'; prior.detail += '；' + finding.detail; }
+      else stuck.push(finding);
+    }
     const mixes = await query(`select h.portfolio_id,m.exit_retry_count from mixes m join mix_portfolio_history h
       on h.mix_id=m.id and h.ended_at is null where m.chain_id=97 and m.deleted_at is null
       and m.status='active' and m.triggered_at is not null and m.exit_alerted_at is not null`);
@@ -263,6 +286,14 @@ export async function detectAlerts(
       });
       stuck.push({ kind: 'portfolio_stuck', severity: 'critical', portfolioId: null,
         detail: `私人組合首版發布待營運確認，strategy ${ids.join(', ')}；未決原簽保留，其他組合獨立對帳。` });
+    }
+    const quarantined = await query(`select 1 from relayer_outbox_nonce_quarantines q
+      join relayer_outbox_nonce_identities n using(tx_hash) where n.chain_id=97 limit 1`);
+    if (quarantined.rows.length) {
+      const detail = 'relayer 外部 nonce 消耗證據已隔離；原簽與歷史保留，請營運對帳。';
+      const prior = stuck.find(finding => finding.portfolioId === null);
+      if (prior) { prior.severity = 'critical'; prior.detail += '；' + detail; }
+      else stuck.push({ kind: 'portfolio_stuck', severity: 'critical', portfolioId: null, detail });
     }
   }
   if(chainIdFromEnv(env)===97&&yieldProfile()!==null)for(const finding of await detectYieldAttention(query)){
@@ -592,7 +623,8 @@ export async function recordAlerts(
  * 把**這一輪沒偵測到**的未解決警示標成 resolved，回傳解除了幾筆。
  *
  * 「沒偵測到」= 不在 `present` 裡。所以呼叫端要傳**這一輪的完整 findings**（不是差集）；傳空陣列
- * 等於「現在什麼問題都沒有」，所有未解決的都會被解除 —— 那正是 `--alerts` 之後看到空清單的條件。
+ * 等於「現在什麼問題都沒有」，一般未解決警示都會被解除。WELCOME_NONCE_CONSUMED 補發告警
+ * 只可由營運核對後手動解除，避免偵測與解除之間才插入的告警被誤認為已修復。
  * 用 (kind, portfolio) 當鍵而不是 id：警示的 id 是 DB 給的，呼叫端不該需要先記住它。
  * 未完成偵測的 kind 要放進 unverifiedKinds：保留既有列，不把「未知」當成「已恢復」。
  */
@@ -780,13 +812,14 @@ const SQL_RECORD_ALERT = `
   returning a.*, (xmax = 0) as inserted, (select severity from previous) as previous_severity
 `;
 
-/** 「不在這一輪的 findings 裡」→ resolved。`empty` 陣列 = 全部解除（`<> all('{}')` 恆真）。 */
+/** Missing findings resolve automatically, except welcome manual-repair alerts. */
 const SQL_RESOLVE_ALERTS = `
   update scheduler_alerts
      set resolved_at = $1
    where resolved_at is null
      and (kind || ':' || coalesce(portfolio_id, -1)::text) <> all($2::text[])
      and kind <> all($3::text[])
+     and not (kind='portfolio_stuck' and detail like '%WELCOME_NONCE_CONSUMED%')
   returning id, kind, severity, portfolio_id, detail, first_seen_at, last_seen_at, resolved_at
 `;
 

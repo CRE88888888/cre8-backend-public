@@ -24,7 +24,7 @@ test('stable mix exclusion covers RPC waits, independent workers, different port
   assert.equal(attempted, 3);
 });
 test('lost stable lock prevents sending after an RPC wait and discards the dead connection', async () => {
-  assert.ok(['cre8_x1_178', 'cre8_x1_180'].includes((await query<{ name: string }>('select current_database() as name')).rows[0]?.name ?? ''));
+  assert.ok(['cre8_x1_178', 'cre8_x1_180', 'cre8_x1_182'].includes((await query<{ name: string }>('select current_database() as name')).rows[0]?.name ?? ''));
   const entered = barrier(), remote = barrier();
   let pid: number | undefined, sent = 0;
   const first = withMixLock('178000000003', async () => {

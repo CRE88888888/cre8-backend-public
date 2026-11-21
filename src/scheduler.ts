@@ -2313,7 +2313,7 @@ async function decideAndMaybeExecute(
     }
     const execution = reconciliation.outcome;
     if(due.executionKind==='per_asset'&&execution.status==='success'){
-      await settleAllocatedCash(ctx.deps,due.portfolioId,op.idempotency_key,execution,due.personalMix);
+      await settleAllocatedCash(ctx.deps,due.portfolioId,op.idempotency_key,execution,due.personalMix ? due : undefined);
       return {...base,outcome:'executed',execution,reason:'原再平衡收據與已配置現金已原子對帳，本輪無重送'};
     }
     const settled = due.personalMix && execution.status === 'reverted'
@@ -2697,7 +2697,7 @@ async function decideAndMaybeExecute(
     valuationAssets,
     idempotencyKey,
     trackAllocatedCash:due.executionKind==='per_asset',
-    ...(due.personalMix ? { personalMix: true } : {}),
+    ...(due.personalMix ? { personalMix: true, mixDue: due } : {}),
     ...(money?.job ? { strategy: { context: money.context, job: money.job } } : {}),
   });
   if (execution.errorCode === 'PINNED_VERSION_CHANGED' || execution.errorCode === 'VERSION_ACTIVATION_IMMINENT' || execution.errorCode === 'VERSION_STATE_UNAVAILABLE') {
@@ -2903,8 +2903,21 @@ async function settleMixFailedOperation(deps: ResolvedDeps, portfolioId: number,
     return result;
   });
 }
-async function settleAllocatedCash(deps:ResolvedDeps,portfolioId:number,key:string,outcome:ExecutionOutcome,personalMix=false):Promise<void>{
+async function settleAllocatedCash(deps:ResolvedDeps,portfolioId:number,key:string,outcome:ExecutionOutcome,mixDue?:DuePortfolio):Promise<void>{
   if(outcome.cashDeltaRaw===undefined||!/^(-?)(0|[1-9][0-9]*)$/.test(outcome.cashDeltaRaw))throw new Error('missing cash evidence');
+  // Re-read actual holdings for both immediate and late receipts, outside the
+  // short settlement transaction. A configured exit is not proof it is still held.
+  let switchExitsPending = true;
+  if (mixDue) {
+    const plan = await deps.planPortfolio(portfolioId);
+    const mix = await deps.mixRuntime(mixDue, deps.query, plan.snapshot.block);
+    if (!mix || plan.portfolioId !== portfolioId || plan.snapshot.portfolioId !== portfolioId ||
+        plan.account.toLowerCase() !== mixDue.account.toLowerCase() || plan.chainId !== deps.chainId ||
+        plan.blocked.length || plan.report === null || plan.snapshot.unpriced.some(h => h.amountWei > 0n)) {
+      throw new Error('[MIX_VALUATION_UNAVAILABLE] 無法確認出口持倉，保留原操作待對帳');
+    }
+    switchExitsPending = mixSwitchExitsPending(mix, plan);
+  }
   await deps.withTransaction(async({query})=>{
     await lockCash(query,{chainId:deps.chainId,portfolioId});
     const op=(await query('select state from operations where idempotency_key=$1 for update',[key])).rows[0] as {state:string}|undefined;
@@ -2913,7 +2926,7 @@ async function settleAllocatedCash(deps:ResolvedDeps,portfolioId:number,key:stri
     const result=await query(SQL_SETTLE_OPERATION,[key,'confirmed',outcome.txHash,outcome.userOpHash,null]);
     if(result.rows.length!==1)throw new Error('operation changed');
     await query(`update strategy_cash_balances set allocated_cash_raw=allocated_cash_raw+$3::numeric,updated_at=clock_timestamp() where chain_id=$1 and portfolio_id=$2`,[deps.chainId,portfolioId,outcome.cashDeltaRaw]);
-    if(personalMix)await recordMixExecution(query,portfolioId,key,'rebalance');
+    if(mixDue)await recordMixExecution(query,portfolioId,key,'rebalance',switchExitsPending);
   });
 }
 
@@ -2959,6 +2972,7 @@ async function executeAndSettle(
   args: {
     beforeSending?: () => Promise<void>;
     personalMix?: boolean;
+    mixDue?: DuePortfolio;
     strategy?: {context:JobContext;job:StrategyJob};
     trackAllocatedCash?:boolean;
     gasPurpose: 'ordinary' | 'exit';
@@ -3000,7 +3014,7 @@ async function executeAndSettle(
       const cash=(deps.chainId===97?TESTNET_97.contracts.usdt:'0x55d398326f99059ff775485246999027b3197955') as Address;
       const verified=await deps.reconcileRebalance({account:args.account,executor:args.executor,chainId:deps.chainId,userOpHash:outcome.userOpHash,txHash:outcome.txHash,payloadHash:planHashFor(args.steps,args.deadline),trackCash:cash});
       if(verified.kind!=='found'||verified.outcome.status!=='success')throw new Error('cash receipt incomplete');
-      await settleAllocatedCash(deps,args.portfolioId,args.idempotencyKey,verified.outcome,args.personalMix);Object.assign(outcome,verified.outcome);return;
+      await settleAllocatedCash(deps,args.portfolioId,args.idempotencyKey,verified.outcome,args.mixDue);Object.assign(outcome,verified.outcome);return;
     }
     const result = args.personalMix && state === 'reverted'
       ? await settleMixFailedOperation(deps, args.portfolioId, args.idempotencyKey, outcome, deps.clock())

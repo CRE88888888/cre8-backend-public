@@ -120,14 +120,14 @@ export async function quiesceMix(db: { query: import('./scheduler.js').Scheduler
   await db.query('select strategy_replan_quiescent($1,$2)', [chainId, portfolioId]);
 }
 
-export async function recordMixExecution(find: import('./scheduler.js').SchedulerQueryFn, portfolioId: number, key: string, mode: 'new_money' | 'rebalance'): Promise<void> {
+export async function recordMixExecution(find: import('./scheduler.js').SchedulerQueryFn, portfolioId: number, key: string, mode: 'new_money' | 'rebalance', switchExitsPending = true): Promise<void> {
   // Called inside canonical receipt settlement, never for a send or timeout.
   if (mode === 'rebalance') await find(`update mixes set last_rebalanced_at=clock_timestamp() where id in
     (select mix_id from mix_portfolio_history where portfolio_id=$1 and ended_at is null)
     and status='active' and triggered_at is null
-    and (last_rebalanced_at is not null or not exists(select 1 from mix_portfolio_history h
+    and (not $2::boolean or last_rebalanced_at is not null or not exists(select 1 from mix_portfolio_history h
       join mix_strategy_settings s on s.strategy_id=h.strategy_id where h.mix_id=mixes.id and h.ended_at is null
-        and jsonb_array_length(s.exit_assets)>0))`, [portfolioId]);
+        and jsonb_array_length(s.exit_assets)>0))`, [portfolioId, switchExitsPending]);
   // A canonical successful sell ends the consecutive-failure streak. Resume only
   // a portfolio paused by this exit guard; the exit latch itself stays set.
   await find(`update portfolios set schedule_state='active' where id=$1 and schedule_state='paused'

@@ -17,7 +17,8 @@ export function foreignNonceRpc(base: ReturnType<typeof registrationRpc>, raw: H
     if (call.functionName !== 'publishSettingsVersion') throw new Error('fixture foreign publication required');
     scheduleHash = call.args[3]; base.state.publicationData = foreign.data; base.state.publicationCount = 1n;
   }
-  const state = { delayMs: 0, originalReceiptError: false, pendingOnly: false, missingTransaction: false, missingReceipt: false, wrongReceipt: false, reorg: false, duplicate: false, reverted: false };
+  const state = { head: null as bigint | null, headSequence: [] as bigint[], missingHead: false, headError: false,
+    delayMs: 0, originalReceiptError: false, pendingOnly: false, nonceGap: false, missingTransaction: false, missingReceipt: false, wrongReceipt: false, reorg: false, duplicate: false, reverted: false };
   const blockHash = (n: bigint) => n === 1n ? zeroHash : toHex(n + (state.reorg ? 100n : 0n), { size: 32 });
   const publicationLogs = () => scheduleHash === null ? [] : [{ address: T.contracts.registry, blockNumber: '0x2', blockHash: blockHash(2n),
     transactionHash: hash, transactionIndex: '0x0', logIndex: '0x0', removed: false,
@@ -31,13 +32,17 @@ export function foreignNonceRpc(base: ReturnType<typeof registrationRpc>, raw: H
     if (state.delayMs) await new Promise(resolve => setTimeout(resolve, state.delayMs));
     const args: readonly unknown[] = Array.isArray(params) ? params : [];
     const published = base.state.publicationCount > 0n;
+    const mined = published || base.state.broadcasts.some(raw => (parseTransaction(raw).nonce ?? -1) > nonce);
     if (method === 'eth_getTransactionCount') {
-      const tag = args[1], block = tag === 'latest' || tag === 'pending' ? (published ? 4n : 3n) : BigInt(String(tag));
+      const tag = args[1], block = tag === 'latest' || tag === 'pending' ? (mined ? 4n : 3n) : BigInt(String(tag));
+      if (state.nonceGap) return toHex(nonce);
       if (state.pendingOnly && tag !== 'pending') return toHex(nonce);
-      return toHex(nonce + (block < 2n ? 0 : block >= 4n && published ? 2 : 1));
+      return toHex(nonce + (block < 2n ? 0 : block >= 4n && mined ? 2 : 1));
     }
     if (method === 'eth_getBlockByNumber') {
-      const number = args[0] === 'latest' ? (published ? 4n : 3n) : BigInt(String(args[0]));
+      if (args[0] === 'latest' && state.headError) throw new Error('private head RPC failure');
+      if (args[0] === 'latest' && state.missingHead) return null;
+      const number = args[0] === 'latest' ? (state.headSequence.shift() ?? state.head ?? (mined ? 4n : 3n)) : BigInt(String(args[0]));
       const tx = { ...transaction, blockHash: blockHash(2n) };
       return { number: toHex(number), hash: blockHash(number), timestamp: toHex(99n + number), baseFeePerGas: '0x1', gasLimit: '0x1000000', gasUsed: '0x1',
         transactions: number === 2n && args[1] === true && !state.missingTransaction ? state.duplicate ? [tx, tx] : [tx] : [] };
@@ -50,7 +55,7 @@ export function foreignNonceRpc(base: ReturnType<typeof registrationRpc>, raw: H
     if (method === 'eth_getLogs' && scheduleHash !== null) return publicationLogs();
     if (method === 'eth_getTransactionReceipt' && args[0] !== hash && state.originalReceiptError && !published) throw new Error('fixture original receipt RPC error');
     const result: unknown = await base.client.transport.request(request);
-    if (published && (method === 'eth_getTransactionReceipt' || method === 'eth_getTransactionByHash') && record(result)) {
+    if (mined && (method === 'eth_getTransactionReceipt' || method === 'eth_getTransactionByHash') && record(result)) {
       return { ...result, blockNumber: '0x4', blockHash: blockHash(4n), ...(Array.isArray(result.logs) ? {
         logs: result.logs.map((log: unknown) => { if (!record(log)) throw new Error('fixture log missing'); return { ...log, blockNumber: '0x4', blockHash: blockHash(4n) }; }),
       } : {}) };

@@ -18,7 +18,7 @@ import { UnauthorizedError } from '../src/errors.js';
 import { RequestRateLimiter, MemoryRateLimitStore } from '../src/ratelimit.js';
 import { loadRateLimitConfig } from '../src/config.js';
 import { syncMixAccountFlows, syncMixEnrollmentFlows } from '../src/mix-flows.js';
-import { loadMixRuntime, decideMixTick, prepareMixTick, recordMixSwitchResidual } from '../src/mix-runtime.js';
+import { loadMixRuntime, decideMixTick, prepareMixTick, recordMixSwitchResidual, mixSwitchExitsPending } from '../src/mix-runtime.js';
 import { recordMixExitFailure, MIX_EXIT_MAX_RETRIES } from '../src/mix-runtime.js';
 import { claimDuePortfolios } from '../src/scheduler.js';
 import { RateLimitError } from '../src/ratelimit.js';
@@ -624,6 +624,32 @@ test('a switched mix keeps its forced pass after a crypto batch until its closed
     await recordMixExecution(find, switched.portfolioId, 'ordinary-period-batch', 'rebalance');
     const ordinary = (await db.query('select last_rebalanced_at from mixes where id=$1', [made.mixId])).rows[0]?.last_rebalanced_at;
     assert.ok(ordinary instanceof Date, 'ordinary period still completes on one batch');
+  });
+});
+
+test('a switch with a closed target stock finishes the period after its crypto exit falls below the step minimum', async () => {
+  await fixture(async (service, db) => {
+    const made = await service.create({ assets: [{ assetId: T.assets.WBNB.token, weightBps: 10000 }],
+      rebalance: { frequency: 'monthly', startDate: '2026-11-01' } }, owner, randomUUID());
+    await service.confirm(made.mixId, owner, { txHash: toHex(84n, { size: 32 }) });
+    await service.patch(made.mixId, owner, { assets: [{ assetId: T.assets.NVDAB.token, weightBps: 5000 }, { assetId: T.assets.BTCB.token, weightBps: 5000 }] });
+    const switched = await service.confirm(made.mixId, owner, { txHash: toHex(85n, { size: 32 }) }); assert.ok(switched.portfolioId);
+    const find: import('../src/scheduler.js').SchedulerQueryFn = (sql, args) => db.query(sql, args ? [...args] : []);
+    const due = { portfolioId: switched.portfolioId, strategyId: made.strategyId, account: made.account, accountType: 'KERNEL',
+      intervalSeconds: 60, unsupportedReason: null, nextRunAt: mixClock };
+    const { plan } = mixRuntimeFixture();
+    const crypto = plan.snapshot.holdings.find(h => h.asset === T.assets.WBNB.token); assert.ok(crypto); crypto.asset = T.assets.BTCB.token; crypto.amountWei *= 2n;
+    const target = plan.targets.find(h => h.asset === T.assets.WBNB.token); assert.ok(target); target.asset = T.assets.BTCB.token;
+    const exit = { asset: T.assets.WBNB.token, amountWei: WAD, decimals: 18, usdPriceE8: 100000000n, priceSource: 'numeraire' as const };
+    plan.targets.push({ asset: exit.asset, weightBps: 1, symbol: 'WBNB' }); plan.snapshot.holdings.push(exit);
+    let state = await loadMixRuntime(due, find); assert.ok(state);
+    assert.ok(state.exits.has(exit.asset));
+    await recordMixExecution(find, switched.portfolioId, 'exit-at-minimum', 'rebalance', mixSwitchExitsPending(state, plan));
+    assert.equal((await loadMixRuntime(due, find))?.last, null, 'exactly the step minimum remains pending');
+    exit.amountWei--;
+    await recordMixExecution(find, switched.portfolioId, 'exit-sold-next-batch', 'rebalance', mixSwitchExitsPending(state, plan));
+    state = await loadMixRuntime(due, find); assert.ok(state); assert.ok(state.last instanceof Date);
+    assert.equal(decideMixTick({ ...state, newMoney: false, takeProfit: null, stopLoss: null }, plan, new Date(state.last.getTime() + 60000)).mode, 'wait');
   });
 });
 

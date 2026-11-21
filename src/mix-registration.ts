@@ -10,6 +10,7 @@ import { MIX_CREATION_COLUMNS } from './mix-creation.js';
 import type { MixCreation } from './mix-creation.js';
 import { mixUnavailable } from './mix-store.js';
 import { TESTNET_97 as T } from './testnet-profile.js';
+import { outboxIdentity, saveOutboxIdentity, saveOutboxConsumption, findOutboxConsumption, verifyOutboxConsumption, checkOutboxNonceHistory } from './relayer-nonce-consumption.js';
 
 export const MIX_REGISTRATION_DATA = encodeFunctionData({ abi: REGISTRY_ABI, functionName: 'registerStrategy', args: ['CRE8 mix', 'My mix', false] });
 type Identity = { operator?: Address; registry?: Address };
@@ -34,12 +35,15 @@ export async function validateMixRegistration(hash: Hex, raw: Hex, identity: Ide
 }
 
 /** Called under the shared relayer lock. Unknown receipt may replay ONLY durable original bytes. */
-export async function reconcileMixRegistration(id: string, deps: MixRegistrationDeps, replay = false): Promise<'registered' | 'replayed' | 'unresolved'> {
+export async function reconcileMixRegistration(id: string, deps: MixRegistrationDeps, replay = false): Promise<'registered' | 'replayed' | 'consumed' | 'unresolved'> {
   const row = await load(id, deps.query);
+  const historyOk = await checkOutboxNonceHistory({ ...deps, operator: deps.operator ?? T.roles.operator }, id);
   const outbox = (await deps.query<{ tx_hash: Hex; signed_raw_tx: Hex }>(`select tx_hash,signed_raw_tx from mix_registration_outbox
-    where request_id=$1 and chain_id=97`, [id])).rows[0];
+    where request_id=$1 and attempt=$2 and tx_hash=$3 and chain_id=97`, [id, row.registration_attempt, row.registration_tx_hash])).rows[0];
   if (!outbox || row.registration_tx_hash !== outbox.tx_hash) throw mixUnavailable();
+  if ((await deps.query('select 1 from relayer_outbox_nonce_consumptions where tx_hash=$1', [outbox.tx_hash])).rows.length) return 'unresolved';
   await validateMixRegistration(outbox.tx_hash, outbox.signed_raw_tx, deps);
+  const identity = await outboxIdentity(outbox.tx_hash, outbox.signed_raw_tx, deps.operator ?? T.roles.operator);
   const client = deps.client;
   const rpc = async <R>(work: Promise<R>): Promise<R> => {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -50,13 +54,39 @@ export async function reconcileMixRegistration(id: string, deps: MixRegistration
   let receipt;
   try { receipt = await rpc(client.getTransactionReceipt({ hash: outbox.tx_hash })); }
   catch (error) {
-    if (!(error instanceof TransactionReceiptNotFoundError) || !replay || row.state !== 'submitted') throw mixUnavailable();
+    if (row.state !== 'submitted') throw mixUnavailable();
+    let proof;
+    try { proof = await findOutboxConsumption(client, identity, deps.timeoutMs); }
+    catch { if (!(error instanceof TransactionReceiptNotFoundError) || !historyOk) throw mixUnavailable(); }
+    if (proof) {
+      await verifyOutboxConsumption(client, identity, proof, deps.timeoutMs);
+      deps.assertHeld?.();
+      await deps.transaction(async db => {
+        await db.query("set local statement_timeout='5s'");
+        await db.query("set local lock_timeout='3s'");
+        const locked = (await db.query<MixCreation>(`select ${MIX_CREATION_COLUMNS} from mix_creation_requests where id=$1 for update`, [id])).rows[0];
+        if (!locked || locked.state !== 'submitted' || locked.registration_attempt !== row.registration_attempt || locked.registration_tx_hash !== outbox.tx_hash) throw mixUnavailable();
+        await saveOutboxIdentity(db, identity, { registrationRequestId: id, registrationAttempt: row.registration_attempt });
+        await saveOutboxConsumption(db, identity, proof);
+        const quarantined = (await db.query(`select 1 from relayer_outbox_nonce_quarantines q join relayer_outbox_nonce_identities n using(tx_hash)
+          where n.registration_request_id=$1`, [id])).rows.length > 0;
+        if (!quarantined) await db.query(`update mix_creation_requests set state='prepared',registration_tx_hash=null,
+          registration_attempt=registration_attempt+1,last_error_code='REGISTRATION_NONCE_CONSUMED',updated_at=clock_timestamp()
+          where id=$1 and state='submitted' and registration_attempt=$2 and registration_tx_hash=$3`, [id, row.registration_attempt, outbox.tx_hash]);
+        deps.assertHeld?.();
+      });
+      return 'consumed';
+    }
+    if (!(error instanceof TransactionReceiptNotFoundError) || !replay || !historyOk) throw mixUnavailable();
     deps.assertHeld?.();
     const hash = await rpc(client.sendRawTransaction({ serializedTransaction: outbox.signed_raw_tx }));
     if (hash !== outbox.tx_hash) throw mixUnavailable();
     return 'replayed';
   }
+  if (!historyOk) return 'unresolved';
   const original = parseTransaction(outbox.signed_raw_tx);
+  if ((await deps.query(`select 1 from relayer_outbox_nonce_consumptions c join relayer_outbox_nonce_identities n using(tx_hash)
+    where n.registration_request_id=$1 and c.block_number>$2 limit 1`, [id, receipt.blockNumber.toString()])).rows.length) throw mixUnavailable();
   const [block, tx] = await rpc(Promise.all([client.getBlock({ blockNumber: receipt.blockNumber }), client.getTransaction({ hash: outbox.tx_hash })]));
   if (receipt.transactionHash !== outbox.tx_hash || receipt.status !== 'success' || block.number !== receipt.blockNumber || block.hash !== receipt.blockHash ||
       tx.hash !== outbox.tx_hash || tx.blockNumber !== receipt.blockNumber || tx.blockHash !== receipt.blockHash || tx.nonce !== original.nonce ||
@@ -92,11 +122,13 @@ export async function registerMixCreation(id: string, overrides: Partial<MixRegi
     const deps: MixRegistrationDeps = { query, transaction: withTransaction, client: chain.publicClient, operator: chain.account.address, registry: chain.registryAddress, ...overrides };
     const initial = await load(id, deps.query);
     if (initial.state === 'registered' || initial.state === 'completed') {
-      await reconcileMixRegistration(id, deps); return load(id, deps.query);
+      if (await reconcileMixRegistration(id, deps) !== 'registered') throw mixUnavailable();
+      return load(id, deps.query);
     }
     await (overrides.lock ?? withRelayerLock)(97, async held => {
       const row = await load(id, deps.query);
       if (row.state === 'prepared') {
+        if (!await checkOutboxNonceHistory({ ...deps, operator: deps.operator ?? T.roles.operator }, id)) throw mixUnavailable();
         if (await deps.client.getChainId() !== 97) throw mixUnavailable();
         const request = await chain.wallet.prepareTransactionRequest({ account: chain.account, chain: bscTestnet,
           to: chain.registryAddress, data: MIX_REGISTRATION_DATA, value: 0n, ...(await relayerNonce(deps.client, chain.account.address)) });
@@ -106,7 +138,9 @@ export async function registerMixCreation(id: string, overrides: Partial<MixRegi
         await deps.transaction(async client => {
           const current = (await client.query<MixCreation>(`select ${MIX_CREATION_COLUMNS} from mix_creation_requests where id=$1 for update`, [id])).rows[0];
           if (!current || current.state !== 'prepared' || current.registration_tx_hash !== null) throw mixUnavailable();
-          await client.query('insert into mix_registration_outbox(request_id,chain_id,tx_hash,signed_raw_tx) values($1,97,$2,$3)', [id, hash, raw]);
+          if (current.registration_attempt !== row.registration_attempt) throw mixUnavailable();
+          await client.query('insert into mix_registration_outbox(request_id,attempt,chain_id,tx_hash,signed_raw_tx) values($1,$2,97,$3,$4)', [id, row.registration_attempt, hash, raw]);
+          await saveOutboxIdentity(client, await outboxIdentity(hash, raw, deps.operator ?? T.roles.operator), { registrationRequestId: id, registrationAttempt: row.registration_attempt });
           await client.query("update mix_creation_requests set state='submitted',registration_tx_hash=$2,updated_at=clock_timestamp() where id=$1", [id, hash]);
         });
         // Even an ambiguous COMMIT throws above: do not broadcast until a later read/retry.

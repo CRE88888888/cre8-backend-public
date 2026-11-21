@@ -1,4 +1,6 @@
 import { withRelayerLock, relayerNonce } from './relayer-lock.js';
+import { outboxIdentity, saveOutboxIdentity, saveOutboxConsumption } from './relayer-nonce-consumption.js';
+import type { FundingNonceConsumption } from './relayer-nonce-consumption.js';
 import { createPublicClient, createWalletClient, decodeEventLog, encodeFunctionData, http, isAddress, keccak256, parseAbi } from 'viem';
 import type { Address, Hex, PublicClient, TransactionReceipt } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
@@ -9,7 +11,7 @@ import { query, withTransaction } from './db.js';
 import type { QueryFn } from './snapshot.js';
 import { AppError } from './errors.js';
 import { TESTNET_97 } from './testnet-profile.js';
-import { saveRelayerTransaction } from './relayer-outbox.js';
+import { saveRelayerTransaction, validateRelayerTransaction } from './relayer-outbox.js';
 import type { SignedSubmission } from './relayer-outbox.js';
 
 export const FAUCET_ABI = parseAbi([
@@ -69,17 +71,24 @@ export async function reserveFaucetClaim(r: ClaimRequest, transaction: typeof wi
 
 /** Settlement always locks the ORIGINAL UTC day, including after midnight. Never changes immutable fields. */
 export async function settleFaucetClaim(claim: FaucetClaim, from: ClaimState, state: ClaimState, hash: Hex | null,
-  transaction: typeof withTransaction = withTransaction, signed?: SignedSubmission): Promise<void> {
+  transaction: typeof withTransaction = withTransaction, signed?: SignedSubmission, consumption?: FundingNonceConsumption): Promise<void> {
   try {
     await transaction(async (client) => {
       await client.query('set transaction isolation level read committed');
       await client.query("set local statement_timeout='5s'");
       await client.query("set local lock_timeout='5s'");
       await client.query(lockSql, [claim.chainId, claim.day]);
-      const row = await client.query<{ state: string }>(`select state from faucet_claims where id=$1 and chain_id=$2 and utc_day=$3::date
+      const row = await client.query<{ state: string; tx_hash: Hex | null }>(`select state,tx_hash from faucet_claims where id=$1 and chain_id=$2 and utc_day=$3::date
         and owner=$4 and account=$5 and amount_wei=$6::numeric for update`,
         [claim.id, claim.chainId, claim.day, claim.owner.toLowerCase(), claim.account.toLowerCase(), claim.amountWei.toString()]);
       if (row.rows[0]?.state !== from) throw unavailable();
+      if (consumption) {
+        if (!hash || row.rows[0].tx_hash !== hash || !['submitted','unknown'].includes(from) || state !== 'failed') throw unavailable();
+        await validateRelayerTransaction({ ...claim, kind: 'faucet' }, hash, consumption.raw, consumption.operator);
+        const original = await outboxIdentity(hash, consumption.raw, consumption.operator);
+        await saveOutboxIdentity(client, original, { fundingTxHash: hash });
+        await saveOutboxConsumption(client, original, consumption.proof);
+      }
       if (state === 'submitted') {
         if (!hash || !signed || from !== 'reserved') throw unavailable();
         await saveRelayerTransaction(client, { ...claim, kind: 'faucet' }, hash, signed);

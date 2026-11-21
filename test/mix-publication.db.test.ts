@@ -381,6 +381,43 @@ test('publication nonce guard expires exactly at ten minutes, retains original a
   }));
 });
 
+for (const failure of ['alert', 'marker', 'timeout', 'read'] as const) test(`publication ${failure} storage failure cannot stop nonce admission and retries only after a minute`, async () => {
+  await mixDbSandbox(async lane => lane(async () => {
+    const id = await reserve(), f = registrationRpc(); f.state.publicationSendFail = true;
+    await assert.rejects(registerMixStrategy(T.roles.keeper, 'alert outage', allocation, id, { chain: f.chain }));
+    const saved = (await query<{ created_at: Date }>('select created_at from mix_publication_outbox')).rows[0]; assert.ok(saved);
+    const now = new Date(saved.created_at.getTime() + 600001);
+    const table = failure === 'marker' ? 'mix_publication_jobs' : 'scheduler_alerts';
+    await query(`create function reject_alert_write() returns trigger language plpgsql as $$ begin
+      ${failure === 'timeout' ? "raise exception 'canceling statement due to statement timeout' using errcode='57014';" : "raise exception 'private storage credential';"} return new; end $$`);
+    if (failure === 'read') {
+      await query('alter table mix_publication_jobs rename to unavailable_publication_jobs');
+      await query("create function reject_alert_read() returns timestamptz language plpgsql as $$ begin raise exception 'private read credential'; end $$");
+      await query('create view mix_publication_jobs as select strategy_id,chain_id,state,reject_alert_read() as alerted_at from unavailable_publication_jobs');
+    }
+    else await query(`create trigger reject_alert before ${failure === 'marker' ? 'update' : 'insert or update'} on ${table}
+      for each row execute function reject_alert_write()`);
+    const logs: string[] = [], warn = console.warn;
+    console.warn = (...args: unknown[]) => { logs.push(args.map(String).join(' ')); };
+    const select = () => relayerNonce(f.client, relayerSigner.address);
+    try {
+      assert.deepEqual(await withRelayerLock(97, select, { now }), {});
+      assert.equal(logs.length, 1);
+      assert.doesNotMatch(logs.join(' '), /private|credential|postgres:|signed_raw_tx/);
+      if (failure === 'read') {
+        await query('drop view mix_publication_jobs');
+        await query('alter table unavailable_publication_jobs rename to mix_publication_jobs');
+      }
+      else await query(`drop trigger reject_alert on ${table}`);
+      assert.deepEqual(await withRelayerLock(97, select, { now: new Date(now.getTime() + 59999) }), {});
+      assert.equal((await query('select alerted_at from mix_publication_jobs')).rows[0]?.alerted_at, null, 'no retry before the throttle boundary');
+      assert.deepEqual(await withRelayerLock(97, select, { now: new Date(now.getTime() + 60000) }), {});
+      assert.ok((await query('select alerted_at from mix_publication_jobs')).rows[0]?.alerted_at instanceof Date);
+      assert.equal((await query('select * from scheduler_alerts where portfolio_id is null')).rows.length, 1);
+    } finally { console.warn = warn; }
+  }));
+});
+
 test('a transient pending-nonce RPC failure retries, and a lagging pending nonce uses validated local originals', async () => {
   await mixDbSandbox(async lane => lane(async () => {
     const id = await reserve(), f = registrationRpc(); f.state.publicationSendFail = true;

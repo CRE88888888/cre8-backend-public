@@ -6,6 +6,9 @@ export type CashWithdrawal = { txHash:Hex; logIndex:number; blockNumber:bigint; 
 const identity=(chainId:number,e:CashWithdrawal)=>`cash-withdrawal:${chainId}:${e.txHash}:${e.logIndex}`;
 const commitment=(e:CashWithdrawal)=>keccak256(toHex(JSON.stringify([e.txHash,e.logIndex,e.blockNumber.toString(),e.blockHash,e.amount.toString()])));
 
+/** 每段 eth_getLogs 的區塊數（含頭尾）。 */
+export const WITHDRAWAL_LOG_CHUNK=10_000n;
+
 /** Only canonical account-to-owner transfers count as known withdrawals. Balance loss alone is not proof. */
 export async function readCashWithdrawals(client:PublicClient,query:SchedulerQueryFn,args:{chainId:number;portfolioId:number;account:Address;cash:Address;blockNumber:bigint}):Promise<CashWithdrawal[]>{
   try{
@@ -14,7 +17,13 @@ export async function readCashWithdrawals(client:PublicClient,query:SchedulerQue
     const first=(await query("select block_number::text,log_index::text from strategy_funding_lots where portfolio_id=$1 and chain_id=$2 and state='confirmed' order by block_number,log_index limit 1",[args.portfolioId,args.chainId])).rows[0] as {block_number:string;log_index:string}|undefined;
     if(!first)return [];
     if(BigInt(first.block_number)>args.blockNumber||await client.getChainId()!==args.chainId)throw new Error('stale cash observation');
-    const logs=await client.getLogs({address:args.cash,event:erc20Abi.find(e=>e.type==='event'&&e.name==='Transfer'),args:{from:args.account,to:owner.owner as Address},fromBlock:BigInt(first.block_number),toBlock:args.blockNumber,strict:true});
+    // 分段查：公共 BSC RPC 的 eth_getLogs 有跨度上限（publicnode 實測 50,000 塊，其他 2k–10k），
+    // 入金幾小時後整段一次查就永遠失敗，整個組合每輪都被擋（tst 2026-11-21）。
+    const logs=[];
+    for(let start=BigInt(first.block_number);start<=args.blockNumber;start+=WITHDRAWAL_LOG_CHUNK){
+      const end=start+WITHDRAWAL_LOG_CHUNK-1n<args.blockNumber?start+WITHDRAWAL_LOG_CHUNK-1n:args.blockNumber;
+      logs.push(...await client.getLogs({address:args.cash,event:erc20Abi.find(e=>e.type==='event'&&e.name==='Transfer'),args:{from:args.account,to:owner.owner as Address},fromBlock:start,toBlock:end,strict:true}));
+    }
     const result:CashWithdrawal[]=[];
     for(const log of logs){
       if(log.blockNumber===null||log.logIndex===null||log.transactionHash===null||log.blockHash===null||log.removed)throw new Error('incomplete cash evidence');
@@ -27,7 +36,7 @@ export async function readCashWithdrawals(client:PublicClient,query:SchedulerQue
       result.push({txHash:log.transactionHash,logIndex:log.logIndex,blockNumber:log.blockNumber,blockHash:log.blockHash,amount:event.args.value});
     }
     return result;
-  }catch{throw new Error('[CASH_RECONCILIATION_UNAVAILABLE] 提領證據無法確認，保留來源與預留');}
+  }catch(cause){throw new Error('[CASH_RECONCILIATION_UNAVAILABLE] 提領證據無法確認，保留來源與預留',{cause});}
 }
 
 /** Called under the portfolio/cash locks, after checking unresolved operations.

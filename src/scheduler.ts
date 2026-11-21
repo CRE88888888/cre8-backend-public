@@ -1619,6 +1619,18 @@ function defaultQuery(): SchedulerQueryFn {
   return (text, params) => dbQuery(text, params ?? []);
 }
 
+/** 錯誤與它的 cause（最多 3 層），一行、遮掉網址；只給 log 用。 */
+export function errorChain(error: unknown): string {
+  const parts: string[] = [];
+  let current: unknown = error;
+  for (let depth = 0; depth < 3 && current !== undefined && current !== null; depth++) {
+    const text = current instanceof Error ? current.message : String(current);
+    parts.push(text.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'`)]+/gi, '<url>').replace(/\s*\n\s*/g, ' | ').slice(0, 600));
+    current = current instanceof Error ? current.cause : undefined;
+  }
+  return parts.join(' ← ');
+}
+
 function oneLine(error: unknown): string {
   return (decodePriceSourceError(error)?.detail ?? a10ErrorMessage(error) ?? errorMessage(error)).split('\n')[0]!.slice(0, 400);
 }
@@ -2206,6 +2218,10 @@ async function runOne(
   } catch (error) {
     // 一個 portfolio 的例外不該讓整輪停擺（RPC 抖動、某個帳戶的資料不一致）。它會被記成 blocked
     // 並在下一輪重試；next_run_at 已經推進過了，所以不會變成熱迴圈。
+    // reason 對外只給通用訊息；真正的錯誤（含 cause）只寫進 log，網址遮掉（RPC URL 可能帶金鑰）。
+    if (due.executionKind !== undefined && !isBuyVersionError(error)) {
+      ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} 拋錯：${errorChain(error)}`);
+    }
     result = { ...base, outcome: 'blocked', reason: due.executionKind === undefined
       ? `處理時拋錯，這一輪不執行：${oneLine(error)}`
       : isBuyVersionError(error) ? error.message

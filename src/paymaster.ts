@@ -328,15 +328,19 @@ async function readBudgetContext(op: PackedSponsorOperation, c: PaymasterConfig,
   const tokenCalls = calls.every((call) => call.callData.startsWith(toFunctionSelector('transfer(address,uint256)')));
   const rebalance = calls.length === 1 && calls[0] !== undefined && isAddressEqual(calls[0].target, c.executor)
     ? decodeFunctionData({ abi: EXECUTOR_ABI, data: calls[0].callData }) : null;
-  const priorSetup = !setup ? null : retrySetup ? await query<{ execution_key: string; state: string; new_nonce: boolean }>(`
+  const priorSetup = !setup ? null : retrySetup ? await query<{ execution_key: string; state: string; new_nonce: boolean; nonces: string[] | null }>(`
     select g.execution_key,g.state,coalesce((select bool_and(f.value->>'nonce' ~ '^[0-9]+$' and f.value->>'nonce'<>$3::text
       and f.value @> jsonb_build_object('chainId',$1::bigint,'account',$2::text,'purpose','setup'))
-      from yield_runtime_state f where f.kind='fact' and f.name like 'auth-%' and f.value->>'executionKey'=g.execution_key),false) as new_nonce
+      from yield_runtime_state f where f.kind='fact' and f.name like 'auth-%' and f.value->>'executionKey'=g.execution_key),false) as new_nonce,
+      (select array_agg(f.value->>'nonce') from yield_runtime_state f where f.kind='fact' and f.name like 'auth-%'
+        and f.value->>'executionKey'=g.execution_key) as nonces
     from gas_budget_reservations g where chain_id=$1 and account=$2 and purpose='setup' and state<>'failed'`, [c.chainId, op.sender, op.nonce.toString()]) :
     await query<{ execution_key: string; state?: string; new_nonce?: boolean }>("select execution_key from gas_budget_reservations where chain_id=$1 and account=$2 and purpose='setup' and state<>'failed'", [c.chainId, op.sender]);
   // Pending setup variants must never silently become ordinary and evade reconciliation.
   // Later approvals after a confirmed setup retain the ordinary policy on a new nonce.
-  let purpose: GasPurpose = setup && (priorSetup?.rows.length === 0 || retrySetup && priorSetup?.rows.some(row => row.state !== 'confirmed' || row.new_nonce !== true)) ? 'setup' : 'ordinary';
+  const pendingSetup = retrySetup && priorSetup?.rows.some(row => row.state !== 'confirmed' || row.new_nonce !== true) === true &&
+    !(setup && await setupNoncesConsumed(client, op, priorSetup?.rows ?? []));
+  let purpose: GasPurpose = setup && (priorSetup?.rows.length === 0 || pendingSetup) ? 'setup' : 'ordinary';
   if (tokenCalls || rebalance?.functionName === 'executeRebalance') {
     const blockNumber = await client.getBlockNumber({ cacheTime: 0 });
     const numeraire = await client.readContract({ address: c.executor, abi: BUDGET_ORACLE_ABI, functionName: 'numeraire', blockNumber });
@@ -368,6 +372,25 @@ async function readBudgetContext(op: PackedSponsorOperation, c: PaymasterConfig,
     }
   }
   return { ...price, purpose };
+}
+
+/** Public setup sponsorships have no receipt reconciler, so a landed setup stays 'reserved'.
+ * Only a recorded nonce the EntryPoint has already passed proves that setup can never execute
+ * again; then a later owner-signed approvals+enroll (e.g. a My mix change) on a NEW nonce is ordinary.
+ * Missing/legacy facts or the same nonce never qualify. Never guess a nonce.
+ */
+async function setupNoncesConsumed(client: PublicClient, op: PackedSponsorOperation,
+  rows: readonly { state?: string; new_nonce?: boolean; nonces?: string[] | null }[]): Promise<boolean> {
+  if (!rows.length || rows.some(row => row.new_nonce !== true || !Array.isArray(row.nonces) || !row.nonces.length ||
+      row.nonces.some(n => typeof n !== 'string' || !/^\d+$/.test(n) || BigInt(n) > MAX_UINT256 || BigInt(n) === op.nonce))) return false;
+  const nonces = rows.filter(row => row.state !== 'confirmed').flatMap(row => (row.nonces ?? []).map(BigInt));
+  try {
+    if (await client.getChainId() !== 97) throw setupUnavailable();
+    const blockNumber = await client.getBlockNumber({ cacheTime: 0 });
+    const onchain = await Promise.all(nonces.map(nonce => client.readContract({ address: TESTNET_97.contracts.entryPoint, abi: EXIT_READ,
+      functionName: 'getNonce', args: [op.sender, nonce >> 64n], blockNumber })));
+    return onchain.every((current, index) => current > (nonces[index] ?? MAX_UINT256));
+  } catch { throw setupUnavailable(); }
 }
 
 /** Canonical final payload is the authority; partial withdrawals are also pure exits. */

@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import pg from 'pg';
 import { bytesToHex, concatHex, keccak256, toHex } from 'viem';
 import { closePool, query, withTransaction } from '../src/db.js';
-import { createPaymasterService, gasExecutionKey, reserveSponsorship, reserveGasBudget } from '../src/paymaster.js';
+import { createPaymasterService, gasExecutionKey, KERNEL_EXECUTE_ABI, reserveSponsorship, reserveGasBudget } from '../src/paymaster.js';
 import type { PaymasterDeps, Reservation } from '../src/paymaster.js';
 import { loadPaymasterConfig } from '../src/config.js';
 import { AppError } from '../src/errors.js';
@@ -320,6 +320,36 @@ test('#150 a consumed confirmed setup rejects its original nonce while a later a
     await assert.rejects(f.make().sponsor({ userOperation: approval }, OWNER), e => e instanceof AppError && e.code === 'PAYMASTER_SETUP_NONCE_CONSUMED');
     await f.make().sponsor({ userOperation: { ...approval, nonce: 1n } }, OWNER);
     assert.deepEqual((await f.rows()).rows.map(r => [r.purpose, r.state]), [['setup', 'confirmed'], ['ordinary', 'reserved']]);
+  } finally { await f.close(); }
+});
+
+test('My mix change: a landed setup still recorded as reserved lets approvals+enroll on a new nonce sponsor as ordinary', async () => {
+  const f = await setupRetryFixture();
+  try {
+    const first = await f.make({ retryOrdinaryGas: true }).sponsor({ userOperation: f.op }, OWNER);
+    const approve = encodeFunctionData({ abi: parseAbi(['function approve(address,uint256)']), functionName: 'approve', args: [f.c.executor, 5n] });
+    const enroll = encodeFunctionData({ abi: parseAbi(['function enroll(address,uint256,uint16)']), functionName: 'enroll', args: [f.sender as `0x${string}`, 2n, 1] });
+    const change = { ...f.op, nonce: 1n, callData: encodeFunctionData({ abi: KERNEL_EXECUTE_ABI, functionName: 'execute', args: [toHex(1n << 248n, { size: 32 }),
+      encodeAbiParameters([{ type: 'tuple[]', components: [{ name: 'target', type: 'address' }, { name: 'value', type: 'uint256' }, { name: 'callData', type: 'bytes' }] }],
+        [[{ target: T.contracts.usdt, value: 0n, callData: approve }, { target: f.c.registry, value: 0n, callData: enroll }]])] }) };
+    const saved = (await f.rows()).rows;
+    // First setup still pending on chain: a different nonce is never guessed into ordinary.
+    await assert.rejects(f.make({ retryOrdinaryGas: true }).sponsor({ userOperation: change }, OWNER),
+      e => e instanceof AppError && e.code === 'PAYMASTER_SETUP_NONCE_MISMATCH');
+    // An unreadable EntryPoint nonce fails closed instead of guessing either policy.
+    f.mode('missing-nonce'); f.nonce(1n);
+    await assert.rejects(f.make({ retryOrdinaryGas: true }).sponsor({ userOperation: change }, OWNER),
+      e => e instanceof AppError && e.code === 'PAYMASTER_SETUP_RETRY_UNAVAILABLE' && e.status === 503);
+    assert.deepEqual((await f.rows()).rows, saved);
+    // The setup landed (EntryPoint nonce passed it) but nothing marks the reservation confirmed.
+    f.mode('ok');
+    const second = await f.make({ retryOrdinaryGas: true }).sponsor({ userOperation: change }, OWNER);
+    assert.notEqual(second.userOpHash, first.userOpHash);
+    assert.deepEqual((await f.rows()).rows.map(r => [r.purpose, r.state]), [['setup', 'reserved'], ['ordinary', 'reserved']]);
+    // The original nonce still never reopens setup or becomes ordinary.
+    await assert.rejects(f.make({ retryOrdinaryGas: true }).sponsor({ userOperation: { ...f.op, preVerificationGas: f.op.preVerificationGas + 1n } }, OWNER),
+      e => e instanceof AppError && e.code === 'PAYMASTER_SETUP_NONCE_CONSUMED');
+    assert.equal((await f.rows()).rows.length, 2);
   } finally { await f.close(); }
 });
 

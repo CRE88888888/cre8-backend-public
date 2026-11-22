@@ -1,6 +1,7 @@
 import { configuredChainId } from './testnet-profile.js';
 import { createMixAssetList, createMixPreview } from './mix-preview.js';
 import { createUserMedia } from './user-media.js';
+import { createCashEarn } from './cash-earn.js';
 import { createMixService } from './mixes.js';
 import { createInfoService, parseInfoFilters } from './info/service.js';
 import { createYieldService } from './yield-service.js';
@@ -176,6 +177,7 @@ export type ServerDeps = {
   mixes: ReturnType<typeof createMixService>;
   mixPreview: ReturnType<typeof createMixPreview>;
   userMedia: ReturnType<typeof createUserMedia>;
+  cashEarn: ReturnType<typeof createCashEarn>;
   mixAssets: ReturnType<typeof createMixAssetList>;
   modelReturns: ReturnType<typeof createModelReader>;
   info: ReturnType<typeof createInfoService>;
@@ -323,6 +325,7 @@ const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
   mixes: createMixService(),
   mixPreview: createMixPreview(),
   userMedia: createUserMedia(),
+  cashEarn: createCashEarn(),
   mixAssets: createMixAssetList(),
   modelReturns: createModelReader(),
   info: createInfoService(),
@@ -465,6 +468,30 @@ async function route(
     if (method !== 'PUT' && method !== 'DELETE') return methodNotAllowed(res, ['PUT', 'DELETE']);
     await deps.rateLimiter.wallet('plan', wallet);
     sendJson(res, 200, await deps.userMedia.setMixCover(wallet, id, method === 'PUT' ? await readJsonBody(req) : null)); return;
+  }
+
+  if (root === 'earn' && segments.length === 2 && segments[1] === 'vaults') {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    await deps.rateLimiter.mixPreview(deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
+    sendJson(res, 200, await deps.cashEarn.vaults(), { 'cache-control': 'public, max-age=30' });
+    return;
+  }
+
+  if (root === 'me' && segments[1] === 'earn' && segments.length <= 3) {
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    await deps.rateLimiter.wallet('plan', wallet);
+    if (segments.length === 2) {
+      if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+      sendJson(res, 200, await deps.cashEarn.account(wallet)); return;
+    }
+    const action = segments[2];
+    if (action === 'deposit' || action === 'withdraw' || action === 'confirm') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      const input = await readJsonBody(req);
+      sendJson(res, 200, action === 'deposit' ? await deps.cashEarn.deposit(wallet, input)
+        : action === 'withdraw' ? await deps.cashEarn.withdraw(wallet, input) : await deps.cashEarn.confirm(wallet, input));
+      return;
+    }
   }
 
   if (root === 'me' && segments[1] === 'mixes' && segments.length >= 2 && segments.length <= 4) {

@@ -67,6 +67,7 @@ jobs:
           test/mix-domain.test.ts
           test/mix-preview.test.ts
           test/user-media.test.ts
+          test/cash-earn.test.ts
           test/mix-http.test.ts
           test/model-returns.test.ts
           test/info-drafter.test.ts

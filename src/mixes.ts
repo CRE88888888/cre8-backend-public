@@ -9,6 +9,7 @@ import { AppError, ValidationError } from './errors.js';
 import { mixSettings, mixChainAllocation, nextMixRebalance, mixKeys } from './mix-domain.js';
 import type { MixSettings } from './mix-domain.js';
 import { assetsMarketOpen } from './trading-calendar.js';
+import { imageUrl } from './user-media.js';
 import { nextMixMarketOpen } from './mix-preview.js';
 import { createMixPreview } from './mix-preview.js';
 import { record } from './strategy-execution.js';
@@ -58,7 +59,8 @@ export function createMixService(overrides: Partial<MixServiceDeps> = {}) {
   async function publicData(m: MixRow) {
     const s = await snapshot(m);
     return { name: m.name, assets: userMixAssets(s), rebalance: { frequency: m.frequency, startDate: m.start_date },
-      createdAt: m.created_at.toISOString(), exit: { takeProfitBps: m.take_profit_bps, stopLossBps: m.stop_loss_bps } };
+      createdAt: m.created_at.toISOString(), exit: { takeProfitBps: m.take_profit_bps, stopLossBps: m.stop_loss_bps },
+      coverUrl: imageUrl(m.cover_image_id) };
   }
   async function detail(m: MixRow, live = true) {
     const h = await currentMixHistory(m.id, db), intent = await pendingMixIntent(m.id, db), settings = await snapshot(m);
@@ -312,7 +314,7 @@ export function createMixService(overrides: Partial<MixServiceDeps> = {}) {
       const settings = await publicData(m), preview = await deps.preview({ assets: settings.assets });
       const copies = (await deps.query<{ count: string }>('select count(*)::text as count from mixes where imported_from_share_code=$1', [code])).rows[0];
       return { name: settings.name, assets: settings.assets, rebalance: settings.rebalance, createdAt: settings.createdAt,
-        exit: settings.exit, modelReturns: preview.modelReturns, modelNav: preview.modelNav, modelComponents: preview.modelComponents, copies: Number(copies?.count ?? 0) };
+        exit: settings.exit, coverUrl: settings.coverUrl, modelReturns: preview.modelReturns, modelNav: preview.modelNav, modelComponents: preview.modelComponents, copies: Number(copies?.count ?? 0) };
     }),
   };
 }

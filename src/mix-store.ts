@@ -9,7 +9,7 @@ import { cancelJob, readJob } from './strategy-jobs.js';
 
 export type MixRow = {
   id: string; owner: Address; name: string; chain_id: string; account: Address; initial_strategy_id: string;
-  account_salt: Hex; share_code: string; imported_from_share_code: string | null;
+  account_salt: Hex; share_code: string; imported_from_share_code: string | null; cover_image_id: string | null;
   frequency: MixFrequency; start_date: string; last_rebalanced_at: Date | null;
   take_profit_bps: number | null; stop_loss_bps: number | null; status: 'active' | 'exited';
   triggered_at: Date | null; triggered_return_bps: string | null; created_at: Date;
@@ -30,7 +30,7 @@ export const MIX_COLUMNS = `m.id,m.owner,m.name,m.chain_id,m.account,m.initial_s
   m.imported_from_share_code,m.frequency,to_char(m.start_date,'YYYY-MM-DD') as start_date,m.last_rebalanced_at,
   m.take_profit_bps,m.stop_loss_bps,m.status,m.triggered_at,m.triggered_return_bps::text,m.created_at,
   m.performance_started_at,m.performance_baseline_raw::text,m.performance_start_block::text,m.performance_start_block_hash,
-  m.exit_retry_count,m.exit_last_attempt_at,m.exit_alerted_at`;
+  m.exit_retry_count,m.exit_last_attempt_at,m.exit_alerted_at,m.cover_image_id::text as cover_image_id`;
 export const pendingMixSql = "state in ('prepared','submitted','unknown')";
 export const mixUnavailable = () => new AppError(503, 'MIX_UNAVAILABLE', '目前無法確認組合資料，請稍後以原請求重試。');
 export const mixBusy = () => new AppError(409, 'MIX_BUSY', '組合正在處理交易，確認完成後才能再次變更。');

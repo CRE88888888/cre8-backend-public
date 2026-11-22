@@ -1,5 +1,6 @@
 import { configuredChainId } from './testnet-profile.js';
 import { createMixAssetList, createMixPreview } from './mix-preview.js';
+import { createUserMedia } from './user-media.js';
 import { createMixService } from './mixes.js';
 import { createInfoService, parseInfoFilters } from './info/service.js';
 import { createYieldService } from './yield-service.js';
@@ -73,7 +74,7 @@ const DB_DOWN_CODES = new Set([
 export const DEFAULT_CORS_ALLOWED_ORIGINS: readonly string[] = ['http://localhost:5173', 'http://127.0.0.1:5173'];
 
 /** preflight 允許的方法：GET、POST 與私人組合的 PATCH（OPTIONS 是 preflight 本身）。 */
-export const CORS_ALLOWED_METHODS = 'GET, POST, PATCH, OPTIONS';
+export const CORS_ALLOWED_METHODS = 'GET, POST, PATCH, PUT, DELETE, OPTIONS';
 
 /** preflight 允許的請求標頭：`content-type` 給 JSON body，`authorization` 給 bearer token，`idempotency-key` 給私人組合建立重試。 */
 export const CORS_ALLOWED_HEADERS = 'authorization, content-type, idempotency-key';
@@ -174,6 +175,7 @@ export const BUNDLER_TIMEOUT_MS = 30_000;
 export type ServerDeps = {
   mixes: ReturnType<typeof createMixService>;
   mixPreview: ReturnType<typeof createMixPreview>;
+  userMedia: ReturnType<typeof createUserMedia>;
   mixAssets: ReturnType<typeof createMixAssetList>;
   modelReturns: ReturnType<typeof createModelReader>;
   info: ReturnType<typeof createInfoService>;
@@ -320,6 +322,7 @@ async function defaultListAssets(): Promise<PriceableAsset[]> {
 const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
   mixes: createMixService(),
   mixPreview: createMixPreview(),
+  userMedia: createUserMedia(),
   mixAssets: createMixAssetList(),
   modelReturns: createModelReader(),
   info: createInfoService(),
@@ -424,6 +427,45 @@ async function route(
   const method = req.method ?? 'GET';
   const segments = url.pathname.split('/').filter((segment) => segment.length > 0);
   const [root] = segments;
+
+  if (root === 'images' && segments.length === 2) {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    const image = await deps.userMedia.image(segments[1] ?? '');
+    const headers = { 'cache-control': 'public, max-age=31536000, immutable', etag: image.etag, 'x-content-type-options': 'nosniff',
+      'content-security-policy': "default-src 'none'", 'cross-origin-resource-policy': 'cross-origin' };
+    if (req.headers['if-none-match'] === image.etag) { res.writeHead(304, headers); res.end(); return; }
+    res.writeHead(200, { ...headers, 'content-type': image.contentType, 'content-length': image.bytes.length });
+    res.end(image.bytes);
+    return;
+  }
+
+  if (root === 'me' && segments[1] === 'profile' && segments.length <= 3) {
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    if (segments.length === 2) {
+      if (method === 'GET') { sendJson(res, 200, await deps.userMedia.profile(wallet)); return; }
+      if (method === 'PATCH') {
+        await deps.rateLimiter.wallet('plan', wallet);
+        sendJson(res, 200, await deps.userMedia.updateProfile(wallet, await readJsonBody(req))); return;
+      }
+      return methodNotAllowed(res, ['GET', 'PATCH']);
+    }
+    if (segments[2] === 'avatar') {
+      if (method === 'PUT') {
+        await deps.rateLimiter.wallet('plan', wallet);
+        sendJson(res, 200, await deps.userMedia.setAvatar(wallet, await readJsonBody(req))); return;
+      }
+      if (method === 'DELETE') { await deps.rateLimiter.wallet('plan', wallet); sendJson(res, 200, await deps.userMedia.deleteAvatar(wallet)); return; }
+      return methodNotAllowed(res, ['PUT', 'DELETE']);
+    }
+  }
+
+  if (root === 'me' && segments[1] === 'mixes' && segments.length === 4 && segments[3] === 'cover') {
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    const id = parsePositiveInteger(segments[2] ?? '', 'mixId');
+    if (method !== 'PUT' && method !== 'DELETE') return methodNotAllowed(res, ['PUT', 'DELETE']);
+    await deps.rateLimiter.wallet('plan', wallet);
+    sendJson(res, 200, await deps.userMedia.setMixCover(wallet, id, method === 'PUT' ? await readJsonBody(req) : null)); return;
+  }
 
   if (root === 'me' && segments[1] === 'mixes' && segments.length >= 2 && segments.length <= 4) {
     const wallet = await deps.auth.authenticate(req.headers.authorization);

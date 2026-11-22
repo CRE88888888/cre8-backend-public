@@ -18,7 +18,7 @@ import { privyFixture, privyMemory } from './fixtures/privy.js';
 const operator = '0x1234567890abcdef1234567890abcdef12345678';
 const twitter = { type: 'twitter_oauth', subject: '1234567890123456789', username: 'cre8_test' };
 const entry: WaitlistEntry = { id: '1', privyUserId: 'did:privy:waitlist-test', xUserId: twitter.subject,
-  xHandle: twitter.username, loginMethod: 'twitter', loginLabel: null, status: 'waiting', joinedAt: '2026-11-16T01:02:03.000001Z', approvedAt: null, approvedBy: null };
+  xHandle: twitter.username, loginMethod: 'twitter', loginLabel: null, status: 'waiting', joinedAt: '2026-11-16T01:02:03.000001Z', approvedAt: null, approvedBy: null, points: 0 };
 const isError = (status: number, code: string) => (error: unknown) => error instanceof AppError && error.status === status && error.code === code;
 function harness(overrides: Partial<WaitlistRepository> = {}) {
   const fixture = privyFixture();
@@ -165,7 +165,7 @@ test('#127 empty/exact/full pages expose only bounded items and a filter-bound n
     else {
       assert.ok(page.nextCursor);
       const decoded: unknown = JSON.parse(Buffer.from(page.nextCursor, 'base64url').toString('utf8'));
-      assert.deepEqual(decoded, { joinedAt: entry.joinedAt, id: '1', status: 'waiting' });
+      assert.deepEqual(decoded, { points: 0, joinedAt: entry.joinedAt, id: '1', status: 'waiting' });
     }
   }
 });

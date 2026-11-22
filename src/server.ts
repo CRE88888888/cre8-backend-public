@@ -23,6 +23,7 @@ import { createWaitlistService } from './waitlist.js';
 import { resolveOperatorWallets } from './waitlist-access.js';
 export { resolveOperatorWallets } from './waitlist-access.js';
 import { createWaitlistInviteService } from './waitlist-invites.js';
+import { createWaitlistTaskService } from './waitlist-tasks.js';
 import { claimFaucetUsdt } from './faucet.js';
 import { claimFaucetGas } from './gas-faucet.js';
 import { PaymasterRetryTooSoonError, sponsorUserOperation } from './paymaster.js';
@@ -191,6 +192,7 @@ export type ServerDeps = {
   privyLogin: typeof loginWithPrivy;
   waitlist: ReturnType<typeof createWaitlistService>;
   waitlistInvites: ReturnType<typeof createWaitlistInviteService>;
+  waitlistTasks: ReturnType<typeof createWaitlistTaskService>;
   rateLimiter: RequestRateLimiter;
   auth: { authenticate: typeof authenticate; issueNonce: typeof issueNonce; login: typeof login; logout: typeof logout };
   /** Public platform snapshot, with a process-wide TTL cache and no wallet/DB reads. */
@@ -339,6 +341,7 @@ const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
   privyLogin: loginWithPrivy,
   waitlist: createWaitlistService(),
   waitlistInvites: createWaitlistInviteService(),
+  waitlistTasks: createWaitlistTaskService(),
   auth: { authenticate, issueNonce, login, logout },
   platformStatus: createPlatformStatusReader(),
   createStrategy,
@@ -731,6 +734,19 @@ async function route(
     if (method !== 'POST') return methodNotAllowed(res, ['POST']);
     await deps.waitlistInvites.checkIp(deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
     sendJson(res, 200, await deps.waitlistInvites.redeem(await readJsonBody(req)));
+    return;
+  }
+
+  // Bonus tasks (backend#198): under /waitlist because the cre8.finance worker forwards only /api/auth/* and /api/waitlist/*.
+  if (root === 'waitlist' && segments[1] === 'tasks' && (segments.length === 2 || segments.length === 3)) {
+    await deps.rateLimiter.auth(deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
+    if (segments.length === 2) {
+      if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+      sendJson(res, 200, await deps.waitlistTasks.tasks(req.headers.authorization));
+    } else {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      sendJson(res, 200, await deps.waitlistTasks.complete(req.headers.authorization, segments[2] ?? '', await readJsonBody(req)));
+    }
     return;
   }
 

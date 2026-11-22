@@ -18,9 +18,11 @@ export type WaitlistEntry = {
   joinedAt: string;
   approvedAt: string | null;
   approvedBy: string | null;
+  /** Bonus task points (db 0062, 0..35): more points are released first, then earlier joins. */
+  points: number;
 };
 type Identity = { privyUserId: string; xUserId: string; xHandle: string };
-type Cursor = { joinedAt: string; id: string };
+type Cursor = { points: number; joinedAt: string; id: string };
 export type WaitlistPageQuery = { status: WaitlistStatus | null; cursor: Cursor | null; limit: number };
 export interface WaitlistRepository {
   join(identity: Identity): Promise<WaitlistEntry>;
@@ -34,7 +36,8 @@ const COLUMNS = `id::text as "id", privy_user_id as "privyUserId", x_user_id as 
   x_handle as "xHandle", login_method as "loginMethod", login_label as "loginLabel", status,
   to_char(joined_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "joinedAt",
   to_char(approved_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "approvedAt",
-  approved_by as "approvedBy"`;
+  approved_by as "approvedBy",
+  (select coalesce(sum(t.points),0)::int from waitlist_tasks t where t.waitlist_id=waitlist.id) as "points"`;
 const conflict = () => new AppError(409, 'X_ALREADY_JOINED', 'X identity is already joined or differs from the original registration');
 const notJoined = () => new AppError(404, 'NOT_JOINED', 'waitlist entry not found');
 const unavailable = () => new AppError(503, 'WAITLIST_UNAVAILABLE', 'waitlist is unavailable; try again later');
@@ -60,11 +63,13 @@ export class PostgresWaitlistRepository implements WaitlistRepository {
   }
 
   async list(input: WaitlistPageQuery): Promise<WaitlistEntry[]> {
+    // Release order (backend#198): more task points first, then earlier joins; id breaks ties.
     return (await query<WaitlistEntry>(`select ${COLUMNS} from waitlist
+      cross join lateral (select coalesce(sum(t.points),0)::int as p from waitlist_tasks t where t.waitlist_id=waitlist.id) s
       where ($1::text is null or status=$1)
-        and ($2::timestamptz is null or (joined_at,id)>($2::timestamptz,$3::bigint))
-      order by waitlist.joined_at,waitlist.id limit $4`,
-    [input.status, input.cursor?.joinedAt ?? null, input.cursor?.id ?? null, input.limit + 1])).rows;
+        and ($2::timestamptz is null or (-s.p,joined_at,id)>(-$5::int,$2::timestamptz,$3::bigint))
+      order by s.p desc,waitlist.joined_at,waitlist.id limit $4`,
+    [input.status, input.cursor?.joinedAt ?? null, input.cursor?.id ?? null, input.limit + 1, input.cursor?.points ?? 0])).rows;
   }
 
   async transition(id: string, status: 'approved' | 'revoked', operator: string): Promise<WaitlistEntry> {
@@ -96,7 +101,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function invalidToken(): UnauthorizedError { return new UnauthorizedError('invalid or expired Privy identity token'); }
 
 /** Match /auth/privy's offline ES256 policy without changing existing login or creating sessions/wallet mappings. */
-async function verifyIdentity(token: unknown, config: PrivyConfig | null, now: number) {
+export async function verifyIdentity(token: unknown, config: PrivyConfig | null, now: number) {
   if (config === null) throw new AppError(503, 'PRIVY_UNAVAILABLE', 'Privy login is unavailable');
   if (typeof token !== 'string' || token.trim() === '' || token.length > MAX_PRIVY_TOKEN_LENGTH) {
     throw new ValidationError('INVALID_AUTH', 'identityToken must be a non-empty string of at most 65536 characters');
@@ -156,8 +161,9 @@ function pageQuery(params: URLSearchParams): WaitlistPageQuery {
       const parsed: unknown = JSON.parse(Buffer.from(rawCursor, 'base64url').toString('utf8'));
       if (!isRecord(parsed) || parsed.status !== status || typeof parsed.id !== 'string' || !validId(parsed.id) ||
           typeof parsed.joinedAt !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(parsed.joinedAt) ||
-          new Date(parsed.joinedAt).toISOString() !== parsed.joinedAt.slice(0, 23) + 'Z') throw new Error();
-      cursor = { joinedAt: parsed.joinedAt, id: parsed.id };
+          new Date(parsed.joinedAt).toISOString() !== parsed.joinedAt.slice(0, 23) + 'Z' ||
+          typeof parsed.points !== 'number' || !Number.isInteger(parsed.points) || parsed.points < 0 || parsed.points > 35) throw new Error();
+      cursor = { points: parsed.points, joinedAt: parsed.joinedAt, id: parsed.id };
     } catch { throw new ValidationError('INVALID_QUERY', 'invalid waitlist cursor or changed status filter'); }
   }
   return { status, limit: Number(rawLimit), cursor };
@@ -197,7 +203,7 @@ export function createWaitlistService(options: {
       const items = rows.slice(0, input.limit);
       const last = items.at(-1);
       const nextCursor = rows.length > input.limit && last
-        ? Buffer.from(JSON.stringify({ joinedAt: last.joinedAt, id: last.id, status: input.status })).toString('base64url') : null;
+        ? Buffer.from(JSON.stringify({ points: last.points, joinedAt: last.joinedAt, id: last.id, status: input.status })).toString('base64url') : null;
       return { items, nextCursor };
     },
     async transition(id: string, status: 'approved' | 'revoked', operator: string) {

@@ -2,6 +2,7 @@ import type { Address, Hex } from 'viem';
 import { AppError } from './errors.js';
 import profileHashes from './testnet-codehashes.js';
 import { TESTNET_97 } from './testnet-profile.js';
+import { isStrategyVault } from './strategy-earn-guard.js';
 
 export const UINT256_MAX = (1n << 256n) - 1n;
 export const RAY = 10n ** 27n;
@@ -41,7 +42,10 @@ export function yieldProfile(value: unknown = TESTNET_97): YieldProfile | null {
     // Stable public slug for 0032; chain identity remains the distinct bytes32 marketId.
     return { id: `${protocol}_${m.symbol.toLowerCase()}`, marketId: hash(m.marketId), protocol, asset: address(m.asset),
       symbol: m.symbol, receipt: address(m.receipt), target: address(m.target), simulated: true };
-  });
+  // backend#199: the strategy earn vault is registered in AtpYieldRegistry but belongs to AtpBorrowExecutor only.
+  // A synced manifest that lists it must not turn it into a Cash/portfolio yield market for AtpExecutor.
+  }).filter(m => !isStrategyVault({ marketId: m.marketId }) && !isStrategyVault({ address: m.receipt }) && !isStrategyVault({ address: m.target }));
+  if (!markets.length) throw unavailable();
   if (new Set(markets.map(m => m.marketId)).size !== markets.length || new Set(markets.map(m => m.receipt)).size !== markets.length) throw unavailable();
   return { chainId: 97, registry: address(contracts.yieldRegistry), executor: address(contracts.executor), registryCodeHash:hash(profileHashes.yieldRegistry), markets };
 }

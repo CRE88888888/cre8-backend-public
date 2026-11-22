@@ -5,6 +5,7 @@ import { createMixService, reconcilePendingMixes } from './mixes.js';
 import { mixAnchor, saveMixValuation } from './mix-valuation.js';
 import { assetsMarketOpen } from './trading-calendar.js';
 import { runYieldRound } from './yield-service.js';
+import { runStrategyEarnRound } from './strategy-earn.js';
 import { assertUserOpCapacity, boundedCallGasLimit, executionBatchSize, MAX_USER_OP_STEPS, userOpGasOverhead } from './execution-batch.js';
 import { EXECUTOR_ABI, EXECUTOR_SELECTOR, PLAN_HASH_ABI } from './chain.js';
 /**
@@ -558,6 +559,7 @@ export type SchedulerDeps = {
   prepareMixTick?: typeof prepareMixTick;
   readBuyVersionWindow?: (strategyId: bigint) => Promise<BuyVersionWindow>;
   yieldRound?: typeof runYieldRound;
+  strategyEarnRound?: typeof runStrategyEarnRound;
   clock?:()=>Date;
   withDexLock?: typeof withDexLock;
   dexGate?: (chainId:number,portfolioId:number)=>Promise<string|null>;
@@ -1927,6 +1929,8 @@ export async function runSchedulerOnce(
 
   // Yield exits/recovery have their own account lock and precede DEX queues, buy throttles and price gates.
   try { const result=await (deps.yieldRound??runYieldRound)({dryRun,limit}); resolved.log('[yield] '+JSON.stringify(result)); } catch { resolved.log('[yield] 生息讀值／對帳未完成，保留原部位與預留'); }
+  // Strategy earn keeper (backend#199): anyone-callable deleverage/unwind and incentive claims for each account's own position.
+  try { const result=await (deps.strategyEarnRound??runStrategyEarnRound)({dryRun,log:resolved.log}); if(result)resolved.log('[strategy-earn] '+JSON.stringify(result)); } catch { resolved.log('[strategy-earn] 健康度讀值未完成，下輪再試'); }
 
   let executorPaused: boolean | null = null;
   try {

@@ -6,6 +6,7 @@ import type { UserOperation, UserOperationReceipt, GetUserOperationReturnType } 
 import { AppError } from './errors.js';
 import { YIELD_EXECUTOR_ABI, YIELD_REGISTRY_ABI } from './yield-abi.js';
 import { TESTNET_97 } from './testnet-profile.js';
+import { assertNotStrategyVault } from './strategy-earn-guard.js';
 import { assertUserOpCapacity, MAX_USER_OP_GAS, userOpGasOverhead } from './execution-batch.js';
 import { canonicalKernelCalls, estimationPaymaster, schedulerPaymaster, gasExecutionKey, settleGasBudget, paymasterExecutionError } from './paymaster.js';
 import type { PaymasterDeps } from './paymaster.js';
@@ -63,6 +64,7 @@ export async function quoteYieldAction(client: PublicClient, account: Address, a
     const deadline = block.timestamp + BigInt(ttlSeconds);
     const scaledReceiptBalance = market.protocol === 'Aave' ? await client.readContract({ address: market.receipt,
       abi: AAVE_ACCOUNTING_ABI, functionName: 'scaledBalanceOf', args: [account], blockNumber: block.number }) : undefined;
+    assertNotStrategyVault({ marketId: action.marketId }); assertNotStrategyVault({ address: market.receipt });
     const data = encodeFunctionData({ abi: YIELD_EXECUTOR_ABI, functionName: action.kind === 'supply' ? 'executeSupply' : 'executeWithdraw',
       args: [account, action.marketId, action.amount, minimum, deadline] });
     await client.call({ account, to: executor, data, blockNumber: block.number, gas: MAX_USER_OP_GAS });

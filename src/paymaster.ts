@@ -24,6 +24,7 @@ import { AppError } from './errors.js';
 import { TESTNET_97, testnetAssets } from './testnet-profile.js';
 import { SESSION_GAS_ALLOWED_WEI, sessionCallPermissions } from './permissions.js';
 import { YIELD_REGISTRY_ABI } from './yield-abi.js';
+import { BORROW_CALL_ABI, isStrategyMarketId, isStrategyVault, STRATEGY_EARN_97 } from './strategy-earn-guard.js';
 import { MAX_USER_OP_GAS } from './execution-batch.js';
 import { applyExpiredExitProofs, expiredExitProofs, rememberExitFacts, unusedExitUsage } from './paymaster-exit-reconciliation.js';
 import type { ExpiredExitProof } from './paymaster-exit-reconciliation.js';
@@ -189,6 +190,11 @@ function validateRenewal(install: Hex, grant: Hex, c: PaymasterConfig, account: 
 }
 
 type CallContext = { owner?: Address; assets?: readonly Address[] };
+const collateralOf = (symbol: string): Address => {
+  const asset = (TESTNET_97.assets as Record<string, { token: string } | undefined>)[symbol];
+  if (!asset) throw new Error('strategy collateral missing');
+  return asset.token as Address;
+};
 export function validateSponsoredCalls(op: PackedSponsorOperation, c: PaymasterConfig, context: CallContext = {}): void {
   try {
     const calls = sponsoredCalls(op);
@@ -208,6 +214,8 @@ export function validateSponsoredCalls(op: PackedSponsorOperation, c: PaymasterC
       } else if (isAddressEqual(call.target, c.executor)) {
         const inner = decodeFunctionData({ abi: EXECUTOR_ABI, data: call.callData });
         if (inner.functionName === 'executeSupply' || inner.functionName === 'executeWithdraw') {
+          // backend#199: AtpExecutor must never move the strategy earn vault (it would become account cash).
+          if (isStrategyVault({ marketId: inner.args[1] })) throw new Error('strategy vault via AtpExecutor');
           if (c.chainId !== 97 || !isAddressEqual(inner.args[0], op.sender) || inner.args[2] === 0n || inner.args[3] === 0n || inner.args[4] === 0n ||
               !TESTNET_97.yieldMarkets.some(m => m.marketId === inner.args[1]) ||
               encodeFunctionData({ abi: EXECUTOR_ABI, functionName: inner.functionName, args: inner.args }).toLowerCase() !== call.callData.toLowerCase()) throw new Error('invalid yield call');
@@ -216,9 +224,32 @@ export function validateSponsoredCalls(op: PackedSponsorOperation, c: PaymasterC
       } else if (c.chainId === 97 && isAddressEqual(call.target, TESTNET_97.contracts.yieldRegistry)) {
         const inner = decodeFunctionData({ abi: YIELD_REGISTRY_ABI, data: call.callData });
         if (inner.functionName !== 'setYieldPolicy' && inner.functionName !== 'requestExit') throw new Error('invalid yield owner action');
+        if (isStrategyVault({ marketId: inner.args[0] })) throw new Error('strategy vault yield policy');
         if (!TESTNET_97.yieldMarkets.some(m => m.marketId === inner.args[0]) ||
             inner.functionName === 'setYieldPolicy' && inner.args[2] && inner.args[1] === 0n ||
             encodeFunctionData({ abi: YIELD_REGISTRY_ABI, functionName: inner.functionName, args: inner.args }).toLowerCase() !== call.callData.toLowerCase()) throw new Error('invalid yield owner calldata');
+      } else if (c.chainId === 97 && isAddressEqual(call.target, STRATEGY_EARN_97.executor)) {
+        // Strategy earn (backend#199): every movement is for this account and one of its fixed markets.
+        const inner = decodeFunctionData({ abi: BORROW_CALL_ABI, data: call.callData });
+        if (!['executeSupplyCollateral', 'executeBorrow', 'executeRepay', 'executeWithdrawCollateral', 'executeDeleverage'].includes(inner.functionName)) throw new Error('invalid borrow call');
+        const args = inner.args as readonly unknown[];
+        if (typeof args[0] !== 'string' || !isAddressEqual(args[0] as Address, op.sender) || typeof args[1] !== 'string' || !isStrategyMarketId(args[1]) ||
+            (args.length > 2 && args[2] === 0n) ||
+            encodeFunctionData({ abi: BORROW_CALL_ABI, functionName: inner.functionName, args: inner.args } as never).toLowerCase() !== call.callData.toLowerCase()) throw new Error('invalid borrow call');
+      } else if (c.chainId === 97 && isAddressEqual(call.target, STRATEGY_EARN_97.registry)) {
+        const inner = decodeFunctionData({ abi: BORROW_CALL_ABI, data: call.callData });
+        if (inner.functionName !== 'setBorrowPolicy' || !isStrategyMarketId(inner.args[0]) || (inner.args[2] && inner.args[1] === 0n) ||
+            encodeFunctionData({ abi: BORROW_CALL_ABI, functionName: inner.functionName, args: inner.args }).toLowerCase() !== call.callData.toLowerCase()) throw new Error('invalid borrow policy');
+      } else if (c.chainId === 97 && (isAddressEqual(call.target, STRATEGY_EARN_97.venusComptroller) || isAddressEqual(call.target, STRATEGY_EARN_97.listaMoolah))) {
+        const inner = decodeFunctionData({ abi: BORROW_CALL_ABI, data: call.callData });
+        const expected = isAddressEqual(call.target, STRATEGY_EARN_97.venusComptroller) ? 'updateDelegate' : 'setAuthorization';
+        if (inner.functionName !== expected || !isAddressEqual(inner.args[0] as Address, STRATEGY_EARN_97.executor) ||
+            encodeFunctionData({ abi: BORROW_CALL_ABI, functionName: inner.functionName, args: inner.args } as never).toLowerCase() !== call.callData.toLowerCase()) throw new Error('invalid lending delegate');
+      } else if (c.chainId === 97 && isStrategyVault({ address: call.target })) {
+        // Strategy vault shares may be approved to AtpBorrowExecutor only — never AtpExecutor (docs/borrow-97 §7).
+        const inner = decodeFunctionData({ abi: BORROW_CALL_ABI, data: call.callData });
+        if (inner.functionName !== 'approve' || !isAddressEqual(inner.args[0] as Address, STRATEGY_EARN_97.executor) ||
+            encodeFunctionData({ abi: BORROW_CALL_ABI, functionName: 'approve', args: inner.args as readonly [Address, bigint] }).toLowerCase() !== call.callData.toLowerCase()) throw new Error('invalid strategy vault approval');
       } else if (isAddressEqual(call.target, c.registry)) {
         const inner = decodeFunctionData({ abi: REGISTRY_ABI, data: call.callData });
         if (inner.functionName !== 'enroll' || !isAddressEqual(inner.args[0], op.sender) || inner.args[1] === 0n || inner.args[2] === 0 ||
@@ -229,7 +260,10 @@ export function validateSponsoredCalls(op: PackedSponsorOperation, c: PaymasterC
         const inner = decodeFunctionData({ abi: TOKEN_ABI, data: call.callData });
         if (encodeFunctionData({ abi: TOKEN_ABI, functionName: inner.functionName, args: inner.args }).toLowerCase() !== call.callData.toLowerCase()) throw new Error('noncanonical token call');
         if (inner.functionName === 'approve') {
-          if (!isAddressEqual(inner.args[0], c.executor)) throw new Error('invalid spender');
+          const borrowSpender = c.chainId === 97 && isAddressEqual(inner.args[0], STRATEGY_EARN_97.executor) &&
+            (isAddressEqual(call.target, TESTNET_97.contracts.usdt) || STRATEGY_EARN_97.markets.some(m => isAddressEqual(call.target, collateralOf(m.symbol))));
+          if (!isAddressEqual(inner.args[0], c.executor) && !borrowSpender) throw new Error('invalid spender');
+          if (isStrategyVault({ address: call.target }) && !borrowSpender) throw new Error('strategy vault approval');
         } else if (context.owner === undefined || !isAddressEqual(inner.args[0], context.owner) || inner.args[1] === 0n) throw new Error('invalid withdrawal');
       } else throw new Error('unknown target');
     }

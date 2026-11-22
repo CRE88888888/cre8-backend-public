@@ -2,6 +2,7 @@ import { configuredChainId } from './testnet-profile.js';
 import { createMixAssetList, createMixPreview } from './mix-preview.js';
 import { createUserMedia } from './user-media.js';
 import { createCashEarn } from './cash-earn.js';
+import { createStrategyEarn } from './strategy-earn.js';
 import { createMixService } from './mixes.js';
 import { createInfoService, parseInfoFilters } from './info/service.js';
 import { createYieldService } from './yield-service.js';
@@ -179,6 +180,7 @@ export type ServerDeps = {
   mixPreview: ReturnType<typeof createMixPreview>;
   userMedia: ReturnType<typeof createUserMedia>;
   cashEarn: ReturnType<typeof createCashEarn>;
+  strategyEarn: ReturnType<typeof createStrategyEarn>;
   mixAssets: ReturnType<typeof createMixAssetList>;
   modelReturns: ReturnType<typeof createModelReader>;
   info: ReturnType<typeof createInfoService>;
@@ -328,6 +330,7 @@ const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
   mixPreview: createMixPreview(),
   userMedia: createUserMedia(),
   cashEarn: createCashEarn(),
+  strategyEarn: createStrategyEarn(),
   mixAssets: createMixAssetList(),
   modelReturns: createModelReader(),
   info: createInfoService(),
@@ -555,6 +558,29 @@ async function route(
     }
     sendJson(res, 200, await deps.info.events(filters));
     return;
+  }
+
+  // Strategy earn (backend#199): per-portfolio borrow-into-vault; separate from wallet cash and Cash Earn.
+  if (root === 'strategy-earn' && segments.length === 2 && segments[1] === 'markets') {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    await deps.rateLimiter.mixPreview(deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
+    sendJson(res, 200, await deps.strategyEarn.markets(), { 'cache-control': 'public, max-age=30' });
+    return;
+  }
+  if (root === 'portfolios' && segments[2] === 'strategy-earn' && (segments.length === 3 || segments.length === 4)) {
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    await deps.rateLimiter.wallet('plan', wallet);
+    const id = parsePositiveInteger(segments[1] ?? '', 'portfolioId');
+    if (segments.length === 3) {
+      if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+      sendJson(res, 200, await deps.strategyEarn.portfolio(id, wallet)); return;
+    }
+    if (segments[3] === 'open' || segments[3] === 'close') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      const input = await readJsonBody(req);
+      sendJson(res, 200, segments[3] === 'open' ? await deps.strategyEarn.open(id, wallet, input) : await deps.strategyEarn.close(id, wallet, input));
+      return;
+    }
   }
 
   if(root==='yield'&&segments.length===2&&segments[1]==='markets'){

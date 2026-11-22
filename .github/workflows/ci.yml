@@ -68,6 +68,7 @@ jobs:
           test/mix-preview.test.ts
           test/user-media.test.ts
           test/cash-earn.test.ts
+          test/strategy-earn.test.ts
           test/waitlist-tasks.test.ts
           test/mix-http.test.ts
           test/model-returns.test.ts

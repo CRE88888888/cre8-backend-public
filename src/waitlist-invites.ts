@@ -8,8 +8,10 @@ import { MAX_PRIVY_TOKEN_LENGTH } from './privy.js';
 import { MemoryRateLimitStore, RateLimitError } from './ratelimit.js';
 import type { RateLimitStore } from './ratelimit.js';
 
-type Identity = { privyUserId: string; xUserId: string; xHandle: string };
-type Redemption = { status: 'approved'; xHandle: string; joinedAt: string };
+export type LoginMethod = 'twitter' | 'google' | 'email';
+/** X fields are set only for an X login; label is the operator-facing display (handle, Google email or email). */
+type Identity = { privyUserId: string; method: LoginMethod; xUserId: string | null; xHandle: string | null; label: string };
+type Redemption = { status: 'approved'; loginMethod: LoginMethod; xHandle: string | null; joinedAt: string };
 export type InviteStatus = 'unused' | 'used' | 'revoked' | 'expired';
 export type InviteEntry = {
   id: string; batchId: string; batchNote: string | null; issuedTo: string | null;
@@ -71,14 +73,25 @@ async function verify(token: unknown, config: PrivyConfig | null, now: number): 
     return { privyUserId: payload.sub, accounts };
   } catch { throw new UnauthorizedError('invalid or expired Privy identity token'); }
 }
-function xIdentity(privyUserId: string, accounts: unknown[]): Identity {
-  const twitter = accounts.filter((a): a is Record<string, unknown> => record(a) && a.type === 'twitter_oauth');
-  const account = twitter[0];
-  if (twitter.length !== 1 || !account || typeof account.subject !== 'string' || !/^[1-9]\d{0,19}$/.test(account.subject) ||
-      typeof account.username !== 'string' || !/^[A-Za-z0-9_]{1,15}$/.test(account.username)) {
-    throw new AppError(409, 'X_REQUIRED', 'link exactly one valid X account before joining');
+const EMAIL = /^[^\s@]{1,64}@[^\s@]{1,253}\.[^\s@]{1,63}$/;
+const emailOf = (value: unknown): string | null =>
+  typeof value === 'string' && value.length <= 254 && EMAIL.test(value) ? value.toLowerCase() : null;
+/**
+ * Invite redemption accepts any verified Privy login (backend#196): one valid X account first, then Google, then email.
+ * Joining the waitlist without a code still requires X (src/waitlist.ts).
+ */
+export function redeemIdentity(privyUserId: string, accounts: unknown[]): Identity {
+  const of = (type: string) => accounts.filter((a): a is Record<string, unknown> => record(a) && a.type === type);
+  const twitter = of('twitter_oauth'), x = twitter[0];
+  if (twitter.length === 1 && x && typeof x.subject === 'string' && /^[1-9]\d{0,19}$/.test(x.subject) &&
+      typeof x.username === 'string' && /^[A-Za-z0-9_]{1,15}$/.test(x.username)) {
+    return { privyUserId, method: 'twitter', xUserId: x.subject, xHandle: x.username, label: '@' + x.username };
   }
-  return { privyUserId, xUserId: account.subject, xHandle: account.username };
+  const google = of('google_oauth').find(a => typeof a.subject === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(a.subject));
+  if (google) return { privyUserId, method: 'google', xUserId: null, xHandle: null, label: emailOf(google.email) ?? 'Google account' };
+  const email = of('email').map(a => emailOf(a.address)).find((a): a is string => a !== null);
+  if (email) return { privyUserId, method: 'email', xUserId: null, xHandle: null, label: email };
+  throw new AppError(409, 'IDENTITY_REQUIRED', 'sign in with X, Google or email before redeeming an invite');
 }
 function batchFilter(params: URLSearchParams): string | null {
   const batch = params.get('batch');
@@ -135,7 +148,7 @@ export function createWaitlistInviteService(options: {
     async redeem(body: unknown) {
       const identity = await verify(record(body) ? body.identityToken : undefined, (options.config ?? getPrivyConfig)(), now());
       await consume('invite-user:' + hashInviteCode(identity.privyUserId), 5);
-      const x = xIdentity(identity.privyUserId, identity.accounts);
+      const x = redeemIdentity(identity.privyUserId, identity.accounts);
       if (!record(body) || typeof body.code !== 'string' || body.code.length > 64) throw invalidInvite();
       const code = body.code.trim().toUpperCase();
       if (!/^[A-HJ-KM-NP-Z2-9]{8,10}$/.test(code)) throw invalidInvite();
@@ -227,11 +240,12 @@ export class PostgresInviteRepository implements InviteRepository {
         const invite = (await client.query<{ id: string; status: string }>(
           'select id::text,status from waitlist_invites where code=$1 for update', [codeHash])).rows[0];
         if (!invite) throw invalidInvite();
-        await client.query(`insert into waitlist(privy_user_id,x_user_id,x_handle) values($1,$2,$3) on conflict do nothing`,
-          [identity.privyUserId, identity.xUserId, identity.xHandle]);
-        const entry = (await client.query<{ id: string; xUserId: string; status: string }>(
+        await client.query(`insert into waitlist(privy_user_id,x_user_id,x_handle,login_method,login_label) values($1,$2,$3,$4,$5) on conflict do nothing`,
+          [identity.privyUserId, identity.xUserId, identity.xHandle, identity.method, identity.method === 'twitter' ? null : identity.label]);
+        const entry = (await client.query<{ id: string; xUserId: string | null; status: string }>(
           'select id::text,x_user_id as "xUserId",status from waitlist where privy_user_id=$1 for update', [identity.privyUserId])).rows[0];
-        if (!entry || entry.xUserId !== identity.xUserId) throw identityConflict();
+        // Only two different X accounts conflict; a row created by Google/email has no X identity to contradict.
+        if (!entry || (entry.xUserId !== null && identity.xUserId !== null && entry.xUserId !== identity.xUserId)) throw identityConflict();
         if (entry.status === 'approved') throw alreadyApproved();
         if (entry.status !== 'waiting') throw invalidTransition();
         if (invite.status === 'used') throw usedInvite();
@@ -244,8 +258,8 @@ export class PostgresInviteRepository implements InviteRepository {
         // Do not supply used_at or preapprove: the DB trigger checks expiry again after both locks.
         const used = await client.query(`update waitlist_invites set status='used',used_by_waitlist_id=$2 where id=$1 and status='unused' returning id`, [invite.id, entry.id]);
         if (used.rows.length !== 1) throw unavailable();
-        const saved = (await client.query<Redemption>(`update waitlist set x_handle=$2 where id=$1 and status='approved'
-          returning status,x_handle as "xHandle",${timestamp('joined_at')} as "joinedAt"`, [entry.id, identity.xHandle])).rows[0];
+        const saved = (await client.query<Redemption>(`update waitlist set x_handle=coalesce($2,x_handle) where id=$1 and status='approved'
+          returning status,login_method as "loginMethod",x_handle as "xHandle",${timestamp('joined_at')} as "joinedAt"`, [entry.id, entry.xUserId === null ? null : identity.xHandle])).rows[0];
         if (!saved || saved.status !== 'approved') throw unavailable();
         return saved;
       });

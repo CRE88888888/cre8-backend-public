@@ -21,7 +21,7 @@ function harness(overrides: Partial<InviteRepository> = {}) {
   const writes: unknown[] = [];
   const repository: InviteRepository = {
     issue: async input => { writes.push(input); return input.codes.map((code, i) => ({ id: String(i + 1), codeHash: code.codeHash })); },
-    redeem: async (identity, codeHash) => { writes.push({ identity, codeHash }); return { status: 'approved', xHandle: identity.xHandle, joinedAt: '2026-11-16T00:00:00.000001Z' }; },
+    redeem: async (identity, codeHash) => { writes.push({ identity, codeHash }); return { status: 'approved', loginMethod: identity.method, xHandle: identity.xHandle, joinedAt: '2026-11-16T00:00:00.000001Z' }; },
     list: async () => [], summary: async () => [], revoke: async () => { writes.push('revoke'); },
     ...overrides,
   };
@@ -34,8 +34,8 @@ function harness(overrides: Partial<InviteRepository> = {}) {
 test('#131 redeem trusts signed X identity and passes only normalized code hash to storage', async () => {
   const h = harness();
   const result = await h.service.redeem({ identityToken: await h.sign(), code: ' abcdefgh23 ', xHandle: 'forged', privyUserId: 'forged' });
-  assert.deepEqual(result, { status: 'approved', xHandle: twitter.username, joinedAt: '2026-11-16T00:00:00.000001Z' });
-  assert.deepEqual(h.writes, [{ identity: { privyUserId: h.fixture.userId, xUserId: twitter.subject, xHandle: twitter.username }, codeHash: hashInviteCode('ABCDEFGH23') }]);
+  assert.deepEqual(result, { status: 'approved', loginMethod: 'twitter', xHandle: twitter.username, joinedAt: '2026-11-16T00:00:00.000001Z' });
+  assert.deepEqual(h.writes, [{ identity: { privyUserId: h.fixture.userId, method: 'twitter', xUserId: twitter.subject, xHandle: twitter.username, label: '@' + twitter.username }, codeHash: hashInviteCode('ABCDEFGH23') }]);
 });
 
 test('#131 issuance bounds, secure unique codes and one-time plaintext projection', async () => {
@@ -109,7 +109,7 @@ test('#131 identity token and X account boundaries match join; no wallet or CRE8
     ...[undefined, '', '0', '01', 123, '1'.repeat(21), 'abc'].map(subject => [{ ...twitter, subject }]),
     ...[undefined, '', 123, 'a'.repeat(16), '@handle', 'a-b', ' '].map(username => [{ ...twitter, username }])]) {
     const service = createWaitlistInviteService({ repository: h.repository, config: () => h.fixture.config, now: () => h.fixture.now });
-    await assert.rejects(service.redeem({ identityToken: await h.fixture.sign({ linked_accounts: JSON.stringify(accounts) }), code: 'ABCDEFGH23' }), isError(409, 'X_REQUIRED'));
+    await assert.rejects(service.redeem({ identityToken: await h.fixture.sign({ linked_accounts: JSON.stringify(accounts) }), code: 'ABCDEFGH23' }), isError(409, 'IDENTITY_REQUIRED'));
   }
   for (const subject of ['1', '1'.repeat(20)]) for (const username of ['a', 'a'.repeat(15)]) {
     const sub = 'did:privy:' + 'a'.repeat(246);
@@ -268,7 +268,7 @@ test('#131 HTTP IP/user limits resist untrusted forwarded headers and user rotat
     for (let i = 0; i < 6; i++) {
       const response = await fetch(base + '/waitlist/redeem', { method: 'POST', headers: { 'x-forwarded-for': '192.0.2.' + i }, body: JSON.stringify({ identityToken: token, code: 'ABCDEFGH23' }) });
       assert.equal(response.status, i < 5 ? 200 : 429);
-      if (i < 5) assert.deepEqual(await response.json(), { status: 'approved', xHandle: twitter.username, joinedAt: '2026-11-16T00:00:00.000001Z' });
+      if (i < 5) assert.deepEqual(await response.json(), { status: 'approved', loginMethod: 'twitter', xHandle: twitter.username, joinedAt: '2026-11-16T00:00:00.000001Z' });
       else assert.ok(Number(response.headers.get('retry-after')) > 0);
     }
   });
@@ -287,4 +287,33 @@ test('#131 HTTP errors and logs contain no input code, token or dependency secre
     assert.ok(logs.length > 0);
     for (const secret of [code, token, 'sensitive-dependency-value']) assert.ok(!logs.join('\n').includes(secret));
   } finally { console.log = originalLog; console.error = originalError; }
+});
+
+test('#196 redeem accepts Google or email when there is no valid X; X wins when present; join still requires X', async () => {
+  const google = { type: 'google_oauth', subject: '109876543210987654321', email: 'Ada@Example.com', name: 'Ada' };
+  const email = { type: 'email', address: 'Bob@Example.org' };
+  const cases: [unknown[], { method: string; xUserId: string | null; xHandle: string | null; label: string }][] = [
+    [[google], { method: 'google', xUserId: null, xHandle: null, label: 'ada@example.com' }],
+    [[{ ...google, email: undefined }], { method: 'google', xUserId: null, xHandle: null, label: 'Google account' }],
+    [[email], { method: 'email', xUserId: null, xHandle: null, label: 'bob@example.org' }],
+    [[email, google], { method: 'google', xUserId: null, xHandle: null, label: 'ada@example.com' }],
+    [[email, google, twitter], { method: 'twitter', xUserId: twitter.subject, xHandle: twitter.username, label: '@' + twitter.username }],
+    // A malformed X link does not block a valid Google/email login.
+    [[{ ...twitter, username: '@bad' }, email], { method: 'email', xUserId: null, xHandle: null, label: 'bob@example.org' }],
+    [[twitter, twitter, google], { method: 'google', xUserId: null, xHandle: null, label: 'ada@example.com' }],
+  ];
+  for (const [accounts, expected] of cases) {
+    const h = harness();
+    const result = await h.service.redeem({ identityToken: await h.fixture.sign({ linked_accounts: JSON.stringify(accounts) }), code: 'ABCDEFGH23' });
+    assert.equal(result.loginMethod, expected.method); assert.equal(result.xHandle, expected.xHandle);
+    assert.deepEqual(h.writes, [{ identity: { privyUserId: h.fixture.userId, ...expected }, codeHash: hashInviteCode('ABCDEFGH23') }]);
+  }
+  for (const accounts of [[{ ...google, subject: '' }], [{ ...google, subject: 'a b' }], [{ ...google, subject: 'x'.repeat(129) }],
+    [{ ...email, address: 'not-an-email' }], [{ ...email, address: 'a@b' }], [{ ...email, address: 'a'.repeat(250) + '@b.co' }], [{ ...email, address: 5 }],
+    [{ type: 'wallet', address: '0x' + '1'.repeat(40) }], [{ type: 'discord_oauth', subject: '1', username: 'u' }]]) {
+    const h = harness();
+    await assert.rejects(h.service.redeem({ identityToken: await h.fixture.sign({ linked_accounts: JSON.stringify(accounts) }), code: 'ABCDEFGH23' }),
+      isError(409, 'IDENTITY_REQUIRED'));
+    assert.deepEqual(h.writes, []);
+  }
 });

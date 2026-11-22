@@ -17,7 +17,7 @@ const repository = new PostgresInviteRepository();
 const waitlist = new PostgresWaitlistRepository();
 const service = createWaitlistInviteService();
 const isError = (status: number, code: string) => (error: unknown) => error instanceof AppError && error.status === status && error.code === code;
-function identity() { return { privyUserId: 'did:privy:be131:' + randomUUID(), xUserId: String(randomInt(1, 2 ** 48 - 1)), xHandle: 'invite_user' }; }
+function identity() { return { privyUserId: 'did:privy:be131:' + randomUUID(), method: 'twitter' as const, xUserId: String(randomInt(1, 2 ** 48 - 1)), xHandle: 'invite_user', label: '@invite_user' }; }
 async function issue(count = 1, issuedTo: string | null = 'alice') {
   const batch = await service.issue({ count, issuedTo, batchNote: 'be131 ' + randomUUID() }, operator);
   const first = batch.items[0]; assert.ok(first);
@@ -55,7 +55,7 @@ test('#131 signed social-only HTTP redemption persists approval and prevents a s
     });
     const response = await post(batch.first.code); assert.equal(response.status, 200);
     const entry = await waitlist.find(user.privyUserId); assert.ok(entry);
-    assert.deepEqual(await response.json(), { status: 'approved', xHandle: user.xHandle, joinedAt: entry.joinedAt });
+    assert.deepEqual(await response.json(), { status: 'approved', loginMethod: 'twitter', xHandle: user.xHandle, joinedAt: entry.joinedAt });
     assert.equal(entry.approvedBy, 'invite:' + batch.first.id);
     const second = batch.items[1]; assert.ok(second);
     const repeated = await post(second.code); assert.equal(repeated.status, 409);
@@ -198,4 +198,28 @@ test('#131 Postgres invite row-lock timeout fails closed and leaves both rows un
   } finally { await client.query('rollback'); client.release(); }
   assert.equal((await stored(batch.first.id)).status, 'unused'); assert.deepEqual(await waitlist.find(user.privyUserId), entry);
   assert.equal((await repository.redeem(user, hashInviteCode(batch.first.code))).status, 'approved');
+});
+
+test('#196 Postgres email/Google redemptions approve without X, record the login, and X users cannot collide with them', async () => {
+  const batch = await issue(4);
+  const [a, b, c, d] = batch.items; assert.ok(a && b && c && d);
+  const emailUser = { privyUserId: 'did:privy:be196:' + randomUUID(), method: 'email' as const, xUserId: null, xHandle: null, label: 'ada@example.com' };
+  const result = await repository.redeem(emailUser, hashInviteCode(a.code));
+  assert.equal(result.status, 'approved'); assert.equal(result.loginMethod, 'email'); assert.equal(result.xHandle, null);
+  const entry = await waitlist.find(emailUser.privyUserId); assert.ok(entry);
+  assert.deepEqual([entry.status, entry.loginMethod, entry.loginLabel, entry.xUserId, entry.xHandle], ['approved', 'email', 'ada@example.com', null, null]);
+  await assert.rejects(repository.redeem(emailUser, hashInviteCode(b.code)), isError(409, 'ALREADY_APPROVED'));
+  // The same Privy user later redeeming with an X link is the same person, not an identity conflict.
+  await assert.rejects(repository.redeem({ ...identity(), privyUserId: emailUser.privyUserId }, hashInviteCode(b.code)), isError(409, 'ALREADY_APPROVED'));
+  const googleUser = { privyUserId: 'did:privy:be196:' + randomUUID(), method: 'google' as const, xUserId: null, xHandle: null, label: 'Google account' };
+  assert.equal((await repository.redeem(googleUser, hashInviteCode(c.code))).loginMethod, 'google');
+  const xUser = identity();
+  const xResult = await repository.redeem(xUser, hashInviteCode(d.code));
+  assert.deepEqual([xResult.loginMethod, xResult.xHandle], ['twitter', xUser.xHandle]);
+  const xEntry = await waitlist.find(xUser.privyUserId); assert.ok(xEntry);
+  assert.deepEqual([xEntry.loginMethod, xEntry.loginLabel, xEntry.xUserId], ['twitter', null, xUser.xUserId]);
+  assert.equal((await stored(b.id)).status, 'unused');
+  // Listing shows who used each code, including non-X users (xHandle null).
+  const used = (await pages(batch.batchId, 'used', 100)).map(row => row.xHandle).sort();
+  assert.deepEqual(used, [null, null, xUser.xHandle].sort());
 });

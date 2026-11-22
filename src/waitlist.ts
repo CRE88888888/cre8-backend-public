@@ -9,8 +9,11 @@ export type WaitlistStatus = 'waiting' | 'approved' | 'revoked';
 export type WaitlistEntry = {
   id: string;
   privyUserId: string;
-  xUserId: string;
-  xHandle: string;
+  /** null for rows created by a Google/email invite redemption (db 0061). */
+  xUserId: string | null;
+  xHandle: string | null;
+  loginMethod: 'twitter' | 'google' | 'email';
+  loginLabel: string | null;
   status: WaitlistStatus;
   joinedAt: string;
   approvedAt: string | null;
@@ -28,7 +31,7 @@ export interface WaitlistRepository {
 
 // Keep microseconds for the keyset cursor: converting joined_at through JS Date loses ties.
 const COLUMNS = `id::text as "id", privy_user_id as "privyUserId", x_user_id as "xUserId",
-  x_handle as "xHandle", status,
+  x_handle as "xHandle", login_method as "loginMethod", login_label as "loginLabel", status,
   to_char(joined_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "joinedAt",
   to_char(approved_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "approvedAt",
   approved_by as "approvedBy"`;

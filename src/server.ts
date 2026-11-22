@@ -1,5 +1,5 @@
 import { configuredChainId } from './testnet-profile.js';
-import { createMixPreview } from './mix-preview.js';
+import { createMixAssetList, createMixPreview } from './mix-preview.js';
 import { createMixService } from './mixes.js';
 import { createInfoService, parseInfoFilters } from './info/service.js';
 import { createYieldService } from './yield-service.js';
@@ -174,6 +174,7 @@ export const BUNDLER_TIMEOUT_MS = 30_000;
 export type ServerDeps = {
   mixes: ReturnType<typeof createMixService>;
   mixPreview: ReturnType<typeof createMixPreview>;
+  mixAssets: ReturnType<typeof createMixAssetList>;
   modelReturns: ReturnType<typeof createModelReader>;
   info: ReturnType<typeof createInfoService>;
   previewContribution: typeof previewContributionAsync;
@@ -319,6 +320,7 @@ async function defaultListAssets(): Promise<PriceableAsset[]> {
 const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
   mixes: createMixService(),
   mixPreview: createMixPreview(),
+  mixAssets: createMixAssetList(),
   modelReturns: createModelReader(),
   info: createInfoService(),
   previewContribution: previewContributionAsync,
@@ -455,6 +457,12 @@ async function route(
     if (method !== 'GET') return methodNotAllowed(res, ['GET']);
     await deps.rateLimiter.mixPreview(deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
     sendJson(res, 200, await deps.mixes.shared(segments[2] ?? '')); return;
+  }
+
+  if (root === 'mixes' && segments.length === 2 && segments[1] === 'assets') {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    sendJson(res, 200, deps.mixAssets(), { 'cache-control': 'public, max-age=300' });
+    return;
   }
 
   if (root === 'mixes' && segments.length === 2 && segments[1] === 'preview') {

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createServer } from '../src/server.js';
-import { createMixPreview } from '../src/mix-preview.js';
+import { createMixAssetList, createMixPreview } from '../src/mix-preview.js';
 import { loadRateLimitConfig } from '../src/config.js';
 import { RequestRateLimiter, MemoryRateLimitStore } from '../src/ratelimit.js';
 import { emptyModel } from '../src/model-returns/calculation.js';
@@ -98,4 +98,48 @@ test('mix yield status is absent and consent, revoke and exit cannot read chain 
   assert.equal(await service.status(1, T.roles.keeper), null);
   for (const method of [service.consent, service.revoke, service.exit]) await assert.rejects(method(1, T.roles.keeper, {}), { code: 'MIX_NO_YIELD' });
   assert.equal(reads, 0);
+});
+
+test('#189 GET /mixes/assets lists 103 assets publicly with kinds, backtest flags and a short public cache', async () => {
+  const server = createServer({
+    mixAssets: createMixAssetList({ chainId: 97 }),
+    rateLimiter: new RequestRateLimiter(loadRateLimitConfig({}), new MemoryRateLimitStore()),
+    auth: { authenticate: async () => { throw new Error('public route attempted authentication'); }, issueNonce: () => { throw new Error('unused'); },
+      login: async () => { throw new Error('unused'); }, logout: async () => {} },
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  const url = `http://127.0.0.1:${address.port}/mixes/assets`;
+  try {
+    assert.equal((await fetch(url, { method: 'POST' })).status, 405);
+    assert.equal((await fetch(url + '/extra')).status, 404);
+    const response = await fetch(url, { headers: { origin: 'http://localhost:5173' } });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('cache-control'), 'public, max-age=300');
+    assert.equal(response.headers.get('access-control-allow-origin'), 'http://localhost:5173');
+    const result: unknown = await response.json();
+    assert.ok(result && typeof result === 'object' && 'assets' in result && Array.isArray(result.assets));
+    const assets: unknown[] = result.assets;
+    assert.equal(assets.length, 103);
+    const bySymbol = new Map(assets.map(item => {
+      assert.ok(item && typeof item === 'object' && 'symbol' in item && typeof item.symbol === 'string');
+      return [item.symbol, item];
+    }));
+    assert.deepEqual(bySymbol.get('NVDAB'), { assetId: T.assets.NVDAB.token, symbol: 'NVDAB', kind: 'stock', hasBacktest: true });
+    assert.deepEqual(bySymbol.get('Cake'), { assetId: T.assets.Cake.token, symbol: 'Cake', kind: 'crypto', hasBacktest: true });
+    assert.deepEqual(bySymbol.get('XAUt'), { assetId: T.assets.XAUt.token, symbol: 'XAUt', kind: 'gold', hasBacktest: true });
+    for (const excluded of ['USDT', 'USDC', 'DAI']) assert.equal(bySymbol.has(excluded), false, excluded);
+  } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+});
+
+test('#189 GET /mixes/assets refuses chains other than 97', async () => {
+  const server = createServer({ mixAssets: createMixAssetList({ chainId: 56 }),
+    rateLimiter: new RequestRateLimiter(loadRateLimitConfig({}), new MemoryRateLimitStore()) });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  try {
+    const response = await fetch(`http://127.0.0.1:${address.port}/mixes/assets`);
+    assert.equal(response.status, 503);
+    assert.match(await response.text(), /MIX_CHAIN_UNAVAILABLE/);
+  } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
 });

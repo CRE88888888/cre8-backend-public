@@ -5,7 +5,8 @@ import { minimumAssetContributionFromAllocation } from './asset-plan.js';
 import { createModelReader } from './model-returns/service.js';
 import type { ModelResult } from './model-returns/calculation.js';
 import { emptyModel } from './model-returns/calculation.js';
-import { mixAssets, mixKeys, MIX_ASSETS } from './mix-domain.js';
+import { mixAssetListing, mixAssets, mixKeys, MIX_ASSETS } from './mix-domain.js';
+import type { MixAssetListing } from './mix-domain.js';
 import { record } from './strategy-execution.js';
 import { assetsMarketOpen } from './trading-calendar.js';
 import { configuredChainId } from './testnet-profile.js';
@@ -83,5 +84,13 @@ export function createMixPreview(deps: MixPreviewDeps = {}) {
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
+  };
+}
+
+/** GET /mixes/assets: the static picker list (testnet only), no chain or DB reads. */
+export function createMixAssetList(deps: { chainId?: number } = {}) {
+  return (): { assets: MixAssetListing[] } => {
+    if ((deps.chainId ?? configuredChainId()) !== 97) throw new AppError(503, 'MIX_CHAIN_UNAVAILABLE', '私人組合目前僅開放測試網。');
+    return { assets: mixAssetListing() };
   };
 }

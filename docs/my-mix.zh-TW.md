@@ -1,6 +1,10 @@
 # 私人組合（My mix，chain 97）
 
-對應 backend#178／#180／#182；schema 依賴 CRE8Finance/cre8-db#77 的 0056、db#79 的 0057 與 db#81 的 0058。部署順序必須先套用 0056、0057、0058，再部署 backend#182；本文件不代表已部署。只開放測試網既有 21 檔目錄的 40 個資產，選 1–10 個，比例以 bp 表示、合計 10000。私人 strategy 不出現在公開基金 API，不能經通用 strategyId 加入。
+對應 backend#178／#180／#182；schema 依賴 CRE8Finance/cre8-db#77 的 0056、db#79 的 0057 與 db#81 的 0058。部署順序必須先套用 0056、0057、0058，再部署 backend#182；本文件不代表已部署。backend#189 起開放測試網 manifest 全部 103 個資產（105 個扣掉 USDC、DAI；USDT 是計價現金），選 1–10 個，比例以 bp 表示、合計 10000。私人 strategy 不出現在公開基金 API，不能經通用 strategyId 加入。
+
+## 可選資產
+
+`GET /mixes/assets` 免登入、只讀靜態 manifest，回 `{assets:[{assetId, symbol, kind, hasBacktest}]}`，`cache-control: public, max-age=300`；非 chain 97 回 503 `MIX_CHAIN_UNAVAILABLE`。`kind` 是 `stock`（股票／ETF，只在美股常規時段成交）、`crypto`（24 小時；含沒有 secondary feed 的 ADA、LINK、BCH、NEAR、UNI、ZEC、TONCOIN、DOT、SHIB、PEPE、AAVE、Cake、FIL、ATOM）、`gold`（XAUt）。`hasBacktest` 表示 model-returns 有價格來源（加密貨幣用 Binance 現貨、股票／ETF 用 Yahoo 原股票代號），不代表今天的資料已收齊；資料不完整時 preview 的 modelReturns 仍是 null。
 
 ## 建立、確認與改比例
 

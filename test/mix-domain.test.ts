@@ -7,13 +7,16 @@ import { TESTNET_97 as T } from '../src/testnet-profile.js';
 const nvda = T.assets.NVDAB.token, tsla = T.assets.TSLAB.token;
 const assets = [{ assetId: nvda, weightBps: 6000 }, { assetId: tsla, weightBps: 4000 }];
 const now = new Date('2026-11-21T23:30:00Z');
-test('mix defaults are complete and its catalogue contains exactly the admitted forty assets', () => {
+test('mix defaults are complete and #189 its catalogue contains all 103 non-cash chain-97 assets', () => {
   const settings = mixSettings({ assets }, now);
   assert.equal(settings.name, 'NVDAB + TSLAB');
   assert.deepEqual(settings.rebalance, { frequency: 'monthly', startDate: '2026-11-21' });
   assert.deepEqual(settings.exit, { takeProfitBps: null, stopLossBps: null });
-  assert.equal(MIX_ASSETS.length, 40);
-  assert.deepEqual(MIX_ASSETS.map(asset => asset.symbol).sort(), [...new Set(lineup.funds.flatMap(fund => fund.components.map(asset => asset.asset_id)))].sort());
+  assert.equal(MIX_ASSETS.length, 103);
+  assert.deepEqual(MIX_ASSETS.map(asset => asset.symbol).sort(), Object.keys(T.assets).filter(symbol => !['USDC', 'DAI'].includes(symbol)).sort());
+  // The 21-fund lineup (former 40-asset limit) stays a subset.
+  const lineupSymbols = new Set(MIX_ASSETS.map(asset => asset.symbol));
+  for (const symbol of new Set(lineup.funds.flatMap(fund => fund.components.map(asset => asset.asset_id)))) assert.ok(lineupSymbols.has(symbol), symbol);
   assert.deepEqual(mixAssets([{ assetId: nvda.toUpperCase(), weightBps: 10000 }]), [{ assetId: nvda, weightBps: 10000 }]);
 });
 test('mix validates asset count, distinct identities and exact positive basis-point sum', () => {
@@ -23,9 +26,20 @@ test('mix validates asset count, distinct identities and exact positive basis-po
   for (const value of [null, [], [...ten, ten[0]], [{ assetId: nvda, weightBps: 0 }], [{ assetId: nvda, weightBps: 10001 }],
     [{ assetId: nvda, weightBps: 9999 }], [{ assetId: nvda, weightBps: 10000.1 }],
     [{ assetId: nvda, weightBps: 5000 }, { assetId: nvda, weightBps: 5000 }], [{ assetId: T.contracts.usdt, weightBps: 10000 }],
-    [{ assetId: T.assets.AVAX.token, weightBps: 10000 }], [{ assetId: 'NVDAB', weightBps: 10000 }], [{ assetId: nvda, weightBps: 10000, yield: true }]]) {
+    [{ assetId: T.assets.USDC.token, weightBps: 10000 }], [{ assetId: T.assets.DAI.token, weightBps: 10000 }],
+    [{ assetId: '0x' + '1'.repeat(40), weightBps: 10000 }], MIX_ASSETS.slice(0, 11).map((asset, i) => ({ assetId: asset.address, weightBps: i ? 909 : 910 })),
+    [{ assetId: 'NVDAB', weightBps: 10000 }], [{ assetId: nvda, weightBps: 10000, yield: true }]]) {
     assert.throws(() => mixAssets(value));
   }
+});
+test('#189 every one of the 103 assets is individually selectable, including the former non-lineup ones', () => {
+  for (const asset of MIX_ASSETS) assert.deepEqual(mixAssets([{ assetId: asset.address, weightBps: 10000 }]), [{ assetId: asset.address, weightBps: 10000 }]);
+  for (const symbol of ['AVAX', 'ETH', 'Cake', 'TONCOIN', 'XAUt', 'Von', 'SHAZB', 'GLDon']) {
+    const token = T.assets[symbol as keyof typeof T.assets].token;
+    assert.equal(mixAssets([{ assetId: token.toUpperCase().replace('0X', '0x'), weightBps: 10000 }])[0]?.assetId, token);
+  }
+  const lastTen = MIX_ASSETS.slice(-10).map(asset => ({ assetId: asset.address, weightBps: 1000 }));
+  assert.equal(mixAssets(lastTen).length, 10);
 });
 test('mix name, attribution and setting boundaries reject malformed or unsupported input', () => {
   assert.equal(mixSettings({ assets, name: '  My tech  ', importCode: 'a'.repeat(22) }, now).name, 'My tech');

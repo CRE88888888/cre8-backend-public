@@ -3,6 +3,8 @@ import { ValidationError } from './errors.js';
 import { record } from './strategy-execution.js';
 import { TESTNET_97, testnetAssets } from './testnet-profile.js';
 import { MODEL_ASSETS } from './model-returns/catalogue.js';
+import { testnetAssetKind } from './trading-calendar.js';
+import type { TestnetAssetKind } from './trading-calendar.js';
 
 export type MixFrequency = 'daily' | 'weekly' | 'monthly' | 'quarterly';
 export type MixAsset = { assetId: Address; weightBps: number };
@@ -10,8 +12,16 @@ export type MixSettings = { name: string; assets: MixAsset[]; rebalance: { frequ
   exit: { takeProfitBps: number | null; stopLossBps: number | null }; importCode?: string };
 const DAY = 86_400_000;
 const frequencies: readonly MixFrequency[] = ['daily', 'weekly', 'monthly', 'quarterly'];
-/** Model catalogue covers the approved 21-fund lineup; the broader chain profile also has legacy assets. */
-export const MIX_ASSETS = testnetAssets().filter(asset => !asset.is_numeraire && MODEL_ASSETS.some(model => model.symbol === asset.symbol.toUpperCase()));
+/** Stablecoins are cash, not a mix constituent (USDT is the numeraire; USDC/DAI would only re-wrap cash). */
+export const MIX_EXCLUDED_SYMBOLS: ReadonlySet<string> = new Set(['USDC', 'DAI']);
+/** Every chain-97 manifest asset except cash-like ones (#189: 103 of 105). */
+export const MIX_ASSETS = testnetAssets().filter(asset => !asset.is_numeraire && !MIX_EXCLUDED_SYMBOLS.has(asset.symbol));
+export type MixAssetListing = { assetId: Address; symbol: string; kind: TestnetAssetKind; hasBacktest: boolean };
+/** Public, static list for the picker. hasBacktest means a model-returns price source exists, not that today's data is ready. */
+export function mixAssetListing(): MixAssetListing[] {
+  return MIX_ASSETS.map(asset => ({ assetId: asset.address, symbol: asset.symbol, kind: testnetAssetKind(asset.symbol),
+    hasBacktest: MODEL_ASSETS.some(model => model.symbol === asset.symbol.toUpperCase()) }));
+}
 const invalid = (code: string, message: string): never => { throw new ValidationError(code, message); };
 export function mixKeys(input: Record<string, unknown>, allowed: readonly string[], code: string): void {
   if (Object.keys(input).some(key => !allowed.includes(key))) invalid(code, '組合設定含有不支援的欄位，請重新確認。');

@@ -23,10 +23,20 @@ export function stockMarketOpen(now: Date): boolean {
 }
 
 
+/** Chain-97 crypto assets that have no secondary feed; they trade around the clock like the feed-backed ones. */
+export const TESTNET_CRYPTO_WITHOUT_FEED: ReadonlySet<string> = new Set(['ADA','LINK','BCH','NEAR','UNI','ZEC','TONCOIN','DOT','SHIB','PEPE','AAVE','Cake','FIL','ATOM']);
+export type TestnetAssetKind = 'stock' | 'crypto' | 'gold';
+/** Only stocks/ETFs follow the NYSE session; unknown symbols fail closed as stocks. */
+export function testnetAssetKind(symbol: string): TestnetAssetKind {
+  if (symbol === 'XAUt') return 'gold';
+  const spec = TESTNET_ASSETS.find(a => a.symbol === symbol);
+  return spec?.hasFeed || TESTNET_CRYPTO_WITHOUT_FEED.has(symbol) ? 'crypto' : 'stock';
+}
+
 /** Asset identity comes from the admitted chain manifest, never a request symbol. */
 export function assetsMarketOpen(chainId:number,assets:readonly string[],now:Date):boolean {
   if(chainId!==97)return true;
-  const stocks=new Set<string>(TESTNET_ASSETS.filter(a=>!a.hasFeed&&a.symbol!=='XAUt').map(a=>a.symbol));
+  const stocks=new Set<string>(TESTNET_ASSETS.filter(a=>testnetAssetKind(a.symbol)==='stock').map(a=>a.symbol));
   const addresses=new Set<string>(testnetAssets().filter(a=>stocks.has(a.symbol)).map(a=>a.address));
   return !assets.some(a=>addresses.has(a.toLowerCase()))||stockMarketOpen(now);
 }

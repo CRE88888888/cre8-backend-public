@@ -12,7 +12,7 @@ import { loadRateLimitConfig } from '../src/config.js';
 import type { InfoBatch } from '../src/info/types.js';
 
 after(closePool);
-const asset = MODEL_ASSETS.find(a => a.symbol === 'AAPLB'); assert.ok(asset);
+const asset = MODEL_ASSETS.find(a => a.symbol === 'AAPLB'); assert.ok(asset?.address);
 const now = new Date(), asOf = lastClosedDay(now);
 const series = closeSeries(asset);
 const batch: InfoBatch = { events: [], markets: Array.from({ length: 8 }, (_, i) => ({ series,
@@ -99,7 +99,7 @@ test('#173 list computes on-chain strategies from DB active_at only and never ca
   assert.ok(id > 0);
   try {
     await saveInfoBatch(batch);
-    const nvda = MODEL_ASSETS.find(a => a.symbol === 'NVDAB'); assert.ok(nvda);
+    const nvda = MODEL_ASSETS.find(a => a.symbol === 'NVDAB'); assert.ok(nvda?.address);
     // v1 is effective in the DB; v2 only becomes effective tomorrow and must not be used yet.
     await query("insert into strategy_versions(strategy_id,version,allocation,schedule,active_at) values($1,1,$2,'{}',now()-interval '1 day')",
       [id, JSON.stringify({ assets: [{ address: asset.address, weightBps: 10000 }] })]);
@@ -128,7 +128,7 @@ test('#173 list computes on-chain strategies from DB active_at only and never ca
 test('#176 actual SQL keeps admissions stable across daily refresh, ignores legacy bStock closes and requires a checked closed day', async () => {
   await migrate();
   const client = await getPool().connect();
-  const nvda = MODEL_ASSETS.find(a => a.symbol === 'NVDAB'); assert.ok(nvda);
+  const nvda = MODEL_ASSETS.find(a => a.symbol === 'NVDAB'); assert.ok(nvda?.address);
   const second = closeSeries(nvda), end = '2026-11-02';
   const url = 'https://query1.finance.yahoo.com/v8/finance/chart/AAPL?range=2y&interval=1d';
   const entries: InfoBatch = { events: [], markets: [

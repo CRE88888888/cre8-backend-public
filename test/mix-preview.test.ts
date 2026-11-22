@@ -83,3 +83,15 @@ test('mix preview retains concurrency slots when storage fails but its parallel 
     await assert.rejects(preview({ assets: [stock] }), /試算的人較多/);
   } finally { finish(); await rpc; }
 });
+
+test('#189 previews a mix of former non-lineup assets: crypto open on a weekend, ETF waits, symbols from the manifest', async () => {
+  const preview = createMixPreview({ chainId: 97, now, gasPrice: async () => 2n, model: async () => emptyModel() });
+  const result = await preview({ assets: [{ assetId: T.assets.Cake.token, weightBps: 3000 }, { assetId: T.assets.TONCOIN.token, weightBps: 3000 },
+    { assetId: T.assets.GLDon.token, weightBps: 4000 }] });
+  assert.deepEqual(result.markets.map(market => [market.symbol, market.open, market.nextOpenAt]),
+    [['Cake', true, null], ['TONCOIN', true, null], ['GLDon', false, '2026-11-23T14:30:00.000Z']]);
+  assert.equal(result.minimumDepositRaw, (50n * 10n ** 18n).toString());
+  const crypto = await preview({ assets: [{ assetId: T.assets.SHIB.token, weightBps: 5000 }, { assetId: T.assets.PEPE.token, weightBps: 5000 }] });
+  assert.equal(crypto.message, '所有成分目前都在可交易時段。');
+  await assert.rejects(preview({ assets: [{ assetId: T.assets.USDC.token, weightBps: 10000 }] }), /這個資產暫時無法加入私人組合/);
+});

@@ -31,5 +31,6 @@ export function modelSymbol(address: string, chainId: number): string | null {
     const symbol = testnetAssets().find(asset => asset.address.toLowerCase() === address.toLowerCase())?.symbol.toUpperCase();
     return MODEL_ASSETS.find(asset => asset.symbol === symbol)?.symbol ?? null;
   }
-  return MODEL_ASSETS.find(asset => asset.address.toLowerCase() === address.toLowerCase())?.symbol ?? null;
+  // #189 testnet-only constituents carry no mainnet address and never match outside chain 97.
+  return MODEL_ASSETS.find(asset => asset.address !== undefined && asset.address.toLowerCase() === address.toLowerCase())?.symbol ?? null;
 }

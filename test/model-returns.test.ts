@@ -8,7 +8,7 @@ import { createModelReader, currentWeights } from '../src/model-returns/service.
 import type { ModelStrategy } from '../src/model-returns/service.js';
 import { createInfoGet, MAX_SOURCE_BYTES } from '../src/info/source.js';
 import { createInfoBackgroundJob } from '../src/info/job.js';
-import { TESTNET_97 } from '../src/testnet-profile.js';
+import { TESTNET_97, testnetAssets } from '../src/testnet-profile.js';
 import { createServer } from '../src/server.js';
 import { loadRateLimitConfig } from '../src/config.js';
 import { MemoryRateLimitStore, RequestRateLimiter } from '../src/ratelimit.js';
@@ -21,7 +21,7 @@ const now = new Date('2026-11-20T12:00:00Z');
 const asOf = '2026-11-19';
 const assetA = MODEL_ASSETS.find(a => a.symbol === 'AAPLB');
 const assetB = MODEL_ASSETS.find(a => a.symbol === 'NVDAB');
-assert.ok(assetA && assetB);
+assert.ok(assetA?.address && assetB?.address);
 const weights = [{ symbol: 'AAPLB', weightBps: 5000 }, { symbol: 'NVDAB', weightBps: 5000 }];
 const date = (start: string, index: number) => new Date(Date.parse(start) + index * DAY_MS).toISOString().slice(0, 10);
 function points(count: number, value = '100', start = date(asOf, 1 - count)): ClosePoint[] {
@@ -411,7 +411,7 @@ test('#176 a successful Yahoo read never falls back; adjusted-close errors and u
 });
 
 test('#176 a checked holiday can carry, but a failed/unverified round cannot masquerade as a flat close; other funds still calculate', async () => {
-  const a = MODEL_ASSETS.find(x => x.symbol === 'AAPLB'), b = MODEL_ASSETS.find(x => x.symbol === 'NVDAB'); assert.ok(a && b);
+  const a = MODEL_ASSETS.find(x => x.symbol === 'AAPLB'), b = MODEL_ASSETS.find(x => x.symbol === 'NVDAB'); assert.ok(a?.address && b?.address);
   const rows = [a, b].flatMap(asset => points(8).map(p => ({ series: closeSeries(asset), source: 'yahoo', ...p })));
   rows.push({ series: checkedSeries(closeSeries(a)), source: 'yahoo', date: asOf, value: '1' });
   const version = strategy.versions[0]; assert.ok(version);
@@ -422,12 +422,13 @@ test('#176 a checked holiday can carry, but a failed/unverified round cannot mas
   assert.deepEqual(results.get(2)?.modelComponents, [{ symbol: 'NVDAB', includedFrom: date(asOf, -7) }]);
 });
 
-test('#176 the catalogue covers 40 unique tokens; crypto/unlisted series and Korean USD conversion are explicit', () => {
-  assert.equal(MODEL_ASSETS.length, 40);
-  assert.equal(new Set(MODEL_ASSETS.map(a => a.symbol)).size, 40);
-  assert.equal(new Set(MODEL_ASSETS.map(a => a.address.toLowerCase())).size, 40);
-  assert.equal(MODEL_ASSETS.filter(a => a.source.kind === 'yahoo').length, 35);
-  assert.equal(MODEL_ASSETS.filter(a => a.source.kind === 'binance').length, 5);
+test('#176/#189 the catalogue covers 103 unique tokens (40 with mainnet addresses); crypto/unlisted series and Korean USD conversion are explicit', () => {
+  assert.equal(MODEL_ASSETS.length, 103);
+  assert.equal(new Set(MODEL_ASSETS.map(a => a.symbol)).size, 103);
+  const mainnet = MODEL_ASSETS.flatMap(a => a.address === undefined ? [] : [a.address.toLowerCase()]);
+  assert.equal(mainnet.length, 40); assert.equal(new Set(mainnet).size, 40);
+  assert.equal(MODEL_ASSETS.filter(a => a.source.kind === 'yahoo').length, 78);
+  assert.equal(MODEL_ASSETS.filter(a => a.source.kind === 'binance').length, 25);
   for (const asset of MODEL_ASSETS) {
     assert.doesNotMatch(closeSeries(asset), /undefined/);
     if (asset.source.kind === 'yahoo') {
@@ -436,4 +437,27 @@ test('#176 the catalogue covers 40 unique tokens; crypto/unlisted series and Kor
       if (asset.symbol === 'SKHYB') assert.equal(asset.source.fx, 'KRW=X');
     } else assert.equal(asset.source.seasoned, ['ANTB', 'SPCXB'].includes(asset.symbol));
   }
+});
+
+test('#189 every chain-97 mix asset has a price source; testnet-only entries never match a mainnet address', () => {
+  for (const asset of testnetAssets().filter(a => !a.is_numeraire && !['USDC', 'DAI'].includes(a.symbol))) {
+    assert.equal(modelSymbol(asset.address, 97), asset.symbol.toUpperCase(), asset.symbol);
+  }
+  for (const symbol of ['USDC', 'DAI']) {
+    const stable = testnetAssets().find(a => a.symbol === symbol); assert.ok(stable);
+    assert.equal(modelSymbol(stable.address, 97), null);
+  }
+  const testnetOnly = MODEL_ASSETS.filter(a => a.address === undefined);
+  assert.equal(testnetOnly.length, 63);
+  for (const asset of testnetOnly) {
+    const token = testnetAssets().find(a => a.symbol.toUpperCase() === asset.symbol); assert.ok(token, asset.symbol);
+    assert.equal(modelSymbol(token.address, 56), null, asset.symbol);
+  }
+  assert.equal(modelSymbol('0x' + '0'.repeat(40), 56), null);
+  // Exact source choices for the renamed/wrapped symbols.
+  const source = (symbol: string) => MODEL_ASSETS.find(a => a.symbol === symbol)?.source;
+  assert.deepEqual(source('TONCOIN'), { kind: 'binance', pair: 'TONUSDT', seasoned: false });
+  assert.deepEqual(source('CAKE'), { kind: 'binance', pair: 'CAKEUSDT', seasoned: false });
+  assert.deepEqual(source('VON'), { kind: 'yahoo', ticker: 'V', currency: 'USD' });
+  assert.deepEqual(source('GOOGON'), { kind: 'yahoo', ticker: 'GOOG', currency: 'USD' });
 });

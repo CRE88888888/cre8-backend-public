@@ -296,6 +296,20 @@ export function strategyKeeperWriter(env: NodeJS.ProcessEnv = process.env): Stra
   };
 }
 
+/**
+ * Chain 97 drill accounts (backend#207): extra addresses the keeper watches besides DB portfolio accounts, e.g. the
+ * contracts repo's BorrowDemoAccount used to rehearse "price drop -> automatic deleverage". Comma separated; any
+ * malformed entry throws (a silently skipped address would make a drill look like a keeper failure).
+ */
+export function strategyEarnDrillAccounts(env: NodeJS.ProcessEnv = process.env): Address[] {
+  const raw = env.STRATEGY_EARN_DRILL_ACCOUNTS?.trim();
+  if (!raw) return [];
+  return [...new Set(raw.split(',').map(s => s.trim()).filter(Boolean).map(s => {
+    if (!/^0x[0-9a-fA-F]{40}$/.test(s)) throw new Error('STRATEGY_EARN_DRILL_ACCOUNTS must be comma-separated 0x addresses');
+    return s.toLowerCase() as Address;
+  }))];
+}
+
 /** Claim when at least 0.01 USDT is pending, so gas is not spent on dust. */
 export const MIN_CLAIM_RAW = 10n ** 16n;
 export type StrategyKeeperResult = { checked: number; flagged: number; deleveraged: number; claimed: number; failed: number; writer: boolean };
@@ -306,15 +320,16 @@ export type StrategyKeeperResult = { checked: number; flagged: number; deleverag
  * Without a keeper key it only reports (dry-run behaves the same).
  */
 export async function runStrategyEarnRound(args: { dryRun: boolean; log: (line: string) => void }, overrides: {
-  chainId?: number; chain?: StrategyEarnChain; writer?: StrategyKeeperWriter | null; accounts?: () => Promise<Address[]>;
+  chainId?: number; chain?: StrategyEarnChain; writer?: StrategyKeeperWriter | null; accounts?: () => Promise<Address[]>; env?: NodeJS.ProcessEnv;
 } = {}): Promise<StrategyKeeperResult | null> {
   const chainId = overrides.chainId ?? Number(process.env.CHAIN_ID?.trim() || '56');
   if (chainId !== 97) return null;
   const chain = overrides.chain ?? defaultStrategyEarnChain();
   const writer = overrides.writer === undefined ? strategyKeeperWriter() : overrides.writer;
-  const accounts = await (overrides.accounts ?? (async () => (await dbQuery<{ address: string }>(
+  const portfolioAccounts = await (overrides.accounts ?? (async () => (await dbQuery<{ address: string }>(
     `select distinct sa.address from smart_accounts sa join portfolios p on p.id=sa.portfolio_id
       where sa.chain_id=97 and sa.retired_at is null order by sa.address`)).rows.map(r => r.address.toLowerCase() as Address)))();
+  const accounts = [...new Set([...portfolioAccounts, ...strategyEarnDrillAccounts(overrides.env ?? process.env)])];
   const result: StrategyKeeperResult = { checked: 0, flagged: 0, deleveraged: 0, claimed: 0, failed: 0, writer: writer !== null };
   const head = await chain.head();
   const markets = strategyMarkets();

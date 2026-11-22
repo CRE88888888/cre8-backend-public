@@ -7,6 +7,8 @@
 - 每一檔投資組合自己的帳戶（Kernel smart account）把一個持股存進「該資產固定的那一個」市場當抵押，借 USDT **同一筆直接存進策略 vault**，關閉時從 vault 還款、取回抵押。錢都在那一檔的帳戶裡，不經錢包現金、不跟現金生息（#193）或其他投資組合混算；API 回的數字也不跟它們加總。
 - 開啟與關閉是**帳戶 owner 簽的一個 UserOp**（後端只產生 calls，跟 My mix、現金生息同一種做法）。paymaster 只代付這些固定形狀的呼叫：帳戶必須是送出者、市場必須是五個之一、授權只能給 `AtpBorrowExecutor`。
 - 自動減倉：scheduler 每輪對每個 chain 97 帳戶讀 `accountMarkets` → `status`，`shouldDeleverage` 或 `shouldUnwind` 為 true 時送 `executeDeleverage`（任何人可呼叫，只用該帳戶自己的 vault 份額還款）。激勵 `claimReward(account)` 只付給該帳戶，達 0.01 USDT 才領，vault 激勵每帳戶一輪只領一次。
+  - 測試網 scheduler 已設 `STRATEGY_EARN_KEEPER_PRIVATE_KEY`（backend#207）：獨立的測試網金鑰，地址 `0x4A07CDAC26aFdc89eb47D653A95b8ABf6B1f4b0a`，私鑰只存在本機 `~/.cre8-testnet/strategy-earn-keeper.json` 與 Railway 測試專案。合約沒有 keeper 角色：`executeDeleverage` 與各市場 `claimReward(account)` 任何人可呼叫，只需要 tBNB 付 gas（單筆減倉約 45 萬 gas）。
+  - `STRATEGY_EARN_DRILL_ACCOUNTS`（選填，逗號分隔地址，只在 chain 97 讀）：DB 投資組合帳戶以外，keeper 也檢查的演練帳戶，例如 cre8-contracts 的 `BorrowDemoAccount`（OWNER 測試金鑰擁有）。格式錯誤整輪報錯，不會默默略過。
   - 需要 scheduler 設 `STRATEGY_EARN_KEEPER_PRIVATE_KEY`（測試網專用、有少量 tBNB 的獨立金鑰，不能和 operator／price keeper 共用，避免 nonce 衝突）。沒設時只在 log 寫「需要減倉」，不送交易；dry-run 也只寫 log。
 - 不開放：槓桿類（合約沒有上架）、私人組合（My mix，回 409 `MIX_NO_STRATEGY_EARN`）。
 

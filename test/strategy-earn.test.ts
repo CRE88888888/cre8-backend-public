@@ -9,7 +9,7 @@ import { EXECUTOR_ABI } from '../src/chain.js';
 import { MemoryRateLimitStore, RequestRateLimiter } from '../src/ratelimit.js';
 import { createServer } from '../src/server.js';
 import {
-  assertNotStrategyVault, borrowPlan, closeCalls, createStrategyEarn, extraApy, isStrategyVault, openCalls, runStrategyEarnRound,
+  assertNotStrategyVault, borrowPlan, closeCalls, createStrategyEarn, extraApy, isStrategyVault, openCalls, runStrategyEarnRound, strategyEarnDrillAccounts,
   STRATEGY_EARN_97 as S, STRATEGY_EARN_ABI, strategyMarkets, usdValue,
 } from '../src/strategy-earn.js';
 import type { StatusReading, StrategyEarnChain, StrategyKeeperWriter } from '../src/strategy-earn.js';
@@ -203,6 +203,27 @@ test('#199 keeper: deleverage/unwind only when the registry says so; dry-run and
   const failed = await runStrategyEarnRound({ dryRun: false, log: () => {} }, { chainId: 97, chain: fakeChain(f), writer: broken, accounts: async () => [account, '0x' + '22'.repeat(20) as Address] });
   assert.equal(failed?.failed, 4); assert.equal(failed?.checked, 6);
   assert.equal(await runStrategyEarnRound({ dryRun: false, log: () => {} }, { chainId: 56 }), null);
+});
+
+test('#207 keeper drill accounts: merged with DB accounts and de-duplicated; empty/unset adds none; malformed entry throws', async () => {
+  const drill = '0x5683Cf2f1e038e8c4444Bf853A31dBF4C841BF54';
+  assert.deepEqual(strategyEarnDrillAccounts({}), []);
+  assert.deepEqual(strategyEarnDrillAccounts({ STRATEGY_EARN_DRILL_ACCOUNTS: ' ' }), []);
+  assert.deepEqual(strategyEarnDrillAccounts({ STRATEGY_EARN_DRILL_ACCOUNTS: ` ${drill}, ${drill.toLowerCase()},,` }), [drill.toLowerCase()]);
+  for (const bad of ['0x1234', `${drill},nope`, drill + '00']) {
+    assert.throws(() => strategyEarnDrillAccounts({ STRATEGY_EARN_DRILL_ACCOUNTS: bad }), /comma-separated 0x addresses/);
+  }
+  const f: Fake = { statuses: { [nvda.marketId]: status({ shouldDeleverage: true, ltv: 41n * E16, debt: 1n }) }, ids: [nvda.marketId], held: 0n, collateral: 0n, prices: {},
+    rewards: { vault: 0n, collateral: 0n } };
+  const sent: string[] = [];
+  const writer: StrategyKeeperWriter = { deleverage: async (a) => { sent.push(a); return '0x01'; }, claim: async () => '0x02' };
+  const env = { STRATEGY_EARN_DRILL_ACCOUNTS: `${drill},${account}` };
+  const r = await runStrategyEarnRound({ dryRun: false, log: () => {} }, { chainId: 97, chain: fakeChain(f), writer, accounts: async () => [account], env });
+  assert.deepEqual([r?.checked, r?.deleveraged], [2, 2]);
+  assert.deepEqual(sent, [account, drill.toLowerCase()], 'DB account once, then the drill account');
+  // Off chain 97 the variable is never read (no round at all), so a bad value cannot break other chains.
+  assert.equal(await runStrategyEarnRound({ dryRun: false, log: () => {} }, { chainId: 56, env: { STRATEGY_EARN_DRILL_ACCOUNTS: 'bad' } }), null);
+  await assert.rejects(runStrategyEarnRound({ dryRun: false, log: () => {} }, { chainId: 97, chain: fakeChain(f), writer, accounts: async () => [], env: { STRATEGY_EARN_DRILL_ACCOUNTS: 'bad' } }), /comma-separated/);
 });
 
 test('#199 HTTP: public markets with short cache; portfolio routes need login; 405 on wrong methods', async () => {

@@ -121,18 +121,23 @@ test('#199 calls: open approves only AtpBorrowExecutor and borrows into the vaul
 });
 
 type Fake = { statuses: Record<string, StatusReading | null>; ids: Hex[]; held: bigint; collateral: bigint; prices: Record<string, bigint>;
-  rewards: { vault: bigint; collateral: bigint }; headFails?: boolean };
+  rewards: { vault: bigint; collateral: bigint }; headFails?: boolean;
+  policies?: Record<string, { maxDebt: bigint; enabled: boolean }>; weights?: { asset: Address; weightBps: number }[]; balances?: Record<string, bigint> };
 function fakeChain(f: Fake): StrategyEarnChain {
   return {
     head: async () => { if (f.headFails) throw new Error('rpc secret'); return { number: 7n, timestamp: 1_795_400_000n }; },
     status: async (id) => { const s = f.statuses[id]; if (!s) throw new Error('read failed'); return s; },
     accountMarkets: async () => f.ids,
     collateral: async () => f.collateral,
-    balance: async () => f.held,
+    balance: async (token) => f.balances?.[token.toLowerCase()] ?? f.held,
     price: async (asset) => f.prices[asset.toLowerCase()] ?? 10n ** 8n,
     rewards: async () => f.rewards,
+    policy: async (_a, id) => f.policies?.[id] ?? { maxDebt: 0n, enabled: false },
+    weights: async () => f.weights ?? [],
   };
 }
+const tx0 = { hash: ('0x' + '01'.repeat(32)) as Hex, blockNumber: 1n, logs: [] };
+const noLedger = { record: async () => {} };
 const ownedPortfolio = (patch: Record<string, unknown> = {}) => async () => ({ id: 3, userId: account, strategyId: 1, version: 1, scheduleState: 'active',
   createdAt: '2026-11-23T00:00:00Z', chainId: 97, accountAddress: account, ownerAddress: account, existingKeyRefs: [], ...patch });
 
@@ -186,21 +191,22 @@ test('#199 keeper: deleverage/unwind only when the registry says so; dry-run and
   const f: Fake = { statuses: { [nvda.marketId]: flagged, [markets[1]?.marketId ?? '']: status({ shouldUnwind: true, debt: 1n }), [qqq.marketId]: status({ debt: 1n }) },
     ids: [nvda.marketId, markets[1]?.marketId as Hex, qqq.marketId], held: 0n, collateral: 0n, prices: {}, rewards: { vault: 10n ** 16n, collateral: 10n ** 16n - 1n } };
   const sent: string[] = [];
-  const writer: StrategyKeeperWriter = { deleverage: async (a, id) => { sent.push(`deleverage:${a}:${id}`); return '0x01'; }, claim: async (target, a) => { sent.push(`claim:${target}:${a}`); return '0x02'; } };
+  const writer: StrategyKeeperWriter = { deleverage: async (a, id) => { sent.push(`deleverage:${a}:${id}`); return tx0; }, claim: async (target, a) => { sent.push(`claim:${target}:${a}`); return tx0; },
+    claimLista: async (id, a) => { sent.push(`lista:${id}:${a}`); return tx0; } };
   const logs: string[] = [];
-  const live = await runStrategyEarnRound({ dryRun: false, log: l => logs.push(l) }, { chainId: 97, chain: fakeChain(f), writer, accounts: async () => [account] });
+  const live = await runStrategyEarnRound({ dryRun: false, log: l => logs.push(l) }, { chainId: 97, chain: fakeChain(f), writer, accounts: async () => [{ account, portfolioId: 3 }], ledger: noLedger });
   assert.deepEqual(live, { checked: 3, flagged: 2, deleveraged: 2, claimed: 1, failed: 0, writer: true });
   assert.deepEqual(sent, [`deleverage:${account}:${nvda.marketId}`, `claim:${S.earnVault}:${account}`, `deleverage:${account}:${markets[1]?.marketId}`]);
   // Exactly at the claim threshold claims; 1 below does not (collateral above is 1 wei short).
   sent.length = 0;
-  const dry = await runStrategyEarnRound({ dryRun: true, log: l => logs.push(l) }, { chainId: 97, chain: fakeChain(f), writer, accounts: async () => [account] });
+  const dry = await runStrategyEarnRound({ dryRun: true, log: l => logs.push(l) }, { chainId: 97, chain: fakeChain(f), writer, accounts: async () => [{ account, portfolioId: 3 }], ledger: noLedger });
   assert.deepEqual([dry?.flagged, dry?.deleveraged, dry?.claimed, sent.length], [2, 0, 0, 0]);
-  const noKey = await runStrategyEarnRound({ dryRun: false, log: l => logs.push(l) }, { chainId: 97, chain: fakeChain(f), writer: null, accounts: async () => [account] });
+  const noKey = await runStrategyEarnRound({ dryRun: false, log: l => logs.push(l) }, { chainId: 97, chain: fakeChain(f), writer: null, accounts: async () => [{ account, portfolioId: 3 }], ledger: noLedger });
   assert.deepEqual([noKey?.deleveraged, noKey?.writer], [0, false]);
   assert.ok(logs.some(l => l.includes('沒有 keeper 金鑰')));
   // Failures are counted per position and never stop the round.
-  const broken: StrategyKeeperWriter = { deleverage: async () => { throw new Error('reverted'); }, claim: async () => '0x02' };
-  const failed = await runStrategyEarnRound({ dryRun: false, log: () => {} }, { chainId: 97, chain: fakeChain(f), writer: broken, accounts: async () => [account, '0x' + '22'.repeat(20) as Address] });
+  const broken: StrategyKeeperWriter = { deleverage: async () => { throw new Error('reverted'); }, claim: async () => tx0, claimLista: async () => tx0 };
+  const failed = await runStrategyEarnRound({ dryRun: false, log: () => {} }, { chainId: 97, chain: fakeChain(f), writer: broken, accounts: async () => [{ account, portfolioId: 3 }, { account: '0x' + '22'.repeat(20) as Address, portfolioId: 4 }], ledger: noLedger });
   assert.equal(failed?.failed, 4); assert.equal(failed?.checked, 6);
   assert.equal(await runStrategyEarnRound({ dryRun: false, log: () => {} }, { chainId: 56 }), null);
 });
@@ -216,14 +222,14 @@ test('#207 keeper drill accounts: merged with DB accounts and de-duplicated; emp
   const f: Fake = { statuses: { [nvda.marketId]: status({ shouldDeleverage: true, ltv: 41n * E16, debt: 1n }) }, ids: [nvda.marketId], held: 0n, collateral: 0n, prices: {},
     rewards: { vault: 0n, collateral: 0n } };
   const sent: string[] = [];
-  const writer: StrategyKeeperWriter = { deleverage: async (a) => { sent.push(a); return '0x01'; }, claim: async () => '0x02' };
+  const writer: StrategyKeeperWriter = { deleverage: async (a) => { sent.push(a); return tx0; }, claim: async () => tx0, claimLista: async () => tx0 };
   const env = { STRATEGY_EARN_DRILL_ACCOUNTS: `${drill},${account}` };
-  const r = await runStrategyEarnRound({ dryRun: false, log: () => {} }, { chainId: 97, chain: fakeChain(f), writer, accounts: async () => [account], env });
+  const r = await runStrategyEarnRound({ dryRun: false, log: () => {} }, { chainId: 97, chain: fakeChain(f), writer, accounts: async () => [{ account, portfolioId: 3 }], ledger: noLedger, env });
   assert.deepEqual([r?.checked, r?.deleveraged], [2, 2]);
   assert.deepEqual(sent, [account, drill.toLowerCase()], 'DB account once, then the drill account');
   // Off chain 97 the variable is never read (no round at all), so a bad value cannot break other chains.
   assert.equal(await runStrategyEarnRound({ dryRun: false, log: () => {} }, { chainId: 56, env: { STRATEGY_EARN_DRILL_ACCOUNTS: 'bad' } }), null);
-  await assert.rejects(runStrategyEarnRound({ dryRun: false, log: () => {} }, { chainId: 97, chain: fakeChain(f), writer, accounts: async () => [], env: { STRATEGY_EARN_DRILL_ACCOUNTS: 'bad' } }), /comma-separated/);
+  await assert.rejects(runStrategyEarnRound({ dryRun: false, log: () => {} }, { chainId: 97, chain: fakeChain(f), writer, accounts: async () => [], ledger: noLedger, env: { STRATEGY_EARN_DRILL_ACCOUNTS: 'bad' } }), /comma-separated/);
 });
 
 test('#199 HTTP: public markets with short cache; portfolio routes need login; 405 on wrong methods', async () => {

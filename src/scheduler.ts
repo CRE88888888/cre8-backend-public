@@ -5,7 +5,9 @@ import { createMixService, reconcilePendingMixes } from './mixes.js';
 import { mixAnchor, saveMixValuation } from './mix-valuation.js';
 import { assetsMarketOpen } from './trading-calendar.js';
 import { runYieldRound } from './yield-service.js';
-import { runStrategyEarnRound } from './strategy-earn.js';
+import { STRATEGY_EARN_97 } from './strategy-earn-guard.js';
+import { dbStrategyEarnLedger, defaultStrategyEarnChain, runStrategyEarnRound, strategyEarnAutoOpen, strategyEarnUnwindForSale } from './strategy-earn.js';
+import type { Call as StrategyEarnCall, StrategyEarnSend, StrategyEarnTx } from './strategy-earn.js';
 import { assertUserOpCapacity, boundedCallGasLimit, executionBatchSize, MAX_USER_OP_STEPS, userOpGasOverhead } from './execution-batch.js';
 import { EXECUTOR_ABI, EXECUTOR_SELECTOR, PLAN_HASH_ABI } from './chain.js';
 /**
@@ -124,7 +126,7 @@ import { a10ErrorMessage, EXECUTOR_BUY_ABI, readGlobalPaused, decodePriceSourceE
 import { getConfig, getSessionKeyConfig, requireSessionKeyConfig } from './config.js';
 import { errorMessage, query as dbQuery, withTransaction, withPortfolioLock } from './db.js';
 import { AppError } from './errors.js';
-import { buildSessionPermissions, yieldAuthorization } from './permissions.js';
+import { borrowAuthorized, buildSessionPermissions, yieldAuthorization } from './permissions.js';
 import { DEFAULT_DEADLINE_SECONDS as PLAN_DEFAULT_DEADLINE_SECONDS, planRebalance, readMaxLegUsdE8, refreshFloors, minimumDepositUsdtWei, checkTradeMinimums, checkBuyFeeReserve } from './rebalance-plan.js';
 import { writeSnapshot as writeSnapshotImpl } from './snapshot.js';
 import type { PlanPartial, PlannedStep, RebalancePlan, RefreshFloorsResult } from './rebalance-plan.js';
@@ -473,6 +475,8 @@ export type PortfolioRunResult = {
 export type SessionKeyRef = {
   /** Present only on owner-installed yield upgrades; original account initConfig remains unchanged. */
   yieldAccount?: Address;
+  /** Present only when the owner renewal also installed the #204 Strategy Earn permissions. */
+  borrowAccount?: Address;
   keyRef: `m/44'/60'/${string}`;
   permissionId: Hex;
   sessionKeyAddress: Address;
@@ -560,6 +564,11 @@ export type SchedulerDeps = {
   readBuyVersionWindow?: (strategyId: bigint) => Promise<BuyVersionWindow>;
   yieldRound?: typeof runYieldRound;
   strategyEarnRound?: typeof runStrategyEarnRound;
+  /** backend#204 (chain 97): auto-open after a buy, and repay + take shares back before a sale, with the session key. */
+  strategyEarn?: {
+    open(due: DuePortfolio, dryRun: boolean): Promise<string | null>;
+    unwind(due: DuePortfolio, steps: readonly PlannedStep[], dryRun: boolean): Promise<string | null>;
+  };
   clock?:()=>Date;
   withDexLock?: typeof withDexLock;
   dexGate?: (chainId:number,portfolioId:number)=>Promise<string|null>;
@@ -1178,6 +1187,7 @@ async function resolveSessionKey(
         validUntil,
         owner,
         ...(args.chainId === 97 && yieldAuthorization(row.permissions, args.account, TESTNET_97.contracts.executor).status === 'ready' ? { yieldAccount: args.account } : {}),
+        ...(args.chainId === 97 && borrowAuthorized(row.permissions, args.account) ? { borrowAccount: args.account } : {}),
       },
     };
   }
@@ -1388,6 +1398,7 @@ export async function sessionKernelAccount(args: Pick<ExecuteArgs, 'account' | '
     executorAddress: args.executor,
     validUntil: args.sessionKey.validUntil,
     ...(args.sessionKey.yieldAccount === undefined ? {} : { yieldAccount: args.sessionKey.yieldAccount }),
+    ...(args.sessionKey.borrowAccount === undefined ? {} : { borrowAccount: args.sessionKey.borrowAccount }),
     signer: await toECDSASigner({ signer: keyAccount, ...(publicClient.chain?.id === 97 ? { signerContractAddress: getAddress(TESTNET_97.contracts.ecdsaSigner) } : {}) }),
   });
   if (permissions.permissionId.toLowerCase() !== args.sessionKey.permissionId.toLowerCase()) {
@@ -1572,6 +1583,62 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
 // 一輪的執行
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Strategy Earn with the portfolio's own session key (backend#204, chain 97)
+// ---------------------------------------------------------------------------
+
+function defaultStrategyEarnSteps(deps: ResolvedDeps): NonNullable<SchedulerDeps['strategyEarn']> {
+  const session = async (due: DuePortfolio): Promise<StrategyEarnSend | null> => {
+    const resolution = await resolveSessionKey({ portfolioId: due.portfolioId, account: due.account, chainId: deps.chainId },
+      { query: deps.query, readPermissionConfig: deps.readPermissionConfig });
+    // Only a key whose installed policy carries the #204 AtpBorrowExecutor calls for this account; others only report.
+    if (!resolution.ok || resolution.key.borrowAccount === undefined) return null;
+    if (await checkSessionKeyDerivation(resolution.key, deps.deriveSessionKeyAddress) !== null) return null;
+    const key = resolution.key;
+    return calls => sendStrategyEarnWithSessionKey(due.account, key, calls);
+  };
+  const args = async (due: DuePortfolio, dryRun: boolean) => ({ chain: defaultStrategyEarnChain(), account: due.account, portfolioId: due.portfolioId,
+    now: deps.clock(), dryRun, send: dryRun ? null : await session(due), ledger: dbStrategyEarnLedger, log: deps.log });
+  return {
+    open: async (due, dryRun) => deps.chainId !== 97 || due.personalMix ? null : strategyEarnAutoOpen(await args(due, dryRun)),
+    unwind: async (due, steps, dryRun) => deps.chainId !== 97 || due.personalMix ? null : strategyEarnUnwindForSale({ ...await args(due, dryRun), steps }),
+  };
+}
+const strategyEarnSteps = (deps: ResolvedDeps) => deps.strategyEarn ?? defaultStrategyEarnSteps(deps);
+
+/** One sponsored session-key UserOp of AtpBorrowExecutor calls (the CallPolicy only allows those, pinned to this account). */
+async function sendStrategyEarnWithSessionKey(accountAddress: Address, sessionKey: SessionKeyRef, calls: StrategyEarnCall[]): Promise<StrategyEarnTx> {
+  const publicClient = defaultPublicClient();
+  if (calls.length === 0 || calls.some(c => !isAddressEqual(c.to, STRATEGY_EARN_97.executor))) throw new Error('strategy earn session calls must target AtpBorrowExecutor only');
+  const account = await sessionKernelAccount({ account: accountAddress, sessionKey, executor: executorAddress() }, publicClient);
+  const paymaster = schedulerPaymaster(accountAddress);
+  if (!paymaster) throw new Error('chain 97 strategy earn needs the paymaster');
+  const client = createKernelAccountClient({ account, paymaster, chain: activeChain(), client: publicClient, bundlerTransport: http(bundlerUrl()),
+    userOperation: { estimateFeesPerGas: async () => { const gasPrice = await publicClient.getGasPrice(); return { maxFeePerGas: gasPrice, maxPriorityFeePerGas: gasPrice }; } } });
+  const userCalls = calls.map(c => ({ to: c.to, data: c.data, value: 0n }));
+  let budgetKey: string | null = null;
+  try {
+    const nonce = await account.getNonce();
+    const estimate = await client.estimateUserOperationGas({ calls: userCalls, nonce, paymaster: estimationPaymaster(paymaster) });
+    // Same margin as yield: interest accrues between estimate and inclusion, and repay paths cost more than estimated.
+    const callGasLimit = estimate.callGasLimit * 2n;
+    const prepared = await client.prepareUserOperation({ calls: userCalls, nonce, callGasLimit,
+      verificationGasLimit: estimate.verificationGasLimit, preVerificationGas: estimate.preVerificationGas, paymaster });
+    assertUserOpCapacity(1, prepared.callGasLimit + userOpGasOverhead(prepared));
+    budgetKey = gasExecutionKey(97, { sender: accountAddress, nonce: prepared.nonce, initCode: '0x', callData: prepared.callData });
+    const signed = await signPreparedOperation(prepared, op => account.signUserOperation(op));
+    const hash = await client.sendUserOperation(signed);
+    await settleGasBudget(budgetKey, 'submitted');
+    const receipt = await client.waitForUserOperationReceipt({ hash, timeout: USER_OP_RECEIPT_TIMEOUT_MS });
+    await settleGasBudget(budgetKey, receipt.success ? 'confirmed' : 'failed');
+    if (receipt.receipt.status !== 'success' || receipt.success !== true) throw new Error(`strategy earn UserOp failed tx=${receipt.receipt.transactionHash}`);
+    return { hash: receipt.receipt.transactionHash, blockNumber: receipt.receipt.blockNumber, logs: receipt.logs };
+  } catch (error) {
+    if (budgetKey !== null) await settleGasBudget(budgetKey, 'unknown').catch(() => {});
+    throw paymasterExecutionError(error);
+  }
+}
+
 let cachedPublicClient: PublicClient | null = null;
 
 function defaultPublicClient(): PublicClient {
@@ -1702,6 +1769,7 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
     prepareMixTick: provided.prepareMixTick ?? prepareMixTick,
     prepareNewMoney: provided.prepareNewMoney ?? prepareNewMoney,
     readBuyVersionWindow: provided.readBuyVersionWindow ?? (id => readBuyVersionWindow(defaultPublicClient(), registryAddress(), id)),
+    strategyEarn: provided.strategyEarn ?? null,
     clock:provided.clock??(()=>new Date()),
     withDexLock: provided.withDexLock ?? withDexLock,
     dexGate: provided.dexGate ?? createDexGate(query, {
@@ -2275,6 +2343,13 @@ async function runOne(
   return result;
 }
 
+/** After a noop (nothing to trade), post consented shares and borrow into the strategy vault. Never changes the outcome. */
+async function strategyEarnOpen(due: DuePortfolio, ctx: { dryRun: boolean; deps: ResolvedDeps }) {
+  if (ctx.deps.chainId !== 97 || due.personalMix) return;
+  try { const note = await strategyEarnSteps(ctx.deps).open(due, ctx.dryRun); if (note !== null) ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} ${note}`); }
+  catch (error) { ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} [STRATEGY_EARN_OPEN_FAILED] 自動開啟未完成，下一輪再試：${oneLine(error)}`); }
+}
+
 async function decideAndMaybeExecute(
   due: DuePortfolio,
   ctx: { dryRun: boolean; now: Date; thresholdBps: number; deps: ResolvedDeps; forcePlan?: boolean },
@@ -2425,6 +2500,7 @@ async function decideAndMaybeExecute(
   // `forcePlan`：呼叫端要用**同一條送出管線**做別的事（例如 redeem 按比例賣成 numeraire）。
   // 那種動作不會讓漂移變大，所以「不需要再平衡」不代表「什麼都不用做」。
   if (due.executionKind === undefined && !plan.report.needsRebalance && ctx.forcePlan !== true) {
+    await strategyEarnOpen(due, ctx);
     return {
       ...base,
       outcome: 'noop',
@@ -2479,6 +2555,7 @@ async function decideAndMaybeExecute(
     if (mix && (mixTick?.mode === 'rebalance' || waitingSourceTarget) && rebalance.retryable !== true && !ctx.dryRun && !mixSwitchExitsPending(mix, plan)) {
       await ctx.deps.query('update mixes set last_rebalanced_at=$2 where id=$1 and triggered_at is null', [mix.id, ctx.now]);
     }
+    if (ctx.forcePlan !== true) await strategyEarnOpen(due, ctx);
     return { ...base, outcome: 'noop', ...(money?.useTargetWeights&&plan.report.maxAbsDeltaBps<=plan.report.thresholdBps?{rebalanceComplete:true}:{}), reason: `Planner returned noop: ${rebalance.reason}` };
   }
   if (rebalance.kind === 'blocked') {
@@ -2523,6 +2600,13 @@ async function decideAndMaybeExecute(
   if(yieldRebalance){
     const pending=await ctx.deps.newMoney.withdrawYield(due,plan,money.context.reserve,rebalance.steps);
     if(pending!==null)return {...base,outcome:'blocked',reason:`[YIELD_REBALANCE_PENDING] ${pending}`};
+  }
+  // backend#204 / EARN_UX B.5: shares posted for Strategy Earn are counted as holdings; selling them repays first.
+  if ((plan.snapshot.strategyEarnCollateral?.length ?? 0) > 0) {
+    let pending: string | null;
+    try { pending = await strategyEarnSteps(ctx.deps).unwind(due, rebalance.steps, ctx.dryRun); }
+    catch (error) { return { ...base, outcome: 'blocked', reason: `[STRATEGY_EARN_UNWIND_FAILED] 賣出前還款取回未完成，下一輪重試：${oneLine(error)}` }; }
+    if (pending !== null) return { ...base, outcome: 'blocked', reason: pending };
   }
   const gasPurpose = rebalance.purpose ?? 'ordinary';
   const cash = ctx.deps.chainId === 97 ? TESTNET_97.contracts.usdt : '0x55d398326f99059ff775485246999027b3197955';

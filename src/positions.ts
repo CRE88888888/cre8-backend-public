@@ -95,6 +95,8 @@ export type UnpricedAsset = {
 export type PricedHolding = Holding & { priceSource: PriceSource };
 
 export type PositionSnapshot = {
+  /** Chain 97 Strategy Earn shares posted as collateral (already included in `holdings`); a sale needs them back first. */
+  strategyEarnCollateral?: { asset: Address; marketId: string; amount: bigint }[];
   /** Separate valuation evidence; never made into spendable underlying holdings. */
   yieldPositions?: YieldPosition[];
   accountValueRaw?: bigint | null;
@@ -165,6 +167,12 @@ export type ReadPositionsArgs = {
    * `unpriced`，持有時擋下漂移。
    */
   tokens: readonly PriceableAsset[];
+  /**
+   * Strategy Earn（backend#204）：這個帳戶抵押在借貸市場的持股（lowercase 地址 → raw 數量）。
+   * 仍是這一檔投資組合的股票，只是由市場保管，所以加回該資產的持倉，讓漂移與總值看見它；
+   * 賣出前排程器會先還款取回（見 scheduler 的 strategy earn unwind），不會直接拿它去換。
+   */
+  extraBalances?: ReadonlyMap<string, bigint>;
   /**
    * 報價分母（numeraire）的來源，通常是**整張** `priceable_assets`(enabled) 查價表。
    *
@@ -372,7 +380,7 @@ export async function readPositions(
   const block = args.block ?? (await client.getBlockNumber());
   const priceToken = args.priceToken ?? twapPriceInUsdt;
 
-  const [nativeBalanceWei, balances] = await Promise.all([
+  const [nativeBalanceWei, readBalances] = await Promise.all([
     client.getBalance({ address: args.account, blockNumber: block }),
     // 1 次 eth_call（aggregate3，2N 筆內層呼叫）取代原本的 2N 次往返；失敗仍然指名到地址。
     readTokens(client, {
@@ -382,6 +390,11 @@ export async function readPositions(
       multicall3: args.multicall3 ?? MULTICALL3_ADDRESS,
     }),
   ]);
+  const extra = args.extraBalances ?? new Map<string, bigint>();
+  for (const [asset, amount] of extra) {
+    if (amount < 0n || !readBalances.some(b => b.token.address.toLowerCase() === asset)) throw new Error(`extraBalances 的 ${asset} 不在策略資產內或為負數`);
+  }
+  const balances = readBalances.map(b => ({ ...b, amountWei: b.amountWei + (extra.get(b.token.address.toLowerCase()) ?? 0n) }));
 
   // 定價來源每個資產只有一種，先一次決定完：後面「要不要去問價格」與「價格是多少」讀的是同一份，
   // 不會出現一處當它是 numeraire、另一處當它是無價這種自相矛盾。

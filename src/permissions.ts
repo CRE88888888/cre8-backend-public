@@ -14,6 +14,7 @@ import { KERNEL_VERSION_STRING, KERNEL_V3_3_ADDRESSES, kernelAddressesForChain }
 import { TESTNET_97, configuredChainId } from './testnet-profile.js';
 import { requireSessionKeyConfig } from './config.js';
 import { EXECUTOR_SELECTOR, YIELD_EXECUTION_SELECTORS } from './chain.js';
+import { BORROW_SESSION_SELECTORS, STRATEGY_EARN_97 } from './strategy-earn-guard.js';
 export { EXECUTOR_SELECTOR } from './chain.js';
 
 /**
@@ -236,14 +237,50 @@ type BuiltPolicies = { call: Policy; gas: Policy; timestamp: Policy };
 /** Default remains the original deployment policy: adding initConfig would move CREATE2 accounts.
  * Yield is installed only by owner renewal, once the existing account address is known.
  */
-export function sessionCallPermissions(executorAddress: Address, yieldAccount?: Address) {
+export function sessionCallPermissions(executorAddress: Address, yieldAccount?: Address, borrowAccount?: Address) {
   return [
     { target: executorAddress, selector: EXECUTOR_SELECTOR },
     ...(yieldAccount === undefined ? [] : YIELD_EXECUTION_SELECTORS.map(selector => ({
       target: executorAddress, selector,
       rules: [{ condition: ParamCondition.EQUAL, offset: 0, params: [pad(yieldAccount)] }],
     }))),
+    // Strategy Earn (backend#204): only AtpBorrowExecutor, argument 0 pinned to this account and argument 1 to the
+    // five whitelisted markets. Appended last so keys renewed before #204 rebuild the same permissionId.
+    ...(borrowAccount === undefined ? [] : borrowSessionPermissions(borrowAccount)),
   ];
+}
+
+/** Session-key calls the scheduler may make on AtpBorrowExecutor for this account (never AtpExecutor, never approvals). */
+export function borrowSessionPermissions(account: Address) {
+  const markets = STRATEGY_EARN_97.markets.map(m => m.marketId as Hex);
+  return BORROW_SESSION_SELECTORS.map(selector => ({
+    target: STRATEGY_EARN_97.executor as Address, selector,
+    rules: [
+      { condition: ParamCondition.EQUAL, offset: 0, params: [pad(account)] },
+      { condition: ParamCondition.ONE_OF, offset: 32, params: markets },
+    ],
+  }));
+}
+
+/** True when this stored policy snapshot carries exactly the #204 borrow permissions for this account. */
+export function borrowAuthorized(snapshot: unknown, account: Address): boolean {
+  if (!snapshot || typeof snapshot !== 'object') return false;
+  const call: unknown = Reflect.get(snapshot, 'call');
+  if (!call || typeof call !== 'object') return false;
+  const permissions: unknown = Reflect.get(call, 'permissions');
+  if (!Array.isArray(permissions)) return false;
+  const markets = STRATEGY_EARN_97.markets.map(m => m.marketId.toLowerCase());
+  return BORROW_SESSION_SELECTORS.every(selector => permissions.some((permission: unknown) => {
+    if (!permission || typeof permission !== 'object') return false;
+    const rules: unknown = Reflect.get(permission, 'rules');
+    if (String(Reflect.get(permission, 'target')).toLowerCase() !== STRATEGY_EARN_97.executor || Reflect.get(permission, 'selector') !== selector ||
+        Reflect.get(permission, 'callType') !== '0x00' || Reflect.get(permission, 'valueLimit') !== '0' || !Array.isArray(rules) || rules.length !== 2) return false;
+    const [first, second] = rules as { condition?: unknown; offset?: unknown; params?: unknown }[];
+    return first?.condition === ParamCondition.EQUAL && first.offset === 0 && Array.isArray(first.params) && first.params.length === 1 &&
+      String(first.params[0]).toLowerCase() === pad(account).toLowerCase() &&
+      second?.condition === ParamCondition.ONE_OF && second.offset === 32 && Array.isArray(second.params) &&
+      second.params.length === markets.length && second.params.every((m: unknown, i: number) => String(m).toLowerCase() === markets[i]);
+  }));
 }
 
 export function yieldAuthorization(snapshot: unknown, account: Address, executor: Address):
@@ -270,13 +307,13 @@ export function yieldAuthorization(snapshot: unknown, account: Address, executor
   return { status: 'ready' };
 }
 
-function buildPolicies(executorAddress: Address, validAfter: number, validUntil: number, chainId = configuredChainId(), yieldAccount?: Address): BuiltPolicies {
+function buildPolicies(executorAddress: Address, validAfter: number, validUntil: number, chainId = configuredChainId(), yieldAccount?: Address, borrowAccount?: Address): BuiltPolicies {
   return {
     // Initial deployment remains legacy; an owner upgrade also pins yield argument 0 to this account.
     call: toCallPolicy({
       ...(chainId === 97 ? { policyAddress: TESTNET_97.contracts.callPolicy } : {}),
       policyVersion: SESSION_CALL_POLICY_VERSION,
-      permissions: sessionCallPermissions(executorAddress, yieldAccount),
+      permissions: sessionCallPermissions(executorAddress, yieldAccount, borrowAccount),
     }),
     gas: toGasPolicy({ allowed: SESSION_GAS_ALLOWED_WEI, ...(chainId === 97 ? { policyAddress: TESTNET_97.contracts.gasPolicy, enforcePaymaster: true, allowedPaymaster: TESTNET_97.contracts.paymaster } : {}) }),
     timestamp: toTimestampPolicy({ validAfter, validUntil, ...(chainId === 97 ? { policyAddress: TESTNET_97.contracts.timestampPolicy } : {}) }),
@@ -284,12 +321,12 @@ function buildPolicies(executorAddress: Address, validAfter: number, validUntil:
 }
 
 /** 目前使用的三層 policy 參數（測試與 log 用）。`validUntil` 未給就用 `sessionValidUntil()`。 */
-export function describePolicies(args: { executorAddress: Address; validUntil?: number; chainId?: number; yieldAccount?: Address }): SessionPolicies {
+export function describePolicies(args: { executorAddress: Address; validUntil?: number; chainId?: number; yieldAccount?: Address; borrowAccount?: Address }): SessionPolicies {
   const executorAddress = assertAddressArg(args.executorAddress, 'executorAddress');
   const validUntil = args.validUntil ?? sessionValidUntil();
   assertValidUntil(validUntil);
 
-  const policies = buildPolicies(executorAddress, SESSION_VALID_AFTER, validUntil, args.chainId, args.yieldAccount);
+  const policies = buildPolicies(executorAddress, SESSION_VALID_AFTER, validUntil, args.chainId, args.yieldAccount, args.borrowAccount);
   return snapshotPolicies(policies);
 }
 
@@ -390,6 +427,8 @@ export async function sudoValidator(publicClient: PublicClient, owner: Address) 
 export type BuildSessionPermissionsArgs = {
   /** Owner upgrade only. Never supply this to counterfactual deployment / initial enrollment. */
   yieldAccount?: Address;
+  /** Owner upgrade only (backend#204): AtpBorrowExecutor calls pinned to this account and the five strategy markets. */
+  borrowAccount?: Address;
   /** 推導地址要用：`toPermissionValidator` 讀 `client.chain.id`（或打 eth_chainId）。 */
   publicClient: PublicClient;
   /** session key 的地址（由 `deriveSessionKey` 得到）。本函式不需要它的私鑰。 */
@@ -433,7 +472,10 @@ export async function buildSessionPermissions(args: BuildSessionPermissionsArgs)
   const chainId = args.publicClient.chain?.id ?? await args.publicClient.getChainId();
   const yieldAccount = args.yieldAccount === undefined ? undefined : assertAddressArg(args.yieldAccount, 'yieldAccount');
   if (yieldAccount !== undefined && (chainId !== 97 || isAddressEqual(yieldAccount, zeroAddress))) throw new Error('生息升權只支援 chain 97 的既有帳戶');
-  const policies = buildPolicies(executorAddress, SESSION_VALID_AFTER, validUntil, chainId, yieldAccount);
+  const borrowAccount = args.borrowAccount === undefined ? undefined : assertAddressArg(args.borrowAccount, 'borrowAccount');
+  if (borrowAccount !== undefined && (chainId !== 97 || isAddressEqual(borrowAccount, zeroAddress) || yieldAccount === undefined ||
+      !isAddressEqual(borrowAccount, yieldAccount))) throw new Error('策略加息升權只支援 chain 97 的既有帳戶，且必須與生息升權同一個帳戶');
+  const policies = buildPolicies(executorAddress, SESSION_VALID_AFTER, validUntil, chainId, yieldAccount, borrowAccount);
 
   // 型別理由同 src/kernel.ts：SDK 把 kernelVersion 收窄成 GetKernelVersion<"0.7">。
   const kernelVersion: GetKernelVersion<'0.7'> = KERNEL_V3_3;

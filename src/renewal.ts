@@ -133,7 +133,8 @@ export async function buildRenewalKey(args: BuildRenewalKeyArgs): Promise<Renewa
     sessionKeyAddress: derived.address,
     executorAddress: args.executorAddress,
     validUntil,
-    ...(chainId === 97 && args.accountAddress !== undefined ? { yieldAccount: args.accountAddress } : {}),
+    // Chain 97 owner renewal installs yield and, since backend#204, the Strategy Earn calls on AtpBorrowExecutor.
+    ...(chainId === 97 && args.accountAddress !== undefined ? { yieldAccount: args.accountAddress, borrowAccount: args.accountAddress } : {}),
   });
 
   return {

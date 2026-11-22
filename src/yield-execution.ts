@@ -10,7 +10,7 @@ import { assertNotStrategyVault } from './strategy-earn-guard.js';
 import { assertUserOpCapacity, MAX_USER_OP_GAS, userOpGasOverhead } from './execution-batch.js';
 import { canonicalKernelCalls, estimationPaymaster, schedulerPaymaster, gasExecutionKey, settleGasBudget, paymasterExecutionError } from './paymaster.js';
 import type { PaymasterDeps } from './paymaster.js';
-import { yieldAuthorization } from './permissions.js';
+import { borrowAuthorized, yieldAuthorization } from './permissions.js';
 import { sessionKernelAccount } from './scheduler.js';
 import { yieldSessionAvailable } from './yield-session.js';
 import type { SessionKeyRef } from './scheduler.js';
@@ -285,7 +285,8 @@ async function submitYieldWithSession(args: YieldSubmitArgs): Promise<YieldEvide
   if (!await yieldSessionAvailable(publicClient, args.policies, args.account, TESTNET_97.contracts.executor, new Date()))
     throw fail('SESSION_AUTHORIZATION_REQUIRED', '需要更新授權：生息 permission 未安裝或已過期', 409);
   const account = await sessionKernelAccount({ account: args.account, executor: TESTNET_97.contracts.executor,
-    sessionKey: { ...args.sessionKey, yieldAccount: args.account } }, publicClient);
+    // Keys renewed after #204 also carry the Strategy Earn calls; the policy must be rebuilt exactly as installed.
+    sessionKey: { ...args.sessionKey, yieldAccount: args.account, ...(borrowAuthorized(args.policies, args.account) ? { borrowAccount: args.account } : {}) } }, publicClient);
   const paymaster = schedulerPaymaster(args.account, args.paymaster);
   if (!paymaster) throw fail('PAYMASTER_DISABLED', 'chain 97 生息需要指定 paymaster');
   const client = createKernelAccountClient({ account, client: publicClient, chain: publicClient.chain,

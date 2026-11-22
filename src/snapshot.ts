@@ -139,7 +139,23 @@ export type PlanDeps = {
    * 給了就可以對同一個塊重跑並要求逐位相同的結果（`snapshot.block` 就是它）。
    */
   block?: bigint;
+  /** Chain 97 Strategy Earn shares posted as collateral at `block` (backend#204). Default reads AtpBorrowRegistry. */
+  strategyEarnCollateral?: (account: Address, block: bigint) => Promise<StrategyEarnCollateral[]>;
 };
+
+/** Shares of a portfolio asset posted in its Strategy Earn market; still this portfolio's, held by the market. */
+export type StrategyEarnCollateral = { asset: Address; marketId: string; amount: bigint };
+export async function readStrategyEarnCollateral(client: PublicClient, account: Address, block: bigint): Promise<StrategyEarnCollateral[]> {
+  const { createStrategyEarnChain, strategyMarkets } = await import('./strategy-earn.js');
+  const chain = createStrategyEarnChain(client);
+  const ids = await chain.accountMarkets(account, block);
+  const out: StrategyEarnCollateral[] = [];
+  for (const m of strategyMarkets().filter(x => ids.includes(x.marketId))) {
+    const amount = await chain.collateral(m.marketId, account, block);
+    if (amount > 0n) out.push({ asset: m.collateral, marketId: m.marketId, amount });
+  }
+  return out;
+}
 
 function shortAddress(address: string): string {
   return `${address.slice(0, 6)}…${address.slice(-4)}`;
@@ -415,11 +431,17 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
   // 「同一份觀測」就不成立。
   // 兩者互不相依，所以並行；`scanPortfolioHoldings` 成功時會自己推進游標（那是觀測證據，不是排程
   // 決策），漂移與快照仍然只有 `writeSnapshot` 會寫——那是本函式「不寫任何東西」的唯一例外。
+  // Strategy Earn (backend#204): posted shares are still this portfolio's holding. Unknown -> throw (never value them as 0).
+  const strategyEarn = chainId === 97 && !personalMix
+    ? await (deps.strategyEarnCollateral ?? ((a: Address, b: bigint) => readStrategyEarnCollateral(client, a, b)))(account, block)
+        .catch(() => { throw new Error('strategy earn collateral unavailable'); })
+    : [];
   const [snapshot, scan] = await Promise.all([
     readPositions(client, {
       portfolioId,
       account,
       tokens: universe,
+      ...(strategyEarn.length === 0 ? {} : { extraBalances: new Map(strategyEarn.map(c => [c.asset.toLowerCase(), c.amount])) }),
       // 分母來自**查價表**而不是 `universe`：策略資產裡沒有 USDT 時（例如純 {WBNB, NVDAB}），
       // 報價仍然要除以 USDT。少了這一欄，那種策略一持有有池資產就會拋錯。
       quoteTable: [...priceTable.values()],
@@ -456,6 +478,7 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
     const { verifyMixBlock } = await import('./mix-flows.js');
     await verifyMixBlock(mixBlockHash, async () => (await client.getBlock({ blockNumber: block })).hash);
   }
+  if (strategyEarn.length > 0) snapshot.strategyEarnCollateral = strategyEarn;
   const yieldConfig = chainId===97 && !personalMix ? yieldProfile() : null;
   if(yieldConfig!==null){
     const lending=await readYieldAccount(client,yieldConfig,account,{block});

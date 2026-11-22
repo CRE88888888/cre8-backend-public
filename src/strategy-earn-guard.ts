@@ -1,4 +1,5 @@
-import { parseAbi } from 'viem';
+import { parseAbi, toFunctionSelector } from 'viem';
+import type { Hex } from 'viem';
 import { AppError } from './errors.js';
 
 /**
@@ -21,11 +22,11 @@ export const STRATEGY_EARN_97 = {
   earnVault: '0x2e915b874a5a544736f5afd97f3fa1dd45d417a9',
   earnVaultMarketId: '0xb2a013f0c2e1f9e7e5ccab3c3ceda82661e64f3efb736fa9ce9bdca51d98959c',
   markets: [
-    { symbol: 'NVDAB', marketId: '0xfa06dd03eff35e3337a8b5b93a8a7943155b4f20e4d19bb0583db20bdd9f5415', protocol: 'venus', collateralVToken: '0x212eb4b5eecb8a089a5079623b7f68a932315476' },
-    { symbol: 'TSLAB', marketId: '0x00f2152bbbefde7b3e65c4b7de0af83a87875c02b6c84ef96410ac14edd850fe', protocol: 'venus', collateralVToken: '0xbd0a5eae45c3cb3b477abab2c2cdb266180eff9c' },
-    { symbol: 'SPCXB', marketId: '0x4632539a0ba6e5e9843b401d97b66b8b34d23fdab2005feacefd5452055c410e', protocol: 'venus', collateralVToken: '0x45e9cf220a38630a551afe2a10d1f2126a749a5d' },
-    { symbol: 'QQQB', marketId: '0xd8def95e75d2489c340ac4d9769646707cf55d17d7aa7f8644c89b64b41844e7', protocol: 'lista', collateralVToken: null },
-    { symbol: 'MSTRB', marketId: '0x208d888e7c3d5ef4d9ccc51083daffe7ddfbce978d339ce258544022cfd9804a', protocol: 'lista', collateralVToken: null },
+    { symbol: 'NVDAB', marketId: '0xfa06dd03eff35e3337a8b5b93a8a7943155b4f20e4d19bb0583db20bdd9f5415', protocol: 'venus', collateralVToken: '0x212eb4b5eecb8a089a5079623b7f68a932315476', listaId: null },
+    { symbol: 'TSLAB', marketId: '0x00f2152bbbefde7b3e65c4b7de0af83a87875c02b6c84ef96410ac14edd850fe', protocol: 'venus', collateralVToken: '0xbd0a5eae45c3cb3b477abab2c2cdb266180eff9c', listaId: null },
+    { symbol: 'SPCXB', marketId: '0x4632539a0ba6e5e9843b401d97b66b8b34d23fdab2005feacefd5452055c410e', protocol: 'venus', collateralVToken: '0x45e9cf220a38630a551afe2a10d1f2126a749a5d', listaId: null },
+    { symbol: 'QQQB', marketId: '0xd8def95e75d2489c340ac4d9769646707cf55d17d7aa7f8644c89b64b41844e7', protocol: 'lista', collateralVToken: null, listaId: '0x1ad1b2495b972b0f26018a815b001aff4dd21c4c5104b52ad9d0128d5913ea0f' },
+    { symbol: 'MSTRB', marketId: '0x208d888e7c3d5ef4d9ccc51083daffe7ddfbce978d339ce258544022cfd9804a', protocol: 'lista', collateralVToken: null, listaId: '0x63c1f20824f66781a9c171d1056bae697cc47b26337c6aab8b49380463d6f966' },
   ],
 } as const;
 /** Throws if a yield market/target/token is the strategy vault; old AtpExecutor must never touch it. */
@@ -53,3 +54,10 @@ export const BORROW_CALL_ABI = parseAbi([
   'function approve(address spender, uint256 amount) returns (bool)',
 ]);
 export const isStrategyMarketId = (id: string) => STRATEGY_EARN_97.markets.some(m => m.marketId === id.toLowerCase());
+/** The four AtpBorrowExecutor calls a session key may make (backend#204). Deleverage is anyone-callable and needs no key. */
+export const BORROW_SESSION_SELECTORS: readonly Hex[] = [
+  'function executeSupplyCollateral(address account, bytes32 marketId, uint256 amount, uint256 deadline)',
+  'function executeBorrow(address account, bytes32 marketId, uint256 amount, uint256 deadline)',
+  'function executeRepay(address account, bytes32 marketId, uint256 amount, bool fromVault, uint256 deadline)',
+  'function executeWithdrawCollateral(address account, bytes32 marketId, uint256 amount, uint256 deadline)',
+].map(signature => toFunctionSelector(signature));

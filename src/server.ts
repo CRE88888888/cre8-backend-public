@@ -575,11 +575,17 @@ async function route(
       if (method !== 'GET') return methodNotAllowed(res, ['GET']);
       sendJson(res, 200, await deps.strategyEarn.portfolio(id, wallet)); return;
     }
-    if (segments[3] === 'open' || segments[3] === 'close') {
+    if (segments[3] === 'open' || segments[3] === 'close' || segments[3] === 'auto') {
       if (method !== 'POST') return methodNotAllowed(res, ['POST']);
       const input = await readJsonBody(req);
-      sendJson(res, 200, segments[3] === 'open' ? await deps.strategyEarn.open(id, wallet, input) : await deps.strategyEarn.close(id, wallet, input));
+      sendJson(res, 200, segments[3] === 'open' ? await deps.strategyEarn.open(id, wallet, input)
+        : segments[3] === 'auto' ? await deps.strategyEarn.auto(id, wallet, input) : await deps.strategyEarn.close(id, wallet, input));
       return;
+    }
+    // backend#204: activity from the verified ledger (db 0063), newest first.
+    if (segments[3] === 'activity') {
+      if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+      sendJson(res, 200, await deps.strategyEarn.activity(id, wallet)); return;
     }
   }
 

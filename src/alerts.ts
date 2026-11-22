@@ -302,7 +302,9 @@ export async function detectAlerts(
   return [
     ...failures,
     ...(await detectSessionKeyExpiry(query, { now, expiryDays: thresholds.keyExpiryDays })),
-    ...(await detectLowGas(query, {
+    // backend#201: with paymaster sponsorship the smart account never pays gas, so its own balance is not a signal;
+    // the paymaster deposit is watched by the global gas_low. Unsponsored (mainnet) keeps the per-account rule.
+    ...(paymasterSponsorsGas(env) ? [] : await detectLowGas(query, {
       chainId: chainIdFromEnv(env),
       minOps: thresholds.minOps,
       readNativeBalance: args.readNativeBalance ?? getAccountGasBalance,
@@ -312,6 +314,11 @@ export async function detectAlerts(
     // （前三個看 operations / session_keys / 鏈上餘額，這個看快照）。
     ...stuck,
   ];
+}
+
+/** A misconfigured paymaster (throws) cannot sponsor anything, so the per-account check stays on. */
+export function paymasterSponsorsGas(env: NodeJS.ProcessEnv): boolean {
+  try { return loadPaymasterConfig(env) !== null; } catch { return false; }
 }
 
 /** Safety releases are not failed attempts. Repeated drops still need an operator's attention. */

@@ -7,6 +7,7 @@ import {
   alertCounts,
   detectAlerts,
   detectLowGas,
+  paymasterSponsorsGas,
   detectRelayerLowGas,
   detectPaymasterLowGas,
   detectPortfolioFailures,
@@ -656,6 +657,32 @@ test('detectAlerts：三條規則合成一份 findings，閾值從 env 來（覆
   );
   const [gas] = findings.filter((entry) => entry.kind === 'gas_low');
   assert.match(gas?.detail ?? '', /threshold 3/, 'ALERT_MIN_OPS 覆寫了預設 10');
+});
+
+test('#201 detectAlerts：paymaster 代付時不讀帳戶餘額、不發逐帳戶 gas_low；沒代付或設定錯誤照舊', async () => {
+  const run = async (env: NodeJS.ProcessEnv) => {
+    let balanceReads = 0, accountQueries = 0;
+    const { query } = stubQuery((sql) => {
+      if (sql.includes('from smart_accounts sa')) { accountQueries++; return [{ portfolio_id: '7', address: SMART_ACCOUNT, confirmed_count: 1, last_confirmed_at: NOW }]; }
+      return [];
+    });
+    const findings = await detectAlerts(query, { now: NOW, env, readGasPrice: async () => GAS_PRICE_WEI,
+      readNativeBalance: async () => { balanceReads++; return 0n; } });
+    return { kinds: findings.map(f => [f.kind, f.severity, f.portfolioId]), balanceReads, accountQueries };
+  };
+  const sponsored = await run(PAYMASTER_ALERT_ENV);
+  assert.deepEqual(sponsored, { kinds: [], balanceReads: 0, accountQueries: 0 });
+  assert.equal(paymasterSponsorsGas(PAYMASTER_ALERT_ENV), true);
+  // Mainnet-style env (no paymaster): unchanged, a confirmed portfolio with 0 gas is critical.
+  const unsponsored = await run({ CHAIN_ID: '56' });
+  assert.deepEqual(unsponsored.kinds, [['gas_low', 'critical', 7]]); assert.equal(unsponsored.balanceReads, 1);
+  assert.equal(paymasterSponsorsGas({ CHAIN_ID: '56' }), false);
+  // A broken paymaster config sponsors nothing: keep watching account balances rather than silently skipping.
+  for (const broken of [{ ...PAYMASTER_ALERT_ENV, PAYMASTER_SIGNER_PRIVATE_KEY: '0x12' }, { ...PAYMASTER_ALERT_ENV, PAYMASTER_ADDRESS: '' },
+    { ...PAYMASTER_ALERT_ENV, CHAIN_ID: '56' }]) {
+    assert.equal(paymasterSponsorsGas(broken), false);
+    assert.deepEqual((await run(broken)).kinds, [['gas_low', 'critical', 7]]);
+  }
 });
 
 test('detectAlerts：env 的閾值格式錯誤 → 拋錯（打錯的門檻不能被靜默忽略）', async () => {

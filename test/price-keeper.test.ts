@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { ContractFunctionRevertedError, getAddress, HttpRequestError, parseAbi, RpcRequestError, SocketClosedError, TimeoutError } from 'viem';
 import { TESTNET_ASSETS } from '../src/keeper/assets.js';
 import { boundedTarget, canSwap, parseScenario, targetAt } from '../src/keeper/scenario.js';
-import { isTransientRpcError, PriceKeeper, RpcRetry, safeReason } from '../src/keeper/engine.js';
+import { feedDue, isTransientRpcError, maintenanceSeconds, PriceKeeper, RpcRetry, safeReason } from '../src/keeper/engine.js';
 import type { Head, KeeperIO, Observation } from '../src/keeper/engine.js';
 import { loadKeeperSettings } from '../src/keeper/run.js';
 import { sqrtPriceFor, spotPrice, validateFeed, signingAccount } from '../src/keeper/chain.js';
@@ -27,6 +27,8 @@ function fixture(rpcFailureTimeoutSeconds = 1800) {
       ...(spec.hasFeed ? { feed: addr(index + 3000), secondary: addr(index + 4000) } : {}) },
     spotE18: BigInt(spec.priceE18), twapE18: BigInt(spec.priceE18), lastObservation: 1000n,
     feedUpdatedAt: spec.hasFeed ? 1000n : null,
+    // Start every feed 1% away from its TWAP so the one-step push paths stay exercised; #187 tests cover age/drift gates.
+    feedAnswerE8: spec.hasFeed ? BigInt(spec.priceE18) * 99n / 100n / 10n ** 10n : null,
   }));
   const fail = (name: string) => { if (state.fail === name) throw new Error('secret RPC credential'); };
   const io: KeeperIO = {
@@ -669,4 +671,89 @@ test('#87 active flat targets use maintenance only once the on-chain observation
     await keeper.round(); assert.equal(f.state.swaps.length, 105);
     f.state.targets.forEach((p, i) => { const o = f.observations[i]; assert.ok(o); assert.ok(p < o.spotE18); assert.ok((o.spotE18 - p) * 10_000n <= o.spotE18 * BigInt(maxStepBps)); });
   }
+});
+
+test('#187 feed sets refresh at half the shorter of feed/cash max age, not every scenario step', () => {
+  const { observations } = fixture();
+  const hourly = observations.find((o) => o.market.feed && o.market.maxFeedAge === 3600);
+  const daily = observations.find((o) => o.market.feed && o.market.maxFeedAge === 86_400);
+  const stock = observations.find((o) => !o.market.feed);
+  assert.ok(hourly && daily && stock && hourly.twapE18 !== null);
+  for (const o of [hourly, daily]) {
+    // Exactly at the published TWAP: only age can make the set due.
+    const at = { ...o, feedUpdatedAt: 10_000n, feedAnswerE8: (o.twapE18 ?? 0n) / 10n ** 10n };
+    assert.equal(feedDue(at, 11_799n, 60), false, o.market.symbol + ' one second early');
+    assert.equal(feedDue(at, 11_800n, 60), true, o.market.symbol + ' exact half of the cash max age');
+    assert.equal(feedDue(at, 13_600n, 60), true, o.market.symbol + ' expired');
+  }
+  assert.equal(feedDue({ ...stock, feedUpdatedAt: null }, 99_999n, 60), false);
+  // A scenario step longer than half the max age still bounds the cadence from below.
+  assert.equal(feedDue({ ...hourly, feedUpdatedAt: 0n }, 1799n, 1900), false);
+  assert.equal(feedDue({ ...hourly, feedUpdatedAt: 0n }, 1900n, 1900), true);
+});
+
+test('#187 TWAP drift republishes at exactly 100 bps, once a step has passed, and never on unknown data', () => {
+  const { observations } = fixture();
+  const o = observations.find((candidate) => candidate.market.feed); assert.ok(o);
+  const answer = 100_000_000_000n; // 1000.00000000
+  const at = (twapE8: bigint, age: bigint, extra: Partial<Observation> = {}) =>
+    feedDue({ ...o, twapE18: twapE8 * 10n ** 10n, feedUpdatedAt: 5_000n, feedAnswerE8: answer, ...extra }, 5_000n + age, 60);
+  assert.equal(at(answer * 10_099n / 10_000n, 60n), false, '99 bps up');
+  assert.equal(at(answer * 10_100n / 10_000n, 60n), true, '100 bps up');
+  assert.equal(at(answer * 9_901n / 10_000n, 60n), false, '99 bps down');
+  assert.equal(at(answer * 9_900n / 10_000n, 60n), true, '100 bps down');
+  assert.equal(at(answer * 10_500n / 10_000n, 59n), false, 'drift inside the current step');
+  assert.equal(at(answer * 10_500n / 10_000n, 60n, { twapE18: null }), false, 'TWAP unavailable');
+  assert.equal(at(answer * 10_500n / 10_000n, 60n, { feedAnswerE8: null }), false, 'no answer');
+  assert.equal(at(answer * 10_500n / 10_000n, 60n, { feedAnswerE8: undefined }), false, 'unknown answer');
+  assert.equal(at(answer * 10_500n / 10_000n, 60n, { feedAnswerE8: 0n }), false, 'zero answer');
+});
+
+test('#187 held markets with feeds at their TWAP push nothing until the oldest feed is 1800 seconds old', async () => {
+  const f = fixture(); f.scenario.timeline = [{ steps: 1, mode: 'closed', stepBps: 0 }];
+  for (const o of f.observations) {
+    o.lastObservation = 1000n;
+    if (o.market.feed) { o.feedUpdatedAt = 1000n; o.feedAnswerE8 = (o.twapE18 ?? 0n) / 10n ** 10n; }
+  }
+  f.state.head = { number: 101n, timestamp: 2799n }; f.state.now = 2_799_000;
+  await f.keeper.round();
+  assert.equal(f.state.pushes.length, 0); assert.equal(f.state.swaps.length, 0);
+  // The per-step round gate would skip a second round one second later; a fresh process sees the exact boundary.
+  const restarted = new PriceKeeper(f.io, f.scenario, addr(1), addr(2), {
+    start: 1000n, minimumUsdtE18: 10_000n * unit, inventoryUsdtE18: 100_000n * unit, swapBudgetUsdtE18: 10_000n * unit, stallSeconds: 90,
+  }, () => {}, async () => {}, () => f.state.now);
+  f.state.head = { number: 102n, timestamp: 2800n }; f.state.now = 2_800_000;
+  await restarted.round();
+  assert.equal(f.state.pushes.length, 12); assert.equal(f.state.pushes[0], 100_000_000n);
+  assert.equal(f.state.swaps.length, 105);
+});
+
+test('#187 maintenance interval: default 1800, configurable within 600-3000, invalid values rejected', async () => {
+  assert.equal(maintenanceSeconds(undefined), 1800);
+  for (const value of [600, 2400, 3000]) assert.equal(maintenanceSeconds(value), value);
+  for (const value of [0, 599, 3001, 1800.5, Number.NaN]) assert.throws(() => maintenanceSeconds(value), /between 600 and 3000/);
+  const env = { PRICE_KEEPER_ENABLED: '1', PRICE_KEEPER_RPC_URL: 'http://127.0.0.1:8557', PRICE_KEEPER_MANIFEST: 'manifest.json',
+    PRICE_KEEPER_SCENARIO: 'scenario.json', PRICE_KEEPER_START_TIMESTAMP: '1000', PRICE_KEEPER_PRIVATE_KEY: `0x${'0'.repeat(63)}1` };
+  assert.equal(loadKeeperSettings(env)?.settings.maintenanceSeconds, 1800);
+  assert.equal(loadKeeperSettings({ ...env, PRICE_KEEPER_MAINTENANCE_SECONDS: '2400' })?.settings.maintenanceSeconds, 2400);
+  for (const value of ['', '599', '3001', '2400.0', '-1', 'abc', ' 2400']) {
+    assert.throws(() => loadKeeperSettings({ ...env, PRICE_KEEPER_MAINTENANCE_SECONDS: value }), /between 600 and 3000/, value);
+  }
+  const f = fixture(); f.scenario.timeline = [{ steps: 1, mode: 'closed', stepBps: 0 }];
+  const keeper = new PriceKeeper(f.io, f.scenario, addr(1), addr(2), {
+    start: 1000n, minimumUsdtE18: 10_000n * unit, inventoryUsdtE18: 100_000n * unit,
+    swapBudgetUsdtE18: 10_000n * unit, stallSeconds: 90, maintenanceSeconds: 2400,
+  }, () => {}, async () => {}, () => f.state.now);
+  f.state.head = { number: 101n, timestamp: 3399n }; f.state.now = 3_399_000;
+  await keeper.round(); assert.equal(f.state.swaps.length, 0, 'one second before 2400');
+  const fresh = new PriceKeeper(f.io, f.scenario, addr(1), addr(2), {
+    start: 1000n, minimumUsdtE18: 10_000n * unit, inventoryUsdtE18: 100_000n * unit,
+    swapBudgetUsdtE18: 10_000n * unit, stallSeconds: 90, maintenanceSeconds: 2400,
+  }, () => {}, async () => {}, () => f.state.now);
+  f.state.head = { number: 102n, timestamp: 3400n }; f.state.now = 3_400_000;
+  await fresh.round(); assert.equal(f.state.swaps.length, 105, 'exactly 2400');
+  assert.throws(() => new PriceKeeper(f.io, f.scenario, addr(1), addr(2), {
+    start: 1000n, minimumUsdtE18: 10_000n * unit, inventoryUsdtE18: 100_000n * unit,
+    swapBudgetUsdtE18: 10_000n * unit, stallSeconds: 90, maintenanceSeconds: 3001,
+  }, () => {}, async () => {}), /between 600 and 3000/);
 });

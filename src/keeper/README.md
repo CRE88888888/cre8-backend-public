@@ -17,6 +17,7 @@
 | `PRICE_KEEPER_MIN_INVENTORY_E18` | 每個代幣的 USDT 計價補貨門檻；預設 10,000 × 10^18 |
 | `PRICE_KEEPER_INVENTORY_E18` | 補貨後庫存價值；預設 100,000 × 10^18，必須大於門檻 |
 | `PRICE_KEEPER_SWAP_BUDGET_E18` | 單筆 input 價值上限；預設 10,000 × 10^18，不能大於門檻 |
+| `PRICE_KEEPER_MAINTENANCE_SECONDS` | 休市／暫停／劇本結束時的維護成交間隔；預設 1,800，只接受 600–3,000 的整數（oracle `maxOracleAge` 為 3,600） |
 | `PRICE_KEEPER_RPC_FAILURE_TIMEOUT_SECONDS` | 連續 RPC 故障的停止門檻；預設 1,800 秒，只接受 1–86,400 的整數；超過門檻才發 critical 並停止 |
 | `TELEGRAM_BOT_TOKEN`／`TELEGRAM_CHAT_ID` | 沿用 `src/notify.ts`；留空停用通知 |
 
@@ -41,7 +42,7 @@ JSON `version=1`，必須完整列出 92 個 `assets`，值固定為 contracts
 第 0 步是基準價；第 1..N 步執行該段，最後一步仍屬該段。全部步驟結束後維持價格。
 同一起點與鏈上時間得到相同目標價。延遲或重啟時只移動一個 `maxStepBps`，不跳追累積落差。
 每池每輪最多一次 swap，且檢查鏈上最後 observation 時間，所以重啟不會提高頻率。
-休市、暫停、劇本結束，或目標與現價僅有 sub-ppm 差距時，鏈上最後 observation 滿 1,800 秒才做維護成交：
+休市、暫停、劇本結束，或目標與現價僅有 sub-ppm 差距時，鏈上最後 observation 滿 `PRICE_KEEPER_MAINTENANCE_SECONDS`（預設 1,800 秒）才做維護成交：
 以凍結目標上下 1 bps 為交替方向，仍受 `maxStepBps` 約束；方向由現價相對目標決定，
 重啟沿用鏈上 observation 時間，不額外加速。劇本價格不改；真實池價會有小幅擺動。
 這更新 #70 的「完全不成交」語義；使用者的交易時段規則不變。
@@ -54,7 +55,7 @@ USDT 在連續買入間逐筆檢查；所有 mint／approve／swap／push 都記
 
 每輪先讀全體市場、雙向 `previewSwap` 與 feed 健康，再做寫入；交易後重讀 TWAP，
 以已形成的 30 分鐘 TWAP 推 11 個 asset/USD feed，USDT/USD 固定 1，持續符合 200 bps secondary 門檻。
-休市或暫停期間仍推 feed，避免過期。feed 剛更新、未滿一步時不重複推送。
+休市或暫停期間仍推 feed，避免過期。backend#187 起 feed 不再每一步都推（原本每小時約 720 筆，是 keeper gas 的大宗）：整組（USDT/USD＋11 個 asset feed）只在最舊的 feed 年齡達到 `min(maxFeedAge, 3600) / 2`（目前 1,800 秒），或某個 TWAP 與已發布值偏離 ≥ 100 bps（secondary 門檻 200 bps 的一半）且距上次推送已滿一步時才推送。所有寫入改用 legacy `gasPrice = eth_gasPrice`（chain 97 為 0.1 gwei），不用 viem 預估的 EIP-1559 小費；讀 gas price 失敗發生在簽名前，視為暫時性讀取故障。
 第一次啟動前，部署池必須已有完整 30 分鐘歷史，且 feed 尚未 stale。
 
 暫時性 RPC 讀取故障（連線中斷、timeout、HTTP 408／429／5xx，以及限流或節點暫不可用的 RPC 錯誤）

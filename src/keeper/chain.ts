@@ -128,10 +128,14 @@ export function createKeeperChain(rpcUrl: string, account: Account, manifest: Ma
     return { number: block.number, timestamp: block.timestamp };
   }
 
-  async function landed(submit: () => Promise<Hex>, action: string): Promise<void> {
+  // Legacy pricing at the node's eth_gasPrice (0.1 gwei on chain 97); viem's EIP-1559 tip estimate overpays.
+  // A failed price read happens before signing, so it stays a retryable read failure.
+  async function landed(submit: (fees: { gasPrice: bigint }) => Promise<Hex>, action: string): Promise<void> {
     await head();
+    const gasPrice = await client.getGasPrice();
+    if (gasPrice <= 0n) throw new Error('invalid gas price');
     try {
-      const hash = await submit();
+      const hash = await submit({ gasPrice });
       log(`[price-keeper] submitted ${action} tx=${hash}`);
       const receipt = await client.waitForTransactionReceipt({ hash, timeout: 30_000, pollingInterval: 250, retryCount: 0 });
       if (receipt.transactionHash.toLowerCase() !== hash.toLowerCase() || receipt.status !== 'success' ||
@@ -199,11 +203,13 @@ export function createKeeperChain(rpcUrl: string, account: Account, manifest: Ma
         const expired = new Map<string, bigint>();
         if (block.timestamp - cash[3] > 3600n) expired.set(manifest.cashFeed.toLowerCase(), cash[3]);
         let feedUpdatedAt: bigint | null = null;
+        let feedAnswerE8: bigint | null = null;
         if (market.feed) {
           const feed = await client.readContract({ address: market.feed, abi: KEEPER_ABI, functionName: 'latestRoundData', blockNumber });
           validateFeed(feed, block.timestamp, market.maxFeedAge, true);
           if (block.timestamp - feed[3] > BigInt(market.maxFeedAge)) expired.set(market.feed.toLowerCase(), feed[3]);
           feedUpdatedAt = feed[3] < cash[3] ? feed[3] : cash[3];
+          feedAnswerE8 = feed[1];
         }
         let twapE18: bigint | null = null;
         try {
@@ -226,7 +232,7 @@ export function createKeeperChain(rpcUrl: string, account: Account, manifest: Ma
             }
           }
         }
-        result.push({ market, spotE18: spotPrice(slot[0], market.decimals, same(token0, market.token)), twapE18, lastObservation: BigInt(observation[0]), feedUpdatedAt });
+        result.push({ market, spotE18: spotPrice(slot[0], market.decimals, same(token0, market.token)), twapE18, lastObservation: BigInt(observation[0]), feedUpdatedAt, feedAnswerE8 });
       }
       return result;
     },
@@ -234,9 +240,9 @@ export function createKeeperChain(rpcUrl: string, account: Account, manifest: Ma
     async mint(token, amount) {
       await head();
       if (same(token, manifest.usdt)) throw new Error('USDT inventory must be prefunded');
-      await landed(() => wallet.writeContract({ address: token, abi: KEEPER_ABI, functionName: 'mint', args: [account.address, amount] }), 'mint');
+      await landed((fees) => wallet.writeContract({ address: token, abi: KEEPER_ABI, functionName: 'mint', args: [account.address, amount], ...fees }), 'mint');
     },
-    push: (feed, answer) => landed(() => wallet.writeContract({ address: feed, abi: KEEPER_ABI, functionName: 'push', args: [answer] }), 'feed'),
+    push: (feed, answer) => landed((fees) => wallet.writeContract({ address: feed, abi: KEEPER_ABI, functionName: 'push', args: [answer], ...fees }), 'feed'),
     async swap(observation, targetE18, budgetUsdtE18) {
       const market = observation.market;
       await head();
@@ -255,11 +261,11 @@ export function createKeeperChain(rpcUrl: string, account: Account, manifest: Ma
       const before = await io.balance(tokenIn);
       if (before < amountIn) throw new Error('swap inventory too low');
       if (await client.readContract({ address: tokenIn, abi: KEEPER_ABI, functionName: 'allowance', args: [account.address, SWAP_ROUTER] }) < amountIn) {
-        await landed(() => wallet.writeContract({ address: tokenIn, abi: KEEPER_ABI, functionName: 'approve', args: [SWAP_ROUTER, amountIn] }), 'approve');
+        await landed((fees) => wallet.writeContract({ address: tokenIn, abi: KEEPER_ABI, functionName: 'approve', args: [SWAP_ROUTER, amountIn], ...fees }), 'approve');
       }
       const block = await head();
       // SwapRouter pays only the input needed to reach sqrtPriceLimitX96, including initialized tick crossings.
-      await landed(() => wallet.writeContract({ address: SWAP_ROUTER, abi: KEEPER_ABI, functionName: 'exactInputSingle', args: [{ tokenIn, tokenOut, amountIn, fee: market.fee, recipient: account.address, deadline: block.timestamp + 60n, amountOutMinimum: quote[0] * 9999n / 10_000n, sqrtPriceLimitX96: limit }] }), 'swap');
+      await landed((fees) => wallet.writeContract({ address: SWAP_ROUTER, abi: KEEPER_ABI, functionName: 'exactInputSingle', args: [{ tokenIn, tokenOut, amountIn, fee: market.fee, recipient: account.address, deadline: block.timestamp + 60n, amountOutMinimum: quote[0] * 9999n / 10_000n, sqrtPriceLimitX96: limit }], ...fees }), 'swap');
       try {
         const after = await client.readContract({ address: market.pool, abi: KEEPER_ABI, functionName: 'slot0' });
         const spent = before - await io.balance(tokenIn);

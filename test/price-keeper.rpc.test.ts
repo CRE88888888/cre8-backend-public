@@ -55,6 +55,7 @@ test('#97 keeper chain refuses every USDT mint without a write, including zero a
 test('keeper inspects 105 markets and both oracle directions at one pinned block', async () => {
   const { state, chain } = keeperChainFixture(); const observations = await chain.io.inspect({ number: 100n, timestamp: 1060n });
   assert.equal(observations.length, 105); assert.equal(observations.filter((o) => o.feedUpdatedAt !== null).length, 11);
+  assert.deepEqual(new Set(observations.map((o) => o.market.feed ? o.feedAnswerE8 : `none:${String(o.feedAnswerE8)}`)), new Set([100_000_000n, 'none:null']));
   assert.equal(state.calls.filter((c) => c.name === 'previewSwap').length, 105 * 3);
   assert.ok(state.calls.every((c) => c.block === '0x64')); assert.equal(state.sends, 0);
 });
@@ -182,6 +183,7 @@ test('keeper writes require a successful canonical receipt and never rebroadcast
         case 'eth_chainId': return '0x61';
         case 'eth_getBlockByNumber': return { number: '0x64', timestamp: '0x424', hash: fault === 'reorg' ? hash : blockHash, transactions: [] };
         case 'eth_blockNumber': return '0x64';
+        case 'eth_gasPrice': return '0x5f5e100';
         case 'eth_sendTransaction':
           sends++;
           if (fault === 'broadcast') throw new Error('secret credential in unknown broadcast');
@@ -228,6 +230,7 @@ test('#162 swap post-write validation must complete: RPC failure, wrong price an
       if (method === 'eth_getBlockByNumber') return { number: '0x64', timestamp: '0x424', hash: blockHash, transactions: [] };
       if (method === 'eth_sendTransaction') { sends++; return hash; }
       if (method === 'eth_blockNumber') return '0x64';
+      if (method === 'eth_gasPrice') return '0x5f5e100';
       if (method === 'eth_getTransactionReceipt') return { transactionHash: hash, transactionIndex: '0x0', blockHash, blockNumber: '0x64',
         from: manifest.keeper, to: market.pool, contractAddress: null, cumulativeGasUsed: '0x1', gasUsed: '0x1',
         effectiveGasPrice: '0x1', logs: [], logsBloom: `0x${'00'.repeat(256)}`, status: '0x1', type: '0x0' };
@@ -354,4 +357,49 @@ test('keeper CLI startup failure redacts key/URL/file errors and notifies throug
     assert.equal(failedAlert.code, 1); assert.equal(messages.length, 2);
     assert.match(failedAlert.output, /HTTP 503/); assert.doesNotMatch(failedAlert.output, /已保留在 DB/);
   } finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
+});
+
+test('#187 every keeper write is a legacy transaction at eth_gasPrice; a failed or zero price read signs nothing', async () => {
+  for (const fault of ['', 'gas price HTTP', 'zero gas price']) {
+    const manifest = parseManifest(manifestInput()); const market = manifest.markets[0]; assert.ok(market);
+    const hash = `0x${'ab'.repeat(32)}`; const blockHash = `0x${'cd'.repeat(32)}`;
+    const sent: unknown[] = [];
+    const transport = custom({ request: async ({ method, params }) => {
+      switch (method) {
+        case 'eth_chainId': return '0x61';
+        case 'eth_getBlockByNumber': return { number: '0x64', timestamp: '0x424', hash: blockHash, transactions: [] };
+        case 'eth_blockNumber': return '0x64';
+        case 'eth_gasPrice':
+          if (fault === 'gas price HTTP') throw new HttpRequestError({ url: 'https://private-token.invalid/key', status: 503 });
+          return fault === 'zero gas price' ? '0x0' : '0x5f5e100';
+        case 'eth_sendTransaction': assert.ok(Array.isArray(params)); sent.push(params[0]); return hash;
+        case 'eth_getTransactionReceipt':
+          return { transactionHash: hash, transactionIndex: '0x0', blockHash, blockNumber: '0x64', from: manifest.keeper, to: market.token,
+            contractAddress: null, cumulativeGasUsed: '0x1', gasUsed: '0x1', effectiveGasPrice: '0x5f5e100', logs: [],
+            logsBloom: `0x${'00'.repeat(256)}`, status: '0x1', type: '0x0' };
+        default: assert.fail(`unexpected write RPC ${method}`);
+      }
+    } }, { retryCount: 0 });
+    const chain = createKeeperChain('http://127.0.0.1:1', { address: manifest.keeper, type: 'json-rpc' }, manifest, () => {}, transport);
+    if (!fault) {
+      await chain.io.mint(market.token, 1n);
+      await chain.io.push(manifest.cashFeed, 100_000_000n);
+      assert.equal(sent.length, 2);
+      for (const tx of sent) {
+        assert.ok(typeof tx === 'object' && tx !== null);
+        assert.equal(Reflect.get(tx, 'gasPrice'), '0x5f5e100');
+        assert.equal(Reflect.get(tx, 'maxPriorityFeePerGas'), undefined);
+        assert.equal(Reflect.get(tx, 'maxFeePerGas'), undefined);
+      }
+    } else {
+      await assert.rejects(chain.io.mint(market.token, 1n), (error: unknown) => {
+        // A price read happens before signing: transport faults stay retryable, a zero price halts.
+        assert.equal(isTransientRpcError(error), fault === 'gas price HTTP', fault);
+        if (fault === 'zero gas price') assert.match(safeReason(error), /invalid gas price/);
+        assert.doesNotMatch(safeReason(error), /private-token|https:/);
+        return true;
+      });
+      assert.equal(sent.length, 0, fault);
+    }
+  }
 });

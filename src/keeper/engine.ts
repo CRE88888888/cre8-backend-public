@@ -7,7 +7,8 @@ import { TESTNET_ASSETS } from './assets.js';
 export type Market = { symbol: string; token: Address; pool: Address; oracle: Address; decimals: number; fee: number; feed?: Address; secondary?: Address; maxFeedAge: number };
 export type Head = { number: bigint; timestamp: bigint };
 // null means the primary oracle explicitly reverted TwapUnavailable, never an RPC/read failure.
-export type Observation = { market: Market; spotE18: bigint; twapE18: bigint | null; lastObservation: bigint; feedUpdatedAt: bigint | null };
+// feedAnswerE8 is the oldest-relevant asset feed answer (null without a feed); omitted means unknown, so drift is not inferred.
+export type Observation = { market: Market; spotE18: bigint; twapE18: bigint | null; lastObservation: bigint; feedUpdatedAt: bigint | null; feedAnswerE8?: bigint | null };
 export type KeeperIO = {
   head(): Promise<Head>;
   inspect(head: Head): Promise<Observation[]>;
@@ -16,7 +17,39 @@ export type KeeperIO = {
   swap(observation: Observation, targetE18: bigint, budgetUsdtE18: bigint): Promise<void>;
   push(feed: Address, answerE8: bigint): Promise<void>;
 };
-export type KeeperSettings = { start: bigint; minimumUsdtE18: bigint; inventoryUsdtE18: bigint; swapBudgetUsdtE18: bigint; stallSeconds: number; rpcFailureTimeoutSeconds?: number };
+export type KeeperSettings = { start: bigint; minimumUsdtE18: bigint; inventoryUsdtE18: bigint; swapBudgetUsdtE18: bigint; stallSeconds: number; rpcFailureTimeoutSeconds?: number; maintenanceSeconds?: number };
+
+/** The USDT/USD cash feed is validated with a one-hour age; every asset feed set includes it. */
+export const CASH_FEED_MAX_AGE = 3600;
+/** Half of the 200 bps secondary deviation gate: republish before the router could reject a quote. */
+export const FEED_DRIFT_BPS = 100n;
+export const DEFAULT_MAINTENANCE_SECONDS = 1800;
+export const MIN_MAINTENANCE_SECONDS = 600;
+/** Oracles reject observations older than 3600 seconds; leave room for one delayed round and RPC backoff. */
+export const MAX_MAINTENANCE_SECONDS = 3000;
+
+export function maintenanceSeconds(value: number | undefined): number {
+  const seconds = value ?? DEFAULT_MAINTENANCE_SECONDS;
+  if (!Number.isInteger(seconds) || seconds < MIN_MAINTENANCE_SECONDS || seconds > MAX_MAINTENANCE_SECONDS) throw new Error('PRICE_KEEPER_MAINTENANCE_SECONDS must be an integer between 600 and 3000');
+  return seconds;
+}
+
+/**
+ * Feeds are pushed as one set (cash + every asset feed). A set is due once its oldest member reaches half of
+ * the shorter of its own max age and the cash feed's, or once a TWAP drifts FEED_DRIFT_BPS from the
+ * published answer (never more than once per scenario step).
+ */
+export function feedDue(observation: Observation, headTimestamp: bigint, stepSeconds: number): boolean {
+  const { feedUpdatedAt, feedAnswerE8, twapE18, market } = observation;
+  if (feedUpdatedAt === null) return false;
+  const age = headTimestamp - feedUpdatedAt;
+  const refresh = BigInt(Math.max(stepSeconds, Math.floor(Math.min(market.maxFeedAge, CASH_FEED_MAX_AGE) / 2)));
+  if (age >= refresh) return true;
+  if (age < BigInt(stepSeconds) || twapE18 === null || feedAnswerE8 === undefined || feedAnswerE8 === null || feedAnswerE8 <= 0n) return false;
+  const published = twapE18 / 10n ** 10n;
+  const gap = published > feedAnswerE8 ? published - feedAnswerE8 : feedAnswerE8 - published;
+  return gap * 10_000n >= FEED_DRIFT_BPS * feedAnswerE8;
+}
 
 const LOCAL_REASONS = new Set([
   'invalid block time', 'block progress unavailable', 'old block', 'incomplete market observations',
@@ -27,9 +60,9 @@ const LOCAL_REASONS = new Set([
   'transaction not confirmed', 'invalid sqrt price inputs', 'sqrt price out of range', 'invalid pool price',
   'feed unavailable', 'unexpected mock USDT/USD', 'pool observation capacity unavailable', 'missing observation',
   'USDT inventory must be prefunded', 'pool changed since inspection', 'swap budget cannot reach target',
-  'swap inventory too low', 'swap result mismatch',
+  'swap inventory too low', 'swap result mismatch', 'invalid gas price',
   'mint balance verification unavailable', 'swap result verification unavailable',
-  'RPC failure timeout exceeded',
+  'RPC failure timeout exceeded', 'PRICE_KEEPER_MAINTENANCE_SECONDS must be an integer between 600 and 3000',
   'PRICE_KEEPER_ENABLED requires 0 or 1', 'PRICE_KEEPER_RPC_URL is required', 'invalid keeper RPC configuration',
   'PRICE_KEEPER_MANIFEST and PRICE_KEEPER_SCENARIO are required', 'invalid replay start', 'invalid inventory thresholds',
   'invalid keeper signing configuration', 'usage: price-keeper [--once]',
@@ -127,6 +160,7 @@ export class PriceKeeper {
   private nonProgressRounds = 0;
   private lastRoundTimestamp: bigint | undefined;
   private readonly retry: RpcRetry;
+  private readonly maintenance: bigint;
 
   constructor(
     private readonly io: KeeperIO,
@@ -137,7 +171,10 @@ export class PriceKeeper {
     private readonly log: (line: string) => void,
     private readonly alert: (line: string) => Promise<void>,
     private readonly now: () => number = Date.now,
-  ) { this.retry = new RpcRetry(settings.rpcFailureTimeoutSeconds, now); }
+  ) {
+    this.retry = new RpcRetry(settings.rpcFailureTimeoutSeconds, now);
+    this.maintenance = BigInt(maintenanceSeconds(settings.maintenanceSeconds));
+  }
 
   get retryDelayMs(): number { return this.retry.delayMs; }
 
@@ -204,12 +241,11 @@ export class PriceKeeper {
       for (const observation of observations) {
         try {
           this.retry.check();
-          const { market, spotE18, lastObservation, feedUpdatedAt } = observation;
+          const { market, spotE18, lastObservation } = observation;
           const target = targetAt(this.scenario, market.symbol, this.settings.start, head.timestamp);
           stage = `inventory ${market.symbol}`;
           await this.inventory(market.token, market.symbol, market.decimals, spotE18);
-          if (feedUpdatedAt !== null && (head.timestamp - feedUpdatedAt >= BigInt(this.scenario.stepSeconds) ||
-            head.timestamp - feedUpdatedAt > BigInt(market.maxFeedAge))) feedsDue = true;
+          if (feedDue(observation, head.timestamp, this.scenario.stepSeconds)) feedsDue = true;
           if (!canSwap(head.timestamp, lastObservation, this.scenario.stepSeconds)) continue;
           let bounded = boundedTarget(spotE18, target.price, this.scenario.maxStepBps);
           const gap = bounded > spotE18 ? bounded - spotE18 : spotE18 - bounded;
@@ -217,7 +253,7 @@ export class PriceKeeper {
           // Frozen script targets (also exhausted/flat timelines) still need observations.
           // Infer direction from spot vs the frozen anchor so restarts cannot reset it.
           if (held || gap * 1_000_000n <= spotE18) {
-            if (head.timestamp - lastObservation < 1800n) continue;
+            if (head.timestamp - lastObservation < this.maintenance) continue;
             const maintenance = target.price * (spotE18 >= target.price ? 9999n : 10001n) / 10_000n;
             bounded = boundedTarget(spotE18, maintenance, this.scenario.maxStepBps);
           }

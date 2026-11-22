@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createKeeperChain, parseManifest, signingAccount, amountSetting } from './chain.js';
-import { isTransientRpcError, PriceKeeper, RpcRetry, safeReason } from './engine.js';
+import { isTransientRpcError, maintenanceSeconds, PriceKeeper, RpcRetry, safeReason } from './engine.js';
 import { parseScenario, positiveAmount } from './scenario.js';
 import { sendTelegram } from '../notify.js';
 
@@ -26,7 +26,11 @@ export function loadKeeperSettings(env: NodeJS.ProcessEnv) {
   const timeout = env.PRICE_KEEPER_RPC_FAILURE_TIMEOUT_SECONDS ?? '1800';
   const rpcFailureTimeoutSeconds = Number(timeout);
   if (!/^[0-9]+$/.test(timeout) || !Number.isInteger(rpcFailureTimeoutSeconds) || rpcFailureTimeoutSeconds < 1 || rpcFailureTimeoutSeconds > 86_400) throw new Error('PRICE_KEEPER_RPC_FAILURE_TIMEOUT_SECONDS must be an integer between 1 and 86400');
-  return { rpc, manifestPath, scenarioPath, account: signingAccount(env.PRICE_KEEPER_PRIVATE_KEY), settings: { start, minimumUsdtE18, inventoryUsdtE18, swapBudgetUsdtE18, stallSeconds: 90, rpcFailureTimeoutSeconds } };
+  const maintenance = env.PRICE_KEEPER_MAINTENANCE_SECONDS ?? '1800';
+  if (!/^[0-9]+$/.test(maintenance)) throw new Error('PRICE_KEEPER_MAINTENANCE_SECONDS must be an integer between 600 and 3000');
+  const settings = { start, minimumUsdtE18, inventoryUsdtE18, swapBudgetUsdtE18, stallSeconds: 90, rpcFailureTimeoutSeconds,
+    maintenanceSeconds: maintenanceSeconds(Number(maintenance)) };
+  return { rpc, manifestPath, scenarioPath, account: signingAccount(env.PRICE_KEEPER_PRIVATE_KEY), settings };
 }
 
 async function readJson(path: string, kind: 'scenario' | 'manifest'): Promise<unknown> {

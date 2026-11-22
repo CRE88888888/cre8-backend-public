@@ -6,7 +6,7 @@ import { mkdtemp, mkdir, writeFile, readFile, rm, symlink } from 'node:fs/promis
 import { resolve, join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { setTimeout as pause } from 'node:timers/promises';
-import { createTestnetWebsite, gatewayClientIp } from '../scripts/testnet-web.js';
+import { cacheControl, createTestnetWebsite, gatewayClientIp } from '../scripts/testnet-web.js';
 import { websiteProxyIps } from '../scripts/testnet-api.js';
 import { prepareDeploy } from '../scripts/prepare-deploy.js';
 import { runPointsSync } from '../scripts/points-sync.js';
@@ -68,6 +68,31 @@ test('#79 website serves SPA and assets; preserves API auth, paths, query, bodie
     const result = await fetch(base + '/api/auth/privy?test=1', { method: 'POST', headers: { authorization: 'Bearer test-only', 'x-forwarded-for': '192.0.2.1, 198.51.100.5', 'x-real-ip': '198.51.100.8' }, body: '{"identityToken":"test-only"}' });
     assert.equal(result.status, 429); assert.equal(result.headers.get('retry-after'), '60');
     assert.equal(result.headers.get('cache-control'), 'no-store'); assert.equal(await result.text(), '{"code":"RATE_LIMITED"}'); assert.ok(seen);
+  } finally { if (website) await close(website); await close(api); await rm(root, { recursive: true, force: true }); }
+});
+
+test('#205 website keeps only explicit public cache headers on successful anonymous API responses', async () => {
+  assert.equal(cacheControl(undefined, 200, 'public, max-age=31536000, immutable'), 'public, max-age=31536000, immutable');
+  assert.equal(cacheControl(undefined, 200, 'public, max-age=30'), 'public, max-age=30');
+  for (const [auth, status, upstream] of [['Bearer x', 200, 'public, max-age=30'], ['', 200, 'public, max-age=30'], [undefined, 200, 'private, max-age=30'],
+    [undefined, 200, 'public, no-store'], [undefined, 200, 'no-store'], [undefined, 200, undefined], [undefined, 404, 'public, max-age=30'],
+    [undefined, 304, 'public, max-age=30'], [undefined, undefined, 'public']] as const) {
+    assert.equal(cacheControl(auth, status, upstream), 'no-store', JSON.stringify([auth, status, upstream]));
+  }
+  const root = await temporary();
+  const api = createServer((req, res) => {
+    res.writeHead(req.url === '/fail' ? 500 : 200, { 'content-type': 'image/webp', 'cache-control': req.url === '/private' ? 'private, max-age=60' : 'public, max-age=31536000, immutable' });
+    res.end('img');
+  });
+  let website: Server | undefined;
+  try {
+    await writeFile(join(root, 'index.html'), '<title>testnet</title>');
+    website = await createTestnetWebsite(root, new URL(await listen(api)));
+    const base = await listen(website);
+    assert.equal((await fetch(base + '/api/images/1')).headers.get('cache-control'), 'public, max-age=31536000, immutable');
+    assert.equal((await fetch(base + '/api/images/1', { headers: { authorization: 'Bearer test-only' } })).headers.get('cache-control'), 'no-store');
+    assert.equal((await fetch(base + '/api/private')).headers.get('cache-control'), 'no-store');
+    assert.equal((await fetch(base + '/api/fail')).headers.get('cache-control'), 'no-store');
   } finally { if (website) await close(website); await close(api); await rm(root, { recursive: true, force: true }); }
 });
 

@@ -21,6 +21,16 @@ function headers(input: IncomingHttpHeaders): IncomingHttpHeaders {
   return Object.fromEntries(Object.entries(input).filter(([name]) => !blocked.has(name)));
 }
 
+/**
+ * backend#205: keep the API's explicit `public` cache header (images, public lists) on successful unauthenticated
+ * requests; everything else — any Authorization, errors, private or missing headers — stays no-store.
+ */
+export function cacheControl(authorization: string | undefined, status: number | undefined, upstream: string | undefined): string {
+  if (authorization !== undefined || status === undefined || status < 200 || status >= 300 || typeof upstream !== 'string') return 'no-store';
+  const directives = upstream.toLowerCase().split(',').map(d => d.trim());
+  return directives.includes('public') && !directives.some(d => d === 'private' || d === 'no-store') ? upstream : 'no-store';
+}
+
 export async function createTestnetWebsite(root: string, upstream: URL, timeoutMs = 30_000) {
   if (upstream.protocol !== 'http:' || upstream.username || upstream.password || upstream.pathname !== '/' || upstream.search || upstream.hash) throw new Error('invalid API origin');
   const base = await realpath(root);
@@ -44,7 +54,7 @@ export async function createTestnetWebsite(root: string, upstream: URL, timeoutM
       delete forwarded.host;
       forwarded['x-forwarded-for'] = gatewayClientIp(req.socket.remoteAddress, req.headers['x-real-ip']);
       const proxy = request(upstream, { method: req.method, path: path.startsWith('?') ? '/' + path : path, headers: forwarded }, (response) => {
-        res.writeHead(response.statusCode ?? 502, { ...headers(response.headers), 'cache-control': 'no-store' });
+        res.writeHead(response.statusCode ?? 502, { ...headers(response.headers), 'cache-control': cacheControl(req.headers.authorization, response.statusCode, response.headers['cache-control']) });
         response.on('error', () => fail(502, 'API_UNAVAILABLE'));
         response.pipe(res);
       });

@@ -90,7 +90,7 @@ import { EXECUTOR_ABI, EXECUTOR_SELECTOR, PLAN_HASH_ABI } from './chain.js';
 import { HDKey } from '@scure/bip32';
 import { estimationPaymaster, paymasterExecutionError, schedulerPaymaster, gasExecutionKey, reserveGasBudget, readNativeBudgetPrice, existingBudgetContext, settleGasBudget, GasBudgetExceededError } from './paymaster.js';
 import { detectPaymasterLowGas } from './alerts.js';
-import type { PaymasterGasChecks } from './alerts.js';
+import type { PaymasterGasChecks, PriceKeeperGasChecks } from './alerts.js';
 import { signerToEcdsaValidator } from '@zerodev/ecdsa-validator';
 import { toECDSASigner } from '@zerodev/permissions/signers';
 import { addressToEmptyAccount, createKernelAccount, createKernelAccountClient } from '@zerodev/sdk';
@@ -120,7 +120,7 @@ import { activeChain } from './chain-object.js';
 import { testnetAssets, TESTNET_97 } from './testnet-profile.js';
 import { signPreparedOperation } from './user-operation.js';
 import { KERNEL_V3_3_ADDRESSES, kernelAddressesForChain } from './addresses.js';
-import { detectAlerts, detectRelayerLowGas, formatAlert, recordAlerts, resolveAlerts, PRICE_SOURCE_FAILURE_ROUNDS, priceSourceAlertAssets } from './alerts.js';
+import { detectAlerts, detectPriceKeeperLowGas, detectRelayerLowGas, formatAlert, recordAlerts, resolveAlerts, PRICE_SOURCE_FAILURE_ROUNDS, priceSourceAlertAssets } from './alerts.js';
 import type { AlertFinding, AlertKind, PriceSourceTracker, RelayerGasChecks } from './alerts.js';
 import { a10ErrorMessage, EXECUTOR_BUY_ABI, readGlobalPaused, decodePriceSourceError, describePriceSourceError, PriceSourceError, inspectPriceSources, oracleUnavailableTag } from './chain.js';
 import { getConfig, getSessionKeyConfig, requireSessionKeyConfig } from './config.js';
@@ -2049,6 +2049,7 @@ export async function runSchedulerOnce(
 export async function announceAlerts(args: {
   relayerGasChecks?: RelayerGasChecks;
   paymasterGasChecks?: PaymasterGasChecks;
+  priceKeeperGasChecks?: PriceKeeperGasChecks;
   priceSourceChecks?: () => Promise<PriceSourceObservation[]>;
   priceSourceTracker?: PriceSourceTracker;
   /** null/omitted = not verified; keep an existing global pause alert open. */
@@ -2117,17 +2118,25 @@ export async function announceAlerts(args: {
       paymasterComplete = paymaster.complete;
       paymasterFinding = paymaster.finding;
     } catch { args.log('[ALERT] paymaster 存款檢查失敗；本輪保留既有全域 gas_low 警示'); }
+    let keeperComplete = false;
+    let keeperFinding: AlertFinding | null = null;
+    try {
+      const keeper = await detectPriceKeeperLowGas(args.priceKeeperGasChecks);
+      keeperComplete = keeper.complete;
+      keeperFinding = keeper.finding;
+    } catch { args.log('[ALERT] price-keeper 餘額檢查失敗；本輪保留既有全域 gas_low 警示'); }
     let globalGasFinding: AlertFinding | null = null;
-    if (relayerFinding !== null || paymasterFinding !== null) {
-      const details = [relayerFinding?.detail, paymasterFinding?.detail].filter((detail): detail is string => detail !== undefined);
-      if (!relayerComplete || !paymasterComplete) {
+    if (relayerFinding !== null || paymasterFinding !== null || keeperFinding !== null) {
+      const details = [relayerFinding?.detail, paymasterFinding?.detail, keeperFinding?.detail].filter((detail): detail is string => detail !== undefined);
+      if (!relayerComplete || !paymasterComplete || !keeperComplete) {
         // Preserve the other source's last confirmed low observation while it is unreadable.
         try {
           const previous = await args.query("select detail from scheduler_alerts where kind = 'gas_low' and portfolio_id is null and resolved_at is null");
           const row = previous.rows[0];
           const oldDetail: unknown = typeof row === 'object' && row !== null ? Reflect.get(row, 'detail') : undefined;
           if (typeof oldDetail === 'string') for (const line of oldDetail.split('\n')) {
-            if ((!relayerComplete && line.startsWith('relayer ')) || (!paymasterComplete && line.startsWith('paymaster '))) details.push(line);
+            if ((!relayerComplete && line.startsWith('relayer ')) || (!paymasterComplete && line.startsWith('paymaster '))
+              || (!keeperComplete && line.startsWith('price-keeper '))) details.push(line);
           }
         } catch { /* The existing alert remains open; current known-low evidence must still be persisted. */ }
       }
@@ -2159,7 +2168,7 @@ export async function announceAlerts(args: {
     if (priceFinding !== null) findings.push(priceFinding);
     if (args.executorPaused !== true && args.executorPaused !== false) unverified.push('executor_paused');
     const present = [...findings, ...(pauseFinding === null ? [] : [pauseFinding]), ...(globalGasFinding === null ? [] : [globalGasFinding])];
-    const resolved = await resolveAlerts(args.query, present, args.now, notifications, unverified, relayerComplete && paymasterComplete ? [] : ['gas_low:-1']);
+    const resolved = await resolveAlerts(args.query, present, args.now, notifications, unverified, relayerComplete && paymasterComplete && keeperComplete ? [] : ['gas_low:-1']);
 
     if (findings.length === 0 && pauseFinding === null && globalGasFinding === null) {
       args.log(`[ALERT] ${seedCheckComplete ? '沒有警示' : '其他規則未偵測到警示'}${resolved > 0 ? `（已解除 ${resolved} 筆）` : ''}`);

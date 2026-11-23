@@ -4,7 +4,7 @@ import type { Address, Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import type { PriceSourceObservation } from './chain.js';
 import { getAccountGasBalance, getGasPriceWei } from './chain.js';
-import { DEFAULT_CHAIN_ID, loadRelayerGasConfig, loadPaymasterConfig } from './config.js';
+import { DEFAULT_CHAIN_ID, loadPriceKeeperGasConfig, loadRelayerGasConfig, loadPaymasterConfig } from './config.js';
 import type { PaymasterConfig } from './config.js';
 import { readPaymasterDeposit } from './paymaster.js';
 import { perOperationCostWei } from './funding.js';
@@ -61,6 +61,52 @@ export async function detectPaymasterLowGas(args: PaymasterGasChecks = {}): Prom
     } : null };
   } catch { throw new Error('paymaster 存款檢查失敗；本輪保留既有全域 gas_low 警示'); }
   finally { if (timer !== undefined) clearTimeout(timer); }
+}
+
+export type PriceKeeperGasChecks = {
+  env?: NodeJS.ProcessEnv;
+  readNativeBalance?: (address: Address) => Promise<bigint>;
+  timeoutMs?: number;
+};
+
+/**
+ * backend#213: the testnet price keeper pays its own gas. On 2026-11-22 it ran dry and stopped with RPC -32003
+ * (insufficient funds); feeds went stale and API deploys failed preflight before anyone noticed.
+ * `PRICE_KEEPER_MIN_GAS_WEI` defaults to 0.1 BNB, about one day of keeper usage at the observed rate
+ * (~180 tx/h × ~119k gas × 0.15 gwei ≈ 0.077 BNB/day). No `PRICE_KEEPER_ADDRESS` means no keeper to watch.
+ */
+export async function detectPriceKeeperLowGas(args: PriceKeeperGasChecks = {}): Promise<{ complete: boolean; finding: AlertFinding | null }> {
+  const env = args.env ?? process.env;
+  const address = env.PRICE_KEEPER_ADDRESS?.trim();
+  if (!address) return { complete: true, finding: null };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    if (!/^0x[0-9a-fA-F]{40}$/.test(address) || /^0x0{40}$/i.test(address)) throw new Error('invalid keeper address');
+    const minimum = loadPriceKeeperGasConfig(env).minPriceKeeperGasWei;
+    const timeoutMs = args.timeoutMs ?? 10_000;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new Error('invalid balance timeout');
+    const balance = await Promise.race([
+      (args.readNativeBalance ?? (async (keeper: Address) => {
+        const url = env.RPC_URL?.trim();
+        if (!url) throw new Error('missing RPC');
+        const client = createPublicClient({ transport: http(url, { timeout: timeoutMs, retryCount: 0 }) });
+        const expectedChain = Number(env.CHAIN_ID ?? DEFAULT_CHAIN_ID);
+        if (!Number.isSafeInteger(expectedChain) || expectedChain < 1 || await client.getChainId() !== expectedChain) throw new Error('RPC chain mismatch');
+        return client.getBalance({ address: keeper });
+      }))(address as Address),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('balance timeout')), timeoutMs); }),
+    ]);
+    if (typeof balance !== 'bigint' || balance < 0n) throw new Error('invalid balance');
+    return { complete: true, finding: balance < minimum ? {
+      kind: 'gas_low', severity: 'critical', portfolioId: null,
+      detail: 'price-keeper ' + address + '：BNB 餘額 ' + balance.toString() + ' wei，低於約一天用量 ' + minimum.toString() + ' wei，請補充行情 keeper gas',
+    } : null };
+  } catch {
+    // RPC errors can contain provider secrets; never include the original error.
+    throw new Error('price-keeper 餘額檢查失敗；本輪保留既有全域 gas_low 警示');
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 /** Unknown is distinct from healthy: callers must preserve the existing global gas_low finding. */

@@ -231,6 +231,11 @@ export function loadRelayerGasConfig(env: NodeJS.ProcessEnv = process.env): { mi
   return { minRelayerGasWei: parseBigInt(env, 'MIN_RELAYER_GAS_WEI', 10n ** 16n) };
 }
 
+/** backend#213: about one day of testnet price-keeper gas (0.1 BNB). */
+export function loadPriceKeeperGasConfig(env: NodeJS.ProcessEnv = process.env): { minPriceKeeperGasWei: bigint } {
+  return { minPriceKeeperGasWei: parseBigInt(env, 'PRICE_KEEPER_MIN_GAS_WEI', 10n ** 17n) };
+}
+
 export function loadAccountDeploymentConfig(env: NodeJS.ProcessEnv = process.env) {
   return {
     perDay: parseInteger(env, 'ACCOUNT_DEPLOYMENTS_PER_DAY', 300, { min: 0, max: 1_000_000 }),

@@ -10,6 +10,7 @@ import {
   paymasterSponsorsGas,
   detectRelayerLowGas,
   detectPaymasterLowGas,
+  detectPriceKeeperLowGas,
   detectPortfolioFailures,
   detectOperationReleases,
   detectSessionKeyExpiry,
@@ -1635,3 +1636,61 @@ async function assertRelayerNotifications(): Promise<void> {
     throw new Error('rollback relayer fixture');
   }), /rollback relayer fixture/);
 }
+
+const KEEPER_TEST_ADDRESS = '0xa38dDFB9FDF0043Cf61B00E1a8d12FA1431f92d5';
+
+test('#213 price-keeper wallet below about one day of gas is a critical gas_low; unset address is not watched', async () => {
+  assert.deepEqual(await detectPriceKeeperLowGas({ env: {}, readNativeBalance: async () => assert.fail('must not read') }), { complete: true, finding: null });
+  for (const balance of [0n, 10n ** 17n - 1n, 10n ** 17n, 10n ** 18n]) {
+    let reads = 0;
+    const result = await detectPriceKeeperLowGas({ env: { PRICE_KEEPER_ADDRESS: KEEPER_TEST_ADDRESS },
+      readNativeBalance: async address => { reads++; assert.equal(address, KEEPER_TEST_ADDRESS); return balance; } });
+    assert.equal(reads, 1); assert.equal(result.complete, true);
+    assert.equal(result.finding !== null, balance < 10n ** 17n, `default threshold is 0.1 BNB (${balance})`);
+    if (result.finding) {
+      assert.equal(result.finding.kind, 'gas_low'); assert.equal(result.finding.severity, 'critical'); assert.equal(result.finding.portfolioId, null);
+      assert.match(result.finding.detail, new RegExp(`^price-keeper ${KEEPER_TEST_ADDRESS}：BNB 餘額 ${balance} wei，低於約一天用量`));
+    }
+  }
+  assert.equal((await detectPriceKeeperLowGas({ env: { PRICE_KEEPER_ADDRESS: KEEPER_TEST_ADDRESS, PRICE_KEEPER_MIN_GAS_WEI: '100' },
+    readNativeBalance: async () => 99n })).finding?.detail.includes('100 wei'), true);
+  for (const fail of ['invalid', 'zero', 'rpc', 'timeout', 'negative']) await assert.rejects(detectPriceKeeperLowGas({
+    env: { PRICE_KEEPER_ADDRESS: fail === 'invalid' ? 'SECRET' : fail === 'zero' ? '0x' + '0'.repeat(40) : KEEPER_TEST_ADDRESS }, timeoutMs: 5,
+    readNativeBalance: async () => {
+      if (fail === 'timeout') return new Promise<never>(() => {});
+      if (fail === 'negative') return -1n;
+      throw new Error('SECRET');
+    },
+  }), (e: unknown) => e instanceof Error && /本輪保留/.test(e.message) && !e.message.includes('SECRET'));
+});
+
+test('#213 scheduler alert round records a low price-keeper wallet, keeps it while unreadable and resolves it once funded', async () => {
+  let balance = 0n, down = false;
+  const round = async () => {
+    const lines: string[] = [];
+    const { query, seen } = stubQuery(() => []);
+    await announceAlerts({ query, now: NOW, chainId: 97, log: (line) => lines.push(line),
+      relayerGasChecks: { env: { OPERATOR_ADDRESS: RELAYER_TEST_ADDRESS, MIN_RELAYER_GAS_WEI: '100' }, readNativeBalance: async () => 100n },
+      paymasterGasChecks: { env: {} },
+      priceKeeperGasChecks: { env: { PRICE_KEEPER_ADDRESS: KEEPER_TEST_ADDRESS }, readNativeBalance: async () => {
+        if (down) throw new Error('SECRET rpc');
+        return balance;
+      } } });
+    const insert = seen.find((entry) => entry.sql.includes('insert into scheduler_alerts') && entry.params[0] === 'gas_low');
+    const resolve = seen.find((entry) => entry.sql.includes('update scheduler_alerts') && entry.sql.includes('resolved_at'));
+    const kept = resolve !== undefined && Array.isArray(resolve.params[1]) && resolve.params[1].includes('gas_low:-1');
+    return { insert, kept, lines, resolve };
+  };
+  const low = await round();
+  assert.ok(low.insert, 'low keeper wallet is persisted as gas_low');
+  assert.ok(low.insert.params.some((param) => typeof param === 'string' && param.startsWith('price-keeper ' + KEEPER_TEST_ADDRESS)));
+  assert.ok(low.lines.some((line) => line.includes('price-keeper') && line.includes('critical')));
+  down = true;
+  const unknown = await round();
+  assert.equal(unknown.insert, undefined); assert.equal(unknown.kept, true, 'an unreadable keeper balance never resolves gas_low');
+  assert.ok(unknown.lines.includes('[ALERT] price-keeper 餘額檢查失敗；本輪保留既有全域 gas_low 警示'));
+  assert.doesNotMatch(unknown.lines.join('\n'), /SECRET/);
+  down = false; balance = 10n ** 17n;
+  const funded = await round();
+  assert.ok(funded.resolve); assert.equal(funded.insert, undefined); assert.equal(funded.kept, false, 'funded keeper lets the round resolve gas_low');
+});

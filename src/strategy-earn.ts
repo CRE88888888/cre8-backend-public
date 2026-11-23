@@ -9,6 +9,7 @@ import { requireOwnedPortfolio } from './portfolios.js';
 import { TESTNET_97 } from './testnet-profile.js';
 import { STRATEGY_EARN_97 } from './strategy-earn-guard.js';
 import { borrowAuthorized } from './permissions.js';
+import { rpcTransport } from './rpc-transport.js';
 export { STRATEGY_EARN_97, assertNotStrategyVault, isStrategyVault } from './strategy-earn-guard.js';
 
 /**
@@ -211,7 +212,7 @@ export function defaultStrategyEarnChain(): StrategyEarnChain {
   if (cachedChain) return cachedChain;
   const rpc = getConfig().rpcUrl;
   if (!rpc) throw new Error('rpc unavailable');
-  cachedChain = createStrategyEarnChain(createPublicClient({ chain: bscTestnet, transport: http(rpc, { retryCount: 1, timeout: 8_000 }) }) as PublicClient);
+  cachedChain = createStrategyEarnChain(createPublicClient({ chain: bscTestnet, transport: rpcTransport('strategy-earn', rpc, { retryCount: 1, timeout: 8_000 }) }) as PublicClient);
   return cachedChain;
 }
 
@@ -411,8 +412,8 @@ export function strategyKeeperWriter(env: NodeJS.ProcessEnv = process.env): Stra
   const rpc = env.RPC_URL?.trim();
   if (!rpc) throw new Error('RPC_URL is required for the strategy earn keeper');
   const account = privateKeyToAccount(raw as Hex);
-  const wallet = createWalletClient({ account, chain: bscTestnet, transport: http(rpc, { retryCount: 1, timeout: 15_000 }) });
-  const pub = createPublicClient({ chain: bscTestnet, transport: http(rpc, { retryCount: 1, timeout: 15_000 }) });
+  const wallet = createWalletClient({ account, chain: bscTestnet, transport: rpcTransport('strategy-earn', rpc, { retryCount: 1, timeout: 15_000 }) });
+  const pub = createPublicClient({ chain: bscTestnet, transport: rpcTransport('strategy-earn', rpc, { retryCount: 1, timeout: 15_000 }) });
   const send = async (to: Address, data: Hex): Promise<StrategyEarnTx> => {
     const hash = await wallet.sendTransaction({ to, data, gas: 1_500_000n, gasPrice: await pub.getGasPrice() });
     const receipt = await pub.waitForTransactionReceipt({ hash, timeout: 60_000 });

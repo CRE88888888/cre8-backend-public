@@ -21,6 +21,7 @@ import { TESTNET_97 } from './testnet-profile.js';
 import { assetsMarketOpen } from './trading-calendar.js';
 import type { SavedYieldOperation, YieldEvidence, YieldOperationJournal, YieldPlan, YieldReceiptResult, YieldSubmitArgs } from './yield-execution.js';
 import { yieldSessionAvailable } from './yield-session.js';
+import { rpcTransport } from './rpc-transport.js';
 
 /**
  * DCA (定投, docs/dca.zh-TW.md, db 0064). The user moves the whole total into the portfolio's own smart account,
@@ -126,7 +127,7 @@ function liveClient(): PublicClient {
   if (cachedClient) return cachedClient;
   const rpc = getConfig().rpcUrl;
   if (!rpc) throw new AppError(503, 'DCA_UNAVAILABLE', TEMPORARILY);
-  cachedClient = createPublicClient({ chain: bscTestnet, transport: http(rpc, { retryCount: 1, timeout: 8_000 }) }) as PublicClient;
+  cachedClient = createPublicClient({ chain: bscTestnet, transport: rpcTransport('dca', rpc, { retryCount: 1, timeout: 8_000 }) }) as PublicClient;
   return cachedClient;
 }
 function defaults(): DcaDeps {

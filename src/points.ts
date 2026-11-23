@@ -8,6 +8,7 @@ import { getPool, query, withTransaction } from './db.js';
 import { AppError } from './errors.js';
 import { kernelAddressesForChain } from './addresses.js';
 import { testnetAssets } from './testnet-profile.js';
+import { rpcTransport } from './rpc-transport.js';
 
 type Task = Exclude<PointsKind, 'invite_reward'>;
 export type PointsOperation = { owner: string; chainId: number; kind: Task; txHash: Hex; logIndex: number; occurredAt: Date };
@@ -317,7 +318,7 @@ export type PointsReader = {
   owner: (account: Address, block: bigint) => Promise<{ root: string; owner: string }>;
 };
 function chainReader(c: PointsConfig): PointsReader {
-  const client: PublicClient = createPublicClient({ transport: http(c.rpcUrl, { retryCount: 0, timeout: c.timeoutMs }) });
+  const client: PublicClient = createPublicClient({ transport: rpcTransport('points', c.rpcUrl, { retryCount: 0, timeout: c.timeoutMs }) });
   const validator = kernelAddressesForChain(c.chainId).ecdsaValidatorV31;
   return {
     chainId: () => client.getChainId(), head: () => client.getBlockNumber({ cacheTime: 0 }),

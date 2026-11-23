@@ -39,6 +39,7 @@ import { getConfig, requireSessionKeyConfig } from '../src/config.js';
 import { query } from '../src/db.js';
 import { inspectSessionKeyDerivation, sessionKeyDerivationDetail } from '../src/scheduler.js';
 import type { SessionKeyDerivationReport } from '../src/scheduler.js';
+import { rpcTransport, secondaryRpc } from '../src/rpc-transport.js';
 
 const USDT_ADDRESS: Address = '0x55d398326f99059fF775485246999027B3197955';
 
@@ -506,7 +507,20 @@ async function main(): Promise<number> {
   }
 
   const chain = activeChain();
-  const client = createPublicClient({ chain, transport: http(rpcUrl) });
+  // The services read through the same primary + public fallback (src/rpc-transport.ts): a quota or rate limit on
+  // RPC_URL is a warning, not a failed deploy, as long as one transport answers.
+  const client = createPublicClient({ chain, transport: rpcTransport('preflight', rpcUrl) });
+  try {
+    await createPublicClient({ chain, transport: http(rpcUrl, { retryCount: 0, timeout: 10_000 }) }).getBlockNumber();
+  } catch (cause) {
+    const secondary = secondaryRpc(rpcUrl, expectedChain);
+    if (secondary === null) {
+      fail('RPC 連線', oneLine(cause), '確認 RPC_URL 可達');
+      print();
+      return 1;
+    }
+    warn('RPC_URL（主要）', `讀不到：${oneLine(cause)}`, '服務會自動改走公開節點；確認 RPC_URL 額度或金鑰');
+  }
 
   try {
     const actualChainId = await client.getChainId();

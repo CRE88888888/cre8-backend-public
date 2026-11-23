@@ -16,6 +16,7 @@ import { validateRelayerTransaction } from './relayer-outbox.js';
 import { outboxIdentity, saveOutboxIdentity, saveOutboxConsumption } from './relayer-nonce-consumption.js';
 import type { FundingNonceConsumption } from './relayer-nonce-consumption.js';
 import { recordAlerts, welcomeNonceConsumedAlert } from './alerts.js';
+import { rpcTransport } from './rpc-transport.js';
 
 export const WELCOME_ABI = parseAbi([
   'function welcomeFor(address to)',
@@ -110,7 +111,7 @@ export async function settleWelcomeGrant(grant: WelcomeGrant, state: WelcomeStat
 export async function readWelcomeFundingEvidence(grant: { chainId: number; account: Address; amountWei: bigint; txHash: Hex }, suppliedClient?: PublicClient, operator: Address = TESTNET_97.roles.operator): Promise<FaucetFundingEvidence> {
   try {
     if (grant.chainId !== 97 || grant.amountWei !== WELCOME_AMOUNT_WEI) throw new AppError(400, 'FUNDING_SOURCE_DISABLED', 'welcome requires chain 97 and exactly 10000 test USDT');
-    const client = suppliedClient ?? createPublicClient({ transport: http(getConfig().rpcUrl ?? undefined, { timeout: 5_000, retryCount: 0 }) });
+    const client = suppliedClient ?? createPublicClient({ transport: rpcTransport('welcome-grants', getConfig().rpcUrl ?? undefined, { timeout: 5_000, retryCount: 0 }) });
     if (!suppliedClient && !getConfig().rpcUrl || await client.getChainId() !== 97) throw new Error('wrong RPC chain');
     const [receipt, tx] = await Promise.all([client.getTransactionReceipt({ hash: grant.txHash }), client.getTransaction({ hash: grant.txHash })]);
     if (receipt.transactionHash.toLowerCase() !== grant.txHash || tx.hash.toLowerCase() !== grant.txHash ||
@@ -150,7 +151,7 @@ async function prepareWelcome(grant: WelcomeGrant, c: WelcomeConfig): Promise<Pr
   if (!config.rpcUrl || !config.operatorPrivateKey || !/^0x[0-9a-fA-F]{64}$/.test(config.operatorPrivateKey)) throw new Error('operator unavailable');
   const operator = privateKeyToAccount(config.operatorPrivateKey as Hex);
   if (operator.address.toLowerCase() !== TESTNET_97.roles.operator) throw new Error('operator mismatch');
-  const transport = http(config.rpcUrl, { retryCount: 0, timeout: c.timeoutMs });
+  const transport = rpcTransport('welcome-grants', config.rpcUrl, { retryCount: 0, timeout: c.timeoutMs });
   const client = createPublicClient({ chain: bscTestnet, transport });
   if (await client.getChainId() !== 97 || !await client.readContract({ address: TESTNET_97.contracts.usdt, abi: WELCOME_ABI, functionName: 'isFaucet', args: [operator.address] })) throw new Error('operator not authorized');
   const wallet = createWalletClient({ account: operator, chain: bscTestnet, transport });

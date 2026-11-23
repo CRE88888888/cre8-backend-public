@@ -14,6 +14,7 @@ import { AppError } from './errors.js';
 import { TESTNET_97 } from './testnet-profile.js';
 import { saveRelayerTransaction, validateRelayerTransaction } from './relayer-outbox.js';
 import type { SignedSubmission } from './relayer-outbox.js';
+import { rpcTransport } from './rpc-transport.js';
 
 export const FAUCET_ABI = parseAbi([
   'function claimFor(address to, uint256 amount)',
@@ -111,7 +112,7 @@ async function prepareClaim(claim: FaucetClaim, c: FaucetConfig): Promise<Prepar
   if (!/^0x[0-9a-fA-F]{64}$/.test(key)) throw new Error('faucet operator unavailable');
   const operator = privateKeyToAccount(key as Hex);
   if (operator.address.toLowerCase() !== TESTNET_97.roles.operator) throw new Error('faucet operator mismatch');
-  const transport = http(config.rpcUrl, { retryCount: 0, timeout: c.timeoutMs });
+  const transport = rpcTransport('faucet', config.rpcUrl, { retryCount: 0, timeout: c.timeoutMs });
   const client = createPublicClient({ chain: bscTestnet, transport });
   const wallet = createWalletClient({ account: operator, chain: bscTestnet, transport });
   await checkFaucetRecipient(client, operator.address, claim);
@@ -178,7 +179,7 @@ export async function readFaucetFundingEvidence(claim: Pick<FaucetClaim, 'chainI
     if (claim.chainId !== 97) throw new AppError(400, 'FUNDING_SOURCE_DISABLED', 'faucet funding is only available on chain 97');
     const config = getConfig();
     if (!suppliedClient && !config.rpcUrl) throw new Error('missing RPC');
-    const client = suppliedClient ?? createPublicClient({ transport: http(config.rpcUrl ?? undefined, { timeout: 5_000, retryCount: 0 }) });
+    const client = suppliedClient ?? createPublicClient({ transport: rpcTransport('faucet', config.rpcUrl ?? undefined, { timeout: 5_000, retryCount: 0 }) });
     if (await client.getChainId() !== 97) throw new Error('wrong RPC chain');
     const receipt = await client.getTransactionReceipt({ hash: claim.txHash });
     if (receipt.status !== 'success' || receipt.transactionHash.toLowerCase() !== claim.txHash || receipt.blockNumber < 0n || !/^0x[0-9a-f]{64}$/.test(receipt.blockHash)) {

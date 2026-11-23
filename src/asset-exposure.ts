@@ -8,6 +8,7 @@ import type { PriceableAsset } from './positions.js';
 import { exactKeys, record } from './strategy-execution.js';
 import type { AssetExecution } from './strategy-execution.js';
 import { testnetAssets } from './testnet-profile.js';
+import { rpcTransport } from './rpc-transport.js';
 
 type Query = (sql: string, params?: readonly unknown[]) => Promise<{ rows: unknown[] }>;
 export type AssetExposure = {
@@ -93,7 +94,7 @@ async function readExposure(strategyId: number, chainId: number, assets: readonl
       const observe = async () => {
         const config = deps.client ? null : getConfig();
         if (!deps.client && !config?.rpcUrl) throw unavailable();
-        const client = deps.client ?? createPublicClient({ transport: http(config?.rpcUrl ?? undefined, { timeout: 5000, retryCount: 0 }) });
+        const client = deps.client ?? createPublicClient({ transport: rpcTransport('asset-exposure', config?.rpcUrl ?? undefined, { timeout: 5000, retryCount: 0 }) });
         if (await client.getChainId() !== chainId) throw unavailable();
         const block = await client.getBlockNumber({ cacheTime: 0 });
         const seen = new Set<string>();

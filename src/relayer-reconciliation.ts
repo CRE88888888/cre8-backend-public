@@ -15,6 +15,7 @@ import { getChain } from './chain.js';
 import type { ChainConfig } from './chain.js';
 import { TESTNET_97 } from './testnet-profile.js';
 import { outboxIdentity, findOutboxConsumption, verifyOutboxConsumption, checkOutboxNonceHistory } from './relayer-nonce-consumption.js';
+import { rpcTransport } from './rpc-transport.js';
 
 type Pending = { kind: 'welcome' | 'faucet'; id: string; chain_id: string; day: string; owner: Address; account: Address;
   amount_wei: string; state: 'submitted' | 'unknown'; tx_hash: Hex; signed_raw_tx: Hex | null };
@@ -51,7 +52,7 @@ export async function reconcileRelayerTransactions(options: Options = {}) {
   if (!options.client && config.chainId !== 97) return counts;
   const timeoutMs = options.timeoutMs ?? 5000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new Error('invalid reconciliation timeout');
-  const client = options.client ?? options.chain?.publicClient ?? createPublicClient({ transport: http(config.rpcUrl ?? undefined, { timeout: timeoutMs, retryCount: 0 }) });
+  const client = options.client ?? options.chain?.publicClient ?? createPublicClient({ transport: rpcTransport('relayer-reconciliation', config.rpcUrl ?? undefined, { timeout: timeoutMs, retryCount: 0 }) });
   let recoveries: string[] = [];
   await withRelayerLock(97, async held => {
     // Snapshot ONLY previously committed prepared attempts. A consumption or an

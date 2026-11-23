@@ -7,6 +7,7 @@ import type { Config, GasFaucetConfig } from './config.js';
 import { AppError } from './errors.js';
 import { RequestRateLimiter } from './ratelimit.js';
 import { withRelayerLock, relayerNonce } from './relayer-lock.js';
+import { rpcTransport } from './rpc-transport.js';
 
 type PreparedTransfer = { hash: Hex; broadcast: () => Promise<void>;
   receipt: () => Promise<{ status: string; transactionHash: string }> };
@@ -23,7 +24,7 @@ export function createGasFaucetChain(c: GasFaucetConfig,
   config: Pick<Config, 'chainId' | 'rpcUrl' | 'operatorPrivateKey'> = getConfig()): GasFaucetChain {
   if (config.chainId !== 97 || !config.rpcUrl || !config.operatorPrivateKey || !/^0x[0-9a-fA-F]{64}$/.test(config.operatorPrivateKey)) throw unavailable();
   const operator = privateKeyToAccount(config.operatorPrivateKey as Hex);
-  const transport = http(config.rpcUrl, { retryCount: 0, timeout: c.timeoutMs });
+  const transport = rpcTransport('gas-faucet', config.rpcUrl, { retryCount: 0, timeout: c.timeoutMs });
   const client = createPublicClient({ chain: bscTestnet, transport });
   const wallet = createWalletClient({ account: operator, chain: bscTestnet, transport });
   return { chainId: () => client.getChainId(), balance: owner => client.getBalance({ address: owner }),

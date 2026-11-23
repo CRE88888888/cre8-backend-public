@@ -9,6 +9,7 @@ import type { YieldMarket, YieldProtocol } from './yield-domain.js';
 import { TESTNET_97 } from './testnet-profile.js';
 import { retryWhileLagging } from './node-lag.js';
 import type { NodeLagOptions } from './node-lag.js';
+import { rpcTransport } from './rpc-transport.js';
 
 /**
  * Cash Earn (backend#193, docs/EARN_UX A/D). The owner's wallet holds the vault position directly:
@@ -318,7 +319,7 @@ export function createCashEarn(overrides: Partial<CashEarnDeps> = {}) {
       if (cached) return cached;
       const rpc = getConfig().rpcUrl;
       if (!rpc) throw unavailable();
-      cached = createCashEarnChain(createPublicClient({ chain: bscTestnet, transport: http(rpc, { retryCount: 1, timeout: 8_000 }) }) as PublicClient);
+      cached = createCashEarnChain(createPublicClient({ chain: bscTestnet, transport: rpcTransport('cash-earn', rpc, { retryCount: 1, timeout: 8_000 }) }) as PublicClient);
       return cached;
     },
     ...overrides,

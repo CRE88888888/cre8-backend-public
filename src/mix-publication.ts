@@ -444,7 +444,7 @@ export async function reconcileMixPublication(id: string, deps: PublicationDeps,
       const sent = await attempt(job, deps); if (!sent) throw mixUnavailable();
       let proof = await receipt(job, sent, deps);
       if (!proof) {
-        try { await bounded(deps.client.waitForTransactionReceipt({ hash: sent.tx_hash, timeout: deps.timeoutMs ?? 5000, pollingInterval: 100 }), deps); }
+        try { await bounded(deps.client.waitForTransactionReceipt({ hash: sent.tx_hash, timeout: deps.timeoutMs ?? 5000, pollingInterval: 500 }), deps); }
         catch (error) { await mark(job, deps, 'PUBLICATION_RECEIPT_PENDING'); return unresolved('receipt-wait-timeout', error); }
       }
       // Our own transaction is included (one node returned its receipt). A load-balanced RPC may route the next reads

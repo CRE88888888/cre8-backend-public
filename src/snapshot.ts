@@ -65,6 +65,7 @@ const E8_TO_E18 = 10n ** 10n;
 
 /** 只用到兩個 view，但兩者的回傳形狀不同（struct vs 攤平），照合約定義寫清楚。 */
 import { REGISTRY_ABI as ENROLLMENT_ABI, REGISTRY_VERSION_ABI } from './registry-abi.js';
+import { rpcTransport } from './rpc-transport.js';
 const REGISTRY_ABI = [...ENROLLMENT_ABI, ...REGISTRY_VERSION_ABI] as const;
 
 const SQL_PORTFOLIO = `
@@ -304,7 +305,7 @@ async function loadPriceTable(query: QueryFn, chainId: number): Promise<Map<stri
 function defaultPublicClient(): PublicClient {
   const { rpcUrl } = getConfig();
   if (!rpcUrl) throw new Error('chain 未設定：RPC_URL 是讀持倉與 enrollment 的必要條件');
-  return createPublicClient({ chain: activeChain(), transport: http(rpcUrl) });
+  return createPublicClient({ chain: activeChain(), transport: rpcTransport('snapshot', rpcUrl) });
 }
 
 /**

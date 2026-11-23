@@ -6,6 +6,7 @@ import { query, withTransaction } from './db.js';
 import { AppError } from './errors.js';
 import { TESTNET_97 } from './testnet-profile.js';
 import { readYieldState, writeYieldState } from './yield-runtime-state.js';
+import { rpcTransport } from './rpc-transport.js';
 
 export type ExitFacts={chainId:number;account:Address;userOpHash:Hex;executionKey:string;nonce:string;validUntil:number;purpose:string};
 export type ExpiredExitProof={facts:ExitFacts;blockNumber:string;blockHash:Hex;blockTimestamp:number;checkedAt:number;operator:string;reference:string};
@@ -83,7 +84,7 @@ export async function expiredExitProofs(c:ReadConfig,account:Address,db:Query=qu
     const keys=new Set(locks.map(row=>record(row).execution_key));
     const entries=await pending(c.chainId,account,db),now=Math.floor(Date.now()/1000);
     const exits=entries?.filter(e=>keys.has(e.facts.executionKey)&&e.facts.purpose==='exit'&&e.facts.validUntil<now)??[];if(!exits.length)return[];
-    const client=createPublicClient({transport:http(c.rpcUrl,{timeout:c.timeoutMs,retryCount:0})});
+    const client=createPublicClient({transport:rpcTransport('paymaster-exit-reconciliation', c.rpcUrl,{timeout:c.timeoutMs,retryCount:0})});
     const block=await client.getBlock({blockTag:'finalized'});
     if(await client.getChainId()!==97||block.number===null||block.hash===null||block.timestamp>BigInt(now))throw fail();
     const proofs:ExpiredExitProof[]=[];

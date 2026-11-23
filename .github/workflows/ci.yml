@@ -135,6 +135,7 @@ jobs:
           test/strategy-cash-row.test.ts
           test/strategy-earn-sponsor.test.ts
           test/sponsor-flows.test.ts
+          test/rpc-transport.test.ts
           test/withdrawal-scan-cache.test.ts
           test/mix-node-lag.test.ts
           test/reconcile-identity.test.ts

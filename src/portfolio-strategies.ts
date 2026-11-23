@@ -23,6 +23,7 @@ import { readAccountCash } from './chain.js';
 import { defaultAmountUsdt, exactKeys, minimumAllocationRaw, record, usdtRaw, utcDate, CONTRIBUTION_FEE_RESERVE_RAW, minimumAssetContribution, minimumDcaTranche, numeraireFor } from './strategy-execution.js';
 import type { AssetExecution } from './strategy-execution.js';
 import { reservedCash, withdrawableCash } from './withdrawable-cash.js';
+import { rpcTransport } from './rpc-transport.js';
 
 export type FundingSource = { kind: 'faucet_claim'; claimId: string } | { kind: 'welcome_grant'; grantId: string }
   | { kind: 'wallet_transfer'; txHash: Hex }
@@ -36,7 +37,7 @@ export async function readWalletFundingEvidence(input: { chainId: number; owner:
     const txHash = fundingHash(input.txHash);
     const rpcUrl = suppliedClient ? undefined : getConfig().rpcUrl;
     if (!suppliedClient && !rpcUrl) throw new Error('missing RPC');
-    const client = suppliedClient ?? createPublicClient({ transport: http(rpcUrl ?? undefined, { timeout: 5_000, retryCount: 0 }) });
+    const client = suppliedClient ?? createPublicClient({ transport: rpcTransport('portfolio-strategies', rpcUrl ?? undefined, { timeout: 5_000, retryCount: 0 }) });
     if (await client.getChainId() !== 97) throw new Error('wrong RPC chain');
     const receipt = await client.getTransactionReceipt({ hash: txHash });
     if (receipt.status !== 'success' || receipt.transactionHash.toLowerCase() !== txHash || receipt.blockNumber < 0n || !/^0x[0-9a-f]{64}$/.test(receipt.blockHash)) {
@@ -305,6 +306,8 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
         values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13,$14,$15,$16,$17,$18,$19) on conflict(chain_id,tx_hash,log_index) do nothing returning *`,
         [p.chainId, id, p.strategyId, p.version, kind, evidence.txHash, evidence.logIndex, evidence.blockNumber.toString(), evidence.blockHash, evidence.amountRaw, contribution?.minimum.toString() ?? null, contribution ? JSON.stringify(contribution.effectiveSlices) : null, confirmedAt, source.kind === 'wallet_transfer' || source.kind === 'dca_tranche' ? null : source.kind, source.kind === 'faucet_claim' ? source.claimId : null, source.kind === 'welcome_grant' ? source.grantId : null,
           allocation?.effectiveAllocation ? JSON.stringify(allocation.effectiveAllocation) : null, allocation?.allocationReason ?? 'version', JSON.stringify(allocation?.cappedAssets ?? [])]);
+      // New money wakes an idle-backed-off portfolio (scheduler IDLE_BACKOFF_SECONDS) for the next round.
+      if (inserted.rows.length === 1) await client.query('update portfolios set next_run_at=null where id=$1', [id]);
       const lot = (await client.query<LotRow>('select * from strategy_funding_lots where chain_id=$1 and tx_hash=$2 and log_index=$3',
         [p.chainId, evidence.txHash, evidence.logIndex])).rows[0];
       if (!lot || Number(lot.portfolio_id) !== id || Number(lot.strategy_id) !== p.strategyId || lot.version !== p.version || lot.kind !== kind ||

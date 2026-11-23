@@ -118,6 +118,7 @@ import type { Address, Hex, PublicClient } from 'viem';
 import { hdKeyToAccount } from 'viem/accounts';
 import { createBundlerClient, entryPoint07Abi, formatUserOperation, formatUserOperationReceipt, getUserOperationHash } from 'viem/account-abstraction';
 import type { GetUserOperationReturnType, UserOperationReceipt } from 'viem/account-abstraction';
+import { rpcTransport } from './rpc-transport.js';
 import { activeChain } from './chain-object.js';
 import { testnetAssets, TESTNET_97 } from './testnet-profile.js';
 import { signPreparedOperation } from './user-operation.js';
@@ -434,6 +435,12 @@ export type PortfolioOutcome = 'noop' | 'blocked' | 'ready-dry-run' | 'executed'
  * 為什麼 `min(intervalSeconds, …)`：排程週期本來就比 30 分鐘短的策略不該被**延後**。
  */
 export const PARTIAL_FOLLOW_UP_SECONDS = 1800;
+/**
+ * Idle back-off (2026-11-23: the RPC quota burned in hours, every portfolio did a full read round every minute).
+ * A per-asset round with nothing to do waits this long before its next round. New money wakes the portfolio at once
+ * (funding sets next_run_at=null), and the buy route runs its own round.
+ */
+export const IDLE_BACKOFF_SECONDS = 300;
 
 
 /** 準備要執行的參數摘要：dry-run 與 live 都會有，差別只在有沒有 `execution`。 */
@@ -1665,7 +1672,7 @@ function defaultPublicClient(): PublicClient {
   if (rpcUrl === null) {
     throw new Error('chain 未設定：排程器要讀鏈（RPC_URL 是空的——空字串等於沒設，見 docs/pitfalls §8.12）');
   }
-  cachedPublicClient = createPublicClient({ chain: activeChain(), transport: http(rpcUrl) });
+  cachedPublicClient = createPublicClient({ chain: activeChain(), transport: rpcTransport('scheduler', rpcUrl) });
   return cachedPublicClient;
 }
 
@@ -2392,6 +2399,14 @@ async function runOne(
         result = { ...result, reason: `${result.reason}；${note}（但寫回失敗：${oneLine(error)}）` };
       }
     }
+    }
+  }
+
+  if (!ctx.dryRun && due.executionKind !== undefined && result.outcome === 'noop' && ctx.forcePlan !== true) {
+    const idleAt = new Date(ctx.now.getTime() + IDLE_BACKOFF_SECONDS * 1_000);
+    if (idleAt.getTime() > result.nextRunAt.getTime()) {
+      try { await ctx.deps.query(SQL_ADVANCE_CLAIMED, [[due.portfolioId], [idleAt.toISOString()]]); result = { ...result, nextRunAt: idleAt }; }
+      catch { /* keep the claimed interval */ }
     }
   }
 

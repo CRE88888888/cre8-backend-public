@@ -53,6 +53,7 @@ import {
   runOperatorRebalance,
 } from './operator.js';
 import type { OperatorActivityRow, OperatorPlanPreview, OperatorRebalanceResult, PortfolioStatusReader } from './operator.js';
+import { rpcTransport } from './rpc-transport.js';
 
 /** Hard cap on request bodies: strategy payloads are small; anything bigger is a mistake or an attack. */
 const MAX_BODY_BYTES = 1_000_000;
@@ -309,7 +310,7 @@ async function defaultListAssets(): Promise<PriceableAsset[]> {
     if (config.rpcUrl !== null && executor !== null) {
       if (assetProbeCache === undefined || assetProbeCache.chainId !== config.chainId ||
           assetProbeCache.rpcUrl !== config.rpcUrl || assetProbeCache.executor !== executor) {
-        const client = createPublicClient({ chain: activeChain(), transport: http(config.rpcUrl) });
+        const client = createPublicClient({ chain: activeChain(), transport: rpcTransport('server', config.rpcUrl) });
         assetProbeCache = {
           chainId: config.chainId, rpcUrl: config.rpcUrl, executor,
           read: createTradableProbeCache(async () => {

@@ -9,6 +9,7 @@ import type { PaymasterConfig } from './config.js';
 import { readPaymasterDeposit } from './paymaster.js';
 import { perOperationCostWei } from './funding.js';
 import { sendTelegram } from './notify.js';
+import { rpcTransport } from './rpc-transport.js';
 
 /**
  * 排程器的告警。不靠 process 記憶體；seed 比對由 scheduler 使用同一套 key 選擇規則補入。
@@ -89,7 +90,7 @@ export async function detectPriceKeeperLowGas(args: PriceKeeperGasChecks = {}): 
       (args.readNativeBalance ?? (async (keeper: Address) => {
         const url = env.RPC_URL?.trim();
         if (!url) throw new Error('missing RPC');
-        const client = createPublicClient({ transport: http(url, { timeout: timeoutMs, retryCount: 0 }) });
+        const client = createPublicClient({ transport: rpcTransport('alerts', url, { timeout: timeoutMs, retryCount: 0 }) });
         const expectedChain = Number(env.CHAIN_ID ?? DEFAULT_CHAIN_ID);
         if (!Number.isSafeInteger(expectedChain) || expectedChain < 1 || await client.getChainId() !== expectedChain) throw new Error('RPC chain mismatch');
         return client.getBalance({ address: keeper });
@@ -132,7 +133,7 @@ export async function detectRelayerLowGas(args: RelayerGasChecks = {}): Promise<
       (args.readNativeBalance ?? (async (address: Address) => {
         const url = env.RPC_URL?.trim();
         if (!url) throw new Error('missing RPC');
-        const client = createPublicClient({ transport: http(url, { timeout: timeoutMs, retryCount: 0 }) });
+        const client = createPublicClient({ transport: rpcTransport('alerts', url, { timeout: timeoutMs, retryCount: 0 }) });
         const expectedChain = Number(env.CHAIN_ID ?? DEFAULT_CHAIN_ID);
         if (!Number.isSafeInteger(expectedChain) || expectedChain < 1 || await client.getChainId() !== expectedChain) throw new Error('RPC chain mismatch');
         return client.getBalance({ address });

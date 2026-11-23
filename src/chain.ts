@@ -44,12 +44,13 @@ import { enrollmentApprovalHash, p11Error, registryConfigHash } from './registry
 import type { VersionSettings } from './registry-versioning.js';
 import { retryWhileLagging } from './node-lag.js';
 import type { NodeLagOptions } from './node-lag.js';
+import { rpcTransport } from './rpc-transport.js';
 
 export async function readAccountCash(chainId: number, account: Address, suppliedClient?: PublicClient) {
   try {
     const config = getConfig();
     if (!suppliedClient && !config.rpcUrl) throw new Error('missing RPC');
-    const client = suppliedClient ?? createPublicClient({ transport: http(config.rpcUrl ?? undefined, { retryCount: 0, timeout: 5_000 }) });
+    const client = suppliedClient ?? createPublicClient({ transport: rpcTransport('chain', config.rpcUrl ?? undefined, { retryCount: 0, timeout: 5_000 }) });
     if (await client.getChainId() !== chainId) throw new Error('wrong chain');
     const block = await client.getBlock({ blockTag: 'latest' });
     if (block.number === null || block.hash === null) throw new Error('missing block');
@@ -72,7 +73,7 @@ export async function assertVersionOnchain(onchainId: number, version: number,
     const config = getConfig();
     const registry = deps.registry ?? config.registryAddress;
     if (!registry || (!deps.client && !config.rpcUrl)) throw new Error('missing chain');
-    const client = deps.client ?? createPublicClient({ transport: http(config.rpcUrl ?? undefined, { retryCount: 0, timeout: 5_000 }) });
+    const client = deps.client ?? createPublicClient({ transport: rpcTransport('chain', config.rpcUrl ?? undefined, { retryCount: 0, timeout: 5_000 }) });
     if (await client.getChainId() !== expected.chainId) throw new Error('wrong chain');
     const block = await client.getBlock(deps.blockNumber === undefined ? { blockTag: 'latest' } : { blockNumber: deps.blockNumber });
     if (block.number === null || block.hash === null || (deps.blockNumber !== undefined && block.number !== deps.blockNumber)) throw new Error('missing block');
@@ -236,7 +237,7 @@ export function createPlatformStatusReader(deps: {
       if (!config.rpcUrl || !config.executor || !config.registry ||
           config.executor === zeroAddress || config.registry === zeroAddress) return unavailable;
       const client = deps.publicClient ?? createPublicClient({
-        transport: http(config.rpcUrl, { timeout: PLATFORM_STATUS_RPC_TIMEOUT_MS, retryCount: 0 }),
+        transport: rpcTransport('chain', config.rpcUrl, { timeout: PLATFORM_STATUS_RPC_TIMEOUT_MS, retryCount: 0 }),
       });
       const [chainId, block] = await Promise.all([
         client.getChainId(),
@@ -318,7 +319,7 @@ export function getChain(): ChainConfig {
     throw new Error('chain is not configured: REGISTRY_ADDRESS is required for on-chain operations');
   }
 
-  const publicClient = createPublicClient({ chain: activeChain(), transport: http(config.rpcUrl) });
+  const publicClient = createPublicClient({ chain: activeChain(), transport: rpcTransport('chain', config.rpcUrl) });
   // operator 只在真的要用 `account`／`wallet` 送交易時才需要。scheduler 刻意不放 OPERATOR_PRIVATE_KEY，
   // 但私人組合的對帳只讀鏈（publicClient、registryAddress），之前一律要求金鑰，組合每輪都被擋（tst 2026-11-21）。
   const operatorKey = config.operatorPrivateKey;
@@ -328,7 +329,7 @@ export function getChain(): ChainConfig {
     if (!operatorKey) throw new Error('chain is not configured: OPERATOR_PRIVATE_KEY is required for on-chain operations');
     if (operator === null) {
       const account = privateKeyToAccount(ensureHex(operatorKey));
-      operator = { account, wallet: createWalletClient({ chain: activeChain(), transport: http(rpcUrl), account }) };
+      operator = { account, wallet: createWalletClient({ chain: activeChain(), transport: rpcTransport('chain', rpcUrl), account }) };
     }
     return operator;
   };

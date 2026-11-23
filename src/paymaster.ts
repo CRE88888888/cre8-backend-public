@@ -33,6 +33,7 @@ import { fresh } from './yield-domain.js';
 import { dcaVaultCall, dcaVaults, isDcaSpender } from './dca-calls.js';
 import { writeYieldState } from './yield-runtime-state.js';
 import { reservedCash } from './withdrawable-cash.js';
+import { rpcTransport } from './rpc-transport.js';
 
 export type PackedSponsorOperation = {
   sender: Address; nonce: bigint; initCode: Hex; callData: Hex; accountGasLimits: Hex;
@@ -862,7 +863,7 @@ async function bounded<T>(work: Promise<T>, ms: number): Promise<T> {
   try { return await Promise.race([work, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(rejected('PAYMASTER_DEPENDENCY_UNAVAILABLE', 503)), ms); })]); }
   finally { if (timer !== undefined) clearTimeout(timer); }
 }
-function rpc(c: PaymasterConfig) { return createPublicClient({ transport: http(c.rpcUrl, { timeout: c.timeoutMs, retryCount: 0 }) }); }
+function rpc(c: PaymasterConfig) { return createPublicClient({ transport: rpcTransport('paymaster', c.rpcUrl, { timeout: c.timeoutMs, retryCount: 0 }) }); }
 export async function readPaymasterDeposit(c: PaymasterConfig): Promise<bigint> {
   const client = rpc(c);
   if (await client.getChainId() !== c.chainId) throw rejected('PAYMASTER_CHAIN_MISMATCH', 503);

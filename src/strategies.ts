@@ -13,6 +13,7 @@ import type { FundingSchedule, TypedExecution } from './strategy-execution.js';
 import { createPublicClient, http } from 'viem';
 import type { Address, Hex } from 'viem';
 import { getConfig } from './config.js';
+import { rpcTransport } from './rpc-transport.js';
 
 /** Basis-point denominator. On-chain AtpRegistry uses the same TOTAL_WEIGHT_BPS. */
 export const BPS_DENOMINATOR = 10_000;
@@ -496,11 +497,26 @@ export async function getStrategyWithVersionState(id: number, deps: {
   })) };
 }
 
+/**
+ * The fund pages ask for every fund's detail on each load (21 × the registry reads below). Chain version state changes
+ * only when a version is published, so a 15 s cache per (fund, version) is enough and cut most API eth_calls.
+ */
+const VERSION_STATE_TTL_MS = 15_000;
+const versionStates = new Map<string, { at: number; value: Promise<Awaited<ReturnType<typeof readPublicVersionStateOnce>>> }>();
 async function readPublicVersionState(onchainId: number, version: number) {
+  const key = `${onchainId}:${version}`, hit = versionStates.get(key);
+  if (hit && Date.now() - hit.at < VERSION_STATE_TTL_MS) return hit.value;
+  const value = readPublicVersionStateOnce(onchainId, version);
+  versionStates.set(key, { at: Date.now(), value });
+  value.catch(() => versionStates.delete(key));
+  if (versionStates.size > 500) versionStates.delete(versionStates.keys().next().value as string);
+  return value;
+}
+async function readPublicVersionStateOnce(onchainId: number, version: number) {
   try {
     const config = getConfig();
     if (!config.rpcUrl || !config.registryAddress) throw new Error('missing configuration');
-    const client = createPublicClient({ transport: http(config.rpcUrl, { retryCount: 0, timeout: 5000 }) });
+    const client = createPublicClient({ transport: rpcTransport('strategies', config.rpcUrl, { retryCount: 0, timeout: 5000 }) });
     if (await client.getChainId() !== config.chainId) throw new Error('wrong chain');
     return await readVersionState(client, config.registryAddress as Address, onchainId, version);
   } catch (error) {
@@ -513,7 +529,7 @@ async function readDefaultPublicationActiveAt(onchainId: number): Promise<Date> 
   try {
     const config = getConfig();
     if (!config.rpcUrl || !config.registryAddress) throw new Error('missing configuration');
-    const client = createPublicClient({ transport: http(config.rpcUrl, { retryCount: 0, timeout: 5000 }) });
+    const client = createPublicClient({ transport: rpcTransport('strategies', config.rpcUrl, { retryCount: 0, timeout: 5000 }) });
     if (await client.getChainId() !== config.chainId) throw new Error('wrong chain');
     return await defaultPublicationActiveAt(client, config.registryAddress as Address, onchainId);
   } catch (error) {

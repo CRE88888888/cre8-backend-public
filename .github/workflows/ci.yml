@@ -136,6 +136,7 @@ jobs:
           test/strategy-earn-sponsor.test.ts
           test/withdrawal-scan-cache.test.ts
           test/mix-node-lag.test.ts
+          test/reconcile-identity.test.ts
           test/trading-calendar.test.ts
           test/scheduler.test.ts
           test/server.test.ts

@@ -19,6 +19,22 @@ import { outboxIdentity, findOutboxConsumption, verifyOutboxConsumption, checkOu
 type Pending = { kind: 'welcome' | 'faucet'; id: string; chain_id: string; day: string; owner: Address; account: Address;
   amount_wei: string; state: 'submitted' | 'unknown'; tx_hash: Hex; signed_raw_tx: Hex | null };
 type Options = { chain?: ChainConfig; client?: PublicClient; operator?: Address; replay?: boolean; timeoutMs?: number; transaction?: typeof withTransaction };
+/**
+ * Who reconciles, without ever needing a key on the scheduler. Reading and verifying chain evidence (receipts,
+ * blocks, versions, exact replay of already-signed bytes) only needs the public operator identity: OPERATOR_ADDRESS,
+ * which must equal the chain 97 profile operator. A signing chain (account/wallet) exists only where
+ * OPERATOR_PRIVATE_KEY is configured, i.e. the API; without it, paths that would sign a fresh attempt stay pending
+ * for the API. `getChain()` is never touched without a key (its account getter throws there).
+ */
+export function reconcileIdentity(options: Pick<Options, 'chain' | 'client' | 'operator'>,
+  env: NodeJS.ProcessEnv = process.env, signingChain: () => ChainConfig = getChain): { chain: ChainConfig | undefined; operator: Address } {
+  const configured = env.OPERATOR_ADDRESS?.trim();
+  if (configured && (!/^0x[0-9a-fA-F]{40}$/.test(configured) || configured.toLowerCase() !== TESTNET_97.roles.operator.toLowerCase())) {
+    throw new Error('OPERATOR_ADDRESS must match the chain 97 profile operator');
+  }
+  const chain = options.chain ?? (options.client || !env.OPERATOR_PRIVATE_KEY?.trim() ? undefined : signingChain());
+  return { chain, operator: options.operator ?? (chain ? chain.account.address : TESTNET_97.roles.operator as Address) };
+}
 async function bounded<T>(work: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try { return await Promise.race([work, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('relayer reconciliation timeout')), ms); })]); }
@@ -140,8 +156,13 @@ export async function reconcileRelayerTransactions(options: Options = {}) {
   // has been released. Frozen settings and canonical history are revalidated.
   for (const id of recoveries) {
     try {
-      const chain = options.chain ?? (options.client ? undefined : getChain());
-      if (!chain) { counts.unresolved++; continue; }
+      // A recovery signs a fresh attempt: API only (the scheduler has no key by design).
+      const { chain } = reconcileIdentity(options);
+      if (!chain) {
+        counts.unresolved++;
+        console.info(JSON.stringify({ level: 'info', msg: 'mix_registration_recovery_needs_signer', requestId: id }));
+        continue;
+      }
       await registerMixCreation(id, { chain, client, operator: options.operator ?? chain.account.address,
         query, transaction: options.transaction ?? withTransaction, timeoutMs });
       counts.confirmed++;
@@ -155,8 +176,9 @@ export async function reconcileRelayerTransactions(options: Options = {}) {
   const jobs = (await query<{ strategy_id: string }>("select strategy_id from mix_publication_jobs where chain_id=97 and state<>'confirmed' order by updated_at,strategy_id limit 20")).rows;
   for (const job of jobs) {
     try {
-      const chain = options.chain ?? (options.client ? undefined : getChain());
-      const result = await reconcileMixPublication(job.strategy_id, { client, chain, operator: options.operator,
+      // Read-only unless this process can sign: without a chain, a job that needs a fresh signature stays pending.
+      const { chain, operator } = reconcileIdentity(options);
+      const result = await reconcileMixPublication(job.strategy_id, { client, ...(chain ? { chain } : {}), operator,
         query, transaction: withTransaction, timeoutMs }, options.replay);
       if (result === 'confirmed') counts.confirmed++;
       else if (result === 'reverted') counts.failed++;

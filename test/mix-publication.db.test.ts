@@ -250,6 +250,37 @@ test('a forked receipt stays quarantined, uncorrected and logged when the chain 
   }
 });
 
+// Strategy 54 was `submitted` and every scheduler round failed before reading the chain: the scheduler has no
+// operator key. Reconciling an already-sent original only reads; it must confirm without a signing chain.
+test('the scheduler (no key, no signing chain) confirms a submitted publication whose original transaction succeeded', async () => {
+  await mixDbSandbox(async lane => lane(async () => {
+    const id = await reserve(), f = registrationRpc();
+    f.state.publicationFail = true; // the API's own confirmation could not read the receipt
+    await assert.rejects(registerMixStrategy(T.roles.keeper, 'scheduler', allocation, id, { chain: f.chain }));
+    const sid = await jobId();
+    assert.equal((await query('select state from mix_publication_jobs')).rows[0]?.state, 'submitted');
+    f.state.publicationFail = false;
+    const counts = await reconcileRelayerTransactions({ client: f.client, operator: relayerSigner.address, replay: true });
+    assert.equal(counts.confirmed, 1);
+    assert.equal((await query('select state from mix_publication_jobs')).rows[0]?.state, 'confirmed');
+    assert.equal((await query('select version from strategy_versions where strategy_id=$1', [sid])).rows.length, 1);
+    assert.equal(f.state.broadcasts.length, 2, 'nothing signed or sent by the scheduler');
+  }));
+});
+
+test('without a signing chain a job that needs a fresh signature stays pending for the API', async () => {
+  await mixDbSandbox(async lane => lane(async () => {
+    const id = await reserve(), f = registrationRpc();
+    f.state.publicationSendFail = true;
+    await assert.rejects(registerMixStrategy(T.roles.keeper, 'needs api', allocation, id, { chain: f.chain }));
+    const before = f.state.broadcasts.length, prepares = f.state.prepareCalls;
+    await reconcileRelayerTransactions({ client: f.client, operator: relayerSigner.address, replay: false });
+    assert.equal(f.state.prepareCalls, prepares, 'the scheduler never prepares a new signature');
+    assert.ok(f.state.broadcasts.length >= before);
+    assert.notEqual((await query('select state from mix_publication_jobs')).rows[0]?.state, 'confirmed');
+  }));
+});
+
 test('two workers cannot publish the same job and a held job lock never reserves the global relayer', async () => {
   await mixDbSandbox(async lane => {
     const f = registrationRpc(); let sid = '';

@@ -104,9 +104,18 @@ const ENTRY_POINT_ABI = parseAbi(['function balanceOf(address account) view retu
 const MAX_UINT256 = (1n << 256n) - 1n;
 const MASK_128 = (1n << 128n) - 1n;
 
-function rejected(code: string, status = 400): AppError {
-  return new AppError(status, code, 'paymaster sponsorship rejected: ' + code);
+/** Our own checks throw plain Errors with a fixed label; library errors are reduced to their class name (no data). */
+const checkName = (error: unknown) => error instanceof Error ? (error.name === 'Error' ? error.message.slice(0, 120) : error.name) : 'invalid';
+/** `reason` is an internal check label (never request bytes, signatures or keys): logged, not returned. */
+function rejected(code: string, status = 400, reason?: string): AppError {
+  return new AppError(status, code, 'paymaster sponsorship rejected: ' + code, reason === undefined ? undefined : { cause: new Error(reason) });
 }
+/**
+ * Largest canonical Kernel batch we sponsor. A buy that turns Strategy Earn on carries the buy calls, a two-call
+ * session-key renewal and `consentCalls` (two delegates, ceiling + approval per market, two approvals), so the
+ * bound follows the market list instead of a fixed 32 that a many-asset fund exceeds.
+ */
+export const MAX_SPONSORED_CALLS = 16 + 2 + 4 + 2 * STRATEGY_EARN_97.markets.length;
 function hex(value: unknown, bytes?: number): Hex {
   if (typeof value !== 'string' || !/^0x(?:[0-9a-fA-F]{2})*$/.test(value) || (bytes !== undefined && value.length !== 2 + bytes * 2)) {
     throw rejected('PAYMASTER_INVALID_OPERATION');
@@ -143,17 +152,18 @@ function sponsoredCalls(op: Pick<PackedSponsorOperation, 'callData'>) {
     const batch = toHex(1n << 248n, { size: 32 });
     const calls = mode === single ? [{ target: slice(payload, 0, 20), value: BigInt(slice(payload, 20, 52)), callData: slice(payload, 52) }]
       : mode === batch ? decodeAbiParameters(BATCH_ABI, payload)[0] : [];
-    if (calls.length === 0 || calls.length > 32) throw new Error('empty/invalid mode');
+    if (calls.length === 0 || calls.length > MAX_SPONSORED_CALLS) throw new Error(calls.length === 0 ? 'empty/invalid mode' : `too many calls: ${calls.length}`);
     if (mode === batch && encodeAbiParameters(BATCH_ABI, [calls]).toLowerCase() !== payload.toLowerCase()) throw new Error('noncanonical batch');
     return calls;
-  } catch { throw rejected('PAYMASTER_CALL_FORBIDDEN', 403); }
+  } catch (error) { throw rejected('PAYMASTER_CALL_FORBIDDEN', 403, `kernel batch: ${checkName(error)}`); }
 }
 
 /** Shared canonical decoder for persisted execution reconciliation. */
 export function canonicalKernelCalls(callData: Hex) { return sponsoredCalls({ callData }); }
 
 /** Match the SDK's complete two-call toInitConfig, never a general-purpose self-call or delegatecall. */
-function validateRenewal(install: Hex, grant: Hex, c: PaymasterConfig, account: Address, yieldUpgrade = false): void {
+type RenewalScope = 'plain' | 'yield' | 'yield+borrow';
+function validateRenewal(install: Hex, grant: Hex, c: PaymasterConfig, account: Address, scope: RenewalScope = 'plain'): void {
   const decoded = decodeFunctionData({ abi: KernelV3_3AccountAbi, data: install });
   if (decoded.functionName !== 'installValidations') throw new Error('invalid install');
   const enableData = decoded.args[2][0];
@@ -168,7 +178,10 @@ function validateRenewal(install: Hex, grant: Hex, c: PaymasterConfig, account: 
   if (validAfter !== 0 || validUntil === 0 || signerAddress.length !== 42 || isAddressEqual(signerAddress, zeroAddress)) throw new Error('invalid session');
   const p = TESTNET_97.contracts; // Canonical SDK policy/signer contracts, also pinned in the chain 97 profile.
   const policies = [
-    toCallPolicy({ policyVersion: CallPolicyVersion.V0_0_4, policyAddress: p.callPolicy, permissions: sessionCallPermissions(c.executor, yieldUpgrade ? account : undefined) }),
+    // 'yield+borrow' is what GET /renewal-params installs on chain 97 since backend#204 (src/renewal.ts): yield and
+    // Strategy Earn calls, argument 0 pinned to this account, current market list.
+    toCallPolicy({ policyVersion: CallPolicyVersion.V0_0_4, policyAddress: p.callPolicy, permissions: sessionCallPermissions(c.executor,
+      scope === 'plain' ? undefined : account, scope === 'yield+borrow' ? account : undefined) }),
     toGasPolicy({ policyAddress: p.gasPolicy, allowed: SESSION_GAS_ALLOWED_WEI, enforcePaymaster: true, allowedPaymaster: c.address }),
     toTimestampPolicy({ policyAddress: p.timestampPolicy, validAfter, validUntil }),
   ];
@@ -196,20 +209,21 @@ const collateralOf = (symbol: string): Address => {
   return asset.token as Address;
 };
 export function validateSponsoredCalls(op: PackedSponsorOperation, c: PaymasterConfig, context: CallContext = {}): void {
+  const calls = sponsoredCalls(op);
+  let at = -1;
   try {
-    const calls = sponsoredCalls(op);
     const assets = c.chainId === 97 ? testnetAssets().map((asset) => asset.address) : context.assets ?? [];
     for (let index = 0; index < calls.length; index++) {
+      at = index;
       const call = calls[index];
       if (call === undefined) throw new Error('missing call');
       if (call.value !== 0n) throw new Error('native transfer');
       if (isAddressEqual(call.target, op.sender)) {
         const next = calls[++index];
         if (next === undefined || next.value !== 0n || !isAddressEqual(next.target, op.sender)) throw new Error('incomplete renewal');
-        try { validateRenewal(call.callData, next.callData, c, op.sender); }
-        catch {
-          if (c.chainId !== 97) throw new Error('yield upgrade requires chain 97');
-          validateRenewal(call.callData, next.callData, c, op.sender, true);
+        const scopes: RenewalScope[] = c.chainId === 97 ? ['plain', 'yield', 'yield+borrow'] : ['plain'];
+        if (!scopes.some((scope) => { try { validateRenewal(call.callData, next.callData, c, op.sender, scope); return true; } catch { return false; } })) {
+          throw new Error('renewal matches no allowed session scope');
         }
       } else if (isAddressEqual(call.target, c.executor)) {
         const inner = decodeFunctionData({ abi: EXECUTOR_ABI, data: call.callData });
@@ -267,7 +281,12 @@ export function validateSponsoredCalls(op: PackedSponsorOperation, c: PaymasterC
         } else if (context.owner === undefined || !isAddressEqual(inner.args[0], context.owner) || inner.args[1] === 0n) throw new Error('invalid withdrawal');
       } else throw new Error('unknown target');
     }
-  } catch { throw rejected('PAYMASTER_CALL_FORBIDDEN', 403); }
+  } catch (error) {
+    const call = calls[at];
+    // Public contract address + 4-byte selector + check name only: enough to find the rule, no request bytes.
+    throw rejected('PAYMASTER_CALL_FORBIDDEN', 403, `call ${at}/${calls.length} to ${call?.target ?? '?'} ${call?.callData.slice(0, 10) ?? ''}: ${
+      checkName(error)}`);
+  }
 }
 
 /** eth-infinitism v0.7.0 7af70c8993a6f42973f520ae0752386a5032abe7, samples/VerifyingPaymaster.sol:getHash.
@@ -999,7 +1018,8 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
     } catch (error) {
       const safe = error instanceof AppError ? error : rejected('PAYMASTER_DEPENDENCY_UNAVAILABLE', 503);
       // Never print request bytes, signatures, keys, RPC/DB exception text or connection strings.
-      console.warn(JSON.stringify({ msg: 'paymaster_rejected', code: safe.code }));
+      console.warn(JSON.stringify({ msg: 'paymaster_rejected', code: safe.code, status: safe.status,
+        ...(safe.cause instanceof Error ? { reason: safe.cause.message.slice(0, 300) } : {}) }));
       throw safe;
     }
   } };

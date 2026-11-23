@@ -9,7 +9,7 @@ import { concatHex, createPublicClient, decodeFunctionData, defineChain, encodeF
 import type { Address, Hex } from 'viem';
 import { EXECUTOR_SELECTOR } from '../src/chain.js';
 import { AppError } from '../src/errors.js';
-import { createPaymasterService, KERNEL_EXECUTE_ABI, validateSponsoredCalls } from '../src/paymaster.js';
+import { createPaymasterService, KERNEL_EXECUTE_ABI, MAX_SPONSORED_CALLS, validateSponsoredCalls } from '../src/paymaster.js';
 import type { PaymasterDeps } from '../src/paymaster.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
 import { TEST_SIGNER, OWNER, SENDER, NOW, operation, config } from './fixtures/paymaster.js';
@@ -125,11 +125,11 @@ for (const [name, calls] of [
   });
 }
 
-test('#71 every profile asset and numeraire is allowed; batch limit is exactly 32', async () => {
+test('#71 every profile asset and numeraire is allowed; batch limit is exactly MAX_SPONSORED_CALLS (buy + renewal + every Strategy Earn consent)', async () => {
   for (const token of [C.usdt, ...Object.values(T.assets).map((a) => a.token)]) {
     await service().sponsor({ userOperation: operation({ callData: await encodeCallDataEpV07([call(approve(), token), call(transfer(), token)]) }) }, OWNER);
   }
-  const calls = Array.from({ length: 32 }, () => call(transfer()));
+  const calls = Array.from({ length: MAX_SPONSORED_CALLS }, () => call(transfer()));
   await service().sponsor({ userOperation: operation({ callData: await encodeCallDataEpV07(calls) }) }, OWNER);
   await assert.rejects(service().sponsor({ userOperation: operation({ callData: await encodeCallDataEpV07([...calls, call(transfer())]) }) }, OWNER), forbidden);
 });

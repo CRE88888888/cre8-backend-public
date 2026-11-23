@@ -211,6 +211,8 @@ export async function prepareMixTick(m: MixRuntime, tick: MixTick, due: DuePortf
               residualProof.anchor.at, tick.plan.snapshot.block.toString(), residualProof.anchor.hash, residualProof.reason]);
         }
         await db.query("update mixes set status='exited' where id=$1", [m.id]);
+        // 使用者要求刪除、而且帳戶裡沒有可領回的 USDT（< 0.01）：不必等 owner 領回，直接完成刪除。
+        if (observedCash < MIX_EXIT_DUST_RAW) await db.query('update mixes set deleted_at=$2 where id=$1 and delete_requested_at is not null and deleted_at is null', [m.id, now]);
         await db.query("update portfolios set schedule_state='paused' where id=$1", [due.portfolioId]);
       } else await db.query('update mixes set last_rebalanced_at=$2 where id=$1', [m.id, now]);
     }

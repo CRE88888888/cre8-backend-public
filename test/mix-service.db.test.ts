@@ -733,3 +733,26 @@ test('mix delete: empty mixes are deleted at once; held assets latch the exit, t
     assert.equal((await service.remove(unavailable.mixId, owner)).status, 'deleted');
   });
 });
+
+test('a delete-requested exit with no USDT left completes the deletion; with USDT it waits for the owner withdrawal', async () => {
+  for (const cash of [0n, 5n * WAD]) await fixture(async (service, db) => {
+    const made = await service.create({ assets: [{ assetId: T.assets.NVDAB.token, weightBps: 5000 }, { assetId: T.assets.WBNB.token, weightBps: 5000 }] }, owner, randomUUID());
+    const joined = await service.confirm(made.mixId, owner, { txHash: toHex(56n, { size: 32 }) }); assert.ok(joined.portfolioId);
+    await db.query('update mixes set triggered_at=clock_timestamp(),triggered_return_bps=0,delete_requested_at=clock_timestamp() where id=$1', [made.mixId]);
+    await db.query('update strategy_cash_balances set allocated_cash_raw=$2 where portfolio_id=$1', [joined.portfolioId, cash.toString()]);
+    const due = { personalMix: true, portfolioId: joined.portfolioId, strategyId: made.strategyId, account: made.account,
+      accountType: 'KERNEL', intervalSeconds: 60, unsupportedReason: null, nextRunAt: mixClock };
+    const find: import('../src/scheduler.js').SchedulerQueryFn = (sql, args) => db.query(sql, args ? [...args] : []);
+    const state = await loadMixRuntime(due, find, undefined, async () => ({ hash: zeroHash, at: mixClock })); assert.ok(state);
+    const { plan } = mixRuntimeFixture();
+    for (const h of plan.snapshot.holdings) h.amountWei = h.asset === T.contracts.usdt ? cash : 0n;
+    const tick = decideMixTick(state, plan, mixClock); assert.equal(tick.mode, 'exit'); assert.equal(tick.complete, true);
+    await prepareMixTick(state, tick, due, new Date(Date.now() + 1000), work => work({ query: find }));
+    await db.query('set constraints all immediate');
+    const row = (await db.query('select status,deleted_at from mixes where id=$1', [made.mixId])).rows[0];
+    assert.equal(row.status, 'exited');
+    assert.equal(row.deleted_at === null, cash > 0n);
+    assert.equal((await service.list(owner)).mixes.some(m => m.id === made.mixId), cash > 0n);
+    if (cash > 0n) assert.equal((await service.list(owner)).mixes.find(m => m.id === made.mixId)?.status, 'ready_to_delete');
+  });
+});

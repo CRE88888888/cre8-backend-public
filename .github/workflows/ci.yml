@@ -130,6 +130,7 @@ jobs:
           test/new-money-plan.test.ts
           test/strategy-runtime.test.ts
           test/cash-reconciliation.test.ts
+          test/mix-cash-withdrawal-source.test.ts
           test/chain-read-only.test.ts
           test/scheduler-error-log.test.ts
           test/status-timeout.test.ts

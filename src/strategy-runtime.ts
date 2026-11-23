@@ -1,5 +1,6 @@
 import { readCashWithdrawals } from './cash-reconciliation.js';
 import type { CashWithdrawal } from './cash-reconciliation.js';
+import { mixCashWithdrawals } from './mix-flows.js';
 import { executionBatchSize, executionInputGroups } from './execution-batch.js';
 import type { Address, PublicClient } from 'viem';
 import { EXECUTOR_ABI } from './chain.js';
@@ -32,7 +33,10 @@ export type NewMoneyDeps = {
 export function defaultNewMoneyDeps(client:()=>PublicClient,executor:()=>Address,registry:()=>Address,query:SchedulerQueryFn,chainId:number):NewMoneyDeps {
   return {
     version:requireTypedVersion,
-    withdrawals:(due,plan)=>readCashWithdrawals(client(),query,{chainId,portfolioId:due.portfolioId,account:due.account,cash:numeraireFor(chainId) as Address,blockNumber:plan.snapshot.block}),
+    // My mix: the same verified flows the mix tick reconciles (any outflow, e.g. a DCA vault deposit). The owner-transfer scan
+    // below cannot re-prove those, so mixing the two sources saved withdrawals one side rejects as [CASH_REORGED] (portfolio 13).
+    withdrawals:(due,plan)=>due.personalMix?mixCashWithdrawals(due.portfolioId,query,plan.snapshot.block):
+      readCashWithdrawals(client(),query,{chainId,portfolioId:due.portfolioId,account:due.account,cash:numeraireFor(chainId) as Address,blockNumber:plan.snapshot.block}),
     rebalanceReserve:plan=>minimumFeeReserve(client(),executor(),BigInt(plan.pinnedVersion.onchainStrategyId),plan.snapshot.block,plan.account,chainId===97),
     yieldHoldings:async(plan)=>{
       const holdings=plan.snapshot.holdings.map(h=>({...h}));

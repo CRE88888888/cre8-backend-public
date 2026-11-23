@@ -683,3 +683,53 @@ test('a below-batch switch residue and completion are atomic, immutable and idem
     await db.query('rollback to savepoint immutable_residual');
   });
 });
+
+test('mix delete: empty mixes are deleted at once; held assets latch the exit, then owner withdrawal completes deletion', async () => {
+  await fixture(async (_service, db, deps) => {
+    let plan = mixRuntimeFixture().plan;
+    const service = createMixService({ ...deps, plan: async () => plan });
+    const holdings = (rows: [string, bigint][]) => {
+      const base = mixRuntimeFixture().plan;
+      return { ...base, snapshot: { ...base.snapshot, holdings: rows.map(([asset, amountWei]) => ({ asset: asset as `0x${string}`, amountWei, decimals: 18, usdPriceE8: 100000000n, priceSource: 'numeraire' as const })) } };
+    };
+    const status = async (id: number) => (await service.list(owner)).mixes.find(m => m.id === id)?.status;
+    const unfunded = await service.create({ assets: [{ assetId: T.assets.NVDAB.token, weightBps: 10000 }] }, owner, randomUUID());
+    assert.deepEqual(await service.remove(unfunded.mixId, owner), { mixId: unfunded.mixId, status: 'deleted' });
+    assert.equal(await status(unfunded.mixId), undefined);
+    await assert.rejects(service.remove(unfunded.mixId, owner), /找不到/);
+    assert.equal((await db.query("select state from mix_switch_intents where mix_id=$1", [unfunded.mixId])).rows[0]?.state, 'cancelled');
+
+    const held = await service.create({ assets: [{ assetId: T.assets.NVDAB.token, weightBps: 10000 }] }, owner, randomUUID());
+    const joined = await service.confirm(held.mixId, owner, { txHash: toHex(91n, { size: 32 }) });
+    await assert.rejects(service.remove(held.mixId, T.roles.operator), /找不到/);
+    plan = holdings([[T.assets.NVDAB.token, 65n * WAD], [T.contracts.usdt, 3n * WAD]]);
+    assert.deepEqual(await service.remove(held.mixId, owner), { mixId: held.mixId, status: 'deleting' });
+    const latched = (await db.query('select triggered_at,triggered_return_bps::text,delete_requested_at,deleted_at from mixes where id=$1', [held.mixId])).rows[0];
+    assert.ok(latched.triggered_at && latched.delete_requested_at); assert.equal(latched.deleted_at, null);
+    assert.equal(await status(held.mixId), 'deleting');
+    assert.equal((await db.query("select count(*)::int as n from user_notifications where kind='mix_delete_requested' and dedup_key=$1", [String(held.mixId)])).rows[0].n, 1);
+    await assert.rejects(service.patch(held.mixId, owner, { name: 'nope' }), { code: 'MIX_DELETING' });
+    await assert.rejects(service.restart(held.mixId, owner), { code: 'MIX_DELETING' });
+    // Repeated requests while selling keep the original latch.
+    assert.equal((await service.remove(held.mixId, owner)).status, 'deleting');
+    await db.query('savepoint restart_guard');
+    await assert.rejects(db.query('update mixes set triggered_at=null,triggered_return_bps=null where id=$1', [held.mixId]), /mixes_delete_requires_exit/);
+    await db.query('rollback to savepoint restart_guard');
+    await db.query("update mixes set status='exited' where id=$1", [held.mixId]);
+    assert.equal(await status(held.mixId), 'ready_to_delete');
+    plan = holdings([[T.assets.NVDAB.token, WAD / 2n], [T.contracts.usdt, 130n * WAD]]);
+    await assert.rejects(service.remove(held.mixId, owner), { code: 'MIX_HAS_CASH' });
+    // After the owner withdrawal only the recorded exit residual remains.
+    plan = holdings([[T.assets.NVDAB.token, WAD / 2n], [T.contracts.usdt, 0n]]);
+    assert.equal((await service.remove(held.mixId, owner)).status, 'deleted');
+    assert.equal(await status(held.mixId), undefined);
+    assert.equal((await db.query('select schedule_state from portfolios where id=$1', [joined.portfolioId])).rows[0]?.schedule_state, 'paused');
+
+    const unavailable = await service.create({ assets: [{ assetId: T.assets.NVDAB.token, weightBps: 10000 }] }, owner, randomUUID());
+    await service.confirm(unavailable.mixId, owner, { txHash: toHex(92n, { size: 32 }) });
+    plan = { ...holdings([[T.assets.NVDAB.token, WAD]]), blocked: [{ asset: T.assets.NVDAB.token, reason: 'fixture' }] } as never;
+    await assert.rejects(service.remove(unavailable.mixId, owner), { code: 'MIX_UNAVAILABLE' });
+    plan = holdings([[T.assets.NVDAB.token, 0n], [T.contracts.usdt, 0n]]);
+    assert.equal((await service.remove(unavailable.mixId, owner)).status, 'deleted');
+  });
+});

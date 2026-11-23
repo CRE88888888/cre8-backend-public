@@ -16,6 +16,7 @@ export type MixRow = {
   performance_started_at: Date | null; performance_baseline_raw: string | null;
   performance_start_block: string | null; performance_start_block_hash: Hex | null;
   exit_retry_count: number; exit_last_attempt_at: Date | null; exit_alerted_at: Date | null;
+  delete_requested_at: Date | null;
 };
 export type MixHistory = { id: string; mix_id: string; portfolio_id: string; strategy_id: string; version: number;
   enroll_block_number: string; enroll_block_hash: Hex; enroll_tx_hash: Hex; enroll_log_index: string;
@@ -30,7 +31,7 @@ export const MIX_COLUMNS = `m.id,m.owner,m.name,m.chain_id,m.account,m.initial_s
   m.imported_from_share_code,m.frequency,to_char(m.start_date,'YYYY-MM-DD') as start_date,m.last_rebalanced_at,
   m.take_profit_bps,m.stop_loss_bps,m.status,m.triggered_at,m.triggered_return_bps::text,m.created_at,
   m.performance_started_at,m.performance_baseline_raw::text,m.performance_start_block::text,m.performance_start_block_hash,
-  m.exit_retry_count,m.exit_last_attempt_at,m.exit_alerted_at,m.cover_image_id::text as cover_image_id`;
+  m.exit_retry_count,m.exit_last_attempt_at,m.exit_alerted_at,m.cover_image_id::text as cover_image_id,m.delete_requested_at`;
 export const pendingMixSql = "state in ('prepared','submitted','unknown')";
 export const mixUnavailable = () => new AppError(503, 'MIX_UNAVAILABLE', '目前無法確認組合資料，請稍後以原請求重試。');
 export const mixBusy = () => new AppError(409, 'MIX_BUSY', '組合正在處理交易，確認完成後才能再次變更。');

@@ -551,9 +551,9 @@ async function route(
       }
       return methodNotAllowed(res, ['GET', 'PATCH']);
     }
-    if (['restart', 'confirm', 'enrollment-params'].includes(segments[3] ?? '')) {
+    if (['restart', 'confirm', 'enrollment-params', 'delete'].includes(segments[3] ?? '')) {
       if (method !== 'POST') return methodNotAllowed(res, ['POST']);
-      const result = segments[3] === 'restart' ? await deps.mixes.restart(id, wallet)
+      const result = segments[3] === 'restart' ? await deps.mixes.restart(id, wallet) : segments[3] === 'delete' ? await deps.mixes.remove(id, wallet)
         : segments[3] === 'confirm' ? await deps.mixes.confirm(id, wallet, await readJsonBody(req)) : await deps.mixes.prepare(id, wallet);
       sendJson(res, 200, result); return;
     }

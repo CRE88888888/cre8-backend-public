@@ -6,6 +6,7 @@ import { loadRateLimitConfig } from '../src/config.js';
 import { RequestRateLimiter, MemoryRateLimitStore } from '../src/ratelimit.js';
 import { emptyModel } from '../src/model-returns/calculation.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
+import { UnauthorizedError } from '../src/errors.js';
 
 const body = JSON.stringify({ assets: [{ assetId: T.assets.NVDAB.token, weightBps: 10000 }] });
 test('mix preview HTTP is public, strict on method/path/body, preserves CORS and enforces an IP budget before parsing', async () => {
@@ -141,5 +142,27 @@ test('#189 GET /mixes/assets refuses chains other than 97', async () => {
     const response = await fetch(`http://127.0.0.1:${address.port}/mixes/assets`);
     assert.equal(response.status, 503);
     assert.match(await response.text(), /MIX_CHAIN_UNAVAILABLE/);
+  } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+});
+
+test('POST /me/mixes/:id/delete authenticates, rate-limits and returns the delete status', async () => {
+  const calls: unknown[] = [];
+  const server = createServer({
+    rateLimiter: new RequestRateLimiter(loadRateLimitConfig({}), new MemoryRateLimitStore()),
+    auth: { authenticate: async header => { if (header !== 'Bearer ok') throw new UnauthorizedError('no'); return T.roles.keeper; },
+      issueNonce: () => { throw new Error('unused'); }, login: async () => { throw new Error('unused'); }, logout: async () => {} },
+    mixes: { remove: async (id: number, wallet: string) => { calls.push([id, wallet]); return { mixId: id, status: 'deleting' as const }; } } as never,
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  const url = `http://127.0.0.1:${address.port}/me/mixes/7/delete`;
+  try {
+    const response = await fetch(url, { method: 'POST', headers: { authorization: 'Bearer ok' } });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { mixId: 7, status: 'deleting' });
+    assert.deepEqual(calls, [[7, T.roles.keeper]]);
+    assert.equal((await fetch(url, { method: 'POST' })).status, 401);
+    assert.equal((await fetch(url, { method: 'GET', headers: { authorization: 'Bearer ok' } })).status, 405);
+    assert.equal(calls.length, 1);
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
 });

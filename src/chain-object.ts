@@ -13,6 +13,13 @@ import { getConfig } from './config.js';
  *
  * 所以凡是**會影響簽章或交易**的地方，都要用這個函式拿到「與 RPC 一致的鏈物件」。
  */
+/**
+ * 使用者在等的鏈上交易（帳戶部署、水龍頭、歡迎金）每隔多久問一次收據。
+ * viem 的 bscTestnet 沒有 blockTime，預設當成 12 秒、每 4 秒才問一次；測試網 0.45 秒就出塊，
+ * 歡迎金又只等 5 秒，常常上鏈了卻來不及看到，前端只好說「一分鐘後再按一次」。與 gas 水龍頭一樣用 1 秒。
+ */
+export const RECEIPT_POLLING_MS = 1_000;
+
 export function activeChain(): Chain {
   const { chainId } = getConfig();
   if (chainId === bsc.id) return bsc;

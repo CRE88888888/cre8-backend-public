@@ -1,7 +1,7 @@
 import { isAddressEqual, WaitForTransactionReceiptTimeoutError } from 'viem';
 import type { Address, Hex } from 'viem';
 import type { ChainConfig } from './chain.js';
-import { activeChain } from './chain-object.js';
+import { activeChain, RECEIPT_POLLING_MS } from './chain-object.js';
 import { AppError } from './errors.js';
 import { withRelayerLock, relayerNonce } from './relayer-lock.js';
 import { consumeAccountDeploymentBudget } from './ratelimit.js';
@@ -36,7 +36,7 @@ export async function deployAccount97(intent: DeploymentIntent, chain: ChainConf
       await (deps.budget ?? consumeAccountDeploymentBudget)(intent.owner);
       assertHeld();
       const hash = await wallet.sendRawTransaction({ serializedTransaction });
-      const receipt = await client.waitForTransactionReceipt({ hash, timeout: 30_000 });
+      const receipt = await client.waitForTransactionReceipt({ hash, timeout: 30_000, pollingInterval: RECEIPT_POLLING_MS });
       if (receipt.transactionHash !== hash || !isAddressEqual(receipt.from, operator.address) || !receipt.to ||
           !isAddressEqual(receipt.to, intent.factory)) throw new AppError(503, 'ACCOUNT_DEPLOYMENT_RECEIPT_MISMATCH', 'account deployment receipt does not match the submitted transaction');
       if ((await client.getBlock({ blockNumber: receipt.blockNumber })).hash !== receipt.blockHash) {

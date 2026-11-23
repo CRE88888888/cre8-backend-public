@@ -2,6 +2,7 @@ import { createPublicClient, createWalletClient, decodeEventLog, encodeFunctionD
 import type { Address, Hex, PublicClient } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { bscTestnet } from 'viem/chains';
+import { RECEIPT_POLLING_MS } from './chain-object.js';
 import { getConfig, loadWelcomeConfig, WELCOME_AMOUNT_WEI } from './config.js';
 import type { WelcomeConfig } from './config.js';
 import { query, withTransaction } from './db.js';
@@ -157,7 +158,7 @@ async function prepareWelcome(grant: WelcomeGrant, c: WelcomeConfig): Promise<Pr
     data: encodeFunctionData({ abi: WELCOME_ABI, functionName: 'welcomeFor', args: [grant.account] }) }));
   const hash = keccak256(signed);
   return { hash, raw: signed, broadcast: async () => { if (await client.sendRawTransaction({ serializedTransaction: signed }) !== hash) throw new Error('unexpected hash'); },
-    wait: async () => { await client.waitForTransactionReceipt({ hash, timeout: c.timeoutMs, confirmations: 1 }); } };
+    wait: async () => { await client.waitForTransactionReceipt({ hash, timeout: c.timeoutMs, confirmations: 1, pollingInterval: RECEIPT_POLLING_MS }); } };
 }
 async function bounded<T>(work: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;

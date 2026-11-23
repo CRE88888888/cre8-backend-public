@@ -9,6 +9,7 @@ import { AppError } from '../src/errors.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
 import { kernelAddressesForChain } from '../src/addresses.js';
 import { loadAccountDeploymentConfig } from '../src/config.js';
+import { RECEIPT_POLLING_MS } from '../src/chain-object.js';
 const operator = mnemonicToAccount('test test test test test test test test test test test junk', { addressIndex: 4 });
 const hash = toHex(1n, { size: 32 });
 const intent: DeploymentIntent = { address: operator.address, owner: T.roles.owner, strategyId: 1n, factory: T.contracts.kernelMetaFactory, factoryData: '0x1234' };
@@ -45,7 +46,9 @@ function fixture(mode = 'healthy') {
       },
     }, kernel: kernelAddressesForChain(97) };
   // Preserve the concrete viem receipt type while overriding only the observed fields.
-  const publicClient = { ...client, waitForTransactionReceipt: async () => {
+  const polling: (number | undefined)[] = [];
+  const publicClient = { ...client, waitForTransactionReceipt: async (args?: { pollingInterval?: number }) => {
+    polling.push(args?.pollingInterval);
     const receipt = await chain.publicClient.waitForTransactionReceipt();
     return { transactionHash: current === 'wrong-receipt-hash' ? hash : receipt.transactionHash, status: receipt.status, blockNumber: 1n, blockHash: hash,
       from: current === 'wrong-receipt-from' ? T.roles.owner : operator.address, to: current === 'wrong-receipt-to' ? T.roles.owner : intent.factory, transactionIndex: 0, contractAddress: null, logs: [], logsBloom: '0x' as const,
@@ -59,7 +62,7 @@ function fixture(mode = 'healthy') {
     if (current === 'db-failure') throw new Error('SECRET_DB');
     return action(() => { if (current === 'lost-lock') throw new AppError(503, 'RELAYER_BUSY', 'busy'); });
   } };
-  return { chain: { ...chain, publicClient }, deps, change: (value: string) => { current = value; }, counts: () => ({ sent, signed, charged }) };
+  return { chain: { ...chain, publicClient }, deps, change: (value: string) => { current = value; }, counts: () => ({ sent, signed, charged }), polling };
 }
 const code = (expected: string) => (error: unknown) => error instanceof AppError && error.code === expected && !error.message.includes('SECRET');
 
@@ -135,4 +138,21 @@ test('#124 a concurrent request for the same account gets 202 while the first de
     assert.equal(f.counts().sent, 0);
   } finally { release(); await first; }
   assert.equal(f.counts().sent, 1);
+});
+
+test('buy speed: deployment receipt is polled every second, not viem\'s 4s default for bscTestnet', async () => {
+  const f = fixture();
+  await deployAccount97(intent, f.chain, f.deps);
+  assert.deepEqual(f.polling, [RECEIPT_POLLING_MS]);
+  assert.ok(RECEIPT_POLLING_MS <= 1_000);
+});
+
+test('buy speed: faucet and welcome receipts use the same 1s polling', async () => {
+  const { readFile } = await import('node:fs/promises');
+  for (const file of ['../src/faucet.ts', '../src/welcome-grants.ts']) {
+    const source = await readFile(new URL(file, import.meta.url), 'utf8');
+    const waits = source.match(/waitForTransactionReceipt\(\{[^}]*\}\)/g) ?? [];
+    assert.ok(waits.length > 0, file);
+    for (const wait of waits) assert.match(wait, /pollingInterval: RECEIPT_POLLING_MS/, file);
+  }
 });

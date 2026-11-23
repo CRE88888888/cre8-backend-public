@@ -5,6 +5,7 @@ import { createPublicClient, createWalletClient, decodeEventLog, encodeFunctionD
 import type { Address, Hex, PublicClient, TransactionReceipt } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { bscTestnet } from 'viem/chains';
+import { RECEIPT_POLLING_MS } from './chain-object.js';
 import { getConfig, loadFaucetConfig } from './config.js';
 import type { FaucetConfig } from './config.js';
 import { query, withTransaction } from './db.js';
@@ -122,7 +123,7 @@ async function prepareClaim(claim: FaucetClaim, c: FaucetConfig): Promise<Prepar
   return { hash, raw: signed,
     broadcast: async () => { if (await client.sendRawTransaction({ serializedTransaction: signed }) !== hash) throw new Error('unexpected transaction hash'); },
     receipt: async () => {
-      await client.waitForTransactionReceipt({ hash, timeout: c.timeoutMs, confirmations: 1 });
+      await client.waitForTransactionReceipt({ hash, timeout: c.timeoutMs, confirmations: 1, pollingInterval: RECEIPT_POLLING_MS });
       return readFaucetSettlementState(client, claim, hash, operator.address);
     },
   };

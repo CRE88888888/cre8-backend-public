@@ -19,7 +19,7 @@ export type MixFlowAccount = { id: string; owner: Address; account: Address };
 
 export async function verifyMixBlock(expected: Hex | null, read: () => Promise<Hex | null>): Promise<void> {
   try { if (expected === null || await read() !== expected) throw mixUnavailable(); }
-  catch { throw mixUnavailable(); }
+  catch (error) { throw mixUnavailable(undefined, error); }
 }
 
 /** Executor pulls, proceeds and refunds are internal. A self-funded transfer to
@@ -97,7 +97,7 @@ export async function readMixFlows(client: PublicClient, m: MixFlowAccount, from
     }
   }
   return [...result.values()];
-  } catch { throw mixUnavailable(); }
+  } catch (error) { throw mixUnavailable(undefined, error); }
 }
 /** Runs BEFORE the holdings cursor advances. A failed read/write never skips a
  * funding interval. Repeat scans and portfolio handovers share the canonical key.

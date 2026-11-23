@@ -4,7 +4,7 @@ import { bscTestnet } from 'viem/chains';
 import type { ChainConfig } from './chain.js';
 import { query, withTransaction } from './db.js';
 import { withMixCreationLock, mixRequestHash } from './mix-creation.js';
-import { mixUnavailable } from './mix-store.js';
+import { mixUnavailable, untilNodesCatchUp } from './mix-store.js';
 import { withRelayerLock, relayerNonce } from './relayer-lock.js';
 import { REGISTRY_ABI, REGISTRY_VERSION_ABI } from './registry-abi.js';
 import { registryConfigHash, typedVersionSettings } from './registry-versioning.js';
@@ -61,7 +61,7 @@ export function validatePublication(job: MixPublication): void {
         job.config_hash !== registryConfigHash(allocation.assets.map(a => a.address as Address), allocation.assets.map(a => a.weightBps), settings) ||
         job.calldata !== encodeFunctionData({ abi: REGISTRY_ABI, functionName: 'publishSettingsVersion', args: [BigInt(job.onchain_strategy_id),
           allocation.assets.map(a => a.address as Address), allocation.assets.map(a => a.weightBps), settings.scheduleHash, settings.settingsHash, settings.performanceFeeBps, 0n] })) throw mixUnavailable();
-  } catch { throw mixUnavailable(); }
+  } catch (error) { throw mixUnavailable(undefined, error); }
 }
 export async function validatePublicationTransaction(job: MixPublication, attempt: Pick<Attempt, 'tx_hash' | 'signed_raw_tx' | 'signer' | 'nonce'>): Promise<void> {
   try {
@@ -73,7 +73,7 @@ export async function validatePublicationTransaction(job: MixPublication, attemp
         tx.data !== job.calldata || !tx.r || !tx.s) throw mixUnavailable();
     const raw = serializeTransaction(tx, { r: tx.r, s: tx.s, v: tx.v ?? BigInt(27 + (tx.yParity ?? 0)) });
     if (keccak256(raw) !== attempt.tx_hash || (await recoverTransactionAddress({ serializedTransaction: raw })).toLowerCase() !== attempt.signer.toLowerCase()) throw mixUnavailable();
-  } catch { throw mixUnavailable(); }
+  } catch (error) { throw mixUnavailable(undefined, error); }
 }
 async function anchor(deps: PublicationDeps, number?: bigint): Promise<Anchor> {
   const block = await bounded(deps.client.getBlock(number === undefined ? { blockTag: 'latest' } : { blockNumber: number }), deps);
@@ -177,8 +177,10 @@ function publicationLog(job: MixPublication, result: TransactionReceipt) {
   const log = matches[0]; if (matches.length !== 1 || !log || log.logIndex === null) throw mixUnavailable();
   return log;
 }
-async function complete(job: MixPublication, current: Attempt | null, proof: { receipt: TransactionReceipt; block: Anchor }, observed: Anchor, deps: PublicationDeps) {
-  if (proof.receipt.status !== 'success' || observed.number < proof.block.number) throw mixUnavailable();
+/** The RPC half of `complete`: every check unchanged. `onConflict` runs right before a quarantining mismatch. */
+async function verifyComplete(job: MixPublication, proof: { receipt: TransactionReceipt; block: Anchor }, observed: Anchor, deps: PublicationDeps, onConflict = () => {}) {
+  if (proof.receipt.status !== 'success') throw mixUnavailable('receipt-not-success');
+  if (observed.number < proof.block.number) throw mixUnavailable(`latest-behind-receipt:${observed.number}<${proof.block.number}`);
   const log = publicationLog(job, proof.receipt);
   const params = { address: job.registry, abi: REGISTRY_VERSION_ABI, blockNumber: observed.number };
   const version = await bounded(deps.client.readContract({ ...params, functionName: 'version', args: [BigInt(job.onchain_strategy_id), 1] }), deps);
@@ -186,8 +188,14 @@ async function complete(job: MixPublication, current: Attempt | null, proof: { r
       registryConfigHash(version.assets, version.weightsBps, version) !== job.config_hash ||
       await bounded(deps.client.readContract({ ...params, functionName: 'activeVersion', args: [BigInt(job.onchain_strategy_id)] }), deps) !== 1 ||
       (await anchor(deps, observed.number)).hash !== observed.hash || (await anchor(deps, proof.block.number)).hash !== proof.block.hash) {
-    await mark(job, deps, 'PUBLICATION_CONFIG_CONFLICT', true); throw mixUnavailable();
+    onConflict(); await mark(job, deps, 'PUBLICATION_CONFIG_CONFLICT', true); throw mixUnavailable('publication-config-conflict');
   }
+  return { log, version };
+}
+async function complete(job: MixPublication, current: Attempt | null, proof: { receipt: TransactionReceipt; block: Anchor }, observed: Anchor, deps: PublicationDeps,
+  checked?: Awaited<ReturnType<typeof verifyComplete>>) {
+  // Same checks as before (verifyComplete); `checked` = they already passed for exactly this proof and observation.
+  const { log, version } = checked ?? await verifyComplete(job, proof, observed, deps);
   await deps.transaction(async db => {
     await db.query("set local statement_timeout='5s'");
     await db.query("set local lock_timeout='3s'");
@@ -356,13 +364,30 @@ export async function reconcileMixPublication(id: string, deps: PublicationDeps,
       if (!proof) {
         try { await bounded(deps.client.waitForTransactionReceipt({ hash: sent.tx_hash, timeout: deps.timeoutMs ?? 5000, pollingInterval: 100 }), deps); }
         catch { await mark(job, deps, 'PUBLICATION_RECEIPT_PENDING'); return 'unresolved'; }
-        proof = await receipt(job, sent, deps);
       }
+      // Our own transaction is included (one node returned its receipt). A load-balanced RPC may route the next reads
+      // to a node a few blocks behind: receipt/block not found yet, or `latest` still before the version. Re-read the
+      // same evidence until it is visible everywhere it is checked, bounded; no check is relaxed and a conflict still
+      // quarantines immediately (never retried).
+      let conflict = false;
+      const confirmed = await untilNodesCatchUp(async () => {
+        try {
+          const visible = proof ?? await receipt(job, sent, deps);
+          if (!visible) throw mixUnavailable('receipt-not-visible-yet');
+          proof = visible;
+          if (visible.receipt.status === 'reverted') return 'reverted' as const;
+          const after = await state(job, deps);
+          if (after.count !== 1n) throw mixUnavailable('version-not-visible-yet');
+          return { observed: after.block, checked: await verifyComplete(job, visible, after.block, deps, () => { conflict = true; }) };
+        } catch (error) {
+          if (conflict) throw new AppError(409, 'PUBLICATION_CONFIG_CONFLICT', 'publication config conflict', { cause: error });
+          proof = null; // re-read the receipt too: the node that had it may not be the one answering next
+          throw error instanceof AppError ? error : mixUnavailable('confirm-read', error); // other AppErrors are not retried
+        }
+      }, () => true);
       if (!proof) { await mark(job, deps, 'PUBLICATION_RECEIPT_PENDING'); return 'unresolved'; }
-      if (proof.receipt.status === 'reverted') return 'unresolved'; // next tick records the original revert before a fresh attempt
-      const after = await state(job, deps);
-      if (after.count !== 1n) throw mixUnavailable();
-      await complete(job, sent, proof, after.block, deps); return 'confirmed';
+      if (confirmed === 'reverted') return 'unresolved'; // next tick records the original revert before a fresh attempt
+      await complete(job, sent, proof, confirmed.observed, deps, confirmed.checked); return 'confirmed';
     } catch {
       try { const latest = await load(id, deps); if (latest.state !== 'quarantined') await mark(latest, deps, 'PUBLICATION_UNAVAILABLE'); }
       catch { /* A lost DB connection preserves the durable attempt for the next worker. */ }
@@ -370,7 +395,7 @@ export async function reconcileMixPublication(id: string, deps: PublicationDeps,
     }
   }).catch(error => {
     if (error instanceof AppError && ['MIX_CREATE_BUSY','MIX_UNAVAILABLE'].includes(error.code)) throw error;
-    throw mixUnavailable();
+    throw mixUnavailable('publication', error);
   });
 }
 
@@ -386,7 +411,8 @@ export async function publishMixStrategy(strategyId: string, onchainId: number, 
       JSON.stringify({ ...allocation, p11: settings }), JSON.stringify(schedule), JSON.stringify(execution), hash, calldata]);
   const saved = await load(strategyId, deps);
   if (saved.calldata !== calldata || saved.config_hash !== hash) { await mark(saved, deps, 'PUBLICATION_CONFIG_CONFLICT', true); throw mixUnavailable(); }
-  if (await reconcileMixPublication(strategyId, deps, true) !== 'confirmed') throw mixUnavailable();
+  const settled = await reconcileMixPublication(strategyId, deps, true);
+  if (settled !== 'confirmed') throw mixUnavailable(`publication-${settled}`);
 }
 
 

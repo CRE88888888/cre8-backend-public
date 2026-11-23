@@ -1,7 +1,7 @@
 import type { Address, Hex } from 'viem';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { query, withConnection, withTransaction, withPortfolioLock } from './db.js';
-import { AppError } from './errors.js';
+import { AppError, callSite, errorChain } from './errors.js';
 import type { MixAsset, MixFrequency } from './mix-domain.js';
 import { record } from './strategy-execution.js';
 import type { MixOwnerCall } from './mix-approval.js';
@@ -33,7 +33,44 @@ export const MIX_COLUMNS = `m.id,m.owner,m.name,m.chain_id,m.account,m.initial_s
   m.performance_started_at,m.performance_baseline_raw::text,m.performance_start_block::text,m.performance_start_block_hash,
   m.exit_retry_count,m.exit_last_attempt_at,m.exit_alerted_at,m.cover_image_id::text as cover_image_id,m.delete_requested_at`;
 export const pendingMixSql = "state in ('prepared','submitted','unknown')";
-export const mixUnavailable = () => new AppError(503, 'MIX_UNAVAILABLE', '目前無法確認組合資料，請稍後以原請求重試。');
+/**
+ * The one public mix failure. The message never changes; the cause chain (logs via `errorChain`) always says where it
+ * was thrown (`where` check id and/or the stack call site, as backend#224 for yield) and keeps the underlying error.
+ */
+export const mixUnavailable = (where?: string, cause?: unknown) => {
+  const label = [where, callSite(new Error().stack)].filter((part): part is string => part !== undefined && part !== '').join(' @ ') || 'unknown';
+  return new AppError(503, 'MIX_UNAVAILABLE', '目前無法確認組合資料，請稍後以原請求重試。',
+    { cause: new Error(`[mix:${label}]`, cause === undefined ? undefined : { cause }) });
+};
+/** Log a mix failure once at the request boundary: code + cause chain + location, never request data or secrets. */
+export function logMixFailure(scope: string, error: unknown): void {
+  console.warn(JSON.stringify({ level: 'warn', msg: 'mix_unavailable', scope, code: error instanceof AppError ? error.code : null, cause: errorChain(error) }));
+}
+
+/** How long a post-send confirmation waits for a load-balanced RPC whose nodes lag a few blocks behind each other. */
+export const MIX_NODE_LAG_BUDGET_MS = 10_000;
+/**
+ * Re-run an idempotent reconcile until `done`, bounded. Right after inclusion one node may still miss the receipt or
+ * block, or report a `latest` below the receipt's block, while another already has it (NodeReal is load-balanced).
+ * Every hash/identity check inside `work` stays as is; only MIX_UNAVAILABLE and not-yet-done results are retried.
+ */
+export async function untilNodesCatchUp<T>(work: (attempt: number) => Promise<T>, done: (result: T) => boolean,
+  options: { budgetMs?: number; sleep?: (ms: number) => Promise<void>; now?: () => number } = {}): Promise<T> {
+  const budget = options.budgetMs ?? MIX_NODE_LAG_BUDGET_MS, now = options.now ?? Date.now;
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
+  const started = now();
+  for (let attempt = 0, delay = 300; ; attempt++, delay = Math.min(delay * 2, 2000)) {
+    let outcome: { ok: true; value: T } | { ok: false; error: unknown };
+    try { outcome = { ok: true, value: await work(attempt) }; }
+    catch (error) {
+      if (!(error instanceof AppError && error.code === 'MIX_UNAVAILABLE')) throw error;
+      outcome = { ok: false, error };
+    }
+    if (outcome.ok && done(outcome.value)) return outcome.value;
+    if (now() - started + delay > budget) { if (!outcome.ok) throw outcome.error; return outcome.value; }
+    await sleep(delay);
+  }
+}
 export const mixBusy = () => new AppError(409, 'MIX_BUSY', '組合正在處理交易，確認完成後才能再次變更。');
 const mixLockState = new AsyncLocalStorage<{ lost: boolean; check: () => Promise<void> }>();
 export function assertMixLock(): void {

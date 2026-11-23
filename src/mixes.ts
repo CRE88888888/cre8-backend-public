@@ -18,7 +18,7 @@ import { preparePortfolioEnrollment, enrollPortfolio } from './portfolios.js';
 import { planPortfolio } from './snapshot.js';
 import { configuredChainId, TESTNET_97 } from './testnet-profile.js';
 import { registerMixStrategy, prepareMixCalls, readMixEnrollmentProof, mixIntentContext, findMixEnrollment } from './mix-chain.js';
-import { MIX_COLUMNS, currentMixHistory, pendingMixIntent, userMixAssets, mixUnavailable, mixBusy, withMixLock, quiesceMix, confirmMixSegment } from './mix-store.js';
+import { MIX_COLUMNS, currentMixHistory, pendingMixIntent, userMixAssets, mixUnavailable, mixBusy, withMixLock, quiesceMix, confirmMixSegment, logMixFailure } from './mix-store.js';
 import type { MixRow, MixSnapshot } from './mix-store.js';
 import { mixAnchor, mixValue, saveMixValuation } from './mix-valuation.js';
 import type { MixValuation } from './mix-valuation.js';
@@ -46,7 +46,11 @@ export function createMixService(overrides: Partial<MixServiceDeps> = {}) {
     try {
       if (deps.chainId() !== 97) throw new AppError(503, 'MIX_CHAIN_UNAVAILABLE', '私人組合目前僅開放測試網。');
       return await work();
-    } catch (e) { if (e instanceof AppError) throw e; throw mixUnavailable(); }
+    } catch (e) {
+      const error = e instanceof AppError ? e : mixUnavailable('mixes', e);
+      if (error.status >= 500) logMixFailure('mixes', error);
+      throw error;
+    }
   }
   async function owned(id: number, wallet: string): Promise<MixRow> {
     const m = (await deps.query<MixRow>(`select ${MIX_COLUMNS} from mixes m where m.id=$1 and m.owner=$2 and m.deleted_at is null`, [id, wallet.toLowerCase()])).rows[0];

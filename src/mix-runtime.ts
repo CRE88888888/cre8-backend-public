@@ -86,7 +86,7 @@ export async function recordMixSwitchResidual(m: MixRuntime, due: DuePortfolio, 
       await db.query('update mixes set last_rebalanced_at=$2 where id=$1', [m.id, now]);
       return true;
     });
-  } catch { throw mixUnavailable(); }
+  } catch (error) { throw mixUnavailable(undefined, error); }
 }
 
 /** All values are oracle-priced, from the same snapshot. A closed stock remains

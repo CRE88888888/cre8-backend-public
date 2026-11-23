@@ -171,3 +171,22 @@ test('reconciler reports an unconfirmed first-version publication as unresolved 
     await withRelayerLock(97, async held => held());
   }));
 });
+
+// 2026-11-23: POST /me/mixes 503 after both transactions succeeded. The api now talks to a load-balanced RPC; right
+// after inclusion the next read may land on a node a few blocks behind (receipt / version not visible yet).
+test('a node lagging right after inclusion no longer fails the request: registration and first version confirm on the same call', async () => {
+  await mixDbSandbox(async lane => lane(async () => {
+    const id = await reserve(), f = registrationRpc();
+    const allocation = { assets: mixChainAllocation([{ assetId: T.assets.NVDAB.token, weightBps: 10000 }], [], 128).assets };
+    // The registration is sent first: its block then misses twice on the "other node"; after the publication,
+    // versionCount still reads 0 twice.
+    f.lag.afterSend = publication => { if (publication) f.state.publicationCountLagReads = 2; else f.lag.blockReads = 2; };
+    const started = Date.now();
+    const sid = await registerMixStrategy(T.roles.keeper, 'lagging node', allocation, id, { chain: f.chain });
+    assert.ok(Date.now() - started < 10_000);
+    assert.equal(f.lag.blockReads, 0); assert.equal(f.state.publicationCountLagReads, 0);
+    assert.equal(f.state.broadcasts.length, 2, 'no extra transaction was signed');
+    assert.equal((await query('select version from strategy_versions where strategy_id=$1', [sid])).rows.length, 1);
+    assert.equal((await query("select state from mix_publication_jobs where strategy_id=$1", [sid])).rows[0]?.state, 'confirmed');
+  }));
+});

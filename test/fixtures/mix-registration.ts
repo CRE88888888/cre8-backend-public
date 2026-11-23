@@ -19,6 +19,8 @@ function decodePublicationSchedule(data: Hex) {
 export function registrationRpc() {
   const transactions = new Map<Hex, { raw: Hex; publication: boolean; reverted: boolean }>();
   const state = { publicationAlreadyKnown: false, publicationCountLagReads: 0, pendingNonceFailures: 0, pendingNonce: null as number | null, latestNonce: null as number | null, blockNumberMismatch: false, prepareCalls: 0, prepareDelayMs: 0, publicationDelayMs: 0, publicationMissing: false, publicationSendFail: false, publicationReverted: false, publicationConfigConflict: false, publicationCount: 0n, publicationRaw: '0x' as Hex, publicationFail: false, publicationData: '0x' as Hex, mode: 'healthy', raw: '0x' as Hex, broadcasts: [] as Hex[], nonces: 0, delayMs: 0, id: 178000001n };
+  /** Load-balanced RPC lag: numbered block reads fail while `blockReads` > 0; `afterSend` runs after each broadcast. */
+  const lag: { blockReads: number; afterSend?: (publication: boolean) => void } = { blockReads: 0 };
   const transport = custom({ request: async ({ method, params }) => {
     if (state.mode === 'rpc') throw new Error('private RPC failure');
     if (method === 'eth_blockNumber') return '0x1';
@@ -33,6 +35,7 @@ export function registrationRpc() {
     }
     if (method === 'eth_maxPriorityFeePerGas' || method === 'eth_gasPrice') return '0x1';
     if (method === 'eth_estimateGas') { state.prepareCalls++; if (state.prepareDelayMs) await new Promise(resolve => setTimeout(resolve, state.prepareDelayMs)); return '0x493e0'; }
+    if (method === 'eth_getBlockByNumber' && lag.blockReads > 0 && Array.isArray(params) && params[0] !== 'latest') { lag.blockReads--; throw new Error('fixture block not found on a lagging node'); }
     if (method === 'eth_getBlockByNumber') return { number: state.blockNumberMismatch && Array.isArray(params) && params[0] === '0x1' ? '0x2' : '0x1', hash: state.mode === 'reorg' ? toHex(2n, { size: 32 }) : zeroHash,
       timestamp: '0x64', baseFeePerGas: '0x1', gasLimit: '0x1000000', gasUsed: '0x1', transactions: [] };
     if (method === 'eth_sendRawTransaction') {
@@ -50,6 +53,7 @@ export function registrationRpc() {
       if (!publication) state.raw = signed;
       else { state.publicationRaw = signed; state.publicationData = tx.data ?? '0x'; }
       state.broadcasts.push(signed);
+      lag.afterSend?.(publication);
       if (state.mode === 'send') throw new Error('private unknown broadcast');
       return keccak256(signed);
     }
@@ -110,5 +114,5 @@ export function registrationRpc() {
   const client = createPublicClient({ chain: bscTestnet, transport, cacheTime: 0, pollingInterval: 1 });
   const chain = { chainId: 97, rpcUrl: 'http://127.0.0.1:8580', registryAddress: T.contracts.registry, account: relayerSigner,
     kernel: kernelAddressesForChain(97), wallet: createWalletClient({ chain: bscTestnet, account: relayerSigner, transport }), publicClient: client };
-  return { state, client, chain };
+  return { state, client, chain, lag };
 }

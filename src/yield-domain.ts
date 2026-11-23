@@ -1,5 +1,6 @@
 import type { Address, Hex } from 'viem';
-import { AppError } from './errors.js';
+import { AppError, callSite } from './errors.js';
+export { callSite } from './errors.js';
 import profileHashes from './testnet-codehashes.js';
 import { TESTNET_97 } from './testnet-profile.js';
 import { isStrategyVault } from './strategy-earn-guard.js';
@@ -22,17 +23,6 @@ export const unavailable = (where?: string, cause?: unknown) => {
   return new AppError(503, 'YIELD_UNAVAILABLE', '生息資料或持久化證據不完整，保留部位與在途',
     { cause: new Error(`[yield:${label}]`, cause === undefined ? undefined : { cause }) });
 };
-/** `at fn (/any/path/src/file.ts:12:3)` → `fn@src/file.ts:12`; drops the `unavailable` frame itself. Paths only, no values. */
-export function callSite(stack: string | undefined, frames = 3): string {
-  if (!stack) return '';
-  return stack.split('\n').map(line => line.trim()).filter(line => line.startsWith('at ')).slice(1, 1 + frames).map(line => {
-    const match = /^at (?:(.+?) \()?(.*?):(\d+)(?::\d+)?\)?$/.exec(line);
-    if (!match) return line.slice(3, 120);
-    const file = match[2] ?? '', at = file.lastIndexOf('/src/');
-    const short = at >= 0 ? file.slice(at + 1) : file.split('/').slice(-2).join('/');
-    return `${match[1] ?? '<anonymous>'}@${short}:${match[3]}`;
-  }).join(' < ');
-}
 export function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw unavailable();
   return value as Record<string, unknown>;

@@ -8,7 +8,8 @@ import { query, withTransaction } from './db.js';
 import { withRelayerLock, relayerNonce } from './relayer-lock.js';
 import { MIX_CREATION_COLUMNS } from './mix-creation.js';
 import type { MixCreation } from './mix-creation.js';
-import { mixUnavailable } from './mix-store.js';
+import { logMixFailure, mixUnavailable, untilNodesCatchUp } from './mix-store.js';
+import { AppError } from './errors.js';
 import { TESTNET_97 as T } from './testnet-profile.js';
 import { outboxIdentity, saveOutboxIdentity, saveOutboxConsumption, findOutboxConsumption, verifyOutboxConsumption, checkOutboxNonceHistory } from './relayer-nonce-consumption.js';
 
@@ -31,7 +32,7 @@ export async function validateMixRegistration(hash: Hex, raw: Hex, identity: Ide
     const serialized = serializeTransaction(tx, { r: tx.r, s: tx.s, v: tx.v ?? BigInt(27 + (tx.yParity ?? 0)) });
     if (keccak256(serialized) !== hash || (await recoverTransactionAddress({ serializedTransaction: serialized })).toLowerCase() !==
         (identity.operator ?? T.roles.operator).toLowerCase()) throw mixUnavailable();
-  } catch { throw mixUnavailable(); }
+  } catch (error) { throw mixUnavailable(undefined, error); }
 }
 
 /** Called under the shared relayer lock. Unknown receipt may replay ONLY durable original bytes. */
@@ -122,9 +123,10 @@ export async function registerMixCreation(id: string, overrides: Partial<MixRegi
     const deps: MixRegistrationDeps = { query, transaction: withTransaction, client: chain.publicClient, operator: chain.account.address, registry: chain.registryAddress, ...overrides };
     const initial = await load(id, deps.query);
     if (initial.state === 'registered' || initial.state === 'completed') {
-      if (await reconcileMixRegistration(id, deps) !== 'registered') throw mixUnavailable();
+      if (await reconcileMixRegistration(id, deps) !== 'registered') throw mixUnavailable('registration-not-confirmed');
       return load(id, deps.query);
     }
+    let includedNow = false; // set only after one node returned the receipt of the transaction sent in this call
     await (overrides.lock ?? withRelayerLock)(97, async held => {
       const row = await load(id, deps.query);
       if (row.state === 'prepared') {
@@ -147,10 +149,22 @@ export async function registerMixCreation(id: string, overrides: Partial<MixRegi
         held();
         if (await deps.client.sendRawTransaction({ serializedTransaction: raw }) !== hash) throw mixUnavailable();
         await deps.client.waitForTransactionReceipt({ hash, timeout: 30000 });
+        includedNow = true;
       }
       held();
-      if (await reconcileMixRegistration(id, { ...deps, assertHeld: held }, true) !== 'registered') throw mixUnavailable();
+      // Load-balanced RPC: the node answering next may still lag the one that returned the receipt. Re-read (replaying
+      // the same signed bytes if the receipt is not visible yet, as a client retry would) until registered or provably consumed; every check stays inside.
+      const reconcile = () => reconcileMixRegistration(id, { ...deps, assertHeld: held }, true);
+      const settled = includedNow ? await untilNodesCatchUp(async () => {
+        try { return await reconcile(); }
+        catch (error) { throw error instanceof AppError ? error : mixUnavailable('confirm-read', error); } // RELAYER_BUSY etc. are not retried
+      }, result => result === 'registered' || result === 'consumed') : await reconcile();
+      if (settled !== 'registered') throw mixUnavailable(`registration-${settled}`);
     }, { reconcile: initial.state === 'submitted' });
     return load(id, deps.query);
-  } catch { throw mixUnavailable(); }
+  } catch (error) {
+    const failure = error instanceof AppError && error.code === 'MIX_UNAVAILABLE' ? error : mixUnavailable('registration', error);
+    logMixFailure('registration', failure);
+    throw failure;
+  }
 }

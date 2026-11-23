@@ -104,3 +104,15 @@ export function errorChain(error: unknown, depth = 5): string {
   }
   return parts.join(' ← ');
 }
+
+/** `at fn (/any/path/src/file.ts:12:3)` → `fn@src/file.ts:12`; drops the `unavailable` frame itself. Paths only, no values. */
+export function callSite(stack: string | undefined, frames = 3): string {
+  if (!stack) return '';
+  return stack.split('\n').map(line => line.trim()).filter(line => line.startsWith('at ')).slice(1, 1 + frames).map(line => {
+    const match = /^at (?:(.+?) \()?(.*?):(\d+)(?::\d+)?\)?$/.exec(line);
+    if (!match) return line.slice(3, 120);
+    const file = match[2] ?? '', at = file.lastIndexOf('/src/');
+    const short = at >= 0 ? file.slice(at + 1) : file.split('/').slice(-2).join('/');
+    return `${match[1] ?? '<anonymous>'}@${short}:${match[3]}`;
+  }).join(' < ');
+}

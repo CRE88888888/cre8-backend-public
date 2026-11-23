@@ -118,7 +118,7 @@ import type { Address, Hex, PublicClient } from 'viem';
 import { hdKeyToAccount } from 'viem/accounts';
 import { createBundlerClient, entryPoint07Abi, formatUserOperation, formatUserOperationReceipt, getUserOperationHash } from 'viem/account-abstraction';
 import type { GetUserOperationReturnType, UserOperationReceipt } from 'viem/account-abstraction';
-import { rpcTransport } from './rpc-transport.js';
+import { rpcBatch, rpcTransport } from './rpc-transport.js';
 import { activeChain } from './chain-object.js';
 import { testnetAssets, TESTNET_97 } from './testnet-profile.js';
 import { signPreparedOperation } from './user-operation.js';
@@ -440,7 +440,7 @@ export const PARTIAL_FOLLOW_UP_SECONDS = 1800;
  * A per-asset round with nothing to do waits this long before its next round. New money wakes the portfolio at once
  * (funding sets next_run_at=null), and the buy route runs its own round.
  */
-export const IDLE_BACKOFF_SECONDS = 300;
+export const IDLE_BACKOFF_SECONDS = 900;
 
 
 /** 準備要執行的參數摘要：dry-run 與 live 都會有，差別只在有沒有 `execution`。 */
@@ -1672,7 +1672,7 @@ function defaultPublicClient(): PublicClient {
   if (rpcUrl === null) {
     throw new Error('chain 未設定：排程器要讀鏈（RPC_URL 是空的——空字串等於沒設，見 docs/pitfalls §8.12）');
   }
-  cachedPublicClient = createPublicClient({ chain: activeChain(), transport: rpcTransport('scheduler', rpcUrl) });
+  cachedPublicClient = createPublicClient({ chain: activeChain(), ...rpcBatch(rpcUrl), transport: rpcTransport('scheduler', rpcUrl) });
   return cachedPublicClient;
 }
 

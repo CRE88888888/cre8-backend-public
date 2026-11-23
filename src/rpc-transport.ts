@@ -160,3 +160,13 @@ export function rpcTransport(source: string, url: string | null | undefined, opt
 
 /** Test hook. */
 export function resetRpcTransport(): void { breakers.clear(); usage.clear(); chainIds.clear(); heads.clear(); }
+
+/**
+ * Multicall batching for the bulk readers (scheduler, snapshot, status, Strategy Earn): concurrent readContract calls
+ * become one Multicall3 eth_call. 2026-11-23: the scheduler made ~4,600 eth_call per 10 min (one round per portfolio
+ * read every asset one by one) and the keyless public node started rate-limiting it. Only on the real chain-97 RPC
+ * (local test nodes keep plain calls).
+ */
+export function rpcBatch(url: string | null | undefined): { batch?: { multicall: { batchSize: number; wait: number } } } {
+  return secondaryRpc(url) === null ? {} : { batch: { multicall: { batchSize: 48_000, wait: 0 } } };
+}

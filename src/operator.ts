@@ -35,7 +35,7 @@ import { buildRoutedStep, capAssetLeg, DEFAULT_DEADLINE_SECONDS, minGrossFor, no
 import type { PlannedStep, RebalancePlan } from './rebalance-plan.js';
 import type { RebalancePlanningInput } from './scheduler.js';
 import type { PortfolioPlan, QueryFn } from './snapshot.js';
-import { rpcTransport } from './rpc-transport.js';
+import { rpcBatch, rpcTransport } from './rpc-transport.js';
 
 // ---------------------------------------------------------------------------
 // GET /portfolios/:id/status
@@ -475,7 +475,7 @@ function statusClient(signal: AbortSignal): PublicClient | undefined {
 
 /** Bounded per request (8 s, 1 retry); once `signal` aborts every in-flight and later request fails at once. */
 export function statusRpcClient(rpcUrl: string, signal: AbortSignal): PublicClient {
-  return createPublicClient({ chain: activeChain(), transport: rpcTransport('operator', rpcUrl, {
+  return createPublicClient({ chain: activeChain(), ...rpcBatch(rpcUrl), transport: rpcTransport('operator', rpcUrl, {
     timeout: STATUS_RPC_TIMEOUT_MS, retryCount: STATUS_RPC_RETRY_COUNT, fetchOptions: { signal } }) });
 }
 
@@ -839,7 +839,7 @@ function defaultPublicClient(): PublicClient {
   if (!rpcUrl) {
     throw new Error('chain 未設定：RPC_URL 是讀 receipt 的必要條件');
   }
-  return createPublicClient({ chain: activeChain(), transport: rpcTransport('operator', rpcUrl) });
+  return createPublicClient({ chain: activeChain(), ...rpcBatch(rpcUrl), transport: rpcTransport('operator', rpcUrl) });
 }
 
 function operatorOutcome(result: PortfolioRunResult): OperatorRebalanceOutcome {

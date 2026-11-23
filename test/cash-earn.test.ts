@@ -313,3 +313,29 @@ test('#193 outages become "temporarily unavailable" states: account, deposit, wi
   assert.deepEqual(await earn.confirm(owner, { txHash: `0x${'ab'.repeat(32)}` }), { status: 'pending', recorded: [] });
   assert.equal(ledger.rows.length, rows);
 });
+
+test('2026-11-23: right after a deposit a lagging RPC node is waited for, so the new position is listed and withdrawable', async () => {
+  // Aave deposit landed at block 120 and is recorded; the node first answers with head 100 (before it), then catches up.
+  const aave = { sharesRaw: 20n * WAD, valueRaw: 20n * WAD, maxWithdrawRaw: 20n * WAD };
+  let heads = [100n, 110n, 120n];
+  const state: FakeState = { readings: [reading({ aprBps: 500 }), reading({ aprBps: 300 }), reading({ aprBps: 400 })], positions: [none, none, aave], balance: 0n, allowance: 0n };
+  const chain = (): CashEarnChain => {
+    const base = fakeChain(state);
+    return { ...base, head: async () => ({ number: heads.length > 1 ? heads.shift()! : heads[0]!, timestamp: 1_795_400_000n }),
+      position: async (v, _o, block) => block >= 120n ? base.position(v, _o, block, 0n, null as never) : none };
+  };
+  const query = (async (sql: string) => sql.startsWith('select vault_id') ? { rows: [{ vault_id: 'aave_v3_usdt', deposited: String(20n * WAD), withdrawn: '0',
+    first_at: new Date('2026-11-23T05:00:00Z'), last_block: '120' }] } : { rows: [] }) as never;
+  const waits: number[] = [];
+  const earn = createCashEarn({ chainId: 97, chain, query, now, nodeLag: { sleep: async (ms) => { waits.push(ms); }, now: () => 0 } });
+  const account = await earn.account(owner);
+  assert.deepEqual(account.cashEarn.positions.map(p => [p.vaultId, p.valueRaw]), [['aave_v3_usdt', String(20n * WAD)]]);
+  assert.equal(waits.length, 2);
+  heads = [100n, 120n];
+  const w = await earn.withdraw(owner, { vaultId: 'aave_v3_usdt', amountRaw: 'max' });
+  assert.equal(w.status, 'ready');
+  // Still behind after the bounded wait: "temporarily unavailable", never an empty (zero) position.
+  heads = [100n];
+  const behind = createCashEarn({ chainId: 97, chain, query, now, nodeLag: { budgetMs: 0 } });
+  assert.equal((await behind.account(owner)).status, 'unavailable');
+});

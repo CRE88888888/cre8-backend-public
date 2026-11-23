@@ -7,6 +7,8 @@ import { AppError, ValidationError } from './errors.js';
 import { yieldProfile } from './yield-domain.js';
 import type { YieldMarket, YieldProtocol } from './yield-domain.js';
 import { TESTNET_97 } from './testnet-profile.js';
+import { retryWhileLagging } from './node-lag.js';
+import type { NodeLagOptions } from './node-lag.js';
 
 /**
  * Cash Earn (backend#193, docs/EARN_UX A/D). The owner's wallet holds the vault position directly:
@@ -304,7 +306,8 @@ export function flowsFromLogs(vaults: readonly CashVault[], owner: Address, logs
 }
 
 type Query = typeof dbQuery;
-export type CashEarnDeps = { chainId: number; vaults: CashVault[]; chain: () => CashEarnChain; query: Query; now: () => Date };
+export type CashEarnDeps = { chainId: number; vaults: CashVault[]; chain: () => CashEarnChain; query: Query; now: () => Date; nodeLag?: NodeLagOptions };
+const BEHIND = new Error('rpc head is behind the last recorded flow');
 const unavailable = () => new AppError(503, 'EARN_UNAVAILABLE', '目前無法讀取生息資料，請稍後再試。');
 
 export function createCashEarn(overrides: Partial<CashEarnDeps> = {}) {
@@ -329,21 +332,30 @@ export function createCashEarn(overrides: Partial<CashEarnDeps> = {}) {
   async function readings(chain: CashEarnChain, block: bigint, timestamp: bigint) {
     return Promise.all(deps.vaults.map(async v => { try { return await chain.vault(v, block, timestamp); } catch { return null; } }));
   }
-  async function vaultList() {
+  /** `minBlock`: the owner's last recorded deposit/withdraw. A load-balanced RPC node can still be behind it right after
+   * the transaction (the position would read as empty), so wait briefly for a head at or past it (src/node-lag.ts). */
+  async function vaultList(minBlock = 0n) {
     ready();
     // docs/EARN_UX D: an RPC outage is a "temporarily unavailable" state per vault, not an error code.
     let live: { chain: CashEarnChain; head: { number: bigint; timestamp: bigint } } | null = null;
-    try { const chain = deps.chain(); live = { chain, head: await chain.head() }; } catch { live = null; }
+    try {
+      const chain = deps.chain();
+      const head = await retryWhileLagging(async () => { const h = await chain.head(); if (h.number < minBlock) throw BEHIND; return h; }, e => e === BEHIND, deps.nodeLag);
+      live = { chain, head };
+    } catch { live = null; }
     const states = live ? await readings(live.chain, live.head.number, live.head.timestamp) : deps.vaults.map(() => null);
     const at = live ? new Date(Number(live.head.timestamp) * 1000) : deps.now();
     return { live, states, vaults: markBest(deps.vaults.map((v, i) => vaultView(v, states[i] ?? null, at))) };
   }
   async function ledger(owner: Address) {
-    const rows = (await deps.query<{ vault_id: string; deposited: string; withdrawn: string; first_at: Date }>(`select vault_id,
+    const rows = (await deps.query<{ vault_id: string; deposited: string; withdrawn: string; first_at: Date; last_block?: string | null }>(`select vault_id,
       coalesce(sum(assets_raw) filter (where kind='deposit'),0)::text as deposited, coalesce(sum(assets_raw) filter (where kind='withdraw'),0)::text as withdrawn,
-      min(created_at) as first_at from cash_earn_flows where chain_id=$1 and owner=$2 group by vault_id`, [deps.chainId, owner])).rows;
-    return new Map(rows.map(r => [r.vault_id, { deposited: BigInt(r.deposited), withdrawn: BigInt(r.withdrawn), firstAt: r.first_at }]));
+      min(created_at) as first_at, max(block_number)::text as last_block from cash_earn_flows where chain_id=$1 and owner=$2 group by vault_id`, [deps.chainId, owner])).rows;
+    return new Map(rows.map(r => [r.vault_id, { deposited: BigInt(r.deposited), withdrawn: BigInt(r.withdrawn), firstAt: r.first_at,
+      lastBlock: typeof r.last_block === 'string' && /^\d+$/.test(r.last_block) ? BigInt(r.last_block) : 0n }]));
   }
+  const lastBlock = (book: Awaited<ReturnType<typeof ledger>>, vaultId?: string) =>
+    [...book.entries()].filter(([id]) => vaultId === undefined || id === vaultId).reduce((max, [, f]) => f.lastBlock > max ? f.lastBlock : max, 0n);
   return {
     async vaults() {
       const { live, vaults } = await vaultList();
@@ -353,7 +365,8 @@ export function createCashEarn(overrides: Partial<CashEarnDeps> = {}) {
     /** Wallet cash and Cash Earn are separate fields; nothing here sums them. */
     async account(wallet: string) {
       const owner = lower(wallet);
-      const { live, states, vaults } = await vaultList();
+      const book = await ledger(owner);
+      const { live, states, vaults } = await vaultList(lastBlock(book));
       let available: bigint | null = null;
       if (live) try { available = await live.chain.balance(deps.vaults[0]?.asset ?? TESTNET_97.contracts.usdt, owner, live.head.number); } catch { available = null; }
       if (!live || available === null) {
@@ -361,7 +374,6 @@ export function createCashEarn(overrides: Partial<CashEarnDeps> = {}) {
           wallet: { availableRaw: null }, cashEarn: { earningRaw: null, earnedTodayRaw: null, earnedTotalRaw: null, positions: [] } };
       }
       const { chain, head } = live;
-      const book = await ledger(owner);
       const now = deps.now(), midnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
       const positions = [];
       // A position we cannot read makes every Cash Earn sum unknown (null), never an understated number.
@@ -420,7 +432,7 @@ export function createCashEarn(overrides: Partial<CashEarnDeps> = {}) {
       ready();
       const b = body(input, ['vaultId', 'amountRaw']), vault = find(b.vaultId), owner = lower(wallet);
       const requested = amount(b.amountRaw, true);
-      const { live, states, vaults } = await vaultList();
+      const { live, states, vaults } = await vaultList(lastBlock(await ledger(owner), vault.id));
       const i = deps.vaults.indexOf(vault), state = states[i], view = vaults[i];
       const dataUnavailable = { status: 'unavailable' as const, vaultId: vault.id, reason: 'data_unavailable', message: TEMPORARILY };
       if (!live || !state || !view) return dataUnavailable;

@@ -11,7 +11,12 @@ export type YieldProtocol = 'venus' | 'lista' | 'aave_v3';
 export type YieldMarket = Readonly<{ id: string; marketId: Hex; protocol: YieldProtocol; asset: Address; symbol: string;
   receipt: Address; target: Address; simulated: boolean }>;
 export type YieldProfile = Readonly<{ chainId: 97; registry: Address; executor: Address; registryCodeHash?: Hex; reservationMode?: 'db_only'; markets: readonly YieldMarket[] }>;
-export const unavailable = () => new AppError(503, 'YIELD_UNAVAILABLE', '生息資料或持久化證據不完整，保留部位與在途');
+/**
+ * The one public yield failure. `where` names the failing check and `cause` keeps the underlying error,
+ * both only in the cause chain (logs via `errorChain`), never in the public message.
+ */
+export const unavailable = (where?: string, cause?: unknown) => new AppError(503, 'YIELD_UNAVAILABLE', '生息資料或持久化證據不完整，保留部位與在途',
+  where === undefined && cause === undefined ? undefined : { cause: new Error(`[yield:${where ?? 'unknown'}]`, cause === undefined ? undefined : { cause }) });
 export function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw unavailable();
   return value as Record<string, unknown>;

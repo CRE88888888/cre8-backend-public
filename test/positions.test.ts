@@ -1146,3 +1146,28 @@ test('chain 97 生息讀取與持倉讀取、日誌掃描同時進行（舊版�
   assert.equal(plan.snapshot.accountValueRaw, 500n * 10n ** 18n);
   assert.deepEqual(plan.blocked, []);
 });
+
+test('status 的 observeOnly：不掃日誌、不二分搜尋部署塊、不寫 DB（排程器拿著鎖時狀態不會等）', async () => {
+  const chain = baseChain({ versions: new Map([[1, { assets: [TESTNET_USDT], weightsBps: [10000] }]]) });
+  chain.balances.set(TESTNET_USDT.toLowerCase(), 500n * 10n ** 18n);
+  const db = baseDb({
+    versions: new Map<string, Map<number, unknown>>([['11', new Map<number, unknown>([[1, { assets: [{ address: TESTNET_USDT, symbol: 'USDT', weightBps: 10000 }] }]])]]),
+  });
+  const base = fakeQuery(db);
+  const query: QueryFn = async (text, params) => text.includes('from yield_events') ? { rows: [] } : base(text, params);
+  let getCode = 0;
+  const client = Object.assign(stubClient(chain), { getCode: async () => { getCode += 1; return undefined; } }) as PublicClient;
+  const plan = await planPortfolio(9, {
+    ...planDeps(chain, db), publicClient: client, query, chainId: 97, strategyEarnCollateral: async () => [],
+    readYield: async (_c, profile, _a, { block }) => ({ profile, positions: [], risks: [], accountValue: 500n * 10n ** 18n,
+      observation: { block, blockHash: `0x${'11'.repeat(32)}`, at: new Date(), source: 'test' } }),
+    yieldOptional: true, observeOnly: true,
+  });
+  assert.deepEqual(chain.logCalls, [], 'no eth_getLogs');
+  assert.equal(getCode, 0, 'no deployment-block bisection');
+  assert.deepEqual(db.calls.filter((c) => /\b(insert|update|delete)\b|for update/i.test(c.text)).map((c) => c.text.slice(0, 40)), [], 'no writes, no row locks');
+  assert.equal(plan.scan.universeComplete, false);
+  assert.equal(plan.snapshot.holdings.find((h) => h.asset === TESTNET_USDT.toLowerCase())?.amountWei, 500n * 10n ** 18n);
+  assert.deepEqual(plan.blocked, []);
+  assert.ok(plan.report !== null);
+});

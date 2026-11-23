@@ -12,7 +12,7 @@
  *
  * 不寫 DB、不加 migration：進程重啟後第一次請求會重讀（前端有自己的本機快取，畫面不會空白）。
  */
-import { AppError } from './errors.js';
+import { AppError, errorChain } from './errors.js';
 
 export type OverviewItemState = 'ok' | 'pending' | 'unavailable';
 export type OverviewError = { code: string; message: string };
@@ -68,6 +68,12 @@ export type OverviewDeps = {
   firstWaitMs?: number;
   /** 同時刷新幾項（全進程）。 */
   concurrency?: number;
+  /**
+   * 單項刷新最多占用名額多久。逾時 → 這一項記成 `TIMEOUT` 錯誤、名額立刻還回去。
+   * 狀態讀取自己有 30 秒上限並會中止 RPC；這一層是給其他讀取（策略加息、現金生息、錢包 USDT）的保險，
+   * 讓任何一個卡住的讀取都不會永遠占著共用的 3 個名額。
+   */
+  loadTimeoutMs?: number;
   /** 背景刷新：多久看一次、看過多久內的錢包要刷。0 = 不開計時器（測試）。 */
   warmEveryMs?: number;
   warmWindowMs?: number;
@@ -82,6 +88,14 @@ export function createOverview(deps: OverviewDeps) {
   const now = deps.now ?? (() => Date.now());
   const freshMs = deps.freshMs ?? 60_000, firstWaitMs = deps.firstWaitMs ?? 1_500, concurrency = Math.max(1, deps.concurrency ?? 3);
   const warmWindowMs = deps.warmWindowMs ?? 15 * 60_000;
+  const loadTimeoutMs = deps.loadTimeoutMs ?? 45_000;
+  const bounded = <T>(load: () => Promise<T>): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    return Promise.race([load(), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new AppError(503, 'TIMEOUT', `refresh did not finish within ${Math.round(loadTimeoutMs / 1000)} s`)), loadTimeoutMs);
+      (timer as { unref?: () => void }).unref?.();
+    })]).finally(() => { if (timer !== undefined) clearTimeout(timer); });
+  };
   const log = deps.log ?? ((line: string) => console.log(line));
   const entries = new Map<string, Entry<unknown>>();
   let running = 0;
@@ -101,11 +115,11 @@ export function createOverview(deps: OverviewDeps) {
   function refresh<T>(key: string, e: Entry<T>): Promise<void> {
     if (e.refreshing) return e.refreshing;
     const started = now();
-    e.refreshing = slot(() => e.load()).then(
+    e.refreshing = slot(() => bounded(e.load)).then(
       (value) => { e.value = value; e.updatedAt = new Date(now()); e.error = undefined; e.errorAt = undefined; },
       (error: unknown) => {
         e.error = toError(error); e.errorAt = new Date(now());
-        log(JSON.stringify({ level: 'warn', msg: 'overview refresh failed', key, ms: now() - started, code: e.error.code, error: e.error.message }));
+        log(JSON.stringify({ level: 'warn', msg: 'overview refresh failed', key, ms: now() - started, code: e.error.code, error: e.error.message, cause: errorChain(error) }));
       },
     ).finally(() => { e.refreshing = null; });
     return e.refreshing;

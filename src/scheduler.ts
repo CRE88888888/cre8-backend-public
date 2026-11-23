@@ -125,6 +125,7 @@ import type { AlertFinding, AlertKind, PriceSourceTracker, RelayerGasChecks } fr
 import { a10ErrorMessage, EXECUTOR_BUY_ABI, readGlobalPaused, decodePriceSourceError, describePriceSourceError, PriceSourceError, inspectPriceSources, oracleUnavailableTag } from './chain.js';
 import { getConfig, getSessionKeyConfig, requireSessionKeyConfig } from './config.js';
 import { errorMessage, query as dbQuery, withTransaction, withPortfolioLock } from './db.js';
+import { errorChain as describeErrorChain } from './errors.js';
 import { AppError } from './errors.js';
 import { borrowKeyMarkets, buildSessionPermissions, yieldAuthorization } from './permissions.js';
 import { DEFAULT_DEADLINE_SECONDS as PLAN_DEFAULT_DEADLINE_SECONDS, planRebalance, readMaxLegUsdE8, refreshFloors, minimumDepositUsdtWei, checkTradeMinimums, checkBuyFeeReserve } from './rebalance-plan.js';
@@ -1702,14 +1703,7 @@ function defaultQuery(): SchedulerQueryFn {
 
 /** 錯誤與它的 cause（最多 3 層），一行、遮掉網址；只給 log 用。 */
 export function errorChain(error: unknown): string {
-  const parts: string[] = [];
-  let current: unknown = error;
-  for (let depth = 0; depth < 3 && current !== undefined && current !== null; depth++) {
-    const text = current instanceof Error ? current.message : String(current);
-    parts.push(text.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'`)]+/gi, '<url>').replace(/\s*\n\s*/g, ' | ').slice(0, 600));
-    current = current instanceof Error ? current.cause : undefined;
-  }
-  return parts.join(' ← ');
+  return describeErrorChain(error);
 }
 
 function oneLine(error: unknown): string {
@@ -2008,7 +2002,7 @@ export async function runSchedulerOnce(
   }
 
   // Yield exits/recovery have their own account lock and precede DEX queues, buy throttles and price gates.
-  try { const result=await (deps.yieldRound??runYieldRound)({dryRun,limit}); resolved.log('[yield] '+JSON.stringify(result)); } catch { resolved.log('[yield] 生息讀值／對帳未完成，保留原部位與預留'); }
+  try { const result=await (deps.yieldRound??runYieldRound)({dryRun,limit}); resolved.log('[yield] '+JSON.stringify(result)); } catch (error) { resolved.log(`[yield] 生息讀值／對帳未完成，保留原部位與預留：${errorChain(error)}`); }
   // Strategy earn keeper (backend#199): anyone-callable deleverage/unwind and incentive claims for each account's own position.
   try { const result=await (deps.strategyEarnRound??runStrategyEarnRound)({dryRun,log:resolved.log}); if(result)resolved.log('[strategy-earn] '+JSON.stringify(result)); } catch { resolved.log('[strategy-earn] 健康度讀值未完成，下輪再試'); }
 

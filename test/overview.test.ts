@@ -84,3 +84,27 @@ test('#216 overview: refreshes share a process-wide concurrency limit', async ()
   assert.ok(peak <= 2, `peak ${peak}`);
   assert.ok(r.portfolios.every((p) => p.state === 'ok'));
 });
+
+test('a refresh that never finishes times out, shows unavailable with TIMEOUT and frees its slot for the others', async () => {
+  const lines: string[] = [];
+  const many = [1, 2, 3, 4].map((id) => ({ id, strategyId: id, strategyName: `F${id}`, smartAccounts: [{ address: `0x0${id}` }] }));
+  const { d } = deps({
+    listPortfolios: async () => many,
+    // 1–3 hang forever (like the three stuck portfolios); 4 answers. Concurrency 3 means 4 only runs once a slot frees.
+    status: (id) => id === 4 ? Promise.resolve({ totalUsdE8: '100', holdings: [], unpriced: [] }) : new Promise(() => {}),
+    strategyEarn: async () => null,
+    loadTimeoutMs: 40, firstWaitMs: 10, concurrency: 3, now: () => Date.now(),
+    log: (line) => lines.push(line),
+  });
+  const o = createOverview(d).overview;
+  await o(W);
+  await sleep(150);
+  const r = await o(W);
+  for (const id of [1, 2, 3]) {
+    const p = r.portfolios.find((x) => x.id === id)!;
+    assert.equal(p.state, 'unavailable', `portfolio ${id}`);
+    assert.equal(p.error?.code, 'TIMEOUT');
+  }
+  assert.equal(r.portfolios.find((x) => x.id === 4)?.state, 'ok', 'the fourth item got a slot');
+  assert.ok(lines.some((line) => line.includes('"code":"TIMEOUT"') && line.includes('"cause"')));
+});

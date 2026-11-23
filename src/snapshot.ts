@@ -151,7 +151,22 @@ export type PlanDeps = {
    * mixes) leave this off and keep failing closed.
    */
   yieldOptional?: boolean;
+  /**
+   * Display callers only (`GET /portfolios/:id/status`): observe without persisting. Skips the holdings
+   * log scan (getCode bisection + chunked getLogs over the whole cursor gap, which status never shows) and
+   * the personal-mix cash-flow sync (a DB row lock and another chunked getLogs loop). Nothing is written and
+   * no lock is taken, so a scheduler round can never make status wait. `plan.scan` is a "not scanned" stub.
+   */
+  observeOnly?: boolean;
 };
+
+/** `plan.scan` when `observeOnly` skipped the scan: universe completeness is unknown, nothing advanced. */
+function unscanned(portfolioId: number, block: bigint): HoldingScanResult {
+  return { portfolioId, block, cursor: { portfolioId, startBlock: block, lastScannedBlock: block - 1n }, scannedRange: null,
+    candidateCount: 0, unknownHoldings: [], zeroBalanceCount: 0, unreadableCandidates: [],
+    deployment: { block: null, reason: 'rpc_cannot_answer', detail: 'observe-only status read: deployment block not resolved' },
+    universeComplete: false, incompleteReasons: ['observe-only status read: holdings log scan skipped'] };
+}
 
 /** Shares of a portfolio asset posted in its Strategy Earn market; still this portfolio's, held by the market. */
 export type StrategyEarnCollateral = { asset: Address; marketId: string; amount: bigint };
@@ -468,7 +483,7 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
       } : undefined),
       ...(personalMix ? { priceSource: 'oracle' as const } : {}),
     }),
-    scanPortfolioHoldings({
+    deps.observeOnly === true ? Promise.resolve(unscanned(portfolioId, block)) : scanPortfolioHoldings({
       ...(personalMix ? { beforeAdvance: async (range: { fromBlock: bigint; toBlock: bigint }) => {
         const { syncMixFlowRange } = await import('./mix-flows.js');
         await syncMixFlowRange(client, portfolioId, range);
@@ -484,7 +499,7 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
     yieldRead,
   ]);
 
-  if (personalMix && (scan.scannedRange === null || scan.cursor.lastScannedBlock < block)) {
+  if (personalMix && deps.observeOnly !== true && (scan.scannedRange === null || scan.cursor.lastScannedBlock < block)) {
     const { syncMixFlowRange } = await import('./mix-flows.js');
     const fromBlock = scan.cursor.lastScannedBlock < block ? scan.cursor.lastScannedBlock + 1n : block;
     await syncMixFlowRange(client, portfolioId, { fromBlock, toBlock: block });

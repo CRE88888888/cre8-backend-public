@@ -301,3 +301,14 @@ test('a timed-out yield read fails fast with YIELD_UNAVAILABLE and stops issuing
   await new Promise(resolve => setTimeout(resolve, 200));
   assert.equal(after, 0, 'no batch reaches the RPC after the timeout');
 });
+
+test('a failed yield read names the failing check in its cause chain (stale block / reorg / RPC error)', async () => {
+  const { errorChain } = await import('../src/errors.js');
+  const f = yieldFixture(['venus']);
+  const late = new Date(f.at.getTime() + 75_000);
+  const stale = await readYieldAccount(f.client, f.profile, f.account, { batch: f.batch, now: () => late }).catch((e: unknown) => e);
+  assert.match(errorChain(stale), /生息資料或持久化證據不完整.* ← \[yield:stale-block:100:age-75000ms\]$/);
+  const failing: typeof f.batch = async () => { throw Object.assign(new Error('rate limited'), { name: 'HttpRequestError' }); };
+  const rpc = await readYieldAccount(f.client, f.profile, f.account, { batch: failing, now: () => f.at }).catch((e: unknown) => e);
+  assert.match(errorChain(rpc), /\[yield:read\] ← HttpRequestError: rate limited$/);
+});

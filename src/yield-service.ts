@@ -4,7 +4,7 @@ import { getChain } from './chain.js';
 import { configuredChainId } from './testnet-profile.js';
 import { query, withPortfolioLock, withTransaction } from './db.js';
 import { requireOwnedPortfolio } from './portfolios.js';
-import { AppError, ValidationError } from './errors.js';
+import { AppError, ValidationError, errorChain } from './errors.js';
 import { object, address, hash, raw, fresh, mustExit, riskHeadroom, idleCash, supplyDecision, yieldProfile, unavailable } from './yield-domain.js';
 import type { YieldProfile, YieldSources } from './yield-domain.js';
 import { readYieldAccount } from './yield-reader.js';
@@ -55,19 +55,19 @@ function body(value:unknown,profile:YieldProfile):{markets:Hex[];txHash:Hex}{
 export function createYieldService(overrides:Partial<YieldServiceDeps>={}){
   const deps={...defaults,...overrides};
   const store={query:deps.query,transaction:deps.transaction};
-  async function safe<T>(fn:()=>Promise<T>):Promise<T>{try{return await fn();}catch(e){if(e instanceof AppError)throw e;throw unavailable();}}
+  async function safe<T>(fn:()=>Promise<T>):Promise<T>{try{return await fn();}catch(e){if(e instanceof AppError)throw e;throw unavailable('service',e);}}
   function profile(){const p=deps.profile();if(!p)throw new AppError(404,'YIELD_NOT_CONFIGURED','此鏈尚未開放生息');return p;}
   async function owned(id:number,wallet:string){const p=await deps.owned(id,wallet);if(p.personalMix)throw new AppError(409,'MIX_NO_YIELD','私人組合目前不提供生息。');if(p.chainId!==97||address(p.ownerAddress)!==address(wallet))throw new AppError(403,'FORBIDDEN','只能操作本人於這條鏈的帳戶');return p;}
   async function locked<T>(id:number,fn:()=>Promise<T>){const result=await deps.lock(id,fn);if(result===null)throw new AppError(409,'PORTFOLIO_BUSY','帳戶處理中，請以原請求重試');return result;}
   async function read(p:YieldAccount,at?:bigint){return deps.read(deps.client(),profile(),p.account,{now:deps.now,...(at===undefined?{}:{block:at})});}
   async function verifyHistory(p:YieldAccount,persist=true){
     const blocks=(await deps.query<{block_number:string;block_hash:Hex;state:string}>('select distinct block_number::text,block_hash,state from yield_events where chain_id=$1 and portfolio_id=$2',[p.chainId,p.portfolioId])).rows;
-    if(blocks.some(b=>b.state==='reorged'))throw unavailable();
+    if(blocks.some(b=>b.state==='reorged'))throw unavailable(`history-reorged-row:${blocks.filter(b=>b.state==='reorged').map(b=>b.block_number).join(',')}`);
     for(const b of blocks){
       const canonical=await deps.client().getBlock({blockNumber:raw(b.block_number)});
       if(canonical.hash===b.block_hash)continue;
       if(persist)await deps.transaction(async db=>{await yieldLocks(db,p);await db.query("update yield_events set state='reorged',updated_at=clock_timestamp() where chain_id=$1 and portfolio_id=$2 and block_number=$3 and block_hash=$4 and state='confirmed'",[p.chainId,p.portfolioId,b.block_number,b.block_hash]);});
-      throw unavailable();
+      throw unavailable(`history-hash-mismatch:${b.block_number}`);
     }
   }
   const keyRows=async(id:number)=>(await deps.query<{key_ref:string;permissions:unknown}>('select key_ref,permissions from session_keys where portfolio_id=$1 and status=\'active\' and expires_at>$2::timestamptz order by expires_at desc,key_ref',[id,deps.now()])).rows;
@@ -193,7 +193,7 @@ export function createYieldService(overrides:Partial<YieldServiceDeps>={}){
       const ctx:JournalContext={...p,cashAsset,consentId:null,exitRequestId:null,sources:{},reserve:()=>reservation,
         validate:async(input:YieldPrepare)=>{
           const quoteBlock=await client.getBlock({blockNumber:input.plan.quoteBlock});
-          if(quoteBlock.number!==input.plan.quoteBlock||quoteBlock.hash!==input.plan.quoteBlockHash||!fresh(new Date(Number(quoteBlock.timestamp)*1000),deps.now()))throw unavailable();
+          if(quoteBlock.number!==input.plan.quoteBlock||quoteBlock.hash!==input.plan.quoteBlockHash||!fresh(new Date(Number(quoteBlock.timestamp)*1000),deps.now()))throw unavailable(`quote-block-stale-or-reorged:${input.plan.quoteBlock}`);
           if(BigInt(Math.floor(deps.now().getTime()/1000))>input.plan.deadline)throw unavailable();
           if(input.plan.executor!==f.executor||input.plan.yieldRegistry!==f.registry)throw unavailable();
           const current=await read(p);await persistYieldRead(p,current,store);
@@ -212,7 +212,7 @@ export function createYieldService(overrides:Partial<YieldServiceDeps>={}){
       const journal=createYieldJournal(ctx,store);
       if(unresolved.length){
         if(dryRun)return '生息原操作待對帳（dry-run）';
-        if(unresolved.length!==1)throw unavailable();const key=unresolved[0]?.execution_key;if(!key)throw unavailable();
+        if(unresolved.length!==1)throw unavailable(`unresolved-actions:${unresolved.length}`);const key=unresolved[0]?.execution_key;if(!key)throw unavailable('unresolved-action-key');
         const row=(await deps.query<SnapshotRow>('select * from yield_execution_snapshots where execution_key=$1',[key])).rows[0];
         if(!row){await journal.unknown(key);return '生息原始快照缺漏，保留 unknown，不重送';}
         try{const original=restoreYieldOperation(row),result=await(await deps.port()).reconcileYieldOperation(client,resolveBundlerUrl(),original);
@@ -221,15 +221,15 @@ export function createYieldService(overrides:Partial<YieldServiceDeps>={}){
         }catch{await journal.unknown(key);return '生息原操作證據不足，保留 unknown，不重送';}
       }
       if((await deps.query(`select id from operations where portfolio_id=$1 and (state in ('pending','submitted') or (state='failed' and (tx_hash is not null or user_op_hash is not null)))`,[p.portfolioId])).rows.length)return '其他帳戶操作待對帳';
-      const state=await read(p,rebalance?.plan.snapshot.block).catch(async()=>{
+      const state=await read(p,rebalance?.plan.snapshot.block).catch(async(readError:unknown)=>{
         if(!dryRun&&rebalance===undefined)await deps.transaction(async db=>{await yieldLocks(db,p);await db.query("update yield_positions set exit_state='retry',exit_reason='data_unavailable',next_retry_at=clock_timestamp()+interval '30 seconds',updated_at=clock_timestamp() where chain_id=$1 and portfolio_id=$2 and (receipt_raw>0 or tracked_units_raw>0)",[p.chainId,p.portfolioId]);});
-        throw unavailable();
+        throw unavailable(rebalance===undefined?'tick-read':'tick-read-at-plan-block',readError);
       });
       if(dryRun)return '生息讀值完成（dry-run，未寫入／送出）';
       await persistYieldRead(p,state,store);
       if(rebalance!==undefined){
         if(rebalance.plan.portfolioId!==p.portfolioId||rebalance.plan.account.toLowerCase()!==p.account||rebalance.plan.chainId!==p.chainId||
-          state.observation.block!==rebalance.plan.snapshot.block||!fresh(state.observation.at,deps.now()))throw unavailable();
+          state.observation.block!==rebalance.plan.snapshot.block||!fresh(state.observation.at,deps.now()))throw unavailable('tick-rebalance-plan-mismatch-or-stale');
         if(rebalance.plan.snapshot.yieldPositions?.some(s=>s.blockHash!==state.observation.blockHash))throw unavailable();
         const needs=rebalanceWithdrawals(rebalance.plan,state.positions,rebalance.steps,cashAsset,rebalance.reserve,deps.now());
         if(!needs.length)return null;
@@ -407,7 +407,7 @@ export async function runYieldRound(options:{dryRun:boolean;limit:number},overri
       blocked++;
       const codes=new Set(['YIELD_UNAVAILABLE','YIELD_QUOTE_UNAVAILABLE','YIELD_RECONCILIATION_REQUIRED','SESSION_AUTHORIZATION_REQUIRED','GAS_BUDGET_EXCEEDED','PAYMASTER_SUBMISSION_UNAVAILABLE']);
       const code=error instanceof AppError&&codes.has(error.code)?error.code:'YIELD_UNAVAILABLE';
-      console.warn(JSON.stringify({msg:'yield_account_blocked',portfolioId:Number(row.portfolio_id),code}));
+      console.warn(JSON.stringify({msg:'yield_account_blocked',portfolioId:Number(row.portfolio_id),code,cause:errorChain(error)}));
     }
   }
   return {checked,blocked};

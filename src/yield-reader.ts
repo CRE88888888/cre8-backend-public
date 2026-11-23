@@ -3,6 +3,7 @@ import type { Address, Hex, PublicClient } from 'viem';
 import { MULTICALL3_ADDRESS } from './positions.js';
 import { fresh, object, raw, hash, address, RAY, UINT256_MAX, WAD, unavailable } from './yield-domain.js';
 import { isStrategyVault } from './strategy-earn-guard.js';
+import { AppError } from './errors.js';
 import type { Observation, YieldMarket, YieldPosition, YieldProfile, YieldRead, YieldRisk } from './yield-domain.js';
 
 // Read-only subset; execution/owner/session ABI remains owned by BE-4.
@@ -43,7 +44,7 @@ export async function yieldBatch(client: PublicClient, block: bigint, calls: rea
   const result = await client.simulateContract({ address: MULTICALL3_ADDRESS, abi: MULTICALL, functionName: 'aggregate3',
     args: [calls.map(c => ({ target: c.target, allowFailure: true,
       callData: encodeFunctionData({ abi: READ, functionName: c.name, args: c.args }) }))], blockNumber: block });
-  if (result.result.length !== calls.length) throw unavailable();
+  if (result.result.length !== calls.length) throw unavailable('multicall-length');
   return result.result.map((r, index) => {
     const call = calls[index];
     if (!call || !r.success || r.returnData === '0x') return null;
@@ -60,7 +61,7 @@ export type MarketIdentity = { market: YieldMarket; riskSource: Address; configu
 export type YieldReaderDeps = { now: () => Date; timeoutMs: number; batch: typeof yieldBatch };
 async function bounded<T>(promise: Promise<T>, timeoutMs: number, onTimeout: () => void): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  try { return await Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => { onTimeout(); reject(unavailable()); }, timeoutMs); })]); }
+  try { return await Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => { onTimeout(); reject(unavailable(`read-timeout-${timeoutMs}ms`)); }, timeoutMs); })]); }
   finally { if (timer !== undefined) clearTimeout(timer); }
 }
 /** At most this many multicall eth_calls of one account read are in flight at once. */
@@ -74,7 +75,7 @@ function limitedBatch(batch: typeof yieldBatch, max: number, expired: () => bool
   const queue: (() => void)[] = [];
   return async (client, block, calls) => {
     if (active >= max) await new Promise<void>(resolve => queue.push(resolve)); else active++;
-    try { if (expired()) throw unavailable(); return await batch(client, block, calls); }
+    try { if (expired()) throw unavailable('read-abandoned'); return await batch(client, block, calls); }
     finally { const next = queue.shift(); if (next) next(); else active--; }
   };
 }
@@ -88,27 +89,28 @@ export async function readYieldAccount(client: PublicClient, profile: YieldProfi
   const resolved: YieldReaderDeps = { now: () => new Date(), timeoutMs: 15000, batch: yieldBatch, ...options };
   let expired = false;
   const deps: YieldReaderDeps = { ...resolved, batch: limitedBatch(resolved.batch, YIELD_READ_CONCURRENCY, () => expired) };
-  try {return await bounded(read(), deps.timeoutMs, () => { expired = true; });} catch {throw unavailable();}
+  try {return await bounded(read(), deps.timeoutMs, () => { expired = true; });}
+  catch (error) {throw error instanceof AppError && error.code === 'YIELD_UNAVAILABLE' && error.cause !== undefined ? error : unavailable('read', error);}
   async function read(): Promise<YieldRead> {
     const [chainId, block] = await Promise.all([client.getChainId(),
       client.getBlock(options.block === undefined ? { blockTag: 'latest' } : { blockNumber: options.block })]);
-    if (chainId !== profile.chainId) throw unavailable();
-    if (block.number === null || block.hash === null) throw unavailable();
+    if (chainId !== profile.chainId) throw unavailable('chain-id');
+    if (block.number === null || block.hash === null) throw unavailable('block-header');
     if(profile.registryCodeHash!==undefined){
       const code=await client.getCode({address:profile.registry,blockNumber:block.number});
-      if(!code||code==='0x'||keccak256(code)!==profile.registryCodeHash)throw unavailable();
+      if(!code||code==='0x'||keccak256(code)!==profile.registryCodeHash)throw unavailable('registry-codehash');
     }
     const base = await deps.batch(client, block.number, [{target: profile.executor, name: 'oracle'}, {target: profile.executor, name: 'numeraire'}, {target:profile.registry,name:'supplyPaused'}, {target:profile.executor,name:'registry'}, {target:profile.registry,name:'marketCount'}, {target:profile.executor,name:'yieldRegistry'}]);
     const oracle = address(base[0]), numeraire = address(base[1]), strategyRegistry=address(base[3]);
     // backend#216: the registry also lists the strategy earn vault (#199), which yieldProfile() drops on purpose.
     // Every profile market must be on chain; any extra on-chain market may only be a strategy vault.
     const count=integer(base[4]);
-    if(address(base[5])!==profile.registry||count<BigInt(profile.markets.length)||count>BigInt(profile.markets.length)+8n)throw unavailable();
+    if(address(base[5])!==profile.registry||count<BigInt(profile.markets.length)||count>BigInt(profile.markets.length)+8n)throw unavailable(`registry-market-count:${count}/profile:${profile.markets.length}`);
     const marketIds=(await deps.batch(client,block.number,Array.from({length:Number(count)},(_m,index):ReadCall=>({target:profile.registry,name:'marketIds',args:[BigInt(index)]})))).map(hash);
     const extra=marketIds.filter(id=>!profile.markets.some(m=>m.marketId===id));
-    if(new Set(marketIds).size!==marketIds.length||profile.markets.some(m=>!marketIds.includes(m.marketId))||extra.some(id=>!isStrategyVault({marketId:id})))throw unavailable();
+    if(new Set(marketIds).size!==marketIds.length||profile.markets.some(m=>!marketIds.includes(m.marketId))||extra.some(id=>!isStrategyVault({marketId:id})))throw unavailable('registry-market-ids');
     const observation: Observation = { block: block.number, blockHash: block.hash, at: new Date(Number(block.timestamp) * 1000), source: 'canonical-yield-registry' };
-    if (!fresh(observation.at, deps.now())) throw unavailable();
+    if (!fresh(observation.at, deps.now())) throw unavailable(`stale-block:${observation.block}:age-${deps.now().getTime() - observation.at.getTime()}ms`);
     const navRead = (async (): Promise<{ nav: bigint; direct: bigint } | null> => {
       try {
         const nav = await deps.batch(client, observation.block, [
@@ -212,7 +214,8 @@ export async function readYieldAccount(client: PublicClient, profile: YieldProfi
     const navEvidence = await navRead;
     const nav = navEvidence !== null && !positions.some(p => p.value === null) &&
       navEvidence.direct + positions.reduce((n, p) => n + (p.value ?? 0n), 0n) === navEvidence.nav ? navEvidence.nav : null;
-    if ((await client.getBlock({ blockNumber: observation.block })).hash !== observation.blockHash || !fresh(observation.at, deps.now())) throw unavailable();
+    if ((await client.getBlock({ blockNumber: observation.block })).hash !== observation.blockHash) throw unavailable(`reorg:${observation.block}`);
+    if (!fresh(observation.at, deps.now())) throw unavailable(`stale-after-read:${observation.block}:age-${deps.now().getTime() - observation.at.getTime()}ms`);
     return { profile, positions, risks, accountValue: positions.some(p=>p.state==='unknown')?null:nav, observation };
 
     async function identity(m: YieldMarket): Promise<MarketIdentity | null> {

@@ -16,7 +16,7 @@ import { activeChain } from './chain-object.js';
 
 import { getConfig, getSessionKeyConfig } from './config.js';
 import { query as dbQuery, withTransaction } from './db.js';
-import { AppError } from './errors.js';
+import { AppError, errorChain } from './errors.js';
 import { requireOwnedPortfolio } from './portfolios.js';
 import { describeGasStatus } from './funding.js';
 import { listOpenAlerts } from './alerts.js';
@@ -55,6 +55,15 @@ export const STATUS_CACHE_TTL_MS = 10_000;
  * 不需要記住整個 fleet。滿了就丟最舊的一筆（Map 的插入順序即 LRU 的近似）。
  */
 export const STATUS_CACHE_MAX_ENTRIES = 100;
+
+/**
+ * 一份狀態最多算多久。逾時 → 503 `STATUS_TIMEOUT`，而且這份計算的 RPC 讀取全部中止（之後的請求立刻失敗），
+ * 不會在背景繼續打 RPC。overview 的背景刷新共用 3 個名額：沒有上限時，3 份卡住的狀態就讓所有人永遠 pending。
+ */
+export const STATUS_TIMEOUT_MS = 30_000;
+/** 狀態用的 RPC client：單次請求逾時與重試次數（viem 預設 10 秒 × 4 次，還會照 Retry-After 等）。 */
+export const STATUS_RPC_TIMEOUT_MS = 8_000;
+export const STATUS_RPC_RETRY_COUNT = 1;
 
 /** 一個有價持倉。`usdValueE8` 與漂移報告裡的同一個資產**逐位相同**（見 `statusOf`）。 */
 export type StatusHolding = {
@@ -162,6 +171,8 @@ export type StatusDeps = {
   /** `gas.ready` 的門檻；省略 = `MIN_SESSION_GAS_WEI`。 */
   minGasWei?: bigint;
   log?: (line: string) => void;
+  /** 單份狀態計算的上限（毫秒）；省略 = `STATUS_TIMEOUT_MS`。 */
+  timeoutMs?: number;
 };
 
 export type PortfolioStatusReader = (portfolioId: number, wallet: string) => Promise<PortfolioStatus>;
@@ -430,9 +441,46 @@ export async function resolveStatusSessionKey(
  * 使用者會把「讀不到」讀成「這個投組是空的」，然後看著一個空的投組按下再平衡。
  */
 async function statusOf(portfolioId: number, deps: StatusDeps, joinedVersion: number): Promise<PortfolioStatus> {
-  // Status only displays: a missing yield read degrades to a YIELD_VALUATION_UNAVAILABLE block (total unknown,
-  // wallet holdings still shown) instead of a 503 for the whole portfolio. Trading callers keep failing closed.
-  const planFn = deps.planPortfolio ?? ((id: number) => planPortfolio(id, { yieldOptional: true }));
+  const controller = new AbortController();
+  const timeoutMs = deps.timeoutMs ?? STATUS_TIMEOUT_MS;
+  // 這份計算專用的 client：逾時就 abort，被放棄的計算不會繼續占用共用的 RPC 額度。
+  const publicClient = deps.publicClient ?? statusClient(controller.signal);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      computeStatus(portfolioId, publicClient === undefined ? deps : { ...deps, publicClient }, joinedVersion),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort(new Error('status timeout'));
+          reject(new AppError(503, 'STATUS_TIMEOUT',
+            `Status of portfolio ${portfolioId} did not finish within ${timeoutMs} ms; its chain reads were abandoned.`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/** 有 `RPC_URL` 才建（沒有的話讓各讀取照舊走自己的預設、照舊報錯）。 */
+function statusClient(signal: AbortSignal): PublicClient | undefined {
+  let rpcUrl: string | null | undefined;
+  try { rpcUrl = getConfig().rpcUrl; } catch { return undefined; }
+  if (!rpcUrl) return undefined;
+  return statusRpcClient(rpcUrl, signal);
+}
+
+/** Bounded per request (8 s, 1 retry); once `signal` aborts every in-flight and later request fails at once. */
+export function statusRpcClient(rpcUrl: string, signal: AbortSignal): PublicClient {
+  return createPublicClient({ chain: activeChain(), transport: http(rpcUrl, {
+    timeout: STATUS_RPC_TIMEOUT_MS, retryCount: STATUS_RPC_RETRY_COUNT, fetchOptions: { signal } }) });
+}
+
+async function computeStatus(portfolioId: number, deps: StatusDeps, joinedVersion: number): Promise<PortfolioStatus> {
+  // 狀態只顯示：生息讀不到降級成 YIELD_VALUATION_UNAVAILABLE（#222）；observeOnly 不掃日誌、不同步組合現金流、
+  // 不寫 DB、不拿鎖（排程器拿著鎖時狀態不會等它）。會交易的呼叫端照舊 fail closed、照舊推進游標。
+  const planFn = deps.planPortfolio ?? ((id: number) => planPortfolio(id, {
+    ...(deps.publicClient === undefined ? {} : { publicClient: deps.publicClient }), yieldOptional: true, observeOnly: true }));
 
   let plan: PortfolioPlan;
   try {
@@ -531,8 +579,9 @@ async function statusOf(portfolioId: number, deps: StatusDeps, joinedVersion: nu
   // gas 讀不到（RPC 掛）不該讓整份狀態變 503：留 null，前端顯示「未知」。
   const gas = await (async () => {
     try {
-      const readBalance = deps.accountGasBalance ?? getAccountGasBalance;
-      const readPrice = deps.gasPrice ?? getGasPriceWei;
+      const client = deps.publicClient;
+      const readBalance = deps.accountGasBalance ?? (client === undefined ? getAccountGasBalance : (address: Address) => client.getBalance({ address }));
+      const readPrice = deps.gasPrice ?? (client === undefined ? getGasPriceWei : () => client.getGasPrice());
       const minimumWei = deps.minGasWei ?? getGasConfig().minSessionGasWei;
       const [balanceWei, gasPriceWei] = await Promise.all([readBalance(plan.account), readPrice()]);
       return describeGasStatus({ address: plan.account, balanceWei, minimumWei, gasPriceWei });
@@ -605,7 +654,9 @@ export function createPortfolioStatusReader(deps: StatusDeps = {}): PortfolioSta
             level: 'warn',
             msg: 'portfolio status failed (not cached)',
             portfolioId,
+            code: error instanceof AppError ? error.code : null,
             error: oneLine(error),
+            cause: errorChain(error),
           }),
         );
       },

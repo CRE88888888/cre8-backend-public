@@ -15,7 +15,7 @@ export type RebalanceWithdrawal = { marketId: Hex; amount: bigint; blocked: bool
 /** Only the shortfall in this rebalance's inputs is redeemable. Receipt claims never become spendable holdings. */
 export function rebalanceWithdrawals(plan: PortfolioPlan, positions: readonly YieldPosition[], steps: readonly PlannedStep[],
   cash: Address, reserve: bigint, now: Date): RebalanceWithdrawal[] {
-  if (!plan.report || plan.blocked.length || reserve < 0n) throw unavailable();
+  if (!plan.report || plan.blocked.length || reserve < 0n) throw unavailable('rebalance-plan-blocked');
   const balances = new Map(plan.snapshot.holdings.map(h => [h.asset.toLowerCase(), h.amountWei]));
   balances.set(cash, (balances.get(cash) ?? 0n) - reserve);
   const deficits = new Map<string,bigint>();
@@ -34,7 +34,9 @@ export function rebalanceWithdrawals(plan: PortfolioPlan, positions: readonly Yi
     for (const p of markets) {
       if (p.state !== 'known' || p.block !== plan.snapshot.block || !fresh(p.at, now) ||
         p.receipt === null || p.claim === null || p.rate === null || p.rate <= 0n || p.scale === null || p.scale <= 0n ||
-        p.maxRedeem === null || p.maxWithdraw === null || p.observedUnits === null || p.trackedUnits !== p.observedUnits) throw unavailable();
+        p.maxRedeem === null || p.maxWithdraw === null || p.observedUnits === null || p.trackedUnits !== p.observedUnits)
+        throw unavailable(p.state !== 'known' ? `rebalance-position-unknown:${p.market.id}` : p.block !== plan.snapshot.block ? `rebalance-position-block:${p.block}/plan:${plan.snapshot.block}`
+          : !fresh(p.at, now) ? `rebalance-position-stale:${p.market.id}:age-${now.getTime() - p.at.getTime()}ms` : `rebalance-position-incomplete:${p.market.id}`);
       if (p.receipt === 0n) continue;
       const wanted = p.market.protocol === 'aave_v3' ? shortfall : (shortfall * p.scale + p.rate - 1n) / p.rate;
       const shares = wanted < p.receipt ? wanted : p.receipt;
@@ -45,7 +47,7 @@ export function rebalanceWithdrawals(plan: PortfolioPlan, positions: readonly Yi
       if (shortfall <= 0n) break;
     }
     // Never sell a smaller portion while another required market is still illiquid / unknown.
-    if (shortfall > 0n && !result.some(r => markets.some(p => p.market.marketId === r.marketId))) throw unavailable();
+    if (shortfall > 0n && !result.some(r => markets.some(p => p.market.marketId === r.marketId))) throw unavailable(`rebalance-shortfall:${asset}`);
   }
   return result;
 }

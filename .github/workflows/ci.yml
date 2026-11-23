@@ -130,6 +130,7 @@ jobs:
           test/cash-reconciliation.test.ts
           test/chain-read-only.test.ts
           test/scheduler-error-log.test.ts
+          test/status-timeout.test.ts
           test/trading-calendar.test.ts
           test/scheduler.test.ts
           test/server.test.ts

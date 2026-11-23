@@ -89,3 +89,18 @@ export class ForbiddenError extends AppError {
     this.name = 'ForbiddenError';
   }
 }
+
+/**
+ * One log line for an error and its causes (`name: message ← name: message …`), URLs masked (an RPC URL can
+ * carry a key) and each part capped. For logs only; public responses keep their own message.
+ */
+export function errorChain(error: unknown, depth = 5): string {
+  const parts: string[] = [];
+  let current: unknown = error;
+  for (let n = 0; n < depth && current !== undefined && current !== null; n++) {
+    const text = current instanceof Error ? (current.name && current.name !== 'Error' ? `${current.name}: ${current.message}` : current.message) : String(current);
+    parts.push(text.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'`)]+/gi, '<url>').replace(/\s*\n\s*/g, ' | ').slice(0, 600));
+    current = current instanceof Error ? current.cause : undefined;
+  }
+  return parts.join(' ← ');
+}

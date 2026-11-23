@@ -58,21 +58,41 @@ const min = (...ns: bigint[]) => ns.reduce((a, b) => a < b ? a : b);
 export type MarketIdentity = { market: YieldMarket; riskSource: Address; configuration: Hex; totalUnits: bigint;
   minRate: bigint; maxRate: bigint; retired: boolean; supplyOpen: boolean; underlyingDecimals: number; receiptDecimals: number; queues: Hex[] };
 export type YieldReaderDeps = { now: () => Date; timeoutMs: number; batch: typeof yieldBatch };
-async function bounded<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+async function bounded<T>(promise: Promise<T>, timeoutMs: number, onTimeout: () => void): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  try { return await Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(unavailable()), timeoutMs); })]); }
+  try { return await Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => { onTimeout(); reject(unavailable()); }, timeoutMs); })]); }
   finally { if (timer !== undefined) clearTimeout(timer); }
+}
+/** At most this many multicall eth_calls of one account read are in flight at once. */
+export const YIELD_READ_CONCURRENCY = 8;
+/**
+ * Bounded-concurrency wrapper around one read's batches. After the read timed out, later batches fail
+ * immediately: an abandoned read must not keep spending RPC capacity that the next read needs.
+ */
+function limitedBatch(batch: typeof yieldBatch, max: number, expired: () => boolean): typeof yieldBatch {
+  let active = 0;
+  const queue: (() => void)[] = [];
+  return async (client, block, calls) => {
+    if (active >= max) await new Promise<void>(resolve => queue.push(resolve)); else active++;
+    try { if (expired()) throw unavailable(); return await batch(client, block, calls); }
+    finally { const next = queue.shift(); if (next) next(); else active--; }
+  };
 }
 /** One eth_call per shared group: sync/rate checks precede balances, claims, S/L/U and cap reads.
  * Independent eth_calls at one block DO NOT share Venus/Lista accrual state.
+ * Every eth_call is pinned to the same block, so independent groups and the NAV evidence are read
+ * concurrently (backend: status took 20–50 s with ~130 sequential round trips and hit the timeout).
  */
 export async function readYieldAccount(client: PublicClient, profile: YieldProfile, account: Address,
   options: Partial<YieldReaderDeps> & { block?: bigint } = {}): Promise<YieldRead> {
-  const deps: YieldReaderDeps = { now: () => new Date(), timeoutMs: 15000, batch: yieldBatch, ...options };
-  try {return await bounded(read(), deps.timeoutMs);} catch {throw unavailable();}
+  const resolved: YieldReaderDeps = { now: () => new Date(), timeoutMs: 15000, batch: yieldBatch, ...options };
+  let expired = false;
+  const deps: YieldReaderDeps = { ...resolved, batch: limitedBatch(resolved.batch, YIELD_READ_CONCURRENCY, () => expired) };
+  try {return await bounded(read(), deps.timeoutMs, () => { expired = true; });} catch {throw unavailable();}
   async function read(): Promise<YieldRead> {
-    if (await client.getChainId() !== profile.chainId) throw unavailable();
-    const block = await client.getBlock(options.block === undefined ? { blockTag: 'latest' } : { blockNumber: options.block });
+    const [chainId, block] = await Promise.all([client.getChainId(),
+      client.getBlock(options.block === undefined ? { blockTag: 'latest' } : { blockNumber: options.block })]);
+    if (chainId !== profile.chainId) throw unavailable();
     if (block.number === null || block.hash === null) throw unavailable();
     if(profile.registryCodeHash!==undefined){
       const code=await client.getCode({address:profile.registry,blockNumber:block.number});
@@ -89,6 +109,30 @@ export async function readYieldAccount(client: PublicClient, profile: YieldProfi
     if(new Set(marketIds).size!==marketIds.length||profile.markets.some(m=>!marketIds.includes(m.marketId))||extra.some(id=>!isStrategyVault({marketId:id})))throw unavailable();
     const observation: Observation = { block: block.number, blockHash: block.hash, at: new Date(Number(block.timestamp) * 1000), source: 'canonical-yield-registry' };
     if (!fresh(observation.at, deps.now())) throw unavailable();
+    const navRead = (async (): Promise<{ nav: bigint; direct: bigint } | null> => {
+      try {
+        const nav = await deps.batch(client, observation.block, [
+          ...profile.markets.map((m): ReadCall => ({ target: profile.registry, name: 'refreshHealth', args: [m.marketId] })),
+          { target: profile.executor, name: 'previewAccountValue', args: [account] },
+        ]).then(values => { const value = values.at(-1); return value === null ? null : integer(value); });
+        if (nav === null) return null;
+        const enrolled=(await deps.batch(client,observation.block,[{target:strategyRegistry,name:'enrollments',args:[account]}]))[0];
+        if(!Array.isArray(enrolled)||enrolled.length!==3)throw unavailable();
+        // Executor values the effective history, independently of the enrollment's
+        // immutable yield-policy version. Pin both reads to the NAV block.
+        const assets=(await deps.batch(client,observation.block,[{target:strategyRegistry,name:'historicalAssets',args:[integer(enrolled[0])]}]))[0];
+        if(!Array.isArray(assets)||assets.length>128)throw unavailable();
+        const tokens=[...new Set([numeraire,...assets.map(address)])].filter(a=>!profile.markets.some(m=>m.receipt===a));
+        const balances=await deps.batch(client,observation.block,tokens.map((token):ReadCall=>({target:token,name:'balanceOf',args:[account]})));
+        const values=await Promise.all(tokens.map(async (token,index)=>{
+          const held=integer(balances[index]);if(held===0n)return 0n;
+          if(token===numeraire)return held;
+          const quote=(await deps.batch(client,observation.block,[{target:oracle,name:'previewSwap',args:[token,numeraire,held]}]))[0];
+          if(!Array.isArray(quote)||quote.length!==2||integer(quote[0])===0n)throw unavailable();return integer(quote[0]);
+        }));
+        return { nav, direct: values.reduce((n, v) => n + v, 0n) };
+      } catch { return null; }
+    })();
     const identities = await Promise.all(profile.markets.map(m => identity(m)));
     const groups = new Map<string, MarketIdentity[]>();
     const positions: YieldPosition[] = [], risks: YieldRisk[] = [];
@@ -97,10 +141,14 @@ export async function readYieldAccount(client: PublicClient, profile: YieldProfi
       const key = `${i.market.protocol}:${i.riskSource}:${i.market.asset}`;
       groups.set(key, [...(groups.get(key) ?? []), i]);
     }
-    for (const [key, group] of groups) {
-      const reads = await groupRead(group).catch(() => group.map(i => unknownPosition(i.market, i)));
-      for (const p of reads) {
-        if (p.state !== 'known' || p.claim === null || p.receipt === null || p.rate === null || p.scale === null) continue;
+    // Groups are independent eth_calls at the same block: read them concurrently, keep profile order.
+    const groupResults = await Promise.all([...groups].map(async ([key, group]) => {
+      const [reads, health] = await Promise.all([
+        groupRead(group).catch(() => group.map(i => unknownPosition(i.market, i))),
+        healthRead(group).catch(() => null),
+      ]);
+      await Promise.all(reads.map(async p => {
+        if (p.state !== 'known' || p.claim === null || p.receipt === null || p.rate === null || p.scale === null) return;
         try {
           if (p.claim === 0n) p.value = 0n;
           else if (p.market.asset === numeraire) p.value = p.claim;
@@ -141,48 +189,29 @@ export async function readYieldAccount(client: PublicClient, profile: YieldProfi
             p.maxWithdraw=p.withdrawPaused?0n:min(p.claim,cash);p.maxRedeem=p.withdrawPaused?0n:min(p.receipt,cash);
           }
         } catch { Object.assign(p, unknownPosition(p.market)); }
-      }
-      positions.push(...reads);
+      }));
       const valid = reads.every(p => p.state === 'known');
-      const health = await healthRead(group).catch(() => null);
+      const groupRisks: YieldRisk[] = [];
       // Exit health uses lenient accrued quotes, independently of supply rate admission.
       const keys = [key, ...new Set(group.flatMap(i => i.queues).map(id => `${key}:${id}`))];
       for (const bucket of keys) {
         const i = group[0]; if (!i) throw unavailable();
-        risks.push({ ...observation, key: bucket, protocol: i.market.protocol, asset: i.market.asset, riskSource: i.riskSource,
+        groupRisks.push({ ...observation, key: bucket, protocol: i.market.protocol, asset: i.market.asset, riskSource: i.riskSource,
           underlyingMarketId: bucket === key ? null : hash(bucket.slice(key.length + 1)), configuration: i.configuration,
           state: valid && health ? 'known' : 'unknown', reason: valid && health ? null : 'market_data_unavailable',
           supply: valid && health ? health.supply : null, liquidity: valid && health ? health.liquidity : null,
           exposure: valid && health ? health.exposure : null, externalReserved: valid && health ? health.reserved : null,
           headroom: valid && health ? health.headroom : null, utilizationBps: valid && health ? health.utilization : null });
       }
-    }
+      return { reads, groupRisks };
+    }));
+    for (const r of groupResults) { positions.push(...r.reads); risks.push(...r.groupRisks); }
     // Missing identities still get explicit unknown positions; never silently omit a market.
     for (const m of profile.markets) if (!positions.some(p => p.market.marketId === m.marketId)) positions.push(unknownPosition(m));
-    let nav = await deps.batch(client, observation.block, [
-      ...profile.markets.map((m): ReadCall => ({ target: profile.registry, name: 'refreshHealth', args: [m.marketId] })),
-      { target: profile.executor, name: 'previewAccountValue', args: [account] },
-    ]).then(values => { const value = values.at(-1); return value === null ? null : integer(value); }).catch(() => null);
-    if(nav!==null){
-      try{
-        const enrolled=(await deps.batch(client,observation.block,[{target:strategyRegistry,name:'enrollments',args:[account]}]))[0];
-        if(!Array.isArray(enrolled)||enrolled.length!==3)throw unavailable();
-        // Executor values the effective history, independently of the enrollment's
-        // immutable yield-policy version. Pin both reads to the NAV block.
-        const assets=(await deps.batch(client,observation.block,[{target:strategyRegistry,name:'historicalAssets',args:[integer(enrolled[0])]}]))[0];
-        if(!Array.isArray(assets)||assets.length>128)throw unavailable();
-        const tokens=[...new Set([numeraire,...assets.map(address)])].filter(a=>!profile.markets.some(m=>m.receipt===a));
-        const balances=await deps.batch(client,observation.block,tokens.map((token):ReadCall=>({target:token,name:'balanceOf',args:[account]})));
-        let direct=0n;
-        for(const [index,token]of tokens.entries()){
-          const held=integer(balances[index]);if(held===0n)continue;
-          if(token===numeraire)direct+=held;
-          else {const quote=(await deps.batch(client,observation.block,[{target:oracle,name:'previewSwap',args:[token,numeraire,held]}]))[0];
-            if(!Array.isArray(quote)||quote.length!==2||integer(quote[0])===0n)throw unavailable();direct+=integer(quote[0]);}
-        }
-        if(positions.some(p=>p.value===null)||direct+positions.reduce((n,p)=>n+(p.value??0n),0n)!==nav)throw unavailable();
-      }catch{nav=null;}
-    }
+    // NAV evidence and the per-market reads share nothing but the block, so they overlap.
+    const navEvidence = await navRead;
+    const nav = navEvidence !== null && !positions.some(p => p.value === null) &&
+      navEvidence.direct + positions.reduce((n, p) => n + (p.value ?? 0n), 0n) === navEvidence.nav ? navEvidence.nav : null;
     if ((await client.getBlock({ blockNumber: observation.block })).hash !== observation.blockHash || !fresh(observation.at, deps.now())) throw unavailable();
     return { profile, positions, risks, accountValue: positions.some(p=>p.state==='unknown')?null:nav, observation };
 

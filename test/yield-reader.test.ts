@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { readYieldAccount } from '../src/yield-reader.js';
+import { readYieldAccount, YIELD_READ_CONCURRENCY } from '../src/yield-reader.js';
 import { yieldFixture, address } from './fixtures/yield.js';
 import { keccak256,toFunctionSelector } from 'viem';
 import { RAY, WAD, mustExit } from '../src/yield-domain.js';
@@ -254,4 +254,50 @@ test('#216 registry may also list the strategy earn vault (filtered from the pro
   await assert.rejects(readYieldAccount(f.client,f.profile,f.account,{batch,now:()=>f.at}),/生息資料/);
   extra=STRATEGY_EARN_97.earnVaultMarketId;drop=true;
   await assert.rejects(readYieldAccount(f.client,f.profile,f.account,{batch,now:()=>f.at}),/生息資料/);
+});
+
+test('status 20–50 s: independent market groups and NAV evidence are read concurrently, at most YIELD_READ_CONCURRENCY at once', async () => {
+  const f = yieldFixture(Array.from({ length: 12 }, () => 'venus' as const));
+  // One risk source per market -> 12 groups, like the 30 single-market groups on chain 97.
+  const sources = new Map(f.profile.markets.map(m => [m.marketId, address()]));
+  let inFlight = 0, peak = 0, batches = 0;
+  const batch: typeof f.batch = async (client, block, calls) => {
+    inFlight++; batches++; peak = Math.max(peak, inFlight);
+    try {
+      await new Promise(resolve => setTimeout(resolve, 20));
+      const values = await f.batch(client, block, calls);
+      return values.map((v, n) => {
+        const c = calls[n];
+        return c?.name === 'market' && v && typeof v === 'object' ? { ...v, riskSource: sources.get(c.args?.[0] as `0x${string}`) } : v;
+      });
+    } finally { inFlight--; }
+  };
+  const started = Date.now();
+  const r = await readYieldAccount(f.client, f.profile, f.account, { batch, now: () => f.at });
+  const elapsed = Date.now() - started;
+  assert.equal(r.positions.length, 12);
+  assert.ok(r.positions.every(p => p.state === 'known'));
+  assert.deepEqual(r.positions.map(p => p.market.marketId), f.profile.markets.map(m => m.marketId), 'profile order is kept');
+  assert.equal(new Set(r.risks.map(x => x.riskSource)).size, 12);
+  assert.ok(peak > 1, `reads must overlap (peak ${peak})`);
+  assert.ok(peak <= YIELD_READ_CONCURRENCY, `at most ${YIELD_READ_CONCURRENCY} batches in flight (peak ${peak})`);
+  // Sequential reads would take batches * 20 ms.
+  assert.ok(elapsed < batches * 20 / 2, `elapsed ${elapsed} ms for ${batches} batches`);
+});
+
+test('a timed-out yield read fails fast with YIELD_UNAVAILABLE and stops issuing RPC batches', async () => {
+  const f = yieldFixture(['venus', 'lista', 'aave_v3']);
+  let after = 0, timedOut = false;
+  const batch: typeof f.batch = async (client, block, calls) => {
+    if (timedOut) after++;
+    await new Promise(resolve => setTimeout(resolve, 30));
+    return f.batch(client, block, calls);
+  };
+  const started = Date.now();
+  await assert.rejects(readYieldAccount(f.client, f.profile, f.account, { batch, now: () => f.at, timeoutMs: 40 }),
+    (e: unknown) => e instanceof Error && e.message.includes('生息資料或持久化證據不完整'));
+  timedOut = true;
+  assert.ok(Date.now() - started < 200);
+  await new Promise(resolve => setTimeout(resolve, 200));
+  assert.equal(after, 0, 'no batch reaches the RPC after the timeout');
 });

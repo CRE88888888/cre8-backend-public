@@ -1,4 +1,5 @@
 import { yieldProfile,object as yieldObject,raw as yieldRaw } from './yield-domain.js';
+import type { YieldProfile, YieldRead } from './yield-domain.js';
 import { readYieldAccount } from './yield-reader.js';
 import { createPublicClient, http } from 'viem';
 import type { Address, PublicClient } from 'viem';
@@ -141,6 +142,15 @@ export type PlanDeps = {
   block?: bigint;
   /** Chain 97 Strategy Earn shares posted as collateral at `block` (backend#204). Default reads AtpBorrowRegistry. */
   strategyEarnCollateral?: (account: Address, block: bigint) => Promise<StrategyEarnCollateral[]>;
+  /** Chain 97 per-account yield read; default `readYieldAccount`. */
+  readYield?: (client: PublicClient, profile: YieldProfile, account: Address, options: { block: bigint }) => Promise<YieldRead>;
+  /**
+   * Display callers only (`GET /portfolios/:id/status`): a failed yield read becomes the
+   * `YIELD_VALUATION_UNAVAILABLE` block (no drift report, total value unknown) instead of failing the whole
+   * plan. Wallet balances stay real; nothing is valued as 0. Callers that trade (scheduler, yield round,
+   * mixes) leave this off and keep failing closed.
+   */
+  yieldOptional?: boolean;
 };
 
 /** Shares of a portfolio asset posted in its Strategy Earn market; still this portfolio's, held by the market. */
@@ -436,7 +446,12 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
     ? await (deps.strategyEarnCollateral ?? ((a: Address, b: bigint) => readStrategyEarnCollateral(client, a, b)))(account, block)
         .catch(() => { throw new Error('strategy earn collateral unavailable'); })
     : [];
-  const [snapshot, scan] = await Promise.all([
+  // The yield read only needs the account and the block, so it overlaps the balance read and the log scan.
+  const yieldConfig = chainId===97 && !personalMix ? yieldProfile() : null;
+  const yieldRead: Promise<YieldRead | null> | null = yieldConfig === null ? null
+    : (deps.readYield ?? readYieldAccount)(client, yieldConfig, account, { block })
+        .catch((error: unknown) => { if (deps.yieldOptional === true) return null; throw error; });
+  const [snapshot, scan, lending] = await Promise.all([
     readPositions(client, {
       portfolioId,
       account,
@@ -466,6 +481,7 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
       knownTokens: universe.map((token) => token.address),
       head: block,
     }),
+    yieldRead,
   ]);
 
   if (personalMix && (scan.scannedRange === null || scan.cursor.lastScannedBlock < block)) {
@@ -479,22 +495,29 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
     await verifyMixBlock(mixBlockHash, async () => (await client.getBlock({ blockNumber: block })).hash);
   }
   if (strategyEarn.length > 0) snapshot.strategyEarnCollateral = strategyEarn;
-  const yieldConfig = chainId===97 && !personalMix ? yieldProfile() : null;
-  if(yieldConfig!==null){
-    const lending=await readYieldAccount(client,yieldConfig,account,{block});
+  let yieldUnread = false;
+  if(yieldConfig!==null && lending===null){
+    // Only reachable with `yieldOptional`: yield positions unknown -> account value unknown, never 0.
+    yieldUnread = true;
+    snapshot.accountValueRaw = null;
+  } else if(yieldConfig!==null && lending!==null){
     snapshot.yieldPositions=lending.positions;
     snapshot.accountValueRaw=snapshot.unpriced.some(a=>a.amountWei>0n)?null:lending.accountValue;
     try{
       const history=await query('select distinct block_number::text,block_hash,state from yield_events where chain_id=$1 and portfolio_id=$2',[chainId,portfolioId]);
-      for(const row of history.rows){const e=yieldObject(row);
-        if(e.state!=='confirmed'||(await client.getBlock({blockNumber:yieldRaw(e.block_number)})).hash!==e.block_hash){snapshot.accountValueRaw=null;break;}
+      const events=history.rows.map(row=>yieldObject(row));
+      if(events.some(e=>e.state!=='confirmed'))snapshot.accountValueRaw=null;
+      else{
+        const hashes=await Promise.all(events.map(async e=>(await client.getBlock({blockNumber:yieldRaw(e.block_number)})).hash));
+        if(hashes.some((h,n)=>h!==events[n]?.block_hash))snapshot.accountValueRaw=null;
       }
     }catch{snapshot.accountValueRaw=null;}
 
   }
 
   const blocked: PlanBlock[] = [];
-  if(snapshot.accountValueRaw===null)blocked.push({code:'YIELD_VALUATION_UNAVAILABLE',detail:'生息或帳戶估值未知，停止新增風險；純領出繼續獨立處理'});
+  if(yieldUnread)blocked.push({code:'YIELD_VALUATION_UNAVAILABLE',detail:'生息部位這次讀不到：總值未知，只列錢包內餘額；停止新增風險'});
+  else if(snapshot.accountValueRaw===null)blocked.push({code:'YIELD_VALUATION_UNAVAILABLE',detail:'生息或帳戶估值未知，停止新增風險；純領出繼續獨立處理'});
   const heldUnpriced = snapshot.unpriced.filter((asset) => asset.amountWei > 0n);
   if (heldUnpriced.length > 0) {
     blocked.push({

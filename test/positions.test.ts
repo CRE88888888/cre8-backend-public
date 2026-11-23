@@ -6,7 +6,9 @@ import { PricingError } from '../src/pricing.js';
 import { MULTICALL3_ADDRESS, NUMERAIRE_PRICE_E8, priceFor, readPositions } from '../src/positions.js';
 import type { PriceableAsset, PriceTokenFn } from '../src/positions.js';
 import { planPortfolio, writeSnapshot } from '../src/snapshot.js';
-import type { QueryFn } from '../src/snapshot.js';
+import type { PlanDeps, QueryFn } from '../src/snapshot.js';
+import { TESTNET_97 } from '../src/testnet-profile.js';
+import { unavailable as yieldUnavailable } from '../src/yield-domain.js';
 
 /**
  * `src/positions.ts` 與 `src/snapshot.ts` 的單元測試：不碰鏈、不碰 DB。
@@ -1082,4 +1084,65 @@ test('writeSnapshot：同一個 block 第二次寫是 UPDATE（表頭與明細�
   assert.deepEqual(first, { headerInserted: true, inserted: 1, updated: 0 });
   assert.deepEqual(second, { headerInserted: false, inserted: 0, updated: 1 });
   assert.match(captured[1]?.text ?? '', /on conflict \(portfolio_id, block, phase\) do update/);
+});
+
+// ---------------------------------------------------------------------------
+// chain 97：生息讀不到時 status 降級、排程器照樣擋（portfolio 9：剛存 500 USDT、沒有生息部位）
+// ---------------------------------------------------------------------------
+
+const TESTNET_USDT = TESTNET_97.contracts.usdt as Address;
+
+function testnetPlan(readYield: NonNullable<PlanDeps['readYield']>, yieldOptional?: boolean, wrap: (client: PublicClient) => PublicClient = (c) => c) {
+  const chain = baseChain({ versions: new Map([[1, { assets: [TESTNET_USDT], weightsBps: [10000] }]]) });
+  chain.balances.set(TESTNET_USDT.toLowerCase(), 500n * 10n ** 18n);
+  const db = baseDb({
+    versions: new Map<string, Map<number, unknown>>([['11', new Map<number, unknown>([[1, { assets: [{ address: TESTNET_USDT, symbol: 'USDT', weightBps: 10000 }] }]])]]),
+  });
+  const base = fakeQuery(db);
+  const query: QueryFn = async (text, params) => text.includes('from yield_events') ? { rows: [] } : base(text, params);
+  return planPortfolio(9, {
+    ...planDeps(chain, db),
+    publicClient: wrap(stubClient(chain)),
+    query,
+    chainId: 97,
+    strategyEarnCollateral: async () => [],
+    readYield,
+    ...(yieldOptional === undefined ? {} : { yieldOptional }),
+  });
+}
+
+test('chain 97 生息讀不到：status 用的 yieldOptional 照樣回持倉（500 USDT），總值未知、擋下漂移，不把生息當 0', async () => {
+  const failing: NonNullable<PlanDeps['readYield']> = async () => { throw yieldUnavailable(); };
+  const plan = await testnetPlan(failing, true);
+  assert.equal(plan.snapshot.holdings.find((h) => h.asset === TESTNET_USDT.toLowerCase())?.amountWei, 500n * 10n ** 18n);
+  assert.equal(plan.snapshot.accountValueRaw, null, '生息讀不到 → 帳戶總值未知，不是 500');
+  assert.equal(plan.snapshot.yieldPositions, undefined);
+  assert.equal(plan.report, null);
+  assert.deepEqual(plan.blocked.map((b) => b.code), ['YIELD_VALUATION_UNAVAILABLE']);
+});
+
+test('chain 97 生息讀不到：預設（排程器、生息輪、組合）仍然整份拒算，不在不完整的證據上交易', async () => {
+  const failing: NonNullable<PlanDeps['readYield']> = async () => { throw yieldUnavailable(); };
+  await assert.rejects(testnetPlan(failing), (error: unknown) => error instanceof Error && error.message.includes('生息資料或持久化證據不完整'));
+});
+
+test('chain 97 生息讀取與持倉讀取、日誌掃描同時進行（舊版排在兩者之後，這裡會卡死）', async () => {
+  let yieldStarted!: () => void;
+  const started = new Promise<void>((resolve) => { yieldStarted = resolve; });
+  const reader: NonNullable<PlanDeps['readYield']> = async (_client, profile, _account, { block }) => {
+    yieldStarted();
+    return { profile, positions: [], risks: [], accountValue: 500n * 10n ** 18n,
+      observation: { block, blockHash: `0x${'11'.repeat(32)}`, at: new Date(), source: 'test' } };
+  };
+  // 日誌掃描要等生息讀取開始才回：順序執行的版本會互等到逾時。
+  const wrap = (client: PublicClient): PublicClient => {
+    const request = (client as unknown as { request: (call: unknown) => Promise<unknown> }).request;
+    return Object.assign(client, { request: async (call: unknown) => { await started; return request(call); } }) as PublicClient;
+  };
+  const plan = await Promise.race([
+    testnetPlan(reader, undefined, wrap),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error('yield read waited for the log scan')), 2_000)),
+  ]);
+  assert.equal(plan.snapshot.accountValueRaw, 500n * 10n ** 18n);
+  assert.deepEqual(plan.blocked, []);
 });

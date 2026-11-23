@@ -430,7 +430,9 @@ export async function resolveStatusSessionKey(
  * 使用者會把「讀不到」讀成「這個投組是空的」，然後看著一個空的投組按下再平衡。
  */
 async function statusOf(portfolioId: number, deps: StatusDeps, joinedVersion: number): Promise<PortfolioStatus> {
-  const planFn = deps.planPortfolio ?? ((id: number) => planPortfolio(id));
+  // Status only displays: a missing yield read degrades to a YIELD_VALUATION_UNAVAILABLE block (total unknown,
+  // wallet holdings still shown) instead of a 503 for the whole portfolio. Trading callers keep failing closed.
+  const planFn = deps.planPortfolio ?? ((id: number) => planPortfolio(id, { yieldOptional: true }));
 
   let plan: PortfolioPlan;
   try {

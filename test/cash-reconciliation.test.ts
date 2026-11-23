@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createPublicClient, custom } from 'viem';
-import { readCashWithdrawals } from '../src/cash-reconciliation.js';
+import { readCashWithdrawals, resetWithdrawalScanCache } from '../src/cash-reconciliation.js';
 import type { SchedulerQueryFn } from '../src/scheduler.js';
 import { TESTNET_97 } from '../src/testnet-profile.js';
 import { strategyRpc, TEST_ACCOUNT, TEST_OWNER, TEST_AMOUNT, OTHER_HASH } from './fixtures/strategy-rpc.js';
 
 function fixture() {
+  resetWithdrawalScanCache();
   const rpc = strategyRpc({assets:[]}, OTHER_HASH, new Date('2026-11-15T00:00:00Z'));
   Object.assign(rpc.state,{mint:true,transferFrom:TEST_ACCOUNT,to:TEST_OWNER,logIndex:1});
   const state:{fail:string;owner:string}={fail:'',owner:TEST_OWNER};

@@ -339,6 +339,25 @@ test('scanPortfolioHoldings：游標起點晚於部署塊 → universeComplete f
   assert.deepEqual(result.unknownHoldings, [], '完整性未確認 ≠ 觀察到策略外持倉');
 });
 
+test('scanPortfolioHoldings：已有游標時只問 2 次 getCode（head 與游標起點前一塊），不再每輪二分搜尋；結論不變', async () => {
+  const chain = stubChain({ head: 10_000n, codeFrom: new Map([[ACCOUNT.toLowerCase(), 100n]]) });
+  let getCode = 0;
+  const client = stubClient(chain);
+  const counted = Object.assign(Object.create(client), { getCode: async (args: { address: Address; blockNumber?: bigint }) => { getCode += 1; return client.getCode(args); } }) as PublicClient;
+  const { query: q } = fakeQuery([{ start_block: '100', last_scanned_block: '10000' }]);
+  const result = await scanPortfolioHoldings({ client: counted, query: q, portfolioId: 5, account: ACCOUNT, knownTokens: [], head: 10_000n });
+  assert.equal(getCode, 2);
+  assert.equal(result.deployment.reason, 'not_before_cursor');
+  assert.equal(result.universeComplete, true);
+  // 游標起點晚於部署塊（code 在起點前就存在）→ 退回完整二分搜尋，報出確切的部署塊。
+  getCode = 0;
+  const late = fakeQuery([{ start_block: '101', last_scanned_block: '10000' }]);
+  const lateResult = await scanPortfolioHoldings({ client: counted, query: late.query, portfolioId: 5, account: ACCOUNT, knownTokens: [], head: 10_000n });
+  assert.ok(getCode > 2);
+  assert.equal(lateResult.deployment.block, 100n);
+  assert.equal(lateResult.universeComplete, false);
+});
+
 test('scanPortfolioHoldings：部署塊取不到 → universeComplete false', async () => {
   const chain = stubChain({ head: 10_000n });
   const { query: q } = fakeQuery([{ start_block: '100', last_scanned_block: '10000' }]);

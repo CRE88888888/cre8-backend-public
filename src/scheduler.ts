@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { mixCashWithdrawals } from './mix-flows.js';
 import { loadMixRuntime, decideMixTick, prepareMixTick, mixAvailableCash, mixBelowExecutorMinimum, recordMixExitFailure, MIX_EXIT_MAX_RETRIES, mixExitCooldownMs, MIX_EXIT_COOLDOWN_SQL, mixSwitchExitsPending, recordMixSwitchResidual } from './mix-runtime.js';
 import { withMixPortfolioLock, excludeMixExitBudgets, checkMixLock, recordMixExecution } from './mix-store.js';
@@ -1997,7 +1998,7 @@ export async function runSchedulerOnce(
   const now = args.now ?? new Date();
   const limit = assertLimit(args.limit ?? DEFAULT_ROUND_LIMIT);
   const thresholdBps = args.thresholdBps ?? DEFAULT_THRESHOLD_BPS;
-  const resolved = resolveDeps({ thresholdBps }, {...deps,clock:deps.clock??(args.now?()=>new Date(now):()=>new Date())});
+  const resolved = withPhaseTiming(resolveDeps({ thresholdBps }, {...deps,clock:deps.clock??(args.now?()=>new Date(now):()=>new Date())}));
   if (!dryRun && resolved.chainId === 97) {
     try { await reconcilePendingMixes(resolved.query, limit); }
     catch { resolved.log('[mix] 意圖對帳未完成，保留原排他與證據。'); }
@@ -2032,9 +2033,12 @@ export async function runSchedulerOnce(
   const results: PortfolioRunResult[] = [];
   for (const due of claimed) {
     // `forcePlan` 要一路傳到 runOne：它決定「漂移低於門檻時要不要照樣規劃」（redeem 用）。
-    const result = await runOne(due, { dryRun, now, thresholdBps, deps: resolved, forcePlan: deps.forcePlan === true, roundBlockReason });
+    const times = new Map<string, number>();
+    const started = performance.now();
+    const result = await phaseTimes.run(times, () => runOne(due, { dryRun, now, thresholdBps, deps: resolved, forcePlan: deps.forcePlan === true, roundBlockReason }));
     results.push(result);
     resolved.log(formatResult(result, dryRun));
+    resolved.log(`[scheduler] portfolio ${due.portfolioId} ${Math.round(performance.now() - started)} ms${times.size ? `：${formatPhases(times)}` : ''}`);
   }
 
   // ---- 一輪的尾端：告警（偵測 → 寫入 → 解除 → 一行 stdout）----
@@ -2192,6 +2196,43 @@ export async function announceAlerts(args: {
 }
 
 type ResolvedDeps = ReturnType<typeof resolveDeps>;
+
+/**
+ * Per-portfolio phase timing for the round log (`[scheduler] portfolio N 41234 ms：plan 3120 · withdrawals 30210 …`).
+ * Rounds took 30–57 s per portfolio with no visible reason; each line now says where the time went.
+ */
+const phaseTimes = new AsyncLocalStorage<Map<string, number>>();
+const TIMED_DEPS = ['planPortfolio', 'planRebalance', 'reconcileRebalance', 'checkTradingMinimums', 'mixRuntime', 'reconcileMix', 'dexGate',
+  'prepareNewMoney', 'readBuyVersionWindow', 'hasBoughtBefore', 'refreshFloors', 'readPermissionConfig', 'readAllowance', 'readBalance',
+  'readRebalanceNonce', 'readLatestBlockTimestamp', 'readEntryPointNonce', 'executeRebalance', 'writeSnapshot', 'query'] as const;
+const TIMED_NEW_MONEY = ['version', 'policy', 'verifyLots', 'withdrawals', 'quote', 'rebalanceReserve', 'yieldHoldings', 'withdrawYield'] as const;
+function timed<F>(name: string, fn: F): F {
+  if (typeof fn !== 'function') return fn;
+  // Keeps sync functions sync and the original return value (only the timing is added).
+  return ((...args: unknown[]) => {
+    const times = phaseTimes.getStore();
+    if (!times) return (fn as (...a: unknown[]) => unknown)(...args);
+    const started = performance.now();
+    const done = () => { times.set(name, (times.get(name) ?? 0) + (performance.now() - started)); };
+    let result: unknown;
+    try { result = (fn as (...a: unknown[]) => unknown)(...args); } catch (error) { done(); throw error; }
+    if (result !== null && typeof result === 'object' && typeof (result as Promise<unknown>).finally === 'function') return (result as Promise<unknown>).finally(done);
+    done();
+    return result;
+  }) as F;
+}
+function withPhaseTiming(deps: ResolvedDeps): ResolvedDeps {
+  const wrapped = { ...deps } as Record<string, unknown>;
+  for (const key of TIMED_DEPS) wrapped[key] = timed(key === 'query' ? 'db' : key, (deps as Record<string, unknown>)[key]);
+  const money = { ...deps.newMoney } as Record<string, unknown>;
+  for (const key of TIMED_NEW_MONEY) money[key] = timed(key, money[key]);
+  wrapped.newMoney = money;
+  return wrapped as ResolvedDeps;
+}
+/** `plan 3120 · withdrawals 30210 · db 410`: nested phases overlap (prepareNewMoney contains withdrawals). */
+function formatPhases(times: Map<string, number>): string {
+  return [...times].filter(([, ms]) => ms >= 50).sort((a, b) => b[1] - a[1]).map(([name, ms]) => `${name} ${Math.round(ms)}`).join(' · ');
+}
 
 function validNonce(nonce: bigint): boolean {
   return typeof nonce === 'bigint' && nonce >= 0n && nonce <= MAX_USER_OP_NONCE;

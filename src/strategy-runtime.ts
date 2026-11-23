@@ -76,10 +76,11 @@ export function defaultNewMoneyDeps(client:()=>PublicClient,executor:()=>Address
         cash:holding?.amountWei??0n};
     },
     verifyLots:async(lots)=>{
-      for(const lot of lots){
-        const block=await client().getBlock({blockNumber:BigInt(lot.block_number)});
-        if(block.hash?.toLowerCase()!==lot.block_hash)throw new Error('[FUNDING_REORGED] 投入區塊需對帳');
-      }
+      // One header per distinct block, read concurrently (was one sequential getBlock per lot every round).
+      const blocks=[...new Set(lots.map(lot=>lot.block_number))];
+      const publicClient=client();
+      const hashes=new Map(await Promise.all(blocks.map(async n=>[n,(await publicClient.getBlock({blockNumber:BigInt(n)})).hash?.toLowerCase()] as const)));
+      for(const lot of lots)if(hashes.get(lot.block_number)!==lot.block_hash)throw new Error('[FUNDING_REORGED] 投入區塊需對帳');
     },
     quote:async(due,plan,inputs,deadline)=>{
       const publicClient=client();

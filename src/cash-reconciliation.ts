@@ -8,6 +8,21 @@ const commitment=(e:CashWithdrawal)=>keccak256(toHex(JSON.stringify([e.txHash,e.
 
 /** 每段 eth_getLogs 的區塊數（含頭尾）。 */
 export const WITHDRAWAL_LOG_CHUNK=10_000n;
+/** 同時在飛的 getLogs 段數。 */
+export const WITHDRAWAL_LOG_CONCURRENCY=6;
+/**
+ * 已掃過、離 head 夠遠（不會再重組）的區段只掃一次：排程器是長駐進程，下一輪只從上次的穩定高度往後掃。
+ * 為什麼要：原本每輪都從第一筆入金一路分段掃到 head（10k 塊一段、逐段等），入金幾天的組合就是幾十次循序
+ * getLogs，每個組合 30–57 秒，連休市都照掃。穩定區段裡的提領照樣每輪重驗 receipt 與區塊雜湊；驗不過就丟掉
+ * 快取、下輪整段重掃。進程重啟後第一次照舊整段掃（並行分段）。
+ */
+export const WITHDRAWAL_REORG_MARGIN=64n;
+type ScannedWithdrawals={stableTo:bigint;logs:WithdrawalLog[]};
+type WithdrawalLog=Awaited<ReturnType<PublicClient['getLogs']>>[number];
+const scanned=new Map<string,ScannedWithdrawals>();
+const SCANNED_MAX_ENTRIES=1000;
+/** Test hook: forget every cached range. */
+export function resetWithdrawalScanCache():void{scanned.clear();}
 
 /** Only canonical account-to-owner transfers count as known withdrawals. Balance loss alone is not proof. */
 export async function readCashWithdrawals(client:PublicClient,query:SchedulerQueryFn,args:{chainId:number;portfolioId:number;account:Address;cash:Address;blockNumber:bigint}):Promise<CashWithdrawal[]>{
@@ -19,11 +34,23 @@ export async function readCashWithdrawals(client:PublicClient,query:SchedulerQue
     if(BigInt(first.block_number)>args.blockNumber||await client.getChainId()!==args.chainId)throw new Error('stale cash observation');
     // 分段查：公共 BSC RPC 的 eth_getLogs 有跨度上限（publicnode 實測 50,000 塊，其他 2k–10k），
     // 入金幾小時後整段一次查就永遠失敗，整個組合每輪都被擋（tst 2026-11-21）。
-    const logs=[];
-    for(let start=BigInt(first.block_number);start<=args.blockNumber;start+=WITHDRAWAL_LOG_CHUNK){
-      const end=start+WITHDRAWAL_LOG_CHUNK-1n<args.blockNumber?start+WITHDRAWAL_LOG_CHUNK-1n:args.blockNumber;
-      logs.push(...await client.getLogs({address:args.cash,event:erc20Abi.find(e=>e.type==='event'&&e.name==='Transfer'),args:{from:args.account,to:owner.owner as Address},fromBlock:start,toBlock:end,strict:true}));
-    }
+    const key=[args.chainId,args.portfolioId,args.account.toLowerCase(),owner.owner,args.cash.toLowerCase(),first.block_number,first.log_index].join(':');
+    const cached=scanned.get(key);
+    const from=cached===undefined?BigInt(first.block_number):cached.stableTo+1n;
+    const ranges:[bigint,bigint][]=[];
+    for(let start=from;start<=args.blockNumber;start+=WITHDRAWAL_LOG_CHUNK)
+      ranges.push([start,start+WITHDRAWAL_LOG_CHUNK-1n<args.blockNumber?start+WITHDRAWAL_LOG_CHUNK-1n:args.blockNumber]);
+    const chunks:WithdrawalLog[][]=new Array(ranges.length);
+    let next=0;
+    await Promise.all(Array.from({length:Math.min(WITHDRAWAL_LOG_CONCURRENCY,ranges.length)},async()=>{
+      for(let i=next++;i<ranges.length;i=next++){
+        const [start,end]=ranges[i]!;
+        chunks[i]=await client.getLogs({address:args.cash,event:erc20Abi.find(e=>e.type==='event'&&e.name==='Transfer'),args:{from:args.account,to:owner.owner as Address},fromBlock:start,toBlock:end,strict:true});
+      }
+    }));
+    const logs=[...(cached?.logs.filter(log=>log.blockNumber!==null&&log.blockNumber<=args.blockNumber)??[]),...chunks.flat()];
+    // The verification below runs for cached logs too; a failure drops the cache entry (catch) and rescans next round.
+    scanned.delete(key);
     const result:CashWithdrawal[]=[];
     for(const log of logs){
       if(log.blockNumber===null||log.logIndex===null||log.transactionHash===null||log.blockHash===null||log.removed)throw new Error('incomplete cash evidence');
@@ -35,6 +62,11 @@ export async function readCashWithdrawals(client:PublicClient,query:SchedulerQue
         !receipt.logs.some(e=>!e.removed&&e.logIndex===log.logIndex&&e.address.toLowerCase()===args.cash.toLowerCase()&&e.data===log.data&&e.topics.join()===log.topics.join()))throw new Error('noncanonical withdrawal');
       result.push({txHash:log.transactionHash,logIndex:log.logIndex,blockNumber:log.blockNumber,blockHash:log.blockHash,amount:event.args.value});
     }
+    const stableTo=args.blockNumber-WITHDRAWAL_REORG_MARGIN;
+    if(stableTo>=(cached?.stableTo??BigInt(first.block_number)-1n)){
+      if(scanned.size>=SCANNED_MAX_ENTRIES){const oldest=scanned.keys().next();if(!oldest.done)scanned.delete(oldest.value);}
+      scanned.set(key,{stableTo,logs:logs.filter(log=>log.blockNumber!==null&&log.blockNumber<=stableTo)});
+    }else if(cached!==undefined)scanned.set(key,cached);
     return result;
   }catch(cause){throw new Error('[CASH_RECONCILIATION_UNAVAILABLE] 提領證據無法確認，保留來源與預留',{cause});}
 }

@@ -3760,3 +3760,17 @@ for (const phase of ['before-pending', 'after-sign'] as const) for (const failur
     assert.ok(db.operations.every(op => op.state === 'failed' && op.userOpHash === null));
   });
 }
+
+test('each portfolio logs how long it took and where the time went (slow phases named)', async () => {
+  const plan = stubPlan();
+  const chain = stubChain({ plan, rebalance: readyPlan([step({ tokenIn: TOKEN_OUT, tokenOut: TOKEN_IN })]) });
+  const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+  const lines: string[] = [];
+  const base = deps(db, chain);
+  const slowPlan = base.planPortfolio!;
+  await runSchedulerOnce({ skipAlerts: true }, { ...base, log: (line) => lines.push(line),
+    planPortfolio: async (id) => { await new Promise((resolve) => setTimeout(resolve, 80)); return slowPlan(id); } });
+  const timing = lines.find((line) => /^\[scheduler\] portfolio \d+ \d+ ms/.test(line));
+  assert.ok(timing, lines.join('\n'));
+  assert.match(timing, /planPortfolio \d+/);
+});

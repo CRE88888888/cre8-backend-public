@@ -78,7 +78,8 @@ export type ScanCursor = { portfolioId: number; startBlock: bigint; lastScannedB
 /** 部署塊解析結果。`block: null` 一律代表「取不到」，呼叫端不得把它當成 0 或 head。 */
 export type DeploymentBlock = {
   block: bigint | null;
-  reason: 'resolved' | 'no_code_at_head' | 'deployed_before_search_from' | 'rpc_cannot_answer';
+  /** `not_before_cursor`: `block` is a lower bound (the cursor start); the exact block was not needed. */
+  reason: 'resolved' | 'no_code_at_head' | 'deployed_before_search_from' | 'rpc_cannot_answer' | 'not_before_cursor';
   detail: string;
 };
 
@@ -221,6 +222,23 @@ export async function findDeploymentBlock(
       reason: 'rpc_cannot_answer',
       detail: `getCode(${args.account}, ${probe}) 失敗，部署塊取不到（${reasonOf(cause)}）`,
     };
+  }
+}
+
+/**
+ * With a cursor, completeness only asks「部署塊 >= 游標起點？」. Code is monotonic, so that is one getCode at
+ * `startBlock - 1` (plus the head check) instead of a ~27-step bisection every scheduler round. Returns null
+ * (→ full bisection, exact block and reason) when code exists before the cursor or the RPC cannot answer.
+ */
+async function deploymentNotBeforeCursor(client: PublicClient, account: Address, head: bigint, startBlock: bigint): Promise<DeploymentBlock | null> {
+  if (startBlock <= 0n || startBlock > head) return null;
+  try {
+    const [atHead, beforeCursor] = await Promise.all([isEmptyCode(client, account, head), isEmptyCode(client, account, startBlock - 1n)]);
+    if (atHead || !beforeCursor) return null;
+    return { block: startBlock, reason: 'not_before_cursor',
+      detail: `帳戶在游標起點前一塊 ${startBlock - 1n} 沒有 bytecode：部署塊 ≥ ${startBlock}，游標涵蓋部署` };
+  } catch {
+    return null;
   }
 }
 
@@ -569,13 +587,14 @@ export type ScanDeps = {
  */
 export async function scanPortfolioHoldings(deps: ScanDeps): Promise<HoldingScanResult> {
   const block = deps.head ?? (await deps.client.getBlockNumber());
-  const deployment = await findDeploymentBlock(deps.client, {
-    account: deps.account,
-    head: block,
-    searchFromBlock: deps.searchFromBlock,
-  });
-
   const existing = await loadCursor(deps.query, deps.portfolioId);
+  const deployment = (existing === null || (deps.searchFromBlock ?? 0n) >= existing.startBlock ? null : await deploymentNotBeforeCursor(deps.client, deps.account, block, existing.startBlock)) ??
+    await findDeploymentBlock(deps.client, {
+      account: deps.account,
+      head: block,
+      searchFromBlock: deps.searchFromBlock,
+    });
+
   const cursor: ScanCursor =
     existing ?? { portfolioId: deps.portfolioId, startBlock: deployment.block ?? block, lastScannedBlock: (deployment.block ?? block) - 1n };
 

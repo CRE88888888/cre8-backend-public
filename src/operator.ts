@@ -2,6 +2,7 @@ import { assetsMarketOpen } from './trading-calendar.js';
 import { MAX_USER_OP_STEPS } from './execution-batch.js';
 import { configuredChainId, TESTNET_97, testnetAssets } from './testnet-profile.js';
 import { cancelJob, lockCash, readJob, unresolvedSql } from './strategy-jobs.js';
+import { OWNER_DEX_WAIT_MS, withDexLock } from './dex-queue.js';
 import type { AggregatorQuoter } from './aggregator.js';
 /**
  * 操作員的兩支端點實作：`GET /portfolios/:id/status` 與 `POST /portfolios/:id/rebalance`。
@@ -921,6 +922,8 @@ export async function runOperatorRebalance(
     { dryRun: false, limit: 1, skipAlerts: true },
     {
       withTransaction: singlePortfolioClaim(portfolioId, deps.withTransaction),
+      // The owner's own round waits for the shared DEX lane (src/dex-queue.ts) instead of failing at once.
+      ...(deps.withTransaction === undefined ? { withDexLock: <T>(chainId: number, fn: () => Promise<T>) => withDexLock(chainId, fn, { waitMs: OWNER_DEX_WAIT_MS }) } : {}),
       ...(deps.log === undefined ? {} : { log: deps.log }),
     },
   );
@@ -995,6 +998,8 @@ export async function previewOperatorRebalance(
     { dryRun: true, limit: 1, skipAlerts: true },
     {
       withTransaction: singlePortfolioClaim(portfolioId, deps.withTransaction),
+      // The owner's own round waits for the shared DEX lane (src/dex-queue.ts) instead of failing at once.
+      ...(deps.withTransaction === undefined ? { withDexLock: <T>(chainId: number, fn: () => Promise<T>) => withDexLock(chainId, fn, { waitMs: OWNER_DEX_WAIT_MS }) } : {}),
       ...(deps.log === undefined ? {} : { log: deps.log }),
     },
   );
@@ -1347,6 +1352,7 @@ async function runOperatorSell(portfolioId: number, wallet: string, request: Sel
     { dryRun: false, limit: 1, skipAlerts: true },
     {
       withTransaction: singlePortfolioClaim(portfolioId, deps.withTransaction, { allowPaused: closing, preserveNextRunAt: true }),
+      ...(deps.withTransaction === undefined ? { withDexLock: <T>(chainId: number, fn: () => Promise<T>) => withDexLock(chainId, fn, { waitMs: OWNER_DEX_WAIT_MS }) } : {}),
       ...(deps.query === undefined ? {} : { query: deps.query }),
       planRebalance: async (input) => {
         const built = await buildRedeemPlan(input, request, deps);

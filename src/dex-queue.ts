@@ -30,18 +30,49 @@ export async function assertDexLock():Promise<void>{
  * snapshot -> pending-commit race. A dead worker never releases an unknown attempt.
  * This also covers shared multi-hop pools and opaque aggregator routes.
  */
-export async function withDexLock<T>(chainId:number,fn:()=>Promise<T>):Promise<T|null>{
+/**
+ * Owner priority (2026-11-23): the scheduler keeps the lane busy round after round (one portfolio holds it 15–25 s),
+ * so a user's sell/buy tried once and got [DEX_QUEUED] almost every time during market hours. The wait stays under the
+ * 30 s proxy deadline (Cloudflare worker and website service) together with the round itself; the app retries quickly. An owner-initiated
+ * round (`waitMs`) now raises a priority flag (advisory lock 830084) and waits for the lane; the scheduler sees the flag
+ * before taking the lane for its next portfolio and yields (that portfolio retries next round).
+ */
+const PRIORITY_LOCK=830084;
+export const OWNER_DEX_WAIT_MS=12_000;
+export async function withDexLock<T>(chainId:number,fn:()=>Promise<T>,options:{waitMs?:number;sleep?:(ms:number)=>Promise<void>}={}):Promise<T|null>{
   const client=await getPool().connect().catch(()=>{throw new Error('DEX queue connection unavailable');});
-  let held=false,healthy=true;
+  let held=false,healthy=true,priority=false;
   const failed=()=>{healthy=false;};client.on('error',failed);
+  const sleep=options.sleep??((ms:number)=>new Promise<void>(r=>setTimeout(r,ms)));
+  const tryLane=async()=>(await client.query<{held:boolean}>('select pg_try_advisory_lock(830083,$1::int) as held',[chainId])
+    .catch(()=>{healthy=false;throw new Error('DEX queue lock unavailable');})).rows[0]?.held===true;
   try{
-    held=(await client.query<{held:boolean}>('select pg_try_advisory_lock(830083,$1::int) as held',[chainId])
-      .catch(()=>{healthy=false;throw new Error('DEX queue lock unavailable');})).rows[0]?.held===true;
+    if(options.waitMs===undefined){
+      // Scheduler: an owner is waiting for the lane -> yield this turn.
+      const free=(await client.query<{held:boolean}>('select pg_try_advisory_lock($1::int,$2::int) as held',[PRIORITY_LOCK,chainId])
+        .catch(()=>{healthy=false;throw new Error('DEX queue lock unavailable');})).rows[0]?.held===true;
+      if(!free)return null;
+      await client.query('select pg_advisory_unlock($1::int,$2::int)',[PRIORITY_LOCK,chainId]).catch(()=>{healthy=false;});
+      held=await tryLane();
+    }else{
+      // Owner: raise the flag (owners queue on it among themselves), then wait for the lane.
+      priority=(await client.query<{held:boolean}>('select pg_try_advisory_lock($1::int,$2::int) as held',[PRIORITY_LOCK,chainId])
+        .catch(()=>{healthy=false;throw new Error('DEX queue lock unavailable');})).rows[0]?.held===true;
+      const until=Date.now()+options.waitMs;
+      for(;;){
+        if(priority||!held)held=await tryLane();
+        if(held||Date.now()+500>until)break;
+        await sleep(500);
+        if(!priority)priority=(await client.query<{held:boolean}>('select pg_try_advisory_lock($1::int,$2::int) as held',[PRIORITY_LOCK,chainId])).rows[0]?.held===true;
+      }
+      if(priority){try{await client.query('select pg_advisory_unlock($1::int,$2::int)',[PRIORITY_LOCK,chainId]);}catch{healthy=false;}priority=false;}
+    }
     if(!held)return null;
     const result=await lockClient.run(client,fn);
     if(!healthy)throw new Error('DEX lock connection lost; reconcile before retry');
     return result;
   }finally{
+    if(priority)try{await client.query('select pg_advisory_unlock($1::int,$2::int)',[PRIORITY_LOCK,chainId]);}catch{healthy=false;}
     if(held)try{healthy=(await client.query<{held:boolean}>('select pg_advisory_unlock(830083,$1::int) as held',[chainId])).rows[0]?.held===true&&healthy;}catch{healthy=false;}
     client.removeListener('error',failed);client.release(!healthy);
   }

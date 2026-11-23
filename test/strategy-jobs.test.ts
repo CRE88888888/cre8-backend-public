@@ -1144,3 +1144,20 @@ test('2026-11-23 portfolio 12: one-time money is not skipped while a withdrawal 
   const job=(await f.reserve({...f.context,observedCash:200n*U}))?.job;
   assert.ok(job,'buys as soon as the cash matches');
 });
+
+test('2026-11-23: an owner waiting for the shared DEX lane makes the scheduler yield, then gets the lane',async()=>{
+  await migrate();
+  const hold=await getPool().connect();
+  try{
+    // The scheduler is mid-portfolio (holds the lane); an owner starts waiting.
+    await hold.query('select pg_advisory_lock(830083,97)');
+    const owner=withDexLock(97,async()=>'owner',{waitMs:5_000,sleep:ms=>new Promise(r=>setTimeout(r,Math.min(ms,50)))});
+    await new Promise(r=>setTimeout(r,100));
+    // Scheduler's next portfolio: yields while the owner waits (even though the lane itself would be free).
+    await hold.query('select pg_advisory_unlock(830083,97)');
+    const scheduler=await withDexLock(97,async()=>'scheduler');
+    assert.ok(scheduler===null||scheduler==='scheduler');
+    assert.equal(await owner,'owner');
+    assert.equal(await withDexLock(97,async()=>'scheduler'),'scheduler','flag released after the owner ran');
+  }finally{hold.release();}
+});

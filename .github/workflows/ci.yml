@@ -89,6 +89,7 @@ jobs:
           test/chain.enroll.test.ts
           test/account-deployment.test.ts
           test/registry-versioning.test.ts
+          test/strategy-detail-last-good.test.ts
           test/enrollment-sponsorship.test.ts
           test/drift.test.ts
           test/deployment.test.ts

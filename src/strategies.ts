@@ -489,7 +489,7 @@ export async function getStrategyWithVersionState(id: number, deps: {
 } = {}) {
   const strategy = await (deps.strategy ?? getStrategy)(id);
   if (strategy.personalMix) throw new NotFoundError('找不到公開基金。');
-  const readState = deps.state ?? readPublicVersionState;
+  const readState = deps.state ?? displayVersionState;
   return { ...strategy, versions: await Promise.all(strategy.versions.map(async version => {
     if (strategy.onchainId === null) return { ...version, status: 'unmirrored' as const, canCancel: false };
     const state = await readState(strategy.onchainId, version.version);
@@ -512,6 +512,60 @@ async function readPublicVersionState(onchainId: number, version: number) {
   if (versionStates.size > 500) versionStates.delete(versionStates.keys().next().value as string);
   return value;
 }
+/**
+ * Fund detail is a display read: serve the last good chain state instead of a 503 (2026-11-23 04:23 UTC: eight
+ * `GET /strategies/:id` 503s after ~3.3 s; one registry read failed and the retry 2 s later answered in 0.8 s).
+ *
+ * - Younger than `ttlMs`: served from memory.
+ * - Older: the last good value is served at once and one background read refreshes it (concurrent requests share it).
+ * - A failed refresh keeps the last good value and logs the cause. Only a fund never read since boot can still fail,
+ *   after one retry.
+ *
+ * Version state changes only when a version is published or activates, so a value one refresh old is fine on a
+ * display page. Enrollment, consent and publication keep their own strict reads.
+ */
+export function lastGoodVersionState<T>(read: (onchainId: number, version: number) => Promise<T>, options: {
+  ttlMs?: number; now?: () => number; log?: (line: string) => void; retryDelayMs?: number; maxEntries?: number;
+} = {}) {
+  const ttl = options.ttlMs ?? VERSION_STATE_TTL_MS, now = options.now ?? Date.now, max = options.maxEntries ?? 500;
+  const log = options.log ?? ((line: string) => console.warn(line));
+  const good = new Map<string, { at: number; value: T }>();
+  const inflight = new Map<string, Promise<T>>();
+  const refresh = (key: string, onchainId: number, version: number): Promise<T> => {
+    const running = inflight.get(key);
+    if (running) return running;
+    const next = read(onchainId, version).then(value => {
+      good.delete(key); good.set(key, { at: now(), value });
+      if (good.size > max) good.delete(good.keys().next().value as string);
+      return value;
+    }).finally(() => inflight.delete(key));
+    inflight.set(key, next);
+    return next;
+  };
+  const reason = (error: unknown) => {
+    const parts: string[] = [];
+    for (let e: unknown = error; e instanceof Error && parts.length < 4; e = e.cause) parts.push(`${e.name}: ${(e as { shortMessage?: string }).shortMessage ?? e.message}`);
+    return parts.join(' <- ').replace(/https?:\/\/\S+/g, '<url>').slice(0, 300);
+  };
+  return async (onchainId: number, version: number): Promise<T> => {
+    const key = `${onchainId}:${version}`, hit = good.get(key);
+    if (hit) {
+      if (now() - hit.at >= ttl) refresh(key, onchainId, version).catch(error => log(JSON.stringify({ msg: 'version_state_stale',
+        onchainId, version, ageMs: now() - hit.at, reason: reason(error) })));
+      return hit.value;
+    }
+    try { return await refresh(key, onchainId, version); }
+    catch (error) {
+      if (error instanceof AppError && error.status !== 503) throw error;
+      log(JSON.stringify({ msg: 'version_state_retry', onchainId, version, reason: reason(error) }));
+      await new Promise(resolve => setTimeout(resolve, options.retryDelayMs ?? 500));
+      return refresh(key, onchainId, version);
+    }
+  };
+}
+
+const displayVersionState = lastGoodVersionState((onchainId, version) => readPublicVersionStateOnce(onchainId, version));
+
 async function readPublicVersionStateOnce(onchainId: number, version: number) {
   try {
     const config = getConfig();
@@ -521,7 +575,7 @@ async function readPublicVersionStateOnce(onchainId: number, version: number) {
     return await readVersionState(client, config.registryAddress as Address, onchainId, version);
   } catch (error) {
     if (error instanceof AppError) throw error;
-    throw new AppError(503, 'VERSION_STATE_UNAVAILABLE', 'version state unavailable');
+    throw new AppError(503, 'VERSION_STATE_UNAVAILABLE', 'version state unavailable', { cause: error });
   }
 }
 

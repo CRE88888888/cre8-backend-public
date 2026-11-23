@@ -152,5 +152,5 @@ export async function readVersionState(client: PublicClient, registry: Address, 
       maxStrategyAssets: maxStrategyAssets.toString(),
       assets: value.assets, weightsBps: value.weightsBps, scheduleHash: value.scheduleHash,
       configHash: value.configHash, settingsHash: value.settingsHash, performanceFeeBps: value.performanceFeeBps };
-  } catch { throw new AppError(503, 'VERSION_STATE_UNAVAILABLE', 'version state unavailable'); }
+  } catch (cause) { throw new AppError(503, 'VERSION_STATE_UNAVAILABLE', 'version state unavailable', { cause }); }
 }

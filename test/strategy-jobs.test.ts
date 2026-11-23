@@ -1135,3 +1135,12 @@ test('My mix reserves only open asset sources and retains closed source budgets;
     from strategy_lot_assets a join strategy_funding_lots l on l.id=a.lot_id where l.portfolio_id=$1 and a.asset=$2`, [f.id, b])).rows[0];
   assert.deepEqual(closed, { state: 'active', n: '0' });
 });
+
+test('2026-11-23 portfolio 12: one-time money is not skipped while a withdrawal is still unreconciled; it buys once the chain agrees',async()=>{
+  const f=await fixture('hold');await f.fund(200n*U);
+  // The account shows less than is classified (a withdrawal whose evidence is not in yet): wait, never skip for good.
+  for(let retry=0;retry<2;retry++)assert.match((await f.reserve({...f.context,observedCash:150n*U}))?.reason??'',/CASH_RECONCILIATION_PENDING/);
+  assert.equal((await query("select id from strategy_asset_slices s join strategy_funding_lots l on l.id=s.lot_id where l.portfolio_id=$1 and s.state like 'skipped%'",[f.id])).rows.length,0);
+  const job=(await f.reserve({...f.context,observedCash:200n*U}))?.job;
+  assert.ok(job,'buys as soon as the cash matches');
+});

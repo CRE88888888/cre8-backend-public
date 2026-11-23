@@ -119,6 +119,11 @@ export async function prepareAssetJob(run:WithTransactionFn,c:JobContext,config:
   const balance=(await query(`select unallocated_hold_raw::text,stack_prefund_raw::text,(unallocated_hold_raw+stack_prefund_raw+allocated_cash_raw+reserved_input_raw+reserved_fee_raw+withdrawal_raw+yield_raw)::text as total from strategy_cash_balances where chain_id=$1 and portfolio_id=$2`,[c.chainId,c.portfolioId])).rows[0] as {total:string;unallocated_hold_raw:string;stack_prefund_raw:string}|undefined;
   if(!balance)throw new Error('missing cash row');
   const holdDue=due.filter(s=>s.mode.kind==='hold').reduce((n,s)=>n+s.budget,0n),stackDue=due.filter(s=>s.mode.kind==='stack').reduce((n,s)=>n+s.budget,0n);
+  // One-time (hold) money is never skipped for a classification ahead of the chain: that is a withdrawal not reconciled
+  // yet (2026-11-23 portfolio 12: a 300 USDT buy right after "sell all" was skipped for good). Wait a round instead.
+  // Creator-scheduled (stack) periods keep the no-catch-up skip.
+  if(stackDue===0n&&BigInt(balance.total)>c.observedCash&&holdDue<=BigInt(balance.unallocated_hold_raw))
+    return {job:null,reason:'[CASH_RECONCILIATION_PENDING] 現金分類高於鏈上餘額，等提領對帳後再買，不略過'};
   if(BigInt(balance.total)>c.observedCash||holdDue>BigInt(balance.unallocated_hold_raw)||stackDue>BigInt(balance.stack_prefund_raw)){
     await recordInsufficient(query,c,due);
     await completeAssetSchedules(query,c.portfolioId);

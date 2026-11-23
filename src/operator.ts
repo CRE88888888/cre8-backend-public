@@ -1,6 +1,7 @@
 import { assetsMarketOpen } from './trading-calendar.js';
 import { MAX_USER_OP_STEPS } from './execution-batch.js';
 import { configuredChainId, TESTNET_97, testnetAssets } from './testnet-profile.js';
+import { cancelJob, lockCash, readJob, unresolvedSql } from './strategy-jobs.js';
 import type { AggregatorQuoter } from './aggregator.js';
 /**
  * 操作員的兩支端點實作：`GET /portfolios/:id/status` 與 `POST /portfolios/:id/rebalance`。
@@ -744,7 +745,27 @@ export type RebalanceDeps = {
   executor?: Address | null;
   registry?: Address;
   log?: (line: string) => void;
+  /** Sell all releases a running buy job first (default: on in production, off when tests inject DB stubs). */
+  releaseRunningBuy?: ((portfolioId: number) => Promise<void>) | null;
 };
+
+/**
+ * Sell all (close): a running buy job would keep its reserved cash, so the owner could not withdraw everything,
+ * or (before the paymaster free-cash check) took it and left the portfolio stuck in [CASH_DEFICIT] (portfolio 12,
+ * 2026-11-23). Cancel it first: cancelJob returns the unspent reservation to the absorbable funding bucket. Skipped
+ * when an operation is unresolved or the job's outcome is unknown; the free-cash clamp still protects the cash then.
+ */
+export async function releaseRunningBuy(portfolioId: number): Promise<void> {
+  const chainId = configuredChainId();
+  await withTransaction(async (client) => {
+    const run = (sql: string, params?: readonly unknown[]) => client.query(sql, params ? [...params] : []);
+    const c = { chainId, portfolioId };
+    await lockCash(run, c);
+    if ((await run(`select id from operations where portfolio_id=$1 and ${unresolvedSql} limit 1`, [portfolioId])).rows.length) return;
+    const job = await readJob(run, c);
+    if (job && job.state !== 'unknown') await cancelJob(run, c, job);
+  });
+}
 
 /** 排程器的認領查詢裡，三個必須看得到的片段（少一個就代表 SQL 換了形狀 → 直接放棄）。 */
 const CLAIM_LOCK_MARKER = 'for update of p skip locked';
@@ -1314,6 +1335,12 @@ export async function runOperatorRedeem(portfolioId: number, wallet: string, amo
 async function runOperatorSell(portfolioId: number, wallet: string, request: SellRequest, deps: RebalanceDeps): Promise<RedeemResult> {
   await (deps.requireOwnedPortfolio ?? requireOwnedPortfolio)(portfolioId, wallet);
   const closing = typeof request === 'object' && 'close' in request;
+  const release = deps.releaseRunningBuy !== undefined ? deps.releaseRunningBuy
+    : deps.withTransaction === undefined && deps.query === undefined ? releaseRunningBuy : null;
+  if (closing && release) {
+    try { await release(portfolioId); }
+    catch (error) { (deps.log ?? console.warn)(`[close] portfolio ${portfolioId}: running buy not released (${errorChain(error)})`); }
+  }
   const planning: { result: RedeemPlanningResult | null } = { result: null };
   const round = await (deps.runSchedulerOnce ?? runSchedulerOnce)(
     { dryRun: false, limit: 1, skipAlerts: true },

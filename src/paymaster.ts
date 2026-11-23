@@ -32,6 +32,7 @@ export { reconcileExpiredExitAuthorizations } from './paymaster-exit-reconciliat
 import { fresh } from './yield-domain.js';
 import { dcaVaultCall, dcaVaults, isDcaSpender } from './dca-calls.js';
 import { writeYieldState } from './yield-runtime-state.js';
+import { reservedCash } from './withdrawable-cash.js';
 
 export type PackedSponsorOperation = {
   sender: Address; nonce: bigint; initCode: Hex; callData: Hex; accountGasLimits: Hex;
@@ -92,6 +93,8 @@ export type PaymasterDeps = {
   retryOrdinaryGas?: boolean;
   /** Public chain-97 setup retries require expired, unused authorization evidence. */
   retrySetup?: boolean;
+  /** Tests: the account's USDT balance (withdraw-to-wallet free cash check). */
+  readCash?: (account: Address, config: PaymasterConfig) => Promise<bigint>;
 };
 export const KERNEL_EXECUTE_ABI = parseAbi(['function execute(bytes32 execMode,bytes executionCalldata) payable']);
 const TOKEN_ABI = parseAbi(['function approve(address spender,uint256 amount)', 'function transfer(address recipient,uint256 amount)']);
@@ -911,6 +914,36 @@ export function packedOperationHash(op:PackedSponsorOperation,chainId:number):He
   return keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'address' }, { type: 'uint256' }], [packedHash, KERNEL_V3_3_ADDRESSES.entryPointV07, BigInt(chainId)]));
 }
 
+async function readAccountCash(account: Address, c: PaymasterConfig): Promise<bigint> {
+  return rpc(c).readContract({ address: TESTNET_97.contracts.usdt, abi: ENTRY_POINT_ABI, functionName: 'balanceOf', args: [account] });
+}
+/**
+ * Withdraw to wallet (USDT transfer to the owner) never takes cash a running buy job or the withdrawal/yield
+ * reservations hold (src/withdrawable-cash.ts). Taking it left portfolio 12 stuck in [CASH_DEFICIT] on 2026-11-23.
+ */
+async function checkFreeCash(op: PackedSponsorOperation, calls: ReturnType<typeof sponsoredCalls>, c: PaymasterConfig, owner: Address, deps: PaymasterDeps): Promise<void> {
+  if (c.chainId !== 97) return;
+  let out = 0n;
+  for (const call of calls) {
+    if (!isAddressEqual(call.target, TESTNET_97.contracts.usdt) || !call.callData.startsWith(toFunctionSelector('transfer(address,uint256)'))) continue;
+    const decoded = decodeFunctionData({ abi: TOKEN_ABI, data: call.callData });
+    if (decoded.functionName === 'transfer' && isAddressEqual(decoded.args[0], owner)) out += decoded.args[1];
+  }
+  if (out === 0n) return;
+  // A DCA Venus return redeems into the account in the same UserOp; that forward is bounded by dcaVaultCall instead.
+  if (calls.some(call => { try { return dcaVaultCall(call, op.sender, owner); } catch { return false; } })) return;
+  const rows = (await (deps.query ?? query)(`select b.reserved_input_raw::text,b.reserved_fee_raw::text,b.withdrawal_raw::text,b.yield_raw::text
+    from strategy_cash_balances b join smart_accounts s on (s.chain_id,s.portfolio_id)=(b.chain_id,b.portfolio_id)
+    where s.chain_id=$1 and s.address=$2 and s.retired_at is null`, [c.chainId, op.sender])).rows;
+  let reserved = 0n;
+  try { for (const row of rows) { const r = object(row); if ('reserved_input_raw' in r) reserved += reservedCash(r); } }
+  catch { throw rejected('PAYMASTER_DEPENDENCY_UNAVAILABLE', 503, 'free cash: unreadable cash buckets'); }
+  if (reserved === 0n) return;
+  const observed = await (deps.readCash ?? readAccountCash)(op.sender, c);
+  const free = observed > reserved ? observed - reserved : 0n;
+  if (out > free) throw rejected('PAYMASTER_WITHDRAW_RESERVED', 409, `free cash: withdraw exceeds free cash by ${out - free}`);
+}
+
 export function createPaymasterService(deps: PaymasterDeps = {}) {
   return { async sponsor(input: unknown, wallet: string) {
     try {
@@ -1010,6 +1043,7 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
         });
       }
       validateSponsoredCalls(op, c, { owner: hex(owner.owner, 20), assets });
+      await bounded(checkFreeCash(op, calls, c, hex(owner.owner, 20), deps), c.timeoutMs);
       const cost = gasCost(op, c);
       if (cost.gasLimit > MAX_USER_OP_GAS) throw rejected('PAYMASTER_USER_OP_CAPACITY', 400);
       await bounded((deps.checkChain ?? checkChain)(op, c), c.timeoutMs);

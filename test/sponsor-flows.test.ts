@@ -54,14 +54,17 @@ async function renewal(): Promise<Call[]> {
 }
 
 type Kind = 'fund' | 'mix';
-function harness(kind: Kind, opts: { pendingChange?: boolean } = {}) {
+function harness(kind: Kind, opts: { pendingChange?: boolean; reservedRaw?: bigint; observedRaw?: bigint } = {}) {
   const seen = { locks: 0, reservations: 0, setups: 0, exits: 0 };
   const service = createPaymasterService({ config: c, now: () => NOW,
     mixLock: async (_id, work) => { seen.locks++; return work(); },
     query: async (sql) => ({ rows: sql.includes('select s.owner') ? [{ owner, user_id: owner, mix_id: kind === 'mix' ? '5' : null }]
       : sql.includes('from mixes m where') ? [{ id: '5', owner, account, triggered_at: null, status: 'active' }]
       : sql.includes('mix_switch_intents') ? opts.pendingChange ? [{ id: '1', strategy_id: '12', owner_calls: [], nonce: '0', user_op_hash: null }] : []
-      : sql.includes('select ms.exit_assets') ? [{ exit_assets: [] }] : [] }),
+      : sql.includes('select ms.exit_assets') ? [{ exit_assets: [] }]
+      : sql.includes('from strategy_cash_balances b') && opts.reservedRaw !== undefined
+        ? [{ reserved_input_raw: opts.reservedRaw.toString(), reserved_fee_raw: '0', withdrawal_raw: '0', yield_raw: '0' }] : [] }),
+    readCash: async () => opts.observedRaw ?? 0n,
     mixSetup: async () => { seen.setups++; },
     checkChain: async () => {},
     readBudgetContext: async () => ({ purpose: 'ordinary', nativePrice: 60000000000n, priceSource: 'fixture:oracle' }),
@@ -155,4 +158,34 @@ test('My mix: DCA keeps every DCA safety rule, and per-asset yield stays off', a
   await assert.rejects(pending.sponsor(dcaDepositCalls(lista, account, 1n, maxUint256).map(asCall)), code('MIX_BUSY', 409));
   await pending.sponsor([transfer(usdt, owner, 1n)]);
   assert.equal(pending.seen.reservations, 1);
+});
+
+test('portfolio 12: withdraw to wallet never takes cash a running buy reserved (fund and My mix)', async () => {
+  const E = 10n ** 18n;
+  for (const kind of ['fund', 'mix'] as const) {
+    // 2,540 USDT in the account, 2,500 reserved by the running buy: 40 is free.
+    const reserved = { reservedRaw: 2_500n * E, observedRaw: 2_540n * E };
+    await harness(kind, reserved).sponsor([transfer(usdt, owner, 40n * E)]);
+    const h = harness(kind, reserved);
+    await assert.rejects(h.sponsor([transfer(usdt, owner, 41n * E)]), code('PAYMASTER_WITHDRAW_RESERVED', 409), kind);
+    assert.equal(h.seen.reservations, 0);
+    // Everything reserved: nothing is free.
+    await assert.rejects(harness(kind, { reservedRaw: 3_000n * E, observedRaw: 2_540n * E }).sponsor([transfer(usdt, owner, 1n)]), code('PAYMASTER_WITHDRAW_RESERVED', 409));
+    // Nothing reserved (or no cash row): the whole balance may go.
+    await harness(kind, { reservedRaw: 0n, observedRaw: 0n }).sponsor([transfer(usdt, owner, 1_000n * E)]);
+    // A Venus DCA return forwards what it just redeemed; reservations elsewhere do not block it.
+    const venus = vaults.find(v => v.id === 'venus_usdt')!;
+    await harness(kind, { reservedRaw: 3_000n * E, observedRaw: 0n }).sponsor(dcaReturnCalls(venus, account, owner, 9n * E, 9n * E).map(asCall));
+  }
+});
+
+test('withdrawable cash = account USDT minus what a running buy / withdrawal / yield reserved', async () => {
+  const { withdrawableCash, reservedCash } = await import('../src/withdrawable-cash.js');
+  const row = { reserved_input_raw: '2499932500000000000000', reserved_fee_raw: '270000000000000000', withdrawal_raw: '0', yield_raw: '0',
+    unallocated_hold_raw: '5', allocated_cash_raw: '7', unclassified_raw: '0', stack_prefund_raw: '0' };
+  assert.equal(reservedCash(row), 2500202500000000000000n);
+  assert.equal(withdrawableCash(1580202500000000000000n, row), 0n, 'portfolio 12: everything left is reserved');
+  assert.equal(withdrawableCash(2600202500000000000000n, row), 100n * 10n ** 18n);
+  assert.equal(withdrawableCash(10n, null), 10n);
+  assert.throws(() => reservedCash({ ...row, yield_raw: '-1' }));
 });

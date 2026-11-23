@@ -22,6 +22,7 @@ import type { WelcomeGrant } from './welcome-grants.js';
 import { readAccountCash } from './chain.js';
 import { defaultAmountUsdt, exactKeys, minimumAllocationRaw, record, usdtRaw, utcDate, CONTRIBUTION_FEE_RESERVE_RAW, minimumAssetContribution, minimumDcaTranche, numeraireFor } from './strategy-execution.js';
 import type { AssetExecution } from './strategy-execution.js';
+import { reservedCash, withdrawableCash } from './withdrawable-cash.js';
 
 export type FundingSource = { kind: 'faucet_claim'; claimId: string } | { kind: 'welcome_grant'; grantId: string }
   | { kind: 'wallet_transfer'; txHash: Hex }
@@ -362,7 +363,9 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
       return { portfolioId: id, chainId: p.chainId, version: p.version, execution: version.execution, configHash: version.configHash,
         lotAssets: lotAssets.rows, slices:slices.rows, enabled: p.scheduleState === 'active', automation: p.chainId===97?'enabled':'testnet_only', jobs:jobs.rows,
         defaultAmountUsdt: version.execution.kind==='per_asset'?formatUnits(minimumAssetContribution(version.execution),18):defaultAmountUsdt(version.allocation, p.chainId),
-        cash: { ...observed, ...cashDifference(difference,yieldPending) },
+        // The owner's withdraw sheet caps at this (never cash a running buy has reserved).
+        cash: { ...observed, ...cashDifference(difference,yieldPending), withdrawableRaw: withdrawableCash(BigInt(observed.amountRaw), balances).toString(),
+          reservedRaw: reservedCash(balances).toString() },
         balances, instructions: instructions.rows.map(mapInstruction), lots: lots.rows.map(mapLot) };
       });
     }),

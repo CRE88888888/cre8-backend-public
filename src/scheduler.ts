@@ -2637,6 +2637,10 @@ async function decideAndMaybeExecute(
     return { ...base, outcome: 'noop', ...(money?.useTargetWeights&&plan.report.maxAbsDeltaBps<=plan.report.thresholdBps?{rebalanceComplete:true}:{}), reason: `Planner returned noop: ${rebalance.reason}` };
   }
   if (rebalance.kind === 'blocked') {
+    // A leftover below one complete batch waits for more money; the filled assets can still turn Strategy Earn on.
+    // 2026-11-23 portfolio 17: bought with "Earn extra", filled, but every round was [BASKET_WAITING], so the auto-open
+    // (called only on noop) never ran.
+    if (ctx.forcePlan !== true && /\[BASKET_WAITING\]/.test(rebalance.reason)) await strategyEarnOpen(due, ctx);
     let nextRunAt = base.nextRunAt;
     let scheduleNote = '';
     const end = rebalance.buyWindowEndsAt;

@@ -70,6 +70,8 @@ test('a revert is the request\'s fault: no failover; eth_chainId is cached; loca
   assert.equal(secondaryRpc('https://bsc-mainnet.nodereal.io/v1/x', 56), null);
   assert.equal(isProviderFailure(Object.assign(new Error('execution reverted'), { code: 3 })), false);
   assert.equal(isProviderFailure(Object.assign(new Error('x'), { code: -32005 })), true);
+  const { PAID_FIRST_SOURCES } = await import('../src/rpc-transport.js');
+  assert.ok(PAID_FIRST_SOURCES.has('paymaster') && PAID_FIRST_SOURCES.has('faucet') && !PAID_FIRST_SOURCES.has('strategy-earn') && !PAID_FIRST_SOURCES.has('operator'));
 });
 
 test('the scheduler reads from the public node first and uses the paid RPC only when the public node fails', async () => {

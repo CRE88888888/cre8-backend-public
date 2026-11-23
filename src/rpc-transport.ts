@@ -17,6 +17,14 @@ import type { EIP1193RequestFn, HttpTransportConfig, Transport } from 'viem';
  */
 export const PUBLIC_RPC_97 = 'https://bsc-testnet-rpc.publicnode.com';
 export const RPC_BREAKER_MS = 60_000;
+/**
+ * API callers that stay on the paid RPC first: sponsorship decisions, operator/faucet transaction submission and the
+ * enrollment confirmations right after a user's transaction (latency and freshness matter, call counts are small).
+ * Every other caller (display endpoints, positions, DCA/Earn views, snapshots, monitoring) reads from the public node
+ * first. Measured 2026-11-23 14:02: in 10 min the API made 277 paid calls, 70 % from display reads.
+ */
+export const PAID_FIRST_SOURCES: ReadonlySet<string> = new Set(['paymaster', 'paymaster-exit-reconciliation', 'faucet', 'gas-faucet',
+  'welcome-grants', 'chain', 'relayer-reconciliation', 'preflight']);
 const LOG_EVERY_MS = 60_000;
 const USAGE_EVERY_MS = 10 * 60_000;
 
@@ -122,7 +130,7 @@ export function rpcTransport(source: string, url: string | null | undefined, opt
   const publicNode = withCache(fallbackUrl, http(fallbackUrl, options), now);
   // The scheduler's reads are bulk and latency-tolerant (drift, scans, monitoring): they go to the keyless public node
   // first and use the paid RPC_URL only when the public node fails. The API keeps RPC_URL first.
-  const preferPublic = deps.preferPublic ?? process.env.SERVICE_ROLE === 'scheduler';
+  const preferPublic = deps.preferPublic ?? (process.env.SERVICE_ROLE === 'scheduler' || !PAID_FIRST_SOURCES.has(source));
   const [first, second] = preferPublic ? [publicNode, primary] : [primary, publicNode];
   const [firstName, secondName] = preferPublic ? ['public', 'primary'] : ['primary', 'public'];
   const key = `${preferPublic ? 'public-first' : 'primary-first'}:${url ?? ''}`;

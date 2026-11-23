@@ -79,12 +79,22 @@ test('the scheduler reads from the public node first and uses the paid RPC only 
   let publicMode: 'ok' | 'limit' = 'ok';
   const paid = await node(() => 'ok', 100n), pub = await node(() => publicMode, 100n);
   try {
-    const client = createPublicClient({ transport: rpcTransport('scheduler', paid.url, { retryCount: 0 }, { secondary: pub.url, preferPublic: true, log: () => {} }) });
+    const lines: string[] = [];
+    const client = createPublicClient({ transport: rpcTransport('scheduler', paid.url, { retryCount: 0 }, { secondary: pub.url, preferPublic: true, schedulerRole: true, log: (l) => lines.push(l) }) });
     const account = '0x00000000000000000000000000000000000000a1';
     await client.getBalance({ address: account });
     assert.equal(paid.calls.length, 0);
+    // Public node rate-limits: a scheduler bulk read fails (round skipped) and never touches the paid RPC.
     publicMode = 'limit';
-    await client.getBalance({ address: account });
+    await assert.rejects(client.getBalance({ address: account }));
+    assert.equal(paid.calls.length, 0);
+    assert.match(lines[0] ?? '', /rpc_failover_skipped/);
+    // Transaction methods may still use the paid RPC.
+    await client.request({ method: 'eth_getTransactionReceipt', params: [`0x${'11'.repeat(32)}` as `0x${string}`] }).catch(() => undefined);
+    assert.equal(paid.calls.filter(m => m === 'eth_getTransactionReceipt').length, 1);
+    // Outside the scheduler (API display reads), the paid fallback stays.
+    const api = createPublicClient({ transport: rpcTransport('dca', paid.url, { retryCount: 0 }, { secondary: pub.url, preferPublic: true, schedulerRole: false, log: () => {} }) });
+    await api.getBalance({ address: account });
     assert.equal(paid.calls.filter(m => m === 'eth_getBalance').length, 1);
   } finally { paid.stop(); pub.stop(); }
 });

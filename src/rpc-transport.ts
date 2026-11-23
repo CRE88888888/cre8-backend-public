@@ -18,6 +18,13 @@ import type { EIP1193RequestFn, HttpTransportConfig, Transport } from 'viem';
 export const PUBLIC_RPC_97 = 'https://bsc-testnet-rpc.publicnode.com';
 export const RPC_BREAKER_MS = 60_000;
 /**
+ * In the scheduler, bulk reads (≈670 calls/min on 2026-11-23) never fall back to the paid RPC: when the public node
+ * rate-limits, the read fails and that portfolio's round is skipped (retried next round). Only transaction submission and
+ * its receipt/nonce/fee reads may use the paid RPC there.
+ */
+export const SCHEDULER_PAID_METHODS: ReadonlySet<string> = new Set(['eth_sendRawTransaction', 'eth_getTransactionReceipt',
+  'eth_getTransactionCount', 'eth_estimateGas', 'eth_gasPrice', 'eth_maxPriorityFeePerGas', 'eth_feeHistory', 'eth_chainId']);
+/**
  * API callers that stay on the paid RPC first: sponsorship decisions, operator/faucet transaction submission and the
  * enrollment confirmations right after a user's transaction (latency and freshness matter, call counts are small).
  * Every other caller (display endpoints, positions, DCA/Earn views, snapshots, monitoring) reads from the public node
@@ -28,7 +35,7 @@ export const PAID_FIRST_SOURCES: ReadonlySet<string> = new Set(['paymaster', 'pa
 const LOG_EVERY_MS = 60_000;
 const USAGE_EVERY_MS = 10 * 60_000;
 
-type Breaker = { openUntil: number; lastLog: number };
+type Breaker = { openUntil: number; lastLog: number; lastSkipLog: number };
 /**
  * Call-volume cuts shared by every client on the same URL (new clients are created per request in many routes):
  * eth_chainId never changes, and eth_blockNumber is reused for 250 ms (under one 0.45 s chain-97 block), so the head-wait
@@ -115,7 +122,7 @@ function withCache(key: string, transport: Transport, now: () => number): Transp
 
 /** Drop-in for `http(rpcUrl, options)` on chain reads/writes. `source` names the caller in `rpc_usage`. */
 export function rpcTransport(source: string, url: string | null | undefined, options: HttpTransportConfig = {},
-  deps: { now?: () => number; log?: (line: string) => void; secondary?: string | null; preferPublic?: boolean } = {}): Transport {
+  deps: { now?: () => number; log?: (line: string) => void; secondary?: string | null; preferPublic?: boolean; schedulerRole?: boolean } = {}): Transport {
   const fallbackUrl = deps.secondary !== undefined ? deps.secondary : secondaryRpc(url);
   // Caches only on the real chain-97 provider (never on local test nodes, which change chain/head between tests).
   const plain = http(url ?? undefined, options);
@@ -134,11 +141,26 @@ export function rpcTransport(source: string, url: string | null | undefined, opt
   const [first, second] = preferPublic ? [publicNode, primary] : [primary, publicNode];
   const [firstName, secondName] = preferPublic ? ['public', 'primary'] : ['primary', 'public'];
   const key = `${preferPublic ? 'public-first' : 'primary-first'}:${url ?? ''}`;
+  const schedulerRole = deps.schedulerRole ?? process.env.SERVICE_ROLE === 'scheduler';
+  // Paid fallback after a public-node failure: always for the API; in the scheduler only for transaction methods.
+  const paidFallback = (method: string) => !preferPublic || !schedulerRole || SCHEDULER_PAID_METHODS.has(method);
   return (args) => {
     const p = first(args), s = second(args);
-    const breaker = breakers.get(key) ?? { openUntil: 0, lastLog: 0 };
+    const breaker = breakers.get(key) ?? { openUntil: 0, lastLog: 0, lastSkipLog: 0 };
     breakers.set(key, breaker);
     const request = (async (req, opts) => {
+      if (!paidFallback(req.method)) {
+        // Scheduler bulk read: public node only. A failure skips this round's work for the portfolio (retried next round).
+        count(`${source}:${firstName}`, req.method);
+        try { return await p.request(req, opts); }
+        catch (error) {
+          if (isProviderFailure(error) && now() - breaker.lastSkipLog >= LOG_EVERY_MS) {
+            breaker.lastSkipLog = now();
+            log(JSON.stringify({ msg: 'rpc_failover_skipped', from: firstName, source, method: req.method, reason: reasonOf(error) }));
+          }
+          throw error;
+        }
+      }
       if (now() >= breaker.openUntil) {
         count(`${source}:${firstName}`, req.method);
         try { return await p.request(req, opts); }

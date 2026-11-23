@@ -167,6 +167,7 @@ test('#199 portfolio view: net value = collateral + vault - debt per position, k
   const earn = createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio() as never, now: () => new Date('2026-11-23T00:00:00Z') });
   const view = await earn.portfolio(3, account);
   assert.equal(view.status, 'ok');
+  assert.equal('autoOpen' in view && view.autoOpen, false, 'a position is on: not "waiting for the fill"');
   const p = view.positions[0]; assert.ok(p && 'netValueUsd' in p);
   assert.deepEqual([p.asset, p.status, p.collateralValueUsd, p.debtRaw, p.vaultAssetsRaw, p.netValueUsd, p.pendingRewardsRaw, p.ltvBps, p.extraApyBps],
     ['NVDAB', 'on', String(1000n * E18), String(250n * E18), String(251n * E18), String(1001n * E18), String(4n * E16), 2500, 112]);
@@ -256,4 +257,15 @@ test('#199 HTTP: public markets with short cache; portfolio routes need login; 4
     assert.equal(close.status, 200);
     assert.equal((await fetch(`${base}/portfolios/3/strategy-earn/open`, { method: 'POST', headers: auth, body: JSON.stringify({ asset: 'TQQQB', collateralRaw: '1' }) })).status, 400);
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+});
+
+test('portfolio view: autoOpen = consented (policy enabled) but nothing posted yet, so the app keeps the switch on until the fill', async () => {
+  const base: Fake = { statuses: Object.fromEntries(markets.map(m => [m.marketId, status()])), ids: [], held: 0n, collateral: 0n, prices: {}, rewards: { vault: 0n, collateral: 0n } };
+  const view = (f: Fake) => createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio() as never }).portfolio(3, account);
+  const none = await view(base);
+  assert.equal('autoOpen' in none && none.autoOpen, false);
+  const armed = await view({ ...base, policies: { [nvda.marketId]: { maxDebt: 100n * E18, enabled: true } } });
+  assert.equal('autoOpen' in armed && armed.autoOpen, true);
+  const zero = await view({ ...base, policies: { [nvda.marketId]: { maxDebt: 0n, enabled: true } } });
+  assert.equal('autoOpen' in zero && zero.autoOpen, false);
 });

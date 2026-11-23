@@ -297,8 +297,12 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
         }
       }));
       const earnNetUsd = positions.reduce((sum, p) => sum + ('earnNetUsd' in p && p.earnNetUsd !== undefined ? BigInt(p.earnNetUsd) : 0n), 0n);
+      // autoOpen: the owner consented (a market's borrow policy is enabled) but nothing is posted yet — the buy has not
+      // filled. The scheduler opens it after the fill (strategyEarnAutoOpen); the app shows the switch as on, "starts when your order fills".
+      const autoOpen = positions.some(p => p.status === 'on') ? false
+        : (await Promise.all(markets.map(m => chain.policy(account, m.marketId, head.number).then(p => p.enabled && p.maxDebt > 0n, () => false)))).some(Boolean);
       return { portfolioId: id, account, status: 'ok' as const, reason: null, message: null, updatedAt: new Date(Number(head.timestamp) * 1000).toISOString(),
-        earnNetUsd: earnNetUsd.toString(), positions };
+        earnNetUsd: earnNetUsd.toString(), autoOpen, positions };
     },
     /** One owner UserOp: consent + approvals (to AtpBorrowExecutor only) + post collateral + borrow into the vault. */
     async open(id: number, wallet: string, input: unknown) {

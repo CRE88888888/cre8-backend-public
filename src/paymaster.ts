@@ -1,6 +1,6 @@
 import { verifyEnrollmentSponsorship } from './enrollment-sponsorship.js';
 import { verifyMixOwnerCalls } from './mix-chain.js';
-import { MIX_COLUMNS, pendingMixSql, withMixLock, checkMixLock } from './mix-store.js';
+import { MIX_COLUMNS, pendingMixSql, withMixLock, checkMixLock, mixBusy } from './mix-store.js';
 import type { MixRow, MixIntent } from './mix-store.js';
 import {
   concatHex, createPublicClient, decodeAbiParameters, decodeFunctionData, encodeAbiParameters,
@@ -30,7 +30,7 @@ import { applyExpiredExitProofs, expiredExitProofs, rememberExitFacts, unusedExi
 import type { ExpiredExitProof } from './paymaster-exit-reconciliation.js';
 export { reconcileExpiredExitAuthorizations } from './paymaster-exit-reconciliation.js';
 import { fresh } from './yield-domain.js';
-import { dcaVaultCall, isDcaSpender } from './dca-calls.js';
+import { dcaVaultCall, dcaVaults, isDcaSpender } from './dca-calls.js';
 import { writeYieldState } from './yield-runtime-state.js';
 
 export type PackedSponsorOperation = {
@@ -203,6 +203,44 @@ function validateRenewal(install: Hex, grant: Hex, c: PaymasterConfig, account: 
   if (install.toLowerCase() !== expectedInstall.toLowerCase() || grant.toLowerCase() !== expectedGrant.toLowerCase()) throw new Error('noncanonical renewal');
 }
 
+/** Every session scope GET /renewal-params can install on this chain (chain 97: plain, yield, yield+borrow). */
+function validateAnyRenewal(install: Hex, grant: Hex, c: PaymasterConfig, account: Address): void {
+  const scopes: RenewalScope[] = c.chainId === 97 ? ['plain', 'yield', 'yield+borrow'] : ['plain'];
+  if (!scopes.some((scope) => { try { validateRenewal(install, grant, c, account, scope); return true; } catch { return false; } })) {
+    throw new Error('renewal matches no allowed session scope');
+  }
+}
+
+/**
+ * DCA (定投, db 0064) on a My mix account. These calls only move the account's own USDT into / out of a DCA vault
+ * (or a period's redemption back into the account), never change the mix's enrollment, so they are not an owner
+ * mix change. The exact rules (recipients, amounts, canonical encoding) stay in validateSponsoredCalls/dcaVaultCall.
+ */
+export type MixDcaCall = 'vault' | 'approval' | 'redeem' | null;
+export function mixDcaCall(call: { target: Address; callData: Hex }, sender: Address, owner: Address | undefined, c: PaymasterConfig): MixDcaCall {
+  if (c.chainId !== 97) return null;
+  const vaults = dcaVaults();
+  try { if (dcaVaultCall(call, sender, owner, vaults)) return 'vault'; } catch { return null; }
+  if (call.callData.startsWith(toFunctionSelector('approve(address,uint256)'))) {
+    try {
+      const inner = decodeFunctionData({ abi: TOKEN_ABI, data: call.callData });
+      if (inner.functionName !== 'approve') return null;
+      const spender = inner.args[0];
+      // USDT to a DCA vault spender (the deposit), or a DCA receipt to AtpExecutor (period redemptions).
+      if (isDcaSpender(call.target, spender, vaults) ||
+          vaults.some(v => isAddressEqual(v.receipt, call.target) && isAddressEqual(spender, c.executor))) return 'approval';
+    } catch { return null; }
+    return null;
+  }
+  if (isAddressEqual(call.target, c.executor) && call.callData.startsWith(toFunctionSelector('executeWithdraw(address,bytes32,uint256,uint256,uint256)'))) {
+    try {
+      const inner = decodeFunctionData({ abi: EXECUTOR_ABI, data: call.callData });
+      if (inner.functionName === 'executeWithdraw' && isAddressEqual(inner.args[0], sender) && vaults.some(v => v.marketId === inner.args[1])) return 'redeem';
+    } catch { return null; }
+  }
+  return null;
+}
+
 type CallContext = { owner?: Address; assets?: readonly Address[] };
 const collateralOf = (symbol: string): Address => {
   const asset = (TESTNET_97.assets as Record<string, { token: string } | undefined>)[symbol];
@@ -222,10 +260,7 @@ export function validateSponsoredCalls(op: PackedSponsorOperation, c: PaymasterC
       if (isAddressEqual(call.target, op.sender)) {
         const next = calls[++index];
         if (next === undefined || next.value !== 0n || !isAddressEqual(next.target, op.sender)) throw new Error('incomplete renewal');
-        const scopes: RenewalScope[] = c.chainId === 97 ? ['plain', 'yield', 'yield+borrow'] : ['plain'];
-        if (!scopes.some((scope) => { try { validateRenewal(call.callData, next.callData, c, op.sender, scope); return true; } catch { return false; } })) {
-          throw new Error('renewal matches no allowed session scope');
-        }
+        validateAnyRenewal(call.callData, next.callData, c, op.sender);
       } else if (isAddressEqual(call.target, c.executor)) {
         const inner = decodeFunctionData({ abi: EXECUTOR_ABI, data: call.callData });
         if (inner.functionName === 'executeSupply' || inner.functionName === 'executeWithdraw') {
@@ -902,18 +937,29 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
       }
       if (!owner || typeof owner.owner !== 'string' || typeof owner.user_id !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(wallet) ||
           owner.owner.toLowerCase() !== wallet.toLowerCase() || owner.user_id.toLowerCase() !== wallet.toLowerCase()) throw rejected('PAYMASTER_SENDER_FORBIDDEN', 403);
+      const isMix = owner.mix_id !== null && owner.mix_id !== undefined;
+      const mixDca = (call: { target: Address; callData: Hex }) => mixDcaCall(call, op.sender, hex(owner.owner, 20), c);
+      const onlyOwnerCash = calls.length > 0 && calls.every(call => isAddressEqual(call.target, TESTNET_97.contracts.usdt) &&
+        call.callData.startsWith(toFunctionSelector('transfer(address,uint256)')));
+      // DCA open/return/redemption: every call is a DCA call, a USDT transfer (Venus return, checked to the owner below)
+      // or a session renewal pair, with at least one vault deposit/return or redemption.
+      const dcaOnly = isMix && calls.some(call => ['vault', 'redeem'].includes(mixDca(call) ?? '')) &&
+        calls.every(call => mixDca(call) !== null || isAddressEqual(call.target, op.sender) ||
+          isAddressEqual(call.target, TESTNET_97.contracts.usdt) && call.callData.startsWith(toFunctionSelector('transfer(address,uint256)')));
       const authorize = async () => {
       let intentToSubmit: MixIntent | null = null;
       if (owner.mix_id !== null && owner.mix_id !== undefined) {
         const m = (await bounded((deps.query ?? query)(`select ${MIX_COLUMNS} from mixes m where m.id=$1 and m.owner=$2 and m.deleted_at is null`,
           [owner.mix_id, wallet.toLowerCase()]), c.timeoutMs)).rows[0] as MixRow | undefined;
         if (!m || c.chainId !== 97) throw rejected('PAYMASTER_SENDER_FORBIDDEN', 403);
+        // Per-asset yield stays off for My mix; only a DCA period redemption (session key, DCA vault market) may withdraw.
         if (calls.some(call => isAddressEqual(call.target, TESTNET_97.contracts.yieldRegistry) ||
             call.callData.startsWith(toFunctionSelector('executeSupply(address,bytes32,uint256,uint256,uint256)')) ||
-            call.callData.startsWith(toFunctionSelector('executeWithdraw(address,bytes32,uint256,uint256,uint256)')))) throw rejected('PAYMASTER_CALL_FORBIDDEN', 403);
-        const ownerChange = calls.some(call => isAddressEqual(call.target, c.registry) || call.callData.startsWith(toFunctionSelector('approve(address,uint256)')));
-        const onlyOwnerCash = calls.length > 0 && calls.every(call => isAddressEqual(call.target, TESTNET_97.contracts.usdt) &&
-          call.callData.startsWith(toFunctionSelector('transfer(address,uint256)')));
+            call.callData.startsWith(toFunctionSelector('executeWithdraw(address,bytes32,uint256,uint256,uint256)')) && mixDca(call) !== 'redeem')) {
+          throw rejected('PAYMASTER_CALL_FORBIDDEN', 403, 'my mix: per-asset yield call');
+        }
+        const ownerChange = calls.some(call => isAddressEqual(call.target, c.registry) ||
+          call.callData.startsWith(toFunctionSelector('approve(address,uint256)')) && mixDca(call) !== 'approval');
         for (const call of calls) {
           if (call.callData.startsWith(toFunctionSelector('transfer(address,uint256)')) && !isAddressEqual(call.target, TESTNET_97.contracts.usdt)) {
             throw rejected('PAYMASTER_CALL_FORBIDDEN', 403);
@@ -921,11 +967,13 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
         }
         const intent = (await bounded((deps.query ?? query)(`select * from mix_switch_intents where mix_id=$1 and ${pendingMixSql}`, [m.id]), c.timeoutMs)).rows[0] as MixIntent | undefined;
         if (ownerChange) {
-          if (!intent || op.initCode !== '0x') throw rejected('PAYMASTER_CALL_FORBIDDEN', 403);
+          if (!intent || op.initCode !== '0x') throw rejected('PAYMASTER_CALL_FORBIDDEN', 403, intent ? 'my mix: undeployed' : 'my mix: owner change without a pending mix change');
           await bounded((deps.mixSetup ?? verifyMixOwnerCalls)(m, intent, calls, op.nonce), c.timeoutMs);
           intentToSubmit = intent;
         } else {
-          if (intent && !onlyOwnerCash) throw rejected('PAYMASTER_CALL_FORBIDDEN', 403);
+          // A DCA UserOp waits for a pending mix change to settle (retryable), like the owner's other actions.
+          if (intent && dcaOnly) throw mixBusy();
+          if (intent && !onlyOwnerCash) throw rejected('PAYMASTER_CALL_FORBIDDEN', 403, 'my mix: pending mix change');
           if (!onlyOwnerCash) {
           const settings = (await bounded((deps.query ?? query)(`select ms.exit_assets from mix_strategy_settings ms
             join mix_portfolio_history h on h.strategy_id=ms.strategy_id where h.mix_id=$1 and h.ended_at is null`, [m.id]), c.timeoutMs)).rows[0];
@@ -937,12 +985,15 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
             if (!call) throw rejected('PAYMASTER_CALL_FORBIDDEN', 403);
             if (isAddressEqual(call.target, op.sender)) {
               const grant = calls[++i];
-              if (!grant || !isAddressEqual(grant.target, op.sender) || grant.value !== 0n) throw rejected('PAYMASTER_CALL_FORBIDDEN', 403);
-              validateRenewal(call.callData, grant.callData, c, op.sender);
+              if (!grant || !isAddressEqual(grant.target, op.sender) || grant.value !== 0n) throw rejected('PAYMASTER_CALL_FORBIDDEN', 403, 'my mix: incomplete renewal');
+              // Same scopes as a fund account: /renewal-params installs yield+borrow on chain 97 (DCA needs the yield calls).
+              try { validateAnyRenewal(call.callData, grant.callData, c, op.sender); }
+              catch (error) { throw rejected('PAYMASTER_CALL_FORBIDDEN', 403, `my mix: ${checkName(error)}`); }
             } else if (isAddressEqual(call.target, c.executor)) {
+              if (mixDca(call) === 'redeem') continue;
               const decoded = decodeFunctionData({ abi: EXECUTOR_ABI, data: call.callData });
               if (decoded.functionName !== 'executeRebalance' || decoded.args[1].some(step => exits.includes(step.tokenOut.toLowerCase()) ||
-                  (m.triggered_at !== null || m.status === 'exited') && !isAddressEqual(step.tokenOut, TESTNET_97.contracts.usdt))) throw rejected('PAYMASTER_CALL_FORBIDDEN', 403);
+                  (m.triggered_at !== null || m.status === 'exited') && !isAddressEqual(step.tokenOut, TESTNET_97.contracts.usdt))) throw rejected('PAYMASTER_CALL_FORBIDDEN', 403, 'my mix: rebalance');
             }
           }
           }
@@ -1020,7 +1071,10 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
       }
       return signed;
       };
-      return owner.mix_id !== null && owner.mix_id !== undefined
+      // The mix lock serialises enrollment changes and buys/sells against the mix state. A DCA UserOp or a USDT
+      // withdrawal to the owner changes neither (both still refuse during a pending mix change, checked above),
+      // so they must not fail with MIX_BUSY while the scheduler or a mix refresh holds the lock.
+      return isMix && !dcaOnly && !onlyOwnerCash
         ? await (deps.mixLock ?? withMixLock)(String(owner.mix_id), authorize) : await authorize();
     } catch (error) {
       const safe = error instanceof AppError ? error : rejected('PAYMASTER_DEPENDENCY_UNAVAILABLE', 503);

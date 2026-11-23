@@ -236,16 +236,30 @@ export async function consentedMarkets(chain: StrategyEarnChain, account: Addres
  */
 async function consentQuotes(chain: StrategyEarnChain, account: Address, head: { number: bigint }, eligible: readonly StrategyMarket[],
   usdtPrice: bigint, valueUsd: (m: StrategyMarket, price: bigint, held: bigint) => bigint) {
-  return Promise.all(eligible.map(async m => {
+  type Read = { market: StrategyMarket; status: 'read'; st: StatusReading; added: bigint };
+  const reads = await Promise.all(eligible.map(async m => {
     try {
       const [st, held, price] = await Promise.all([chain.status(m.marketId, account, head.number), chain.balance(m.collateral, account, head.number), chain.price(m.collateral, head.number)]);
       if (st.gate !== 0) return { market: m, status: 'unavailable' as const, reason: GATE_REASONS[st.gate] ?? 'closed' };
-      const plan = borrowPlan({ existingCollateralValue: st.health.collateralValue, addedCollateralValue: valueUsd(m, price, held), existingDebtValue: st.health.debtValue,
-        targetLtv: st.targetLtv, usdtPriceE8: usdtPrice, currentDebtRaw: st.debt });
-      if (plan.maxDebtRaw === 0n) return { market: m, status: 'unavailable' as const, reason: 'nothing_to_borrow' };
-      return { market: m, status: 'ready' as const, maxDebtRaw: plan.maxDebtRaw, extraApyBps: extraApy(st, st.targetLtv).totalBps };
+      return { market: m, status: 'read' as const, st, added: valueUsd(m, price, held) };
     } catch { return { market: m, status: 'unavailable' as const, reason: 'data_unavailable' }; }
   }));
+  // Venus: one comptroller, one USDT loan per account. Every Venus market's `debt` / `health` is the account's whole
+  // Venus position, and AtpBorrowExecutor checks each market's ceiling against that whole debt (DebtAboveConsent). So
+  // the Venus markets are planned together — all their new collateral at the strictest target — and each one gets the
+  // same ceiling: the account's total planned Venus debt +10%. Lista is per market.
+  const venus = reads.filter((r): r is Read => r.status === 'read' && r.market.protocol === 'venus');
+  const first = venus[0];
+  const venusPlan = first === undefined ? null : borrowPlan({ existingCollateralValue: first.st.health.collateralValue,
+    addedCollateralValue: venus.reduce((sum, r) => sum + r.added, 0n), existingDebtValue: first.st.health.debtValue,
+    targetLtv: venus.reduce((min, r) => r.st.targetLtv < min ? r.st.targetLtv : min, first.st.targetLtv), usdtPriceE8: usdtPrice, currentDebtRaw: first.st.debt });
+  return reads.map(r => {
+    if (r.status !== 'read') return r;
+    const plan = r.market.protocol === 'venus' && venusPlan !== null ? venusPlan : borrowPlan({ existingCollateralValue: r.st.health.collateralValue,
+      addedCollateralValue: r.added, existingDebtValue: r.st.health.debtValue, targetLtv: r.st.targetLtv, usdtPriceE8: usdtPrice, currentDebtRaw: r.st.debt });
+    if (plan.maxDebtRaw === 0n) return { market: r.market, status: 'unavailable' as const, reason: 'nothing_to_borrow' };
+    return { market: r.market, status: 'ready' as const, maxDebtRaw: plan.maxDebtRaw, extraApyBps: extraApy(r.st, r.st.targetLtv).totalBps };
+  });
 }
 
 /**
@@ -272,6 +286,29 @@ export async function mixStrategyConsentCalls(input: { account: Address; previou
   const usdtPrice = await chain.price(TESTNET_97.contracts.usdt as Address, head.number);
   const quoted = await consentQuotes(chain, account, head, eligible, usdtPrice, m => input.totalValueUsd * BigInt(weight(m)) / 10_000n);
   return consentCalls(quoted.flatMap(q => q.status === 'ready' ? [{ market: q.market, maxDebtRaw: q.maxDebtRaw }] : []));
+}
+
+/**
+ * Venus positions all report the account's ONE Venus debt. Shown per asset and summed, it would count that debt once
+ * per Venus asset (2026-11-23 Mag7: 9.17 USDT on NVDAB and again on TSLAB). Split it across the Venus positions by
+ * their strategy vault assets (what each borrowed, plus interest; collateral value when no vault is left), so the
+ * per-asset numbers add up to the real debt. Lista positions are per market and stay as read.
+ */
+export function splitVenusDebt<P extends { marketId: string; debtRaw?: string; vaultAssetsRaw?: string; collateralValueUsd?: string; netValueUsd?: string; earnNetUsd?: string }>(
+  positions: P[], markets: readonly StrategyMarket[]): void {
+  const venus = positions.filter(p => p.debtRaw !== undefined && markets.find(m => m.marketId === p.marketId)?.protocol === 'venus');
+  if (venus.length < 2) return;
+  const total = venus.reduce((max, p) => BigInt(p.debtRaw ?? '0') > max ? BigInt(p.debtRaw ?? '0') : max, 0n);
+  const byVault = venus.reduce((sum, p) => sum + BigInt(p.vaultAssetsRaw ?? '0'), 0n);
+  const weight = (p: P) => byVault > 0n ? BigInt(p.vaultAssetsRaw ?? '0') : BigInt(p.collateralValueUsd ?? '0');
+  const weights = venus.reduce((sum, p) => sum + weight(p), 0n);
+  let left = total;
+  venus.forEach((p, i) => {
+    const share = i === venus.length - 1 ? left : weights === 0n ? total / BigInt(venus.length) : total * weight(p) / weights;
+    left -= share;
+    const vault = BigInt(p.vaultAssetsRaw ?? '0'), collateral = BigInt(p.collateralValueUsd ?? '0');
+    p.debtRaw = share.toString(); p.earnNetUsd = (vault - share).toString(); p.netValueUsd = (collateral + vault - share).toString();
+  });
 }
 
 const TEMPORARILY = 'Temporarily unavailable.';
@@ -376,6 +413,7 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
           return { asset: m.symbol, marketId: m.marketId, status: 'unavailable' as const, message: TEMPORARILY };
         }
       }));
+      splitVenusDebt(positions, markets);
       const earnNetUsd = positions.reduce((sum, p) => sum + ('earnNetUsd' in p && p.earnNetUsd !== undefined ? BigInt(p.earnNetUsd) : 0n), 0n);
       // autoOpen: the owner consented (a market's borrow policy is enabled) but nothing is posted yet — the buy has not
       // filled. The scheduler opens it after the fill (strategyEarnAutoOpen); the app shows the switch as on, "starts when your order fills".
@@ -730,6 +768,10 @@ export async function strategyEarnAutoOpen(args: StrategyEarnStepArgs): Promise<
   const opened: string[] = [];
   const renewal: string[] = [];
   const deadline = BigInt(Math.floor(args.now.getTime() / 1000) + 30 * 60);
+  // Venus debt and health are account-wide (one comptroller, one USDT loan). Every Venus market here was read before
+  // this UserOp, so each later one adds what the earlier ones in the same UserOp post and borrow; otherwise the second
+  // market re-borrows against the same capacity and its ceiling check sees the first market's debt too.
+  const venus = { addedValue: 0n, borrowRaw: 0n, borrowValue: 0n };
   for (const m of candidates) {
     const maxDebt = consented.get(m.marketId);
     if (maxDebt === undefined) continue;
@@ -741,11 +783,14 @@ export async function strategyEarnAutoOpen(args: StrategyEarnStepArgs): Promise<
     if (st.gate !== 0) continue;
     const added = usdValue(held, price, m.decimals);
     if (added < MIN_AUTO_OPEN_USD) continue;
-    const plan = borrowPlan({ existingCollateralValue: st.health.collateralValue, addedCollateralValue: added, existingDebtValue: st.health.debtValue,
-      targetLtv: st.targetLtv, usdtPriceE8: usdtPrice, currentDebtRaw: st.debt });
+    const shared = m.protocol === 'venus' ? venus : { addedValue: 0n, borrowRaw: 0n, borrowValue: 0n };
+    const debt = st.debt + shared.borrowRaw;
+    const plan = borrowPlan({ existingCollateralValue: st.health.collateralValue + shared.addedValue, addedCollateralValue: added,
+      existingDebtValue: st.health.debtValue + shared.borrowValue, targetLtv: st.targetLtv, usdtPriceE8: usdtPrice, currentDebtRaw: debt });
     // Keep 1% under the owner's ceiling: interest accrues between this read and inclusion.
-    const headroom = policy.maxDebt > st.debt ? (policy.maxDebt - st.debt) * 9_900n / 10_000n : 0n;
+    const headroom = policy.maxDebt > debt ? (policy.maxDebt - debt) * 9_900n / 10_000n : 0n;
     const borrow = plan.borrowRaw < headroom ? plan.borrowRaw : headroom;
+    if (m.protocol === 'venus') { venus.addedValue += added; venus.borrowRaw += borrow; venus.borrowValue += borrow * usdtPrice / 10n ** 8n; }
     calls.push(call(STRATEGY_EARN_97.executor, 'executeSupplyCollateral', [account, m.marketId, held, deadline]));
     if (borrow > 0n) calls.push(call(STRATEGY_EARN_97.executor, 'executeBorrow', [account, m.marketId, borrow, deadline]));
     opened.push(`${m.symbol} ${shares(held)}${borrow > 0n ? `／借 ${usdt2(borrow)} USDT 存 vault` : ''}`);

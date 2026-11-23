@@ -10,11 +10,17 @@ import { assertNotStrategyVault } from './strategy-earn-guard.js';
 import { assertUserOpCapacity, MAX_USER_OP_GAS, userOpGasOverhead } from './execution-batch.js';
 import { canonicalKernelCalls, estimationPaymaster, schedulerPaymaster, gasExecutionKey, settleGasBudget, paymasterExecutionError } from './paymaster.js';
 import type { PaymasterDeps } from './paymaster.js';
-import { borrowAuthorized, yieldAuthorization } from './permissions.js';
+import { borrowKeyMarkets, yieldAuthorization } from './permissions.js';
 import { sessionKernelAccount } from './scheduler.js';
 import { yieldSessionAvailable } from './yield-session.js';
 import type { SessionKeyRef } from './scheduler.js';
 import { signPreparedOperation } from './user-operation.js';
+
+/** Keys renewed after #204 also carry the Strategy Earn calls; the policy must be rebuilt exactly as installed (market list included). */
+function borrowGrant(policies: unknown, account: Address): { borrowAccount?: Address; borrowMarkets?: Hex[] } {
+  const markets = borrowKeyMarkets(policies, account);
+  return markets === null ? {} : { borrowAccount: account, borrowMarkets: markets };
+}
 
 export type YieldAction = Readonly<{ kind: 'supply' | 'withdraw'; marketId: Hex; amount: bigint }>;
 export type YieldPlan = YieldAction & Readonly<{
@@ -286,7 +292,7 @@ async function submitYieldWithSession(args: YieldSubmitArgs): Promise<YieldEvide
     throw fail('SESSION_AUTHORIZATION_REQUIRED', '需要更新授權：生息 permission 未安裝或已過期', 409);
   const account = await sessionKernelAccount({ account: args.account, executor: TESTNET_97.contracts.executor,
     // Keys renewed after #204 also carry the Strategy Earn calls; the policy must be rebuilt exactly as installed.
-    sessionKey: { ...args.sessionKey, yieldAccount: args.account, ...(borrowAuthorized(args.policies, args.account) ? { borrowAccount: args.account } : {}) } }, publicClient);
+    sessionKey: { ...args.sessionKey, yieldAccount: args.account, ...borrowGrant(args.policies, args.account) } }, publicClient);
   const paymaster = schedulerPaymaster(args.account, args.paymaster);
   if (!paymaster) throw fail('PAYMASTER_DISABLED', 'chain 97 生息需要指定 paymaster');
   const client = createKernelAccountClient({ account, client: publicClient, chain: publicClient.chain,

@@ -126,7 +126,7 @@ import { a10ErrorMessage, EXECUTOR_BUY_ABI, readGlobalPaused, decodePriceSourceE
 import { getConfig, getSessionKeyConfig, requireSessionKeyConfig } from './config.js';
 import { errorMessage, query as dbQuery, withTransaction, withPortfolioLock } from './db.js';
 import { AppError } from './errors.js';
-import { borrowAuthorized, buildSessionPermissions, yieldAuthorization } from './permissions.js';
+import { borrowKeyMarkets, buildSessionPermissions, yieldAuthorization } from './permissions.js';
 import { DEFAULT_DEADLINE_SECONDS as PLAN_DEFAULT_DEADLINE_SECONDS, planRebalance, readMaxLegUsdE8, refreshFloors, minimumDepositUsdtWei, checkTradeMinimums, checkBuyFeeReserve } from './rebalance-plan.js';
 import { writeSnapshot as writeSnapshotImpl } from './snapshot.js';
 import type { PlanPartial, PlannedStep, RebalancePlan, RefreshFloorsResult } from './rebalance-plan.js';
@@ -477,6 +477,8 @@ export type SessionKeyRef = {
   yieldAccount?: Address;
   /** Present only when the owner renewal also installed the #204 Strategy Earn permissions. */
   borrowAccount?: Address;
+  /** With `borrowAccount`: the market list the key was installed with (keys renewed before cre8-contracts#67 hold five). */
+  borrowMarkets?: Hex[];
   keyRef: `m/44'/60'/${string}`;
   permissionId: Hex;
   sessionKeyAddress: Address;
@@ -1116,6 +1118,12 @@ const SQL_ACTIVE_SESSION_KEYS = `
    order by (split_part(k.key_ref, '/', 6))::bigint desc
 `;
 
+/** A key's #204 borrow grant as installed: account plus the exact market list, so the policy rebuilds to the same id. */
+function borrowMarketsOf(permissions: unknown, account: Address): Pick<SessionKeyRef, 'borrowAccount' | 'borrowMarkets'> {
+  const markets = borrowKeyMarkets(permissions, account);
+  return markets === null ? {} : { borrowAccount: account, borrowMarkets: markets };
+}
+
 /**
  * 前置檢查 a：挑一把**鏈上真的裝好了**的 session key。
  *
@@ -1187,7 +1195,7 @@ async function resolveSessionKey(
         validUntil,
         owner,
         ...(args.chainId === 97 && yieldAuthorization(row.permissions, args.account, TESTNET_97.contracts.executor).status === 'ready' ? { yieldAccount: args.account } : {}),
-        ...(args.chainId === 97 && borrowAuthorized(row.permissions, args.account) ? { borrowAccount: args.account } : {}),
+        ...(args.chainId === 97 ? borrowMarketsOf(row.permissions, args.account) : {}),
       },
     };
   }
@@ -1399,6 +1407,7 @@ export async function sessionKernelAccount(args: Pick<ExecuteArgs, 'account' | '
     validUntil: args.sessionKey.validUntil,
     ...(args.sessionKey.yieldAccount === undefined ? {} : { yieldAccount: args.sessionKey.yieldAccount }),
     ...(args.sessionKey.borrowAccount === undefined ? {} : { borrowAccount: args.sessionKey.borrowAccount }),
+    ...(args.sessionKey.borrowMarkets === undefined ? {} : { borrowMarkets: args.sessionKey.borrowMarkets }),
     signer: await toECDSASigner({ signer: keyAccount, ...(publicClient.chain?.id === 97 ? { signerContractAddress: getAddress(TESTNET_97.contracts.ecdsaSigner) } : {}) }),
   });
   if (permissions.permissionId.toLowerCase() !== args.sessionKey.permissionId.toLowerCase()) {
@@ -1588,17 +1597,20 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
 // ---------------------------------------------------------------------------
 
 function defaultStrategyEarnSteps(deps: ResolvedDeps): NonNullable<SchedulerDeps['strategyEarn']> {
-  const session = async (due: DuePortfolio): Promise<StrategyEarnSend | null> => {
+  const session = async (due: DuePortfolio): Promise<{ send: StrategyEarnSend; markets: Hex[] | undefined } | null> => {
     const resolution = await resolveSessionKey({ portfolioId: due.portfolioId, account: due.account, chainId: deps.chainId },
       { query: deps.query, readPermissionConfig: deps.readPermissionConfig });
     // Only a key whose installed policy carries the #204 AtpBorrowExecutor calls for this account; others only report.
     if (!resolution.ok || resolution.key.borrowAccount === undefined) return null;
     if (await checkSessionKeyDerivation(resolution.key, deps.deriveSessionKeyAddress) !== null) return null;
     const key = resolution.key;
-    return calls => sendStrategyEarnWithSessionKey(due.account, key, calls);
+    return { send: (calls: StrategyEarnCall[]) => sendStrategyEarnWithSessionKey(due.account, key, calls), markets: key.borrowMarkets };
   };
-  const args = async (due: DuePortfolio, dryRun: boolean) => ({ chain: defaultStrategyEarnChain(), account: due.account, portfolioId: due.portfolioId,
-    now: deps.clock(), dryRun, send: dryRun ? null : await session(due), ledger: dbStrategyEarnLedger, log: deps.log });
+  const args = async (due: DuePortfolio, dryRun: boolean) => {
+    const key = dryRun ? null : await session(due);
+    return { chain: defaultStrategyEarnChain(), account: due.account, portfolioId: due.portfolioId, now: deps.clock(), dryRun,
+      send: key?.send ?? null, ...(key?.markets === undefined ? {} : { sendable: key.markets }), ledger: dbStrategyEarnLedger, log: deps.log };
+  };
   return {
     open: async (due, dryRun) => deps.chainId !== 97 || due.personalMix ? null : strategyEarnAutoOpen(await args(due, dryRun)),
     unwind: async (due, steps, dryRun) => deps.chainId !== 97 || due.personalMix ? null : strategyEarnUnwindForSale({ ...await args(due, dryRun), steps }),

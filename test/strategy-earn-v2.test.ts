@@ -6,7 +6,7 @@ import { bscTestnet } from 'viem/chains';
 import { ParamCondition } from '@zerodev/permissions/policies';
 import { AppError } from '../src/errors.js';
 import { validateSponsoredCalls } from '../src/paymaster.js';
-import { borrowAuthorized, borrowSessionPermissions, buildSessionPermissions, describePolicies, sessionCallPermissions } from '../src/permissions.js';
+import { borrowAuthorized, borrowKeyMarkets, borrowSessionPermissions, buildSessionPermissions, describePolicies, sessionCallPermissions } from '../src/permissions.js';
 import { readPositions } from '../src/positions.js';
 import { runSchedulerOnce } from '../src/scheduler.js';
 import type { SchedulerDeps, SchedulerQueryFn } from '../src/scheduler.js';
@@ -16,7 +16,7 @@ import {
   strategyEarnEvents, strategyEarnMessage, strategyEarnUnwindForSale, strategyMarkets,
 } from '../src/strategy-earn.js';
 import type { StatusReading, StrategyEarnChain, StrategyEarnEvent, StrategyEarnTx, StrategyKeeperWriter } from '../src/strategy-earn.js';
-import { BORROW_SESSION_SELECTORS } from '../src/strategy-earn-guard.js';
+import { BORROW_SESSION_SELECTORS, STRATEGY_EARN_LEGACY_MARKET_IDS } from '../src/strategy-earn-guard.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
 import { mixRuntimeFixture } from './fixtures/mix.js';
 import { config, kernelCall, operation, SENDER, TEST_SIGNER } from './fixtures/paymaster.js';
@@ -53,7 +53,7 @@ const now = new Date('2026-11-23T15:00:00Z'), deadline = BigInt(Math.floor(now.g
 
 // ---- session permissions --------------------------------------------------------------------------------------
 
-test('#204 session policy: borrow calls only on AtpBorrowExecutor, account pinned, five markets; never AtpExecutor or approvals', () => {
+test('#204 session policy: borrow calls only on AtpBorrowExecutor, account pinned, every strategy market; never AtpExecutor or approvals', () => {
   const perms = borrowSessionPermissions(account);
   assert.equal(perms.length, 4);
   assert.deepEqual(perms.map(p => p.selector), BORROW_SESSION_SELECTORS);
@@ -132,7 +132,7 @@ const keyRows = (permissions: unknown) => (async () => ({ rows: permissions === 
 const borrowSnap = describePolicies({ executorAddress: T.contracts.executor, validUntil: 2_000_000_000, chainId: 97, yieldAccount: account, borrowAccount: account });
 
 test('#204 POST auto: eligible assets from the enrolled version; ceiling = (new money share + held) x target, +10%; renewal flag', async () => {
-  const f: Fake = { weights: [{ asset: nvda.collateral, weightBps: 6000 }, { asset: qqq.collateral, weightBps: 2000 }, { asset: T.assets.WBNB.token.toLowerCase() as Address, weightBps: 2000 }],
+  const f: Fake = { weights: [{ asset: nvda.collateral, weightBps: 6000 }, { asset: qqq.collateral, weightBps: 2000 }, { asset: T.assets.TQQQB.token.toLowerCase() as Address, weightBps: 2000 }],
     statuses: { [qqq.marketId]: status({ gate: 4 }) }, balances: { [nvda.collateral]: 2n * E18 }, prices: { [nvda.collateral]: 100n * 10n ** 8n } };
   const earn = createStrategyEarn({ chainId: 97, chain: () => chainOf(f), owned: owned(), query: keyRows(borrowSnap) });
   const r = await earn.auto(3, account, { budgetRaw: String(1000n * E18) });
@@ -405,4 +405,121 @@ test('#204 scheduler: noop runs auto-open; a sale with posted shares unwinds and
   assert.equal(normal.results[0]?.reason, '[FIXTURE_STOP] stop before quoting'); assert.deepEqual(c.calls, ['minimums']);
   // Personal mixes never reach Strategy Earn steps (default steps return null for them; injected ones are not called on mix paths).
   void parseAbi; void encodeFunctionData;
+});
+
+// ---- cre8-contracts#67: every launch-fund holding has a market --------------------------------------------------
+
+const bySymbol = (symbol: string) => { const m = markets.find(x => x.symbol === symbol); assert.ok(m, symbol); return m; };
+const LEGACY = ['0xfa06dd03eff35e3337a8b5b93a8a7943155b4f20e4d19bb0583db20bdd9f5415', '0x00f2152bbbefde7b3e65c4b7de0af83a87875c02b6c84ef96410ac14edd850fe',
+  '0x4632539a0ba6e5e9843b401d97b66b8b34d23fdab2005feacefd5452055c410e', '0xd8def95e75d2489c340ac4d9769646707cf55d17d7aa7f8644c89b64b41844e7',
+  '0x208d888e7c3d5ef4d9ccc51083daffe7ddfbce978d339ce258544022cfd9804a'];
+
+test('#67 market table: 31 markets (registry max 32), #65 rows first and unchanged, new rows Lista, no leveraged / DOGE / satellites', () => {
+  assert.equal(markets.length, 31);
+  assert.deepEqual(STRATEGY_EARN_LEGACY_MARKET_IDS, LEGACY);
+  assert.deepEqual(markets.slice(0, 5).map(m => [m.symbol, m.marketId, m.protocol]), [['NVDAB', LEGACY[0], 'venus'], ['TSLAB', LEGACY[1], 'venus'],
+    ['SPCXB', LEGACY[2], 'venus'], ['QQQB', LEGACY[3], 'lista'], ['MSTRB', LEGACY[4], 'lista']]);
+  assert.equal(new Set(markets.map(m => m.marketId)).size, 31); assert.equal(new Set(markets.map(m => m.symbol)).size, 31);
+  assert.equal(new Set(markets.map(m => m.collateral)).size, 31, 'one market per asset');
+  for (const m of markets.slice(5)) {
+    assert.equal(m.protocol, 'lista', m.symbol); assert.equal(m.collateralVToken, null, m.symbol); assert.match(m.listaId ?? '', /^0x[0-9a-f]{64}$/, m.symbol);
+    assert.match(m.marketId, /^0x[0-9a-f]{64}$/, m.symbol);
+  }
+  for (const absent of ['TQQQB', 'SOXLB', 'DOGE', 'AMCB', 'DJTB', 'CYPHB', 'PENGB', 'MRVLB', 'RDDTB']) assert.equal(markets.some(m => m.symbol === absent), false, absent);
+  for (const sym of ['AAPLB', 'MSFTB', 'GOOGLB', 'AMZNB', 'METAB', 'INTCB', 'AVGOB', 'SPYB', 'BTCB', 'WBNB', 'XAUt', 'SKHYB', 'MUB', 'SNDKB', 'COINB', 'BMNRB', 'BNCB']) bySymbol(sym);
+  // Collateral decimals come from the profile: XAUt is 6 on chain 97.
+  assert.equal(bySymbol('XAUt').decimals, 6); assert.equal(bySymbol('AAPLB').decimals, 18);
+  for (const m of markets) assert.equal(m.decimals, (T.assets as Record<string, { decimals: number }>)[m.symbol]?.decimals, m.symbol);
+});
+
+test('#67 session keys: a renewal installs every market; a key renewed before #67 keeps its five, rebuilds exactly and asks for renewal', async () => {
+  const current = describePolicies({ executorAddress: T.contracts.executor, validUntil: 2_000_000_000, chainId: 97, yieldAccount: account, borrowAccount: account });
+  assert.equal(borrowKeyMarkets(current, account)?.length, 31); assert.equal(borrowAuthorized(current, account), true);
+  const legacy = describePolicies({ executorAddress: T.contracts.executor, validUntil: 2_000_000_000, chainId: 97, yieldAccount: account, borrowAccount: account,
+    borrowMarkets: STRATEGY_EARN_LEGACY_MARKET_IDS as Hex[] });
+  // The pre-#67 shape: ONE_OF over exactly the five #65 ids, in order.
+  const borrowPerms = (snap: unknown) => (snap as { call: { permissions: { target: string; rules: { params: string[] }[] }[] } }).call.permissions
+    .filter(p => p.target.toLowerCase() === S.executor);
+  assert.equal(borrowPerms(legacy).length, 4);
+  for (const p of borrowPerms(legacy)) assert.deepEqual(p.rules[1]?.params.map(x => x.toLowerCase()), LEGACY);
+  assert.deepEqual(borrowKeyMarkets(legacy, account), LEGACY);
+  assert.equal(borrowAuthorized(legacy, account), false, 'a buy that wants the new markets asks for a renewal');
+  assert.equal(borrowKeyMarkets(legacy, '0x' + '12'.repeat(20) as Address), null);
+  // Any other list (subset, reordered, extra) is neither installable nor recognised.
+  for (const bad of [LEGACY.slice(0, 4), [...LEGACY].reverse(), [...LEGACY, markets[5]!.marketId], markets.map(m => m.marketId).slice(1)]) {
+    assert.throws(() => borrowSessionPermissions(account, bad as Hex[]), /市場清單/);
+  }
+  const reordered = JSON.parse(JSON.stringify(legacy)) as { call: { permissions: { target: string; rules: { params: string[] }[] }[] } };
+  for (const p of reordered.call.permissions.filter(x => x.target.toLowerCase() === S.executor)) p.rules[1]!.params.reverse();
+  assert.equal(borrowKeyMarkets(reordered, account), null);
+  // buildSessionPermissions rebuilds the legacy key to a stable id that differs from today's.
+  const client = createPublicClient({ chain: bscTestnet, transport: custom({ request: async () => { throw new Error('no rpc'); } }) });
+  const key = '0x' + '34'.repeat(20) as Address;
+  const build = (borrowMarkets?: Hex[]) => buildSessionPermissions({ publicClient: client as never, sessionKeyAddress: key, executorAddress: T.contracts.executor,
+    validUntil: 2_000_000_000, yieldAccount: account, borrowAccount: account, ...(borrowMarkets ? { borrowMarkets } : {}) });
+  const [a, b, now31] = await Promise.all([build(LEGACY as Hex[]), build(LEGACY as Hex[]), build()]);
+  assert.equal(a.permissionId, b.permissionId); assert.notEqual(a.permissionId, now31.permissionId);
+  assert.deepEqual(borrowKeyMarkets(a.policySnapshot, account), LEGACY);
+  // POST auto with a pre-#67 key: renewal required.
+  const f: Fake = { weights: [{ asset: bySymbol('AAPLB').collateral, weightBps: 10_000 }], prices: { [bySymbol('AAPLB').collateral]: 300n * 10n ** 8n } };
+  const r = await createStrategyEarn({ chainId: 97, chain: () => chainOf(f), owned: owned(), query: keyRows(legacy) }).auto(3, account, { budgetRaw: String(1000n * E18) });
+  assert.ok('authorization' in r); assert.equal(r.authorization, 'renewal_required');
+  assert.deepEqual(r.assets.map(x => x.asset), ['AAPLB']);
+});
+
+test('#67 auto-open / unwind with a pre-#67 key: only its five markets are sent; the others wait for the owner renewal', async () => {
+  const aapl = bySymbol('AAPLB');
+  const f: Fake = {
+    policies: { [nvda.marketId]: { maxDebt: 1000n * E18, enabled: true }, [aapl.marketId]: { maxDebt: 1000n * E18, enabled: true } },
+    balances: { [nvda.collateral]: 10n * E18, [aapl.collateral]: 10n * E18 },
+    prices: { [nvda.collateral]: 100n * 10n ** 8n, [aapl.collateral]: 300n * 10n ** 8n },
+  };
+  let sent: { to: Address; data: Hex }[] = [];
+  const legacyArgs = (fake: Fake) => ({ ...stepArgs(fake, async calls => { sent = calls; return tx([]); }).args, sendable: LEGACY as Hex[] });
+  const note = await strategyEarnAutoOpen(legacyArgs(f));
+  assert.deepEqual([...new Set(sent.map(c => decode(c.data).args[1]))], [nvda.marketId]);
+  assert.match(note ?? '', /已自動開啟：NVDAB .*；AAPLB 等 owner 續期策略加息授權$/);
+  // Only new markets wanted: nothing is sent.
+  sent = [];
+  const onlyNew = await strategyEarnAutoOpen(legacyArgs({ ...f, policies: { [aapl.marketId]: { maxDebt: 1000n * E18, enabled: true } } }));
+  assert.deepEqual(sent, []); assert.match(onlyNew ?? '', /AAPLB 等 owner 續期.*未送出/);
+  // A current key (no `sendable`) opens both.
+  sent = [];
+  await strategyEarnAutoOpen(stepArgs(f, async calls => { sent = calls; return tx([]); }).args);
+  assert.deepEqual([...new Set(sent.map(c => decode(c.data).args[1]))], [nvda.marketId, aapl.marketId]);
+  // Unwind before selling posted AAPLB with a pre-#67 key: blocked with a reason, nothing sent.
+  sent = [];
+  const blocked = await strategyEarnUnwindForSale({ ...legacyArgs({ ids: [aapl.marketId], collateral: { [aapl.marketId]: 10n * E18 }, balances: {} }),
+    steps: [{ tokenIn: aapl.collateral, amountIn: 5n * E18 }] });
+  assert.deepEqual(sent, []); assert.match(blocked ?? '', /^\[STRATEGY_EARN_UNWINDING\] AAPLB 需要 owner 續期/);
+});
+
+test('#67 XAUt (6 decimals): values, auto-open plan and the vault-short take-back use the token\'s own decimals', async () => {
+  const xaut = bySymbol('XAUt');
+  const price = 3866n * 10n ** 8n;
+  // 2 XAUt = 2e6 raw -> 7,732 USD; target 35% x 98% = 2,652.076 USDT.
+  const f: Fake = { policies: { [xaut.marketId]: { maxDebt: 10_000n * E18, enabled: true } }, balances: { [xaut.collateral]: 2_000_000n },
+    prices: { [xaut.collateral]: price }, statuses: { [xaut.marketId]: status({ targetLtv: 35n * E16 }) } };
+  let sent: { to: Address; data: Hex }[] = [];
+  await strategyEarnAutoOpen(stepArgs(f, async calls => { sent = calls; return tx([]); }).args);
+  assert.deepEqual(sent.map(c => [decode(c.data).functionName, decode(c.data).args[2]]), [['executeSupplyCollateral', 2_000_000n], ['executeBorrow', 2652076n * 10n ** 15n]]);
+  // Dust boundary: 10 USD is the minimum. 2,586 raw = 9.997 USD -> skipped; 2,587 raw = 10.0014 USD -> opened.
+  sent = [];
+  await strategyEarnAutoOpen(stepArgs({ ...f, balances: { [xaut.collateral]: 2_586n } }, async calls => { sent = calls; return tx([]); }).args);
+  assert.deepEqual(sent, []);
+  await strategyEarnAutoOpen(stepArgs({ ...f, balances: { [xaut.collateral]: 2_587n } }, async calls => { sent = calls; return tx([]); }).args);
+  assert.equal(sent.length, 2);
+  // POST auto: 50% of 1,000 USDT new money + 1 XAUt held (3,866 USD) = 4,366 x 35% x 98% x 110% = 1,647.2918 USDT ceiling.
+  const r = await createStrategyEarn({ chainId: 97, chain: () => chainOf({ ...f, balances: { [xaut.collateral]: 1_000_000n }, weights: [{ asset: xaut.collateral, weightBps: 5000 }] }),
+    owned: owned(), query: keyRows(null) }).auto(3, account, { budgetRaw: String(1000n * E18) });
+  assert.ok('assets' in r);
+  assert.deepEqual(r.assets, [{ asset: 'XAUt', status: 'ready', maxDebtRaw: String(16472918n * 10n ** 14n), extraApyBps: 137 }]);
+  // Vault short before a sale: 1,000 owed, 600 in the vault, 10 XAUt (38,660 USD) posted -> keep (400 + 1 raw) / 35% x 102% = 1,165.71 USD = 0.301531 XAUt.
+  let calls: { to: Address; data: Hex }[] = [];
+  const short: Fake = { ids: [xaut.marketId], collateral: { [xaut.marketId]: 10_000_000n }, balances: {}, prices: { [xaut.collateral]: price },
+    statuses: { [xaut.marketId]: status({ debt: 1000n * E18, vaultAssets: 600n * E18, targetLtv: 35n * E16,
+      health: { collateralValue: 38_660n * E18, liquidationValue: 0n, debtValue: 1000n * E18, healthFactor: 0n } }) } };
+  await strategyEarnUnwindForSale({ ...stepArgs(short, async c => { calls = c; return tx([]); }).args, steps: [{ tokenIn: xaut.collateral, amountIn: 9_900_000n }] });
+  const take = decode(calls[1]!.data).args[2] as bigint;
+  assert.ok(take > 9_698_000n && take < 9_699_000n, String(take));
 });

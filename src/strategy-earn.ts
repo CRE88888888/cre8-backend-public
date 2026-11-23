@@ -22,12 +22,14 @@ export { STRATEGY_EARN_97, assertNotStrategyVault, isStrategyVault } from './str
  * AtpExecutor. The backend never approves strategy vault shares to AtpExecutor and never builds an AtpExecutor
  * yield call for the strategy vault market (see `assertNotStrategyVault`, yield-domain and paymaster guards).
  */
-export type StrategyMarket = { symbol: string; marketId: Hex; protocol: 'venus' | 'lista'; collateral: Address; collateralVToken: Address | null; listaId: Hex | null };
+export type StrategyMarket = { symbol: string; marketId: Hex; protocol: 'venus' | 'lista'; collateral: Address; decimals: number; collateralVToken: Address | null; listaId: Hex | null };
 export function strategyMarkets(): StrategyMarket[] {
   return STRATEGY_EARN_97.markets.map(m => {
-    const asset = (TESTNET_97.assets as Record<string, { token: string } | undefined>)[m.symbol];
+    const asset = (TESTNET_97.assets as Record<string, { token: string; decimals: number } | undefined>)[m.symbol];
     if (!asset) throw new Error('strategy earn asset missing from profile: ' + m.symbol);
-    return { symbol: m.symbol, marketId: m.marketId, protocol: m.protocol, collateral: asset.token.toLowerCase() as Address, collateralVToken: m.collateralVToken, listaId: m.listaId };
+    // XAUt has 6 decimals on chain 97: every value below is computed in the collateral's own decimals.
+    return { symbol: m.symbol, marketId: m.marketId, protocol: m.protocol, collateral: asset.token.toLowerCase() as Address, decimals: asset.decimals,
+      collateralVToken: m.collateralVToken, listaId: m.listaId };
   });
 }
 
@@ -184,7 +186,7 @@ export function consentCalls(items: readonly { market: StrategyMarket; maxDebtRa
   ];
 }
 
-/** USD value (1e18) of `amount` raw collateral (18 decimals) at an 8-decimal oracle price. */
+/** USD value (1e18) of `amount` raw collateral (in `decimals`, default 18) at an 8-decimal oracle price. */
 export const usdValue = (amountRaw: bigint, priceE8: bigint, decimals = 18) => amountRaw * priceE8 * 10n ** 10n / 10n ** BigInt(decimals);
 /** Keep 2% under the target so interest accrued before inclusion cannot push LTV over it. */
 export const BORROW_BUFFER_BPS = 9800n;
@@ -280,7 +282,7 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
         try {
           const [s, posted, price, pending] = await Promise.all([chain.status(m.marketId, account, head.number), chain.collateral(m.marketId, account, head.number),
             chain.price(m.collateral, head.number), chain.rewards(m, account, head.number)]);
-          const collateralValue = usdValue(posted, price);
+          const collateralValue = usdValue(posted, price, m.decimals);
           const ratio = s.ltv;
           return { asset: m.symbol, marketId: m.marketId, status: s.debt > 0n || posted > 0n ? 'on' as const : 'off' as const,
             collateralRaw: posted.toString(), collateralValueUsd: collateralValue.toString(), debtRaw: s.debt.toString(), vaultAssetsRaw: s.vaultAssets.toString(),
@@ -317,7 +319,7 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
       if (s.gate !== 0) return unavailable(GATE_REASONS[s.gate] ?? 'closed');
       if (collateralRaw > held) throw new ValidationError('INSUFFICIENT_HOLDING', '投資組合持有的數量不足。');
       // Venus health is account-wide (every market entered in that comptroller); Lista is per market.
-      const plan = borrowPlan({ existingCollateralValue: s.health.collateralValue, addedCollateralValue: usdValue(collateralRaw, price),
+      const plan = borrowPlan({ existingCollateralValue: s.health.collateralValue, addedCollateralValue: usdValue(collateralRaw, price, market.decimals),
         existingDebtValue: s.health.debtValue, targetLtv: s.targetLtv, usdtPriceE8: usdtPrice, currentDebtRaw: s.debt });
       const deadline = BigInt(Math.floor(deps.now().getTime() / 1000) + 30 * 60);
       return { status: 'ready' as const, asset: market.symbol, collateralRaw: collateralRaw.toString(), borrowRaw: plan.borrowRaw.toString(),
@@ -350,7 +352,7 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
           const [st, held, price] = await Promise.all([chain.status(m.marketId, account, head.number), chain.balance(m.collateral, account, head.number), chain.price(m.collateral, head.number)]);
           if (st.gate !== 0) return { market: m, status: 'unavailable' as const, reason: GATE_REASONS[st.gate] ?? 'closed' };
           // USD (1e18): new money's share of this asset + what the portfolio already holds of it.
-          const value = budget * BigInt(w) / 10_000n * usdtPrice / 10n ** 8n + usdValue(held, price);
+          const value = budget * BigInt(w) / 10_000n * usdtPrice / 10n ** 8n + usdValue(held, price, m.decimals);
           const plan = borrowPlan({ existingCollateralValue: st.health.collateralValue, addedCollateralValue: value, existingDebtValue: st.health.debtValue,
             targetLtv: st.targetLtv, usdtPriceE8: usdtPrice, currentDebtRaw: st.debt });
           if (plan.maxDebtRaw === 0n) return { market: m, status: 'unavailable' as const, reason: 'nothing_to_borrow' };
@@ -609,7 +611,12 @@ export const MIN_AUTO_OPEN_USD = 10n * E18;
 export type StrategyEarnSend = (calls: Call[]) => Promise<StrategyEarnTx>;
 export type StrategyEarnStepArgs = { chain: StrategyEarnChain; account: Address; portfolioId: number; now: Date; dryRun: boolean;
   /** null: no session key with the #204 permissions (owner has not renewed) — the step only reports. */
-  send: StrategyEarnSend | null; ledger: StrategyEarnLedger; log: (line: string) => void };
+  send: StrategyEarnSend | null;
+  /** Markets the session key may call (its installed ONE_OF list); absent = every market. A key renewed before
+   * cre8-contracts#67 holds only the five #65 markets: calls for the others would fail the whole UserOp. */
+  sendable?: readonly Hex[];
+  ledger: StrategyEarnLedger; log: (line: string) => void };
+const keyCovers = (args: Pick<StrategyEarnStepArgs, 'sendable'>, m: StrategyMarket) => args.sendable === undefined || args.sendable.includes(m.marketId);
 
 /**
  * After a buy has filled (the portfolio is otherwise idle): for every market the owner consented to at buy time
@@ -623,15 +630,17 @@ export async function strategyEarnAutoOpen(args: StrategyEarnStepArgs): Promise<
   const usdtPrice = await chain.price(TESTNET_97.contracts.usdt as Address, head.number);
   const calls: Call[] = [];
   const opened: string[] = [];
+  const renewal: string[] = [];
   const deadline = BigInt(Math.floor(args.now.getTime() / 1000) + 30 * 60);
   for (const m of strategyMarkets()) {
     const policy = await chain.policy(account, m.marketId, head.number);
     if (!policy.enabled || policy.maxDebt === 0n) continue;
     const held = await chain.balance(m.collateral, account, head.number);
     if (held === 0n) continue;
+    if (!keyCovers(args, m)) { renewal.push(m.symbol); continue; }
     const [st, price] = await Promise.all([chain.status(m.marketId, account, head.number), chain.price(m.collateral, head.number)]);
     if (st.gate !== 0) continue;
-    const added = usdValue(held, price);
+    const added = usdValue(held, price, m.decimals);
     if (added < MIN_AUTO_OPEN_USD) continue;
     const plan = borrowPlan({ existingCollateralValue: st.health.collateralValue, addedCollateralValue: added, existingDebtValue: st.health.debtValue,
       targetLtv: st.targetLtv, usdtPriceE8: usdtPrice, currentDebtRaw: st.debt });
@@ -642,11 +651,12 @@ export async function strategyEarnAutoOpen(args: StrategyEarnStepArgs): Promise<
     if (borrow > 0n) calls.push(call(STRATEGY_EARN_97.executor, 'executeBorrow', [account, m.marketId, borrow, deadline]));
     opened.push(`${m.symbol} ${shares(held)}${borrow > 0n ? `／借 ${usdt2(borrow)} USDT 存 vault` : ''}`);
   }
-  if (calls.length === 0) return null;
+  const waiting = renewal.length === 0 ? '' : `；${renewal.join('、')} 等 owner 續期策略加息授權`;
+  if (calls.length === 0) return renewal.length === 0 ? null : `[STRATEGY_EARN_OPEN] ${renewal.join('、')} 等 owner 續期策略加息授權（session key 不含這些市場），未送出`;
   if (args.dryRun || !args.send) return `[STRATEGY_EARN_OPEN] 可自動開啟：${opened.join('、')}（${args.dryRun ? 'dry-run' : '沒有策略加息 session 權限，等 owner 續期'}，未送出）`;
   const tx = await args.send(calls);
   await recordOrLog(args, tx);
-  return `[STRATEGY_EARN_OPEN] 已自動開啟：${opened.join('、')} tx=${tx.hash}`;
+  return `[STRATEGY_EARN_OPEN] 已自動開啟：${opened.join('、')} tx=${tx.hash}${waiting}`;
 }
 
 /**
@@ -668,6 +678,7 @@ export async function strategyEarnUnwindForSale(args: StrategyEarnStepArgs & { s
     if (need === 0n) continue;
     const [posted, free] = await Promise.all([chain.collateral(m.marketId, account, head.number), chain.balance(m.collateral, account, head.number)]);
     if (posted === 0n || need <= free) continue;
+    if (!keyCovers(args, m)) { notes.push(`${m.symbol} 需要 owner 續期策略加息授權才能先還款取回`); continue; }
     const st = await chain.status(m.marketId, account, head.number);
     if (st.debt === 0n) {
       calls.push(call(STRATEGY_EARN_97.executor, 'executeWithdrawCollateral', [account, m.marketId, maxUint256, deadline]));
@@ -687,8 +698,9 @@ export async function strategyEarnUnwindForSale(args: StrategyEarnStepArgs & { s
     const remainingValue = (st.debt - pay) * usdtPrice / 10n ** 8n;
     const keepValue = st.targetLtv === 0n ? st.health.collateralValue : remainingValue * E18 / st.targetLtv * 10_200n / 10_000n;
     const freeValue = st.health.collateralValue > keepValue ? st.health.collateralValue - keepValue : 0n;
-    const perUnit = usdValue(E18, price);
-    let take = perUnit === 0n ? 0n : freeValue * E18 / perUnit;
+    const unit = 10n ** BigInt(m.decimals);
+    const perUnit = usdValue(unit, price, m.decimals);
+    let take = perUnit === 0n ? 0n : freeValue * unit / perUnit;
     if (take > posted) take = posted;
     if (pay > 0n) calls.push(call(STRATEGY_EARN_97.executor, 'executeRepay', [account, m.marketId, pay, true, deadline]));
     if (take > 0n) calls.push(call(STRATEGY_EARN_97.executor, 'executeWithdrawCollateral', [account, m.marketId, take, deadline]));

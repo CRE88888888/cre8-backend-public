@@ -78,7 +78,8 @@ test('#199 paymaster: AtpExecutor can never move or be approved the strategy vau
   forbidden(S.venusComptroller, enc('setAuthorization', [S.executor, true]));
   forbidden(nvda.collateral, enc('approve', [SENDER, 1n]));
   // A non-strategy asset may still be approved to AtpExecutor (existing flow) but not to AtpBorrowExecutor.
-  const other = T.assets.AAPLB?.token ?? Object.values(T.assets)[0]?.token; assert.ok(other);
+  // TQQQB: leveraged, never a strategy market (cre8-contracts#67 lists AAPLB and the other launch-fund holdings).
+  const other = T.assets.TQQQB?.token; assert.ok(other);
   sponsored(other, enc('approve', [T.contracts.executor, maxUint256]));
   forbidden(other, enc('approve', [S.executor, maxUint256]));
 });
@@ -148,7 +149,8 @@ test('#199 service: market quotes with gate reasons; outages are "temporarily un
   const earn = createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio() as never });
   const list = await earn.markets();
   assert.deepEqual(list.markets.map(m => [m.asset, m.status, m.reason, m.extraApyBps]), [['NVDAB', 'open', null, 125], ['TSLAB', 'open', null, 125],
-    ['SPCXB', 'open', null, 125], ['QQQB', 'unavailable', 'vault_utilization', 125], ['MSTRB', 'unavailable', 'data_unavailable', null]]);
+    ['SPCXB', 'open', null, 125], ['QQQB', 'unavailable', 'vault_utilization', 125], ['MSTRB', 'unavailable', 'data_unavailable', null],
+    ...markets.slice(5).map(m => [m.symbol, 'open', null, 125])]);
   f.headFails = true;
   const down = await earn.markets();
   assert.equal(down.updatedAt, null); assert.ok(down.markets.every(m => m.status === 'unavailable' && m.message === 'Temporarily unavailable.'));

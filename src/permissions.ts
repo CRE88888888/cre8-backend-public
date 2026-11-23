@@ -14,7 +14,7 @@ import { KERNEL_VERSION_STRING, KERNEL_V3_3_ADDRESSES, kernelAddressesForChain }
 import { TESTNET_97, configuredChainId } from './testnet-profile.js';
 import { requireSessionKeyConfig } from './config.js';
 import { EXECUTOR_SELECTOR, YIELD_EXECUTION_SELECTORS } from './chain.js';
-import { BORROW_SESSION_SELECTORS, STRATEGY_EARN_97 } from './strategy-earn-guard.js';
+import { BORROW_SESSION_SELECTORS, STRATEGY_EARN_97, STRATEGY_EARN_LEGACY_MARKET_IDS } from './strategy-earn-guard.js';
 export { EXECUTOR_SELECTOR } from './chain.js';
 
 /**
@@ -237,7 +237,7 @@ type BuiltPolicies = { call: Policy; gas: Policy; timestamp: Policy };
 /** Default remains the original deployment policy: adding initConfig would move CREATE2 accounts.
  * Yield is installed only by owner renewal, once the existing account address is known.
  */
-export function sessionCallPermissions(executorAddress: Address, yieldAccount?: Address, borrowAccount?: Address) {
+export function sessionCallPermissions(executorAddress: Address, yieldAccount?: Address, borrowAccount?: Address, borrowMarkets?: readonly Hex[]) {
   return [
     { target: executorAddress, selector: EXECUTOR_SELECTOR },
     ...(yieldAccount === undefined ? [] : YIELD_EXECUTION_SELECTORS.map(selector => ({
@@ -245,14 +245,23 @@ export function sessionCallPermissions(executorAddress: Address, yieldAccount?: 
       rules: [{ condition: ParamCondition.EQUAL, offset: 0, params: [pad(yieldAccount)] }],
     }))),
     // Strategy Earn (backend#204): only AtpBorrowExecutor, argument 0 pinned to this account and argument 1 to the
-    // five whitelisted markets. Appended last so keys renewed before #204 rebuild the same permissionId.
-    ...(borrowAccount === undefined ? [] : borrowSessionPermissions(borrowAccount)),
+    // whitelisted markets. Appended last so keys renewed before #204 rebuild the same permissionId. `borrowMarkets`
+    // rebuilds an installed key exactly (keys renewed before cre8-contracts#67 hold the five #65 markets).
+    ...(borrowAccount === undefined ? [] : borrowSessionPermissions(borrowAccount, borrowMarkets)),
   ];
 }
 
+/** Every current strategy market id, in table order: what a renewal installs today. */
+export const borrowMarketIds = (): Hex[] => STRATEGY_EARN_97.markets.map(m => m.marketId as Hex);
+/** The ONE_OF lists a borrow session key can carry: today's table, or the five #65 markets of keys renewed before #67. */
+const BORROW_MARKET_LISTS: readonly (readonly string[])[] = [borrowMarketIds(), STRATEGY_EARN_LEGACY_MARKET_IDS];
+
 /** Session-key calls the scheduler may make on AtpBorrowExecutor for this account (never AtpExecutor, never approvals). */
-export function borrowSessionPermissions(account: Address) {
-  const markets = STRATEGY_EARN_97.markets.map(m => m.marketId as Hex);
+export function borrowSessionPermissions(account: Address, borrowMarkets: readonly Hex[] = borrowMarketIds()) {
+  if (!BORROW_MARKET_LISTS.some(list => list.length === borrowMarkets.length && list.every((m, i) => m === borrowMarkets[i]?.toLowerCase()))) {
+    throw new Error('策略加息 session 權限只接受目前或 #65 的市場清單');
+  }
+  const markets = [...borrowMarkets];
   return BORROW_SESSION_SELECTORS.map(selector => ({
     target: STRATEGY_EARN_97.executor as Address, selector,
     rules: [
@@ -262,14 +271,27 @@ export function borrowSessionPermissions(account: Address) {
   }));
 }
 
-/** True when this stored policy snapshot carries exactly the #204 borrow permissions for this account. */
+/** True when this stored policy snapshot carries exactly the #204 borrow permissions for this account and every current market. */
 export function borrowAuthorized(snapshot: unknown, account: Address): boolean {
+  return borrowKeyMarkets(snapshot, account)?.length === STRATEGY_EARN_97.markets.length;
+}
+
+/**
+ * The market list this stored snapshot's #204 borrow permissions were installed with (today's table, or the five #65
+ * markets of a key renewed before cre8-contracts#67), or null when it carries no exact borrow permissions for this
+ * account. The scheduler rebuilds the key with this list and only sends calls for these markets.
+ */
+export function borrowKeyMarkets(snapshot: unknown, account: Address): Hex[] | null {
+  for (const list of BORROW_MARKET_LISTS) if (borrowSnapshotMatches(snapshot, account, list)) return list.map(m => m as Hex);
+  return null;
+}
+
+function borrowSnapshotMatches(snapshot: unknown, account: Address, markets: readonly string[]): boolean {
   if (!snapshot || typeof snapshot !== 'object') return false;
   const call: unknown = Reflect.get(snapshot, 'call');
   if (!call || typeof call !== 'object') return false;
   const permissions: unknown = Reflect.get(call, 'permissions');
   if (!Array.isArray(permissions)) return false;
-  const markets = STRATEGY_EARN_97.markets.map(m => m.marketId.toLowerCase());
   return BORROW_SESSION_SELECTORS.every(selector => permissions.some((permission: unknown) => {
     if (!permission || typeof permission !== 'object') return false;
     const rules: unknown = Reflect.get(permission, 'rules');
@@ -307,13 +329,14 @@ export function yieldAuthorization(snapshot: unknown, account: Address, executor
   return { status: 'ready' };
 }
 
-function buildPolicies(executorAddress: Address, validAfter: number, validUntil: number, chainId = configuredChainId(), yieldAccount?: Address, borrowAccount?: Address): BuiltPolicies {
+function buildPolicies(executorAddress: Address, validAfter: number, validUntil: number, chainId = configuredChainId(), yieldAccount?: Address, borrowAccount?: Address,
+  borrowMarkets?: readonly Hex[]): BuiltPolicies {
   return {
     // Initial deployment remains legacy; an owner upgrade also pins yield argument 0 to this account.
     call: toCallPolicy({
       ...(chainId === 97 ? { policyAddress: TESTNET_97.contracts.callPolicy } : {}),
       policyVersion: SESSION_CALL_POLICY_VERSION,
-      permissions: sessionCallPermissions(executorAddress, yieldAccount, borrowAccount),
+      permissions: sessionCallPermissions(executorAddress, yieldAccount, borrowAccount, borrowMarkets),
     }),
     gas: toGasPolicy({ allowed: SESSION_GAS_ALLOWED_WEI, ...(chainId === 97 ? { policyAddress: TESTNET_97.contracts.gasPolicy, enforcePaymaster: true, allowedPaymaster: TESTNET_97.contracts.paymaster } : {}) }),
     timestamp: toTimestampPolicy({ validAfter, validUntil, ...(chainId === 97 ? { policyAddress: TESTNET_97.contracts.timestampPolicy } : {}) }),
@@ -321,12 +344,13 @@ function buildPolicies(executorAddress: Address, validAfter: number, validUntil:
 }
 
 /** 目前使用的三層 policy 參數（測試與 log 用）。`validUntil` 未給就用 `sessionValidUntil()`。 */
-export function describePolicies(args: { executorAddress: Address; validUntil?: number; chainId?: number; yieldAccount?: Address; borrowAccount?: Address }): SessionPolicies {
+export function describePolicies(args: { executorAddress: Address; validUntil?: number; chainId?: number; yieldAccount?: Address; borrowAccount?: Address;
+  borrowMarkets?: readonly Hex[] }): SessionPolicies {
   const executorAddress = assertAddressArg(args.executorAddress, 'executorAddress');
   const validUntil = args.validUntil ?? sessionValidUntil();
   assertValidUntil(validUntil);
 
-  const policies = buildPolicies(executorAddress, SESSION_VALID_AFTER, validUntil, args.chainId, args.yieldAccount, args.borrowAccount);
+  const policies = buildPolicies(executorAddress, SESSION_VALID_AFTER, validUntil, args.chainId, args.yieldAccount, args.borrowAccount, args.borrowMarkets);
   return snapshotPolicies(policies);
 }
 
@@ -427,8 +451,10 @@ export async function sudoValidator(publicClient: PublicClient, owner: Address) 
 export type BuildSessionPermissionsArgs = {
   /** Owner upgrade only. Never supply this to counterfactual deployment / initial enrollment. */
   yieldAccount?: Address;
-  /** Owner upgrade only (backend#204): AtpBorrowExecutor calls pinned to this account and the five strategy markets. */
+  /** Owner upgrade only (backend#204): AtpBorrowExecutor calls pinned to this account and the strategy markets. */
   borrowAccount?: Address;
+  /** Rebuilding an installed key: the market list it was installed with (`borrowKeyMarkets`). Default: today's table. */
+  borrowMarkets?: readonly Hex[];
   /** 推導地址要用：`toPermissionValidator` 讀 `client.chain.id`（或打 eth_chainId）。 */
   publicClient: PublicClient;
   /** session key 的地址（由 `deriveSessionKey` 得到）。本函式不需要它的私鑰。 */
@@ -475,7 +501,7 @@ export async function buildSessionPermissions(args: BuildSessionPermissionsArgs)
   const borrowAccount = args.borrowAccount === undefined ? undefined : assertAddressArg(args.borrowAccount, 'borrowAccount');
   if (borrowAccount !== undefined && (chainId !== 97 || isAddressEqual(borrowAccount, zeroAddress) || yieldAccount === undefined ||
       !isAddressEqual(borrowAccount, yieldAccount))) throw new Error('策略加息升權只支援 chain 97 的既有帳戶，且必須與生息升權同一個帳戶');
-  const policies = buildPolicies(executorAddress, SESSION_VALID_AFTER, validUntil, chainId, yieldAccount, borrowAccount);
+  const policies = buildPolicies(executorAddress, SESSION_VALID_AFTER, validUntil, chainId, yieldAccount, borrowAccount, args.borrowMarkets);
 
   // 型別理由同 src/kernel.ts：SDK 把 kernelVersion 收窄成 GetKernelVersion<"0.7">。
   const kernelVersion: GetKernelVersion<'0.7'> = KERNEL_V3_3;

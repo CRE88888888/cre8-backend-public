@@ -84,8 +84,12 @@ function limitedBatch(batch: typeof yieldBatch, max: number, expired: () => bool
  * Every eth_call is pinned to the same block, so independent groups and the NAV evidence are read
  * concurrently (backend: status took 20–50 s with ~130 sequential round trips and hit the timeout).
  */
-export async function readYieldAccount(client: PublicClient, profile: YieldProfile, account: Address,
-  options: Partial<YieldReaderDeps> & { block?: bigint } = {}): Promise<YieldRead> {
+export async function readYieldAccount(client: PublicClient, fullProfile: YieldProfile, account: Address,
+  options: Partial<YieldReaderDeps> & { block?: bigint; ignore?: readonly Hex[] } = {}): Promise<YieldRead> {
+  // DCA (定投): its vault shares are the account's own untracked receipts on another ledger (db 0064).
+  // They are left out of this read entirely (no position, no NAV term), like the strategy earn vault.
+  const ignored = new Set((options.ignore ?? []).map(id => id.toLowerCase()));
+  const profile: YieldProfile = ignored.size ? { ...fullProfile, markets: fullProfile.markets.filter(m => !ignored.has(m.marketId)) } : fullProfile;
   const resolved: YieldReaderDeps = { now: () => new Date(), timeoutMs: 15000, batch: yieldBatch, ...options };
   let expired = false;
   const deps: YieldReaderDeps = { ...resolved, batch: limitedBatch(resolved.batch, YIELD_READ_CONCURRENCY, () => expired) };
@@ -105,10 +109,10 @@ export async function readYieldAccount(client: PublicClient, profile: YieldProfi
     // backend#216: the registry also lists the strategy earn vault (#199), which yieldProfile() drops on purpose.
     // Every profile market must be on chain; any extra on-chain market may only be a strategy vault.
     const count=integer(base[4]);
-    if(address(base[5])!==profile.registry||count<BigInt(profile.markets.length)||count>BigInt(profile.markets.length)+8n)throw unavailable(`registry-market-count:${count}/profile:${profile.markets.length}`);
+    if(address(base[5])!==profile.registry||count<BigInt(profile.markets.length)||count>BigInt(profile.markets.length)+8n+BigInt(ignored.size))throw unavailable(`registry-market-count:${count}/profile:${profile.markets.length}`);
     const marketIds=(await deps.batch(client,block.number,Array.from({length:Number(count)},(_m,index):ReadCall=>({target:profile.registry,name:'marketIds',args:[BigInt(index)]})))).map(hash);
     const extra=marketIds.filter(id=>!profile.markets.some(m=>m.marketId===id));
-    if(new Set(marketIds).size!==marketIds.length||profile.markets.some(m=>!marketIds.includes(m.marketId))||extra.some(id=>!isStrategyVault({marketId:id})))throw unavailable('registry-market-ids');
+    if(new Set(marketIds).size!==marketIds.length||profile.markets.some(m=>!marketIds.includes(m.marketId))||extra.some(id=>!isStrategyVault({marketId:id})&&!ignored.has(id)))throw unavailable('registry-market-ids');
     const observation: Observation = { block: block.number, blockHash: block.hash, at: new Date(Number(block.timestamp) * 1000), source: 'canonical-yield-registry' };
     if (!fresh(observation.at, deps.now())) throw unavailable(`stale-block:${observation.block}:age-${deps.now().getTime() - observation.at.getTime()}ms`);
     const navRead = (async (): Promise<{ nav: bigint; direct: bigint } | null> => {

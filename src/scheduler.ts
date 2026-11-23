@@ -5,6 +5,7 @@ import { createMixService, reconcilePendingMixes } from './mixes.js';
 import { mixAnchor, saveMixValuation } from './mix-valuation.js';
 import { assetsMarketOpen } from './trading-calendar.js';
 import { runYieldRound } from './yield-service.js';
+import { runDcaRound } from './dca.js';
 import { STRATEGY_EARN_97 } from './strategy-earn-guard.js';
 import { dbStrategyEarnLedger, defaultStrategyEarnChain, runStrategyEarnRound, strategyEarnAutoOpen, strategyEarnUnwindForSale } from './strategy-earn.js';
 import type { Call as StrategyEarnCall, StrategyEarnSend, StrategyEarnTx } from './strategy-earn.js';
@@ -566,6 +567,7 @@ export type SchedulerDeps = {
   prepareMixTick?: typeof prepareMixTick;
   readBuyVersionWindow?: (strategyId: bigint) => Promise<BuyVersionWindow>;
   yieldRound?: typeof runYieldRound;
+  dcaRound?: typeof runDcaRound;
   strategyEarnRound?: typeof runStrategyEarnRound;
   /** backend#204 (chain 97): auto-open after a buy, and repay + take shares back before a sale, with the session key. */
   strategyEarn?: {
@@ -2003,6 +2005,8 @@ export async function runSchedulerOnce(
 
   // Yield exits/recovery have their own account lock and precede DEX queues, buy throttles and price gates.
   try { const result=await (deps.yieldRound??runYieldRound)({dryRun,limit}); resolved.log('[yield] '+JSON.stringify(result)); } catch (error) { resolved.log(`[yield] 生息讀值／對帳未完成，保留原部位與預留：${errorChain(error)}`); }
+  // DCA (定投, db 0064): redeem due tranches from each plan's vault and credit them as funding lots before the buy round.
+  try { const result=await (deps.dcaRound??runDcaRound)({dryRun,limit,log:resolved.log}); if(result.checked||result.blocked)resolved.log('[dca] '+JSON.stringify(result)); } catch { resolved.log('[dca] 定投讀值／對帳未完成，下輪再試'); }
   // Strategy earn keeper (backend#199): anyone-callable deleverage/unwind and incentive claims for each account's own position.
   try { const result=await (deps.strategyEarnRound??runStrategyEarnRound)({dryRun,log:resolved.log}); if(result)resolved.log('[strategy-earn] '+JSON.stringify(result)); } catch { resolved.log('[strategy-earn] 健康度讀值未完成，下輪再試'); }
 

@@ -8,6 +8,7 @@ import { AppError, ValidationError, errorChain } from './errors.js';
 import { object, address, hash, raw, fresh, mustExit, riskHeadroom, idleCash, supplyDecision, yieldProfile, unavailable } from './yield-domain.js';
 import type { YieldProfile, YieldSources } from './yield-domain.js';
 import { readYieldAccount } from './yield-reader.js';
+import { readDcaMarkets } from './dca-markets.js';
 import { createYieldJournal, persistYieldRead, restoreYieldOperation, syncYieldCatalog, yieldLocks, readPrefundPositions } from './yield-store.js';
 import type { JournalContext, SnapshotRow, YieldAccount, YieldStoreDeps } from './yield-store.js';
 import { yieldExecutionPort } from './yield-port.js';
@@ -59,7 +60,9 @@ export function createYieldService(overrides:Partial<YieldServiceDeps>={}){
   function profile(){const p=deps.profile();if(!p)throw new AppError(404,'YIELD_NOT_CONFIGURED','此鏈尚未開放生息');return p;}
   async function owned(id:number,wallet:string){const p=await deps.owned(id,wallet);if(p.personalMix)throw new AppError(409,'MIX_NO_YIELD','私人組合目前不提供生息。');if(p.chainId!==97||address(p.ownerAddress)!==address(wallet))throw new AppError(403,'FORBIDDEN','只能操作本人於這條鏈的帳戶');return p;}
   async function locked<T>(id:number,fn:()=>Promise<T>){const result=await deps.lock(id,fn);if(result===null)throw new AppError(409,'PORTFOLIO_BUSY','帳戶處理中，請以原請求重試');return result;}
-  async function read(p:YieldAccount,at?:bigint){return deps.read(deps.client(),profile(),p.account,{now:deps.now,...(at===undefined?{}:{block:at})});}
+  // DCA (定投, db 0064) shares are the account's own separate ledger: never a portfolio yield position to value or exit.
+  async function read(p:YieldAccount,at?:bigint){const ignore=await readDcaMarkets(deps.query,p.chainId,p.account);
+    return deps.read(deps.client(),profile(),p.account,{now:deps.now,...(at===undefined?{}:{block:at}),...(ignore.length?{ignore}:{})});}
   async function verifyHistory(p:YieldAccount,persist=true){
     const blocks=(await deps.query<{block_number:string;block_hash:Hex;state:string}>('select distinct block_number::text,block_hash,state from yield_events where chain_id=$1 and portfolio_id=$2',[p.chainId,p.portfolioId])).rows;
     if(blocks.some(b=>b.state==='reorged'))throw unavailable(`history-reorged-row:${blocks.filter(b=>b.state==='reorged').map(b=>b.block_number).join(',')}`);
@@ -253,7 +256,7 @@ export function createYieldService(overrides:Partial<YieldServiceDeps>={}){
       }
       if(exits.length){
         const requestAt=exits[0]?.requested_at;
-        const complete=requestAt!==undefined&&state.positions.length===f.markets.length&&state.positions.every(s=>s.state==='known'&&s.receipt===0n&&s.observedUnits===0n&&s.trackedUnits===0n&&s.at>=requestAt);
+        const complete=requestAt!==undefined&&state.positions.length===state.profile.markets.length&&state.positions.every(s=>s.state==='known'&&s.receipt===0n&&s.observedUnits===0n&&s.trackedUnits===0n&&s.at>=requestAt);
         await deps.transaction(async db=>{await yieldLocks(db,p);
           if(complete){await db.query("update yield_positions set exit_state='completed',exit_reason=null,next_retry_at=null,updated_at=clock_timestamp() where chain_id=$1 and portfolio_id=$2",[p.chainId,p.portfolioId]);
             await db.query("update yield_exit_requests set state='completed',completed_at=clock_timestamp(),next_retry_at=null,updated_at=clock_timestamp() where chain_id=$1 and portfolio_id=$2 and state<>'completed'",[p.chainId,p.portfolioId]);}

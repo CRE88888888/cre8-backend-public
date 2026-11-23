@@ -22,11 +22,12 @@ export type ContributionPlan = { minimum:bigint; effectiveSlices:Record<string,n
 /** Evaluate actual merged timestamps, preserving signed N while shortening only this lot.
  * At most assets.length*365 count reductions (each pass visits at most assets.length*365 slots); no search proportional to uint256 amounts.
  */
-export function planContribution(total:bigint,config:AssetExecution,confirmedAt:Date,reserve:bigint,feeWindow=false):ContributionPlan|null {
+export function planContribution(total:bigint,config:AssetExecution,confirmedAt:Date,reserve:bigint,feeWindow=false,minimumOverride?:bigint):ContributionPlan|null {
   if(total<=0n||total>UINT256_MAX||reserve<0n)throw new RangeError('invalid contribution');
   const assets=config.assets.filter(a=>a.asset!==config.numeraire);
   const counts=Object.fromEntries(assets.map(a=>[a.asset,a.execution?.kind==='stack'?a.execution.slices:1]));
-  const minimum=minimumAssetContribution(config);
+  // DCA tranches (定投) use the batch floor instead of the one-time subscription minimum.
+  const minimum=minimumOverride??minimumAssetContribution(config);
   const stepLimit=executionBatchSize(assets.length);
   if(stepLimit===0)return null;
   if(total<minimum)return null;
@@ -108,9 +109,9 @@ export function assetBatchBudget(budgets:InputVector,reserve:bigint,caps:Readonl
 }
 
 /** Same conservative fee bound and chain-specific window semantics for preview and persisted lots. */
-export function planFundingContribution(total:bigint,config:AssetExecution,confirmedAt:Date,chainId:number):ContributionPlan|null {
+export function planFundingContribution(total:bigint,config:AssetExecution,confirmedAt:Date,chainId:number,minimumOverride?:bigint):ContributionPlan|null {
   const reserve=config.assets.some(a=>a.asset!==config.numeraire)?CONTRIBUTION_FEE_RESERVE_RAW:0n;
-  return planContribution(total,config,confirmedAt,reserve,chainId===97);
+  return planContribution(total,config,confirmedAt,reserve,chainId===97,minimumOverride);
 }
 
 export type ContributionPreviewInput = { amount: bigint; execution: AssetExecution; chainId: number };

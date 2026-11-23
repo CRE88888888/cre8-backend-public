@@ -172,6 +172,13 @@ export function validateAssetConfig(value: unknown, allocation: Allocation, chai
   return { kind: 'per_asset', numeraire: cash, rebalance, assets };
 }
 
+/** DCA (定投) per-period floor: one complete fee-inclusive 10 USDT batch of the non-cash part, without the
+ * 50 USDT subscription floor of a one-time buy. A tranche lot below it could never form a batch. */
+export function minimumDcaTranche(config: AssetExecution): bigint {
+  const risky = config.assets.filter(a => a.asset !== config.numeraire).reduce((n,a) => n + BigInt(a.weightBps),0n);
+  if (risky === 0n) return MIN_ASSET_BATCH_RAW;
+  return (MIN_BATCH_USDT * 10000n + risky - 1n) / risky * UNIT;
+}
 export function minimumAssetContribution(config: AssetExecution): bigint {
   const risky = config.assets.filter(a => a.asset !== config.numeraire).reduce((n,a) => n + BigInt(a.weightBps),0n);
   if (risky === 0n) return 50n * UNIT;

@@ -30,6 +30,7 @@ import { applyExpiredExitProofs, expiredExitProofs, rememberExitFacts, unusedExi
 import type { ExpiredExitProof } from './paymaster-exit-reconciliation.js';
 export { reconcileExpiredExitAuthorizations } from './paymaster-exit-reconciliation.js';
 import { fresh } from './yield-domain.js';
+import { dcaVaultCall, isDcaSpender } from './dca-calls.js';
 import { writeYieldState } from './yield-runtime-state.js';
 
 export type PackedSponsorOperation = {
@@ -264,6 +265,8 @@ export function validateSponsoredCalls(op: PackedSponsorOperation, c: PaymasterC
         const inner = decodeFunctionData({ abi: BORROW_CALL_ABI, data: call.callData });
         if (inner.functionName !== 'approve' || !isAddressEqual(inner.args[0] as Address, STRATEGY_EARN_97.executor) ||
             encodeFunctionData({ abi: BORROW_CALL_ABI, functionName: 'approve', args: inner.args as readonly [Address, bigint] }).toLowerCase() !== call.callData.toLowerCase()) throw new Error('invalid strategy vault approval');
+      } else if (c.chainId === 97 && dcaVaultCall(call, op.sender, context.owner)) {
+        // DCA (定投, db 0064): the account deposits its own USDT for itself, or returns its whole position to its owner.
       } else if (isAddressEqual(call.target, c.registry)) {
         const inner = decodeFunctionData({ abi: REGISTRY_ABI, data: call.callData });
         if (inner.functionName !== 'enroll' || !isAddressEqual(inner.args[0], op.sender) || inner.args[1] === 0n || inner.args[2] === 0 ||
@@ -276,7 +279,8 @@ export function validateSponsoredCalls(op: PackedSponsorOperation, c: PaymasterC
         if (inner.functionName === 'approve') {
           const borrowSpender = c.chainId === 97 && isAddressEqual(inner.args[0], STRATEGY_EARN_97.executor) &&
             (isAddressEqual(call.target, TESTNET_97.contracts.usdt) || STRATEGY_EARN_97.markets.some(m => isAddressEqual(call.target, collateralOf(m.symbol))));
-          if (!isAddressEqual(inner.args[0], c.executor) && !borrowSpender) throw new Error('invalid spender');
+          const dcaSpender = c.chainId === 97 && isDcaSpender(call.target, inner.args[0]);
+          if (!isAddressEqual(inner.args[0], c.executor) && !borrowSpender && !dcaSpender) throw new Error('invalid spender');
           if (isStrategyVault({ address: call.target }) && !borrowSpender) throw new Error('strategy vault approval');
         } else if (context.owner === undefined || !isAddressEqual(inner.args[0], context.owner) || inner.args[1] === 0n) throw new Error('invalid withdrawal');
       } else throw new Error('unknown target');
@@ -481,7 +485,10 @@ async function verifyYieldWithdraw(op:PackedSponsorOperation,c:PaymasterConfig,n
         client.readContract({address:market.receipt,abi:EXIT_READ,functionName:'balanceOf',args:[op.sender],blockNumber:block.number}),
         client.readContract({address:TESTNET_97.contracts.yieldRegistry,abi:EXIT_READ,functionName:'accountUnits',args:[op.sender,id],blockNumber:block.number}),
       ]);
-      if(amount===0n||amount>balance||units===0n)throw rejected('PAYMASTER_EXIT_INVALID',403);
+      // DCA (db 0064): the vault shares were deposited by the account itself (untracked by the registry);
+      // a session-key redemption of an open plan's own market is still a pure exit back to account cash.
+      if(amount===0n||amount>balance||units===0n&&!(await db(`select 1 from dca_plans where chain_id=$1 and account=$2 and market_id=$3
+        and state in ('active','paused') limit 1`,[c.chainId,op.sender.toLowerCase(),id.toLowerCase()])).rows.length)throw rejected('PAYMASTER_EXIT_INVALID',403);
     }
     let data=op.callData;
     let stateOverride:Parameters<typeof client.call>[0]['stateOverride'];

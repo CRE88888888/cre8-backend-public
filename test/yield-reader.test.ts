@@ -312,3 +312,20 @@ test('a failed yield read names the failing check in its cause chain (stale bloc
   const rpc = await readYieldAccount(f.client, f.profile, f.account, { batch: failing, now: () => f.at }).catch((e: unknown) => e);
   assert.match(errorChain(rpc), /\[yield:read @ readYieldAccount@src\/yield-reader\.ts:\d+[^\]]*\] ← HttpRequestError: rate limited$/);
 });
+
+test('DCA (db 0064): an ignored market (the account\'s own DCA vault shares) is neither read nor an unknown extra', async () => {
+  const f = yieldFixture(['venus', 'lista']);
+  const dca = f.profile.markets[1]?.marketId;
+  assert.ok(dca);
+  const read = await readYieldAccount(f.client, f.profile, f.account, { batch: f.batch, now: () => f.at, ignore: [dca] });
+  assert.deepEqual(read.positions.map(p => p.market.marketId), [f.profile.markets[0]?.marketId]);
+  assert.equal(read.profile.markets.length, 1);
+  // Ignoring a market never widens what an extra on-chain market may be.
+  const batch: typeof f.batch = async (client, block, calls) => {
+    const ids = [...f.profile.markets.map(m => m.marketId as string), `0x${'cd'.repeat(32)}`];
+    const values = await f.batch(client, block, calls.filter(c => c.name !== 'marketCount' && c.name !== 'marketIds'));
+    let i = 0;
+    return calls.map(c => c.name === 'marketCount' ? BigInt(ids.length) : c.name === 'marketIds' ? ids[Number(c.args?.[0])] : values[i++]);
+  };
+  await assert.rejects(readYieldAccount(f.client, f.profile, f.account, { batch, now: () => f.at, ignore: [dca] }), /生息資料/);
+});

@@ -1,8 +1,9 @@
 import { yieldProfile,object as yieldObject,raw as yieldRaw } from './yield-domain.js';
 import type { YieldProfile, YieldRead } from './yield-domain.js';
 import { readYieldAccount } from './yield-reader.js';
+import { readDcaMarkets } from './dca-markets.js';
 import { createPublicClient, http } from 'viem';
-import type { Address, PublicClient } from 'viem';
+import type { Address, Hex, PublicClient } from 'viem';
 import { testnetAssets } from './testnet-profile.js';
 import { activeChain } from './chain-object.js';
 import { getConfig } from './config.js';
@@ -143,7 +144,7 @@ export type PlanDeps = {
   /** Chain 97 Strategy Earn shares posted as collateral at `block` (backend#204). Default reads AtpBorrowRegistry. */
   strategyEarnCollateral?: (account: Address, block: bigint) => Promise<StrategyEarnCollateral[]>;
   /** Chain 97 per-account yield read; default `readYieldAccount`. */
-  readYield?: (client: PublicClient, profile: YieldProfile, account: Address, options: { block: bigint }) => Promise<YieldRead>;
+  readYield?: (client: PublicClient, profile: YieldProfile, account: Address, options: { block: bigint; ignore?: readonly Hex[] }) => Promise<YieldRead>;
   /**
    * Display callers only (`GET /portfolios/:id/status`): a failed yield read becomes the
    * `YIELD_VALUATION_UNAVAILABLE` block (no drift report, total value unknown) instead of failing the whole
@@ -463,8 +464,11 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
     : [];
   // The yield read only needs the account and the block, so it overlaps the balance read and the log scan.
   const yieldConfig = chainId===97 && !personalMix ? yieldProfile() : null;
+  // DCA (定投, db 0064): the not-yet-invested money is the account's own vault position on a separate ledger.
+  // It is neither portfolio value nor rebalance cash, so its markets are left out of the yield read.
+  const dcaMarkets = yieldConfig === null ? [] : await readDcaMarkets(query, chainId, account);
   const yieldRead: Promise<YieldRead | null> | null = yieldConfig === null ? null
-    : (deps.readYield ?? readYieldAccount)(client, yieldConfig, account, { block })
+    : (deps.readYield ?? readYieldAccount)(client, yieldConfig, account, { block, ...(dcaMarkets.length ? { ignore: dcaMarkets } : {}) })
         .catch((error: unknown) => { if (deps.yieldOptional === true) return null; throw error; });
   const [snapshot, scan, lending] = await Promise.all([
     readPositions(client, {

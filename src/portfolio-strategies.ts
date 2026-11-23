@@ -20,10 +20,13 @@ import type { FaucetFundingEvidence } from './faucet.js';
 import { createWelcomeService, findWelcomeGrant, readWelcomeFundingEvidence, settleWelcomeGrant } from './welcome-grants.js';
 import type { WelcomeGrant } from './welcome-grants.js';
 import { readAccountCash } from './chain.js';
-import { defaultAmountUsdt, exactKeys, minimumAllocationRaw, record, usdtRaw, utcDate, CONTRIBUTION_FEE_RESERVE_RAW, minimumAssetContribution, numeraireFor } from './strategy-execution.js';
+import { defaultAmountUsdt, exactKeys, minimumAllocationRaw, record, usdtRaw, utcDate, CONTRIBUTION_FEE_RESERVE_RAW, minimumAssetContribution, minimumDcaTranche, numeraireFor } from './strategy-execution.js';
+import type { AssetExecution } from './strategy-execution.js';
 
 export type FundingSource = { kind: 'faucet_claim'; claimId: string } | { kind: 'welcome_grant'; grantId: string }
-  | { kind: 'wallet_transfer'; txHash: Hex };
+  | { kind: 'wallet_transfer'; txHash: Hex }
+  /** DCA (定投, db 0064): one tranche the scheduler redeemed from the plan's vault into the account. Internal only, never an HTTP source. */
+  | { kind: 'dca_tranche'; evidence: FaucetFundingEvidence };
 
 /** One mined receipt, pinned to its canonical block, as for faucet/welcome funding. */
 export async function readWalletFundingEvidence(input: { chainId: number; owner: Address; account: Address; txHash: Hex }, suppliedClient?: PublicClient): Promise<FaucetFundingEvidence> {
@@ -197,6 +200,7 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
   }
 
   async function fundingEvidence(p: OwnedPortfolio, wallet: string, source: FundingSource) {
+    if (source.kind === 'dca_tranche') return source.evidence;
     if (source.kind === 'wallet_transfer') {
       try { return await deps.walletEvidence({ chainId: p.chainId, owner: p.ownerAddress as Address, account: p.accountAddress as Address, txHash: source.txHash }); }
       catch (error) { await reconcileFundingReorg(p, source.txHash, error); throw error; }
@@ -262,7 +266,7 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
           throw new AppError(409, 'MIX_FUNDING_ALREADY_CARRIED', '這筆入金已包含在改比例的承接現金，不會重複計入。');
         }
       }
-      const original = (source.kind === 'wallet_transfer'
+      const original = (source.kind === 'wallet_transfer' || source.kind === 'dca_tranche'
         ? await client.query<LotRow>(`select * from strategy_funding_lots where chain_id=$1 and tx_hash=$2
             and (log_index=$3 or portfolio_id=$4) order by (log_index=$3) desc limit 1`, [p.chainId, evidence.txHash, evidence.logIndex, id])
         : await client.query<LotRow>('select * from strategy_funding_lots where chain_id=$1 and tx_hash=$2', [p.chainId, evidence.txHash])).rows[0];
@@ -283,19 +287,22 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
           query: (sql, params) => client.query(sql, params === undefined ? [] : [...params]), cappedOnly: true,
         })) : null;
       const execution = allocation?.execution;
-      const standalone = execution ? planFundingContribution(BigInt(evidence.amountRaw),execution,confirmedAt,p.chainId) : null;
+      // DCA (db 0064): one tranche only has to form a complete 10 USDT fee-inclusive batch; one-time buys keep 50.
+      const dca = source.kind === 'dca_tranche';
+      const floor = (config: AssetExecution) => dca ? minimumDcaTranche(config) : minimumAssetContribution(config);
+      const standalone = execution ? planFundingContribution(BigInt(evidence.amountRaw),execution,confirmedAt,p.chainId,dca?minimumDcaTranche(execution):undefined) : null;
       // Subscription minimum is distinct from the eventual account/time batch.
       // An individually small source may join another lot at the same creator slot.
       // Preserve the signed subscription minimum, even if redistribution would lower it.
-      const originalMinimum=version.execution.kind==='per_asset'?minimumAssetContribution(version.execution):0n;
-      const effectiveMinimum=execution?minimumAssetContribution(execution):0n;
+      const originalMinimum=version.execution.kind==='per_asset'?floor(version.execution):0n;
+      const effectiveMinimum=execution?floor(execution):0n;
       const minimum=originalMinimum>effectiveMinimum?originalMinimum:effectiveMinimum;
       if(kind==='asset'&&BigInt(evidence.amountRaw)<minimum)throw new ValidationError('BELOW_MINIMUM_ALLOCATION',`minimum total contribution is ${formatUnits(minimum,18)} USDT including fees`);
       const contribution=standalone?{...standalone,minimum}:(execution?{minimum,effectiveSlices:Object.fromEntries(execution.assets.filter(a=>a.asset!==numeraireFor(p.chainId)).map(a=>[a.asset,1]))}:null);
       const inserted = await client.query<LotRow>(`insert into strategy_funding_lots
         (chain_id,portfolio_id,strategy_id,version,kind,tx_hash,log_index,block_number,block_hash,amount_raw,minimum_contribution_raw,effective_slices,created_at,updated_at,source_kind,faucet_claim_id,welcome_grant_id,effective_allocation,allocation_reason,capped_assets)
         values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13,$14,$15,$16,$17,$18,$19) on conflict(chain_id,tx_hash,log_index) do nothing returning *`,
-        [p.chainId, id, p.strategyId, p.version, kind, evidence.txHash, evidence.logIndex, evidence.blockNumber.toString(), evidence.blockHash, evidence.amountRaw, contribution?.minimum.toString() ?? null, contribution ? JSON.stringify(contribution.effectiveSlices) : null, confirmedAt, source.kind === 'wallet_transfer' ? null : source.kind, source.kind === 'faucet_claim' ? source.claimId : null, source.kind === 'welcome_grant' ? source.grantId : null,
+        [p.chainId, id, p.strategyId, p.version, kind, evidence.txHash, evidence.logIndex, evidence.blockNumber.toString(), evidence.blockHash, evidence.amountRaw, contribution?.minimum.toString() ?? null, contribution ? JSON.stringify(contribution.effectiveSlices) : null, confirmedAt, source.kind === 'wallet_transfer' || source.kind === 'dca_tranche' ? null : source.kind, source.kind === 'faucet_claim' ? source.claimId : null, source.kind === 'welcome_grant' ? source.grantId : null,
           allocation?.effectiveAllocation ? JSON.stringify(allocation.effectiveAllocation) : null, allocation?.allocationReason ?? 'version', JSON.stringify(allocation?.cappedAssets ?? [])]);
       const lot = (await client.query<LotRow>('select * from strategy_funding_lots where chain_id=$1 and tx_hash=$2 and log_index=$3',
         [p.chainId, evidence.txHash, evidence.logIndex])).rows[0];
@@ -375,6 +382,12 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
       return locked(id, async () => {
         return creditFunding(p, wallet, source);
       });
+    }),
+
+    /** DCA (db 0064): credit exactly one redeemed tranche as an ordinary funding lot of the account's current portfolio. */
+    creditDcaTranche: (id: number, owner: string, evidence: FaucetFundingEvidence) => safe(async () => {
+      const p = await ownedContext(id, owner);
+      return locked(id, async () => creditFunding(p, owner, { kind: 'dca_tranche', evidence }));
     }),
 
     buyFunding: (id: number, wallet: string, input: unknown) => safe(async () => {

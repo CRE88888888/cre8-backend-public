@@ -248,6 +248,39 @@ export function mixDcaCall(call: { target: Address; callData: Hex }, sender: Add
   return null;
 }
 
+/**
+ * Yield strategy (策略加息) on a My mix account: the same AtpBorrowExecutor calls a fund account sends — consent
+ * (lending delegates, debt ceilings, approvals to AtpBorrowExecutor), open, close, and the scheduler's session-key
+ * steps. They never change the mix's enrollment, so they are not an owner mix change; their exact rules (account,
+ * market, spender, canonical encoding) stay in validateSponsoredCalls. 'risk' = adds collateral, borrowing or consent;
+ * 'settle' = repays, takes shares back or withdraws consent.
+ */
+export type MixStrategyCall = 'risk' | 'settle' | null;
+export function mixStrategyCall(call: { target: Address; callData: Hex }, c: PaymasterConfig): MixStrategyCall {
+  if (c.chainId !== 97) return null;
+  const S = STRATEGY_EARN_97;
+  try {
+    if (isAddressEqual(call.target, S.executor)) {
+      const name = decodeFunctionData({ abi: BORROW_CALL_ABI, data: call.callData }).functionName;
+      return name === 'executeSupplyCollateral' || name === 'executeBorrow' ? 'risk'
+        : name === 'executeRepay' || name === 'executeWithdrawCollateral' || name === 'executeDeleverage' ? 'settle' : null;
+    }
+    if (isAddressEqual(call.target, S.registry)) {
+      const inner = decodeFunctionData({ abi: BORROW_CALL_ABI, data: call.callData });
+      return inner.functionName === 'setBorrowPolicy' ? (inner.args[2] ? 'risk' : 'settle') : null;
+    }
+    if (isAddressEqual(call.target, S.venusComptroller) || isAddressEqual(call.target, S.listaMoolah)) {
+      const name = decodeFunctionData({ abi: BORROW_CALL_ABI, data: call.callData }).functionName;
+      return name === 'updateDelegate' || name === 'setAuthorization' ? 'risk' : null;
+    }
+    if (call.callData.startsWith(toFunctionSelector('approve(address,uint256)'))) {
+      const inner = decodeFunctionData({ abi: TOKEN_ABI, data: call.callData });
+      return inner.functionName === 'approve' && isAddressEqual(inner.args[0], S.executor) ? 'risk' : null;
+    }
+  } catch { return null; }
+  return null;
+}
+
 type CallContext = { owner?: Address; assets?: readonly Address[] };
 const collateralOf = (symbol: string): Address => {
   const asset = (TESTNET_97.assets as Record<string, { token: string } | undefined>)[symbol];
@@ -985,6 +1018,11 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
       const dcaOnly = isMix && calls.some(call => ['vault', 'redeem'].includes(mixDca(call) ?? '')) &&
         calls.every(call => mixDca(call) !== null || isAddressEqual(call.target, op.sender) ||
           isAddressEqual(call.target, TESTNET_97.contracts.usdt) && call.callData.startsWith(toFunctionSelector('transfer(address,uint256)')));
+      // Yield strategy only (with an optional session renewal pair, like a fund's turn-on): owner consent/open/close or
+      // the scheduler's session-key steps. Not an enrollment change, so no mix lock, like DCA.
+      const mixStrategy = (call: { target: Address; callData: Hex }) => mixStrategyCall(call, c);
+      const strategyOnly = isMix && calls.some(call => mixStrategy(call) !== null) &&
+        calls.every(call => mixStrategy(call) !== null || isAddressEqual(call.target, op.sender));
       const authorize = async () => {
       let intentToSubmit: MixIntent | null = null;
       if (owner.mix_id !== null && owner.mix_id !== undefined) {
@@ -998,7 +1036,7 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
           throw rejected('PAYMASTER_CALL_FORBIDDEN', 403, 'my mix: per-asset yield call');
         }
         const ownerChange = calls.some(call => isAddressEqual(call.target, c.registry) ||
-          call.callData.startsWith(toFunctionSelector('approve(address,uint256)')) && mixDca(call) !== 'approval');
+          call.callData.startsWith(toFunctionSelector('approve(address,uint256)')) && mixDca(call) !== 'approval' && mixStrategy(call) === null);
         for (const call of calls) {
           if (call.callData.startsWith(toFunctionSelector('transfer(address,uint256)')) && !isAddressEqual(call.target, TESTNET_97.contracts.usdt)) {
             throw rejected('PAYMASTER_CALL_FORBIDDEN', 403);
@@ -1010,8 +1048,12 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
           await bounded((deps.mixSetup ?? verifyMixOwnerCalls)(m, intent, calls, op.nonce), c.timeoutMs);
           intentToSubmit = intent;
         } else {
-          // A DCA UserOp waits for a pending mix change to settle (retryable), like the owner's other actions.
-          if (intent && dcaOnly) throw mixBusy();
+          // A DCA or yield strategy UserOp waits for a pending mix change to settle (retryable), like the owner's other actions.
+          if (intent && (dcaOnly || strategyOnly)) throw mixBusy();
+          // An exiting (take profit / stop loss), exited or deleting mix sells everything: no new collateral, borrowing or consent.
+          if ((m.triggered_at !== null || m.status === 'exited' || m.delete_requested_at) && calls.some(call => mixStrategy(call) === 'risk')) {
+            throw rejected('PAYMASTER_CALL_FORBIDDEN', 403, 'my mix: yield strategy while exiting');
+          }
           if (intent && !onlyOwnerCash) throw rejected('PAYMASTER_CALL_FORBIDDEN', 403, 'my mix: pending mix change');
           if (!onlyOwnerCash) {
           const settings = (await bounded((deps.query ?? query)(`select ms.exit_assets from mix_strategy_settings ms
@@ -1114,7 +1156,7 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
       // The mix lock serialises enrollment changes and buys/sells against the mix state. A DCA UserOp or a USDT
       // withdrawal to the owner changes neither (both still refuse during a pending mix change, checked above),
       // so they must not fail with MIX_BUSY while the scheduler or a mix refresh holds the lock.
-      return isMix && !dcaOnly && !onlyOwnerCash
+      return isMix && !dcaOnly && !onlyOwnerCash && !strategyOnly
         ? await (deps.mixLock ?? withMixLock)(String(owner.mix_id), authorize) : await authorize();
     } catch (error) {
       const safe = error instanceof AppError ? error : rejected('PAYMASTER_DEPENDENCY_UNAVAILABLE', 503);

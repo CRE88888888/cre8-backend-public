@@ -8,7 +8,7 @@ import { AppError } from '../src/errors.js';
 import { createPaymasterService } from '../src/paymaster.js';
 import { EXECUTOR_ABI } from '../src/chain.js';
 import { buildSessionPermissions } from '../src/permissions.js';
-import { closeCalls, consentCalls, openCalls, strategyMarkets } from '../src/strategy-earn.js';
+import { closeCalls, consentCalls, openCalls, STRATEGY_EARN_97 as S, STRATEGY_EARN_ABI, strategyMarkets } from '../src/strategy-earn.js';
 import { dcaDepositCalls, dcaReceiptApproval, dcaReturnCalls, dcaVaults } from '../src/dca-calls.js';
 import { YIELD_EXECUTOR_ABI } from '../src/yield-abi.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
@@ -54,12 +54,13 @@ async function renewal(): Promise<Call[]> {
 }
 
 type Kind = 'fund' | 'mix';
-function harness(kind: Kind, opts: { pendingChange?: boolean; reservedRaw?: bigint; observedRaw?: bigint } = {}) {
+function harness(kind: Kind, opts: { pendingChange?: boolean; reservedRaw?: bigint; observedRaw?: bigint; exiting?: 'triggered' | 'exited' | 'deleting' } = {}) {
   const seen = { locks: 0, reservations: 0, setups: 0, exits: 0 };
   const service = createPaymasterService({ config: c, now: () => NOW,
     mixLock: async (_id, work) => { seen.locks++; return work(); },
     query: async (sql) => ({ rows: sql.includes('select s.owner') ? [{ owner, user_id: owner, mix_id: kind === 'mix' ? '5' : null }]
-      : sql.includes('from mixes m where') ? [{ id: '5', owner, account, triggered_at: null, status: 'active' }]
+      : sql.includes('from mixes m where') ? [{ id: '5', owner, account, triggered_at: opts.exiting === 'triggered' ? new Date(NOW * 1000) : null,
+        status: opts.exiting === 'exited' ? 'exited' : 'active', delete_requested_at: opts.exiting === 'deleting' ? new Date(NOW * 1000) : null }]
       : sql.includes('mix_switch_intents') ? opts.pendingChange ? [{ id: '1', strategy_id: '12', owner_calls: [], nonce: '0', user_op_hash: null }] : []
       : sql.includes('select ms.exit_assets') ? [{ exit_assets: [] }]
       : sql.includes('from strategy_cash_balances b') && opts.reservedRaw !== undefined
@@ -92,6 +93,7 @@ async function flows(kind: Kind): Promise<[string, Call[], { lock: boolean }][]>
   shared.push(['standalone permission renewal', r, { lock: true }]);
   if (kind === 'mix') {
     shared.push(['mix buy (scheduler session key)', [rebalance(usdt, asset)], { lock: true }]);
+    shared.push(...strategyFlows(r, deadline));
     return shared;
   }
   shared.push(['fund buy: approvals', [approve(usdt, executor), approve(asset, executor)], { lock: false }]);
@@ -101,6 +103,29 @@ async function flows(kind: Kind): Promise<[string, Call[], { lock: boolean }][]>
   shared.push(['Strategy Earn off', closeCalls(markets[0]!, account, deadline).map(asCall), { lock: false }]);
   shared.push(['fund sell', [rebalance(asset, usdt)], { lock: false }]);
   return shared;
+}
+
+/**
+ * Yield strategy (策略加息) UserOps a My mix sends, the same shapes as a fund (wallet-entry strategyAutoOn / strategyOpen /
+ * strategyClose, and the scheduler's session-key steps). Not an enrollment change: no mix lock.
+ */
+function strategyFlows(r: Call[], deadline: bigint): [string, Call[], { lock: boolean }][] {
+  const consent = consentCalls(markets.slice(0, 3).map((market) => ({ market, maxDebtRaw: 10n ** 21n }))).map(asCall);
+  const lista = markets.find(m => m.protocol === 'lista')!;
+  const executor = (fn: 'executeSupplyCollateral' | 'executeBorrow' | 'executeRepay' | 'executeWithdrawCollateral', args: readonly unknown[]): Call =>
+    ({ to: S.executor as Address, value: 0n, data: encodeFunctionData({ abi: STRATEGY_EARN_ABI, functionName: fn, args: args as never }) });
+  return [
+    ['mix buy with yield strategy: consent after funding (renewal + consent)', [...r, ...consent], { lock: false }],
+    ['mix buy with yield strategy: consent (key ready)', consent, { lock: false }],
+    ['mix yield strategy on after the fill (Venus)', openCalls(markets[0]!, account, 10n ** 18n, 10n ** 17n, 10n ** 18n, deadline).map(asCall), { lock: false }],
+    ['mix yield strategy on after the fill (Lista)', openCalls(lista, account, 10n ** 18n, 0n, 10n ** 18n, deadline).map(asCall), { lock: false }],
+    ['mix yield strategy off', closeCalls(markets[0]!, account, deadline).map(asCall), { lock: false }],
+    ['mix yield strategy off, two assets', [...closeCalls(markets[0]!, account, deadline), ...closeCalls(lista, account, deadline)].map(asCall), { lock: false }],
+    ['mix auto-open after the fill (scheduler session key)', [executor('executeSupplyCollateral', [account, markets[0]!.marketId, 10n ** 18n, deadline]),
+      executor('executeBorrow', [account, markets[0]!.marketId, 10n ** 17n, deadline])], { lock: false }],
+    ['mix repay and take shares back before a sale (scheduler session key)', [executor('executeRepay', [account, markets[0]!.marketId, maxUint256, true, deadline]),
+      executor('executeWithdrawCollateral', [account, markets[0]!.marketId, maxUint256, deadline])], { lock: false }],
+  ];
 }
 
 for (const kind of ['fund', 'mix'] as const) {
@@ -188,4 +213,48 @@ test('withdrawable cash = account USDT minus what a running buy / withdrawal / y
   assert.equal(withdrawableCash(2600202500000000000000n, row), 100n * 10n ** 18n);
   assert.equal(withdrawableCash(10n, null), 10n);
   assert.throws(() => reservedCash({ ...row, yield_raw: '-1' }));
+});
+
+test('My mix yield strategy: exiting / exited / deleting mixes can only settle; a pending mix change makes it wait; the rules stay strict', async () => {
+  const deadline = BigInt(NOW + 600), r = await renewal();
+  const consent = consentCalls([{ market: markets[0]!, maxDebtRaw: 10n ** 21n }]).map(asCall);
+  const open = openCalls(markets[0]!, account, 10n ** 18n, 10n ** 17n, 10n ** 18n, deadline).map(asCall);
+  const close = closeCalls(markets[0]!, account, deadline).map(asCall);
+  for (const exiting of ['triggered', 'exited', 'deleting'] as const) {
+    for (const [name, calls] of [['consent', [...r, ...consent]], ['open', open]] as const) {
+      const h = harness('mix', { exiting });
+      await assert.rejects(h.sponsor([...calls]), code('PAYMASTER_CALL_FORBIDDEN', 403), `${exiting}: ${name}`);
+      assert.equal(h.seen.reservations, 0);
+    }
+    const h = harness('mix', { exiting });
+    await h.sponsor(close);
+    assert.equal(h.seen.reservations, 1, `${exiting}: off still settles`);
+  }
+  // A weight change waiting for its signature voids consent on chain: strategy UserOps wait (409 MIX_BUSY, retryable).
+  for (const calls of [consent, open, close]) await assert.rejects(harness('mix', { pendingChange: true }).sponsor(calls), code('MIX_BUSY', 409));
+  // Same call rules as a fund account.
+  const strict: [string, Call[]][] = [
+    ['strategy vault shares approved to AtpExecutor', [approve(S.earnVault as Address, executor)]],
+    ['leveraged asset approved to AtpBorrowExecutor', [approve(T.assets.TQQQB.token as Address, S.executor as Address)]],
+    ['borrow for another account', [{ to: S.executor as Address, value: 0n, data: encodeFunctionData({ abi: STRATEGY_EARN_ABI, functionName: 'executeBorrow', args: [stranger, markets[0]!.marketId, 1n, deadline] }) }]],
+    ['consent with a zero ceiling', [{ to: S.registry as Address, value: 0n, data: encodeFunctionData({ abi: STRATEGY_EARN_ABI, functionName: 'setBorrowPolicy', args: [markets[0]!.marketId, 0n, true] }) }]],
+    ['lending delegate to a stranger', [{ to: S.venusComptroller as Address, value: 0n, data: encodeFunctionData({ abi: STRATEGY_EARN_ABI, functionName: 'updateDelegate', args: [stranger, true] }) }]],
+    ['consent + a token transfer out', [...consent, transfer(asset, owner, 1n)]],
+  ];
+  for (const [name, calls] of strict) {
+    const h = harness('mix');
+    await assert.rejects(h.sponsor(calls), code('PAYMASTER_CALL_FORBIDDEN', 403), name);
+    assert.equal(h.seen.reservations, 0, name);
+  }
+});
+
+test('My mix weight change with the yield strategy on: approval + enroll + consent goes through the exact pending-change check under the mix lock', async () => {
+  const enroll = { to: T.contracts.registry as Address, value: 0n,
+    data: encodeFunctionData({ abi: [{ type: 'function', name: 'enroll', inputs: [{ type: 'address' }, { type: 'uint256' }, { type: 'uint16' }], outputs: [], stateMutability: 'nonpayable' }],
+      functionName: 'enroll', args: [account, 12n, 1] }) };
+  const calls = [approve(asset, executor), enroll, ...consentCalls([{ market: markets[0]!, maxDebtRaw: 10n ** 21n }]).map(asCall)];
+  await assert.rejects(harness('mix').sponsor(calls), code('PAYMASTER_CALL_FORBIDDEN', 403));
+  const h = harness('mix', { pendingChange: true });
+  await h.sponsor(calls);
+  assert.deepEqual([h.seen.setups, h.seen.locks, h.seen.reservations], [1, 1, 1]);
 });

@@ -136,6 +136,7 @@ import { writeSnapshot as writeSnapshotImpl } from './snapshot.js';
 import type { PlanPartial, PlannedStep, RebalancePlan, RefreshFloorsResult } from './rebalance-plan.js';
 import { DEFAULT_THRESHOLD_BPS, planPortfolio } from './snapshot.js';
 import type { PortfolioPlan } from './snapshot.js';
+import type { MixRuntime } from './mix-runtime.js';
 import { MIN_INTERVAL_SECONDS } from './strategies.js';
 import { defaultNewMoneyDeps, prepareNewMoney, PinnedVersionChangedError } from './strategy-runtime.js';
 import { readBuyVersionWindow } from './registry-versioning.js';
@@ -579,7 +580,8 @@ export type SchedulerDeps = {
   strategyEarnRound?: typeof runStrategyEarnRound;
   /** backend#204 (chain 97): auto-open after a buy, and repay + take shares back before a sale, with the session key. */
   strategyEarn?: {
-    open(due: DuePortfolio, dryRun: boolean): Promise<string | null>;
+    /** `held`: collateral the planner saw in the account (lowercase); only those markets are read. */
+    open(due: DuePortfolio, dryRun: boolean, held?: readonly string[]): Promise<string | null>;
     unwind(due: DuePortfolio, steps: readonly PlannedStep[], dryRun: boolean): Promise<string | null>;
   };
   clock?:()=>Date;
@@ -1617,14 +1619,15 @@ function defaultStrategyEarnSteps(deps: ResolvedDeps): NonNullable<SchedulerDeps
     const key = resolution.key;
     return { send: (calls: StrategyEarnCall[]) => sendStrategyEarnWithSessionKey(due.account, key, calls), markets: key.borrowMarkets };
   };
-  const args = async (due: DuePortfolio, dryRun: boolean) => {
+  const args = async (due: DuePortfolio, dryRun: boolean, held?: readonly string[]) => {
     const key = dryRun ? null : await session(due);
-    return { chain: defaultStrategyEarnChain(), account: due.account, portfolioId: due.portfolioId, now: deps.clock(), dryRun,
+    return { chain: defaultStrategyEarnChain(), account: due.account, portfolioId: due.portfolioId, now: deps.clock(), dryRun, ...(held === undefined ? {} : { held }),
       send: key?.send ?? null, ...(key?.markets === undefined ? {} : { sendable: key.markets }), ledger: dbStrategyEarnLedger, log: deps.log };
   };
   return {
-    open: async (due, dryRun) => deps.chainId !== 97 || due.personalMix ? null : strategyEarnAutoOpen(await args(due, dryRun)),
-    unwind: async (due, steps, dryRun) => deps.chainId !== 97 || due.personalMix ? null : strategyEarnUnwindForSale({ ...await args(due, dryRun), steps }),
+    // My mix: the same steps on the mix's own account (its session key moves with each weight change, mix-store).
+    open: async (due, dryRun, held) => deps.chainId !== 97 ? null : strategyEarnAutoOpen(await args(due, dryRun, held)),
+    unwind: async (due, steps, dryRun) => deps.chainId !== 97 ? null : strategyEarnUnwindForSale({ ...await args(due, dryRun), steps }),
   };
 }
 const strategyEarnSteps = (deps: ResolvedDeps) => deps.strategyEarn ?? defaultStrategyEarnSteps(deps);
@@ -2421,10 +2424,16 @@ async function runOne(
   return result;
 }
 
-/** After a noop (nothing to trade), post consented shares and borrow into the strategy vault. Never changes the outcome. */
-async function strategyEarnOpen(due: DuePortfolio, ctx: { dryRun: boolean; deps: ResolvedDeps }) {
-  if (ctx.deps.chainId !== 97 || due.personalMix) return;
-  try { const note = await strategyEarnSteps(ctx.deps).open(due, ctx.dryRun); if (note !== null) ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} ${note}`); }
+/**
+ * After a noop (nothing to trade), post consented shares and borrow into the strategy vault. Never changes the outcome.
+ * `plan` narrows the reads to the collateral the account holds. My mix: never while the mix is exiting, exited or has a
+ * weight change waiting for its signature (that change voids the consent it was given under).
+ */
+async function strategyEarnOpen(due: DuePortfolio, ctx: { dryRun: boolean; deps: ResolvedDeps }, plan?: PortfolioPlan, mix?: MixRuntime | null) {
+  if (ctx.deps.chainId !== 97) return;
+  if (due.personalMix && (!mix || mix.triggered || mix.status !== 'active' || mix.pending)) return;
+  const held = plan?.snapshot.holdings.filter(h => h.amountWei > 0n).map(h => h.asset.toLowerCase());
+  try { const note = await strategyEarnSteps(ctx.deps).open(due, ctx.dryRun, held); if (note !== null) ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} ${note}`); }
   catch (error) { ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} [STRATEGY_EARN_OPEN_FAILED] 自動開啟未完成，下一輪再試：${oneLine(error)}`); }
 }
 
@@ -2564,11 +2573,18 @@ async function decideAndMaybeExecute(
         (mix.lastExitAttempt === null || ctx.now.getTime() - mix.lastExitAttempt.getTime() < mixExitCooldownMs(mix.retries))) {
       return { ...base, outcome: 'blocked', reason: '退出連續失敗已告警，等待退避間隔結束後重新確認條件並續作。' };
     }
-    if (ctx.forcePlan !== true && mixTick.mode === 'wait') return { ...base, outcome: 'noop', reason: mixTick.reason };
+    // A mix waits between rebalance dates: like a fund's quiet round, that is when consented shares get posted.
+    if (ctx.forcePlan !== true && mixTick.mode === 'wait') {
+      if (plan.blocked.length === 0) await strategyEarnOpen(due, ctx, plan, mix);
+      return { ...base, outcome: 'noop', reason: mixTick.reason };
+    }
     if (ctx.forcePlan !== true) {
       plan = mixTick.plan;
       if (!ctx.dryRun) await ctx.deps.prepareMixTick(mix, mixTick, due, ctx.now, ctx.deps.withTransaction, await mixCashWithdrawals(due.portfolioId, ctx.deps.query, plan.snapshot.block));
-      if (mixTick.complete) return { ...base, outcome: 'noop', reason: mixTick.mode === 'exit' ? '組合已退出，剩餘為現金與低於最小交易額的尾差。' : '偏離低於最小交易額，本次再平衡檢查完成。' };
+      if (mixTick.complete) {
+        if (mixTick.mode !== 'exit') await strategyEarnOpen(due, ctx, plan, mix);
+        return { ...base, outcome: 'noop', reason: mixTick.mode === 'exit' ? '組合已退出，剩餘為現金與低於最小交易額的尾差。' : '偏離低於最小交易額，本次再平衡檢查完成。' };
+      }
     }
     if (!ctx.dryRun && mixTick.mode === 'new_money') await ctx.deps.withTransaction(async db => {
       await excludeMixExitBudgets(db, due.portfolioId);
@@ -2578,7 +2594,7 @@ async function decideAndMaybeExecute(
   // `forcePlan`：呼叫端要用**同一條送出管線**做別的事（例如 redeem 按比例賣成 numeraire）。
   // 那種動作不會讓漂移變大，所以「不需要再平衡」不代表「什麼都不用做」。
   if (due.executionKind === undefined && !plan.report.needsRebalance && ctx.forcePlan !== true) {
-    await strategyEarnOpen(due, ctx);
+    await strategyEarnOpen(due, ctx, plan, mix);
     return {
       ...base,
       outcome: 'noop',
@@ -2633,14 +2649,14 @@ async function decideAndMaybeExecute(
     if (mix && (mixTick?.mode === 'rebalance' || waitingSourceTarget) && rebalance.retryable !== true && !ctx.dryRun && !mixSwitchExitsPending(mix, plan)) {
       await ctx.deps.query('update mixes set last_rebalanced_at=$2 where id=$1 and triggered_at is null', [mix.id, ctx.now]);
     }
-    if (ctx.forcePlan !== true) await strategyEarnOpen(due, ctx);
+    if (ctx.forcePlan !== true && mixTick?.mode !== 'exit') await strategyEarnOpen(due, ctx, plan, mix);
     return { ...base, outcome: 'noop', ...(money?.useTargetWeights&&plan.report.maxAbsDeltaBps<=plan.report.thresholdBps?{rebalanceComplete:true}:{}), reason: `Planner returned noop: ${rebalance.reason}` };
   }
   if (rebalance.kind === 'blocked') {
     // A leftover below one complete batch waits for more money; the filled assets can still turn Strategy Earn on.
     // 2026-11-23 portfolio 17: bought with "Earn extra", filled, but every round was [BASKET_WAITING], so the auto-open
     // (called only on noop) never ran.
-    if (ctx.forcePlan !== true && /\[BASKET_WAITING\]/.test(rebalance.reason)) await strategyEarnOpen(due, ctx);
+    if (ctx.forcePlan !== true && mixTick?.mode !== 'exit' && /\[BASKET_WAITING\]/.test(rebalance.reason)) await strategyEarnOpen(due, ctx, plan, mix);
     let nextRunAt = base.nextRunAt;
     let scheduleNote = '';
     const end = rebalance.buyWindowEndsAt;

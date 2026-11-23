@@ -29,6 +29,7 @@ import { WAD } from './fixtures/mix.js';
 import { createFaucetService } from '../src/faucet.js';
 import { loadFaucetConfig } from '../src/config.js';
 import { listPortfolios, requireOwnedPortfolio } from '../src/portfolios.js';
+import { consentCalls, strategyMarkets } from '../src/strategy-earn.js';
 const owner = T.roles.keeper;
 after(closePool);
 
@@ -79,7 +80,7 @@ async function fixture(work: (service: ReturnType<typeof createMixService>, db: 
     },
     proof: async (_m, _intent, hash) => ({ txHash: hash, userOpHash: hash, logIndex: 0, blockNumber: block++, blockHash: hash,
       at: new Date('2026-01-02Z'), cashRaw: '0', nonce: 0n }),
-    plan: async () => mixRuntimeFixture().plan,
+    plan: async () => mixRuntimeFixture().plan, strategyConsent: async () => [],
     preview: createMixPreview({ chainId: 97, model: async () => emptyModel(), gasPrice: async () => 1n }) };
   try { await work(createMixService(deps), db, deps); }
   finally { await db.query('rollback'); db.release(); }
@@ -754,5 +755,38 @@ test('a delete-requested exit with no USDT left completes the deletion; with USD
     assert.equal(row.deleted_at === null, cash > 0n);
     assert.equal((await service.list(owner)).mixes.some(m => m.id === made.mixId), cash > 0n);
     if (cash > 0n) assert.equal((await service.list(owner)).mixes.find(m => m.id === made.mixId)?.status, 'ready_to_delete');
+  });
+});
+
+test('mix weight change with the yield strategy on: the owner intent re-consents for the new weights after the enroll; unreadable -> 503 before publishing', async () => {
+  await fixture(async (service, db, deps) => {
+    const made = await service.create({ assets: [{ assetId: T.assets.NVDAB.token, weightBps: 10000 }],
+      rebalance: { frequency: 'monthly', startDate: '2026-11-01' }, exit: { takeProfitBps: null, stopLossBps: null } }, owner, randomUUID());
+    await service.confirm(made.mixId, owner, { txHash: toHex(11n, { size: 32 }) });
+    const tsla = strategyMarkets().find(m => m.symbol === 'TSLAB'); assert.ok(tsla);
+    const consent = consentCalls([{ market: tsla, maxDebtRaw: 10n ** 20n }]);
+    const seen: Parameters<MixServiceDeps['strategyConsent']>[0][] = [];
+    let registered = 0;
+    const on = createMixService({ ...deps, register: async (...a) => { registered++; return deps.register(...a); },
+      strategyConsent: async input => { seen.push(input); return consent; } });
+    const changed = await on.patch(made.mixId, owner, { assets: [{ assetId: T.assets.TSLAB.token, weightBps: 10000 }] });
+    assert.ok('calls' in changed);
+    // NVDAB (removed, sold after repaying) gets no consent; the mix is worth 130 USD in the fixture plan.
+    assert.equal(seen.length, 1);
+    assert.deepEqual(seen[0]?.assets.map(a => a.address), [T.assets.TSLAB.token, T.contracts.usdt]);
+    assert.equal(seen[0]?.totalValueUsd, 130n * WAD);
+    assert.ok(seen[0]?.previousAssets.includes(T.assets.NVDAB.token));
+    const stored = (await db.query<{ owner_calls: { to: string; data: string }[] }>("select owner_calls from mix_switch_intents where mix_id=$1 and state='prepared'", [made.mixId])).rows[0];
+    assert.ok(stored);
+    assert.deepEqual(stored.owner_calls.slice(-consent.length), consent, 'consent after the enroll');
+    assert.match(stored.owner_calls[stored.owner_calls.length - consent.length - 1]?.data ?? '', /^0x/);
+    assert.deepEqual(changed.calls, stored.owner_calls);
+    assert.equal(registered, 1);
+    // Unreadable strategy state: nothing is published, the owner retries.
+    await db.query("update mix_switch_intents set state='cancelled' where mix_id=$1 and state='prepared'", [made.mixId]);
+    const down = createMixService({ ...deps, register: async (...a) => { registered++; return deps.register(...a); },
+      strategyConsent: async () => { throw new Error('private RPC'); } });
+    await assert.rejects(down.patch(made.mixId, owner, { assets: [{ assetId: T.assets.WBNB.token, weightBps: 10000 }] }), (e: unknown) => e instanceof Error && 'status' in e && e.status === 503);
+    assert.equal(registered, 1, 'no strategy published');
   });
 });

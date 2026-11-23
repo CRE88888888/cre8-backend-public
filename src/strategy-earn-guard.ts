@@ -61,6 +61,16 @@ export const STRATEGY_EARN_97 = {
  * usable for these markets (the policy is rebuilt as installed); a buy that wants the newer markets asks for a renewal.
  */
 export const STRATEGY_EARN_LEGACY_MARKET_IDS = STRATEGY_EARN_97.markets.slice(0, 5).map(m => m.marketId);
+/**
+ * Contracts that move a portfolio's own tokens for Strategy Earn: AtpBorrowExecutor (pulls collateral, takes a cash
+ * repayment, returns Venus collateral), the strategy vault (redeems the strategy's USDT back after a full repayment,
+ * pays its incentive), Lista Moolah (returns Lista collateral, pays incentives) and the Venus collateral / loan vTokens
+ * (pay incentives). A token transfer between the account and one of these stays inside the portfolio: the posted
+ * shares are still counted as holdings, the vault and debt are the strategy's own money. My mix flow accounting
+ * (src/mix-flows.ts) must not book them as an owner deposit or withdrawal.
+ */
+export const STRATEGY_EARN_INTERNAL: ReadonlySet<string> = new Set([STRATEGY_EARN_97.executor, STRATEGY_EARN_97.earnVault, STRATEGY_EARN_97.listaMoolah,
+  STRATEGY_EARN_97.vUSDT, ...STRATEGY_EARN_97.markets.flatMap(m => m.collateralVToken === null ? [] : [m.collateralVToken])]);
 /** Throws if a yield market/target/token is the strategy vault; old AtpExecutor must never touch it. */
 export function assertNotStrategyVault(input: { marketId?: string | null; address?: string | null }): void {
   if ((input.marketId && input.marketId.toLowerCase() === STRATEGY_EARN_97.earnVaultMarketId) ||

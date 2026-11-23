@@ -106,7 +106,7 @@ test('#199 borrow plan: 2% under target LTV, existing debt counted, never negati
   function E17() { return 10n ** 17n; }
 });
 
-test('#199 calls: open approves only AtpBorrowExecutor and borrows into the vault; close repays first, then withdraws', () => {
+test('#199 calls: open approves only AtpBorrowExecutor and borrows into the vault; close repays first, then withdraws, then withdraws consent', () => {
   const open = openCalls(nvda, account, 5n * E18, 100n * E18, 110n * E18, 1_700_000_000n);
   const decoded = open.map(c => ({ to: c.to.toLowerCase(), ...decodeFunctionData({ abi: STRATEGY_EARN_ABI, data: c.data }) }));
   assert.deepEqual(decoded.map(d => [d.to, d.functionName]), [[S.venusComptroller, 'updateDelegate'], [S.registry, 'setBorrowPolicy'], [nvda.collateral, 'approve'],
@@ -118,7 +118,7 @@ test('#199 calls: open approves only AtpBorrowExecutor and borrows into the vaul
   assert.equal(openCalls(nvda, account, 1n, 0n, 1n, 1n).some(c => decodeFunctionData({ abi: STRATEGY_EARN_ABI, data: c.data }).functionName === 'executeBorrow'), false);
   const close = closeCalls(nvda, account, 1_700_000_000n).map(c => decodeFunctionData({ abi: STRATEGY_EARN_ABI, data: c.data }));
   assert.deepEqual(close.map(c => [c.functionName, c.args]), [['executeRepay', [account, nvda.marketId, maxUint256, true, 1_700_000_000n]],
-    ['executeWithdrawCollateral', [account, nvda.marketId, maxUint256, 1_700_000_000n]]]);
+    ['executeWithdrawCollateral', [account, nvda.marketId, maxUint256, 1_700_000_000n]], ['setBorrowPolicy', [nvda.marketId, 0n, false]]]);
 });
 
 type Fake = { statuses: Record<string, StatusReading | null>; ids: Hex[]; held: bigint; collateral: bigint; prices: Record<string, bigint>;
@@ -181,8 +181,17 @@ test('#199 portfolio view: net value = collateral + vault - debt per position, k
   for (const bad of [{ asset: 'TQQQB', collateralRaw: '1' }, { asset: 'NVDAB', collateralRaw: '0' }, { asset: 'NVDAB', collateralRaw: '1.5' }, { asset: 'NVDAB' }, { asset: 'NVDAB', collateralRaw: '1', x: 1 }, null]) {
     await assert.rejects(earn.open(3, account, bad), (e: unknown) => e instanceof AppError && e.status === 400);
   }
-  assert.equal((await earn.close(3, account, { asset: 'NVDAB' })).calls.length, 2);
-  await assert.rejects(createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio({ personalMix: true }) as never }).open(3, account, { asset: 'NVDAB', collateralRaw: '1' }), isError(409, 'MIX_NO_STRATEGY_EARN'));
+  assert.equal((await earn.close(3, account, { asset: 'NVDAB' })).calls.length, 3);
+  // Close skips what is not there: collateral posted but nothing borrowed -> no repay (NothingToRepay would revert the UserOp).
+  const unborrowed = { ...f, statuses: { ...f.statuses, [nvda.marketId]: status() } };
+  assert.deepEqual((await createStrategyEarn({ chainId: 97, chain: () => fakeChain(unborrowed), owned: ownedPortfolio() as never }).close(3, account, { asset: 'NVDAB' }))
+    .calls.map(c => decodeFunctionData({ abi: STRATEGY_EARN_ABI, data: c.data }).functionName), ['executeWithdrawCollateral', 'setBorrowPolicy']);
+  // My mix: the mix's own account; an exiting / exited / deleting mix takes no new collateral or borrowing.
+  const mixRow = (busy: boolean) => (async () => ({ rows: [{ busy }] })) as never;
+  const mixEarn = (busy: boolean) => createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio({ personalMix: true }) as never, query: mixRow(busy) });
+  assert.equal((await mixEarn(false).open(3, account, { asset: 'NVDAB', collateralRaw: String(2n * E18) })).status, 'ready');
+  await assert.rejects(mixEarn(true).open(3, account, { asset: 'NVDAB', collateralRaw: '1' }), isError(409, 'MIX_EXITING'));
+  assert.equal((await mixEarn(true).close(3, account, { asset: 'NVDAB' })).calls.length, 3, 'a mix that is exiting can always settle');
   await assert.rejects(createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio({ chainId: 56 }) as never }).close(3, account, { asset: 'NVDAB' }), isError(403, 'FORBIDDEN'));
   await assert.rejects(createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: (async () => { throw new ForbiddenError('not yours'); }) as never }).portfolio(3, account),
     (e: unknown) => e instanceof AppError && e.status === 403);

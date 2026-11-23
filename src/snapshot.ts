@@ -459,7 +459,8 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
   // 兩者互不相依，所以並行；`scanPortfolioHoldings` 成功時會自己推進游標（那是觀測證據，不是排程
   // 決策），漂移與快照仍然只有 `writeSnapshot` 會寫——那是本函式「不寫任何東西」的唯一例外。
   // Strategy Earn (backend#204): posted shares are still this portfolio's holding. Unknown -> throw (never value them as 0).
-  const strategyEarn = chainId === 97 && !personalMix
+  // My mix too: without them a posted asset would read as sold, the planner would buy it again and the return would jump.
+  const strategyEarn = chainId === 97
     ? await (deps.strategyEarnCollateral ?? ((a: Address, b: bigint) => readStrategyEarnCollateral(client, a, b)))(account, block)
         .catch(() => { throw new Error('strategy earn collateral unavailable'); })
     : [];

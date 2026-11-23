@@ -103,8 +103,12 @@ export type StrategyEarnChain = {
   /** Pending incentives owed to this account (claim pays only to it), USDT raw: strategy vault, and the market's own
    * (Venus collateral vToken, or Lista Moolah per market id). */
   rewards(market: StrategyMarket, account: Address, block: bigint): Promise<{ vault: bigint; collateral: bigint }>;
-  /** Owner consent for this market (AtpBorrowRegistry.policies): enabled with a debt ceiling. */
-  policy(account: Address, marketId: Hex, block: bigint): Promise<{ maxDebt: bigint; enabled: boolean }>;
+  /** Owner consent for this market (AtpBorrowRegistry.policies): enabled with a debt ceiling, pinned to the enrollment
+   * (strategy id + version) it was given under. */
+  policy(account: Address, marketId: Hex, block: bigint): Promise<{ maxDebt: bigint; enabled: boolean; strategyId?: bigint; version?: number }>;
+  /** AtpRegistry.enrollments(account). A My mix weight change re-enrolls the same account into a new private strategy, which
+   * voids consent given before it (AtpBorrowRegistry._consent: ConsentRequired). Absent in old test fakes = consent is current. */
+  enrollment?(account: Address, block: bigint): Promise<{ strategyId: bigint; version: number }>;
   /** The portfolio's enrolled version on AtpRegistry: assets and weights (lowercase). */
   weights(account: Address, block: bigint): Promise<{ asset: Address; weightBps: number }[]>;
 };
@@ -138,8 +142,12 @@ export function createStrategyEarnChain(client: PublicClient): StrategyEarnChain
       return v.assets.map((asset, i) => ({ asset: asset.toLowerCase() as Address, weightBps: Number(v.weightsBps[i] ?? 0) }));
     },
     async policy(account, marketId, block) {
-      const [maxDebt, , , enabled] = await read(S.registry, 'policies', [account, marketId], block) as readonly [bigint, bigint, number, boolean];
-      return { maxDebt, enabled };
+      const [maxDebt, strategyId, version, enabled] = await read(S.registry, 'policies', [account, marketId], block) as readonly [bigint, bigint, number, boolean];
+      return { maxDebt, enabled, strategyId, version: Number(version) };
+    },
+    async enrollment(account, block) {
+      const [strategyId, version] = await read(TESTNET_97.contracts.registry as Address, 'enrollments', [account], block) as readonly [bigint, number, boolean];
+      return { strategyId, version: Number(version) };
     },
   };
 }
@@ -162,12 +170,17 @@ export function openCalls(market: StrategyMarket, account: Address, collateralRa
     ...(borrowRaw > 0n ? [call(S.executor, 'executeBorrow', [account, market.marketId, borrowRaw, deadline])] : []),
   ];
 }
-/** Close = repay everything (vault first, then the account's own USDT), then take all collateral back. Order matters. */
+/**
+ * Close = repay everything (vault first, then the account's own USDT), then take all collateral back. Order matters.
+ * Then withdraw the consent for this market: an enabled policy is what the scheduler's auto-open reads after every
+ * quiet round, so without it a turned-off strategy would be posted again with the next fill.
+ */
 export function closeCalls(market: StrategyMarket, account: Address, deadline: bigint): Call[] {
   const S = STRATEGY_EARN_97;
   return [
     call(S.executor, 'executeRepay', [account, market.marketId, maxUint256, true, deadline]),
     call(S.executor, 'executeWithdrawCollateral', [account, market.marketId, maxUint256, deadline]),
+    call(S.registry, 'setBorrowPolicy', [market.marketId, 0n, false]),
   ];
 }
 
@@ -201,6 +214,64 @@ export function borrowPlan(input: { existingCollateralValue: bigint; addedCollat
   const borrowRaw = valueToBorrow * 10n ** 8n / input.usdtPriceE8;
   const maxDebtRaw = (input.currentDebtRaw + borrowRaw) * MAX_DEBT_BUFFER_BPS / 10_000n;
   return { borrowRaw, maxDebtRaw };
+}
+
+/**
+ * Usable consent: enabled with a ceiling and given under the account's current enrollment. One enrollment read per call,
+ * only when some policy is enabled. Funds never re-enroll, so for them this is just "enabled with a ceiling".
+ */
+export async function consentedMarkets(chain: StrategyEarnChain, account: Address, block: bigint, markets: readonly StrategyMarket[]): Promise<Map<Hex, bigint>> {
+  const policies = await Promise.all(markets.map(async m => ({ m, p: await chain.policy(account, m.marketId, block) })));
+  const enabled = policies.filter(x => x.p.enabled && x.p.maxDebt > 0n);
+  if (enabled.length === 0) return new Map();
+  const e = chain.enrollment ? await chain.enrollment(account, block) : null;
+  return new Map(enabled.filter(x => e === null || x.p.strategyId === undefined || (x.p.strategyId === e.strategyId && x.p.version === e.version))
+    .map(x => [x.m.marketId, x.p.maxDebt]));
+}
+
+/**
+ * The consent an owner signs for a set of target weights (`valueUsd`: what each eligible asset will be worth, USD 1e18):
+ * one debt ceiling per market at the target ratio +10%, skipping markets whose gate is not open (EARN_UX D) or that
+ * would borrow nothing. Leveraged products are never in STRATEGY_EARN_97.markets.
+ */
+async function consentQuotes(chain: StrategyEarnChain, account: Address, head: { number: bigint }, eligible: readonly StrategyMarket[],
+  usdtPrice: bigint, valueUsd: (m: StrategyMarket, price: bigint, held: bigint) => bigint) {
+  return Promise.all(eligible.map(async m => {
+    try {
+      const [st, held, price] = await Promise.all([chain.status(m.marketId, account, head.number), chain.balance(m.collateral, account, head.number), chain.price(m.collateral, head.number)]);
+      if (st.gate !== 0) return { market: m, status: 'unavailable' as const, reason: GATE_REASONS[st.gate] ?? 'closed' };
+      const plan = borrowPlan({ existingCollateralValue: st.health.collateralValue, addedCollateralValue: valueUsd(m, price, held), existingDebtValue: st.health.debtValue,
+        targetLtv: st.targetLtv, usdtPriceE8: usdtPrice, currentDebtRaw: st.debt });
+      if (plan.maxDebtRaw === 0n) return { market: m, status: 'unavailable' as const, reason: 'nothing_to_borrow' };
+      return { market: m, status: 'ready' as const, maxDebtRaw: plan.maxDebtRaw, extraApyBps: extraApy(st, st.targetLtv).totalBps };
+    } catch { return { market: m, status: 'unavailable' as const, reason: 'data_unavailable' }; }
+  }));
+}
+
+/**
+ * My mix weight change (src/mixes.ts): the change re-enrolls the account, which voids the yield strategy consent given
+ * under the old enrollment. When the strategy is on for this account (a posted position, or consent waiting for a fill),
+ * the same owner signature re-consents for every eligible asset in the NEW weights — newly added assets included. Assets
+ * the change removes get no consent; the scheduler repays and takes their shares back before selling them
+ * (strategyEarnUnwindForSale), as for a fund. Returns [] when the strategy is off or nothing is eligible.
+ * `totalValueUsd` (1e18) is the mix's value; each asset's ceiling assumes it reaches its target weight.
+ */
+export async function mixStrategyConsentCalls(input: { account: Address; previousAssets: readonly string[]; assets: readonly { address: string; weightBps: number }[];
+  totalValueUsd: bigint }, chain: StrategyEarnChain = defaultStrategyEarnChain()): Promise<Call[]> {
+  const account = input.account.toLowerCase() as Address;
+  const markets = strategyMarkets();
+  const head = await chain.head();
+  const ids = await chain.accountMarkets(account, head.number);
+  const posted = await Promise.all(markets.filter(m => ids.includes(m.marketId)).map(async m => (await chain.collateral(m.marketId, account, head.number)) > 0n));
+  const previous = markets.filter(m => input.previousAssets.some(a => a.toLowerCase() === m.collateral));
+  const on = posted.some(Boolean) || (await consentedMarkets(chain, account, head.number, previous)).size > 0;
+  if (!on) return [];
+  const weight = (m: StrategyMarket) => input.assets.find(a => a.address.toLowerCase() === m.collateral)?.weightBps ?? 0;
+  const eligible = markets.filter(m => weight(m) > 0);
+  if (eligible.length === 0) return [];
+  const usdtPrice = await chain.price(TESTNET_97.contracts.usdt as Address, head.number);
+  const quoted = await consentQuotes(chain, account, head, eligible, usdtPrice, m => input.totalValueUsd * BigInt(weight(m)) / 10_000n);
+  return consentCalls(quoted.flatMap(q => q.status === 'ready' ? [{ market: q.market, maxDebtRaw: q.maxDebtRaw }] : []));
 }
 
 const TEMPORARILY = 'Temporarily unavailable.';
@@ -237,9 +308,17 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
   async function owned(id: number, wallet: string) {
     ready();
     const p = await deps.owned(id, wallet);
-    if (p.personalMix) throw new AppError(409, 'MIX_NO_STRATEGY_EARN', '私人組合目前不提供策略加息。');
     if (p.chainId !== 97 || p.ownerAddress.toLowerCase() !== wallet.toLowerCase()) throw new AppError(403, 'FORBIDDEN', '只能操作本人於這條鏈的帳戶');
     return p.accountAddress.toLowerCase() as Address;
+  }
+  /** My mix: the strategy belongs to the mix's own account (one account per mix). A mix that is exiting (take profit /
+   * stop loss), exited or being deleted sells everything to USDT, so it takes no new collateral or borrowing. */
+  async function mixAccepting(id: number, wallet: string) {
+    const p = await deps.owned(id, wallet);
+    if (!p.personalMix) return;
+    const m = (await deps.query<{ busy: boolean }>(`select (triggered_at is not null or status='exited' or delete_requested_at is not null) as busy
+      from mixes where chain_id=97 and account=$1 and deleted_at is null`, [p.accountAddress.toLowerCase()])).rows[0];
+    if (!m || m.busy) throw new AppError(409, 'MIX_EXITING', '組合正在退出或刪除，不能開啟加息策略。');
   }
   const findMarket = (asset: unknown) => {
     const m = markets.find(x => typeof asset === 'string' && x.symbol === asset);
@@ -301,13 +380,14 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
       // autoOpen: the owner consented (a market's borrow policy is enabled) but nothing is posted yet — the buy has not
       // filled. The scheduler opens it after the fill (strategyEarnAutoOpen); the app shows the switch as on, "starts when your order fills".
       const autoOpen = positions.some(p => p.status === 'on') ? false
-        : (await Promise.all(markets.map(m => chain.policy(account, m.marketId, head.number).then(p => p.enabled && p.maxDebt > 0n, () => false)))).some(Boolean);
+        : await consentedMarkets(chain, account, head.number, markets).then(c => c.size > 0, () => false);
       return { portfolioId: id, account, status: 'ok' as const, reason: null, message: null, updatedAt: new Date(Number(head.timestamp) * 1000).toISOString(),
         earnNetUsd: earnNetUsd.toString(), autoOpen, positions };
     },
     /** One owner UserOp: consent + approvals (to AtpBorrowExecutor only) + post collateral + borrow into the vault. */
     async open(id: number, wallet: string, input: unknown) {
       const account = await owned(id, wallet);
+      await mixAccepting(id, wallet);
       const b = body(input, ['asset', 'collateralRaw']);
       const market = findMarket(b.asset);
       if (typeof b.collateralRaw !== 'string' || !/^[1-9][0-9]{0,77}$/.test(b.collateralRaw)) throw new ValidationError('INVALID_AMOUNT', 'collateralRaw 須為正整數字串。');
@@ -340,6 +420,7 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
      */
     async auto(id: number, wallet: string, input: unknown) {
       const account = await owned(id, wallet);
+      await mixAccepting(id, wallet);
       const b = body(input, ['budgetRaw']);
       if (typeof b.budgetRaw !== 'string' || !/^(0|[1-9][0-9]{0,77})$/.test(b.budgetRaw)) throw new ValidationError('INVALID_AMOUNT', 'budgetRaw 須為非負整數字串。');
       const budget = BigInt(b.budgetRaw);
@@ -351,19 +432,9 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
       try { [weights, usdtPrice] = await Promise.all([chain.weights(account, head.number), chain.price(TESTNET_97.contracts.usdt as Address, head.number)]); }
       catch { return { status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY }; }
       const eligible = markets.filter(m => weights.some(w => w.asset === m.collateral && w.weightBps > 0));
-      const quoted = await Promise.all(eligible.map(async m => {
-        try {
-          const w = weights.find(x => x.asset === m.collateral)?.weightBps ?? 0;
-          const [st, held, price] = await Promise.all([chain.status(m.marketId, account, head.number), chain.balance(m.collateral, account, head.number), chain.price(m.collateral, head.number)]);
-          if (st.gate !== 0) return { market: m, status: 'unavailable' as const, reason: GATE_REASONS[st.gate] ?? 'closed' };
-          // USD (1e18): new money's share of this asset + what the portfolio already holds of it.
-          const value = budget * BigInt(w) / 10_000n * usdtPrice / 10n ** 8n + usdValue(held, price, m.decimals);
-          const plan = borrowPlan({ existingCollateralValue: st.health.collateralValue, addedCollateralValue: value, existingDebtValue: st.health.debtValue,
-            targetLtv: st.targetLtv, usdtPriceE8: usdtPrice, currentDebtRaw: st.debt });
-          if (plan.maxDebtRaw === 0n) return { market: m, status: 'unavailable' as const, reason: 'nothing_to_borrow' };
-          return { market: m, status: 'ready' as const, maxDebtRaw: plan.maxDebtRaw, extraApyBps: extraApy(st, st.targetLtv).totalBps };
-        } catch { return { market: m, status: 'unavailable' as const, reason: 'data_unavailable' }; }
-      }));
+      // USD (1e18): new money's share of this asset + what the portfolio already holds of it.
+      const quoted = await consentQuotes(chain, account, head, eligible, usdtPrice, (m, price, held) =>
+        budget * BigInt(weights.find(x => x.asset === m.collateral)?.weightBps ?? 0) / 10_000n * usdtPrice / 10n ** 8n + usdValue(held, price, m.decimals));
       const ready = quoted.filter((q): q is Extract<typeof q, { status: 'ready' }> => q.status === 'ready');
       const assets = quoted.map(q => q.status === 'ready' ? { asset: q.market.symbol, status: q.status, maxDebtRaw: q.maxDebtRaw.toString(), extraApyBps: q.extraApyBps }
         : { asset: q.market.symbol, status: q.status, reason: q.reason, message: TEMPORARILY });
@@ -373,11 +444,13 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
     },
     /** Activity (EARN_UX B.6): newest first, one plain sentence each, from the verified ledger (db 0063). */
     async activity(id: number, wallet: string) {
-      await owned(id, wallet);
+      const account = await owned(id, wallet);
+      // A My mix weight change moves the same account to a new portfolio id; its earlier strategy events stay with the mix.
       const rows = (await deps.query<{ kind: StrategyEarnKind; asset: string | null; amount_raw: string; collateral_raw: string; ltv_before_bps: number | null;
         ltv_after_bps: number | null; tx_hash: string; block_number: string; created_at: Date | string }>(
         `select kind, asset, amount_raw::text, collateral_raw::text, ltv_before_bps, ltv_after_bps, tx_hash, block_number::text, created_at
-           from strategy_earn_events where chain_id = 97 and portfolio_id = $1 order by block_number desc, log_index desc limit 50`, [id])).rows;
+           from strategy_earn_events where chain_id = 97 and (portfolio_id = $1 or portfolio_id in (select h.portfolio_id from mix_portfolio_history h
+             join mixes m on m.id = h.mix_id where m.chain_id = 97 and m.account = $2)) order by block_number desc, log_index desc limit 50`, [id, account])).rows;
       return { portfolioId: id, activity: rows.map(r => {
         const e = { kind: r.kind, asset: r.asset, amountRaw: BigInt(r.amount_raw), collateralRaw: BigInt(r.collateral_raw), ltvBeforeBps: r.ltv_before_bps, ltvAfterBps: r.ltv_after_bps };
         return { kind: r.kind, asset: r.asset, amountRaw: r.amount_raw, collateralRaw: r.collateral_raw, ltvBeforeBps: r.ltv_before_bps, ltvAfterBps: r.ltv_after_bps,
@@ -389,7 +462,19 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
       const account = await owned(id, wallet);
       const market = findMarket(body(input, ['asset']).asset);
       const deadline = BigInt(Math.floor(deps.now().getTime() / 1000) + 30 * 60);
-      return { status: 'ready' as const, asset: market.symbol, calls: closeCalls(market, account, deadline) };
+      const calls = closeCalls(market, account, deadline);
+      // Collateral posted but nothing borrowed (gate was closed at open): executeRepay would revert NothingToRepay and take
+      // the whole UserOp with it; with nothing posted executeWithdrawCollateral reverts ZeroAmount. Skip what is not there.
+      // Unreadable -> keep every call (the chain still refuses anything wrong).
+      const l = await live();
+      if (l) {
+        try {
+          const [st, posted] = await Promise.all([l.chain.status(market.marketId, account, l.head.number), l.chain.collateral(market.marketId, account, l.head.number)]);
+          const [repay, withdraw, consent] = calls as [Call, Call, Call];
+          return { status: 'ready' as const, asset: market.symbol, calls: [...(st.debt > 0n || st.vaultAssets > 0n ? [repay] : []), ...(posted > 0n ? [withdraw] : []), consent] };
+        } catch { /* fall through */ }
+      }
+      return { status: 'ready' as const, asset: market.symbol, calls };
     },
   };
 }
@@ -615,6 +700,9 @@ export const MIN_AUTO_OPEN_USD = 10n * E18;
 /** Sends one session-key UserOp from the account (AtpBorrowExecutor calls only) and returns the mined receipt. */
 export type StrategyEarnSend = (calls: Call[]) => Promise<StrategyEarnTx>;
 export type StrategyEarnStepArgs = { chain: StrategyEarnChain; account: Address; portfolioId: number; now: Date; dryRun: boolean;
+  /** Collateral the planner saw in the account (lowercase); when given, only those markets are read (fewer RPC reads
+   * per quiet round). Absent = every market. */
+  held?: readonly string[];
   /** null: no session key with the #204 permissions (owner has not renewed) — the step only reports. */
   send: StrategyEarnSend | null;
   /** Markets the session key may call (its installed ONE_OF list); absent = every market. A key renewed before
@@ -631,15 +719,21 @@ const keyCovers = (args: Pick<StrategyEarnStepArgs, 'sendable'>, m: StrategyMark
  */
 export async function strategyEarnAutoOpen(args: StrategyEarnStepArgs): Promise<string | null> {
   const { chain, account } = args;
+  const candidates = strategyMarkets().filter(m => args.held === undefined || args.held.some(a => a.toLowerCase() === m.collateral));
+  if (candidates.length === 0) return null;
   const head = await chain.head();
+  // Consent given under the current enrollment only: after a My mix weight change, consent from before it is void on chain.
+  const consented = await consentedMarkets(chain, account, head.number, candidates);
+  if (consented.size === 0) return null;
   const usdtPrice = await chain.price(TESTNET_97.contracts.usdt as Address, head.number);
   const calls: Call[] = [];
   const opened: string[] = [];
   const renewal: string[] = [];
   const deadline = BigInt(Math.floor(args.now.getTime() / 1000) + 30 * 60);
-  for (const m of strategyMarkets()) {
-    const policy = await chain.policy(account, m.marketId, head.number);
-    if (!policy.enabled || policy.maxDebt === 0n) continue;
+  for (const m of candidates) {
+    const maxDebt = consented.get(m.marketId);
+    if (maxDebt === undefined) continue;
+    const policy = { maxDebt };
     const held = await chain.balance(m.collateral, account, head.number);
     if (held === 0n) continue;
     if (!keyCovers(args, m)) { renewal.push(m.symbol); continue; }

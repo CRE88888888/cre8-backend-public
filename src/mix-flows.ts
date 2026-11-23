@@ -7,6 +7,7 @@ import type { CashWithdrawal } from './cash-reconciliation.js';
 import { mixUnavailable } from './mix-store.js';
 import { TESTNET_97 as T } from './testnet-profile.js';
 import { findDeploymentBlock } from './holdings-scan.js';
+import { STRATEGY_EARN_INTERNAL } from './strategy-earn-guard.js';
 export type MixFlow = { kind: 'deposit' | 'withdrawal'; amountRaw: string; txHash: Hex; logIndex: number;
   blockNumber: bigint; blockHash: Hex; at: Date; asset: Address; quantityRaw: string; quote: MixFlowQuote };
 export type MixFlowQuote = { decimals: number; priceUsdE8: bigint; source: string; at: Date };
@@ -28,6 +29,8 @@ export async function verifyMixBlock(expected: Hex | null, read: () => Promise<H
 export function mixFlowDirection(from: string, to: string, m: MixFlowAccount): MixFlow['kind'] | null {
   const sender = from.toLowerCase(), recipient = to.toLowerCase();
   if (sender === recipient) return null;
+  // Yield strategy (posting/returning shares, repaying, the strategy vault and incentives) stays inside the mix.
+  if (STRATEGY_EARN_INTERNAL.has(sender) || STRATEGY_EARN_INTERNAL.has(recipient)) return null;
   if (recipient === m.account && sender !== T.contracts.executor) return 'deposit';
   if (sender === m.account && recipient !== T.contracts.executor) return 'withdrawal';
   return null;

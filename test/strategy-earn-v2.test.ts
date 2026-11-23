@@ -159,8 +159,12 @@ test('#204 POST auto: eligible assets from the enrolled version; ceiling = (new 
   for (const bad of [{ budgetRaw: '-1' }, { budgetRaw: '1.5' }, { budgetRaw: 1 }, {}, { budgetRaw: '1', x: 1 }]) {
     await assert.rejects(earn.auto(3, account, bad), (e: unknown) => e instanceof AppError && e.status === 400);
   }
-  await assert.rejects(createStrategyEarn({ chainId: 97, chain: () => chainOf(f), owned: owned({ personalMix: true }) }).auto(3, account, { budgetRaw: '1' }),
-    (e: unknown) => e instanceof AppError && e.code === 'MIX_NO_STRATEGY_EARN');
+  // My mix: same consent on the mix's own account (one account per mix); refused while the mix is exiting or deleting.
+  const mixQuery = (busy: boolean) => (async (sql: string) => sql.includes('from mixes') ? { rows: [{ busy }] } : { rows: [] }) as never;
+  const mix = await createStrategyEarn({ chainId: 97, chain: () => chainOf(f), owned: owned({ personalMix: true }), query: mixQuery(false) }).auto(3, account, { budgetRaw: String(1000n * E18) });
+  assert.ok('calls' in mix && mix.calls); assert.deepEqual(mix.calls, r.calls);
+  await assert.rejects(createStrategyEarn({ chainId: 97, chain: () => chainOf(f), owned: owned({ personalMix: true }), query: mixQuery(true) }).auto(3, account, { budgetRaw: '1' }),
+    (e: unknown) => e instanceof AppError && e.code === 'MIX_EXITING');
 });
 
 // ---- ledger events ----------------------------------------------------------------------------------------------
@@ -228,14 +232,15 @@ test('#204 activity sentences: one plain sentence per kind, no collateral / LTV 
 
 test('#204 GET activity: newest first from the ledger, owner only', async () => {
   const sqls: string[] = [];
-  const query = (async (sql: string, params: unknown[]) => { sqls.push(sql); assert.deepEqual(params, [3]); return { rows: [
+  const query = (async (sql: string, params: unknown[]) => { sqls.push(sql); assert.deepEqual(params, [3, account]); return { rows: [
     { kind: 'deleverage', asset: 'NVDAB', amount_raw: String(6750n * E16), collateral_raw: '0', ltv_before_bps: 4174, ltv_after_bps: 3000, tx_hash: '0x' + '01'.repeat(32), block_number: '9', created_at: new Date('2026-11-23T01:00:00Z') },
   ] }; }) as never;
   const r = await createStrategyEarn({ chainId: 97, chain: () => chainOf({}), owned: owned(), query }).activity(3, account);
   assert.deepEqual(r.activity, [{ kind: 'deleverage', asset: 'NVDAB', amountRaw: String(6750n * E16), collateralRaw: '0', ltvBeforeBps: 4174, ltvAfterBps: 3000,
     txHash: '0x' + '01'.repeat(32), blockNumber: '9', createdAt: '2026-11-23T01:00:00.000Z',
     message: 'NVDAB fell, so we automatically used 67.50 USDT from Earn to stay safe (safety level 41.7% → 30.0%).' }]);
-  assert.match(sqls[0] ?? '', /from strategy_earn_events where chain_id = 97 and portfolio_id = \$1 order by block_number desc, log_index desc/);
+  assert.match(sqls[0] ?? '', /from strategy_earn_events where chain_id = 97 and \(portfolio_id = \$1 or portfolio_id in \(select h\.portfolio_id from mix_portfolio_history h/);
+  assert.match(sqls[0] ?? '', /m\.account = \$2\)\) order by block_number desc, log_index desc limit 50/);
   await assert.rejects(createStrategyEarn({ chainId: 97, chain: () => chainOf({}), owned: (async () => { throw new AppError(403, 'FORBIDDEN', 'no'); }) as never, query }).activity(3, account),
     (e: unknown) => e instanceof AppError && e.status === 403);
 });

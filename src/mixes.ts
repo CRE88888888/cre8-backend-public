@@ -23,6 +23,7 @@ import type { MixRow, MixSnapshot } from './mix-store.js';
 import { mixAnchor, mixValue, saveMixValuation } from './mix-valuation.js';
 import type { MixValuation } from './mix-valuation.js';
 import { MIX_EXIT_DUST_RAW } from './mix-runtime.js';
+import { mixStrategyConsentCalls } from './strategy-earn.js';
 
 export type MixServiceDeps = {
   query: typeof query; transaction: typeof withTransaction; lock: typeof withMixLock; now: () => Date; chainId: () => number;
@@ -31,12 +32,14 @@ export type MixServiceDeps = {
   preview: ReturnType<typeof createMixPreview>;
   maxAssets: () => Promise<number>; anchor: typeof mixAnchor; context: typeof mixIntentContext; findEnrollment: typeof findMixEnrollment;
   syncFlows: (m: MixRow, proof: import('./mix-store.js').MixEnrollmentProof) => Promise<void>;
+  /** Yield strategy consent to re-sign with a weight change (src/strategy-earn.ts mixStrategyConsentCalls); [] when off. */
+  strategyConsent: typeof mixStrategyConsentCalls;
 };
 const defaults: MixServiceDeps = { query, transaction: withTransaction, lock: withMixLock, now: () => new Date(), chainId: configuredChainId,
   creationLock: withMixCreationLock, register: registerMixStrategy, prepareAccount: preparePortfolioEnrollment, enroll: enrollPortfolio, calls: prepareMixCalls,
   proof: readMixEnrollmentProof, plan: planPortfolio, anchor: mixAnchor, context: mixIntentContext, findEnrollment: findMixEnrollment, preview: createMixPreview(), syncFlows: async (m, proof) => {
     await syncMixEnrollmentFlows(getChain().publicClient, m, proof);
-  }, maxAssets: async () => Number(await getChain().publicClient.readContract({ address: getChain().registryAddress, abi: (await import('./registry-abi.js')).REGISTRY_VERSION_ABI, functionName: 'MAX_STRATEGY_ASSETS' })) };
+  }, strategyConsent: (input) => mixStrategyConsentCalls(input), maxAssets: async () => Number(await getChain().publicClient.readContract({ address: getChain().registryAddress, abi: (await import('./registry-abi.js')).REGISTRY_VERSION_ABI, functionName: 'MAX_STRATEGY_ASSETS' })) };
 const MIX_CASH = TESTNET_97.contracts.usdt.toLowerCase();
 const notFound = () => new AppError(404, 'MIX_NOT_FOUND', '找不到這個私人組合或分享連結。');
 export function createMixService(overrides: Partial<MixServiceDeps> = {}) {
@@ -312,11 +315,16 @@ export function createMixService(overrides: Partial<MixServiceDeps> = {}) {
         const max = await deps.maxAssets();
         const allocation = mixChainAllocation(settings.assets, plan.snapshot.holdings.filter(a => prior.user_allocation[a.asset] !== undefined || prior.exit_assets.includes(a.asset as Address))
           .map(a => ({ assetId: a.asset as Address, balanceRaw: a.amountWei })), Number(max));
+        const previous = [...Object.keys(prior.user_allocation), ...prior.exit_assets];
+        // Yield strategy on: the enroll voids its consent, so the same signature re-consents for the new weights (after the
+        // enroll). Read before anything is published, so an unreadable chain leaves no orphan strategy behind.
+        const consent = await deps.strategyConsent({ account: m.account, previousAssets: previous,
+          assets: allocation.assets.filter(a => !allocation.sellOnlyAssets.includes(a.address)), totalValueUsd: plan.report.totalUsdE8 * 10n ** 10n })
+          .catch(error => { throw mixUnavailable('strategy-consent', error); });
         // Cancel only known, unsent remaining work before preparing the owner intent.
         await deps.transaction(client => quiesceMix(client, 97, Number(h.portfolio_id)));
         const strategyId = await deps.register(m.owner, settings.name, { assets: allocation.assets });
-        const previous = [...Object.keys(prior.user_allocation), ...prior.exit_assets];
-        const calls = await deps.calls(m, strategyId, previous as Address[]), context = await deps.context(m.account);
+        const calls = [...await deps.calls(m, strategyId, previous as Address[]), ...consent], context = await deps.context(m.account);
         await deps.transaction(async client => {
           await client.query('select id from mixes where id=$1 for update', [m.id]);
           await client.query('insert into mix_strategy_settings(strategy_id,mix_id,user_allocation,exit_assets) values($1,$2,$3,$4)',

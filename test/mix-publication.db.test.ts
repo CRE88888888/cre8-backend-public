@@ -153,6 +153,47 @@ test('conflicting version/config quarantines only its job, preserves nonce autho
   }));
 });
 
+// Strategy 54 (2026-11-23): a quarantine raised while a lagging/forked node answered must lift once the chain proves
+// the exact publication; a mismatch that is still there, and identity conflicts, stay for an operator.
+test('a read-flagged quarantine self-heals when receipt, blocks, versionCount/version and settings hash all match now', async () => {
+  await mixDbSandbox(async lane => lane(async () => {
+    const id = await reserve(), f = registrationRpc();
+    f.state.publicationConfigConflict = true; // what the bad read saw
+    await assert.rejects(registerMixStrategy(T.roles.keeper, 'heal', allocation, id, { chain: f.chain }));
+    const sid = await jobId();
+    assert.deepEqual((await query('select state,last_error_code from mix_publication_jobs')).rows[0], { state: 'quarantined', last_error_code: 'PUBLICATION_CONFIG_CONFLICT' });
+    assert.ok((await detectAlerts(query, { env: { CHAIN_ID: '97' }, readGasPrice: async () => 1n, readNativeBalance: async () => 0n })).some(a => a.detail.includes(`strategy ${sid}`)));
+    // Still mismatched on chain: stays quarantined, no version row, no extra signature.
+    assert.equal(await reconcileMixPublication(sid, pubDeps(f), true), 'unresolved');
+    assert.equal((await query('select state from mix_publication_jobs')).rows[0]?.state, 'quarantined');
+    assert.equal((await query('select version from strategy_versions')).rows.length, 0);
+    // The chain matches exactly now: the scheduler's reconciler confirms it and the alert stops.
+    f.state.publicationConfigConflict = false;
+    assert.equal((await reconcileRelayerTransactions({ client: f.client, chain: f.chain, operator: relayerSigner.address, replay: true })).confirmed, 1);
+    assert.deepEqual((await query('select state,last_error_code from mix_publication_jobs')).rows[0], { state: 'confirmed', last_error_code: null });
+    assert.equal((await query('select version from strategy_versions where strategy_id=$1', [sid])).rows.length, 1);
+    assert.equal((await query('select status from mix_publication_receipts')).rows.length, 1, 'one receipt row, never rewritten');
+    assert.equal(f.state.broadcasts.length, 2, 'healing signs nothing');
+    assert.ok(!(await detectAlerts(query, { env: { CHAIN_ID: '97' }, readGasPrice: async () => 1n, readNativeBalance: async () => 0n })).some(a => a.detail.includes(`strategy ${sid}`)));
+    // The user's retry with the same request now succeeds.
+    assert.equal(await registerMixStrategy(T.roles.keeper, 'heal', allocation, id, { chain: f.chain }), Number(sid));
+  }));
+});
+
+test('identity conflicts never self-heal even when the chain matches', async () => {
+  await mixDbSandbox(async lane => lane(async () => {
+    const id = await reserve(), f = registrationRpc();
+    f.state.publicationConfigConflict = true;
+    await assert.rejects(registerMixStrategy(T.roles.keeper, 'no heal', allocation, id, { chain: f.chain }));
+    const sid = await jobId();
+    await query("update mix_publication_jobs set last_error_code='PUBLICATION_NONCE_PROOF_REORG' where strategy_id=$1", [sid]);
+    f.state.publicationConfigConflict = false;
+    assert.equal(await reconcileMixPublication(sid, pubDeps(f), true), 'unresolved');
+    assert.equal((await query('select state from mix_publication_jobs')).rows[0]?.state, 'quarantined');
+    assert.equal((await query('select version from strategy_versions')).rows.length, 0);
+  }));
+});
+
 test('two workers cannot publish the same job and a held job lock never reserves the global relayer', async () => {
   await mixDbSandbox(async lane => {
     const f = registrationRpc(); let sid = '';

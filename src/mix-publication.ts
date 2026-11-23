@@ -13,7 +13,7 @@ import { validateAssetConfig } from './strategy-execution.js';
 import type { AssetExecution } from './strategy-execution.js';
 import type { Allocation } from './strategies.js';
 import { TESTNET_97 as T } from './testnet-profile.js';
-import { AppError } from './errors.js';
+import { AppError, errorChain } from './errors.js';
 import { recordAlerts } from './alerts.js';
 import { findPublicationNonceConsumption, verifyPublicationNonceConsumption } from './mix-publication-nonce.js';
 import type { NonceConsumption } from './mix-publication-nonce.js';
@@ -22,7 +22,7 @@ export type MixPublication = {
   strategy_id: string; chain_id: string; registry: Address; onchain_strategy_id: string; creation_request_id: string | null;
   allocation: Allocation & { p11: VersionSettings }; schedule: { kind: 'funding' }; execution: AssetExecution; config_hash: Hex; calldata: Hex;
   state: 'prepared' | 'submitted' | 'confirmed' | 'quarantined'; created_at: Date; alerted_at: Date | null;
-  published_tx_hash: Hex | null; published_block_number: string | null; published_block_hash: Hex | null;
+  published_tx_hash: Hex | null; published_block_number: string | null; published_block_hash: Hex | null; last_error_code?: string | null;
 };
 type Attempt = { strategy_id: string; attempt: number; signer: Address; nonce: string; tx_hash: Hex; signed_raw_tx: Hex;
   checked_block_number: string; checked_block_hash: Hex; checked_block_time: Date; status: 'success' | 'reverted' | null;
@@ -33,7 +33,14 @@ export type PublicationDeps = { client: PublicClient; chain?: ChainConfig; opera
   lock?: typeof withRelayerLock; jobLock?: typeof withMixCreationLock; timeoutMs?: number; nonceLockMs?: number; deadlineAt?: number; now?: () => Date };
 export const PUBLICATION_ALERT_MS = 60_000;
 const jobColumns = `strategy_id,chain_id,registry,onchain_strategy_id,creation_request_id,allocation,schedule,execution,config_hash,calldata,state,
-  created_at,alerted_at,published_tx_hash,published_block_number,published_block_hash`;
+  created_at,alerted_at,published_tx_hash,published_block_number,published_block_hash,last_error_code`;
+/**
+ * Quarantines that can come from reading the chain through a lagging or briefly forked node (load-balanced RPC):
+ * a block/receipt hash that did not match at that moment, or the old combined config/anchor check. They are lifted
+ * only by `healQuarantine`, which re-proves the whole publication against the chain now. Version-count, nonce
+ * consumption and other identity conflicts never self-heal.
+ */
+export const PUBLICATION_HEALABLE_CODES: ReadonlySet<string> = new Set(['PUBLICATION_RECEIPT_REORG', 'PUBLICATION_HISTORY_REORG', 'PUBLICATION_CONFIG_CONFLICT']);
 const event = parseAbiItem('event VersionPublished(uint256 indexed id,uint16 version,bytes32 scheduleHash)');
 async function bounded<R>(work: Promise<R>, deps: PublicationDeps): Promise<R> {
   const requested = deps.timeoutMs ?? 5000;
@@ -193,7 +200,7 @@ async function verifyComplete(job: MixPublication, proof: { receipt: Transaction
   return { log, version };
 }
 async function complete(job: MixPublication, current: Attempt | null, proof: { receipt: TransactionReceipt; block: Anchor }, observed: Anchor, deps: PublicationDeps,
-  checked?: Awaited<ReturnType<typeof verifyComplete>>) {
+  checked?: Awaited<ReturnType<typeof verifyComplete>>, heal = false) {
   // Same checks as before (verifyComplete); `checked` = they already passed for exactly this proof and observation.
   const { log, version } = checked ?? await verifyComplete(job, proof, observed, deps);
   await deps.transaction(async db => {
@@ -201,9 +208,12 @@ async function complete(job: MixPublication, current: Attempt | null, proof: { r
     await db.query("set local lock_timeout='3s'");
     const locked = (await db.query<{ state: string }>('select state from mix_publication_jobs where strategy_id=$1 for update', [job.strategy_id])).rows[0];
     if (locked?.state === 'confirmed') return;
-    if (!locked || locked.state === 'quarantined') throw mixUnavailable();
-    if (current) await db.query(`insert into mix_publication_receipts(strategy_id,attempt,status,block_number,block_hash,block_time)
-      values($1,$2,'success',$3,$4,$5)`, [job.strategy_id, current.attempt, proof.block.number.toString(), proof.block.hash, proof.block.at]);
+    if (!locked || locked.state === 'quarantined' && !heal) throw mixUnavailable();
+    // A healed job may already hold this exact receipt row (verified canonical above); never rewrite audit rows.
+    if (current && !(await db.query('select 1 from mix_publication_receipts where strategy_id=$1 and attempt=$2', [job.strategy_id, current.attempt])).rows.length) {
+      await db.query(`insert into mix_publication_receipts(strategy_id,attempt,status,block_number,block_hash,block_time)
+        values($1,$2,'success',$3,$4,$5)`, [job.strategy_id, current.attempt, proof.block.number.toString(), proof.block.hash, proof.block.at]);
+    }
     await db.query(`insert into strategy_versions(strategy_id,version,allocation,schedule,execution_schema_version,execution,execution_chain_id,config_hash,active_at)
       values($1,1,$2,$3,2,$4,97,$5,$6)`, [job.strategy_id, JSON.stringify(job.allocation), JSON.stringify(job.schedule), JSON.stringify(job.execution), job.config_hash, new Date(Number(version.activeAt) * 1000)]);
     await db.query(`update mix_publication_jobs set state='confirmed',last_error_code=null,published_tx_hash=$2,published_log_index=$3,
@@ -213,6 +223,48 @@ async function complete(job: MixPublication, current: Attempt | null, proof: { r
         observed.number.toString(), observed.hash, observed.at, new Date(Number(version.activeAt) * 1000)]);
     if (job.creation_request_id) await db.query('update mix_creation_requests set last_error_code=null,updated_at=clock_timestamp() where id=$1', [job.creation_request_id]);
   });
+}
+
+/**
+ * Re-prove a read-flagged quarantine against the chain now (all evidence was just checked canonical by the caller):
+ * our original transaction's receipt and block, success, exactly one VersionPublished(version 1) with this schedule,
+ * versionCount = 1, activeVersion = 1, version 1's config hash recomputed from its assets/weights equal to the job's,
+ * and every block hash stable. All of it must match exactly (read through lagging nodes with the same bounded
+ * retry as a fresh send); then the job is confirmed and its alert stops. Any genuine mismatch keeps the quarantine.
+ */
+async function healQuarantine(job: MixPublication, current: Attempt, deps: PublicationDeps): Promise<boolean> {
+  if (current.status === 'reverted') return false;
+  let conflict = false;
+  let proved: { proof: NonNullable<Awaited<ReturnType<typeof receipt>>>; observed: Anchor; checked: Awaited<ReturnType<typeof verifyComplete>> };
+  try {
+    proved = await untilNodesCatchUp(async () => {
+      try {
+        const proof = await receipt(job, current, deps);
+        if (!proof) throw mixUnavailable('heal-receipt-not-visible');
+        if (proof.receipt.status !== 'success') { conflict = true; throw mixUnavailable('heal-receipt-not-success'); }
+        if (current.block_number !== null && (BigInt(current.block_number) !== proof.block.number || current.block_hash !== proof.block.hash)) {
+          conflict = true; throw mixUnavailable('heal-stored-receipt-differs');
+        }
+        const after = await state(job, deps);
+        if (after.count !== 1n) throw mixUnavailable(`heal-version-count:${after.count}`);
+        return { proof, observed: after.block, checked: await verifyComplete(job, proof, after.block, deps, () => { conflict = true; }) };
+      } catch (error) {
+        if (conflict) throw new AppError(409, 'PUBLICATION_CONFIG_CONFLICT', 'publication does not match the chain', { cause: error });
+        throw error instanceof AppError ? error : mixUnavailable('heal-read', error);
+      }
+    }, () => true);
+  } catch (error) {
+    console.warn(JSON.stringify({ level: 'warn', msg: 'mix_publication_heal_failed', strategyId: job.strategy_id, code: job.last_error_code, cause: errorChain(error) }));
+    return false;
+  }
+  try { await complete(job, current, proved.proof, proved.observed, deps, proved.checked, true); }
+  catch (error) {
+    console.warn(JSON.stringify({ level: 'warn', msg: 'mix_publication_heal_failed', strategyId: job.strategy_id, code: job.last_error_code, cause: errorChain(error) }));
+    return false;
+  }
+  console.info(JSON.stringify({ level: 'info', msg: 'mix_publication_healed', strategyId: job.strategy_id, previousCode: job.last_error_code,
+    txHash: current.tx_hash, blockNumber: proved.proof.block.number.toString() }));
+  return true;
 }
 
 /** One job lock; shared nonce exclusion covers preparation+commit+broadcast only.
@@ -244,6 +296,8 @@ export async function reconcileMixPublication(id: string, deps: PublicationDeps,
       }
       if (!await historyCanonical(job, deps)) { await mark(job, deps, 'PUBLICATION_HISTORY_REORG', true); return 'unresolved'; }
       if (job.state === 'quarantined') {
+        if (current && !consumption(current) && job.last_error_code != null && PUBLICATION_HEALABLE_CODES.has(job.last_error_code) &&
+            await healQuarantine(job, current, deps)) return 'confirmed';
         if (current && current.status === null && !consumption(current)) {
           const pending = current, { proof, foreign } = await resolution(job, pending, observed.block, deps);
           if (proof) await deps.transaction(async db => {

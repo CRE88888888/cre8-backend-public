@@ -31,7 +31,10 @@ import { PaymasterRetryTooSoonError, sponsorUserOperation } from './paymaster.js
 import { createPointsService } from './points.js';
 import { RateLimitError, RequestRateLimiter } from './ratelimit.js';
 import { getConfig, getSessionKeyConfig } from './config.js';
-import { createPlatformStatusReader } from './chain.js';
+import { createPlatformStatusReader, getChain } from './chain.js';
+import { createOverview } from './overview.js';
+import { TESTNET_97 } from './testnet-profile.js';
+import { erc20Abi } from 'viem';
 import { query } from './db.js';
 import { AppError, ValidationError } from './errors.js';
 import { strategyVersionState, getStrategyWithVersionState, createStrategy, getStrategy, listStrategies, publishVersion, typedVersionInput, typedMinimumDeposit } from './strategies.js';
@@ -224,6 +227,8 @@ export type ServerDeps = {
   /** 清倉：把全部部位賣成 numeraire。 */
   operatorClose: (portfolioId: number, wallet: string) => Promise<unknown>;
   portfolioStatus: PortfolioStatusReader;
+  /** `GET /me/overview`（backend#216）：持倉、錢包 USDT、現金生息的快照，過期在背景刷新。 */
+  overview: ReturnType<typeof createOverview>;
   /** `POST /portfolios/:id/rebalance`（會動錢；預設實作見 `operator.ts`）。 */
   operatorRebalance: (portfolioId: number, wallet: string) => Promise<OperatorRebalanceResult>;
   /**
@@ -325,12 +330,28 @@ async function defaultListAssets(): Promise<PriceableAsset[]> {
   return listPriceableAssets(undefined, probe);
 }
 
+// 這三個要和 /me/overview 共用同一份（快取與狀態跨請求存活）。
+const defaultPortfolioStatus = createPortfolioStatusReader();
+const defaultCashEarn = createCashEarn();
+const defaultStrategyEarn = createStrategyEarn();
+const defaultOverview = createOverview({
+  // 只要 DB 的清單：gas 狀態是逐檔讀鏈，總覽用不到，換成立即回的假讀取（失敗會收成 gas: null）。
+  listPortfolios: (wallet) => listPortfolios(wallet, { getAccountGasBalance: async () => { throw new Error('skip'); }, getGasPriceWei: async () => 0n, minSessionGasWei: 0n }),
+  status: (id, wallet) => defaultPortfolioStatus(id, wallet),
+  strategyEarn: (id, wallet) => defaultStrategyEarn.portfolio(id, wallet),
+  cashEarn: (wallet) => defaultCashEarn.account(wallet),
+  walletUsdt: async (wallet) => {
+    if (configuredChainId() !== 97) throw new AppError(409, 'CASH_UNAVAILABLE', 'wallet cash is only on the testnet app');
+    return getChain().publicClient.readContract({ address: TESTNET_97.contracts.usdt, abi: erc20Abi, functionName: 'balanceOf', args: [wallet as Address] });
+  },
+});
+
 const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
   mixes: createMixService(),
   mixPreview: createMixPreview(),
   userMedia: createUserMedia(),
-  cashEarn: createCashEarn(),
-  strategyEarn: createStrategyEarn(),
+  cashEarn: defaultCashEarn,
+  strategyEarn: defaultStrategyEarn,
   mixAssets: createMixAssetList(),
   modelReturns: createModelReader(),
   info: createInfoService(),
@@ -355,7 +376,8 @@ const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
   buildRenewalParams,
   recordRenewalResult,
   // 快取要跨請求存活，不能每個請求重建一份。
-  portfolioStatus: createPortfolioStatusReader(),
+  portfolioStatus: defaultPortfolioStatus,
+  overview: defaultOverview,
   operatorRebalance: (portfolioId, wallet) => runOperatorRebalance(portfolioId, wallet, { resumeIfPaused: true }),
   operatorActivity: (limit) => readOperatorActivity(limit),
   // 與 force rebalance 用同一個「不檢查 owner」的注入；差別是這支只讀不送。
@@ -466,6 +488,14 @@ async function route(
       if (method === 'DELETE') { await deps.rateLimiter.wallet('plan', wallet); sendJson(res, 200, await deps.userMedia.deleteAvatar(wallet)); return; }
       return methodNotAllowed(res, ['PUT', 'DELETE']);
     }
+  }
+
+  // backend#216：「我的」頁一次要的數字，回快照（不現場讀鏈）。?fresh=1：剛做完交易，馬上在背景重讀。
+  if (root === 'me' && segments[1] === 'overview' && segments.length === 2) {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    sendJson(res, 200, await deps.overview.overview(wallet, { force: url.searchParams.get('fresh') === '1' }), { 'cache-control': 'no-store' });
+    return;
   }
 
   if (root === 'me' && segments[1] === 'mixes' && segments.length === 4 && segments[3] === 'cover') {

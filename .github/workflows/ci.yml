@@ -80,6 +80,7 @@ jobs:
           test/asset-exposure.test.ts
           test/yield-domain.test.ts
           test/yield-reader.test.ts
+          test/overview.test.ts
           test/yield-snapshot.test.ts
           test/yield-http.test.ts
           test/yield-scheduler.test.ts

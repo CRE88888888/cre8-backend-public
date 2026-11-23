@@ -2,6 +2,7 @@ import { decodeFunctionResult, encodeFunctionData, keccak256, parseAbi } from 'v
 import type { Address, Hex, PublicClient } from 'viem';
 import { MULTICALL3_ADDRESS } from './positions.js';
 import { fresh, object, raw, hash, address, RAY, UINT256_MAX, WAD, unavailable } from './yield-domain.js';
+import { isStrategyVault } from './strategy-earn-guard.js';
 import type { Observation, YieldMarket, YieldPosition, YieldProfile, YieldRead, YieldRisk } from './yield-domain.js';
 
 // Read-only subset; execution/owner/session ABI remains owned by BE-4.
@@ -79,9 +80,13 @@ export async function readYieldAccount(client: PublicClient, profile: YieldProfi
     }
     const base = await deps.batch(client, block.number, [{target: profile.executor, name: 'oracle'}, {target: profile.executor, name: 'numeraire'}, {target:profile.registry,name:'supplyPaused'}, {target:profile.executor,name:'registry'}, {target:profile.registry,name:'marketCount'}, {target:profile.executor,name:'yieldRegistry'}]);
     const oracle = address(base[0]), numeraire = address(base[1]), strategyRegistry=address(base[3]);
-    if(address(base[5])!==profile.registry||integer(base[4])!==BigInt(profile.markets.length))throw unavailable();
-    const marketIds=await deps.batch(client,block.number,profile.markets.map((_m,index):ReadCall=>({target:profile.registry,name:'marketIds',args:[BigInt(index)]})));
-    if(new Set(marketIds.map(hash)).size!==profile.markets.length||marketIds.some(id=>!profile.markets.some(m=>m.marketId===id)))throw unavailable();
+    // backend#216: the registry also lists the strategy earn vault (#199), which yieldProfile() drops on purpose.
+    // Every profile market must be on chain; any extra on-chain market may only be a strategy vault.
+    const count=integer(base[4]);
+    if(address(base[5])!==profile.registry||count<BigInt(profile.markets.length)||count>BigInt(profile.markets.length)+8n)throw unavailable();
+    const marketIds=(await deps.batch(client,block.number,Array.from({length:Number(count)},(_m,index):ReadCall=>({target:profile.registry,name:'marketIds',args:[BigInt(index)]})))).map(hash);
+    const extra=marketIds.filter(id=>!profile.markets.some(m=>m.marketId===id));
+    if(new Set(marketIds).size!==marketIds.length||profile.markets.some(m=>!marketIds.includes(m.marketId))||extra.some(id=>!isStrategyVault({marketId:id})))throw unavailable();
     const observation: Observation = { block: block.number, blockHash: block.hash, at: new Date(Number(block.timestamp) * 1000), source: 'canonical-yield-registry' };
     if (!fresh(observation.at, deps.now())) throw unavailable();
     const identities = await Promise.all(profile.markets.map(m => identity(m)));

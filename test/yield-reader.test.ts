@@ -235,3 +235,23 @@ test('#106 reviewed Lista optimistic redeem can clear dust only when its full qu
     assert.equal((await readYieldAccount(f.client,f.profile,f.account,{batch,now:()=>f.at})).positions[0]?.state,'unknown');
   }
 });
+
+test('#216 registry may also list the strategy earn vault (filtered from the profile); any other extra or missing market fails closed',async()=>{
+  const { STRATEGY_EARN_97 } = await import('../src/strategy-earn-guard.js');
+  const f=yieldFixture(['venus','lista']);
+  let extra:string|null=STRATEGY_EARN_97.earnVaultMarketId,drop=false;
+  const batch:typeof f.batch=async(client,block,calls)=>{
+    const ids=[...f.profile.markets.map(m=>m.marketId as string)];
+    if(drop)ids.pop();
+    if(extra!==null)ids.splice(1,0,extra);
+    const values=await f.batch(client,block,calls.filter(c=>c.name!=='marketCount'&&c.name!=='marketIds'));
+    let i=0;
+    return calls.map(c=>c.name==='marketCount'?BigInt(ids.length):c.name==='marketIds'?ids[Number(c.args?.[0])]:values[i++]);
+  };
+  const ok=await readYieldAccount(f.client,f.profile,f.account,{batch,now:()=>f.at});
+  assert.equal(ok.positions.length,2);assert.notEqual(ok.accountValue,null);
+  extra=`0x${'ab'.repeat(32)}`;
+  await assert.rejects(readYieldAccount(f.client,f.profile,f.account,{batch,now:()=>f.at}),/生息資料/);
+  extra=STRATEGY_EARN_97.earnVaultMarketId;drop=true;
+  await assert.rejects(readYieldAccount(f.client,f.profile,f.account,{batch,now:()=>f.at}),/生息資料/);
+});

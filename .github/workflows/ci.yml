@@ -131,6 +131,7 @@ jobs:
           test/chain-read-only.test.ts
           test/scheduler-error-log.test.ts
           test/status-timeout.test.ts
+          test/strategy-cash-row.test.ts
           test/trading-calendar.test.ts
           test/scheduler.test.ts
           test/server.test.ts

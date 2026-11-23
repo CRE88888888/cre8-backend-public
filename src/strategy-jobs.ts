@@ -32,8 +32,22 @@ export async function fundingLots(query: SchedulerQueryFn, c: Pick<JobContext,'c
     and (l.kind='asset' or not exists(select 1 from strategy_job_lot_inputs i where i.lot_id=l.id)) order by l.id`,
   [c.chainId,c.portfolioId,c.strategyId,c.version])).rows as FundingLot[];
 }
-export async function lockCash(query: SchedulerQueryFn, c: Pick<JobContext,'chainId'|'portfolioId'>): Promise<void> {
+/**
+ * Lock the portfolio's cash row, creating it first with the same defaults as yieldLocks/cashLock/mix-store.
+ * Portfolios funded before those paths existed have no row; `select … for update` alone locks nothing and the
+ * job then fails every round on the missing row (portfolio 2). The account is the job's, or else the
+ * portfolio's live smart account.
+ */
+export async function lockCash(query: SchedulerQueryFn, c: Pick<JobContext,'chainId'|'portfolioId'> & { account?: Address }): Promise<void> {
   await query("set local lock_timeout='5s'");
+  if (c.account !== undefined && /^0x[0-9a-fA-F]{40}$/.test(c.account) && !/^0x0{40}$/.test(c.account)) {
+    await query(`insert into strategy_cash_balances(chain_id,portfolio_id,account) values($1,$2,$3)
+      on conflict(chain_id,portfolio_id) do nothing`, [c.chainId, c.portfolioId, c.account.toLowerCase()]);
+  } else {
+    await query(`insert into strategy_cash_balances(chain_id,portfolio_id,account)
+      select $1,$2,a.address from smart_accounts a where a.chain_id=$1 and a.portfolio_id=$2 and a.retired_at is null limit 1
+      on conflict(chain_id,portfolio_id) do nothing`, [c.chainId, c.portfolioId]);
+  }
   await query('select portfolio_id from strategy_cash_balances where chain_id=$1 and portfolio_id=$2 for update',[c.chainId,c.portfolioId]);
   await query('select id from portfolios where id=$1 for update',[c.portfolioId]);
 }

@@ -42,6 +42,8 @@ export { REGISTRY_ABI, REGISTRY_VERSION_ABI } from './registry-abi.js';
 import { REGISTRY_ABI, REGISTRY_VERSION_ABI } from './registry-abi.js';
 import { enrollmentApprovalHash, p11Error, registryConfigHash } from './registry-versioning.js';
 import type { VersionSettings } from './registry-versioning.js';
+import { retryWhileLagging } from './node-lag.js';
+import type { NodeLagOptions } from './node-lag.js';
 
 export async function readAccountCash(chainId: number, account: Address, suppliedClient?: PublicClient) {
   try {
@@ -487,7 +489,13 @@ export async function versionCancelledOnchain(onchainId: number, version: number
 }
 
 /** Confirmation only: owner sudo has already enrolled; never deploy or send a transaction. */
-export async function readOwnerEnrollment(account: Address, onchainId: number, chain?: ChainConfig): Promise<number> {
+/** Right after the owner's enroll UserOp lands, a lagging node may not see it yet: retry "not enrolled" briefly. */
+export async function readOwnerEnrollment(account: Address, onchainId: number, chain?: ChainConfig, lag: NodeLagOptions = {}): Promise<number> {
+  return retryWhileLagging(() => readOwnerEnrollmentOnce(account, onchainId, chain),
+    error => error instanceof AppError && error.code === 'ENROLLMENT_NOT_CONFIRMED' && error.cause === NOT_YET_ENROLLED, lag);
+}
+const NOT_YET_ENROLLED = new Error('not enrolled at the read block');
+async function readOwnerEnrollmentOnce(account: Address, onchainId: number, chain?: ChainConfig): Promise<number> {
   const { publicClient, registryAddress, chainId } = chain ?? getChain();
   try {
     if (await publicClient.getChainId() !== chainId) throw new Error('wrong chain');
@@ -499,7 +507,7 @@ export async function readOwnerEnrollment(account: Address, onchainId: number, c
     ]);
     if ((await publicClient.getBlock({ blockNumber: block.number })).hash !== block.hash) throw new Error('reorg');
     if (!enrolled || value[0] !== BigInt(onchainId) || value[1] < 1 || value[1] > 65535 || value[2]) {
-      throw new AppError(409, 'ENROLLMENT_NOT_CONFIRMED', 'owner sudo enrollment must be confirmed for this strategy and account');
+      throw new AppError(409, 'ENROLLMENT_NOT_CONFIRMED', 'owner sudo enrollment must be confirmed for this strategy and account', enrolled ? undefined : { cause: NOT_YET_ENROLLED });
     }
     return value[1];
   } catch (error) {

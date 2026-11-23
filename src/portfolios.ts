@@ -22,6 +22,8 @@ import { configuredChainId, TESTNET_97 } from './testnet-profile.js';
 import { minimumDepositUsdtWei } from './rebalance-plan.js';
 import { minimumAllocationRaw } from './strategy-execution.js';
 import { computeSalt, getKernelAccountParams } from './kernel.js';
+import { retryWhileLagging } from './node-lag.js';
+import type { NodeLagOptions } from './node-lag.js';
 
 export type EnrollmentPreparation = Awaited<ReturnType<typeof prepareEnrollmentApproval>> & { accountDeployed?: true };
 
@@ -146,6 +148,8 @@ export type EnrollDeps = {
   afterWrite: (client: import('pg').PoolClient, portfolioId: number) => Promise<void>;
   /** Sponsorship may only observe deployed code for the persisted owner intent; it must never broadcast. */
   verifyAccountDeployment: boolean;
+  /** Tests: bounded wait for a lagging RPC node (src/node-lag.ts). */
+  nodeLag?: NodeLagOptions;
   accountParams: typeof getKernelAccountParams;
   confirmEnrollment: typeof readOwnerEnrollment;
   activeVersion: (onchainId: number) => Promise<number>;
@@ -377,8 +381,11 @@ async function prepareOrEnroll(
     if (chainId === 97) {
       try {
         if (deps.verifyAccountDeployment) {
-          const code = await publicClient.getCode({ address: smartAccount.address });
-          if (!code || code === '0x') throw new AppError(403, 'PAYMASTER_ACCOUNT_UNDEPLOYED', 'owner setup requires a deployed account');
+          // The operator deploys the account just before the owner signs; a lagging node may not have the code yet.
+          await retryWhileLagging(async () => {
+            const code = await publicClient.getCode({ address: smartAccount.address });
+            if (!code || code === '0x') throw new AppError(403, 'PAYMASTER_ACCOUNT_UNDEPLOYED', 'owner setup requires a deployed account');
+          }, error => error instanceof AppError && error.code === 'PAYMASTER_ACCOUNT_UNDEPLOYED', deps.nodeLag);
         } else {
           const deployed = await deployAccount(account as Address, BigInt(strategyId), options);
           if (deployed.address.toLowerCase() !== smartAccount.address.toLowerCase()) throw new AppError(503, 'ACCOUNT_DEPLOYMENT_MISMATCH', 'deployed account differs from persisted owner intent');
@@ -396,7 +403,7 @@ async function prepareOrEnroll(
   // DB row exists.
   // A retry may find the original consent version on-chain; P11 swaps follow activeVersion.
   const enrolledVersion = chainId === 97
-    ? await (deps.confirmEnrollment ?? readOwnerEnrollment)(smartAccount.address, onchainId)
+    ? await (deps.confirmEnrollment ?? ((a: Address, id: number) => readOwnerEnrollment(a, id, undefined, deps.nodeLag)))(smartAccount.address, onchainId)
     : await enroll(smartAccount.address, onchainId);
   if ((row.execution_schema_version === 1 || row.execution_schema_version === 2)) {
     await (deps.requireTypedVersion ?? requireTypedVersion)(strategyId, enrolledVersion, onchainId, smartAccount.address);

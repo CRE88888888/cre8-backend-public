@@ -1336,9 +1336,22 @@ test('#124 deployment failures and account mismatch never expose enrollment call
   }
 });
 
+test('2026-11-23: sponsorship preparation waits briefly for a node that does not have the new account code yet', async () => {
+  const { deps } = fakeEnrollDeps(); deps.chainId = 97; deps.verifyAccountDeployment = true;
+  deps.accountParams = async () => ({ address: KERNEL_CHECKSUMMED, factory: KERNEL_V3_3_ADDRESSES.kernelMetaFactory, factoryData: '0x1234' });
+  assert.ok(deps.publicClient);
+  let reads = 0;
+  deps.publicClient = { ...deps.publicClient, getCode: async () => ++reads >= 3 ? '0x6001' : '0x' };
+  deps.nodeLag = { sleep: async () => {}, now: () => 0 };
+  deps.prepareApproval = async account => ({ account, expectedVersion: 1, configHash: FOLLOW_VERSIONS_TERMS, activeAt: new Date(0).toISOString(),
+    performanceFeeBps: 500, terms: FOLLOW_VERSIONS_TEXT, termsHash: FOLLOW_VERSIONS_TERMS, signingMode: 'sudo', call: { to: EXECUTOR, value: '0', data: '0x' } });
+  assert.equal((await preparePortfolioEnrollment(3, ROUTE_WALLET.address, deps)).accountDeployed, true);
+  assert.equal(reads, 3);
+});
+
 test('#124 sponsorship preparation is read-only and requires existing account code', async () => {
   for (const deployed of [false, true]) {
-    const { deps, calls } = fakeEnrollDeps(); deps.chainId = 97; deps.verifyAccountDeployment = true;
+    const { deps, calls } = fakeEnrollDeps(); deps.chainId = 97; deps.verifyAccountDeployment = true; deps.nodeLag = { budgetMs: 0 };
     deps.accountParams = async () => ({ address: KERNEL_CHECKSUMMED, factory: KERNEL_V3_3_ADDRESSES.kernelMetaFactory, factoryData: '0x1234' });
     assert.ok(deps.publicClient);
     deps.publicClient = { ...deps.publicClient, getCode: async () => deployed ? '0x6001' : '0x' };

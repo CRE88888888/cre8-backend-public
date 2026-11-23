@@ -218,8 +218,22 @@ test('#124 owner enrollment confirmation is read-only and rejects missing, forei
     const wallet = createWalletClient({ account: signer, transport: custom({ request: async () => { throw new Error('must not write'); } }) });
     const chain = { chainId: 56, rpcUrl: 'http://127.0.0.1:8597', registryAddress: asset, account: signer, publicClient: f.client, wallet, kernel: kernelAddressesForChain(56) };
     if (scenario === 'ok') assert.equal(await readOwnerEnrollment(account, 7, chain), 1);
-    else await assert.rejects(readOwnerEnrollment(account, 7, chain), (error: unknown) => error instanceof AppError && !error.message.includes('credential'));
+    else await assert.rejects(readOwnerEnrollment(account, 7, chain, { budgetMs: 0 }), (error: unknown) => error instanceof AppError && !error.message.includes('credential'));
   }
+});
+
+test('2026-11-23: a node that does not see the just-landed enroll yet is retried; a real mismatch is not', async () => {
+  const signer = toAccount(account);
+  const wallet = createWalletClient({ account: signer, transport: custom({ request: async () => { throw new Error('must not write'); } }) });
+  const f = stateRpc(); f.state.enrolled = false;
+  const chain = { chainId: 56, rpcUrl: 'http://127.0.0.1:8597', registryAddress: asset, account: signer, publicClient: f.client, wallet, kernel: kernelAddressesForChain(56) };
+  let waits = 0;
+  const lag = { sleep: async () => { waits++; if (waits === 2) f.state.enrolled = true; }, now: () => 0 };
+  assert.equal(await readOwnerEnrollment(account, 7, chain, lag), 1);
+  assert.equal(waits, 2);
+  const g = stateRpc(); g.state.id = 8n; waits = 0;
+  await assert.rejects(readOwnerEnrollment(account, 7, { ...chain, publicClient: g.client }, lag), (error: unknown) => error instanceof AppError && error.code === 'ENROLLMENT_NOT_CONFIRMED');
+  assert.equal(waits, 0, 'enrolled in another strategy is not lag');
 });
 
 test('#124 public strategy detail combines execution metadata with chain-authoritative assets and pending state', async () => {

@@ -32,7 +32,9 @@ export function currentWeights(strategy: ModelStrategy, chainId: number, now: Da
 }
 
 /** One DB history read per HTTP request; no live source requests, no stale version cache. */
-export function createModelReader(deps: { query?: InfoQuery; now?: () => Date; chainId?: number } = {}) {
+export function createModelReader(deps: { query?: InfoQuery; now?: () => Date; chainId?: number; log?: (line: string) => void } = {}) {
+  const log = deps.log ?? (line => console.error(line));
+  let warnedDay: string | null = null;
   return async (strategies: readonly ModelStrategy[]): Promise<Map<number, ModelResult>> => {
     const results = new Map(strategies.map(strategy => [strategy.id, emptyModel()]));
     try {
@@ -67,6 +69,11 @@ export function createModelReader(deps: { query?: InfoQuery; now?: () => Date; c
         history.set(asset.symbol, stored.get(key) ?? []);
         if (checked.has(checkedSeries(key))) available.add(asset.symbol);
       }
+      // backend#211: a missing collection round used to blank every fund silently; warn once per closed day.
+      if (!available.size && warnedDay !== asOf) {
+        warnedDay = asOf;
+        log(`[model-returns] no checked closes for ${asOf}; every fund is served without model returns until the close job runs`);
+      }
       for (const [id, allocation] of weights) {
         if (allocation) {
           try {
@@ -78,7 +85,10 @@ export function createModelReader(deps: { query?: InfoQuery; now?: () => Date; c
           catch { /* Preserve known constituent identities when their data is unavailable. */ }
         }
       }
-    } catch { /* Model storage failure leaves the existing strategy API available. */ }
+    } catch (error) {
+      // Model storage failure leaves the existing strategy API available, but must show in the log.
+      log(`[model-returns] history read failed: ${error instanceof Error ? `${error.name}: ${error.message}`.slice(0, 300) : typeof error}`);
+    }
     return results;
   };
 }

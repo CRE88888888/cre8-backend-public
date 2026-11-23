@@ -69,7 +69,9 @@ export function createCloseJob(deps: { env?: NodeJS.ProcessEnv; now?: () => Date
     try {
       let results: InfoCollectorResult[] = [];
       await (deps.lock ?? withInfoJobLock)(async () => {
-        nextRun = now.getTime() + DAY_MS;
+        // The reader only accepts a `:checked` marker for lastClosedDay(now), so the next round must run as soon as
+        // the UTC day rolls over, not 24 hours after process start (which left funds without models most of the day).
+        nextRun = Date.parse(lastClosedDay(now)) + 2 * DAY_MS;
         const get = (deps.get ?? createMarketGet)();
         let pairs: Promise<Set<string>> | undefined;
         const yahoo = new Map<string, Promise<string>>();

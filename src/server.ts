@@ -1023,6 +1023,15 @@ async function loginRoute(req: IncomingMessage, res: ServerResponse, deps: Serve
   sendJson(res, 200, session);
 }
 
+/** Model fields are optional for the strategy API, but a failure must be visible in the service log (backend#211). */
+export function modelReturnsFailed(route: 'list' | 'detail', log: (line: string) => void = line => console.error(line)) {
+  return (error: unknown): null => {
+    const reason = error instanceof Error ? `${error.name}: ${error.message}`.slice(0, 300) : typeof error;
+    log(`[model-returns] ${route} unavailable; strategies served without model fields: ${reason}`);
+    return null;
+  };
+}
+
 /** GET /strategies?limit=50&offset=0&provider=0x…&public=true */
 async function listRoute(res: ServerResponse, url: URL, deps: ServerDeps): Promise<void> {
   const provider = url.searchParams.get('provider')?.trim() ?? '';
@@ -1033,7 +1042,7 @@ async function listRoute(res: ServerResponse, url: URL, deps: ServerDeps): Promi
     isPublic: parseBoolean(url.searchParams.get('public'), 'public') ?? true,
   });
   const records = await Promise.all(page.items.map(item => deps.strategyRecord(item.id).then(dbModelStrategy, () => null)));
-  const models = await deps.modelReturns(records.filter(record => record !== null)).catch(() => null);
+  const models = await deps.modelReturns(records.filter(record => record !== null)).catch(modelReturnsFailed('list'));
   sendJson(res, 200, { ...page, items: await Promise.all(page.items.map(async (item) => ({ ...item,
     modelReturns: models?.get(item.id)?.modelReturns ?? null, minDepositUsdtWei: await strategyMinimumDeposit(item.id) }))) });
 }
@@ -1041,7 +1050,7 @@ async function listRoute(res: ServerResponse, url: URL, deps: ServerDeps): Promi
 /** GET /strategies/:id — metadata plus version history (newest first). */
 async function detailRoute(res: ServerResponse, id: number, deps: ServerDeps): Promise<void> {
   const strategy = await deps.strategyDetail(id);
-  const model = (await deps.modelReturns([strategy]).catch(() => null))?.get(id) ?? emptyModel();
+  const model = (await deps.modelReturns([strategy]).catch(modelReturnsFailed('detail')))?.get(id) ?? emptyModel();
   const exposure = await deps.strategyExposure(id, getConfig().chainId, strategy.versions.flatMap(v => v.allocation.assets.map(a => a.address)), { cappedOnly: true });
   const versions = strategy.versions.map((version) => ({ ...version,
     allocation: { assets: version.allocation.assets.map(a => {

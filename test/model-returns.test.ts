@@ -9,7 +9,7 @@ import type { ModelStrategy } from '../src/model-returns/service.js';
 import { createInfoGet, MAX_SOURCE_BYTES } from '../src/info/source.js';
 import { createInfoBackgroundJob } from '../src/info/job.js';
 import { TESTNET_97, testnetAssets } from '../src/testnet-profile.js';
-import { createServer } from '../src/server.js';
+import { createServer, modelReturnsFailed } from '../src/server.js';
 import { loadRateLimitConfig } from '../src/config.js';
 import { MemoryRateLimitStore, RequestRateLimiter } from '../src/ratelimit.js';
 import { getStrategyWithVersionState } from '../src/strategies.js';
@@ -132,8 +132,10 @@ test('#173 current effective weights override old weights, ignore pending/cancel
   assert.equal((await read([strategy])).get(1)?.modelReturns?.d7, '50.00000000');
   assert.equal((await read([latest])).get(1)?.modelReturns?.d7, '100.00000000');
   assert.equal(reads, 2);
-  const failed = createModelReader({ chainId: 56, now: () => now, query: async () => { throw new Error('SECRET_DB'); } });
+  const readerLogs: string[] = [];
+  const failed = createModelReader({ chainId: 56, now: () => now, log: line => readerLogs.push(line), query: async () => { throw new Error('db_down'); } });
   assert.deepEqual((await failed([strategy])).get(1), { ...emptyModel(), modelComponents: weights.map(w => ({ symbol: w.symbol, includedFrom: null })) });
+  assert.deepEqual(readerLogs, ['[model-returns] history read failed: Error: db_down']);
 });
 
 function candle(at: number, value = '100.00000000'): unknown[] { return [at, '1', '1', '1', value, '1', at + DAY_MS - 1, '1', 1, '1', '1', '0']; }
@@ -178,8 +180,10 @@ test('#173 daily opt-in job checks pairs, isolates source/DB failures, bounds ti
   const [first, overlap] = await Promise.all([job(), job()]); assert.deepEqual(overlap, []);
   assert.deepEqual(first.map(r => r.error), ['pair_not_found', 'dependency_unavailable', null]);
   assert.equal(first[2]?.savedMarkets, 2); assert.doesNotMatch(JSON.stringify(logs), /SECRET/);
-  const before = calls; time += DAY_MS - 1; await job(); assert.equal(calls, before);
-  time++; await job(); assert.ok(calls > before);
+  // backend#211: the next round is due at the next UTC midnight (the new closed day), not 24 hours after this round.
+  const midnight = Date.parse('2026-11-21T00:00:00Z');
+  const before = calls; time = midnight - 1; await job(); assert.equal(calls, before);
+  time = midnight; const second = await job(); assert.ok(calls > before); assert.equal(second.length, 3);
   const failed = await createCloseJob({ env: { MODEL_RETURNS_ENABLED: '1' }, now: () => now, lock: action => action(),
     assets: [{ symbol: 'AAPLB', pair: 'AAPLBUSDT' }], get: () => async url => url.endsWith('ticker/price')
       ? '[{"symbol":"AAPLBUSDT","price":"1.00"}]' : '[]',
@@ -460,4 +464,47 @@ test('#189 every chain-97 mix asset has a price source; testnet-only entries nev
   assert.deepEqual(source('CAKE'), { kind: 'binance', pair: 'CAKEUSDT', seasoned: false });
   assert.deepEqual(source('VON'), { kind: 'yahoo', ticker: 'V', currency: 'USD' });
   assert.deepEqual(source('GOOGON'), { kind: 'yahoo', ticker: 'GOOG', currency: 'USD' });
+});
+
+test('#211 a day with no checked closes is logged once per closed day instead of silently blanking every fund', async () => {
+  const a = MODEL_ASSETS.find(x => x.symbol === 'AAPLB'); assert.ok(a?.address);
+  const version = strategy.versions[0]; assert.ok(version);
+  const fund = { id: 1, onchainId: null, versions: [{ ...version, allocation: { assets: [{ address: a.address, weightBps: 10000 }] } }] };
+  // Yesterday's marker only: exactly the state after a round that ran before UTC midnight.
+  const rows = [...points(8).map(p => ({ series: closeSeries(a), source: 'yahoo', ...p })),
+    { series: checkedSeries(closeSeries(a)), source: 'yahoo', date: date(asOf, -1), value: '1' }];
+  const logs: string[] = [];
+  let at = now.getTime();
+  const reader = createModelReader({ chainId: 56, now: () => new Date(at), log: line => logs.push(line), query: async () => ({ rows }) });
+  assert.equal((await reader([fund])).get(1)?.modelReturns, null);
+  assert.equal((await reader([fund])).get(1)?.modelReturns, null);
+  assert.deepEqual(logs, [`[model-returns] no checked closes for ${asOf}; every fund is served without model returns until the close job runs`]);
+  rows.push({ series: checkedSeries(closeSeries(a)), source: 'yahoo', date: asOf, value: '1' });
+  assert.equal((await reader([fund])).get(1)?.modelReturns?.d7, '0.00000000');
+  at += DAY_MS; await reader([fund]);
+  assert.equal(logs.length, 2); assert.match(logs[1] ?? '', new RegExp(date(asOf, 1)));
+});
+
+test('#211 the strategy routes log a model reader failure instead of swallowing it, and still answer without model fields', async () => {
+  const lines: string[] = [];
+  assert.equal(modelReturnsFailed('list', line => lines.push(line))(new Error('boom')), null);
+  assert.equal(modelReturnsFailed('detail', line => lines.push(line))('opaque'), null);
+  assert.deepEqual(lines, ['[model-returns] list unavailable; strategies served without model fields: Error: boom',
+    '[model-returns] detail unavailable; strategies served without model fields: string']);
+  const original = console.error, seen: string[] = [];
+  console.error = (...args: unknown[]) => { seen.push(args.map(String).join(' ')); };
+  const api = createServer({
+    strategyDetail: id => getStrategyWithVersionState(id, { strategy: async () => ({ id, provider: 'owner', name: 'Model', description: '',
+      isPublic: true, category: null, catalogKey: null, swapFeeBps: 0, onchainId: null, createdAt: now.toISOString(), versions: [] }) }),
+    modelReturns: async () => { throw new Error('reader_broken'); },
+    strategyExposure: async () => [], rateLimiter: new RequestRateLimiter(loadRateLimitConfig({}), new MemoryRateLimitStore()),
+  });
+  try {
+    await new Promise<void>(resolve => api.listen(0, '127.0.0.1', resolve));
+    const address = api.address(); assert.ok(address && typeof address !== 'string');
+    const response = await fetch(`http://127.0.0.1:${address.port}/strategies/1`); assert.equal(response.status, 200);
+    const body: unknown = await response.json(); assert.ok(typeof body === 'object' && body !== null);
+    assert.equal(Reflect.get(body, 'modelReturns'), null); assert.doesNotMatch(JSON.stringify(body), /reader_broken/);
+    assert.ok(seen.includes('[model-returns] detail unavailable; strategies served without model fields: Error: reader_broken'));
+  } finally { console.error = original; await new Promise<void>(resolve => api.close(() => resolve())); }
 });

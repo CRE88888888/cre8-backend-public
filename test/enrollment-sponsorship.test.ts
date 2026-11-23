@@ -106,3 +106,27 @@ test('#124 setup fallback keeps chain/capacity/budget gates, and a late timeout 
     assert.equal(budget, phase === 'budget' ? 1 : 0);
   }
 });
+
+test('buy speed: first-buy setup may also approve address-book assets to the executor, once each, up to 32 calls', async () => {
+  const approveAbi = parseAbi(['function approve(address,uint256)']);
+  const approve = (target: Address, spender: Address = c.executor) => ({ target, value: 0n, callData: encodeFunctionData({ abi: approveAbi, functionName: 'approve', args: [spender, 2n ** 256n - 1n] }) });
+  const batch = (entries: { target: Address; value: bigint; callData: Hex }[]) => encodeFunctionData({ abi: KERNEL_EXECUTE_ABI, functionName: 'execute', args: [toHex(1n << 248n, { size: 32 }),
+    encodeAbiParameters([{ type: 'tuple[]', components: [{ name: 'target', type: 'address' }, { name: 'value', type: 'uint256' }, { name: 'callData', type: 'bytes' }] }], [entries])] });
+  const deps = { query: async () => ({ rows: [{ strategy_id: '7' }] }), prepare: async () => prepared };
+  const enroll = { target: c.registry, value: 0n, callData: data };
+  const assets = Object.values(T.assets).map(asset => asset.token as Address);
+  assert.ok(assets.length >= 31);
+  await verifyEnrollmentSponsorship({ ...op(), callData: batch([enroll, approve(T.contracts.usdt), ...assets.slice(0, 5).map(a => approve(a))]) }, c, OWNER, deps);
+  await verifyEnrollmentSponsorship({ ...op(), callData: batch([enroll, approve(T.contracts.usdt), ...assets.slice(0, 30).map(a => approve(a))]) }, c, OWNER, deps);
+  const [a0, a1] = assets; assert.ok(a0 && a1);
+  for (const entries of [
+    [enroll, approve(T.contracts.usdt), ...assets.slice(0, 31).map(a => approve(a))], // 33 calls
+    [enroll, approve(a0), approve(a0)], // same asset twice
+    [enroll, approve(a0, T.roles.owner)], // foreign spender
+    [enroll, approve(T.roles.owner)], // not in the address book
+    [enroll, { ...approve(a1), value: 1n }],
+    [enroll, enroll, approve(a0)],
+    [approve(a0), approve(a1)], // no enrollment
+  ]) await assert.rejects(verifyEnrollmentSponsorship({ ...op(), callData: batch(entries) }, c, OWNER, deps),
+    (error: unknown) => error instanceof AppError && (error.code === 'PAYMASTER_SENDER_FORBIDDEN' || error.code === 'PAYMASTER_CALL_FORBIDDEN'));
+});

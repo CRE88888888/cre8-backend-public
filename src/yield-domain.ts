@@ -12,11 +12,27 @@ export type YieldMarket = Readonly<{ id: string; marketId: Hex; protocol: YieldP
   receipt: Address; target: Address; simulated: boolean }>;
 export type YieldProfile = Readonly<{ chainId: 97; registry: Address; executor: Address; registryCodeHash?: Hex; reservationMode?: 'db_only'; markets: readonly YieldMarket[] }>;
 /**
- * The one public yield failure. `where` names the failing check and `cause` keeps the underlying error,
- * both only in the cause chain (logs via `errorChain`), never in the public message.
+ * The one public yield failure. The public message never changes; the cause chain (logs via `errorChain`) always
+ * says where it was thrown: the explicit `where` check id when given, plus the call site read from the stack
+ * (`fn@src/file.ts:line`, up to three frames), so a bare `unavailable()` is still traceable to its check.
  */
-export const unavailable = (where?: string, cause?: unknown) => new AppError(503, 'YIELD_UNAVAILABLE', '生息資料或持久化證據不完整，保留部位與在途',
-  where === undefined && cause === undefined ? undefined : { cause: new Error(`[yield:${where ?? 'unknown'}]`, cause === undefined ? undefined : { cause }) });
+export const unavailable = (where?: string, cause?: unknown) => {
+  const site = callSite(new Error().stack);
+  const label = [where, site].filter((part): part is string => part !== undefined && part !== '').join(' @ ') || 'unknown';
+  return new AppError(503, 'YIELD_UNAVAILABLE', '生息資料或持久化證據不完整，保留部位與在途',
+    { cause: new Error(`[yield:${label}]`, cause === undefined ? undefined : { cause }) });
+};
+/** `at fn (/any/path/src/file.ts:12:3)` → `fn@src/file.ts:12`; drops the `unavailable` frame itself. Paths only, no values. */
+export function callSite(stack: string | undefined, frames = 3): string {
+  if (!stack) return '';
+  return stack.split('\n').map(line => line.trim()).filter(line => line.startsWith('at ')).slice(1, 1 + frames).map(line => {
+    const match = /^at (?:(.+?) \()?(.*?):(\d+)(?::\d+)?\)?$/.exec(line);
+    if (!match) return line.slice(3, 120);
+    const file = match[2] ?? '', at = file.lastIndexOf('/src/');
+    const short = at >= 0 ? file.slice(at + 1) : file.split('/').slice(-2).join('/');
+    return `${match[1] ?? '<anonymous>'}@${short}:${match[3]}`;
+  }).join(' < ');
+}
 export function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw unavailable();
   return value as Record<string, unknown>;

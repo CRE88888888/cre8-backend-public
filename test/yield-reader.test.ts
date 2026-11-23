@@ -307,8 +307,8 @@ test('a failed yield read names the failing check in its cause chain (stale bloc
   const f = yieldFixture(['venus']);
   const late = new Date(f.at.getTime() + 75_000);
   const stale = await readYieldAccount(f.client, f.profile, f.account, { batch: f.batch, now: () => late }).catch((e: unknown) => e);
-  assert.match(errorChain(stale), /生息資料或持久化證據不完整.* ← \[yield:stale-block:100:age-75000ms\]$/);
+  assert.match(errorChain(stale), /生息資料或持久化證據不完整.* ← \[yield:stale-block:100:age-75000ms @ read@src\/yield-reader\.ts:\d+/);
   const failing: typeof f.batch = async () => { throw Object.assign(new Error('rate limited'), { name: 'HttpRequestError' }); };
   const rpc = await readYieldAccount(f.client, f.profile, f.account, { batch: failing, now: () => f.at }).catch((e: unknown) => e);
-  assert.match(errorChain(rpc), /\[yield:read\] ← HttpRequestError: rate limited$/);
+  assert.match(errorChain(rpc), /\[yield:read @ readYieldAccount@src\/yield-reader\.ts:\d+[^\]]*\] ← HttpRequestError: rate limited$/);
 });

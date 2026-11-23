@@ -5,7 +5,7 @@ import type { AddressInfo } from 'node:net';
 import { createPortfolioStatusReader, statusRpcClient } from '../src/operator.js';
 import type { PortfolioPlan } from '../src/snapshot.js';
 import { AppError, errorChain } from '../src/errors.js';
-import { unavailable } from '../src/yield-domain.js';
+import { address, unavailable } from '../src/yield-domain.js';
 import type { requireOwnedPortfolio } from '../src/portfolios.js';
 
 /**
@@ -66,7 +66,20 @@ test('yield failures name the failing check and keep the underlying cause in the
   const error = unavailable('stale-block:100:age-75000ms', rpc);
   assert.equal(error.message, '生息資料或持久化證據不完整，保留部位與在途', 'public message unchanged');
   const line = errorChain(error);
-  assert.match(line, /^AppError: 生息資料或持久化證據不完整.* ← \[yield:stale-block:100:age-75000ms\] ← HttpRequestError: HTTP request failed\. \| URL: <url>$/);
+  assert.match(line, /^AppError: 生息資料或持久化證據不完整.* ← \[yield:stale-block:100:age-75000ms @ [^\]]*status-timeout\.test\.ts:\d+[^\]]*\] ← HttpRequestError: HTTP request failed\. \| URL: <url>$/);
   assert.ok(!line.includes('SECRET'));
-  assert.equal(errorChain(unavailable()), 'AppError: 生息資料或持久化證據不完整，保留部位與在途');
+});
+
+test('a bare unavailable() still says where it was thrown (call site from the stack), public message unchanged', () => {
+  const throwsBare = () => { throw unavailable(); };
+  let caught: unknown;
+  try { throwsBare(); } catch (error) { caught = error; }
+  assert.ok(caught instanceof AppError);
+  assert.equal(caught.message, '生息資料或持久化證據不完整，保留部位與在途');
+  assert.match(errorChain(caught), /^AppError: 生息資料或持久化證據不完整，保留部位與在途 ← \[yield:throwsBare@test\/status-timeout\.test\.ts:\d+/);
+  // Helpers in yield-domain name themselves and their caller.
+  const viaHelper = () => address('not-an-address');
+  try { viaHelper(); } catch (error) { caught = error; }
+  assert.match(errorChain(caught), /\[yield:address@src\/yield-domain\.ts:\d+ < [^@\]]+@test\/status-timeout\.test\.ts:\d+/);
+  assert.ok(!errorChain(caught).includes('not-an-address'), 'values are not logged, only locations');
 });

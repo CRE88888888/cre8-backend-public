@@ -33,6 +33,7 @@ import { fresh } from './yield-domain.js';
 import { dcaVaultCall, dcaVaults, isDcaSpender } from './dca-calls.js';
 import { writeYieldState } from './yield-runtime-state.js';
 import { reservedCash } from './withdrawable-cash.js';
+import { NODE_LAG_BUDGET_MS } from './node-lag.js';
 import { rpcTransport } from './rpc-transport.js';
 
 export type PackedSponsorOperation = {
@@ -94,6 +95,8 @@ export type PaymasterDeps = {
   retryOrdinaryGas?: boolean;
   /** Public chain-97 setup retries require expired, unused authorization evidence. */
   retrySetup?: boolean;
+  /** Extra time for a first join's lagging-node wait (default NODE_LAG_BUDGET_MS). */
+  enrollmentLagMs?: number;
   /** Tests: the account's USDT balance (withdraw-to-wallet free cash check). */
   readCash?: (account: Address, config: PaymasterConfig) => Promise<bigint>;
 };
@@ -860,7 +863,7 @@ function reservationParams(r: Reservation): (string | number)[] {
 }
 async function bounded<T>(work: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  try { return await Promise.race([work, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(rejected('PAYMASTER_DEPENDENCY_UNAVAILABLE', 503)), ms); })]); }
+  try { return await Promise.race([work, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(rejected('PAYMASTER_DEPENDENCY_UNAVAILABLE', 503, `timeout after ${ms} ms`)), ms); })]); }
   finally { if (timer !== undefined) clearTimeout(timer); }
 }
 function rpc(c: PaymasterConfig) { return createPublicClient({ transport: rpcTransport('paymaster', c.rpcUrl, { timeout: c.timeoutMs, retryCount: 0 }) }); }
@@ -966,7 +969,9 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
           and not exists(select 1 from smart_accounts s where s.chain_id=$1 and s.address=$2 and s.retired_at is null)`, [c.chainId, op.sender]), c.timeoutMs);
       let owner = known.rows.length === 1 ? object(known.rows[0]) : null;
       if (known.rows.length === 0 && c.chainId === 97) {
-        await bounded((deps.enrollmentSetup ?? verifyEnrollmentSponsorship)(op, c, wallet), c.timeoutMs);
+        // First join: the operator deployed the account seconds ago and the read node may still lag (src/node-lag.ts
+        // waits up to NODE_LAG_BUDGET_MS). 2026-11-23 14:33 the plain 5 s bound cut that wait short: 503 on the first try.
+        await bounded((deps.enrollmentSetup ?? verifyEnrollmentSponsorship)(op, c, wallet), c.timeoutMs + (deps.enrollmentLagMs ?? NODE_LAG_BUDGET_MS));
         owner = { owner: wallet, user_id: wallet };
       }
       if (!owner || typeof owner.owner !== 'string' || typeof owner.user_id !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(wallet) ||

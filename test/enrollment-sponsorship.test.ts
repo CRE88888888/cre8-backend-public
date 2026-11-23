@@ -93,7 +93,7 @@ test('#124 sponsorship still reserves normally after intent verification, and ne
 test('#124 setup fallback keeps chain/capacity/budget gates, and a late timeout result never reserves', async () => {
   for (const phase of ['chain', 'capacity', 'budget', 'timeout']) {
     let reserved = 0, budget = 0;
-    const service = createPaymasterService({ config: { ...c, timeoutMs: 5 }, now: () => NOW, query: async () => ({ rows: [] }),
+    const service = createPaymasterService({ config: { ...c, timeoutMs: 5 }, enrollmentLagMs: 0, now: () => NOW, query: async () => ({ rows: [] }),
       enrollmentSetup: async () => { if (phase === 'timeout') await new Promise(resolve => setTimeout(resolve, 20)); },
       checkChain: async () => { if (phase === 'chain') throw new Error('SECRET_RPC'); },
       readBudgetContext: async () => { budget++; if (phase === 'budget') throw new Error('SECRET_BUDGET_DB'); return { purpose: 'ordinary', nativePrice: 1n, priceSource: 'fixture' }; },

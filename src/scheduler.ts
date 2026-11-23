@@ -2402,7 +2402,10 @@ async function runOne(
     }
   }
 
-  if (!ctx.dryRun && due.executionKind !== undefined && result.outcome === 'noop' && ctx.forcePlan !== true) {
+  // [BASKET_WAITING]: the remaining vector is below a complete batch and waits for more money of the same version
+  // (seen 2026-11-23 on 4 portfolios every round). Nothing changes until new money arrives, which wakes the portfolio.
+  const idle = result.outcome === 'noop' || result.outcome === 'blocked' && /\[BASKET_WAITING\]/.test(result.reason);
+  if (!ctx.dryRun && due.executionKind !== undefined && idle && ctx.forcePlan !== true) {
     const idleAt = new Date(ctx.now.getTime() + IDLE_BACKOFF_SECONDS * 1_000);
     if (idleAt.getTime() > result.nextRunAt.getTime()) {
       try { await ctx.deps.query(SQL_ADVANCE_CLAIMED, [[due.portfolioId], [idleAt.toISOString()]]); result = { ...result, nextRunAt: idleAt }; }

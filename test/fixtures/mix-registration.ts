@@ -18,7 +18,9 @@ function decodePublicationSchedule(data: Hex) {
 }
 export function registrationRpc() {
   const transactions = new Map<Hex, { raw: Hex; publication: boolean; reverted: boolean }>();
-  const state = { publicationAlreadyKnown: false, publicationCountLagReads: 0, pendingNonceFailures: 0, pendingNonce: null as number | null, latestNonce: null as number | null, blockNumberMismatch: false, prepareCalls: 0, prepareDelayMs: 0, publicationDelayMs: 0, publicationMissing: false, publicationSendFail: false, publicationReverted: false, publicationConfigConflict: false, publicationCount: 0n, publicationRaw: '0x' as Hex, publicationFail: false, publicationData: '0x' as Hex, mode: 'healthy', raw: '0x' as Hex, broadcasts: [] as Hex[], nonces: 0, delayMs: 0, id: 178000001n };
+  const state = { publicationAlreadyKnown: false, publicationCountLagReads: 0, pendingNonceFailures: 0, pendingNonce: null as number | null, latestNonce: null as number | null, blockNumberMismatch: false, prepareCalls: 0, prepareDelayMs: 0, publicationDelayMs: 0, publicationMissing: false, publicationSendFail: false, publicationReverted: false, publicationConfigConflict: false, publicationCount: 0n, publicationRaw: '0x' as Hex, publicationFail: false, publicationData: '0x' as Hex, mode: 'healthy', raw: '0x' as Hex, broadcasts: [] as Hex[], nonces: 0, delayMs: 0, id: 178000001n,
+    /** Canonical block of later receipts (default: everything in block 1 with hash 0, as before). */
+    receiptBlock: 1n, receiptBlockHash: zeroHash as Hex };
   /** Load-balanced RPC lag: numbered block reads fail while `blockReads` > 0; `afterSend` runs after each broadcast. */
   const lag: { blockReads: number; afterSend?: (publication: boolean) => void } = { blockReads: 0 };
   const transport = custom({ request: async ({ method, params }) => {
@@ -36,6 +38,11 @@ export function registrationRpc() {
     if (method === 'eth_maxPriorityFeePerGas' || method === 'eth_gasPrice') return '0x1';
     if (method === 'eth_estimateGas') { state.prepareCalls++; if (state.prepareDelayMs) await new Promise(resolve => setTimeout(resolve, state.prepareDelayMs)); return '0x493e0'; }
     if (method === 'eth_getBlockByNumber' && lag.blockReads > 0 && Array.isArray(params) && params[0] !== 'latest') { lag.blockReads--; throw new Error('fixture block not found on a lagging node'); }
+    if (method === 'eth_getBlockByNumber' && state.receiptBlock !== 1n) {
+      const requested = Array.isArray(params) && params[0] !== 'latest' ? BigInt(String(params[0])) : state.receiptBlock;
+      return { number: toHex(requested), hash: requested === state.receiptBlock ? state.receiptBlockHash : zeroHash,
+        timestamp: '0x64', baseFeePerGas: '0x1', gasLimit: '0x1000000', gasUsed: '0x1', transactions: [] };
+    }
     if (method === 'eth_getBlockByNumber') return { number: state.blockNumberMismatch && Array.isArray(params) && params[0] === '0x1' ? '0x2' : '0x1', hash: state.mode === 'reorg' ? toHex(2n, { size: 32 }) : zeroHash,
       timestamp: '0x64', baseFeePerGas: '0x1', gasLimit: '0x1000000', gasUsed: '0x1', transactions: [] };
     if (method === 'eth_sendRawTransaction') {
@@ -86,10 +93,10 @@ export function registrationRpc() {
       if (publication && state.publicationMissing) return null;
       if (publication && state.publicationFail) throw new Error('private publication receipt failure');
       const hash = keccak256(saved?.raw ?? state.raw);
-      return { transactionHash: hash, blockHash: zeroHash, blockNumber: '0x1', transactionIndex: '0x0', from: relayerSigner.address,
+      return { transactionHash: hash, blockHash: state.receiptBlockHash, blockNumber: toHex(state.receiptBlock), transactionIndex: '0x0', from: relayerSigner.address,
         to: T.contracts.registry, cumulativeGasUsed: '0x1', gasUsed: '0x1', effectiveGasPrice: '0x1', type: '0x2', contractAddress: null,
         status: state.mode === 'revert' || transactions.get(hash)?.reverted ? '0x0' : '0x1', logsBloom: '0x' + '0'.repeat(512),
-        logs: state.mode === 'event' ? [] : [{ address: T.contracts.registry, blockNumber: '0x1', blockHash: zeroHash, transactionHash: hash,
+        logs: state.mode === 'event' ? [] : [{ address: T.contracts.registry, blockNumber: toHex(state.receiptBlock), blockHash: state.receiptBlockHash, transactionHash: hash,
           transactionIndex: '0x0', logIndex: '0x0', removed: false,
           topics: publication ? encodeEventTopics({ abi: REGISTRY_ABI, eventName: 'VersionPublished', args: { id: state.id } })
             : encodeEventTopics({ abi: REGISTRY_ABI, eventName: 'StrategyRegistered', args: { id: state.id, provider: relayerSigner.address } }),
@@ -103,10 +110,10 @@ export function registrationRpc() {
       const tx = parseTransaction(raw);
       return { ...tx, nonce: toHex((tx.nonce ?? 0) + (state.mode === 'nonce' ? 1 : 0)), hash: keccak256(raw),
         from: relayerSigner.address, to: T.contracts.registry, input: tx.data, value: '0x0', type: '0x2', chainId: '0x61',
-        gas: '0x493e0', gasPrice: '0x2', maxFeePerGas: '0x2', maxPriorityFeePerGas: '0x1', blockNumber: '0x1', blockHash: zeroHash, transactionIndex: '0x0' };
+        gas: '0x493e0', gasPrice: '0x2', maxFeePerGas: '0x2', maxPriorityFeePerGas: '0x1', blockNumber: toHex(state.receiptBlock), blockHash: state.receiptBlockHash, transactionIndex: '0x0' };
     }
     if (method === 'eth_getLogs') return [...transactions.entries()].filter(([, tx]) => tx.publication && !tx.reverted).map(([hash, tx]) => ({
-      address: T.contracts.registry, blockNumber: '0x1', blockHash: zeroHash, transactionHash: hash, transactionIndex: '0x0', logIndex: '0x0', removed: false,
+      address: T.contracts.registry, blockNumber: toHex(state.receiptBlock), blockHash: state.receiptBlockHash, transactionHash: hash, transactionIndex: '0x0', logIndex: '0x0', removed: false,
       topics: encodeEventTopics({ abi: REGISTRY_ABI, eventName: 'VersionPublished', args: { id: state.id } }),
       data: encodeAbiParameters([{ type: 'uint16' }, { type: 'bytes32' }], [1, decodePublicationSchedule(parseTransaction(tx.raw).data ?? '0x')]) }));
     throw new Error('unexpected fixture method ' + method);

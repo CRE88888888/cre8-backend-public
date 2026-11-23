@@ -200,7 +200,7 @@ async function verifyComplete(job: MixPublication, proof: { receipt: Transaction
   return { log, version };
 }
 async function complete(job: MixPublication, current: Attempt | null, proof: { receipt: TransactionReceipt; block: Anchor }, observed: Anchor, deps: PublicationDeps,
-  checked?: Awaited<ReturnType<typeof verifyComplete>>, heal = false) {
+  checked?: Awaited<ReturnType<typeof verifyComplete>>, heal = false, correct = false) {
   // Same checks as before (verifyComplete); `checked` = they already passed for exactly this proof and observation.
   const { log, version } = checked ?? await verifyComplete(job, proof, observed, deps);
   await deps.transaction(async db => {
@@ -210,9 +210,20 @@ async function complete(job: MixPublication, current: Attempt | null, proof: { r
     if (locked?.state === 'confirmed') return;
     if (!locked || locked.state === 'quarantined' && !heal) throw mixUnavailable();
     // A healed job may already hold this exact receipt row (verified canonical above); never rewrite audit rows.
-    if (current && !(await db.query('select 1 from mix_publication_receipts where strategy_id=$1 and attempt=$2', [job.strategy_id, current.attempt])).rows.length) {
+    const stored = current ? (await db.query<{ status: string; block_number: string; block_hash: Hex; block_time: Date }>(
+      'select status,block_number::text,block_hash,block_time from mix_publication_receipts where strategy_id=$1 and attempt=$2 for update',
+      [job.strategy_id, current.attempt])).rows[0] : undefined;
+    if (current && !stored) {
       await db.query(`insert into mix_publication_receipts(strategy_id,attempt,status,block_number,block_hash,block_time)
         values($1,$2,'success',$3,$4,$5)`, [job.strategy_id, current.attempt, proof.block.number.toString(), proof.block.hash, proof.block.at]);
+    } else if (current && stored && (stored.block_number !== proof.block.number.toString() || stored.block_hash !== proof.block.hash)) {
+      // Only a heal in correction mode may replace a stored success receipt, and db 0067 requires the audit row first.
+      if (!heal || !correct || stored.status !== 'success') throw mixUnavailable('stored-receipt-differs');
+      await db.query(`insert into mix_publication_receipt_corrections(strategy_id,attempt,previous_block_number,previous_block_hash,previous_block_time,
+        block_number,block_hash,block_time) values($1,$2,$3,$4,$5,$6,$7,$8)`, [job.strategy_id, current.attempt, stored.block_number, stored.block_hash,
+        stored.block_time, proof.block.number.toString(), proof.block.hash, proof.block.at]);
+      await db.query(`update mix_publication_receipts set block_number=$3,block_hash=$4,block_time=$5 where strategy_id=$1 and attempt=$2 and status='success'
+        and block_hash=$6`, [job.strategy_id, current.attempt, proof.block.number.toString(), proof.block.hash, proof.block.at, stored.block_hash]);
     }
     await db.query(`insert into strategy_versions(strategy_id,version,allocation,schedule,execution_schema_version,execution,execution_chain_id,config_hash,active_at)
       values($1,1,$2,$3,2,$4,97,$5,$6)`, [job.strategy_id, JSON.stringify(job.allocation), JSON.stringify(job.schedule), JSON.stringify(job.execution), job.config_hash, new Date(Number(version.activeAt) * 1000)]);
@@ -232,7 +243,7 @@ async function complete(job: MixPublication, current: Attempt | null, proof: { r
  * and every block hash stable. All of it must match exactly (read through lagging nodes with the same bounded
  * retry as a fresh send); then the job is confirmed and its alert stops. Any genuine mismatch keeps the quarantine.
  */
-async function healQuarantine(job: MixPublication, current: Attempt, deps: PublicationDeps): Promise<boolean> {
+async function healQuarantine(job: MixPublication, current: Attempt, deps: PublicationDeps, correct = false): Promise<boolean> {
   if (current.status === 'reverted') return false;
   let conflict = false;
   let proved: { proof: NonNullable<Awaited<ReturnType<typeof receipt>>>; observed: Anchor; checked: Awaited<ReturnType<typeof verifyComplete>> };
@@ -242,7 +253,9 @@ async function healQuarantine(job: MixPublication, current: Attempt, deps: Publi
         const proof = await receipt(job, current, deps);
         if (!proof) throw mixUnavailable('heal-receipt-not-visible');
         if (proof.receipt.status !== 'success') { conflict = true; throw mixUnavailable('heal-receipt-not-success'); }
-        if (current.block_number !== null && (BigInt(current.block_number) !== proof.block.number || current.block_hash !== proof.block.hash)) {
+        // `correct`: the stored receipt's block is known non-canonical (read through a lagging fork); the canonical
+        // receipt of the SAME transaction replaces it under db 0067, keeping the old values as an audit row.
+        if (!correct && current.block_number !== null && (BigInt(current.block_number) !== proof.block.number || current.block_hash !== proof.block.hash)) {
           conflict = true; throw mixUnavailable('heal-stored-receipt-differs');
         }
         const after = await state(job, deps);
@@ -257,13 +270,14 @@ async function healQuarantine(job: MixPublication, current: Attempt, deps: Publi
     console.warn(JSON.stringify({ level: 'warn', msg: 'mix_publication_heal_failed', strategyId: job.strategy_id, code: job.last_error_code, cause: errorChain(error) }));
     return false;
   }
-  try { await complete(job, current, proved.proof, proved.observed, deps, proved.checked, true); }
+  try { await complete(job, current, proved.proof, proved.observed, deps, proved.checked, true, correct); }
   catch (error) {
     console.warn(JSON.stringify({ level: 'warn', msg: 'mix_publication_heal_failed', strategyId: job.strategy_id, code: job.last_error_code, cause: errorChain(error) }));
     return false;
   }
   console.info(JSON.stringify({ level: 'info', msg: 'mix_publication_healed', strategyId: job.strategy_id, previousCode: job.last_error_code,
-    txHash: current.tx_hash, blockNumber: proved.proof.block.number.toString() }));
+    txHash: current.tx_hash, blockNumber: proved.proof.block.number.toString(), blockHash: proved.proof.block.hash,
+    ...(correct ? { correctedFrom: { blockNumber: current.block_number, blockHash: current.block_hash } } : {}) }));
   return true;
 }
 
@@ -272,6 +286,12 @@ async function healQuarantine(job: MixPublication, current: Attempt, deps: Publi
 export async function reconcileMixPublication(id: string, deps: PublicationDeps, replay = false): Promise<'confirmed' | 'replayed' | 'reverted' | 'consumed' | 'unresolved'> {
   return (deps.jobLock ?? withMixCreationLock)('publication:' + id, async () => {
     let job = await load(id, deps);
+    // Every unresolved answer says why (the scheduler only counts them): strategy, state, code, reason; no raw/tx bytes.
+    const unresolved = (reason: string, error?: unknown) => {
+      console.warn(JSON.stringify({ level: 'warn', msg: 'mix_publication_unresolved', strategyId: id, loadedState: job.state, code: job.last_error_code ?? null, reason,
+        ...(error === undefined ? {} : { cause: errorChain(error) }) }));
+      return 'unresolved' as const;
+    };
     try {
       const observed = await state(job, deps);
       if (observed.count > 1n) { await mark(job, deps, 'PUBLICATION_VERSION_CONFLICT', true); job = await load(id, deps); }
@@ -283,18 +303,26 @@ export async function reconcileMixPublication(id: string, deps: PublicationDeps,
       if (current && consumption(current)) {
         const proof = consumption(current); if (!proof) throw mixUnavailable();
         if ((await anchor(deps, BigInt(proof.block_number))).hash !== proof.block_hash) {
-          await mark(job, deps, 'PUBLICATION_NONCE_PROOF_REORG', true); return 'unresolved';
+          await mark(job, deps, 'PUBLICATION_NONCE_PROOF_REORG', true); return unresolved('nonce-proof-reorg');
         }
         await verifyPublicationNonceConsumption(deps.client, current, proof, work => bounded(work, deps), number => anchor(deps, number));
       }
       if (current?.status && current.block_number !== null && (await anchor(deps, BigInt(current.block_number))).hash !== current.block_hash) {
         const orphan = current;
+        // Identity quarantines stay untouchable even though mark() below rewrites the code.
+        const healable = job.state !== 'quarantined' || (job.last_error_code != null && PUBLICATION_HEALABLE_CODES.has(job.last_error_code));
         await mark(job, deps, 'PUBLICATION_RECEIPT_REORG', true);
+        // The stored block is not canonical. If the same original transaction succeeded on the canonical chain (as a
+        // stored receipt read through a lagging fork would), re-prove everything and correct the receipt (db 0067).
+        if (healable && orphan.status === 'success' && observed.count === 1n && !consumption(orphan)) {
+          job = await load(id, deps);
+          if (await healQuarantine(job, orphan, deps, true)) return 'confirmed';
+        }
         if (replay && observed.count === 0n) await (deps.lock ?? withRelayerLock)(97, held =>
           replayPublicationNonceGap(deps.client, orphan.signer, BigInt(orphan.nonce), held).then(() => {}), { reconcile: true });
-        return 'unresolved';
+        return unresolved(`receipt-block-not-canonical:${orphan.block_number}`);
       }
-      if (!await historyCanonical(job, deps)) { await mark(job, deps, 'PUBLICATION_HISTORY_REORG', true); return 'unresolved'; }
+      if (!await historyCanonical(job, deps)) { await mark(job, deps, 'PUBLICATION_HISTORY_REORG', true); return unresolved('history-not-canonical'); }
       if (job.state === 'quarantined') {
         if (current && !consumption(current) && job.last_error_code != null && PUBLICATION_HEALABLE_CODES.has(job.last_error_code) &&
             await healQuarantine(job, current, deps)) return 'confirmed';
@@ -315,19 +343,19 @@ export async function reconcileMixPublication(id: string, deps: PublicationDeps,
               replayPublicationNonceGap(deps.client, pending.signer, BigInt(pending.nonce), held).then(() => {}), { reconcile: true });
           }
         }
-        return 'unresolved';
+        return unresolved('quarantined');
       }
       if (job.state === 'confirmed') {
         if (observed.count !== 1n || job.published_block_number === null ||
             (await anchor(deps, BigInt(job.published_block_number))).hash !== job.published_block_hash) {
-          await mark(job, deps, 'PUBLICATION_RECEIPT_REORG', true); return 'unresolved';
+          await mark(job, deps, 'PUBLICATION_RECEIPT_REORG', true); return unresolved('confirmed-block-not-canonical');
         }
         const confirmed = await bounded(deps.client.readContract({ address: job.registry, abi: REGISTRY_VERSION_ABI, functionName: 'version',
           args: [BigInt(job.onchain_strategy_id), 1], blockNumber: observed.block.number }), deps);
         if (confirmed.configHash !== job.config_hash || registryConfigHash(confirmed.assets, confirmed.weightsBps, confirmed) !== job.config_hash ||
             await bounded(deps.client.readContract({ address: job.registry, abi: REGISTRY_VERSION_ABI, functionName: 'activeVersion',
               args: [BigInt(job.onchain_strategy_id)], blockNumber: observed.block.number }), deps) !== 1 ||
-            (await anchor(deps, observed.block.number)).hash !== observed.block.hash) { await mark(job, deps, 'PUBLICATION_CONFIG_CONFLICT', true); return 'unresolved'; }
+            (await anchor(deps, observed.block.number)).hash !== observed.block.hash) { await mark(job, deps, 'PUBLICATION_CONFIG_CONFLICT', true); return unresolved('confirmed-version-mismatch'); }
         return 'confirmed';
       }
       if (current && current.status === null && !consumption(current)) {
@@ -350,7 +378,7 @@ export async function reconcileMixPublication(id: string, deps: PublicationDeps,
           return 'reverted';
         }
         if (foreign) { await saveConsumption(job, pending, foreign, deps); return 'consumed'; }
-        if (!replay || observed.count !== 0n) { await mark(job, deps, 'PUBLICATION_RECEIPT_PENDING'); return 'unresolved'; }
+        if (!replay || observed.count !== 0n) { await mark(job, deps, 'PUBLICATION_RECEIPT_PENDING'); return unresolved('receipt-pending'); }
         await (deps.lock ?? withRelayerLock)(97, async held => {
           await validatePublicationTransaction(job, pending);
           held();
@@ -371,7 +399,7 @@ export async function reconcileMixPublication(id: string, deps: PublicationDeps,
             tx.input !== job.calldata || tx.value !== 0n || tx.blockHash !== result.blockHash || tx.blockNumber !== result.blockNumber || tx.hash !== result.transactionHash) throw mixUnavailable();
         await complete(job, null, { receipt: result, block: await anchor(deps, result.blockNumber) }, observed.block, deps); return 'confirmed';
       }
-      if (!replay || !deps.chain) { await mark(job, deps, 'PUBLICATION_PENDING'); return 'unresolved'; }
+      if (!replay || !deps.chain) { await mark(job, deps, 'PUBLICATION_PENDING'); return unresolved('pending-no-replay'); }
       await (deps.lock ?? withRelayerLock)(97, async lockHeld => {
         const duration = deps.nonceLockMs ?? 15000;
         if (!Number.isSafeInteger(duration) || duration < 1 || duration > 30000) throw mixUnavailable();
@@ -417,7 +445,7 @@ export async function reconcileMixPublication(id: string, deps: PublicationDeps,
       let proof = await receipt(job, sent, deps);
       if (!proof) {
         try { await bounded(deps.client.waitForTransactionReceipt({ hash: sent.tx_hash, timeout: deps.timeoutMs ?? 5000, pollingInterval: 100 }), deps); }
-        catch { await mark(job, deps, 'PUBLICATION_RECEIPT_PENDING'); return 'unresolved'; }
+        catch (error) { await mark(job, deps, 'PUBLICATION_RECEIPT_PENDING'); return unresolved('receipt-wait-timeout', error); }
       }
       // Our own transaction is included (one node returned its receipt). A load-balanced RPC may route the next reads
       // to a node a few blocks behind: receipt/block not found yet, or `latest` still before the version. Re-read the
@@ -439,13 +467,13 @@ export async function reconcileMixPublication(id: string, deps: PublicationDeps,
           throw error instanceof AppError ? error : mixUnavailable('confirm-read', error); // other AppErrors are not retried
         }
       }, () => true);
-      if (!proof) { await mark(job, deps, 'PUBLICATION_RECEIPT_PENDING'); return 'unresolved'; }
-      if (confirmed === 'reverted') return 'unresolved'; // next tick records the original revert before a fresh attempt
+      if (!proof) { await mark(job, deps, 'PUBLICATION_RECEIPT_PENDING'); return unresolved('receipt-not-visible'); }
+      if (confirmed === 'reverted') return unresolved('reverted-recorded-next-tick'); // next tick records the original revert before a fresh attempt
       await complete(job, sent, proof, confirmed.observed, deps, confirmed.checked); return 'confirmed';
-    } catch {
+    } catch (error) {
       try { const latest = await load(id, deps); if (latest.state !== 'quarantined') await mark(latest, deps, 'PUBLICATION_UNAVAILABLE'); }
       catch { /* A lost DB connection preserves the durable attempt for the next worker. */ }
-      return 'unresolved';
+      return unresolved('error', error);
     }
   }).catch(error => {
     if (error instanceof AppError && ['MIX_CREATE_BUSY','MIX_UNAVAILABLE'].includes(error.code)) throw error;

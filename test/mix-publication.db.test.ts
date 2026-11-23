@@ -194,6 +194,62 @@ test('identity conflicts never self-heal even when the chain matches', async () 
   }));
 });
 
+// Strategy 54 after 0066: the quarantined job had already stored a success receipt whose block hash came from a
+// lagging fork, so every round re-flagged PUBLICATION_RECEIPT_REORG and never reached the heal. Canonically the same
+// original transaction succeeded in another block. db 0067 lets the heal replace that receipt, keeping the old one.
+async function forkedReceipt(f: ReturnType<typeof registrationRpc>, conflict: boolean, code?: string) {
+  const id = await reserve();
+  f.state.publicationConfigConflict = true; // the bad read at creation time
+  await assert.rejects(registerMixStrategy(T.roles.keeper, 'fork', allocation, id, { chain: f.chain }));
+  const sid = await jobId();
+  const outbox = (await query<{ checked_block_time: Date }>('select checked_block_time from mix_publication_outbox where strategy_id=$1', [sid])).rows[0]; assert.ok(outbox);
+  const fork = `0x${'f0'.repeat(32)}` as const, canonical = `0x${'c1'.repeat(32)}` as const;
+  // What the lagging fork answered, stored as the success receipt of the original attempt.
+  await query(`insert into mix_publication_receipts(strategy_id,attempt,status,block_number,block_hash,block_time) values($1,1,'success',2,$2,$3)`,
+    [sid, fork, outbox.checked_block_time]);
+  if (code) await query('update mix_publication_jobs set last_error_code=$2 where strategy_id=$1', [sid, code]);
+  // Canonical chain: the same transaction in block 2 with another hash.
+  f.state.receiptBlock = 2n; f.state.receiptBlockHash = canonical; f.state.publicationConfigConflict = conflict;
+  return { sid, fork, canonical };
+}
+
+test('a success receipt stored from a lagging fork is corrected to the canonical block and the job confirmed; the old receipt is kept', async () => {
+  await mixDbSandbox(async lane => lane(async () => {
+    const f = registrationRpc(), { sid, fork, canonical } = await forkedReceipt(f, false);
+    const logs: string[] = [], warn = console.warn, info = console.info;
+    console.warn = (line: unknown) => { logs.push(String(line)); }; console.info = (line: unknown) => { logs.push(String(line)); };
+    try { assert.equal((await reconcileRelayerTransactions({ client: f.client, chain: f.chain, operator: relayerSigner.address, replay: true })).confirmed, 1); }
+    finally { console.warn = warn; console.info = info; }
+    assert.deepEqual((await query('select state,last_error_code from mix_publication_jobs')).rows[0], { state: 'confirmed', last_error_code: null });
+    assert.deepEqual((await query('select block_number::text,block_hash from mix_publication_receipts')).rows, [{ block_number: '2', block_hash: canonical }]);
+    assert.deepEqual((await query('select previous_block_hash,block_hash from mix_publication_receipt_corrections')).rows, [{ previous_block_hash: fork, block_hash: canonical }]);
+    assert.equal((await query('select version from strategy_versions where strategy_id=$1', [sid])).rows.length, 1);
+    assert.equal(f.state.broadcasts.length, 2, 'nothing new is signed');
+    assert.ok(logs.some(l => l.includes('mix_publication_healed') && l.includes(fork.slice(0, 10))), logs.join('\n'));
+    assert.ok(!(await detectAlerts(query, { env: { CHAIN_ID: '97' }, readGasPrice: async () => 1n, readNativeBalance: async () => 0n })).some(a => a.detail.includes(`strategy ${sid}`)));
+    // Corrections and receipts stay immutable afterwards.
+    await assert.rejects(query("update mix_publication_receipts set block_hash=$1 where strategy_id=$2", [fork, sid]));
+    await assert.rejects(query('delete from mix_publication_receipt_corrections'));
+  }));
+});
+
+test('a forked receipt stays quarantined, uncorrected and logged when the chain still does not match, or the quarantine is an identity conflict', async () => {
+  for (const [conflict, code] of [[true, undefined], [false, 'PUBLICATION_NONCE_PROOF_REORG'], [false, 'PUBLICATION_VERSION_CONFLICT']] as const) {
+    await mixDbSandbox(async lane => lane(async () => {
+      const f = registrationRpc(), { sid, fork } = await forkedReceipt(f, conflict, code);
+      const logs: string[] = [], warn = console.warn;
+      console.warn = (line: unknown) => { logs.push(String(line)); };
+      try { assert.equal(await reconcileMixPublication(sid, pubDeps(f), true), 'unresolved'); }
+      finally { console.warn = warn; }
+      assert.equal((await query('select state from mix_publication_jobs')).rows[0]?.state, 'quarantined', String(code));
+      assert.deepEqual((await query('select block_hash from mix_publication_receipts')).rows, [{ block_hash: fork }]);
+      assert.equal((await query('select 1 from mix_publication_receipt_corrections')).rows.length, 0);
+      assert.equal((await query('select version from strategy_versions')).rows.length, 0);
+      assert.ok(logs.some(l => l.includes('mix_publication_unresolved') && l.includes('receipt-block-not-canonical')), logs.join('\n'));
+    }));
+  }
+});
+
 test('two workers cannot publish the same job and a held job lock never reserves the global relayer', async () => {
   await mixDbSandbox(async lane => {
     const f = registrationRpc(); let sid = '';

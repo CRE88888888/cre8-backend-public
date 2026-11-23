@@ -1,3 +1,4 @@
+import { errorChain } from './errors.js';
 import { createPublicClient, http, parseTransaction, TransactionReceiptNotFoundError } from 'viem';
 import type { Address, Hex, PublicClient } from 'viem';
 import { getConfig } from './config.js';
@@ -128,7 +129,10 @@ export async function reconcileRelayerTransactions(options: Options = {}) {
           operator: options.operator, assertHeld: held, timeoutMs }, options.replay);
         if (result === 'registered') counts.confirmed++;
         else { counts.unresolved++; if (result === 'replayed') counts.replayed++; }
-      } catch { counts.unresolved++; }
+      } catch (error) {
+        counts.unresolved++;
+        console.warn(JSON.stringify({ level: 'warn', msg: 'mix_registration_reconcile_failed', requestId: mix.id, cause: errorChain(error) }));
+      }
     }
     return counts;
   }, { reconcile: true }).catch(() => { throw new AppError(503, 'RELAYER_RECONCILIATION_UNAVAILABLE', 'relayer reconciliation unavailable; original transactions retained'); });
@@ -141,7 +145,10 @@ export async function reconcileRelayerTransactions(options: Options = {}) {
       await registerMixCreation(id, { chain, client, operator: options.operator ?? chain.account.address,
         query, transaction: options.transaction ?? withTransaction, timeoutMs });
       counts.confirmed++;
-    } catch { counts.unresolved++; }
+    } catch (error) {
+      counts.unresolved++;
+      console.warn(JSON.stringify({ level: 'warn', msg: 'mix_registration_recovery_failed', requestId: id, cause: errorChain(error) }));
+    }
   }
   // Each publication owns only its job lock during RPC/receipt work. One bad mix
   // cannot keep the faucet's shared nonce lock while waiting for a receipt.
@@ -154,7 +161,10 @@ export async function reconcileRelayerTransactions(options: Options = {}) {
       if (result === 'confirmed') counts.confirmed++;
       else if (result === 'reverted') counts.failed++;
       else { counts.unresolved++; if (result === 'replayed') counts.replayed++; }
-    } catch { counts.unresolved++; }
+    } catch (error) {
+      counts.unresolved++;
+      console.warn(JSON.stringify({ level: 'warn', msg: 'mix_publication_reconcile_failed', strategyId: job.strategy_id, cause: errorChain(error) }));
+    }
   }
   return counts;
 }

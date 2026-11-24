@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { AAVE_POOL_56, createMainnetRates, LISTA_MAIN_USDT_MARKET, mainnetQuote, USDT_56, VUSDT_56 } from '../src/strategy-earn-mainnet.js';
+import { AAVE_POOL_56, createMainnetRates, LISTA_MAIN_USDT_MARKET, mainnetQuote, pickListaMarket, USDT_56, VUSDT_56 } from '../src/strategy-earn-mainnet.js';
 import { createStrategyEarn } from '../src/strategy-earn.js';
 
 // Shapes copied from the live APIs (2026-11-24): Venus core pool, Lista Moolah markets / vaults, Aave getReserveData.
@@ -35,7 +35,7 @@ test('mainnet rates: Venus vUSDT, Lista main USDT market + largest USDT vault, A
   assert.equal(r.collateralIncentiveBps.NVDAB, 25);
   // Lista: (3.53 - 2.95) x 30% = 0.174 -> 17 bps; Venus: 5.15 > 3.53 -> negative carry, no new borrowing, 0 extra.
   assert.deepEqual(mainnetQuote(r, 'lista', 'AAPLB', 3000), { open: true, reason: null, borrowBps: 295, borrowIncentiveBps: 0, vaultBps: 353, vaultIncentiveBps: 0,
-    collateralBps: 0, collateralIncentiveBps: 0, ratioBps: 3000, carryBps: 17, extraApyBps: 17 });
+    collateralBps: 0, collateralIncentiveBps: 0, ratioBps: 3000, carryBps: 17, extraApyBps: 17, limited: false, loan: 'USDT', listaMarketId: null, liquidityUsd: null });
   const v = mainnetQuote(r, 'venus', 'NVDAB', 3000);
   assert.equal(v?.open, false); assert.equal(v?.reason, 'negative_carry'); assert.equal(v?.extraApyBps, 0);
 });
@@ -59,4 +59,23 @@ test('GET /strategy-earn/markets carries mainnetRates and a mainnet quote per ma
   assert.equal(view.mainnetRates?.vault.venue, 'venus');
   // Chain down: no target LTV, so no per-market mainnet quote rather than a guessed ratio.
   assert.ok(view.markets.every(m => 'mainnet' in m && m.mainnet === null));
+});
+
+test('Lista per-asset market: lowest net rate (rate − emission, may be negative) with ≥ $50k, else ≥ $1k marked limited, open-term stables only', () => {
+  const m = (id: string, collateral: string, loan: string, rate: string, emission: string, liquidityUsd: string, termType = 0) =>
+    ({ id, collateral, loan, rate, borrowEmissionApy: emission, liquidityUsd, lltv: '0.75', termType, zone: 5 });
+  const all = [m('a', 'QQQB', 'USD1', '0.0182', '0.0276', '501000'), m('b', 'QQQB', 'U', '0.0346', '0.0393', '24000'), m('c', 'QQQB', 'USDT', '0.0002', '0', '0'),
+    m('d', 'QQQB', 'USD1', '0.001', '0', '900000', 1), m('e', 'NVDAB', 'USD1', '0.0067', '0.0431', '17000'), m('f', 'NVDAB', 'BNB', '0.001', '0', '900000')];
+  const q = pickListaMarket(all, 'QQQB');
+  assert.deepEqual(q && [q.marketId, q.netBorrowBps, q.limited], ['a', -94, false]); // fixed-term 'd' and empty 'c' ignored
+  const n = pickListaMarket(all, 'NVDAB');
+  assert.deepEqual(n && [n.marketId, n.netBorrowBps, n.limited, n.loan], ['e', -364, true, 'USD1']); // BNB loan is not a USD stable
+  assert.equal(pickListaMarket(all, 'AAPLB'), null);
+});
+
+test('mainnet quote with a negative Lista net rate: carry = vault + |net| (incentives pay the borrower), limited passes through', async () => {
+  const r = await createMainnetRates({ fetch: fakeFetch() as never }).get(); assert.ok(r);
+  r.lista = { NVDAB: { marketId: 'e', collateral: 'NVDAB', loan: 'USD1', borrowApyBps: 67, incentiveBps: 431, netBorrowBps: -364, liquidityUsd: 17000, lltvBps: 7500, limited: true, zone: 5 } };
+  const q = mainnetQuote(r, 'lista', 'NVDAB', 3000);
+  assert.deepEqual(q && [q.open, q.carryBps, q.extraApyBps, q.limited, q.loan], [true, 215, 215, true, 'USD1']); // (353 + 364) x 30%
 });

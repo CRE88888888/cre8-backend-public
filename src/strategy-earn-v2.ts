@@ -1,4 +1,4 @@
-import { decodeEventLog, decodeFunctionData, encodeAbiParameters, encodeFunctionData, isAddressEqual, keccak256, maxUint256, pad, parseAbi, toFunctionSelector, zeroAddress } from 'viem';
+import { decodeEventLog, decodeFunctionData, encodeAbiParameters, stringToHex, encodeFunctionData, isAddressEqual, keccak256, maxUint256, pad, parseAbi, toFunctionSelector, zeroAddress } from 'viem';
 import type { Address, Hex, Log } from 'viem';
 import { ParamCondition } from '@zerodev/permissions/policies';
 import { planAccount } from './strategy-earn-routing.js';
@@ -6,7 +6,7 @@ import type { Costs, Decision, Holding, Liquidity, PricedRoute, RouteKey } from 
 import type { RoutingSnapshot, Stable, Venue } from './strategy-earn-mainnet.js';
 
 /**
- * Strategy Earn routing v2 (cre8-contracts docs/borrow-routing-v2, interface v2.0-draft1): the execution side of the
+ * Strategy Earn routing v2 (cre8-contracts docs/borrow-routing-v2, interface v2.0-draft3): the execution side of the
  * routing engine. NOT DEPLOYED anywhere yet: `strategyEarnV2()` returns null until a deployment is configured, and every
  * caller keeps the v1 chain-97 flow while it is null. Nothing here does I/O; it builds and checks calls.
  *
@@ -15,7 +15,7 @@ import type { RoutingSnapshot, Stable, Venue } from './strategy-earn-mainnet.js'
  * strategy box; consent is one account-level `setStrategyPolicy(maxDebt, rewardRecipient, enabled)`; no call takes a
  * receiver; every `execute*` except `executeDeleverage` needs `msg.sender == account`.
  */
-export const V2_INTERFACE_VERSION = 'v2.0-draft1';
+export const V2_INTERFACE_VERSION = 'v2.0-draft3';
 export type StrategyEarnV2 = {
   chainId: number; executor: Address; registry: Address; venusComptroller: Address; moolah: Address;
   /** Loan tokens on the registry allowlist (same-token routes only). */
@@ -55,6 +55,8 @@ export const V2_EXECUTOR_ABI = parseAbi([
   'function executeRelease(address account, bytes32 vaultId, uint256 deadline)',
   'function executeSweepRewards(address account, address token, uint256 accountAmount, uint256 deadline)',
   'function boxOf(address account) view returns (address)',
+  'function lens() view returns (address)',
+  'function collectRewards(address account, address token) returns (uint256 amount)',
 ]);
 export const V2_REGISTRY_ABI = parseAbi([
   'function setStrategyPolicy(uint256 maxDebt, address rewardRecipient, bool enabled)',
@@ -64,13 +66,14 @@ export const V2_REGISTRY_ABI = parseAbi([
   'function reconcile(address account, bytes32 routeId)',
 ]);
 export const V2_EVENTS_ABI = parseAbi([
-  'event Opened(address indexed account, bytes32 indexed routeId, bytes32 indexed vaultId, uint256 collateralIn, uint256 borrowed, uint256 ltv)',
+  'event Opened(address indexed account, bytes32 indexed routeId, bytes32 indexed vaultId, uint256 collateralIn, uint256 borrowed, uint256 debtValue, uint256 budgetValue)',
   'event Reduced(address indexed account, bytes32 indexed routeId, bytes32 indexed vaultId, uint256 repaid, uint256 fromVault, uint256 fromCash, uint256 collateralOut, uint256 debtLeft)',
   'event Deleveraged(address indexed account, bytes32 indexed routeId, bytes32 indexed vaultId, uint256 repaid, uint256 debtValueBefore, uint256 debtValueAfter)',
   'event Migrated(address indexed account, bytes32 indexed fromRouteId, bytes32 indexed toRouteId, bytes32 fromVaultId, bytes32 toVaultId, uint256 repaid, uint256 collateralMoved, uint256 borrowed)',
   'event VaultSwitched(address indexed account, bytes32 indexed fromVaultId, bytes32 indexed toVaultId, uint256 assets)',
   'event Released(address indexed account, bytes32 indexed vaultId, uint256 assets)',
   'event RewardsSwept(address indexed account, address indexed token, address indexed recipient, uint256 amount)',
+  'event RewardsCollected(address indexed account, address indexed token, uint256 amount)',
 ]);
 const LENDING_ABI = parseAbi(['function updateDelegate(address delegate, bool allowBorrows)', 'function setAuthorization(address authorized, bool newIsAuthorized)']);
 const TOKEN_ABI = parseAbi(['function approve(address spender, uint256 amount)']);
@@ -111,6 +114,8 @@ export const v2Calls = {
   switchVault: (v2: StrategyEarnV2, account: Address, fromVaultId: Hex, toVaultId: Hex, amountRaw: bigint, deadline: bigint) => exec(v2, 'executeSwitchVault', [account, fromVaultId, toVaultId, amountRaw, deadline]),
   release: (v2: StrategyEarnV2, account: Address, vaultId: Hex, deadline: bigint) => exec(v2, 'executeRelease', [account, vaultId, deadline]),
   sweepRewards: (v2: StrategyEarnV2, account: Address, token: Address, accountAmountRaw: bigint, deadline: bigint) => exec(v2, 'executeSweepRewards', [account, token, accountAmountRaw, deadline]),
+  /** Anyone-callable (no deadline): strategy box -> account for a reward token. The weekly rewards job sends it after a claim to the box. */
+  collectRewards: (v2: StrategyEarnV2, account: Address, token: Address) => exec(v2, 'collectRewards', [account, token]),
   /** Anyone-callable: sent by the operator, not through the account. */
   deleverage: (v2: StrategyEarnV2, account: Address, routeId: Hex, vaultId: Hex, maxRepayRaw: bigint = maxUint256) => exec(v2, 'executeDeleverage', [account, routeId, vaultId, maxRepayRaw]),
 };
@@ -228,6 +233,8 @@ export function planExecution(input: { v2: StrategyEarnV2; account: Address; dec
         let borrow = want > debt ? want - debt : 0n;
         const room = input.policyMaxDebtUsdRaw > principal ? input.policyMaxDebtUsdRaw - principal : 0n;
         if (borrow > room) { borrow = room; consentShort = true; }
+        // Moolah refuses a loan under its minimum (about 15 USD): do not send an open that would leave less than that.
+        if (d.to!.venue === 'lista' && borrow > 0n && debt + borrow < usdRaw(LISTA_MIN_LOAN_USD)) { steps.push({ ...base, via: 'session', calls: [], skipped: 'below the Lista minimum loan' }); continue; }
         if (borrow === 0n && p.freeCollateralRaw === 0n) { steps.push({ ...base, via: 'session', calls: [], skipped: consentShort ? 'debt ceiling reached' : 'nothing to post or borrow' }); continue; }
         principal += borrow;
         steps.push({ ...base, via: 'session', calls: [v2Calls.open(v2, account, to.routeId, to.vaultId, p.freeCollateralRaw, borrow, deadline)] });
@@ -252,6 +259,20 @@ export function v2ExitCalls(v2: StrategyEarnV2, account: Address, input: { route
   ];
 }
 
+/**
+ * The same exit as `v2ExitCalls`, one executor call per UserOp. A transaction that touches a Lista vault walks its whole
+ * withdraw queue and costs 6-10M gas (contracts fork runs: migrate QQQB USDC->USD1 10.06M); with the sender's doubled
+ * estimate two of them do not fit the 14M per-UserOp cap. Consent is withdrawn in the last UserOp.
+ */
+export function v2ExitBatches(v2: StrategyEarnV2, account: Address, input: Parameters<typeof v2ExitCalls>[2]): Call[][] {
+  const calls = v2ExitCalls(v2, account, { ...input, withdrawConsent: false });
+  const batches = calls.map(c => [c]);
+  if (input.withdrawConsent) { if (batches.length === 0) batches.push([]); batches[batches.length - 1]!.push(v2ConsentOffCall(v2)); }
+  return batches;
+}
+/** Before a sale, one route per UserOp (see v2ExitBatches). */
+export const v2PreSellBatches = (v2: StrategyEarnV2, account: Address, routes: readonly { routeId: Hex; vaultId: Hex; cashRaw?: bigint }[], deadline: bigint): Call[][] =>
+  v2PreSellCalls(v2, account, routes, deadline).map(c => [c]);
 /** Before a sale: for each asset being sold, repay its route and take the shares back (session key). */
 export function v2PreSellCalls(v2: StrategyEarnV2, account: Address, routes: readonly { routeId: Hex; vaultId: Hex; cashRaw?: bigint }[], deadline: bigint): Call[] {
   return routes.map(r => v2Calls.close(v2, account, r.routeId, r.vaultId, r.cashRaw ?? 0n, deadline));
@@ -376,12 +397,13 @@ export function v2RateReport(v2: StrategyEarnV2, routes: readonly { collateral: 
 /**
  * Vault incentives accrue to the strategy box (it is the depositor), and Lista's proof API needs a signature the box itself
  * validates. Agreed with the contracts side (2026-11-24, not in the interface yet): the box's ERC-1271 accepts ONLY the
- * Lista reward message — the signature carries the plaintext, the box checks its exact suffix and EIP-191 hash, then asks
- * the account. DRAFT encoding `abi.encode(string message, bytes accountSignature)`: confirm against the spec when the
- * contracts agent publishes it; until then this is only used by tests.
+ * Lista reward message. Spec draft2 §9: `signature = abi.encode(bytes message, bytes accountSignature)`; the box checks
+ * that `message` ends with the registry's `rewardProofSuffix` (at most 64 bytes before it), that `hash` is its EIP-191
+ * hash, and that the account itself validates `accountSignature` for that hash. Not yet verified on mainnet: which hash
+ * form Lista's backend actually passes to the contract — so vault-side LISTA is not to be counted until that is tested.
  */
 export const boxRewardSignature = (message: string, accountSignature: Hex): Hex =>
-  encodeAbiParameters([{ type: 'string' }, { type: 'bytes' }], [message, accountSignature]);
+  encodeAbiParameters([{ type: 'bytes' }, { type: 'bytes' }], [stringToHex(message), accountSignature]);
 
 // ---------------------------------------------------------------------------
 // Scheduler step: one account, one round (auto-open after a fill, top-up, migrate, reduce, close, deleverage)

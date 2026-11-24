@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
-import { decodeFunctionData, encodeAbiParameters, encodeEventTopics, keccak256, maxUint256, toFunctionSelector, zeroAddress } from 'viem';
+import { decodeFunctionData, encodeAbiParameters, encodeEventTopics, keccak256, stringToHex, maxUint256, toFunctionSelector, zeroAddress } from 'viem';
 import type { Abi, AbiEvent, AbiFunction, Address, Hex, Log } from 'viem';
 import { formatAbiItem } from 'viem/utils';
 import { describePolicies, sessionCallPermissions } from '../src/permissions.js';
@@ -9,6 +9,7 @@ import type { Decision, PricedRoute, RouteKey } from '../src/strategy-earn-routi
 import { boxRewardSignature, maxDebtFor, planExecution, routeIdOf, routeIds, strategyEarnV2, V2_EVENTS_ABI, V2_EXECUTOR_ABI, V2_INTERFACE_VERSION, V2_REGISTRY_ABI, V2_SESSION_SELECTORS,
   routeMessage, runV2Account, v2Authorized, v2RouteEvents, v2Calls, v2ConsentCalls, v2ExitCalls, v2PreSellCalls, v2RateReport, v2SessionPermissions, vaultIdOf } from '../src/strategy-earn-v2.js';
 import type { Call, PositionState, StrategyEarnV2, V2Holding } from '../src/strategy-earn-v2.js';
+import { v2ExitBatches, v2PreSellBatches } from '../src/strategy-earn-v2.js';
 import type { RouteOption, RoutingSnapshot, RoutingVault } from '../src/strategy-earn-mainnet.js';
 
 const A = (n: number) => ('0x' + n.toString(16).padStart(40, '0')) as Address;
@@ -160,9 +161,10 @@ test('rate report: incentives per route and Lista vault rates only, deduplicated
   assert.equal(v2RateReport(V2, [], []), null);
 });
 
-test('strategy box reward signature carries the plaintext the box checks (draft encoding)', () => {
+test('strategy box reward signature = abi.encode(bytes message, bytes accountSig) (spec §9); collectRewards is the anyone-callable box -> account move', () => {
   const sig = boxRewardSignature('2026-11-24T12:00:00.000Z\nThank you for your support of listaDAO.', '0xabcd');
-  assert.equal(sig, encodeAbiParameters([{ type: 'string' }, { type: 'bytes' }], ['2026-11-24T12:00:00.000Z\nThank you for your support of listaDAO.', '0xabcd']));
+  assert.equal(sig, encodeAbiParameters([{ type: 'bytes' }, { type: 'bytes' }], [stringToHex('2026-11-24T12:00:00.000Z\nThank you for your support of listaDAO.'), '0xabcd']));
+  assert.deepEqual(decode(v2Calls.collectRewards(V2, account, LISTA).data), { functionName: 'collectRewards', args: [account, LISTA] });
   assert.deepEqual(v2Calls.deleverage(V2, account, ('0x' + '01'.repeat(32)) as Hex, ('0x' + '02'.repeat(32)) as Hex).to, V2.executor);
 });
 
@@ -230,15 +232,15 @@ test('ledger rows from a receipt: only this account, only the v2 executor; a red
     return { address, topics: encodeEventTopics({ abi: [item], eventName: name, args: indexed } as never), data: encodeAbiParameters(plain, data as never), logIndex } as unknown as Log;
   };
   const tx = { hash: ('0x' + 'cc'.repeat(32)) as Hex, blockNumber: 77n, logs: [
-    log('Opened', { account, routeId: R, vaultId: VA }, [10n * E, 3n * E, 3n * E / 10n], 0),
+    log('Opened', { account, routeId: R, vaultId: VA }, [10n * E, 3n * E, 3n * E, 10n * E], 0),
     log('Reduced', { account, routeId: R, vaultId: VA }, [E, E, 0n, 0n, 2n * E], 1),
     log('Reduced', { account, routeId: R, vaultId: VA }, [2n * E, 2n * E, 0n, 10n * E, 0n], 2),
     log('Migrated', { account, fromRouteId: R, toRouteId: R2 }, [VA, VB, 3n * E, 10n * E, 3n * E] as never, 3),
     log('VaultSwitched', { account, fromVaultId: VA, toVaultId: VB }, [3n * E], 4),
     log('Deleveraged', { account, routeId: R, vaultId: VA }, [E, 5n * E, 4n * E], 5),
     log('Released', { account, vaultId: VA }, [E / 100n], 6),
-    log('Opened', { account: A(0x99), routeId: R, vaultId: VA }, [E, E, E], 7), // someone else's position
-    log('Opened', { account, routeId: R, vaultId: VA }, [E, E, E], 8, A(0xdd))] }; // not the v2 executor
+    log('Opened', { account: A(0x99), routeId: R, vaultId: VA }, [E, E, E, E], 7), // someone else's position
+    log('Opened', { account, routeId: R, vaultId: VA }, [E, E, E, E], 8, A(0xdd))] }; // not the v2 executor
   const lookup = { route: (id: Hex) => id === R ? { asset: 'QQQB', venue: 'lista' as const, loan: 'USDT' } : id === R2 ? { asset: 'QQQB', venue: 'venus' as const, loan: 'USDC' } : null,
     vault: (id: Hex) => id === VB ? { venue: 'aave' as const } : { venue: 'lista' as const } };
   const events = v2RouteEvents(V2, tx, { portfolioId: 7, account, lookup, reason: 'better_route' });
@@ -259,4 +261,16 @@ test('activity sentence: short, English and Simplified Chinese, no venue or borr
     assert.ok(!/[換開關閉還債並從於個與這種幣場級險質額獲轉賬戶]/.test(m.zh), kind + ': Traditional character');
     assert.ok(!/borrow|loan|collateral|LTV|Venus|Lista|借|抵押|质押/i.test(m.en + m.zh), kind);
   }
+});
+
+test('draft3: Lista vault transactions go one per UserOp; an open under the Lista minimum loan is not sent', () => {
+  const a = routeIds(V2, NVDA, venusUsdt), b = routeIds(V2, QQQ, listaUsdc);
+  const batches = v2ExitBatches(V2, account, { routes: [a, b], leftoverVaults: [a.vaultId], rewardTokens: [LISTA], deadline: DEADLINE, withdrawConsent: true });
+  assert.deepEqual(batches.map(batch => batch.map(c => c.to === V2.registry ? 'setStrategyPolicy' : decode(c.data).functionName)),
+    [['executeReduce'], ['executeReduce'], ['executeRelease'], ['executeSweepRewards', 'setStrategyPolicy']]);
+  assert.deepEqual(v2PreSellBatches(V2, account, [a, b], DEADLINE).map(x => x.length), [1, 1]);
+  const small = plan([decision('QQQB', 'open', 'best_route', null, listaUsdc, 14)], [state('QQQB', QQQ, { freeCollateralRaw: E })]);
+  assert.deepEqual([small.steps[0]!.calls.length, small.steps[0]!.skipped], [0, 'below the Lista minimum loan']);
+  const venusSmall = plan([decision('NVDAB', 'open', 'best_route', null, venusUsdt, 14)], [state('NVDAB', NVDA, { freeCollateralRaw: E })]);
+  assert.equal(venusSmall.steps[0]!.calls.length, 1); // Venus has no such minimum
 });

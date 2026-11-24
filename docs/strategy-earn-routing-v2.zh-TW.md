@@ -1,6 +1,6 @@
 # 加息策略動態路由 v2：後端這一側
 
-合約規格：cre8-contracts `docs/borrow-routing-v2.zh-TW.md`（這裡對的是 **v2.0-draft1**）。選路線的規則：`docs/strategy-earn-mainnet-routing.zh-TW.md`。激勵代幣：`docs/strategy-earn-rewards.zh-TW.md`。
+合約規格：cre8-contracts `docs/borrow-routing-v2.zh-TW.md`（這裡對的是 **v2.0-draft3**）。選路線的規則：`docs/strategy-earn-mainnet-routing.zh-TW.md`。激勵代幣：`docs/strategy-earn-rewards.zh-TW.md`。
 實作：`src/strategy-earn-v2.ts`。測試：`test/strategy-earn-routing-v2.test.ts`、`test/sponsor-flows.test.ts`、`test/strategy-route-events.db.test.ts`。
 
 ## 開關
@@ -70,3 +70,29 @@ v2 executor 上那六個函式，第一個參數釘死是這個帳戶。沒有�
   - `source: 'onchain'`：路由 v2 的部位實際所在的路線（v2 部署後才會出現）。App 的示意圖只在這種情況改用部位自己的路線，其餘跟買入前一樣。
 - `GET /portfolios/:id/strategy-earn/activity`：有 v2 部署設定時，多回 db 0069 的事件（`migrate`、`switch_vault`、`reduce`…），附 `message`（英文）與 `messageZh`（簡體）。沒有設定時不讀那張表。
 - `GET /portfolios/:id/strategy-earn/rewards`：待領與已在帳戶裡的 LISTA／XVS（見 `docs/strategy-earn-rewards.zh-TW.md`）。
+
+## draft3 對齊（2026-11-24）
+
+已改：
+- `Opened` 事件最後一欄改成 `debtValue, budgetValue`；新增 `collectRewards(account, token)`（任何人可呼叫，策略盒 → 帳戶，`v2Calls.collectRewards`，由 operator 送）、`lens()`、`RewardsCollected` 事件。
+- 策略盒簽名 `boxRewardSignature`＝`abi.encode(bytes message, bytes accountSignature)`（規格 §9）。
+- 碰到 Lista vault 的交易一筆要 6–10M gas（會走完整個提領佇列），估算乘 2 後兩筆放不進 14M：`v2ExitBatches`／`v2PreSellBatches` 一個 executor 呼叫一筆 UserOp；`planExecution` 的每個 step 本來就各自一筆。
+- Lista 最低借款約 15 美元：開倉後總債務低於它就不送（`below the Lista minimum loan`）。
+- 簽名比對用的 fixture 重新從 interface.json 產生（含 `AtpBorrowLensV2`）。
+
+還沒做（都要等部署或另外的資料來源）：
+- 讀取改走 `AtpBorrowLensV2`（`routeStatus`／`vaultStatus`／`quote`／`health`／`debt`／`routeDebt`／`tokenDebt`／`minLoan`）；持有時間改讀 `registry.openedAt`、`vaultSince`。
+- 非 USDT 的零頭與差額：合約不換幣，還款不足要用同一種幣補。後端需要 USDC／USD1／U ↔ USDT 的換幣路徑（走既有交易路徑），兩步搬家的中間那一步也用得到。
+- 路線挑選要排除不能存入的 vault（Lista Gauntlet USDT vault 的 supply queue 是空的）與已達供給上限的 Venus 市場（主網 vNVDAB 已滿）。現在的 `mainnetRates` 還沒有這兩個條件。
+- Lista vault 那一側的 LISTA 激勵：策略盒簽名流程在主網驗過之前，不應該算進顯示的收益。目前顯示仍有算（見下）。
+- `reportRates` 每 12 小時一次（48 小時過期；40 條路線＋10 個 vault 約 322k gas）。
+
+### 顯示數字若排除 Lista vault 激勵（2026-11-24 13:45 UTC 的實際利率，僅試算、顯示沒改）
+
+USDC 最佳 vault 會從 Lista USDC Vault（1.41% 基礎 + 3.66% 激勵 = 5.07%）變成 Aave（3.39%）。借款那一側的 LISTA 激勵兩邊都照算。
+
+| 基金 | 現在顯示的加息 | 排除後 |
+| --- | --- | --- |
+| Mag7 | 0.99% | 0.68% |
+| Pelosi | 0.74% | 0.53% |
+| US Market | 1.41% | 1.15% |

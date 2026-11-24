@@ -366,8 +366,11 @@ test('detectPortfolioFailures：最近 N 筆全部不是 confirmed → 一筆 cr
   // SQL 的形狀就是規則本身：「最近 N 筆」＝ row_number by id desc；「全部沒成功」＝ bool_and。
   const sql = findSeen(seen, 'row_number() over').sql;
   assert.match(sql, /partition by o\.portfolio_id order by o\.id desc/, '「最近」是 id desc，不是時鐘');
-  assert.match(sql, /having count\(\*\) >= \$1 and bool_and\(state <> 'confirmed'\)/, '門檻與「全部不是 confirmed」都在 SQL 裡');
-  assert.deepEqual(findSeen(seen, 'row_number() over').params, [3]);
+  assert.match(sql, /having count\(\*\) >= \$1 and bool_and\(r\.state <> 'confirmed'\)/, '門檻與「全部不是 confirmed」都在 SQL 裡');
+  assert.match(sql, /s\.retired_at is null/, '帳戶已退役的投資組合不列入');
+  assert.match(sql, /h\.ended_at is not null/, 'My mix 已結束的段不列入');
+  assert.match(sql, /p\.last_checked_at > max\(r\.created_at\)/, '之後的輪次乾淨就過期');
+  assert.deepEqual(findSeen(seen, 'row_number() over').params, [3, 6]);
 });
 
 test('detectPortfolioFailures：沒有列（沒有問題／樣本不足）→ 不產生警示', async () => {
@@ -650,7 +653,7 @@ test('detectAlerts：三條規則合成一份 findings，閾值從 env 來（覆
     ['portfolio_repeatedly_failing', 'session_key_expiring', 'gas_low'],
     '順序固定，stdout 才穩定',
   );
-  assert.deepEqual(findSeen(seen, 'row_number() over').params, [4], 'ALERT_FAILING_OPS 覆寫了預設 3');
+  assert.deepEqual(findSeen(seen, 'row_number() over').params, [4, 6], 'ALERT_FAILING_OPS 覆寫了預設 3；第二個參數是乾淨輪次的時間窗（小時）');
   assert.equal(
     findSeen(seen, 'from session_keys k').params[0],
     new Date(NOW.getTime() + 14 * DAY_MS).toISOString(),

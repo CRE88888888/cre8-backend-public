@@ -8,6 +8,7 @@ import { assetsMarketOpen } from './trading-calendar.js';
 import { runYieldRound } from './yield-service.js';
 import { runDcaRound } from './dca.js';
 import { STRATEGY_EARN_97 } from './strategy-earn-guard.js';
+import { noteRoundOutcome } from './alerts.js';
 import { runStrategyRewardsRound } from './strategy-rewards.js';
 import { strategyEarnV2, v2Authorized } from './strategy-earn-v2.js';
 import { dbStrategyEarnLedger, defaultStrategyEarnChain, runStrategyEarnRound, strategyEarnAutoOpen, strategyEarnUnwindForSale } from './strategy-earn.js';
@@ -2078,6 +2079,8 @@ export async function runSchedulerOnce(
     const started = performance.now();
     const result = await phaseTimes.run(times, () => runOne(due, { dryRun, now, thresholdBps, deps: resolved, forcePlan: deps.forcePlan === true, roundBlockReason }));
     results.push(result);
+    // Alerts (same process, end of the round) read this to tell "waiting for a harmless reason" from "stuck".
+    noteRoundOutcome(due.portfolioId, result.outcome, result.reason, now);
     resolved.log(formatResult(result, dryRun));
     resolved.log(`[scheduler] portfolio ${due.portfolioId} ${Math.round(performance.now() - started)} ms${times.size ? `：${formatPhases(times)}` : ''}`);
   }

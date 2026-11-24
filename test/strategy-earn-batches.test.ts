@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { decodeFunctionData, encodeFunctionData } from 'viem';
 import type { Address, Hex } from 'viem';
-import { STRATEGY_EARN_ABI, STRATEGY_EARN_MARKETS_PER_USER_OP, strategyEarnAutoOpen, strategyEarnBatches, strategyEarnUnwindForSale, strategyMarkets } from '../src/strategy-earn.js';
+import { createStrategyEarn, STRATEGY_EARN_97, STRATEGY_EARN_ABI, STRATEGY_EARN_MARKETS_PER_USER_OP, strategyEarnAutoOpen, strategyEarnBatches, strategyEarnUnwindForSale, strategyMarkets } from '../src/strategy-earn.js';
 import type { Call, StatusReading, StrategyEarnChain, StrategyEarnStepArgs, StrategyMarket } from '../src/strategy-earn.js';
 import { strategyEarnOpenDelay } from '../src/scheduler.js';
 import { AppError } from '../src/errors.js';
@@ -123,3 +123,44 @@ test('a failed auto-open backs off: 5, 10, 20, 40, then 60 minutes', () => {
   assert.deepEqual([1, 2, 3, 4, 5, 9].map(n => strategyEarnOpenDelay(n) / 60_000), [5, 10, 20, 40, 60, 60]);
 });
 
+
+test('owner turn-off (API close): up to three markets is one UserOp as before; ten markets come as batches that each finish what they touch', async () => {
+  const w = world();
+  await strategyEarnAutoOpen(step(w).args);
+  const earn = createStrategyEarn({ chainId: 97, chain: () => w.chain, owned: (async () => ({ chainId: 97, ownerAddress: account, accountAddress: account })) as never, now: () => now });
+  const isOff = (c: Call) => c.to.toLowerCase() === STRATEGY_EARN_97.registry && decode(c).functionName === 'setBorrowPolicy';
+  const marketsOf = (batch: Call[]) => [...new Set(batch.map(c => isOff(c) ? String((decode(c).args as readonly unknown[])[0]).toLowerCase() : marketOf(c)))];
+  const small = await earn.close(8, account, { assets: lista.slice(0, 3).map(m => m.symbol) });
+  assert.ok(small.status === 'ready');
+  assert.deepEqual(small.batches, [small.calls]);
+  const all = await earn.close(8, account, { assets: ten.map(m => m.symbol) });
+  assert.ok(all.status === 'ready');
+  // Venus (shared debt) first with its two consent withdrawals in the same UserOp, then Lista three markets at a time.
+  assert.deepEqual(all.batches.map(b => marketsOf(b).length), [2, 3, 3, 2]);
+  assert.deepEqual(marketsOf(all.batches[0]!).sort(), venus.map(m => m.marketId).sort());
+  for (const batch of all.batches) {
+    const closed = [...new Set(batch.filter(c => !isOff(c)).map(marketOf))], off = batch.filter(isOff).map(c => String((decode(c).args as readonly unknown[])[0]).toLowerCase());
+    assert.deepEqual([...off].sort(), [...closed].sort(), 'every market a UserOp closes also has its consent withdrawn in that UserOp');
+    for (const id of closed) assert.ok(batch.findIndex(c => isOff(c) && String((decode(c).args as readonly unknown[])[0]).toLowerCase() === id) > batch.map(c => !isOff(c) && marketOf(c) === id).lastIndexOf(true), 'settle before withdrawing consent');
+  }
+  assert.equal(all.batches.flat().length, all.calls.length); // same calls, only grouped differently
+  // Retry after the second UserOp failed: the wallet asks again for what is still on and gets only those.
+  for (const batch of all.batches.slice(0, 2)) w.apply(batch.filter(c => !isOff(c)));
+  const stillOn = ten.filter(m => (w.posted.get(m.marketId) ?? 0n) > 0n);
+  assert.equal(stillOn.length, 5);
+  const retry = await earn.close(8, account, { assets: stillOn.map(m => m.symbol) });
+  assert.ok(retry.status === 'ready');
+  assert.deepEqual(retry.batches.map(b => marketsOf(b).length), [3, 2]);
+});
+
+test('consent and single-asset open also carry batches (one batch in practice)', async () => {
+  const w = world();
+  const earn = createStrategyEarn({ chainId: 97, chain: () => ({ ...w.chain, weights: async () => ten.map(m => ({ asset: m.collateral, weightBps: 1000 })) }),
+    owned: (async () => ({ chainId: 97, ownerAddress: account, accountAddress: account, personalMix: false })) as never, now: () => now,
+    query: (async () => ({ rows: [] })) as never });
+  const open = await earn.open(8, account, { asset: lista[0]!.symbol, collateralRaw: (10n * E18).toString() });
+  assert.ok(open.status === 'ready' && open.batches.length === 1 && open.batches[0]!.length === open.calls.length);
+  const auto = await earn.auto(8, account, { budgetRaw: (1000n * E18).toString() });
+  assert.ok(auto.status === 'ready');
+  assert.deepEqual([auto.batches.length, auto.batches[0]!.length], [1, auto.calls.length]); // 2 delegations + 10 × (ceiling + approval) + 2 approvals = 24 light calls
+});

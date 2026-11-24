@@ -548,7 +548,7 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
         existingDebtValue: s.health.debtValue, targetLtv: s.targetLtv, usdtPriceE8: usdtPrice, currentDebtRaw: s.debt });
       const deadline = BigInt(Math.floor(deps.now().getTime() / 1000) + 30 * 60);
       return { status: 'ready' as const, asset: market.symbol, collateralRaw: collateralRaw.toString(), borrowRaw: plan.borrowRaw.toString(),
-        maxDebtRaw: plan.maxDebtRaw.toString(), extraApyBps: extraApy(s, s.targetLtv).totalBps, calls: openCalls(market, account, collateralRaw, plan.borrowRaw, plan.maxDebtRaw, deadline) };
+        maxDebtRaw: plan.maxDebtRaw.toString(), extraApyBps: extraApy(s, s.targetLtv).totalBps, ...withBatches(openCalls(market, account, collateralRaw, plan.borrowRaw, plan.maxDebtRaw, deadline)) };
     },
     /**
      * Buy confirmation with "Earn extra" on (backend#204, EARN_UX B.1): the owner's one consent, appended to the buy UserOp.
@@ -580,7 +580,7 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
         : { asset: q.market.symbol, status: q.status, reason: q.reason, message: TEMPORARILY });
       if (ready.length === 0) return { status: 'unavailable' as const, reason: eligible.length === 0 ? 'no_eligible_asset' : 'data_unavailable', message: TEMPORARILY, assets };
       return { status: 'ready' as const, authorization: await borrowKeyReady(id, account) ? 'ready' as const : 'renewal_required' as const,
-        assets, calls: consentCalls(ready.map(q => ({ market: q.market, maxDebtRaw: q.maxDebtRaw }))) };
+        assets, ...withBatches(consentCalls(ready.map(q => ({ market: q.market, maxDebtRaw: q.maxDebtRaw })))) };
     },
     /** Activity (EARN_UX B.6): newest first, one plain sentence each, from the verified ledger (db 0063). */
     async activity(id: number, wallet: string) {
@@ -657,13 +657,24 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
           venusCalls = venusReleaseCalls({ account, positions, release: venus.map(m => m.marketId), cash, usdtPriceE8: usdtPrice, deadline }).calls;
         } catch { return { status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY }; }
       }
-      const listaCalls: Call[] = [];
-      for (const market of chosen.filter(m => m.protocol !== 'venus')) listaCalls.push(...(await closeOne(account, market, deadline)));
-      const consent = chosen.map(m => call(STRATEGY_EARN_97.registry, 'setBorrowPolicy', [m.marketId, 0n, false]));
-      const calls = [...venusCalls, ...listaCalls, ...consent];
-      // `batches`: the same calls in order, split so each owner UserOp stays under the per-UserOp gas cap (a wallet that
-      // sends `calls` as one UserOp keeps working for small portfolios; sending `batches` one after another always fits).
-      return { status: 'ready' as const, asset: chosen[0]!.symbol, assets: chosen.map(m => m.symbol), calls, batches: strategyEarnBatches(calls) };
+      const off = (m: StrategyMarket) => call(STRATEGY_EARN_97.registry, 'setBorrowPolicy', [m.marketId, 0n, false]);
+      const listaGroups: Call[][] = [];
+      for (const market of chosen.filter(m => m.protocol !== 'venus')) listaGroups.push([...(await closeOne(account, market, deadline)), off(market)]);
+      const consent = chosen.map(off);
+      const calls = [...venusCalls, ...listaGroups.flatMap(g => g.slice(0, -1)), ...consent];
+      // `batches`: what the wallet sends, one owner UserOp each, so a big portfolio stays under the per-UserOp gas cap.
+      // Up to three markets: one UserOp, exactly `calls`. More: Venus first (one shared debt, planned as one sequence and cut
+      // in order; its consent is withdrawn in the UserOp that finishes it), then three Lista markets per UserOp, each with
+      // its own consent withdrawal. So whatever UserOps landed are fully turned off (the scheduler will not reopen them),
+      // and a retry after a failure asks again and closes only what is still on.
+      let batches: Call[][] = [calls];
+      if (chosen.length > STRATEGY_EARN_MARKETS_PER_USER_OP) {
+        // Up to three Venus markets (repay all, then withdraw all) stay one UserOp; more are cut in order.
+        batches = venus.length <= STRATEGY_EARN_MARKETS_PER_USER_OP ? (venusCalls.length > 0 ? [[...venusCalls]] : []) : strategyEarnBatches(venusCalls);
+        if (venus.length > 0) { if (batches.length === 0) batches.push([]); batches[batches.length - 1]!.push(...venus.map(off)); }
+        for (let i = 0; i < listaGroups.length; i += STRATEGY_EARN_MARKETS_PER_USER_OP) batches.push(listaGroups.slice(i, i + STRATEGY_EARN_MARKETS_PER_USER_OP).flat());
+      }
+      return { status: 'ready' as const, asset: chosen[0]!.symbol, assets: chosen.map(m => m.symbol), calls, batches };
     },
   };
 }
@@ -922,6 +933,14 @@ export function strategyEarnBatches(calls: readonly Call[], marketsPerOp = STRAT
   for (let i = 0; i < groups.length; i += Math.max(1, marketsPerOp)) out.push(groups.slice(i, i + Math.max(1, marketsPerOp)).flat());
   return out;
 }
+/** Consent calls (delegations, ceilings, approvals) are light: this many fit one owner UserOp with a wide margin. */
+export const STRATEGY_EARN_CONSENT_CALLS_PER_USER_OP = 40;
+/** `calls` plus the same calls cut into owner UserOps (`batches`), in order. One asset's open, or a normal consent, is one batch. */
+export const withBatches = (calls: Call[], perOp = STRATEGY_EARN_CONSENT_CALLS_PER_USER_OP) => {
+  const batches: Call[][] = [];
+  for (let i = 0; i < calls.length; i += perOp) batches.push(calls.slice(i, i + perOp));
+  return { calls, batches };
+};
 const isCapacity = (error: unknown) => /USER_OP_CAPACITY/.test(`${(error as { code?: string })?.code ?? ''} ${(error as Error)?.message ?? ''}`);
 /**
  * Send the calls as several sequential UserOps (strategyEarnBatches), each recorded in the ledger as it lands. A batch

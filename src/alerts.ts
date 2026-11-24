@@ -293,7 +293,7 @@ export async function detectAlerts(
     else failures.push(release);
   }
 
-  const stuck=await detectPortfolioStuck(query,thresholds.stuckHours);
+  const stuck=await detectPortfolioStuck(query,thresholds.stuckHours,now);
   if (chainIdFromEnv(env) === 97) {
     // Recover even if the immediate alert failed or its COMMIT response was
     // lost. Only a manually resolved matching alert acknowledges the repair.
@@ -398,8 +398,8 @@ export async function detectOperationReleases(query: QueryFn, now: Date): Promis
  * `N >= 筆數` 是條件的一部分：只有 2 筆 operation 的 portfolio 不會因為「2 筆都失敗」就被報成
  * critical（太少樣本）。查詢用 `having count(*) >= $1` 表達這件事。
  */
-export async function detectPortfolioFailures(query: QueryFn, failingOps: number): Promise<AlertFinding[]> {
-  const { rows } = await query(SQL_FAILING_TAIL, [failingOps]);
+export async function detectPortfolioFailures(query: QueryFn, failingOps: number, cleanHours: number = FAILING_TAIL_CLEAN_HOURS): Promise<AlertFinding[]> {
+  const { rows } = await query(SQL_FAILING_TAIL, [failingOps, cleanHours]);
 
   return rows.map((row) => {
     const fields = row as Record<string, unknown>;
@@ -426,7 +426,7 @@ export async function detectPortfolioFailures(query: QueryFn, failingOps: number
  * 這個告警蓋到兩種對人來說一樣的狀況：**排程器一直 noop**（例如現貨偏離 TWAP 讓 impact 預算
  * 做不了事）與**排程器根本沒在跑**。
  */
-export async function detectPortfolioStuck(query: QueryFn, stuckHours: number): Promise<AlertFinding[]> {
+export async function detectPortfolioStuck(query: QueryFn, stuckHours: number, now: Date = new Date()): Promise<AlertFinding[]> {
   const { rows } = await query(SQL_STUCK, [stuckHours]);
 
   return rows.map((row) => {
@@ -435,7 +435,10 @@ export async function detectPortfolioStuck(query: QueryFn, stuckHours: number): 
     const hours = Number(fields.hours_since);
     const drift = toInteger(fields.gross_drift_bps, 'gross_drift_bps');
     // 一天沒進展不是「今天運氣不好」：24 小時是「需要有人去看」的門檻。
-    const severity: AlertSeverity = Number.isFinite(hours) && hours >= 24 ? 'critical' : 'warn';
+    // The scheduler looked at it recently and is waiting for a known, harmless reason (market closed, below the minimum
+    // trade, budget used up): nobody has to act, so it is a warn that says why, whatever its age.
+    const waiting = waitingReason(portfolioId, now);
+    const severity: AlertSeverity = waiting === null && Number.isFinite(hours) && hours >= 24 ? 'critical' : 'warn';
     return {
       kind: 'portfolio_stuck',
       severity,
@@ -443,9 +446,32 @@ export async function detectPortfolioStuck(query: QueryFn, stuckHours: number): 
       detail:
         `portfolio ${portfolioId}: last observation showed ${drift} bps drift (still above the threshold) ` +
         `${Number.isFinite(hours) ? hours.toFixed(1) : '?'} hours ago, with no successful execution since — ` +
-        'the market may be making the impact budget unusable (see `GET /portfolios/:id/plan`), or the scheduler is not running',
+        (waiting !== null ? `waiting, nothing to fix: ${waiting}`
+          : 'the market may be making the impact budget unusable (see `GET /portfolios/:id/plan`), or the scheduler is not running'),
     } satisfies AlertFinding;
   });
+}
+
+/** A failing tail stops alerting once its newest operation is this old and the scheduler has checked the portfolio since without writing a new one. */
+export const FAILING_TAIL_CLEAN_HOURS = 6;
+/** A round outcome older than this says nothing about now. */
+export const ROUND_OUTCOME_TTL_MS = 2 * 60 * 60_000;
+/** Reasons a portfolio can sit above its drift threshold with nothing wrong: the scheduler is waiting, not failing. */
+const WAITING = /\[(MARKET_CLOSED|BASKET_WAITING|DEFERRED_MIN_ASSET|NO_DUE_SLOT|SLOT_RECORDED|BELOW_MIN_STEP|BELOW_MIN_BATCH|BELOW_MIN_DEPOSIT|[A-Z_]*BUDGET[A-Z_]*)\]|低於最小交易額|低於批次最小額|低於執行器最小步/;
+const roundOutcomes = new Map<number, { outcome: string; reason: string; at: number }>();
+/**
+ * The scheduler reports every portfolio it processes (same process as the alert evaluation). Kept in memory on purpose:
+ * after a restart the map is empty and alerts fall back to their strict form until each portfolio is seen again.
+ */
+export function noteRoundOutcome(portfolioId: number, outcome: string, reason: string | undefined, now: Date): void {
+  roundOutcomes.set(portfolioId, { outcome, reason: reason ?? '', at: now.getTime() });
+}
+export const resetRoundOutcomes = () => roundOutcomes.clear();
+/** The waiting reason of the latest round, when that round was recent, did not fail and waits for a known harmless cause. */
+export function waitingReason(portfolioId: number, now: Date): string | null {
+  const last = roundOutcomes.get(portfolioId);
+  if (!last || now.getTime() - last.at > ROUND_OUTCOME_TTL_MS || !['noop', 'blocked'].includes(last.outcome)) return null;
+  return WAITING.test(last.reason) ? truncate(last.reason.replace(/^Planner returned noop: /, ''), 160) : null;
 }
 
 const SQL_STUCK = `
@@ -785,19 +811,30 @@ const SQL_FAILING_TAIL = `
     select o.portfolio_id as portfolio_id,
            o.state        as state,
            o.last_error   as last_error,
+           o.created_at   as created_at,
            row_number() over (partition by o.portfolio_id order by o.id desc) as rn
       from operations o
      where o.state <> 'expired'
   )
-  select portfolio_id,
+  select r.portfolio_id,
          count(*)::int                       as failed_count,
-         (array_agg(state      order by rn))[1] as last_state,
-         (array_agg(last_error order by rn))[1] as last_error
-    from ranked
-   where rn <= $1
-   group by portfolio_id
-  having count(*) >= $1 and bool_and(state <> 'confirmed')
-   order by portfolio_id
+         (array_agg(r.state      order by r.rn))[1] as last_state,
+         (array_agg(r.last_error order by r.rn))[1] as last_error
+    from ranked r
+    join portfolios p on p.id = r.portfolio_id
+   where r.rn <= $1
+     -- A portfolio nobody runs any more can never replace its last rows: a My mix segment that ended (the mix moved on to
+     -- a new portfolio) or an account that was retired. Its old failures are history, not something to act on.
+     and (not exists (select 1 from smart_accounts s where s.portfolio_id = p.id)
+          or exists (select 1 from smart_accounts s where s.portfolio_id = p.id and s.retired_at is null))
+     and not exists (select 1 from mix_portfolio_history h where h.portfolio_id = p.id and h.ended_at is not null)
+   group by r.portfolio_id, p.last_checked_at
+  having count(*) >= $1 and bool_and(r.state <> 'confirmed')
+     -- Aged out: the newest of them is older than $2 hours and the scheduler has checked the portfolio since without
+     -- writing another operation (clean rounds). A portfolio that keeps failing keeps writing rows and stays here.
+     and not (max(r.created_at) < now() - make_interval(hours => $2::int)
+              and p.last_checked_at is not null and p.last_checked_at > max(r.created_at))
+   order by r.portfolio_id
 `;
 
 /**

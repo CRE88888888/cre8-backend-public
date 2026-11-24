@@ -1212,8 +1212,13 @@ export function estimationPaymaster(hooks: ReturnType<typeof schedulerPaymaster>
 /** viem RPC errors contain the entire UserOp. Sponsored send/estimate boundaries must not log them. */
 export function paymasterExecutionError(error: unknown): AppError {
   if (error instanceof GasBudgetExceededError) return error;
-  return error instanceof AppError && (error.code.startsWith('PAYMASTER_') || error.code.startsWith('GAS_BUDGET_'))
+  const out = error instanceof AppError && (error.code.startsWith('PAYMASTER_') || error.code.startsWith('GAS_BUDGET_'))
     ? rejected(error.code, error.status) : rejected('PAYMASTER_SUBMISSION_UNAVAILABLE', 503);
+  // The public code stays generic; the original error rides along as `cause` so the scheduler's own log (errorChain,
+  // URLs masked) can say what really happened. 2026-11-24 portfolio 13: three sends in a row failed in about a second and
+  // nothing anywhere recorded why.
+  if (out !== error) (out as Error & { cause?: unknown }).cause = error;
+  return out;
 }
 
 /** Standard viem hook: only the final, fully estimated op receives an authorization and durable charge. */

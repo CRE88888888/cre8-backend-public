@@ -38,3 +38,19 @@ test('the scheduler log line shows the real error and its cause, with URLs maske
   assert.ok(!line.includes('SECRET'));
   assert.equal(errorChain(new Error('see https://rpc.example/key-SECRET now')), 'see <url> now');
 });
+
+test('a masked send failure keeps its real cause for the log: public message stays generic, errorChain shows the chain with URLs masked', async () => {
+  const { paymasterExecutionError } = await import('../src/paymaster.js');
+  const { AppError } = await import('../src/errors.js');
+  const original = new Error('UserOperation reverted during simulation with reason: AA23 reverted (details at https://rpc.example/v1/SECRET-KEY)');
+  const masked = paymasterExecutionError(original);
+  assert.equal(masked.code, 'PAYMASTER_SUBMISSION_UNAVAILABLE');
+  assert.doesNotMatch(masked.message, /AA23|SECRET|UserOperation/, 'nothing of the original reaches the public message');
+  const line = errorChain(masked);
+  assert.match(line, /AA23 reverted/);
+  assert.doesNotMatch(line, /SECRET-KEY|rpc\.example/);
+  // A paymaster rejection keeps its own code, and still carries the original for the log.
+  const rejected = paymasterExecutionError(new AppError(403, 'PAYMASTER_CALL_FORBIDDEN', 'my mix: pending mix change'));
+  assert.equal(rejected.code, 'PAYMASTER_CALL_FORBIDDEN');
+  assert.match(errorChain(rejected), /my mix: pending mix change/);
+});

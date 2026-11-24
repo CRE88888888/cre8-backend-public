@@ -3325,6 +3325,9 @@ async function executeAndSettle(
     const failure = decodePriceSourceError(error);
     const message = isBuyVersionError(error) ? error.message : typed ? '[STRATEGY_EXECUTION_UNAVAILABLE] 無法確認執行結果，保留原身分待對帳' : oneLine(error);
     const unknown = sending || (received !== null && received.status !== 'error');
+    // The stored / shown message is deliberately generic for typed strategies. The log gets the real chain (URLs masked),
+    // and whether anything could have been sent: `未送出` = failed before the bundler accepted it, safe to retry.
+    if (typed && !isBuyVersionError(error)) deps.log(`[scheduler] portfolio ${args.portfolioId} 送出失敗的原始錯誤（${unknown ? '可能已送出' : '未送出'}）：${errorChain(error)}`);
     const outcome: ExecutionOutcome = { status: unknown ? 'unknown' : 'error',
       ...(error instanceof AppError ? { errorCode: error.code } : quotaExceeded(error) ? { errorCode: 'PAYMASTER_QUOTA_EXCEEDED' } : {}),
       ...(error instanceof PinnedVersionChangedError ? { errorCode: 'PINNED_VERSION_CHANGED' } : {}),

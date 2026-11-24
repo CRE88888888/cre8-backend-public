@@ -602,7 +602,7 @@ async function route(
   if (root === 'strategy-earn' && segments.length === 2 && segments[1] === 'markets') {
     if (method !== 'GET') return methodNotAllowed(res, ['GET']);
     await deps.rateLimiter.mixPreview(deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
-    sendJson(res, 200, await deps.strategyEarn.markets(), { 'cache-control': 'public, max-age=30' });
+    sendJson(res, 200, await deps.strategyEarn.markets(), { 'cache-control': 'public, max-age=60' });
     return;
   }
   if (root === 'portfolios' && segments[2] === 'strategy-earn' && (segments.length === 3 || segments.length === 4)) {

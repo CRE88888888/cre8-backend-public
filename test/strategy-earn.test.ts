@@ -146,8 +146,14 @@ test('#199 service: market quotes with gate reasons; outages are "temporarily un
   const f: Fake = { statuses: Object.fromEntries(markets.map(m => [m.marketId, status()])), ids: [], held: 0n, collateral: 0n, prices: {}, rewards: { vault: 0n, collateral: 0n } };
   f.statuses[qqq.marketId] = status({ gate: 3 });
   f.statuses[markets[4]?.marketId ?? ''] = null;
-  const earn = createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio() as never });
+  const earn = createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio() as never, marketsCacheMs: 0 });
   const list = await earn.markets();
+  // Where the money goes: Venus -> collateral vToken + vUSDT; Lista -> Moolah + market id; every market -> the strategy vault.
+  const nv = list.markets[0], qq = list.markets[3];
+  assert.deepEqual(nv?.contracts, { collateralMarket: nvda.collateralVToken, listaMarketId: null, loanMarket: S.vUSDT, vault: S.earnVault });
+  assert.deepEqual(qq?.contracts, { collateralMarket: S.listaMoolah, listaMarketId: qqq.listaId, loanMarket: S.listaMoolah, vault: S.earnVault });
+  assert.equal(list.vault.address, S.earnVault);
+  assert.equal(nv?.liquidationLtvBps, toBpsTest(status().liquidationLtv));
   assert.deepEqual(list.markets.map(m => [m.asset, m.status, m.reason, m.extraApyBps]), [['NVDAB', 'open', null, 125], ['TSLAB', 'open', null, 125],
     ['SPCXB', 'open', null, 125], ['QQQB', 'unavailable', 'vault_utilization', 125], ['MSTRB', 'unavailable', 'data_unavailable', null],
     ...markets.slice(5).map(m => [m.symbol, 'open', null, 125])]);
@@ -257,7 +263,7 @@ test('#199 HTTP: public markets with short cache; portfolio routes need login; 4
   const base = `http://127.0.0.1:${address.port}`, auth = { authorization: 'Bearer ok' };
   try {
     const list = await fetch(`${base}/strategy-earn/markets`);
-    assert.equal(list.status, 200); assert.equal(list.headers.get('cache-control'), 'public, max-age=30');
+    assert.equal(list.status, 200); assert.equal(list.headers.get('cache-control'), 'public, max-age=60');
     assert.equal((await fetch(`${base}/strategy-earn/markets`, { method: 'POST' })).status, 405);
     assert.equal((await fetch(`${base}/portfolios/3/strategy-earn`)).status, 401);
     assert.equal((await fetch(`${base}/portfolios/3/strategy-earn`, { headers: auth })).status, 200);
@@ -277,4 +283,21 @@ test('portfolio view: autoOpen = consented (policy enabled) but nothing posted y
   assert.equal('autoOpen' in armed && armed.autoOpen, true);
   const zero = await view({ ...base, policies: { [nvda.marketId]: { maxDebt: 0n, enabled: true } } });
   assert.equal('autoOpen' in zero && zero.autoOpen, false);
+});
+
+const toBpsTest = (rate: bigint) => Number(rate / 10n ** 14n);
+test('GET /strategy-earn/markets is cached server-side: one chain read per window, stale served while re-reading, failures keep the last reading', async () => {
+  const f: Fake = { statuses: Object.fromEntries(markets.map(m => [m.marketId, status()])), ids: [], held: 0n, collateral: 0n, prices: {}, rewards: { vault: 0n, collateral: 0n } };
+  let reads = 0, t = 1_000_000;
+  const chain = fakeChain(f), counted: StrategyEarnChain = { ...chain, status: async (...a) => { reads++; return chain.status(...a); } };
+  const earn = createStrategyEarn({ chainId: 97, chain: () => counted, owned: ownedPortfolio() as never, now: () => new Date(t) });
+  const first = await earn.markets();
+  assert.equal(reads, markets.length);
+  assert.equal(await earn.markets(), first); assert.equal(reads, markets.length);
+  t += 61_000;
+  f.headFails = true;
+  assert.equal(await earn.markets(), first); // stale served at once
+  await new Promise(r => setTimeout(r, 0));
+  t += 61_000;
+  assert.equal((await earn.markets()).updatedAt, first.updatedAt); // a failed re-read never replaces the last good one
 });

@@ -320,7 +320,11 @@ export function splitVenusDebt<P extends { marketId: string; debtRaw?: string; v
 }
 
 const TEMPORARILY = 'Temporarily unavailable.';
+/** Server-side cache for the public GET /strategy-earn/markets (31 status reads): one chain read per minute at most. */
+export const MARKETS_CACHE_MS = 60_000;
 export type StrategyEarnDeps = { chainId: number; chain: () => StrategyEarnChain; owned: typeof requireOwnedPortfolio; now: () => Date; ledger?: StrategyEarnLedger;
+  /** 0 = no cache (tests). Default MARKETS_CACHE_MS. */
+  marketsCacheMs?: number;
   query: <T extends Record<string, unknown> = Record<string, unknown>>(sql: string, params?: unknown[]) => Promise<{ rows: T[] }> };
 
 let cachedChain: StrategyEarnChain | undefined;
@@ -341,15 +345,40 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
   const markets = strategyMarkets();
   const ready = () => { if (deps.chainId !== 97) throw new AppError(404, 'STRATEGY_EARN_NOT_CONFIGURED', '策略加息目前僅開放測試網。'); };
   const live = async () => { try { const chain = deps.chain(); return { chain, head: await chain.head() }; } catch { return null; } };
+  // Where the money sits (public, for "Where your money goes"): the collateral market contract (Venus collateral vToken, or
+  // Lista Moolah + market id), the USDT loan market (Venus vUSDT / the same Moolah market) and the strategy vault.
+  const contracts = (m: StrategyMarket) => ({ collateralMarket: m.protocol === 'venus' ? m.collateralVToken : STRATEGY_EARN_97.listaMoolah, listaMarketId: m.listaId,
+    loanMarket: m.protocol === 'venus' ? STRATEGY_EARN_97.vUSDT : STRATEGY_EARN_97.listaMoolah, vault: STRATEGY_EARN_97.earnVault });
   const quote = (m: StrategyMarket, s: StatusReading | null, at: string | null) => {
     if (!s) return { asset: m.symbol, marketId: m.marketId, protocol: m.protocol, status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY,
-      extraApyBps: null, breakdown: null, targetLtvBps: null, deleverageLtvBps: null, updatedAt: at };
+      extraApyBps: null, breakdown: null, targetLtvBps: null, deleverageLtvBps: null, liquidationLtvBps: null, borrowUtilizationBps: null, vaultUtilizationBps: null,
+      contracts: contracts(m), updatedAt: at };
     const apy = extraApy(s, s.targetLtv);
     const open = s.gate === 0;
     return { asset: m.symbol, marketId: m.marketId, protocol: m.protocol, status: open ? 'open' as const : 'unavailable' as const,
       reason: open ? null : GATE_REASONS[s.gate] ?? 'closed', message: open ? null : TEMPORARILY,
-      extraApyBps: apy.totalBps, breakdown: apy.breakdown, targetLtvBps: toBps(s.targetLtv), deleverageLtvBps: toBps(s.deleverageLtv), updatedAt: at };
+      extraApyBps: apy.totalBps, breakdown: apy.breakdown, targetLtvBps: toBps(s.targetLtv), deleverageLtvBps: toBps(s.deleverageLtv),
+      liquidationLtvBps: toBps(s.liquidationLtv), borrowUtilizationBps: Number(s.borrowUtilizationBps), vaultUtilizationBps: Number(s.vaultUtilizationBps),
+      contracts: contracts(m), updatedAt: at };
   };
+  type MarketsView = { chainId: 97; updatedAt: string | null; vault: { address: string }; markets: ReturnType<typeof quote>[] };
+  async function readMarkets(previous: MarketsView | null): Promise<MarketsView> {
+    const l = await live();
+    const at = l ? new Date(Number(l.head.timestamp) * 1000).toISOString() : null;
+    const items = await Promise.all(markets.map(async m => {
+      if (!l) return quote(m, null, at);
+      try { return quote(m, await l.chain.status(m.marketId, '0x0000000000000000000000000000000000000000', l.head.number), at); } catch { return quote(m, null, at); }
+    }));
+    // A market that could not be read this time keeps its last reading (with its own older updatedAt) instead of going blank.
+    const merged = items.map(q => q.reason === 'data_unavailable' ? previous?.markets.find(p => p.marketId === q.marketId && p.reason !== 'data_unavailable') ?? q : q);
+    return { chainId: 97, updatedAt: at ?? previous?.updatedAt ?? null, vault: { address: STRATEGY_EARN_97.earnVault }, markets: merged };
+  }
+  let marketsCache: { at: number; value: MarketsView } | null = null;
+  let marketsInflight: Promise<MarketsView> | null = null;
+  const refreshMarkets = () => marketsInflight ??= readMarkets(marketsCache?.value ?? null).then(value => {
+    if (value.updatedAt !== null) marketsCache = { at: deps.now().getTime(), value };
+    return value;
+  }).finally(() => { marketsInflight = null; });
   async function owned(id: number, wallet: string) {
     ready();
     const p = await deps.owned(id, wallet);
@@ -399,15 +428,17 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
   }
   return {
     /** Pre-buy quote per eligible asset (ratio = target LTV). Leveraged products are never listed. */
-    async markets() {
+    // Public and cached (MARKETS_CACHE_MS): fresh within the window; after it the last reading is served at once and
+    // re-read in the background (one read in flight), so visitors never wait on, or multiply, the 31 status reads.
+    async markets(): Promise<MarketsView> {
       ready();
-      const l = await live();
-      const at = l ? new Date(Number(l.head.timestamp) * 1000).toISOString() : null;
-      const items = await Promise.all(markets.map(async m => {
-        if (!l) return quote(m, null, at);
-        try { return quote(m, await l.chain.status(m.marketId, '0x0000000000000000000000000000000000000000', l.head.number), at); } catch { return quote(m, null, at); }
-      }));
-      return { chainId: 97, updatedAt: at, markets: items };
+      const ttl = deps.marketsCacheMs ?? MARKETS_CACHE_MS;
+      if (ttl <= 0) return readMarkets(null);
+      if (marketsCache) {
+        if (deps.now().getTime() - marketsCache.at >= ttl) void refreshMarkets().catch(() => undefined);
+        return marketsCache.value;
+      }
+      return refreshMarkets();
     },
     /** This portfolio's positions; net value = collateral + vault - debt, kept apart from cash and Cash Earn. */
     async portfolio(id: number, wallet: string) {

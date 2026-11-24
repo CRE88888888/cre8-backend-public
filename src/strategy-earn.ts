@@ -12,6 +12,8 @@ import { borrowAuthorized } from './permissions.js';
 import { rpcBatch, rpcTransport } from './rpc-transport.js';
 import { createMainnetRates, mainnetQuote } from './strategy-earn-mainnet.js';
 import type { MainnetRates } from './strategy-earn-mainnet.js';
+import { parseRewardSignature, rewardsStore, strategyRewardsEnabled } from './strategy-rewards.js';
+import type { RewardsStore, RewardsView } from './strategy-rewards.js';
 export { STRATEGY_EARN_97, assertNotStrategyVault, isStrategyVault } from './strategy-earn-guard.js';
 
 /**
@@ -324,7 +326,7 @@ export function splitVenusDebt<P extends { marketId: string; debtRaw?: string; v
 const TEMPORARILY = 'Temporarily unavailable.';
 /** Server-side cache for the public GET /strategy-earn/markets (31 status reads): one chain read per minute at most. */
 export const MARKETS_CACHE_MS = 60_000;
-export type StrategyEarnDeps = { chainId: number; chain: () => StrategyEarnChain; owned: typeof requireOwnedPortfolio; now: () => Date; ledger?: StrategyEarnLedger;
+export type StrategyEarnDeps = { chainId: number; chain: () => StrategyEarnChain; owned: typeof requireOwnedPortfolio; now: () => Date; rewards?: RewardsStore; rewardsEnabled?: boolean; ledger?: StrategyEarnLedger;
   /** 0 = no cache (tests). Default MARKETS_CACHE_MS. */
   marketsCacheMs?: number;
   /** Real BSC mainnet rates for display (src/strategy-earn-mainnet.ts); null = none. */
@@ -350,6 +352,15 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
     ...overrides,
   };
   const markets = strategyMarkets();
+  // Reward tokens (LISTA / XVS): mainnet only, behind STRATEGY_REWARDS_ENABLED. Off = the field is absent and nothing is read.
+  const rewardsOn = () => deps.rewardsEnabled ?? strategyRewardsEnabled(deps.chainId);
+  /** Ownership on this service's chain (the 97-only `owned` below belongs to the v1 position API). */
+  const rewardsAccount = async (id: number, wallet: string) => {
+    if (!rewardsOn()) throw new AppError(404, 'STRATEGY_REWARDS_NOT_CONFIGURED', '激勵領取尚未開放。');
+    const p = await deps.owned(id, wallet);
+    if (p.chainId !== deps.chainId || p.ownerAddress.toLowerCase() !== wallet.toLowerCase()) throw new AppError(403, 'FORBIDDEN', '只能操作本人於這條鏈的帳戶');
+    return p.accountAddress.toLowerCase() as Address;
+  };
   const ready = () => { if (deps.chainId !== 97) throw new AppError(404, 'STRATEGY_EARN_NOT_CONFIGURED', '策略加息目前僅開放測試網。'); };
   const live = async () => { try { const chain = deps.chain(); return { chain, head: await chain.head() }; } catch { return null; } };
   // Where the money sits (public, for "Where your money goes"): the collateral market contract (Venus collateral vToken, or
@@ -484,6 +495,21 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
         : await consentedMarkets(chain, account, head.number, markets).then(c => c.size > 0, () => false);
       return { portfolioId: id, account, status: 'ok' as const, reason: null, message: null, updatedAt: new Date(Number(head.timestamp) * 1000).toISOString(),
         earnNetUsd: earnNetUsd.toString(), autoOpen, positions };
+    },
+    /**
+     * The owner's signature for Lista's reward proof API (docs/strategy-earn-rewards.zh-TW.md): `{ signedAt, signature }`, the
+     * account's ERC-1271 signature over REWARD_MESSAGE(signedAt). Kept 7 days; the weekly job reads proofs with it.
+     */
+    async rewardSignature(id: number, wallet: string, input: unknown) {
+      const account = await rewardsAccount(id, wallet);
+      const sig = parseRewardSignature(input, deps.now());
+      await (deps.rewards ?? rewardsStore()).saveSignature(deps.chainId, id, account, sig);
+      return { status: 'saved' as const, signedAt: sig.signedAt.toISOString() };
+    },
+    /** Reward tokens of this portfolio from the ledger (no chain read): in the account, earned but not yet claimed, and whether a new signature is due. */
+    async rewards(id: number, wallet: string): Promise<RewardsView & { portfolioId: number; account: Address }> {
+      const account = await rewardsAccount(id, wallet);
+      return { portfolioId: id, account, ...await (deps.rewards ?? rewardsStore()).view(deps.chainId, id, deps.now()) };
     },
     /** One owner UserOp: consent + approvals (to AtpBorrowExecutor only) + post collateral + borrow into the vault. */
     async open(id: number, wallet: string, input: unknown) {

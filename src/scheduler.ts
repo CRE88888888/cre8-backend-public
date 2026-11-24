@@ -8,6 +8,7 @@ import { assetsMarketOpen } from './trading-calendar.js';
 import { runYieldRound } from './yield-service.js';
 import { runDcaRound } from './dca.js';
 import { STRATEGY_EARN_97 } from './strategy-earn-guard.js';
+import { runStrategyRewardsRound } from './strategy-rewards.js';
 import { dbStrategyEarnLedger, defaultStrategyEarnChain, runStrategyEarnRound, strategyEarnAutoOpen, strategyEarnUnwindForSale } from './strategy-earn.js';
 import type { Call as StrategyEarnCall, StrategyEarnSend, StrategyEarnTx } from './strategy-earn.js';
 import { assertUserOpCapacity, boundedCallGasLimit, executionBatchSize, MAX_USER_OP_STEPS, userOpGasOverhead } from './execution-batch.js';
@@ -580,6 +581,7 @@ export type SchedulerDeps = {
   yieldRound?: typeof runYieldRound;
   dcaRound?: typeof runDcaRound;
   strategyEarnRound?: typeof runStrategyEarnRound;
+  strategyRewardsRound?: (args: { dryRun: boolean; log: (line: string) => void }) => Promise<unknown>;
   resumePausedJobs?: typeof resumeRetryablePausedJobs;
   /** backend#204 (chain 97): auto-open after a buy, and repay + take shares back before a sale, with the session key. */
   strategyEarn?: {
@@ -2023,6 +2025,8 @@ export async function runSchedulerOnce(
   try { const result=await (deps.dcaRound??runDcaRound)({dryRun,limit,log:resolved.log}); if(result.checked||result.blocked)resolved.log('[dca] '+JSON.stringify(result)); } catch { resolved.log('[dca] 定投讀值／對帳未完成，下輪再試'); }
   // Strategy earn keeper (backend#199): anyone-callable deleverage/unwind and incentive claims for each account's own position.
   try { const result=await (deps.strategyEarnRound??runStrategyEarnRound)({dryRun,log:resolved.log}); if(result)resolved.log('[strategy-earn] '+JSON.stringify(result)); } catch { resolved.log('[strategy-earn] 健康度讀值未完成，下輪再試'); }
+  // Strategy rewards (LISTA / XVS, db 0068): mainnet only and off unless STRATEGY_REWARDS_ENABLED=1; returns null otherwise (no I/O).
+  try { const result=await (deps.strategyRewardsRound??((a)=>runStrategyRewardsRound(a,{chainId:getConfig().chainId})))({dryRun,log:resolved.log}); if(result)resolved.log('[strategy-rewards] '+JSON.stringify(result)); } catch { resolved.log('[strategy-rewards] 激勵領取未完成，下輪再試'); }
   // Paused strategy jobs (three failed attempts): retryable pauses resume after their cool-down; the rest wait for the
   // owner's next action (src/strategy-job-recovery.ts). Plain SQL, no chain reads. Still-paused ones are logged hourly.
   if (!dryRun) {

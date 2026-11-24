@@ -1,3 +1,4 @@
+import { sponsoredRewardTokens } from './strategy-rewards.js';
 import { verifyEnrollmentSponsorship } from './enrollment-sponsorship.js';
 import { verifyMixOwnerCalls } from './mix-chain.js';
 import { MIX_COLUMNS, pendingMixSql, withMixLock, checkMixLock, mixBusy } from './mix-store.js';
@@ -80,6 +81,8 @@ export class PaymasterRetryTooSoonError extends AppError {
 }
 type Query = (sql: string, params?: readonly unknown[]) => Promise<{ rows: unknown[] }>;
 export type PaymasterDeps = {
+  /** Reward tokens an owner may send to their wallet. Default: sponsoredRewardTokens(chainId) (mainnet, behind STRATEGY_REWARDS_ENABLED). */
+  rewardTokens?: readonly Address[];
   mixSetup?: typeof verifyMixOwnerCalls;
   mixLock?: typeof withMixLock;
   config?: PaymasterConfig | null;
@@ -284,7 +287,9 @@ export function mixStrategyCall(call: { target: Address; callData: Hex }, c: Pay
   return null;
 }
 
-type CallContext = { owner?: Address; assets?: readonly Address[] };
+type CallContext = { owner?: Address; assets?: readonly Address[];
+  /** Yield strategy reward tokens (LISTA, XVS): the owner may send them from the account to their own wallet, nothing else. */
+  rewardTokens?: readonly Address[] };
 const collateralOf = (symbol: string): Address => {
   const asset = (TESTNET_97.assets as Record<string, { token: string } | undefined>)[symbol];
   if (!asset) throw new Error('strategy collateral missing');
@@ -361,6 +366,11 @@ export function validateSponsoredCalls(op: PackedSponsorOperation, c: PaymasterC
           if (!isAddressEqual(inner.args[0], c.executor) && !borrowSpender && !dcaSpender) throw new Error('invalid spender');
           if (isStrategyVault({ address: call.target }) && !borrowSpender) throw new Error('strategy vault approval');
         } else if (context.owner === undefined || !isAddressEqual(inner.args[0], context.owner) || inner.args[1] === 0n) throw new Error('invalid withdrawal');
+      } else if ((context.rewardTokens ?? []).some((token) => isAddressEqual(call.target, token))) {
+        // Reward tokens leave the account only as a plain transfer to its owner (sell-all / withdraw / delete). No approvals.
+        const inner = decodeFunctionData({ abi: TOKEN_ABI, data: call.callData });
+        if (inner.functionName !== 'transfer' || context.owner === undefined || !isAddressEqual(inner.args[0], context.owner) || inner.args[1] === 0n ||
+            encodeFunctionData({ abi: TOKEN_ABI, functionName: 'transfer', args: inner.args }).toLowerCase() !== call.callData.toLowerCase()) throw new Error('invalid reward payout');
       } else throw new Error('unknown target');
     }
   } catch (error) {
@@ -1014,7 +1024,10 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
           owner.owner.toLowerCase() !== wallet.toLowerCase() || owner.user_id.toLowerCase() !== wallet.toLowerCase()) throw rejected('PAYMASTER_SENDER_FORBIDDEN', 403);
       const isMix = owner.mix_id !== null && owner.mix_id !== undefined;
       const mixDca = (call: { target: Address; callData: Hex }) => mixDcaCall(call, op.sender, hex(owner.owner, 20), c);
-      const onlyOwnerCash = calls.length > 0 && calls.every(call => isAddressEqual(call.target, TESTNET_97.contracts.usdt) &&
+      const rewardTokens = deps.rewardTokens ?? sponsoredRewardTokens(c.chainId);
+      const isRewardToken = (target: Address) => rewardTokens.some(token => isAddressEqual(target, token));
+      // USDT and reward tokens (LISTA / XVS) going to the owner's wallet; the recipient is checked in validateSponsoredCalls.
+      const onlyOwnerCash = calls.length > 0 && calls.every(call => (isAddressEqual(call.target, TESTNET_97.contracts.usdt) || isRewardToken(call.target)) &&
         call.callData.startsWith(toFunctionSelector('transfer(address,uint256)')));
       // DCA open/return/redemption: every call is a DCA call, a USDT transfer (Venus return, checked to the owner below)
       // or a session renewal pair, with at least one vault deposit/return or redemption.
@@ -1041,7 +1054,7 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
         const ownerChange = calls.some(call => isAddressEqual(call.target, c.registry) ||
           call.callData.startsWith(toFunctionSelector('approve(address,uint256)')) && mixDca(call) !== 'approval' && mixStrategy(call) === null);
         for (const call of calls) {
-          if (call.callData.startsWith(toFunctionSelector('transfer(address,uint256)')) && !isAddressEqual(call.target, TESTNET_97.contracts.usdt)) {
+          if (call.callData.startsWith(toFunctionSelector('transfer(address,uint256)')) && !isAddressEqual(call.target, TESTNET_97.contracts.usdt) && !isRewardToken(call.target)) {
             throw rejected('PAYMASTER_CALL_FORBIDDEN', 403);
           }
         }
@@ -1093,7 +1106,7 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
           return hex(address, 20);
         });
       }
-      validateSponsoredCalls(op, c, { owner: hex(owner.owner, 20), assets });
+      validateSponsoredCalls(op, c, { owner: hex(owner.owner, 20), assets, rewardTokens });
       await bounded(checkFreeCash(op, calls, c, hex(owner.owner, 20), deps), c.timeoutMs);
       const cost = gasCost(op, c);
       if (cost.gasLimit > MAX_USER_OP_GAS) throw rejected('PAYMASTER_USER_OP_CAPACITY', 400);

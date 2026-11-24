@@ -626,6 +626,15 @@ async function route(
       if (method !== 'GET') return methodNotAllowed(res, ['GET']);
       sendJson(res, 200, await deps.strategyEarn.activity(id, wallet)); return;
     }
+    // Reward tokens (LISTA / XVS, db 0068): the owner's weekly signature for Lista's proof API. 404 while the feature is off.
+    if (segments[3] === 'rewards') {
+      if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+      sendJson(res, 200, await deps.strategyEarn.rewards(id, wallet)); return;
+    }
+    if (segments[3] === 'reward-signature') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      sendJson(res, 200, await deps.strategyEarn.rewardSignature(id, wallet, await readJsonBody(req))); return;
+    }
   }
 
   // DCA (定投, docs/dca.zh-TW.md): the not-yet-invested total sits in a vault owned by the portfolio account.

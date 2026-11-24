@@ -54,9 +54,9 @@ async function renewal(): Promise<Call[]> {
 }
 
 type Kind = 'fund' | 'mix';
-function harness(kind: Kind, opts: { pendingChange?: boolean; reservedRaw?: bigint; observedRaw?: bigint; exiting?: 'triggered' | 'exited' | 'deleting' } = {}) {
+function harness(kind: Kind, opts: { pendingChange?: boolean; reservedRaw?: bigint; observedRaw?: bigint; exiting?: 'triggered' | 'exited' | 'deleting'; rewardTokens?: Address[] } = {}) {
   const seen = { locks: 0, reservations: 0, setups: 0, exits: 0 };
-  const service = createPaymasterService({ config: c, now: () => NOW,
+  const service = createPaymasterService({ config: c, now: () => NOW, ...(opts.rewardTokens ? { rewardTokens: opts.rewardTokens } : {}),
     mixLock: async (_id, work) => { seen.locks++; return work(); },
     query: async (sql) => ({ rows: sql.includes('select s.owner') ? [{ owner, user_id: owner, mix_id: kind === 'mix' ? '5' : null }]
       : sql.includes('from mixes m where') ? [{ id: '5', owner, account, triggered_at: opts.exiting === 'triggered' ? new Date(NOW * 1000) : null,
@@ -257,4 +257,40 @@ test('My mix weight change with the yield strategy on: approval + enroll + conse
   const h = harness('mix', { pendingChange: true });
   await h.sponsor(calls);
   assert.deepEqual([h.seen.setups, h.seen.locks, h.seen.reservations], [1, 1, 1]);
+});
+
+test('reward tokens (LISTA / XVS): only a plain transfer to the owner wallet, on a fund and a My mix; nothing while the feature is off', async () => {
+  const LISTA = '0xfceb31a79f71ac9cbdcf853519c1b12d379edc46' as Address, XVS = '0xcf6bb5389c92bdda8a3747ddb454cb7a64626c63' as Address;
+  const { rewardExitCalls } = await import('../src/strategy-rewards.js');
+  const payout = rewardExitCalls([{ token: LISTA, balanceRaw: 7n * 10n ** 18n }, { token: XVS, balanceRaw: 10n ** 17n }], owner).map(asCall);
+  for (const kind of ['fund', 'mix'] as const) {
+    const on = (o: Parameters<typeof harness>[1] = {}) => harness(kind, { rewardTokens: [LISTA, XVS], ...o });
+    // The exact flows: rewards alone (delete after sell-all), together with the USDT withdrawal, and during a mix's exit / deletion / pending change.
+    for (const [name, calls, o] of [['rewards to wallet', payout, {}], ['withdraw USDT + rewards', [transfer(usdt, owner, 10n ** 18n), ...payout], {}],
+      ['exited', payout, { exiting: 'exited' }], ['deleting', payout, { exiting: 'deleting' }], ['triggered', payout, { exiting: 'triggered' }],
+      ['pending mix change', payout, { pendingChange: true }]] as const) {
+      const h = on(o);
+      await assert.doesNotReject(h.sponsor([...calls]), `${kind}: ${name}`);
+      assert.deepEqual([h.seen.reservations, h.seen.locks], [1, 0], `${kind}: ${name}`);
+    }
+    // Reserved cash still protects the USDT part of a combined withdrawal.
+    await assert.rejects(on({ reservedRaw: 5n * 10n ** 18n, observedRaw: 5n * 10n ** 18n }).sponsor([transfer(usdt, owner, 10n ** 18n), ...payout]), code('PAYMASTER_WITHDRAW_RESERVED', 409), kind);
+    const strict: [string, Call[]][] = [
+      ['reward token to a stranger', [transfer(LISTA, stranger, 1n)]],
+      ['zero amount', [transfer(LISTA, owner, 0n)]],
+      ['reward token approved to AtpExecutor', [approve(LISTA, executor)]],
+      ['reward token approved to a stranger', [approve(XVS, stranger)]],
+      ['unknown selector on the reward token', [{ to: LISTA, value: 0n, data: '0x12345678' }]],
+      ['a reward payout mixed with a strategy call', [...payout, ...closeCalls(markets[0]!, account, BigInt(NOW + 600)).map(asCall), transfer(LISTA, stranger, 1n)]],
+      // A fund may already send a portfolio asset to its owner; a My mix may not, with or without rewards next to it.
+      ...(kind === 'mix' ? [['a portfolio asset sent out next to the rewards', [...payout, transfer(asset, owner, 1n)]] as [string, Call[]]] : []),
+    ];
+    for (const [name, calls] of strict) {
+      const h = on();
+      await assert.rejects(h.sponsor(calls), code('PAYMASTER_CALL_FORBIDDEN', 403), `${kind}: ${name}`);
+      assert.equal(h.seen.reservations, 0, `${kind}: ${name}`);
+    }
+    // Feature off (the default on every chain today): the same transfer is not sponsored.
+    await assert.rejects(harness(kind).sponsor(payout), code('PAYMASTER_CALL_FORBIDDEN', 403), `${kind}: off`);
+  }
 });

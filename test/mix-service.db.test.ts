@@ -80,7 +80,7 @@ async function fixture(work: (service: ReturnType<typeof createMixService>, db: 
     },
     proof: async (_m, _intent, hash) => ({ txHash: hash, userOpHash: hash, logIndex: 0, blockNumber: block++, blockHash: hash,
       at: new Date('2026-01-02Z'), cashRaw: '0', nonce: 0n }),
-    plan: async () => mixRuntimeFixture().plan, strategyConsent: async () => [],
+    plan: async () => mixRuntimeFixture().plan, strategyConsent: async () => [], strategyV2: () => null,
     preview: createMixPreview({ chainId: 97, model: async () => emptyModel(), gasPrice: async () => 1n }) };
   try { await work(createMixService(deps), db, deps); }
   finally { await db.query('rollback'); db.release(); }
@@ -847,6 +847,14 @@ test('mix weight change with the yield strategy on: the owner intent re-consents
     assert.match(stored.owner_calls[stored.owner_calls.length - consent.length - 1]?.data ?? '', /^0x/);
     assert.deepEqual(changed.calls, stored.owner_calls);
     assert.equal(registered, 1);
+    // Routing v2 addresses for the app's pre-signing check: only for an owner in the v2 audience (nobody by default).
+    assert.equal('strategyV2' in changed, false);
+    const v2 = { registry: toHex(0xa1n, { size: 20 }), executor: toHex(0xa2n, { size: 20 }) };
+    const audience: string[] = [];
+    const prepared = await createMixService({ ...deps, strategyV2: o => { audience.push(o); return v2; } }).prepare(made.mixId, owner);
+    assert.deepEqual((prepared as { strategyV2?: unknown }).strategyV2, v2);
+    assert.deepEqual(prepared.calls, stored.owner_calls);
+    assert.deepEqual(audience, [owner.toLowerCase()]);
     // Unreadable strategy state: nothing is published, the owner retries.
     await db.query("update mix_switch_intents set state='cancelled' where mix_id=$1 and state='prepared'", [made.mixId]);
     const down = createMixService({ ...deps, register: async (...a) => { registered++; return deps.register(...a); },

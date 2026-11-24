@@ -77,7 +77,7 @@ UserOp：一筆最多 3 個 executor 呼叫，估計 gas 合計 ≤ 600 萬（�
 | `POST …/confirm` `{ txHash }` | 把 v2 事件寫進帳本（db 0069）與激勵帳本（db 0068） |
 | `GET …/strategy-earn` | 每個部位的 `route.source` 是 `onchain`（實際所在的路線與 vault）；`earnNetUsd` 含策略盒閒置的錢；`rewards` 是策略盒與帳戶裡的激勵代幣 |
 | `GET …/strategy-earn/rewards` | 測試網沒有 proof API：直接回帳本，`signature.needed` 永遠是 false |
-| My mix 改比例 | 後端組 owner calls 時，帳戶在 v2 就在 enroll 後面接 `setStrategyPolicy`＋新增資產的 approve（`mixStrategyConsent`） |
+| My mix 改比例 | 後端組 owner calls 時，帳戶在 v2 就在 enroll 後面接 `setStrategyPolicy`＋新增資產的 approve（`mixStrategyConsent`）。簽名資料（`GET /me/mixes/:id/enrollment-params`、PATCH 的回應）對 v2 對象內的 owner 多 `strategyV2: { registry, executor }`：App 沒有自己的 v2 地址，簽名前用這兩個地址核對 v2 的呼叫（cre8-app `mix-chain.ts`），並在鏈上確認 `registry.executor()` 就是它 |
 
 ## reportRates
 

@@ -2464,9 +2464,23 @@ async function strategyEarnOpen(due: DuePortfolio, ctx: { dryRun: boolean; deps:
   if (ctx.deps.chainId !== 97) return;
   if (due.personalMix && (!mix || mix.triggered || mix.status !== 'active' || mix.pending)) return;
   const held = plan?.snapshot.holdings.filter(h => h.amountWei > 0n).map(h => h.asset.toLowerCase());
-  try { const note = await strategyEarnSteps(ctx.deps).open(due, ctx.dryRun, held); if (note !== null) ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} ${note}`); }
-  catch (error) { ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} [STRATEGY_EARN_OPEN_FAILED] 自動開啟未完成，下一輪再試：${oneLine(error)}`); }
+  // A failed auto-open backs off (5, 10, 20, 40, then 60 minutes) instead of failing again every round; any success clears it.
+  const wait = strategyEarnOpenBackoff.get(due.portfolioId), nowMs = Date.now();
+  if (wait && nowMs < wait.until) return;
+  try {
+    const note = await strategyEarnSteps(ctx.deps).open(due, ctx.dryRun, held);
+    strategyEarnOpenBackoff.delete(due.portfolioId);
+    if (note !== null) ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} ${note}`);
+  } catch (error) {
+    const next = strategyEarnOpenDelay((wait?.fails ?? 0) + 1);
+    strategyEarnOpenBackoff.set(due.portfolioId, { fails: (wait?.fails ?? 0) + 1, until: nowMs + next });
+    ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} [STRATEGY_EARN_OPEN_FAILED] 自動開啟未完成，${Math.round(next / 60_000)} 分鐘後再試：${oneLine(error)}`);
+  }
 }
+const strategyEarnOpenBackoff = new Map<number, { fails: number; until: number }>();
+/** 5 min after the first failure, doubling, capped at 60 min. */
+export const strategyEarnOpenDelay = (fails: number) => Math.min(60, 5 * 2 ** Math.max(0, fails - 1)) * 60_000;
+export const resetStrategyEarnOpenBackoff = () => strategyEarnOpenBackoff.clear();
 
 async function decideAndMaybeExecute(
   due: DuePortfolio,

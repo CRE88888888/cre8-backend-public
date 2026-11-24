@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { beforeEach, test } from 'node:test';
 import { decodeFunctionData, encodeFunctionData, erc20Abi, maxUint256 } from 'viem';
 import type { Address, Hex } from 'viem';
 import { mixFlowDirection } from '../src/mix-flows.js';
@@ -13,6 +13,9 @@ import {
 import type { StatusReading, StrategyEarnChain } from '../src/strategy-earn.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
 import { mixClock, mixRuntimeFixture } from './fixtures/mix.js';
+import { resetStrategyEarnOpenBackoff } from '../src/scheduler.js';
+// A failed auto-open backs off for minutes (process-wide, real clock): each case starts with a clean slate.
+beforeEach(resetStrategyEarnOpenBackoff);
 
 /**
  * Yield strategy (策略加息) on a My mix: the mix's own account posts its eligible holdings, borrows into the strategy
@@ -196,4 +199,19 @@ test('scheduler: a mix sale (rebalance or take-profit exit) with posted shares r
   const e = await runSchedulerOnce({ dryRun: true, now: at, skipAlerts: true }, exit.deps);
   assert.equal(e.results[0]?.reason, '[STRATEGY_EARN_UNWINDING] fixture');
   assert.deepEqual(exit.calls, ['unwind:true:1'], 'exit never auto-opens');
+});
+
+test('scheduler: a failed auto-open backs off instead of failing again every round; the log says when it retries', async () => {
+  const s = mixScheduler(), lines: string[] = [];
+  let attempts = 0;
+  s.deps.log = l => { lines.push(l); };
+  s.deps.strategyEarn = { ...s.deps.strategyEarn!, open: async () => { attempts++; throw new Error('paymaster sponsorship rejected: PAYMASTER_USER_OP_CAPACITY'); } };
+  for (let round = 0; round < 3; round++) await runSchedulerOnce({ dryRun: false, now: mixClock, skipAlerts: true }, s.deps);
+  assert.equal(attempts, 1, 'rounds 2 and 3 fall inside the 5-minute delay: not attempted, nothing logged');
+  assert.deepEqual(lines.filter(l => l.includes('STRATEGY_EARN_OPEN_FAILED')), ['[scheduler] portfolio 1 [STRATEGY_EARN_OPEN_FAILED] 自動開啟未完成，5 分鐘後再試：paymaster sponsorship rejected: PAYMASTER_USER_OP_CAPACITY']);
+  // Cleared (here by the per-test reset; in production by the delay passing): the next attempt runs, and a success removes the delay.
+  resetStrategyEarnOpenBackoff();
+  s.deps.strategyEarn = { ...s.deps.strategyEarn!, open: async () => { attempts++; return null; } };
+  for (let round = 0; round < 2; round++) await runSchedulerOnce({ dryRun: false, now: mixClock, skipAlerts: true }, s.deps);
+  assert.equal(attempts, 3);
 });

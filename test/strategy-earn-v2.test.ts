@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { beforeEach, test } from 'node:test';
 import { createPublicClient, custom, decodeFunctionData, encodeAbiParameters, encodeEventTopics, encodeFunctionData, maxUint256, pad, parseAbi, toFunctionSelector } from 'viem';
 import type { AbiEvent, Address, Hex, Log } from 'viem';
 import { bscTestnet } from 'viem/chains';
@@ -20,6 +20,9 @@ import { BORROW_SESSION_SELECTORS, STRATEGY_EARN_LEGACY_MARKET_IDS } from '../sr
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
 import { mixRuntimeFixture } from './fixtures/mix.js';
 import { config, kernelCall, operation, SENDER, TEST_SIGNER } from './fixtures/paymaster.js';
+import { resetStrategyEarnOpenBackoff } from '../src/scheduler.js';
+// A failed auto-open backs off for minutes (process-wide, real clock): each case starts with a clean slate.
+beforeEach(resetStrategyEarnOpenBackoff);
 
 const E18 = 10n ** 18n, E16 = 10n ** 16n;
 const account = SENDER.toLowerCase() as Address;

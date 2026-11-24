@@ -74,6 +74,7 @@ jobs:
           test/strategy-earn-routing.test.ts
           test/strategy-rewards.test.ts
           test/strategy-earn-routing-v2.test.ts
+          test/strategy-earn-batches.test.ts
           test/strategy-earn-v2.test.ts
           test/waitlist-tasks.test.ts
           test/mix-http.test.ts

@@ -1,4 +1,4 @@
-import { createPublicClient, createWalletClient, decodeEventLog, encodeFunctionData, http, maxUint256, parseAbi } from 'viem';
+import { createPublicClient, createWalletClient, decodeEventLog, decodeFunctionData, encodeFunctionData, http, maxUint256, parseAbi } from 'viem';
 import type { Address, Hex, Log, PublicClient } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { bscTestnet } from 'viem/chains';
@@ -660,7 +660,10 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
       const listaCalls: Call[] = [];
       for (const market of chosen.filter(m => m.protocol !== 'venus')) listaCalls.push(...(await closeOne(account, market, deadline)));
       const consent = chosen.map(m => call(STRATEGY_EARN_97.registry, 'setBorrowPolicy', [m.marketId, 0n, false]));
-      return { status: 'ready' as const, asset: chosen[0]!.symbol, assets: chosen.map(m => m.symbol), calls: [...venusCalls, ...listaCalls, ...consent] };
+      const calls = [...venusCalls, ...listaCalls, ...consent];
+      // `batches`: the same calls in order, split so each owner UserOp stays under the per-UserOp gas cap (a wallet that
+      // sends `calls` as one UserOp keeps working for small portfolios; sending `batches` one after another always fits).
+      return { status: 'ready' as const, asset: chosen[0]!.symbol, assets: chosen.map(m => m.symbol), calls, batches: strategyEarnBatches(calls) };
     },
   };
 }
@@ -897,6 +900,54 @@ export type StrategyEarnStepArgs = { chain: StrategyEarnChain; account: Address;
    * cre8-contracts#67 holds only the five #65 markets: calls for the others would fail the whole UserOp. */
   sendable?: readonly Hex[];
   ledger: StrategyEarnLedger; log: (line: string) => void };
+/**
+ * One session-key UserOp carries at most this many markets. A UserOp is capped at MAX_USER_OP_GAS (14M) and the sender
+ * doubles the estimated call gas, so one UserOp for a whole portfolio stopped fitting at about seven markets
+ * (portfolio 8, 2026-11-24: PAYMASTER_USER_OP_CAPACITY every round). Three keeps a wide margin.
+ */
+export const STRATEGY_EARN_MARKETS_PER_USER_OP = 3;
+const marketOfCall = (c: Call): string => {
+  try { return String((decodeFunctionData({ abi: STRATEGY_EARN_ABI, data: c.data }).args as readonly unknown[])[1]).toLowerCase(); } catch { return c.data; }
+};
+/**
+ * Split executor calls into UserOps in the order given: consecutive calls on the same market stay together (post + borrow,
+ * repay + withdraw), at most `marketsPerOp` such groups per UserOp. Every prefix of the original sequence is a state the
+ * single UserOp would have passed through (each executor call checks the position on its own), so stopping between two
+ * UserOps leaves nothing half-done; the next round re-reads the chain and plans only what is left.
+ */
+export function strategyEarnBatches(calls: readonly Call[], marketsPerOp = STRATEGY_EARN_MARKETS_PER_USER_OP): Call[][] {
+  const groups: Call[][] = []; let last: string | null = null;
+  for (const c of calls) { const m = marketOfCall(c); if (last !== null && m === last) groups[groups.length - 1]!.push(c); else groups.push([c]); last = m; }
+  const out: Call[][] = [];
+  for (let i = 0; i < groups.length; i += Math.max(1, marketsPerOp)) out.push(groups.slice(i, i + Math.max(1, marketsPerOp)).flat());
+  return out;
+}
+const isCapacity = (error: unknown) => /USER_OP_CAPACITY/.test(`${(error as { code?: string })?.code ?? ''} ${(error as Error)?.message ?? ''}`);
+/**
+ * Send the calls as several sequential UserOps (strategyEarnBatches), each recorded in the ledger as it lands. A batch
+ * that still does not fit is retried one market at a time. When a later UserOp fails, the error says how many landed.
+ */
+async function sendBatched(args: StrategyEarnStepArgs, calls: readonly Call[]): Promise<StrategyEarnTx[]> {
+  const txs: StrategyEarnTx[] = [];
+  const one = async (batch: Call[]) => { const tx = await args.send!(batch); await recordOrLog(args, tx); txs.push(tx); };
+  try {
+    for (const batch of strategyEarnBatches(calls)) {
+      try { await one(batch); }
+      catch (error) {
+        const singles = strategyEarnBatches(batch, 1);
+        if (!isCapacity(error) || singles.length < 2) throw error;
+        for (const single of singles) await one(single);
+      }
+    }
+  } catch (error) {
+    if (txs.length === 0) throw error;
+    const e = new Error(`已完成 ${txs.length} 筆（tx=${txs.map(t => t.hash).join(',')}），其餘未完成：${String((error as Error)?.message ?? error).split('\n')[0]}`);
+    (e as Error & { code?: string }).code = (error as { code?: string })?.code;
+    throw e;
+  }
+  return txs;
+}
+const txList = (txs: readonly StrategyEarnTx[]) => `tx=${txs.map(t => t.hash).join(',')}${txs.length > 1 ? `（分 ${txs.length} 筆）` : ''}`;
 const keyCovers = (args: Pick<StrategyEarnStepArgs, 'sendable'>, m: StrategyMarket) => args.sendable === undefined || args.sendable.includes(m.marketId);
 
 /**
@@ -948,9 +999,8 @@ export async function strategyEarnAutoOpen(args: StrategyEarnStepArgs): Promise<
   const waiting = renewal.length === 0 ? '' : `；${renewal.join('、')} 等 owner 續期策略加息授權`;
   if (calls.length === 0) return renewal.length === 0 ? null : `[STRATEGY_EARN_OPEN] ${renewal.join('、')} 等 owner 續期策略加息授權（session key 不含這些市場），未送出`;
   if (args.dryRun || !args.send) return `[STRATEGY_EARN_OPEN] 可自動開啟：${opened.join('、')}（${args.dryRun ? 'dry-run' : '沒有策略加息 session 權限，等 owner 續期'}，未送出）`;
-  const tx = await args.send(calls);
-  await recordOrLog(args, tx);
-  return `[STRATEGY_EARN_OPEN] 已自動開啟：${opened.join('、')} tx=${tx.hash}${waiting}`;
+  const txs = await sendBatched(args, calls);
+  return `[STRATEGY_EARN_OPEN] 已自動開啟：${opened.join('、')} ${txList(txs)}${waiting}`;
 }
 
 /**
@@ -1016,9 +1066,8 @@ export async function strategyEarnUnwindForSale(args: StrategyEarnStepArgs & { s
   if (notes.length === 0) return null;
   if (calls.length === 0) return `[STRATEGY_EARN_UNWINDING] ${notes.join('；')}`;
   if (args.dryRun || !args.send) return `[STRATEGY_EARN_UNWINDING] 賣出前需先還款取回：${notes.join('；')}（${args.dryRun ? 'dry-run' : '沒有策略加息 session 權限，等 owner 續期'}，未送出）`;
-  const tx = await args.send(calls);
-  await recordOrLog(args, tx);
-  return `[STRATEGY_EARN_UNWINDING] 賣出前已還款取回：${notes.join('；')} tx=${tx.hash}；下一輪再賣`;
+  const txs = await sendBatched(args, calls);
+  return `[STRATEGY_EARN_UNWINDING] 賣出前已還款取回：${notes.join('；')} ${txList(txs)}；下一輪再賣`;
 }
 
 // ---------------------------------------------------------------------------

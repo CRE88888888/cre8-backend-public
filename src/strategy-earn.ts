@@ -10,6 +10,8 @@ import { TESTNET_97 } from './testnet-profile.js';
 import { STRATEGY_EARN_97 } from './strategy-earn-guard.js';
 import { borrowAuthorized } from './permissions.js';
 import { rpcBatch, rpcTransport } from './rpc-transport.js';
+import { createMainnetRates, mainnetQuote } from './strategy-earn-mainnet.js';
+import type { MainnetRates } from './strategy-earn-mainnet.js';
 export { STRATEGY_EARN_97, assertNotStrategyVault, isStrategyVault } from './strategy-earn-guard.js';
 
 /**
@@ -325,6 +327,8 @@ export const MARKETS_CACHE_MS = 60_000;
 export type StrategyEarnDeps = { chainId: number; chain: () => StrategyEarnChain; owned: typeof requireOwnedPortfolio; now: () => Date; ledger?: StrategyEarnLedger;
   /** 0 = no cache (tests). Default MARKETS_CACHE_MS. */
   marketsCacheMs?: number;
+  /** Real BSC mainnet rates for display (src/strategy-earn-mainnet.ts); null = none. */
+  mainnetRates?: { get(): Promise<MainnetRates | null> };
   query: <T extends Record<string, unknown> = Record<string, unknown>>(sql: string, params?: unknown[]) => Promise<{ rows: T[] }> };
 
 let cachedChain: StrategyEarnChain | undefined;
@@ -335,6 +339,9 @@ export function defaultStrategyEarnChain(): StrategyEarnChain {
   cachedChain = createStrategyEarnChain(createPublicClient({ chain: bscTestnet, ...rpcBatch(rpc), transport: rpcTransport('strategy-earn', rpc, { retryCount: 1, timeout: 8_000 }) }) as PublicClient);
   return cachedChain;
 }
+
+let cachedMainnetRates: ReturnType<typeof createMainnetRates> | undefined;
+const defaultMainnetRates = () => cachedMainnetRates ??= createMainnetRates();
 
 export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
   const deps: StrategyEarnDeps = {
@@ -430,15 +437,17 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
     /** Pre-buy quote per eligible asset (ratio = target LTV). Leveraged products are never listed. */
     // Public and cached (MARKETS_CACHE_MS): fresh within the window; after it the last reading is served at once and
     // re-read in the background (one read in flight), so visitors never wait on, or multiply, the 31 status reads.
-    async markets(): Promise<MarketsView> {
+    // `mainnetRates` + per market `mainnet`: what the app displays (real BSC mainnet rates, same formula, ratio = this
+    // market's target LTV). Testnet positions keep accruing at the simulated chain-97 rates above.
+    async markets() {
       ready();
       const ttl = deps.marketsCacheMs ?? MARKETS_CACHE_MS;
-      if (ttl <= 0) return readMarkets(null);
-      if (marketsCache) {
-        if (deps.now().getTime() - marketsCache.at >= ttl) void refreshMarkets().catch(() => undefined);
-        return marketsCache.value;
-      }
-      return refreshMarkets();
+      const view = ttl <= 0 ? await readMarkets(null) : marketsCache
+        ? (deps.now().getTime() - marketsCache.at >= ttl && void refreshMarkets().catch(() => undefined), marketsCache.value) : await refreshMarkets();
+      const rates = await (deps.mainnetRates ?? defaultMainnetRates()).get().catch(() => null);
+      if (!rates) return { ...view, mainnetRates: null };
+      return { ...view, mainnetRates: rates, markets: view.markets.map(q => ({ ...q, mainnet: mainnetQuote(rates, q.protocol, q.asset,
+        q.targetLtvBps ?? null) })) };
     },
     /** This portfolio's positions; net value = collateral + vault - debt, kept apart from cash and Cash Earn. */
     async portfolio(id: number, wallet: string) {

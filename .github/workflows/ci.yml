@@ -70,6 +70,7 @@ jobs:
           test/cash-earn.test.ts
           test/dca.test.ts
           test/strategy-earn.test.ts
+          test/strategy-earn-mainnet.test.ts
           test/strategy-earn-v2.test.ts
           test/waitlist-tasks.test.ts
           test/mix-http.test.ts

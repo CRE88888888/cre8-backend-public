@@ -137,6 +137,7 @@ function fakeChain(f: Fake): StrategyEarnChain {
     weights: async () => f.weights ?? [],
   };
 }
+const noMainnet = { get: async () => null };
 const tx0 = { hash: ('0x' + '01'.repeat(32)) as Hex, blockNumber: 1n, logs: [] };
 const noLedger = { record: async () => {} };
 const ownedPortfolio = (patch: Record<string, unknown> = {}) => async () => ({ id: 3, userId: account, strategyId: 1, version: 1, scheduleState: 'active',
@@ -146,7 +147,7 @@ test('#199 service: market quotes with gate reasons; outages are "temporarily un
   const f: Fake = { statuses: Object.fromEntries(markets.map(m => [m.marketId, status()])), ids: [], held: 0n, collateral: 0n, prices: {}, rewards: { vault: 0n, collateral: 0n } };
   f.statuses[qqq.marketId] = status({ gate: 3 });
   f.statuses[markets[4]?.marketId ?? ''] = null;
-  const earn = createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio() as never, marketsCacheMs: 0 });
+  const earn = createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio() as never, marketsCacheMs: 0, mainnetRates: noMainnet });
   const list = await earn.markets();
   // Where the money goes: Venus -> collateral vToken + vUSDT; Lista -> Moolah + market id; every market -> the strategy vault.
   const nv = list.markets[0], qq = list.markets[3];
@@ -253,7 +254,7 @@ test('#207 keeper drill accounts: merged with DB accounts and de-duplicated; emp
 test('#199 HTTP: public markets with short cache; portfolio routes need login; 405 on wrong methods', async () => {
   const f: Fake = { statuses: Object.fromEntries(markets.map(m => [m.marketId, status()])), ids: [], held: 0n, collateral: 0n, prices: {}, rewards: { vault: 0n, collateral: 0n } };
   const server = createServer({
-    strategyEarn: createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio() as never }),
+    strategyEarn: createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio() as never, mainnetRates: noMainnet }),
     rateLimiter: new RequestRateLimiter(loadRateLimitConfig({}), new MemoryRateLimitStore()),
     auth: { authenticate: async (h) => { if (h !== 'Bearer ok') throw new UnauthorizedError('login required'); return account; },
       issueNonce: () => { throw new Error('unused'); }, login: async () => { throw new Error('unused'); }, logout: async () => {} },
@@ -290,13 +291,13 @@ test('GET /strategy-earn/markets is cached server-side: one chain read per windo
   const f: Fake = { statuses: Object.fromEntries(markets.map(m => [m.marketId, status()])), ids: [], held: 0n, collateral: 0n, prices: {}, rewards: { vault: 0n, collateral: 0n } };
   let reads = 0, t = 1_000_000;
   const chain = fakeChain(f), counted: StrategyEarnChain = { ...chain, status: async (...a) => { reads++; return chain.status(...a); } };
-  const earn = createStrategyEarn({ chainId: 97, chain: () => counted, owned: ownedPortfolio() as never, now: () => new Date(t) });
+  const earn = createStrategyEarn({ chainId: 97, chain: () => counted, owned: ownedPortfolio() as never, now: () => new Date(t), mainnetRates: noMainnet });
   const first = await earn.markets();
   assert.equal(reads, markets.length);
-  assert.equal(await earn.markets(), first); assert.equal(reads, markets.length);
+  assert.deepEqual(await earn.markets(), first); assert.equal(reads, markets.length);
   t += 61_000;
   f.headFails = true;
-  assert.equal(await earn.markets(), first); // stale served at once
+  assert.deepEqual(await earn.markets(), first); // stale served at once
   await new Promise(r => setTimeout(r, 0));
   t += 61_000;
   assert.equal((await earn.markets()).updatedAt, first.updatedAt); // a failed re-read never replaces the last good one

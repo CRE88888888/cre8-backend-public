@@ -1462,3 +1462,76 @@ test('basket waiting DB: a started job whose remainder needs two transactions bu
   assert.equal(await job(g),null);assert.equal(await jobState(kept.job.id),'completed');
   assert.equal(t.sends.reduce((sum,send)=>sum+send.steps.length,0),17);
 });
+
+// ---- 2026-11-25 a started job that is released must close its sources ----------------------------------------------
+// cancelJob marks the started job's periods 'cancelled'; completeAssetSchedules only closes sources whose periods were
+// all bought or skipped, so those sources stayed 'active' for good. A private basket reads "an active source" as new
+// money still to buy and never went back to its own rebalance, which is the only thing that uses the returned cash.
+const pendingSources=async(f:Fixture)=>(await query(`select 1 from strategy_lot_assets a join strategy_funding_lots l on l.id=a.lot_id
+  where l.portfolio_id=$1 and a.state='active'`,[f.id])).rows.length;
+
+test('cancelled source DB: a started one-time job that is released closes its sources; the returned cash stays in this portfolio as free cash',async()=>{
+  // #273: 9.90 principal + 0.05 fee left is under one 10 USDT batch.
+  const f=await fixture();await f.fund(100n*U);
+  const before=await spendDownTo(f,usdt('9.9'),usdt('0.05'));
+  assert.equal(await pendingSources(f),2,'both sources are being bought');
+  const s=feeScheduler(f);
+  assert.match((await s.once(new Date(+start+60000))).results[0]?.reason??'',/\[BELOW_MIN_BATCH\]/);
+  assert.equal(await jobState(before.job.id),'cancelled');
+  assert.deepEqual(await sourceRows(f),[a,b].sort().map(asset=>({asset,state:'cancelled',slices:['cancelled']})),'no period is left: the sources are closed');
+  assert.equal(await pendingSources(f),0,'nothing is left pending on this portfolio');
+  // The money did not leave the portfolio's own ledger: free one-time cash, nothing reserved, nothing lost.
+  const cash=await balances(f);assert.ok(cash);
+  assert.equal(cash.unallocated_hold_raw,usdt('9.95').toString());assert.equal(cash.reserved_input_raw,'0');assert.equal(cash.reserved_fee_raw,'0');assert.equal(cash.stack_prefund_raw,'0');
+  assert.equal(before.firstSpent+before.firstFee+BigInt(cash.unallocated_hold_raw)+BigInt(cash.allocated_cash_raw),100n*U);
+  // Later rounds change nothing, and a later deposit still buys only its own money.
+  assert.match((await s.once(new Date(+start+120000))).results[0]?.reason??'',/\[NO_DUE_SLOT\]/);
+  assert.deepEqual(await balances(f),cash);
+  await f.fund(50n*U,new Date(+start+180000));
+  assert.equal((await s.once(new Date(+start+240000))).results[0]?.outcome,'executed');
+  assert.equal(sumInputs(s.spent(s.sends[0] as ExecuteArgs))+R,50n*U,'the new deposit, not the returned cash');
+  assert.equal((await sourceRows(f)).filter(r=>r.state==='cancelled').length,2);
+
+  // #275: a remainder that needs two transactions and cannot fill both.
+  const now=new Date('2026-11-16T15:00:00Z');
+  const g=await fixture('hold',0,4,'none',undefined,undefined,17);await g.fund(100n*U);
+  await spendDownTo(g,15n*U,usdt('0.05'));
+  assert.match((await feeScheduler(g).once(now)).results[0]?.reason??'',/\[BELOW_MIN_BATCH\].*17 個資產/);
+  const rows=await sourceRows(g);assert.equal(rows.length,17);
+  assert.ok(rows.every(r=>r.state==='cancelled'&&r.slices.length===1&&r.slices[0]==='cancelled'),JSON.stringify(rows));
+  assert.equal(await pendingSources(g),0);assert.equal((await balances(g))?.unallocated_hold_raw,usdt('15.05').toString());
+});
+
+test('cancelled source DB: a creator-scheduled source keeps its later periods after one is released, and closes when none is left',async()=>{
+  // Two daily periods of 100 USDT. The first is released part-way: the second must still be bought on its day.
+  const f=await fixture('stack',0,2);await f.fund(200n*U);
+  await spendDownTo(f,usdt('9.9'),usdt('0.05'));
+  const s=feeScheduler(f);
+  assert.match((await s.once(new Date(+start+60000))).results[0]?.reason??'',/\[BELOW_MIN_BATCH\]/);
+  assert.deepEqual(await sourceRows(f),[a,b].sort().map(asset=>({asset,state:'active',slices:['cancelled']})),'one period is still to come');
+  assert.equal((await balances(f))?.stack_prefund_raw,(100n*U+usdt('9.95')).toString(),'scheduled money goes back to the scheduled bucket');
+  const day=new Date(+start+86400000);
+  // The last period is released part-way too: nothing is left, so the sources close.
+  const last=(await f.reserve({...f.context,now:day}))?.job;assert.ok(last);
+  const left=Object.fromEntries(Object.keys(last.remaining_input).map(asset=>[asset,usdt('4.95').toString()]));
+  await complete(f,last,Object.fromEntries(Object.keys(last.remaining_input).map(asset=>[asset,(BigInt(last.remaining_input[asset]??'0')-usdt('4.95')).toString()])),BigInt(last.remaining_fee_raw)-usdt('0.05'));
+  assert.deepEqual((await job(f))?.remaining_input,left);
+  assert.match((await s.once(new Date(+day+60000))).results[0]?.reason??'',/\[BELOW_MIN_BATCH\]/);
+  assert.deepEqual(await sourceRows(f),[a,b].sort().map(asset=>({asset,state:'cancelled',slices:['cancelled','cancelled']})));
+  assert.equal(await pendingSources(f),0);
+  const cash=await balances(f);assert.ok(cash);
+  assert.equal(cash.stack_prefund_raw,(usdt('9.95')*2n).toString());assert.equal(cash.unallocated_hold_raw,'0');assert.equal(cash.reserved_input_raw,'0');assert.equal(cash.reserved_fee_raw,'0');
+
+  // A released period followed by a fully bought last period also ends the source (it can never be 'completed').
+  const g=await fixture('stack',0,2);await g.fund(200n*U);
+  await spendDownTo(g,usdt('9.9'),usdt('0.05'));
+  const t=feeScheduler(g);
+  assert.match((await t.once(new Date(+start+60000))).results[0]?.reason??'',/\[BELOW_MIN_BATCH\]/);
+  assert.equal((await t.once(day)).results[0]?.outcome,'executed');
+  assert.equal(await job(g),null);
+  assert.deepEqual(await sourceRows(g),[a,b].sort().map(asset=>({asset,state:'cancelled',slices:['cancelled','completed']})));
+  // Untouched: sources with no cancelled period still finish as 'completed'.
+  const h=await fixture();await h.fund(100n*U);
+  assert.equal((await feeScheduler(h).once(start)).results[0]?.outcome,'executed');
+  assert.deepEqual(await sourceRows(h),[a,b].sort().map(asset=>({asset,state:'completed',slices:['completed']})));
+});

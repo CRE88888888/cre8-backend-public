@@ -16,6 +16,15 @@ export async function completeAssetSchedules(query:SchedulerQueryFn,portfolioId:
     where l.id=a.lot_id and l.portfolio_id=$1 and a.state='active'
     and (select count(*) from strategy_asset_slices s where s.lot_id=a.lot_id and s.asset=a.asset)=a.effective_slices
     and not exists(select 1 from strategy_asset_slices s where s.lot_id=a.lot_id and s.asset=a.asset and s.state in ('reserved','cancelled'))`,[portfolioId]);
+  // A source whose every period is recorded but one of them was cancelled after its job had started (cancelJob) can never
+  // be 'completed' (0032 forbids it), so it used to stay 'active' for good. A private basket reads an active source as
+  // new money still to buy and never returned to its own rebalance, the only thing that uses the cash cancelJob gave
+  // back. Nothing is left to buy from it: 'cancelled' is its end state. The cash stays where cancelJob put it.
+  await query(`update strategy_lot_assets a set state='cancelled',updated_at=clock_timestamp() from strategy_funding_lots l
+    where l.id=a.lot_id and l.portfolio_id=$1 and a.state='active'
+    and (select count(*) from strategy_asset_slices s where s.lot_id=a.lot_id and s.asset=a.asset)=a.effective_slices
+    and exists(select 1 from strategy_asset_slices s where s.lot_id=a.lot_id and s.asset=a.asset and s.state='cancelled')
+    and not exists(select 1 from strategy_asset_slices s where s.lot_id=a.lot_id and s.asset=a.asset and s.state='reserved')`,[portfolioId]);
 }
 async function sources(query:SchedulerQueryFn,c:Pick<JobContext,'chainId'|'portfolioId'|'strategyId'|'version'>):Promise<Source[]>{
   const rows=await query(`select a.*,l.created_at as confirmed_at,e.value->'execution' as mode,

@@ -612,6 +612,71 @@ test('a switched mix settles its real handover funding job and still owes an exi
   });
 });
 
+test('a mix whose started buy is released closes its sources: it leaves new-money mode and its own rebalance gets the returned cash', async () => {
+  await fixture(async (_service, db, deps) => {
+    const proof = deps.proof;
+    let carrying = false;
+    // The valuation anchor is "now": 0056 refuses a valuation older than the mix (the shared mixClock is in the past).
+    const service = createMixService({ ...deps, anchor: async () => ({ hash: zeroHash, at: new Date() }),
+      proof: async (...args) => ({ ...await proof(...args), cashRaw: carrying ? (100n * WAD).toString() : '0' }) });
+    const made = await service.create({ assets: [{ assetId: T.assets.NVDAB.token, weightBps: 5000 },
+      { assetId: T.assets.WBNB.token, weightBps: 5000 }] }, owner, randomUUID());
+    await service.confirm(made.mixId, owner, { txHash: toHex(90n, { size: 32 }) });
+    await service.patch(made.mixId, owner, { assets: [{ assetId: T.assets.TSLAB.token, weightBps: 5000 }, { assetId: T.assets.WBNB.token, weightBps: 5000 }] });
+    carrying = true;
+    const switched = await service.confirm(made.mixId, owner, { txHash: toHex(91n, { size: 32 }) }); assert.ok(switched.portfolioId);
+    const detail = await service.get(made.mixId, owner);
+    const find: import('../src/scheduler.js').SchedulerQueryFn = (sql, args) => db.query(sql, args ? [...args] : []);
+    const version = (await db.query<{ allocation: import('../src/strategies.js').Allocation; execution: import('../src/strategy-execution.js').AssetExecution }>(
+      'select allocation,execution from strategy_versions where strategy_id=$1 and version=1', [detail.strategyId])).rows[0]; assert.ok(version);
+    const context: import('../src/strategy-jobs.js').JobContext = { personalMix: true, chainId: 97, portfolioId: switched.portfolioId,
+      strategyId: detail.strategyId, version: 1, kind: 'asset', account: made.account, allocation: version.allocation, execution: version.execution,
+      cash: T.contracts.usdt, now: mixClock, reserve: 0n, caps: new Map(version.allocation.assets.map(a => [a.address, null])), buyLimit: 100n * WAD, observedCash: 100n * WAD, enabled: true, marketOpen: true };
+    const { fundingLots, prepareStrategyJob, settleStrategyBatch, readJob, cancelJob } = await import('../src/strategy-jobs.js');
+    const { mixAvailableCash } = await import('../src/mix-runtime.js');
+    const run: import('../src/scheduler.js').WithTransactionFn = work => work({ query: find });
+    const prepared = await prepareStrategyJob(run, context, await fundingLots(find, context)); assert.ok(prepared.job);
+    const job = prepared.job;
+    // The first transaction buys all but 5 USDT of each leg; the 10 USDT left is then released (#273 / #275 call cancelJob).
+    const bought = Object.fromEntries(Object.entries(job.remaining_input).map(([asset, raw]) => [asset, (BigInt(raw) - 5n * WAD).toString()]));
+    await db.query("update strategy_jobs set state='running',asset_started_at=slot_at where id=$1", [job.id]);
+    await db.query('insert into strategy_job_batches(job_id,batch_index,input_raw) values($1,0,$2)', [job.id, JSON.stringify(bought)]);
+    const op = (await db.query<{ id: string }>(`insert into operations(portfolio_id,type,state,idempotency_key,payload_hash,deadline,user_op_nonce,strategy_job_id,strategy_batch_index)
+      values($1,'rebalance','pending',$2,$3,$4,0,$5,0) returning id`, [switched.portfolioId, randomUUID(), zeroHash, new Date(mixClock.getTime() + 300000), job.id])).rows[0]; assert.ok(op);
+    await db.query("update operations set state='submitted',tx_hash=$2,user_op_hash=$2 where id=$1", [op.id, toHex(92n, { size: 32 })]);
+    await settleStrategyBatch(run, context, op.id, { received: Object.fromEntries(Object.keys(bought).map(asset => [asset, '1'])),
+      fees: {}, feePaid: 0n, blockNumber: 3n, blockHash: toHex(93n, { size: 32 }) });
+    const due = { personalMix: true, portfolioId: switched.portfolioId, strategyId: detail.strategyId, account: made.account,
+      accountType: 'KERNEL', intervalSeconds: 60, unsupportedReason: null, nextRunAt: mixClock };
+    const buying = await loadMixRuntime(due, find); assert.ok(buying); assert.equal(buying.newMoney, true, 'the job is still buying');
+    const running = await readJob(find, context); assert.ok(running); assert.equal(running.state, 'running');
+    await cancelJob(find, context, running);
+    const sources = (await db.query<{ state: string; slices: string[] }>(`select a.state,array(select s.state from strategy_asset_slices s
+      where (s.lot_id,s.asset)=(a.lot_id,a.asset)) as slices from strategy_lot_assets a join strategy_funding_lots l on l.id=a.lot_id
+      where l.portfolio_id=$1 and a.effective_slices>0`, [switched.portfolioId])).rows;
+    assert.deepEqual(sources, [{ state: 'cancelled', slices: ['cancelled'] }, { state: 'cancelled', slices: ['cancelled'] }]);
+    const cashRow = async () => (await db.query<Record<string, string>>(`select unallocated_hold_raw::text,allocated_cash_raw::text,stack_prefund_raw::text,
+      reserved_input_raw::text,reserved_fee_raw::text from strategy_cash_balances where chain_id=97 and portfolio_id=$1`, [switched.portfolioId])).rows[0];
+    assert.deepEqual(await cashRow(), { unallocated_hold_raw: (10n * WAD).toString(), allocated_cash_raw: '0', stack_prefund_raw: '0', reserved_input_raw: '0', reserved_fee_raw: '0' },
+      'the 10 USDT is this portfolio\'s own free cash');
+    // Before the fix the sources stayed active: every round was "new money" with nothing to buy, and a target pass in
+    // that mode may only spend allocated_cash_raw (mixAvailableCash), which is 0 here.
+    const state = await loadMixRuntime(due, find); assert.ok(state); assert.equal(state.newMoney, false, 'no source is pending any more');
+    const { plan } = mixRuntimeFixture();
+    plan.targets = version.allocation.assets.map(a => ({ asset: a.address, weightBps: a.weightBps, symbol: a.address }));
+    plan.snapshot.holdings = [{ asset: T.assets.TSLAB.token, amountWei: 45n * WAD }, { asset: T.assets.WBNB.token, amountWei: 45n * WAD },
+      { asset: T.contracts.usdt, amountWei: 10n * WAD }].map(h => ({ ...h, decimals: 18, usdPriceE8: 100000000n, priceSource: 'numeraire' as const }));
+    // Between its dates the basket waits; on its date (here: the forced pass after a switch) it rebalances.
+    assert.equal(decideMixTick({ ...state, last: mixClock }, plan, new Date(mixClock.getTime() + 60000)).mode, 'wait');
+    const tick = decideMixTick(state, plan, mixClock);
+    assert.equal(tick.mode, 'rebalance'); assert.equal(tick.complete, false);
+    await prepareMixTick(state, tick, due, mixClock, run);
+    assert.deepEqual(await cashRow(), { unallocated_hold_raw: '0', allocated_cash_raw: (10n * WAD).toString(), stack_prefund_raw: '0', reserved_input_raw: '0', reserved_fee_raw: '0' });
+    assert.equal(await mixAvailableCash(due, tick.plan, find), 10n * WAD, 'the rebalance may spend all of the returned cash');
+    await db.query('set constraints all immediate');
+  });
+});
+
 test('a switched mix keeps its forced pass after a crypto batch until its closed stock exits are resolved', async () => {
   await fixture(async (service, db) => {
     const made = await service.create({ assets: [{ assetId: T.assets.NVDAB.token, weightBps: 10000 }] }, owner, randomUUID());

@@ -274,3 +274,13 @@ test('draft3: Lista vault transactions go one per UserOp; an open under the List
   const venusSmall = plan([decision('NVDAB', 'open', 'best_route', null, venusUsdt, 14)], [state('NVDAB', NVDA, { freeCollateralRaw: E })]);
   assert.equal(venusSmall.steps[0]!.calls.length, 1); // Venus has no such minimum
 });
+
+test('an account that still has a v1 Venus position gets nothing on Venus from v2 (the two must never coexist)', async () => {
+  const options = [option('venus', 'USDT', A(0xb2), 100), option('lista', 'USDC', LISTA_MARKET, 300)]; // Venus is clearly better
+  const run = async (hasV1Venus: boolean) => { const sent: Call[][] = [];
+    await runV2Account({ v2: V2, portfolioId: 7, account, snapshot: snapshot({ QQQB: options }), costs: { gasUsdPerTx: 0.05 }, now: NOW_MS, deadline: DEADLINE, dryRun: false, log: () => {},
+      state: { enabled: true, policyMaxDebtUsdRaw: 100_000n * E, principalUsdRaw: 0n, holdings: [holding()], hasV1Venus }, send: async calls => { sent.push(calls); return { hash: ('0x' + '01'.repeat(32)) as Hex }; } });
+    return (decode(sent[0]![0]!.data).args as readonly unknown[])[1]; };
+  assert.equal(await run(false), routeIds(V2, QQQ, { venue: 'venus', marketId: A(0xb2), loan: 'USDT', vault: { venue: 'venus', address: A(0xb2) } }).routeId);
+  assert.equal(await run(true), routeIds(V2, QQQ, listaUsdc).routeId);
+});

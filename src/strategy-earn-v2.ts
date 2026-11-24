@@ -399,8 +399,9 @@ export function v2RateReport(v2: StrategyEarnV2, routes: readonly { collateral: 
  * validates. Agreed with the contracts side (2026-11-24, not in the interface yet): the box's ERC-1271 accepts ONLY the
  * Lista reward message. Spec draft2 §9: `signature = abi.encode(bytes message, bytes accountSignature)`; the box checks
  * that `message` ends with the registry's `rewardProofSuffix` (at most 64 bytes before it), that `hash` is its EIP-191
- * hash, and that the account itself validates `accountSignature` for that hash. Not yet verified on mainnet: which hash
- * form Lista's backend actually passes to the contract — so vault-side LISTA is not to be counted until that is tested.
+ * hash, and that the account itself validates `accountSignature` for that hash. Verified on BSC mainnet (2026-11-24) with a
+ * real Kernel v3.3 account and StrategyBox: Lista calls `isValidSignature(bytes32,bytes)` with the EIP-191 hash and accepts
+ * this wrapper for both proof endpoints (`type=safe` required).
  */
 export const boxRewardSignature = (message: string, accountSignature: Hex): Hex =>
   encodeAbiParameters([{ type: 'bytes' }, { type: 'bytes' }], [stringToHex(message), accountSignature]);
@@ -416,7 +417,10 @@ export type V2Holding = PositionState & {
   /** The open position's route, debt in USD and when it entered this route (registry `openedAt`, or the last vault switch from the ledger). */
   position: null | { route: RouteKey; debtUsd: number; since: number; ltvBps?: number; deleverageLtvBps?: number };
 };
-export type V2AccountState = { enabled: boolean; policyMaxDebtUsdRaw: bigint; principalUsdRaw: bigint; holdings: readonly V2Holding[] };
+export type V2AccountState = { enabled: boolean; policyMaxDebtUsdRaw: bigint; principalUsdRaw: bigint; holdings: readonly V2Holding[];
+  /** The account still has a v1 (AtpBorrowExecutor) Venus position. v2 treats the account's whole Venus debt and vTokens as its
+   * own, so the two must never coexist: while this is true v2 neither opens nor moves anything onto Venus for this account. */
+  hasV1Venus?: boolean };
 export type V2Tx = { hash: Hex };
 export type V2RoundArgs = { v2: StrategyEarnV2; portfolioId: number; account: Address; snapshot: RoutingSnapshot; state: V2AccountState; costs: Costs; now: number; deadline: bigint;
   liquidity?: Liquidity; dryRun: boolean; log: (line: string) => void;
@@ -434,7 +438,8 @@ export type V2RoundResult = { decisions: number; sent: number; failed: number; s
  */
 export async function runV2Account(a: V2RoundArgs): Promise<V2RoundResult> {
   const holdings: Holding[] = a.state.holdings.map(h => ({ symbol: h.symbol, collateralUsd: h.collateralUsd, enabled: a.state.enabled, position: h.position }));
-  const engine = planAccount({ snapshot: a.snapshot, holdings, costs: a.costs, now: a.now, ...(a.liquidity ? { liquidity: a.liquidity } : {}) });
+  const snapshot = a.state.hasV1Venus ? { ...a.snapshot, options: Object.fromEntries(Object.entries(a.snapshot.options).map(([k, v]) => [k, v.filter(o => o.venue !== 'venus')])) } : a.snapshot;
+  const engine = planAccount({ snapshot, holdings, costs: a.costs, now: a.now, ...(a.liquidity ? { liquidity: a.liquidity } : {}) });
   const execution = planExecution({ v2: a.v2, account: a.account, decisions: engine.decisions, positions: a.state.holdings, deadline: a.deadline,
     policyMaxDebtUsdRaw: a.state.policyMaxDebtUsdRaw, principalUsdRaw: a.state.principalUsdRaw });
   const result: V2RoundResult = { decisions: engine.decisions.length, sent: 0, failed: 0, skipped: 0, consentShort: execution.consentShort };

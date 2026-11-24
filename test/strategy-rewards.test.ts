@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { decodeFunctionData, encodeAbiParameters, encodeEventTopics, erc20Abi } from 'viem';
 import type { Address, Hex, Log } from 'viem';
-import { claimCalls, fetchListaProofs, parseRewardSignature, REWARD_MESSAGE, REWARDS, REWARDS_ABI, REWARD_TOKENS, resetRewardsRoundClock, rewardEvents, rewardExitCalls,
+import { RewardProofError, claimCalls, fetchListaProofs, parseRewardSignature, REWARD_MESSAGE, REWARDS, REWARDS_ABI, REWARD_TOKENS, resetRewardsRoundClock, rewardEvents, rewardExitCalls,
   runStrategyRewardsRound, signatureUsable, sponsoredRewardTokens, strategyRewardsEnabled } from '../src/strategy-rewards.js';
 import type { Claimable, RewardEvent, RewardsStore, RewardSignature } from '../src/strategy-rewards.js';
 import { createStrategyEarn } from '../src/strategy-earn.js';
@@ -27,8 +27,8 @@ function listaApi(by: Record<string, { one?: bigint; multi?: bigint }>, seen: st
     assert.equal(u.searchParams.get('type'), 'safe'); assert.equal(u.searchParams.get('message'), sig.message);
     assert.equal(u.searchParams.get('signature'), who === box ? boxSig.signature : sig.signature); // the box is asked with its own signature form
     const d = by[who] ?? {};
-    if (url.includes('userMultiProof')) return new Response(JSON.stringify({ code: '000000', data: d.multi ? [{ token: OTHER, tokenSymbol: 'slisBNB', amountWei: d.multi.toString(), proof }] : [] }));
-    return new Response(JSON.stringify({ code: '000000', data: d.one ? { amountWei: d.one.toString(), proof } : null }));
+    if (url.includes('userMultiProof')) return new Response(JSON.stringify({ code: '000000000', data: d.multi ? [{ token: OTHER, tokenSymbol: 'slisBNB', amountWei: d.multi.toString(), proof }] : [] }));
+    return new Response(JSON.stringify({ code: '000000000', msg: 'success', data: d.one ? { amountWei: d.one.toString(), proof } : null }));
   };
 }
 function memoryStore(signed = [{ portfolioId: 7, account, owner, sig }]) {
@@ -163,4 +163,24 @@ test('API: GET rewards and POST reward-signature are 404 while the feature is of
   assert.deepEqual(view.tokens, [{ token: REWARDS.LISTA, symbol: 'LISTA', balanceRaw: '4', pendingRaw: '1' }]);
   assert.deepEqual(await on.rewardSignature(7, owner, { signedAt: NOW.toISOString(), signature: sig.signature }), { status: 'saved', signedAt: NOW.toISOString() });
   assert.deepEqual((saved[0] as unknown[]).slice(0, 3), [56, 7, account]);
+});
+
+test('proof API responses as verified on mainnet: 000000000 success (empty data = nothing earned), 1005 wrong signature, 401 stale, 500 system error', async () => {
+  const api = (status: number, body: unknown) => (async () => new Response(JSON.stringify(body), { status })) as never;
+  assert.deepEqual(await fetchListaProofs(api(200, { code: '000000000', msg: 'success' }), account, sig), []); // no data field at all
+  assert.deepEqual(await fetchListaProofs(api(200, { code: '000000000', msg: 'success', data: null }), account, sig), []);
+  const reason = async (status: number, body: unknown) => fetchListaProofs(api(status, body), account, sig).then(() => 'ok', e => e instanceof RewardProofError ? e.reason : 'other');
+  assert.deepEqual([await reason(200, { code: '1005', msg: 'Invalid signature' }), await reason(401, { code: '401', msg: 'x' }), await reason(200, { code: '401', msg: 'expired' }),
+    await reason(500, { code: '-1', msg: 'System error' }), await reason(200, { code: '-1', msg: 'message is required' })], ['signature_invalid', 'signature_expired', 'signature_expired', 'unavailable', 'unavailable']);
+});
+
+test('round: a signature Lista refuses is dropped so the app asks the owner again; an outage keeps it', async () => {
+  for (const [body, status, dropped] of [[{ code: '1005', msg: 'Invalid signature' }, 200, 1], [{ code: '-1', msg: 'System error' }, 500, 0]] as const) {
+    resetRewardsRoundClock();
+    const m = memoryStore(); let drops = 0;
+    (m.store as unknown as { dropSignature: () => Promise<void> }).dropSignature = async () => { drops++; };
+    const r = await runStrategyRewardsRound({ dryRun: false, log: () => {}, force: true }, { chainId: 56, env: { STRATEGY_REWARDS_ENABLED: '1' }, now: () => NOW, store: m.store,
+      fetch: (async () => new Response(JSON.stringify(body), { status })) as never, chain: { claimed: async () => 0n, venusAccrued: async () => 0n }, writer: null });
+    assert.deepEqual([r?.failed, drops], [1, dropped]);
+  }
 });

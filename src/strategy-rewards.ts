@@ -16,7 +16,8 @@ import { PUBLIC_RPC_56 } from './strategy-earn-mainnet.js';
  * pay the account, so the operator sends them: no session key, no UserOp, no paymaster rule. Amounts are cumulative;
  * claimable = totalAmount − claimed(account).
  * Proofs come from api.lista.org and need a signature BY THE HOLDER over REWARD_MESSAGE(datetime), valid 7 days
- * (contracts: type=safe, checked by ERC-1271).
+ * (contracts: type=safe; Lista calls `isValidSignature(bytes32,bytes)` with the EIP-191 personal_sign hash of the message;
+ * any signature length is accepted). Verified on mainnet for a Kernel v3.3 account and for a StrategyBox.
  *
  * Signature (decision): the OWNER signs once per 7 days in the app, silently, with the embedded wallet, when a
  * portfolio page is opened (GET shows `signature.needed`). We did not give the session key ERC-1271 signing: a key
@@ -89,15 +90,29 @@ export function parseRewardSignature(input: unknown, now: Date): RewardSignature
 }
 export const signatureUsable = (signedAt: Date, now: Date) => now.getTime() - signedAt.getTime() < REWARDS.SIGNATURE_TTL_MS;
 
+/**
+ * Why a proof could not be read. `signature_invalid` / `signature_expired`: the stored owner signature is no use any more
+ * (the round drops it so the app asks the owner to sign again); `unavailable`: Lista's side, try again next round.
+ */
+export class RewardProofError extends Error {
+  constructor(readonly reason: 'signature_invalid' | 'signature_expired' | 'unavailable', message: string) { super(message); this.name = 'RewardProofError'; }
+}
 /** Both Lista distributors' proofs for one holder. A holder with nothing earned gets an empty list. */
 export async function fetchListaProofs(f: Fetcher, holder: Address, sig: RewardSignature): Promise<Claimable[]> {
   const get = async (base: string) => {
     const url = `${base}?${new URLSearchParams({ address: holder, signature: sig.signature, message: sig.message, type: 'safe' })}`;
     const res = await f(url, { signal: AbortSignal.timeout(15_000), headers: { accept: 'application/json' } });
-    if (!res.ok) throw new Error('Lista proof API HTTP ' + res.status);
-    const body = await res.json() as { code?: string; msg?: string; data?: unknown };
-    if (String(body.code) !== '000000' && body.data === undefined) throw new Error('Lista proof API: ' + String(body.msg ?? body.code).slice(0, 80));
-    return body.data;
+    // Verified on BSC mainnet (2026-11-24, real Kernel v3.3 account and StrategyBox): success is code "000000000" (data empty
+    // when nothing is earned); a wrong signature is 1005; a stale datetime is HTTP 401; a contract address sent without
+    // type=safe is HTTP 500 "System error" (we always send type=safe).
+    if (res.status === 401) throw new RewardProofError('signature_expired', 'Lista proof API: signature datetime is stale (401)');
+    if (!res.ok) throw new RewardProofError('unavailable', 'Lista proof API HTTP ' + res.status);
+    const body = await res.json() as { code?: string | number; msg?: string; data?: unknown };
+    const code = String(body.code ?? '');
+    if (code === '1005') throw new RewardProofError('signature_invalid', 'Lista proof API: Invalid signature (1005)');
+    if (code === '401') throw new RewardProofError('signature_expired', 'Lista proof API: signature datetime is stale (401)');
+    if (!/^0+$/.test(code)) throw new RewardProofError('unavailable', 'Lista proof API: ' + `${code} ${String(body.msg ?? '')}`.trim().slice(0, 80));
+    return body.data ?? null;
   };
   const [one, multi] = await Promise.all([get(REWARDS.PROOF_API), get(REWARDS.MULTI_PROOF_API)]);
   const out: Claimable[] = [];
@@ -171,6 +186,7 @@ export function rewardsStore(run: Query = dbQuery as Query) {
         on conflict (chain_id,account) do update set message=excluded.message, signature=excluded.signature, signed_at=excluded.signed_at, updated_at=clock_timestamp()
         where strategy_reward_signatures.signed_at < excluded.signed_at`, [chainId, portfolioId, account, sig.message, sig.signature, sig.signedAt.toISOString()]);
     },
+    async dropSignature(chainId: number, account: Address) { await run(`delete from strategy_reward_signatures where chain_id=$1 and account=$2`, [chainId, account]); },
     /** Accounts with a signature Lista still accepts, with their owner. */
     async signed(chainId: number, now: Date): Promise<{ portfolioId: number; account: Address; owner: Address; sig: RewardSignature }[]> {
       const r = await run(`select s.portfolio_id, s.account, a.owner, s.message, s.signature, s.signed_at from strategy_reward_signatures s
@@ -309,6 +325,8 @@ export async function runStrategyRewardsRound(args: { dryRun: boolean; log: (lin
       }
     } catch (error) {
       result.failed++;
+      // A signature Lista refuses will never work: forget it, so the portfolio view asks the owner for a new one.
+      if (error instanceof RewardProofError && error.reason !== 'unavailable') await store.dropSignature(deps.chainId, a.account).catch(() => {});
       args.log(`[strategy-rewards] portfolio ${a.portfolioId}: not finished, next round retries: ${String((error as Error)?.message ?? error).split('\n')[0]!.slice(0, 160)}`);
     }
   }

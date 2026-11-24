@@ -1,4 +1,5 @@
 import { query } from './db.js';
+import { restoreRoundOutcomes, roundOutcomeSnapshot } from './alerts.js';
 import type { PortfolioOutcome, SchedulerRound } from './scheduler.js';
 
 /**
@@ -75,7 +76,8 @@ export type HeartbeatInput = {
 /** 排程器每輪呼叫一次（`round === null` 代表這一輪拋錯，只更新錯誤）。 */
 export async function writeHeartbeat(input: HeartbeatInput): Promise<void> {
   const finishedAt = input.round === null ? null : new Date();
-  const summary = input.round === null ? null : summarizeRound(input.round);
+  // `outcomes`: each portfolio's last round outcome (reason + time), so the next process knows why they were waiting.
+  const summary = input.round === null ? null : { ...summarizeRound(input.round), outcomes: roundOutcomeSnapshot(finishedAt ?? new Date()) };
   const results = input.round?.results ?? [];
   const finished = results.length > 0 || input.round !== null;
 
@@ -155,10 +157,22 @@ export async function readSchedulerStatus(now: Date = new Date()): Promise<Sched
     roundLimit: Number(row.round_limit),
     thresholdBps: Number(row.threshold_bps),
     intervalSeconds: Number(row.interval_seconds),
-    lastSummary: row.last_summary ?? {},
+    // Counts only: `outcomes` (per-portfolio reasons for the alerts) is not part of this view.
+    lastSummary: Object.fromEntries(Object.entries(row.last_summary ?? {}).filter(([, value]) => typeof value === 'number')),
     lastError: row.last_error,
     pid: row.pid === null ? null : Number(row.pid),
     staleSeconds,
     alive: staleSeconds !== null && staleSeconds <= HEARTBEAT_STALE_SECONDS,
   };
+}
+
+/**
+ * Scheduler start: load the per-portfolio round outcomes the previous process saved with its last heartbeat.
+ * Never throws (a missing row or a DB hiccup only means alerts start strict, as they did before). Returns how many it took.
+ */
+export async function restoreSavedRoundOutcomes(now: Date = new Date()): Promise<number> {
+  try {
+    const { rows } = await query<{ outcomes: unknown }>(`select last_summary -> 'outcomes' as outcomes from scheduler_status where id = 1`);
+    return restoreRoundOutcomes(rows[0]?.outcomes ?? null, now);
+  } catch { return 0; }
 }

@@ -460,13 +460,48 @@ export const ROUND_OUTCOME_TTL_MS = 2 * 60 * 60_000;
 const WAITING = /\[(MARKET_CLOSED|BASKET_WAITING|DEFERRED_MIN_ASSET|NO_DUE_SLOT|SLOT_RECORDED|BELOW_MIN_STEP|BELOW_MIN_BATCH|BELOW_MIN_DEPOSIT|[A-Z_]*BUDGET[A-Z_]*)\]|低於最小交易額|低於批次最小額|低於執行器最小步/;
 const roundOutcomes = new Map<number, { outcome: string; reason: string; at: number }>();
 /**
- * The scheduler reports every portfolio it processes (same process as the alert evaluation). Kept in memory on purpose:
- * after a restart the map is empty and alerts fall back to their strict form until each portfolio is seen again.
+ * The scheduler reports every portfolio it processes (same process as the alert evaluation). The heartbeat saves the map
+ * every round and a new process takes it back at start (roundOutcomeSnapshot / restoreRoundOutcomes), so alerts keep
+ * their reasons across a restart; anything older than the TTL still falls back to the strict form.
  */
 export function noteRoundOutcome(portfolioId: number, outcome: string, reason: string | undefined, now: Date): void {
   roundOutcomes.set(portfolioId, { outcome, reason: reason ?? '', at: now.getTime() });
 }
 export const resetRoundOutcomes = () => roundOutcomes.clear();
+/**
+ * Every outcome still inside its TTL, in the shape the scheduler heartbeat stores (scheduler_status.last_summary.outcomes).
+ * The map alone made every restart forget why portfolios were waiting: their drift alerts went critical until each was
+ * processed again (about 15 minutes after every deploy).
+ */
+export function roundOutcomeSnapshot(now: Date): Record<string, { outcome: string; reason: string; at: string }> {
+  const saved: Record<string, { outcome: string; reason: string; at: string }> = {};
+  for (const [portfolioId, last] of roundOutcomes) {
+    if (now.getTime() - last.at > ROUND_OUTCOME_TTL_MS) continue;
+    // Reasons can quote an upstream error: never store a URL (it may carry a provider key), and keep them short.
+    saved[String(portfolioId)] = { outcome: last.outcome, reason: truncate(last.reason.replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, '<url>'), 300), at: new Date(last.at).toISOString() };
+  }
+  return saved;
+}
+/**
+ * After a restart: take back the outcomes the previous process saved. A portfolio this process has already seen keeps
+ * its own newer outcome; entries that are malformed, from the future or past their TTL are ignored. Returns how many it took.
+ */
+export function restoreRoundOutcomes(saved: unknown, now: Date): number {
+  if (saved === null || typeof saved !== 'object' || Array.isArray(saved)) return 0;
+  let restored = 0;
+  for (const [key, value] of Object.entries(saved)) {
+    const portfolioId = Number(key);
+    if (!Number.isSafeInteger(portfolioId) || portfolioId <= 0 || roundOutcomes.has(portfolioId)) continue;
+    if (value === null || typeof value !== 'object') continue;
+    const { outcome, reason, at } = value as { outcome?: unknown; reason?: unknown; at?: unknown };
+    if (typeof outcome !== 'string' || typeof reason !== 'string' || typeof at !== 'string') continue;
+    const time = Date.parse(at);
+    if (!Number.isFinite(time) || time > now.getTime() || now.getTime() - time > ROUND_OUTCOME_TTL_MS) continue;
+    roundOutcomes.set(portfolioId, { outcome, reason, at: time });
+    restored++;
+  }
+  return restored;
+}
 /** The waiting reason of the latest round, when that round was recent, did not fail and waits for a known harmless cause. */
 export function waitingReason(portfolioId: number, now: Date): string | null {
   const last = roundOutcomes.get(portfolioId);

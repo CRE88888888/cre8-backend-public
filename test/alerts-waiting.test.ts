@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { beforeEach, test } from 'node:test';
-import { detectPortfolioFailures, detectPortfolioStuck, noteRoundOutcome, resetRoundOutcomes, ROUND_OUTCOME_TTL_MS, waitingReason } from '../src/alerts.js';
+import { detectPortfolioFailures, detectPortfolioStuck, noteRoundOutcome, resetRoundOutcomes, restoreRoundOutcomes, roundOutcomeSnapshot, ROUND_OUTCOME_TTL_MS, waitingReason } from '../src/alerts.js';
 
 const NOW = new Date('2026-11-24T13:30:00Z');
 const stuckRows = (rows: { portfolio_id: number; hours_since: number; gross_drift_bps: number }[]) => async () => ({ rows });
@@ -43,4 +43,45 @@ test('failing-tail alert: real failures stay critical; the query gets the clean-
   assert.deepEqual([f!.severity, f!.kind, seen[0]], ['critical', 'portfolio_repeatedly_failing', [3, 6]]);
   await detectPortfolioFailures(query, 3, 12);
   assert.deepEqual(seen[1], [3, 12]);
+});
+
+test('drift alert: the outcomes saved by one process keep their reason and time in the next one (a deploy no longer turns waiting portfolios critical)', async () => {
+  noteRoundOutcome(4, 'noop', 'Planner returned noop: [NO_DUE_SLOT] 沒有新投入或到期期次', NOW);
+  noteRoundOutcome(13, 'blocked', '[STRATEGY_EXECUTION_UNAVAILABLE] 無法確認執行結果', NOW);
+  noteRoundOutcome(20, 'noop', '[MARKET_CLOSED] 股票休市', new Date(NOW.getTime() - ROUND_OUTCOME_TTL_MS - 1)); // already too old to matter
+  const saved = JSON.parse(JSON.stringify(roundOutcomeSnapshot(NOW))) as unknown; // what the heartbeat row holds (jsonb)
+  assert.deepEqual(saved, {
+    4: { outcome: 'noop', reason: 'Planner returned noop: [NO_DUE_SLOT] 沒有新投入或到期期次', at: NOW.toISOString() },
+    13: { outcome: 'blocked', reason: '[STRATEGY_EXECUTION_UNAVAILABLE] 無法確認執行結果', at: NOW.toISOString() },
+  });
+  resetRoundOutcomes(); // the restart
+  const strict = async (at: Date) => (await detectPortfolioStuck(stuckRows([4, 13].map(id => ({ portfolio_id: id, hours_since: 25.7, gross_drift_bps: 8755 }))), 6, at)).map(f => f.severity);
+  assert.deepEqual(await strict(NOW), ['critical', 'critical'], 'what every deploy did before');
+  const started = new Date(NOW.getTime() + 90_000);
+  assert.equal(restoreRoundOutcomes(saved, started), 2);
+  assert.deepEqual(await strict(started), ['warn', 'critical'], 'the waiting one stays a warn; the one that needs someone stays critical');
+  assert.equal(waitingReason(4, started), '[NO_DUE_SLOT] 沒有新投入或到期期次');
+  // The saved time is the round's time, not the restart's: the reason still expires two hours after that round.
+  assert.equal(waitingReason(4, new Date(NOW.getTime() + ROUND_OUTCOME_TTL_MS)), '[NO_DUE_SLOT] 沒有新投入或到期期次');
+  assert.equal(waitingReason(4, new Date(NOW.getTime() + ROUND_OUTCOME_TTL_MS + 1)), null);
+  // A round of the new process wins over what was saved, and a later restore never overwrites it.
+  noteRoundOutcome(4, 'failed', 'send failed', started);
+  assert.equal(restoreRoundOutcomes(saved, started), 0);
+  assert.equal(waitingReason(4, started), null);
+});
+
+test('drift alert: restoring ignores stale, future-dated and malformed entries, and saved reasons never carry a URL', () => {
+  const at = NOW.toISOString();
+  const old = new Date(NOW.getTime() - ROUND_OUTCOME_TTL_MS - 1).toISOString(), future = new Date(NOW.getTime() + 1).toISOString();
+  assert.equal(restoreRoundOutcomes({ 1: { outcome: 'noop', reason: '[MARKET_CLOSED] a', at: old }, 2: { outcome: 'noop', reason: '[MARKET_CLOSED] b', at: future },
+    3: { outcome: 'noop', reason: 7, at }, 4: null, x: { outcome: 'noop', reason: '[MARKET_CLOSED] c', at }, '-5': { outcome: 'noop', reason: '[MARKET_CLOSED] d', at },
+    6: { outcome: 'noop', reason: '[MARKET_CLOSED] e', at: 'yesterday' }, 7: { outcome: 'noop', reason: '[MARKET_CLOSED] ok', at } }, NOW), 1);
+  assert.equal(waitingReason(7, NOW), '[MARKET_CLOSED] ok');
+  for (const id of [1, 2, 3, 4, 5, 6]) assert.equal(waitingReason(id, NOW), null);
+  for (const nothing of [null, undefined, 'text', 7, [], [{ outcome: 'noop', reason: '[MARKET_CLOSED]', at }]]) assert.equal(restoreRoundOutcomes(nothing, NOW), 0);
+  resetRoundOutcomes();
+  noteRoundOutcome(9, 'blocked', `quote failed: https://rpc.invalid/v1/secret-key-value and postgres://user:pw@db.invalid/x ${'x'.repeat(600)}`, NOW);
+  const saved = roundOutcomeSnapshot(NOW)[9];
+  assert.ok(saved); assert.ok(!/secret-key-value|user:pw|rpc\.invalid|db\.invalid/.test(saved.reason)); assert.ok(saved.reason.length <= 301);
+  assert.deepEqual(roundOutcomeSnapshot(new Date(NOW.getTime() + ROUND_OUTCOME_TTL_MS + 1)), {});
 });

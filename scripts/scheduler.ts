@@ -19,7 +19,7 @@ import { alertCounts, formatAlert, listOpenAlerts } from '../src/alerts.js';
 import { closePool, query } from '../src/db.js';
 import { getConfig, getSessionKeyConfig } from '../src/config.js';
 import { DEFAULT_ROUND_LIMIT, runSchedulerOnce } from '../src/scheduler.js';
-import { writeHeartbeat } from '../src/scheduler-status.js';
+import { restoreSavedRoundOutcomes, writeHeartbeat } from '../src/scheduler-status.js';
 import { reconcileRelayerTransactions } from '../src/relayer-reconciliation.js';
 import { pruneDailyOperationCounts } from '../src/ratelimit.js';
 import { DEFAULT_THRESHOLD_BPS } from '../src/snapshot.js';
@@ -203,6 +203,10 @@ async function main(): Promise<number> {
   if (args.mode === 'loop') stopHealth = await startWorkerHealth();
 
   const startedAt = new Date();
+  // Why each portfolio was waiting (market closed, below the minimum…) lived only in the previous process's memory:
+  // take it back from its last heartbeat, or every drift alert turns critical until that portfolio is processed again.
+  const restored = await restoreSavedRoundOutcomes(startedAt);
+  if (restored > 0) console.log(`[scheduler] 已還原上一個行程記錄的 ${restored} 個投組上一輪結果（告警的等待原因不因重啟遺失）`);
   const infoWorker = createInfoWorker();
   stopInfo = () => infoWorker.stop();
   const runRound = async (): Promise<SchedulerRound> => {

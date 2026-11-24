@@ -2905,7 +2905,9 @@ async function decideAndMaybeExecute(
   if (execution.errorCode === 'PINNED_VERSION_CHANGED' || execution.errorCode === 'VERSION_ACTIVATION_IMMINENT' || execution.errorCode === 'VERSION_STATE_UNAVAILABLE') {
     return { ...withPlan, execution, outcome: 'blocked', reason: execution.error ?? '[VERSION_STATE_UNAVAILABLE] 不送買入' };
   }
-  if (execution.errorCode === 'GAS_BUDGET_EXCEEDED') {
+  // Our own daily gas budget, or the paymaster's daily quota (site / account, per UTC day): retrying every minute only
+  // spins (2026-11-23: portfolios 13 and 19 re-planned and re-quoted every round for hours). Wait for the next UTC day.
+  if (execution.errorCode === 'GAS_BUDGET_EXCEEDED' || execution.errorCode === 'PAYMASTER_QUOTA_EXCEEDED') {
     const nextDay = execution.budgetResetAt === undefined ? new Date(ctx.now) : new Date(execution.budgetResetAt);
     if (execution.budgetResetAt === undefined) nextDay.setUTCHours(24, 0, 0, 0);
     try {
@@ -3276,7 +3278,7 @@ async function executeAndSettle(
     const message = isBuyVersionError(error) ? error.message : typed ? '[STRATEGY_EXECUTION_UNAVAILABLE] 無法確認執行結果，保留原身分待對帳' : oneLine(error);
     const unknown = sending || (received !== null && received.status !== 'error');
     const outcome: ExecutionOutcome = { status: unknown ? 'unknown' : 'error',
-      ...(error instanceof AppError ? { errorCode: error.code } : {}),
+      ...(error instanceof AppError ? { errorCode: error.code } : quotaExceeded(error) ? { errorCode: 'PAYMASTER_QUOTA_EXCEEDED' } : {}),
       ...(error instanceof PinnedVersionChangedError ? { errorCode: 'PINNED_VERSION_CHANGED' } : {}),
       ...(error instanceof GasBudgetExceededError ? { budgetResetAt: error.resetAt } : {}),
       userOpHash: received?.userOpHash ?? submitted.userOpHash ?? null,
@@ -3334,11 +3336,11 @@ async function failStrategyAttempt(deps:ResolvedDeps,c:Pick<JobContext,'chainId'
     if(!op)throw new Error('attempt missing');
     await query(SQL_SETTLE_OPERATION,[key,state,outcome.txHash,outcome.userOpHash,outcome.error]);
     await query("update strategy_job_batches set state='failed',updated_at=clock_timestamp() where job_id=$1 and batch_index=$2",[op.strategy_job_id,op.strategy_batch_index]);
-    const budget=outcome.errorCode==='GAS_BUDGET_EXCEEDED';
+    const budget=outcome.errorCode==='GAS_BUDGET_EXCEEDED'||outcome.errorCode==='PAYMASTER_QUOTA_EXCEEDED';
     await query(`update strategy_jobs set failure_count=least(3,failure_count+$2),state=case when failure_count+$2>=3 then 'paused' else 'running' end,
       next_check_at=case when $3::timestamptz is not null then $3 else clock_timestamp()+case failure_count when 0 then interval '1 minute'
         when 1 then interval '5 minutes' else interval '30 minutes' end end,updated_at=clock_timestamp() where id=$1`,
-      [op.strategy_job_id,budget?0:1,budget?outcome.budgetResetAt??new Date(Date.now()+86400000).toISOString():null]);
+      [op.strategy_job_id,budget?0:1,budget?outcome.budgetResetAt??nextUtcDay(new Date()).toISOString():null]);
   });
 }
 
@@ -3388,3 +3390,13 @@ export function formatResult(result: PortfolioRunResult, dryRun: boolean): strin
     `${dryRun ? '｜dry-run（沒有送出任何交易）' : ''}\n           ${result.reason}`
   );
 }
+
+/** The paymaster's daily quota refusal, also when viem wraps it (the bundler client rethrows with `cause`). */
+export function quotaExceeded(error: unknown): boolean {
+  for (let e: unknown = error, depth = 0; e && depth < 8; e = (e as { cause?: unknown }).cause, depth++) {
+    if (e instanceof AppError && e.code === 'PAYMASTER_QUOTA_EXCEEDED') return true;
+    if (e instanceof Error && /PAYMASTER_QUOTA_EXCEEDED/.test(e.message)) return true;
+  }
+  return false;
+}
+function nextUtcDay(now: Date): Date { const d = new Date(now); d.setUTCHours(24, 0, 0, 0); return d; }

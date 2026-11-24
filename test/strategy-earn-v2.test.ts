@@ -285,10 +285,10 @@ test('#204 auto-open: only consented markets with an open gate and a non-dust ho
   await assert.rejects(strategyEarnAutoOpen(failing.args), /AA23/); assert.equal(failing.recorded.length, 0);
 });
 
-test('#204 unwind before a sale: repay first then take shares back; vault short pays what it can and keeps the target ratio', async () => {
+test('#204 unwind before a sale (Lista, its own debt): repay first then take shares back; vault short pays what it can and keeps the target ratio', async () => {
   const sell = (token: string, amount: bigint) => [{ tokenIn: token, amountIn: amount }];
-  const base: Fake = { ids: [nvda.marketId], collateral: { [nvda.marketId]: 10n * E18 }, balances: { [nvda.collateral]: 1n * E18 },
-    prices: { [nvda.collateral]: 100n * 10n ** 8n } };
+  const base: Fake = { ids: [qqq.marketId], collateral: { [qqq.marketId]: 10n * E18 }, balances: { [qqq.collateral]: 1n * E18 },
+    prices: { [qqq.collateral]: 100n * 10n ** 8n } };
   const run = async (f: Fake, steps: { tokenIn: string; amountIn: bigint }[], dryRun = false) => {
     let sent: { to: Address; data: Hex }[] = [];
     const s = stepArgs(f, async calls => { sent = calls; return tx([]); }, dryRun);
@@ -296,31 +296,31 @@ test('#204 unwind before a sale: repay first then take shares back; vault short 
     return { reason, calls: sent.map(c => [decode(c.data).functionName, decode(c.data).args]) };
   };
   // Sale fits the free balance, or does not touch a posted asset: nothing to do.
-  assert.equal((await run(base, sell(nvda.collateral, E18))).reason, null);
+  assert.equal((await run(base, sell(qqq.collateral, E18))).reason, null);
   assert.equal((await run(base, sell(T.assets.WBNB.token, 5n * E18))).reason, null);
-  assert.equal((await run({ ...base, collateral: {} }, sell(nvda.collateral, 5n * E18))).reason, null);
+  assert.equal((await run({ ...base, collateral: {} }, sell(qqq.collateral, 5n * E18))).reason, null);
   // No debt: just take the shares back.
-  const noDebt = await run(base, sell(nvda.collateral, 5n * E18));
-  assert.deepEqual(noDebt.calls, [['executeWithdrawCollateral', [account, nvda.marketId, maxUint256, deadline]]]);
-  assert.match(noDebt.reason ?? '', /^\[STRATEGY_EARN_UNWINDING\] 賣出前已還款取回：NVDAB 取回 tx=.*下一輪再賣$/);
+  const noDebt = await run(base, sell(qqq.collateral, 5n * E18));
+  assert.deepEqual(noDebt.calls, [['executeWithdrawCollateral', [account, qqq.marketId, maxUint256, deadline]]]);
+  assert.match(noDebt.reason ?? '', /^\[STRATEGY_EARN_UNWINDING\] 賣出前已還款取回：QQQB 取回 tx=.*下一輪再賣$/);
   // Vault (+ cash) covers the debt: repay everything from the vault first, then take all shares back.
-  const covered = { ...base, statuses: { [nvda.marketId]: status({ debt: 300n * E18, vaultAssets: 301n * E18 }) } };
-  assert.deepEqual((await run(covered, sell(nvda.collateral, 5n * E18))).calls, [['executeRepay', [account, nvda.marketId, maxUint256, true, deadline]],
-    ['executeWithdrawCollateral', [account, nvda.marketId, maxUint256, deadline]]]);
+  const covered = { ...base, statuses: { [qqq.marketId]: status({ debt: 300n * E18, vaultAssets: 301n * E18 }) } };
+  assert.deepEqual((await run(covered, sell(qqq.collateral, 5n * E18))).calls, [['executeRepay', [account, qqq.marketId, maxUint256, true, deadline]],
+    ['executeWithdrawCollateral', [account, qqq.marketId, maxUint256, deadline]]]);
   // Vault short: 300 owed, 200 in the vault + 0 cash -> repay 200 - 1 raw; keep (100 + 1 raw) / 30% x 102% ≈ 340 USD posted -> take back ~6.6 of 10.
-  const short = { ...base, statuses: { [nvda.marketId]: status({ debt: 300n * E18, vaultAssets: 200n * E18, health: { collateralValue: 1000n * E18, liquidationValue: 0n, debtValue: 300n * E18, healthFactor: 0n } }) } };
-  const partial = await run(short, sell(nvda.collateral, 9n * E18));
+  const short = { ...base, statuses: { [qqq.marketId]: status({ debt: 300n * E18, vaultAssets: 200n * E18, health: { collateralValue: 1000n * E18, liquidationValue: 0n, debtValue: 300n * E18, healthFactor: 0n } }) } };
+  const partial = await run(short, sell(qqq.collateral, 9n * E18));
   assert.equal(partial.calls.length, 2);
-  assert.deepEqual(partial.calls[0], ['executeRepay', [account, nvda.marketId, 200n * E18 - 1n, true, deadline]]);
+  assert.deepEqual(partial.calls[0], ['executeRepay', [account, qqq.marketId, 200n * E18 - 1n, true, deadline]]);
   const take = (partial.calls[1]?.[1] as readonly unknown[])[2] as bigint;
   assert.ok(take > 6599n * 10n ** 15n && take < 6601n * 10n ** 15n, String(take));
   assert.match(partial.reason ?? '', /vault 不足/);
   // Dry-run reports and sends nothing.
-  const dry = await run(covered, sell(nvda.collateral, 5n * E18), true);
+  const dry = await run(covered, sell(qqq.collateral, 5n * E18), true);
   assert.deepEqual(dry.calls, []); assert.match(dry.reason ?? '', /dry-run，未送出/);
   // Every call targets AtpBorrowExecutor and nothing ever approves or calls AtpExecutor.
   let all: { to: Address; data: Hex }[] = [];
-  await strategyEarnUnwindForSale({ ...stepArgs(short, async calls => { all = calls; return tx([]); }).args, steps: sell(nvda.collateral, 9n * E18) });
+  await strategyEarnUnwindForSale({ ...stepArgs(short, async calls => { all = calls; return tx([]); }).args, steps: sell(qqq.collateral, 9n * E18) });
   assert.ok(all.length > 0 && all.every(c => c.to === S.executor));
 });
 

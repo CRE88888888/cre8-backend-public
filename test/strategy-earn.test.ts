@@ -181,17 +181,17 @@ test('#199 portfolio view: net value = collateral + vault - debt per position, k
   for (const bad of [{ asset: 'TQQQB', collateralRaw: '1' }, { asset: 'NVDAB', collateralRaw: '0' }, { asset: 'NVDAB', collateralRaw: '1.5' }, { asset: 'NVDAB' }, { asset: 'NVDAB', collateralRaw: '1', x: 1 }, null]) {
     await assert.rejects(earn.open(3, account, bad), (e: unknown) => e instanceof AppError && e.status === 400);
   }
-  assert.equal((await earn.close(3, account, { asset: 'NVDAB' })).calls.length, 3);
+  assert.equal((await earn.close(3, account, { asset: 'NVDAB' })).calls?.length, 3);
   // Close skips what is not there: collateral posted but nothing borrowed -> no repay (NothingToRepay would revert the UserOp).
   const unborrowed = { ...f, statuses: { ...f.statuses, [nvda.marketId]: status() } };
   assert.deepEqual((await createStrategyEarn({ chainId: 97, chain: () => fakeChain(unborrowed), owned: ownedPortfolio() as never }).close(3, account, { asset: 'NVDAB' }))
-    .calls.map(c => decodeFunctionData({ abi: STRATEGY_EARN_ABI, data: c.data }).functionName), ['executeWithdrawCollateral', 'setBorrowPolicy']);
+    .calls?.map(c => decodeFunctionData({ abi: STRATEGY_EARN_ABI, data: c.data }).functionName), ['executeWithdrawCollateral', 'setBorrowPolicy']);
   // My mix: the mix's own account; an exiting / exited / deleting mix takes no new collateral or borrowing.
   const mixRow = (busy: boolean) => (async () => ({ rows: [{ busy }] })) as never;
   const mixEarn = (busy: boolean) => createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio({ personalMix: true }) as never, query: mixRow(busy) });
   assert.equal((await mixEarn(false).open(3, account, { asset: 'NVDAB', collateralRaw: String(2n * E18) })).status, 'ready');
   await assert.rejects(mixEarn(true).open(3, account, { asset: 'NVDAB', collateralRaw: '1' }), isError(409, 'MIX_EXITING'));
-  assert.equal((await mixEarn(true).close(3, account, { asset: 'NVDAB' })).calls.length, 3, 'a mix that is exiting can always settle');
+  assert.equal((await mixEarn(true).close(3, account, { asset: 'NVDAB' })).calls?.length, 3, 'a mix that is exiting can always settle');
   await assert.rejects(createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio({ chainId: 56 }) as never }).close(3, account, { asset: 'NVDAB' }), isError(403, 'FORBIDDEN'));
   await assert.rejects(createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: (async () => { throw new ForbiddenError('not yours'); }) as never }).portfolio(3, account),
     (e: unknown) => e instanceof AppError && e.status === 403);

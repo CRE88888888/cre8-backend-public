@@ -646,6 +646,18 @@ test('#75 exhausted ordinary budget defers until the next UTC day without broadc
   assert.equal(chain.executeCalls.length, 0);
 });
 
+test('paymaster daily quota refusal (also wrapped by the bundler client) waits for the next UTC day instead of retrying every minute', async () => {
+  for (const thrown of [new AppError(429, 'PAYMASTER_QUOTA_EXCEEDED', 'paymaster sponsorship rejected: PAYMASTER_QUOTA_EXCEEDED'),
+    new Error('UserOperation preparation failed', { cause: new AppError(429, 'PAYMASTER_QUOTA_EXCEEDED', 'paymaster sponsorship rejected: PAYMASTER_QUOTA_EXCEEDED') })]) {
+    const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+    const chain = stubChain();
+    const round = await runSchedulerOnce({ dryRun: false, now: new Date('2026-11-23T16:09:45Z') }, deps(db, chain, { executeRebalance: async () => { throw thrown; } }));
+    assert.equal(round.results[0]?.outcome, 'blocked');
+    assert.equal(round.results[0]?.nextRunAt.toISOString(), '2026-11-24T00:00:00.000Z');
+    assert.equal(db.portfolios[0]?.nextRunAt?.toISOString(), '2026-11-24T00:00:00.000Z');
+  }
+});
+
 test('#75 crossing midnight uses the DB reservation day, not the scheduler round start', async () => {
   const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
   const chain = stubChain();

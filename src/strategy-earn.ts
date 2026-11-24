@@ -374,6 +374,21 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
     }
     return input as Record<string, unknown>;
   }
+  /** One Lista market (its own debt): repay all (vault, then cash), take all shares back. */
+  async function closeOne(account: Address, market: StrategyMarket, deadline: bigint): Promise<Call[]> {
+      const [repay, withdraw] = closeCalls(market, account, deadline) as [Call, Call, Call];
+      // Collateral posted but nothing borrowed (gate was closed at open): executeRepay would revert NothingToRepay and take
+      // the whole UserOp with it; with nothing posted executeWithdrawCollateral reverts ZeroAmount. Skip what is not there.
+      // Unreadable -> keep both (the chain still refuses anything wrong).
+      const l = await live();
+      if (l) {
+        try {
+          const [st, posted] = await Promise.all([l.chain.status(market.marketId, account, l.head.number), l.chain.collateral(market.marketId, account, l.head.number)]);
+          return [...(st.debt > 0n || st.vaultAssets > 0n ? [repay] : []), ...(posted > 0n ? [withdraw] : [])];
+        } catch { /* fall through */ }
+      }
+      return [repay, withdraw];
+  }
   return {
     /** Pre-buy quote per eligible asset (ratio = target LTV). Leveraged products are never listed. */
     async markets() {
@@ -496,23 +511,33 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
       }) };
     },
     /** Turn off / before selling: repay first (vault, then the account's own USDT), then withdraw all collateral. */
+    /**
+     * Turn off. `{ assets: [...] }` (the app sends every asset that is on, in one UserOp) or `{ asset }`. Lista: per market
+     * as below. Venus: planned together (venusReleaseCalls) — the account has ONE Venus debt, so the markets share the
+     * repayment and nothing is asked of a single market's vault that it cannot pay.
+     */
     async close(id: number, wallet: string, input: unknown) {
       const account = await owned(id, wallet);
-      const market = findMarket(body(input, ['asset']).asset);
+      const raw = typeof input === 'object' && input !== null && 'assets' in input ? body(input, ['assets']).assets : [body(input, ['asset']).asset];
+      if (!Array.isArray(raw) || raw.length === 0 || raw.length > markets.length) throw new ValidationError('INVALID_STRATEGY_EARN_REQUEST', '請送出 asset 或 assets。');
+      const chosen = [...new Set(raw)].map(findMarket);
       const deadline = BigInt(Math.floor(deps.now().getTime() / 1000) + 30 * 60);
-      const calls = closeCalls(market, account, deadline);
-      // Collateral posted but nothing borrowed (gate was closed at open): executeRepay would revert NothingToRepay and take
-      // the whole UserOp with it; with nothing posted executeWithdrawCollateral reverts ZeroAmount. Skip what is not there.
-      // Unreadable -> keep every call (the chain still refuses anything wrong).
-      const l = await live();
-      if (l) {
+      const venus = chosen.filter(m => m.protocol === 'venus');
+      const l = venus.length > 0 ? await live() : null;
+      if (venus.length > 0 && !l) return { status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY };
+      let venusCalls: Call[] = [];
+      if (l && venus.length > 0) {
         try {
-          const [st, posted] = await Promise.all([l.chain.status(market.marketId, account, l.head.number), l.chain.collateral(market.marketId, account, l.head.number)]);
-          const [repay, withdraw, consent] = calls as [Call, Call, Call];
-          return { status: 'ready' as const, asset: market.symbol, calls: [...(st.debt > 0n || st.vaultAssets > 0n ? [repay] : []), ...(posted > 0n ? [withdraw] : []), consent] };
-        } catch { /* fall through */ }
+          const ids = await l.chain.accountMarkets(account, l.head.number);
+          const [positions, cash, usdtPrice] = await Promise.all([readVenusPositions(l.chain, account, l.head.number, [...new Set([...ids, ...venus.map(m => m.marketId)])]),
+            l.chain.balance(TESTNET_97.contracts.usdt as Address, account, l.head.number), l.chain.price(TESTNET_97.contracts.usdt as Address, l.head.number)]);
+          venusCalls = venusReleaseCalls({ account, positions, release: venus.map(m => m.marketId), cash, usdtPriceE8: usdtPrice, deadline }).calls;
+        } catch { return { status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY }; }
       }
-      return { status: 'ready' as const, asset: market.symbol, calls };
+      const listaCalls: Call[] = [];
+      for (const market of chosen.filter(m => m.protocol !== 'venus')) listaCalls.push(...(await closeOne(account, market, deadline)));
+      const consent = chosen.map(m => call(STRATEGY_EARN_97.registry, 'setBorrowPolicy', [m.marketId, 0n, false]));
+      return { status: 'ready' as const, asset: chosen[0]!.symbol, assets: chosen.map(m => m.symbol), calls: [...venusCalls, ...listaCalls, ...consent] };
     },
   };
 }
@@ -817,12 +842,15 @@ export async function strategyEarnUnwindForSale(args: StrategyEarnStepArgs & { s
   const calls: Call[] = [];
   const notes: string[] = [];
   const deadline = BigInt(Math.floor(args.now.getTime() / 1000) + 30 * 60);
+  const venusRelease: StrategyMarket[] = [];
   for (const m of strategyMarkets().filter(x => ids.includes(x.marketId))) {
     const need = args.steps.filter(st => st.tokenIn.toLowerCase() === m.collateral).reduce((sum, st) => sum + st.amountIn, 0n);
     if (need === 0n) continue;
     const [posted, free] = await Promise.all([chain.collateral(m.marketId, account, head.number), chain.balance(m.collateral, account, head.number)]);
     if (posted === 0n || need <= free) continue;
     if (!keyCovers(args, m)) { notes.push(`${m.symbol} 需要 owner 續期策略加息授權才能先還款取回`); continue; }
+    // Venus: one debt for the whole account; planned together below.
+    if (m.protocol === 'venus') { venusRelease.push(m); continue; }
     const st = await chain.status(m.marketId, account, head.number);
     if (st.debt === 0n) {
       calls.push(call(STRATEGY_EARN_97.executor, 'executeWithdrawCollateral', [account, m.marketId, maxUint256, deadline]));
@@ -850,12 +878,128 @@ export async function strategyEarnUnwindForSale(args: StrategyEarnStepArgs & { s
     if (take > 0n) calls.push(call(STRATEGY_EARN_97.executor, 'executeWithdrawCollateral', [account, m.marketId, take, deadline]));
     notes.push(`${m.symbol} vault 不足：先還 ${usdt2(pay)} USDT、取回 ${shares(take)}，賣出後再還剩下的`);
   }
+  if (venusRelease.length > 0) {
+    const [read, cash, usdtPrice] = await Promise.all([readVenusPositions(chain, account, head.number, ids),
+      chain.balance(TESTNET_97.contracts.usdt as Address, account, head.number), chain.price(TESTNET_97.contracts.usdt as Address, head.number)]);
+    // A market the session key cannot call lends no vault (its call would fail the whole UserOp).
+    const positions = read.map(p => keyCovers(args, p.market) ? p : { ...p, st: { ...p.st, vaultAssets: 0n } });
+    const plan = venusReleaseCalls({ account, positions, release: venusRelease.map(m => m.marketId), cash, usdtPriceE8: usdtPrice, deadline });
+    calls.push(...plan.calls);
+    const names = venusRelease.map(m => m.symbol).join('、');
+    notes.push(plan.full ? `${names} 先還 ${usdt2(plan.repaidRaw)} USDT 再取回（Venus 共用負債）` : `${names} vault＋現金不足：先還 ${usdt2(plan.repaidRaw)} USDT、取回部分，賣出後再還剩下的`);
+  }
   if (notes.length === 0) return null;
   if (calls.length === 0) return `[STRATEGY_EARN_UNWINDING] ${notes.join('；')}`;
   if (args.dryRun || !args.send) return `[STRATEGY_EARN_UNWINDING] 賣出前需先還款取回：${notes.join('；')}（${args.dryRun ? 'dry-run' : '沒有策略加息 session 權限，等 owner 續期'}，未送出）`;
   const tx = await args.send(calls);
   await recordOrLog(args, tx);
   return `[STRATEGY_EARN_UNWINDING] 賣出前已還款取回：${notes.join('；')} tx=${tx.hash}；下一輪再賣`;
+}
+
+// ---------------------------------------------------------------------------
+// Venus: one shared debt per account
+// ---------------------------------------------------------------------------
+
+/** One Venus position as read at one block. `st.debt` / `st.health` are the account's whole Venus position. */
+export type VenusPosition = { market: StrategyMarket; st: StatusReading; posted: bigint; price: bigint };
+/** Interest accrues between the read and inclusion: plan against 0.1% more debt. */
+const VENUS_DEBT_BUFFER_BPS = 10_010n;
+/** Stay 2% under the strictest target so the executor's LTV check (each market's own target) always passes. */
+const VENUS_SAFE_BPS = 9_800n;
+
+/**
+ * Take the shares of `release` (Venus market ids) back out of Venus, never reverting and never leaving the account above
+ * its target LTV. Venus has ONE debt for the whole account (every market's `debt`/`health` is the same reading), and
+ * `executeRepay(market, maxUint, fromVault)` would try to pay all of it from that one market's vault plus the account's
+ * cash — the 2026-11-23 bug: with two Venus positions, closing the first reverted when cash was short.
+ *
+ * Plan (one UserOp, AtpBorrowExecutor calls only):
+ * 1. Released markets: each repays from its own strategy vault (99.99% of what it is worth, so the executor always
+ *    takes the vault-only path; once the debt is gone the call releases the rest of that vault into the account).
+ * 2. Only as much more as the collateral that stays needs: from the account's cash, then from the other Venus
+ *    markets' vaults (they keep their own shares and stay on).
+ * 3. Withdraw the released shares — all of them when the rest is covered, otherwise only what keeps the account
+ *    under the target (the sale of that part pays the rest next round).
+ * `full`: every released share comes back.
+ */
+export function venusReleaseCalls(input: { account: Address; positions: readonly VenusPosition[]; release: readonly Hex[]; cash: bigint;
+  usdtPriceE8: bigint; deadline: bigint }): { calls: Call[]; full: boolean; repaidRaw: bigint } {
+  const S = STRATEGY_EARN_97;
+  const { account, deadline } = input;
+  const rel = input.positions.filter(p => input.release.includes(p.market.marketId));
+  const others = input.positions.filter(p => !input.release.includes(p.market.marketId));
+  const first = input.positions[0];
+  if (rel.length === 0 || first === undefined || input.usdtPriceE8 <= 0n) return { calls: [], full: true, repaidRaw: 0n };
+  const debt = first.st.debt, collateralValue = first.st.health.collateralValue;
+  const target = input.positions.reduce((min, p) => p.st.targetLtv < min ? p.st.targetLtv : min, first.st.targetLtv) * VENUS_SAFE_BPS / 10_000n;
+  const calls: Call[] = [];
+  const repay = (m: StrategyMarket, amount: bigint, fromVault: boolean) => calls.push(call(S.executor, 'executeRepay', [account, m.marketId, amount, fromVault, deadline]));
+  // What a vault-only repay may ask for: just under its worth (it only grows), at least 1 raw (the executor refuses 0).
+  // With debt left the executor then takes exactly that from the vault; with none left it releases the whole vault.
+  const ask = (worth: bigint) => { const a = worth * 9_999n / 10_000n; return a > 0n ? a : 1n; };
+  const buffered = (raw: bigint) => raw * VENUS_DEBT_BUFFER_BPS / 10_000n;
+  const byVault = [...rel].filter(p => p.st.vaultAssets > 0n).sort((a, b) => (a.st.vaultAssets < b.st.vaultAssets ? -1 : a.st.vaultAssets > b.st.vaultAssets ? 1 : 0));
+  const releasedValue = rel.reduce((sum, p) => sum + usdValue(p.posted, p.price, p.market.decimals), 0n);
+  const kept = collateralValue > releasedValue ? collateralValue - releasedValue : 0n;
+  const allowedRaw = kept * target / E18 * 10n ** 8n / input.usdtPriceE8;
+  // `owed` is a lower bound of the debt at inclusion (interest only adds), so "the executor takes all of `amount`"
+  // predictions below are certain; anything that needs the debt to be at most X uses the buffered figure.
+  let owed = debt;
+  const dust: StrategyMarket[] = [];
+  const vaultRepay = (p: VenusPosition) => { const a = ask(p.st.vaultAssets); repay(p.market, a, true); if (owed >= a) dust.push(p.market); owed -= owed < a ? owed : a; };
+  let short = 0n;
+  const vaultTotal = byVault.reduce((sum, p) => sum + ask(p.st.vaultAssets), 0n);
+  if (kept === 0n && debt > 0n && vaultTotal + input.cash >= buffered(debt)) {
+    // Closing every Venus share and the vaults + cash cover the debt: the largest vault goes last with "repay all", so
+    // whatever interest added is paid from that vault, then the account's cash; it releases its own rest afterwards.
+    const anchor = byVault[byVault.length - 1];
+    for (const p of byVault.slice(0, -1)) vaultRepay(p);
+    if (anchor) repay(anchor.market, maxUint256, true); else repay(rel[0]!.market, maxUint256, false);
+    owed = 0n;
+    for (const m of dust) repay(m, 1n, true); // debt is 0 now: releases each vault's sliver (it has one)
+  } else {
+    for (const p of byVault) vaultRepay(p);
+    // What the shares that stay posted still need repaid (all of it when nothing stays posted).
+    // Interest grows with the whole debt, not with what is left of it: carry the whole debt's buffer.
+    const interest = buffered(debt) - debt;
+    const left = owed + interest;
+    short = kept === 0n ? left : left > allowedRaw ? left - allowedRaw : 0n;
+    const fromCash = [input.cash, short, owed].reduce((a, b) => (a < b ? a : b));
+    if (fromCash > 0n) { repay(rel[0]!.market, fromCash, false); owed -= fromCash; short -= fromCash; }
+    for (const p of [...others].sort((a, b) => (a.st.vaultAssets > b.st.vaultAssets ? -1 : a.st.vaultAssets < b.st.vaultAssets ? 1 : 0))) {
+      if (short === 0n || owed === 0n || p.st.vaultAssets === 0n) continue;
+      const room = ask(p.st.vaultAssets) - 1n; // strictly below its worth: the vault-only path, its strategy stays on
+      const take = [short, room, owed].reduce((a, b) => (a < b ? a : b));
+      if (take <= 0n) continue;
+      repay(p.market, take, true); owed -= take; short -= take;
+    }
+    if (owed === 0n) for (const m of dust) repay(m, 1n, true);
+  }
+  // Withdraw. Short -> only the part the remaining (buffered) debt allows at the target.
+  const full = short === 0n;
+  let budget = full ? releasedValue : (() => {
+    const keep = target === 0n ? collateralValue : (owed + buffered(debt) - debt) * input.usdtPriceE8 / 10n ** 8n * E18 / target + 1n;
+    return collateralValue > keep ? collateralValue - keep : 0n;
+  })();
+  for (const p of rel) {
+    if (p.posted === 0n) continue;
+    if (full) { calls.push(call(S.executor, 'executeWithdrawCollateral', [account, p.market.marketId, maxUint256, deadline])); continue; }
+    const unit = 10n ** BigInt(p.market.decimals), perUnit = usdValue(unit, p.price, p.market.decimals);
+    let take = perUnit === 0n ? 0n : budget * unit / perUnit;
+    if (take > p.posted) take = p.posted;
+    if (take === 0n) continue;
+    budget -= usdValue(take, p.price, p.market.decimals);
+    calls.push(call(S.executor, 'executeWithdrawCollateral', [account, p.market.marketId, take === p.posted ? maxUint256 : take, deadline]));
+  }
+  return { calls, full, repaidRaw: debt - owed };
+}
+
+/** Reads every Venus position of the account at one block (the planner needs the whole account, not one market). */
+async function readVenusPositions(chain: StrategyEarnChain, account: Address, block: bigint, ids: readonly Hex[]): Promise<VenusPosition[]> {
+  return Promise.all(strategyMarkets().filter(m => m.protocol === 'venus' && ids.includes(m.marketId)).map(async market => {
+    const [st, posted, price] = await Promise.all([chain.status(market.marketId, account, block), chain.collateral(market.marketId, account, block), chain.price(market.collateral, block)]);
+    return { market, st, posted, price };
+  }));
 }
 
 async function recordOrLog(args: Pick<StrategyEarnStepArgs, 'ledger' | 'portfolioId' | 'account' | 'log'>, tx: StrategyEarnTx) {

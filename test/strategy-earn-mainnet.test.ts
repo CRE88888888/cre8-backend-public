@@ -119,3 +119,21 @@ test('GET /strategy-earn/markets carries mainnetRates and a mainnet quote per ro
   const byAsset = Object.fromEntries(view.markets.map(m => [m.asset, 'mainnet' in m ? m.mainnet : undefined]));
   assert.equal(byAsset.QQQB?.ratioBps, 3500); assert.equal(byAsset.NVDAB?.venue, 'venus'); assert.equal(byAsset.TSLAB, null); // TSLAB not in this fake's list
 });
+
+test('routing snapshot for the engine: every option per asset, every stable vault (filtered ones marked), per-source read times', async () => {
+  let t = 1000; const opts: { venusFails?: boolean } = {};
+  const rates = createMainnetRates({ fetch: fakeFetch(opts) as never, now: () => t, markets });
+  const a = await rates.routing();
+  assert.ok(a);
+  assert.deepEqual(a.options.QQQB?.map(o => [o.venue, o.loan, o.marketId]), [['lista', 'USDC', 'q2'], ['lista', 'USD1', 'q1']]); // q3 has no liquidity
+  assert.deepEqual(a.options.AAPLB, []);
+  assert.deepEqual(a.options.NVDAB?.map(o => [o.venue, o.loan, o.collateralIncentiveBps]), [['venus', 'USDT', 25], ['venus', 'USDC', 25], ['venus', 'USD1', 25], ['venus', 'U', 25]]);
+  assert.deepEqual(a.vaults.filter(v => v.venue === 'lista').map(v => [v.name, v.eligible]),
+    [['Gauntlet USDT Vault', true], ['Saturn USDT', false], ['Lista USDC Vault', true], ['Solv-Exclusive USD1 Vault', false]]);
+  assert.deepEqual(a.sourceAt, { venus: 1000, lista: 1000, aave: 1000 });
+  // Venus goes down: its last values stay, but its read time does not advance, so the engine can refuse to act on it.
+  t += 11 * 60_000; opts.venusFails = true;
+  await rates.get(); await new Promise(r => setTimeout(r, 10));
+  const b = await rates.routing();
+  assert.deepEqual(b?.sourceAt, { venus: 1000, lista: t, aave: t });
+});

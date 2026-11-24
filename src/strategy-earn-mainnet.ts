@@ -56,6 +56,8 @@ export type Venue = 'venus' | 'lista' | 'aave';
 export type SupplyVault = { token: Stable; venue: Venue; name: string; address: string; apyBps: number; baseBps: number; incentiveBps: number; tvlUsd: number | null };
 export type Route = { protocol: 'venus' | 'lista'; venue: 'venus' | 'lista'; ratioBps: number; factorBps: number; extraBps: number; loan: Stable; marketId: string | null; borrowApyBps: number; incentiveBps: number; netBorrowBps: number;
   liquidityUsd: number | null; lltvBps: number | null; limited: boolean; vault: SupplyVault; carryBps: number;
+  /** Venus XVS supply incentive on the collateral (bps of collateral value); 0 on Lista. Already inside extraBps. */
+  collateralIncentiveBps: number;
   /** Best borrow X → swap → deposit Y route, when it beats this one (unscaled carry gain, bps). Display only; we default to same token. */
   cross: { loan: Stable; deposit: Stable; gainBps: number } | null };
 export type MainnetRates = {
@@ -119,16 +121,18 @@ async function listaMarkets(f: Fetcher, zone: number): Promise<any[]> {
 export async function readLista(f: Fetcher) {
   const [bstock, general, vaultList] = await Promise.all([listaMarkets(f, 5), listaMarkets(f, 0), json(f, LISTA_VAULTS_API)]);
   if (bstock.length + general.length === 0) throw new Error('Lista API empty');
-  const supply: Partial<Record<Stable, SupplyVault>> = {};
+  const supply: Partial<Record<Stable, SupplyVault>> = {}, allVaults: RoutingVault[] = [];
   for (const v of (vaultList?.data?.list ?? []) as any[]) {
     const token = STABLES.find(s => TOKENS_56[s] === String(v.asset).toLowerCase());
     if (!token) continue;
     const base = bps(num(v.apy)), inc = bps(num(v.emissionApy ?? 0)), tvl = num(v.depositsUsd);
-    if (tvl < LISTA_VAULT_MIN_USD || /exclusive/i.test(String(v.name)) || inc > 3 * base) continue;
     const cand: SupplyVault = { token, venue: 'lista', name: String(v.name), address: String(v.address).toLowerCase(), apyBps: base + inc, baseBps: base, incentiveBps: inc, tvlUsd: Math.round(tvl) };
+    const eligible = !(tvl < LISTA_VAULT_MIN_USD || /exclusive/i.test(String(v.name)) || inc > 3 * base);
+    allVaults.push({ ...cand, eligible });
+    if (!eligible) continue;
     if (!supply[token] || cand.apyBps > supply[token]!.apyBps) supply[token] = cand;
   }
-  return { markets: [...bstock, ...general], supply };
+  return { markets: [...bstock, ...general], supply, allVaults };
 }
 
 export async function readAave(f: Fetcher, rpc = PUBLIC_RPC_56) {
@@ -154,17 +158,19 @@ export function listaMarketFor(all: readonly ListaMarket[], collateral: string, 
     .sort((a, b) => net(a) - net(b))[0] ?? null;
 }
 
-/**
- * Every venue × token for this asset (Venus if it is collateral there, Lista for every market on that collateral): extra =
- * carry × min(tier cap, F/2) + Venus collateral incentive. Highest extra wins among markets with ≥ MIN_LIQUIDITY_USD available;
- * under $50k is `limited`. No usable market → null (no route).
- */
-export function chooseRoute(input: { symbol: string; listaMarkets: readonly ListaMarket[];
+type RouteInput = { symbol: string; listaMarkets: readonly ListaMarket[];
   venusBorrow: Partial<Record<Stable, { borrowApyBps: number; incentiveBps: number; address: string; liquidityUsd?: number }>>;
   venusCollateral?: Record<string, { factorBps: number; address: string }>; venusIncentives?: Record<string, number>;
-  vaults: Partial<Record<Stable, SupplyVault>> }): Route | null {
+  vaults: Partial<Record<Stable, SupplyVault>> };
+export type RouteOption = Omit<Route, 'cross'>;
+/**
+ * Every usable venue × token for this asset (Venus if it is collateral there, Lista for every open-term market on that
+ * collateral), each with ≥ MIN_LIQUIDITY_USD available: extra = carry × min(tier cap, F/2) + Venus collateral incentive.
+ * Carry may be ≤ 0. The routing engine (strategy-earn-routing.ts) reads the same list.
+ */
+export function routeOptions(input: RouteInput): RouteOption[] {
   const collateral = LISTA_COLLATERAL[input.symbol] ?? input.symbol;
-  const options: Omit<Route, 'cross'>[] = [];
+  const options: RouteOption[] = [];
   const venusCf = input.venusCollateral?.[input.symbol];
   for (const loan of STABLES) {
     const vault = input.vaults[loan];
@@ -175,15 +181,21 @@ export function chooseRoute(input: { symbol: string; listaMarkets: readonly List
       const inc = input.venusIncentives?.[input.symbol] ?? 0;
       options.push({ protocol: 'venus', venue: 'venus', ratioBps, factorBps: venusCf.factorBps, extraBps: Math.trunc(carryBps * ratioBps / 10_000) + inc, loan,
         marketId: b.address, borrowApyBps: b.borrowApyBps, incentiveBps: b.incentiveBps, netBorrowBps, liquidityUsd: b.liquidityUsd ?? null, lltvBps: venusCf.factorBps,
-        limited: b.liquidityUsd !== undefined && b.liquidityUsd < LISTA_LIMITED_USD, vault, carryBps });
+        limited: b.liquidityUsd !== undefined && b.liquidityUsd < LISTA_LIMITED_USD, vault, carryBps, collateralIncentiveBps: inc });
     }
     for (const m of input.listaMarkets.filter(x => x.collateral === collateral && x.loan === loan && Number(x.termType ?? 0) === 0 && num(x.liquidityUsd) >= MIN_LIQUIDITY_USD)) {
       const borrowApyBps = bps(num(m.rate)), incentiveBps = bps(num(m.borrowEmissionApy ?? 0)), liquidityUsd = Math.round(num(m.liquidityUsd));
       const lltvBps = bps(num(m.lltv)), ratioBps = targetRatioBps(input.symbol, lltvBps), carryBps = vault.apyBps - (borrowApyBps - incentiveBps);
       options.push({ protocol: 'lista', venue: 'lista', ratioBps, factorBps: lltvBps, extraBps: Math.trunc(carryBps * ratioBps / 10_000), loan, marketId: String(m.id).toLowerCase(),
-        borrowApyBps, incentiveBps, netBorrowBps: borrowApyBps - incentiveBps, liquidityUsd, lltvBps, limited: liquidityUsd < LISTA_LIMITED_USD, vault, carryBps });
+        borrowApyBps, incentiveBps, netBorrowBps: borrowApyBps - incentiveBps, liquidityUsd, lltvBps, limited: liquidityUsd < LISTA_LIMITED_USD, vault, carryBps, collateralIncentiveBps: 0 });
     }
   }
+  return options;
+}
+
+/** Highest extra among `routeOptions`. No usable market → null (no route). */
+export function chooseRoute(input: RouteInput): Route | null {
+  const options = routeOptions(input);
   const chosen = [...options].sort((a, b) => b.extraBps - a.extraBps)[0];
   if (!chosen) return null;
   // Cross-token (display only): the cheapest borrow on the chosen venue, deposited into the best vault overall.
@@ -194,6 +206,14 @@ export function chooseRoute(input: { symbol: string; listaMarkets: readonly List
     ? { loan: cheapest.loan, deposit: top.token, gainBps: gain } : null };
 }
 
+/**
+ * What the routing engine reads: every borrow option per asset and every stablecoin supply vault (not only the best one per
+ * token, so an open position's own vault can still be priced), with the time each source was last read successfully.
+ */
+export type RoutingVault = SupplyVault & { /** Passes the "realistic" filter (size, not Exclusive, not campaign-driven): may receive new deposits. */ eligible: boolean;
+  /** USD that can be withdrawn right now, when the source reports it. */ liquidityUsd?: number | null };
+export type RoutingSnapshot = { at: number; sourceAt: Record<Venue, number | null>; options: Record<string, RouteOption[]>; vaults: RoutingVault[] };
+
 /** Cached reader: fresh within MAINNET_RATES_MS; after that the last value is served while one refresh runs. */
 export function createMainnetRates(deps: { fetch?: Fetcher; now?: () => number; ttlMs?: number;
   markets?: readonly { symbol: string; protocol: 'venus' | 'lista' }[] } = {}) {
@@ -202,24 +222,31 @@ export function createMainnetRates(deps: { fetch?: Fetcher; now?: () => number; 
   let last: MainnetRates | null = null, at = 0, inflight: Promise<MainnetRates | null> | null = null;
   let venusLast: Awaited<ReturnType<typeof readVenus>> | null = null, listaLast: Awaited<ReturnType<typeof readLista>> | null = null,
     aaveLast: Awaited<ReturnType<typeof readAave>> | null = null;
+  const sourceAt: Record<Venue, number | null> = { venus: null, lista: null, aave: null };
+  let routing: RoutingSnapshot | null = null;
   async function refresh(): Promise<MainnetRates | null> {
     const [venus, lista, aave] = await Promise.allSettled([readVenus(f), readLista(f), readAave(f)]);
     const fresh = venus.status === 'fulfilled' || lista.status === 'fulfilled' || aave.status === 'fulfilled';
-    if (venus.status === 'fulfilled') venusLast = venus.value;
-    if (lista.status === 'fulfilled') listaLast = lista.value;
-    if (aave.status === 'fulfilled') aaveLast = aave.value;
+    if (venus.status === 'fulfilled') { venusLast = venus.value; sourceAt.venus = now(); }
+    if (lista.status === 'fulfilled') { listaLast = lista.value; sourceAt.lista = now(); }
+    if (aave.status === 'fulfilled') { aaveLast = aave.value; sourceAt.aave = now(); }
     const vaults: Partial<Record<Stable, SupplyVault>> = {};
     for (const src of [venusLast?.supply, listaLast?.supply, aaveLast?.supply]) for (const v of Object.values(src ?? {}) as SupplyVault[]) {
       if (!vaults[v.token] || v.apyBps > vaults[v.token]!.apyBps) vaults[v.token] = v;
     }
     const top = (Object.values(vaults) as SupplyVault[]).sort((a, b) => b.apyBps - a.apyBps)[0];
     if (!top) return last;
-    const routes: Record<string, Route> = {};
+    const routes: Record<string, Route> = {}, options: Record<string, RouteOption[]> = {};
     for (const m of deps.markets ?? []) {
-      const r = chooseRoute({ symbol: m.symbol, listaMarkets: listaLast?.markets ?? [], venusBorrow: venusLast?.borrow ?? {}, venusCollateral: venusLast?.collateral,
-        venusIncentives: venusLast?.incentives, vaults });
+      const input = { symbol: m.symbol, listaMarkets: listaLast?.markets ?? [], venusBorrow: venusLast?.borrow ?? {}, venusCollateral: venusLast?.collateral,
+        venusIncentives: venusLast?.incentives, vaults };
+      const r = chooseRoute(input);
       if (r) routes[m.symbol] = r;
+      options[m.symbol] = routeOptions(input);
     }
+    routing = { at: now(), sourceAt: { ...sourceAt }, options, vaults: [
+      ...(Object.values(venusLast?.supply ?? {}) as SupplyVault[]).map(v => ({ ...v, eligible: true })), ...(listaLast?.allVaults ?? []),
+      ...(Object.values(aaveLast?.supply ?? {}) as SupplyVault[]).map(v => ({ ...v, eligible: true }))] };
     last = { chainId: 56, updatedAt: fresh ? new Date(now()).toISOString() : last?.updatedAt ?? new Date(now()).toISOString(), vaults, routes,
       vault: { venue: top.venue, supplyApyBps: top.apyBps }, collateralIncentiveBps: venusLast?.incentives ?? {} };
     if (fresh) at = now();
@@ -232,6 +259,8 @@ export function createMainnetRates(deps: { fetch?: Fetcher; now?: () => number; 
       if (last) { void kick(); return last; }
       return kick();
     },
+    /** The same refresh as `get()`, in the shape the routing engine reads (every option and vault, per-source read times). */
+    async routing(): Promise<RoutingSnapshot | null> { await this.get(); return routing; },
   };
 }
 

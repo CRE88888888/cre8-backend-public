@@ -60,3 +60,13 @@ v2 executor 上那六個函式，第一個參數釘死是這個帳戶。沒有�
 6. **利率回報的排程**：`v2RateReport` 48 小時過期，operator 每天送一次。
 
 介面如果改版：`test/fixtures/borrow-routing-v2.signatures.json` 是從規格的 interface.json 抽出來的函式與事件簽名，測試會逐一比對這裡用到的每個簽名，改了會直接紅。
+
+## API（App 用）
+
+- `GET /portfolios/:id/strategy-earn`：每個部位多一個 `route`：
+  `{ source, venue, loan, marketId, borrowBps, borrowIncentiveBps, vault: { venue, name, token, address, apyBps }, ratioBps, since }`。
+  健康度仍是原本的 `ltvBps`／`targetLtvBps`／`deleverageLtvBps`／`liquidationLtvBps`。
+  - `source: 'simulated'`：chain 97 的 v1 部位。鏈上是固定的模擬市場，這裡給的是 App 本來就顯示的那條主網路線（同一份 10 分鐘快取，這支請求不等主網 API、不讀鏈；快取還沒有時 `route` 是 null）。
+  - `source: 'onchain'`：路由 v2 的部位實際所在的路線（v2 部署後才會出現）。App 的示意圖只在這種情況改用部位自己的路線，其餘跟買入前一樣。
+- `GET /portfolios/:id/strategy-earn/activity`：有 v2 部署設定時，多回 db 0069 的事件（`migrate`、`switch_vault`、`reduce`…），附 `message`（英文）與 `messageZh`（簡體）。沒有設定時不讀那張表。
+- `GET /portfolios/:id/strategy-earn/rewards`：待領與已在帳戶裡的 LISTA／XVS（見 `docs/strategy-earn-rewards.zh-TW.md`）。

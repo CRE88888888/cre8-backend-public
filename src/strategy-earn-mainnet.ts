@@ -259,6 +259,8 @@ export function createMainnetRates(deps: { fetch?: Fetcher; now?: () => number; 
       if (last) { void kick(); return last; }
       return kick();
     },
+    /** The last value, without waiting for or starting a refresh (null until the first `get()` finished). For per-request paths. */
+    peek(): MainnetRates | null { return last; },
     /** The same refresh as `get()`, in the shape the routing engine reads (every option and vault, per-source read times). */
     async routing(): Promise<RoutingSnapshot | null> { await this.get(); return routing; },
   };

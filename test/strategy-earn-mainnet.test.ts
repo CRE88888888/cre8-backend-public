@@ -137,3 +137,45 @@ test('routing snapshot for the engine: every option per asset, every stable vaul
   const b = await rates.routing();
   assert.deepEqual(b?.sourceAt, { venus: 1000, lista: t, aave: t });
 });
+
+test('portfolio view: each open position carries its route (v1 chain-97 = the simulated mainnet route the app shows), from the cache only', async () => {
+  const { strategyMarkets } = await import('../src/strategy-earn.js');
+  const qqq = strategyMarkets().find(m => m.symbol === 'QQQB')!, aapl = strategyMarkets().find(m => m.symbol === 'AAPLB')!;
+  const st = { gate: 0, shouldDeleverage: false, shouldUnwind: false, borrowRate: 0n, collateralRate: 0n, vaultRate: 0n, collateralIncentiveRate: 0n, borrowIncentiveRate: 0n, vaultIncentiveRate: 0n,
+    borrowUtilizationBps: 0n, vaultUtilizationBps: 0n, ltv: 3n * 10n ** 17n, targetLtv: 35n * 10n ** 16n, deleverageLtv: 5n * 10n ** 17n, liquidationLtv: 75n * 10n ** 16n, debt: 30n * 10n ** 18n, vaultAssets: 30n * 10n ** 18n,
+    health: { collateralValue: 100n * 10n ** 18n, liquidationValue: 75n * 10n ** 18n, debtValue: 30n * 10n ** 18n, healthFactor: 25n * 10n ** 17n } };
+  const chain = { head: async () => ({ number: 1n, timestamp: 1_795_400_000n }), status: async () => st, accountMarkets: async () => [qqq.marketId, aapl.marketId], collateral: async () => 10n ** 18n,
+    balance: async () => 0n, price: async () => 100n * 10n ** 8n, rewards: async () => ({ vault: 0n, collateral: 0n }), policy: async () => ({ maxDebt: 0n, enabled: false }), weights: async () => [] };
+  const account = '0x1000000000000000000000000000000000000005';
+  const owned = (async () => ({ chainId: 97, ownerAddress: account, accountAddress: account })) as never;
+  const calls: string[] = [];
+  const rates = createMainnetRates({ fetch: fakeFetch({ calls }) as never, markets });
+  const earn = createStrategyEarn({ chainId: 97, chain: () => chain as never, owned, mainnetRates: rates });
+  // Cold cache: the portfolio request does not wait for (or start) the mainnet read; routes are simply absent.
+  const cold = await earn.portfolio(3, account);
+  assert.equal(calls.length, 0);
+  assert.deepEqual(cold.positions.map(p => 'route' in p ? p.route : 'none'), [null, null]);
+  await rates.get(); // what GET /strategy-earn/markets does
+  const view = await earn.portfolio(3, account);
+  const [q, a] = view.positions as { asset: string; ltvBps: number; deleverageLtvBps: number; route: Record<string, unknown> | null }[];
+  assert.deepEqual([q!.asset, q!.ltvBps, q!.deleverageLtvBps], ['QQQB', 3000, 5000]);
+  assert.deepEqual(q!.route, { source: 'simulated', venue: 'lista', loan: 'USDC', marketId: 'q2', borrowBps: 117, borrowIncentiveBps: 54, ratioBps: 3500, since: null,
+    vault: { venue: 'lista', name: 'Lista USDC Vault', token: 'USDC', address: '0xcc', apyBps: 495 } });
+  assert.equal(a!.route, null); // AAPLB has no mainnet market in this fake: no route, nothing made up
+});
+
+test('activity: route changes come from db 0069 only when a v2 deployment is configured; without one the table is never read', async () => {
+  const account = '0x1000000000000000000000000000000000000005';
+  const owned = (async () => ({ chainId: 97, ownerAddress: account, accountAddress: account })) as never;
+  const sqls: string[] = [];
+  const query = (async (sql: string) => { sqls.push(sql);
+    if (sql.includes('strategy_route_events')) return { rows: [{ kind: 'migrate', asset: 'QQQB', reason: 'better_route', venue: 'venus', loan: 'USDT', vault_venue: 'aave', amount_raw: '5', collateral_raw: '7',
+      tx_hash: '0x' + 'aa'.repeat(32), block_number: '9', created_at: '2026-11-24T10:00:00Z' }] };
+    return { rows: [{ kind: 'open', asset: 'QQQB', amount_raw: '0', collateral_raw: '1000000000000000000', ltv_before_bps: null, ltv_after_bps: null, tx_hash: '0x' + 'bb'.repeat(32), block_number: '5', created_at: '2026-11-23T10:00:00Z' }] }; }) as never;
+  const off = await createStrategyEarn({ chainId: 97, chain: () => { throw new Error('unused'); }, owned, query, v2: null }).activity(3, account);
+  assert.deepEqual([off.activity.map(a => a.kind), sqls.some(s => s.includes('strategy_route_events'))], [['open'], false]);
+  const v2 = { chainId: 97, executor: '0x20000000000000000000000000000000000000e2', registry: '0x20000000000000000000000000000000000000e3', venusComptroller: '0x20000000000000000000000000000000000000e4',
+    moolah: '0x20000000000000000000000000000000000000e5', loanTokens: { USDT: '0x20000000000000000000000000000000000000a1' }, rewardTokens: [] } as never;
+  const on = await createStrategyEarn({ chainId: 97, chain: () => { throw new Error('unused'); }, owned, query, v2 }).activity(3, account);
+  assert.deepEqual(on.activity.map(a => [a.kind, a.message, 'messageZh' in a ? a.messageZh : null]), [['migrate', 'Moved QQQB to a better rate', 'QQQB 换到更好的利率'], ['open', 'Earn extra turned on for QQQB: 1 QQQB put to work.', null]]);
+});

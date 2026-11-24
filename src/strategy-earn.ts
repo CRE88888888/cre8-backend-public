@@ -14,6 +14,8 @@ import { createMainnetRates, mainnetQuote } from './strategy-earn-mainnet.js';
 import type { MainnetRates } from './strategy-earn-mainnet.js';
 import { parseRewardSignature, rewardsStore, strategyRewardsEnabled } from './strategy-rewards.js';
 import type { RewardsStore, RewardsView } from './strategy-rewards.js';
+import { routeMessage, strategyEarnV2 } from './strategy-earn-v2.js';
+import type { RouteEventKind, StrategyEarnV2 } from './strategy-earn-v2.js';
 export { STRATEGY_EARN_97, assertNotStrategyVault, isStrategyVault } from './strategy-earn-guard.js';
 
 /**
@@ -326,11 +328,11 @@ export function splitVenusDebt<P extends { marketId: string; debtRaw?: string; v
 const TEMPORARILY = 'Temporarily unavailable.';
 /** Server-side cache for the public GET /strategy-earn/markets (31 status reads): one chain read per minute at most. */
 export const MARKETS_CACHE_MS = 60_000;
-export type StrategyEarnDeps = { chainId: number; chain: () => StrategyEarnChain; owned: typeof requireOwnedPortfolio; now: () => Date; rewards?: RewardsStore; rewardsEnabled?: boolean; ledger?: StrategyEarnLedger;
+export type StrategyEarnDeps = { chainId: number; chain: () => StrategyEarnChain; owned: typeof requireOwnedPortfolio; now: () => Date; rewards?: RewardsStore; rewardsEnabled?: boolean; v2?: StrategyEarnV2 | null; ledger?: StrategyEarnLedger;
   /** 0 = no cache (tests). Default MARKETS_CACHE_MS. */
   marketsCacheMs?: number;
   /** Real BSC mainnet rates for display (src/strategy-earn-mainnet.ts); null = none. */
-  mainnetRates?: { get(): Promise<MainnetRates | null> };
+  mainnetRates?: { get(): Promise<MainnetRates | null>; peek?(): MainnetRates | null };
   query: <T extends Record<string, unknown> = Record<string, unknown>>(sql: string, params?: unknown[]) => Promise<{ rows: T[] }> };
 
 let cachedChain: StrategyEarnChain | undefined;
@@ -466,6 +468,17 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
       const l = await live();
       if (!l) return { portfolioId: id, account, status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY, updatedAt: null, positions: [] };
       const { chain, head } = l;
+      // Each open position's route (venue, loan token, base borrow rate, incentive, vault, ratio). v1 chain-97 positions sit in
+      // one fixed simulated market, so their route is the mainnet route the app already shows for that asset (`simulated`);
+      // routing v2 positions report the route they are really on (`onchain`). Cached mainnet rates: no chain read here.
+      // `peek`: whatever GET /strategy-earn/markets last cached (the app always loads it first); this request never waits for the mainnet APIs.
+      const source = deps.mainnetRates ?? defaultMainnetRates();
+      const rates = source.peek ? source.peek() : await source.get().catch(() => null);
+      const routeOf = (m: StrategyMarket) => {
+        const q = rates ? mainnetQuote(rates, m.protocol, m.symbol, null) : null;
+        return q ? { source: 'simulated' as const, venue: q.venue, loan: q.loan, marketId: q.marketId, borrowBps: q.borrowBps, borrowIncentiveBps: q.borrowIncentiveBps,
+          vault: q.vault, ratioBps: q.ratioBps, since: null } : null;
+      };
       let ids: Hex[];
       try { ids = await chain.accountMarkets(account, head.number); }
       catch { return { portfolioId: id, account, status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY, updatedAt: null, positions: [] }; }
@@ -482,7 +495,7 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
             earnNetUsd: (s.vaultAssets - s.debt).toString(), pendingRewardsRaw: (pending.vault + pending.collateral).toString(),
             ltvBps: toBps(s.ltv), targetLtvBps: toBps(s.targetLtv), deleverageLtvBps: toBps(s.deleverageLtv), liquidationLtvBps: toBps(s.liquidationLtv),
             extraApyBps: extraApy(s, ratio).totalBps, shouldDeleverage: s.shouldDeleverage, shouldUnwind: s.shouldUnwind,
-            newBorrowing: s.gate === 0 ? 'open' as const : 'unavailable' as const, reason: s.gate === 0 ? null : GATE_REASONS[s.gate] ?? 'closed' };
+            newBorrowing: s.gate === 0 ? 'open' as const : 'unavailable' as const, reason: s.gate === 0 ? null : GATE_REASONS[s.gate] ?? 'closed', route: routeOf(m) };
         } catch {
           return { asset: m.symbol, marketId: m.marketId, status: 'unavailable' as const, message: TEMPORARILY };
         }
@@ -578,12 +591,25 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
         `select kind, asset, amount_raw::text, collateral_raw::text, ltv_before_bps, ltv_after_bps, tx_hash, block_number::text, created_at
            from strategy_earn_events where chain_id = 97 and (portfolio_id = $1 or portfolio_id in (select h.portfolio_id from mix_portfolio_history h
              join mixes m on m.id = h.mix_id where m.chain_id = 97 and m.account = $2)) order by block_number desc, log_index desc limit 50`, [id, account])).rows;
-      return { portfolioId: id, activity: rows.map(r => {
+      const v1 = rows.map(r => {
         r = { ...r, asset: markets.find(m => m.symbol.toUpperCase() === r.asset)?.symbol ?? r.asset };
         const e = { kind: r.kind, asset: r.asset, amountRaw: BigInt(r.amount_raw), collateralRaw: BigInt(r.collateral_raw), ltvBeforeBps: r.ltv_before_bps, ltvAfterBps: r.ltv_after_bps };
-        return { kind: r.kind, asset: r.asset, amountRaw: r.amount_raw, collateralRaw: r.collateral_raw, ltvBeforeBps: r.ltv_before_bps, ltvAfterBps: r.ltv_after_bps,
+        return { kind: r.kind as StrategyEarnKind | RouteEventKind, asset: r.asset, amountRaw: r.amount_raw, collateralRaw: r.collateral_raw, ltvBeforeBps: r.ltv_before_bps, ltvAfterBps: r.ltv_after_bps,
           txHash: r.tx_hash, blockNumber: r.block_number, createdAt: new Date(r.created_at).toISOString(), message: strategyEarnMessage(e) };
-      }) };
+      });
+      // Routing v2 (db 0069): route changes and the other v2 events, only when a v2 deployment is configured for this chain.
+      const v2 = deps.v2 === undefined ? strategyEarnV2(deps.chainId) : deps.v2;
+      if (!v2) return { portfolioId: id, activity: v1 };
+      const moved = (await deps.query<{ kind: RouteEventKind; asset: string | null; reason: string | null; venue: string | null; loan: string | null; vault_venue: string | null;
+        amount_raw: string; collateral_raw: string; tx_hash: string; block_number: string; created_at: Date | string }>(
+        `select kind, asset, reason, venue, loan, vault_venue, amount_raw::text, collateral_raw::text, tx_hash, block_number::text, created_at
+           from strategy_route_events where chain_id = $3 and kind <> 'release' and (portfolio_id = $1 or portfolio_id in (select h.portfolio_id from mix_portfolio_history h
+             join mixes m on m.id = h.mix_id where m.chain_id = $3 and m.account = $2)) order by block_number desc, log_index desc limit 50`, [id, account, deps.chainId])).rows;
+      const routed = moved.map(r => { const text = routeMessage({ kind: r.kind, asset: r.asset });
+        return { kind: r.kind as StrategyEarnKind | RouteEventKind, asset: r.asset, amountRaw: r.amount_raw, collateralRaw: r.collateral_raw, ltvBeforeBps: null, ltvAfterBps: null,
+          txHash: r.tx_hash, blockNumber: r.block_number, createdAt: new Date(r.created_at).toISOString(), message: text?.en ?? '', messageZh: text?.zh ?? '',
+          reason: r.reason, venue: r.venue, loan: r.loan, vaultVenue: r.vault_venue }; });
+      return { portfolioId: id, activity: [...v1, ...routed].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)).slice(0, 50) };
     },
     /**
      * The owner's own UserOp (turn on, turn off, open after a fill) is mined: record its business events from the

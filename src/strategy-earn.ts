@@ -505,6 +505,7 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
            from strategy_earn_events where chain_id = 97 and (portfolio_id = $1 or portfolio_id in (select h.portfolio_id from mix_portfolio_history h
              join mixes m on m.id = h.mix_id where m.chain_id = 97 and m.account = $2)) order by block_number desc, log_index desc limit 50`, [id, account])).rows;
       return { portfolioId: id, activity: rows.map(r => {
+        r = { ...r, asset: markets.find(m => m.symbol.toUpperCase() === r.asset)?.symbol ?? r.asset };
         const e = { kind: r.kind, asset: r.asset, amountRaw: BigInt(r.amount_raw), collateralRaw: BigInt(r.collateral_raw), ltvBeforeBps: r.ltv_before_bps, ltvAfterBps: r.ltv_after_bps };
         return { kind: r.kind, asset: r.asset, amountRaw: r.amount_raw, collateralRaw: r.collateral_raw, ltvBeforeBps: r.ltv_before_bps, ltvAfterBps: r.ltv_after_bps,
           txHash: r.tx_hash, blockNumber: r.block_number, createdAt: new Date(r.created_at).toISOString(), message: strategyEarnMessage(e) };
@@ -648,7 +649,9 @@ export const strategyEarnLedger = (run: (sql: string, params: unknown[]) => Prom
       await run(`insert into strategy_earn_events(chain_id,portfolio_id,account,market_id,asset,kind,amount_raw,collateral_raw,
           ltv_before_bps,ltv_after_bps,tx_hash,log_index,block_number) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
         on conflict (chain_id,tx_hash,log_index) do nothing`,
-        [chainId, e.portfolioId, e.account, e.marketId, e.asset, e.kind, e.amountRaw.toString(), e.collateralRaw.toString(),
+        // db 0063 allows asset ^[A-Z0-9]{1,16}$: 'XAUt' failed the check (2026-11-24, mix portfolio 20) and the rest of
+        // that receipt went unrecorded. Store it upper-cased; activity maps it back to the market's symbol.
+        [chainId, e.portfolioId, e.account, e.marketId, e.asset?.toUpperCase() ?? null, e.kind, e.amountRaw.toString(), e.collateralRaw.toString(),
           e.ltvBeforeBps, e.ltvAfterBps, e.txHash, e.logIndex, e.blockNumber.toString()]);
     }
   },

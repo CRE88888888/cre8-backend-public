@@ -215,3 +215,15 @@ test('POST close { assets }: Venus planned together, Lista per market, consent w
   await assert.rejects(earn.close(3, account, { assets: [] }));
   await assert.rejects(earn.close(3, account, { assets: ['TQQQB'] }));
 });
+
+test('ledger: XAUt is stored as XAUT (db 0063 asset check) and shown as XAUt again', async () => {
+  const { strategyEarnLedger } = await import('../src/strategy-earn.js');
+  const seen: unknown[][] = [];
+  await strategyEarnLedger(async (_sql, params) => { seen.push(params); return {}; }).record(97, [{ portfolioId: 20, account, marketId: m('XAUt').marketId, asset: 'XAUt', kind: 'close',
+    amountRaw: 1n, collateralRaw: 1n, ltvBeforeBps: null, ltvAfterBps: null, txHash: ('0x' + '05'.repeat(32)) as Hex, logIndex: 1, blockNumber: 1n }]);
+  assert.equal(seen[0]?.[4], 'XAUT');
+  assert.match(String(seen[0]?.[4]), /^[A-Z0-9]{1,16}$/);
+  const r = await createStrategyEarn({ chainId: 97, chain: () => chain({}), owned, query: (async () => ({ rows: [{ kind: 'close', asset: 'XAUT', amount_raw: '1', collateral_raw: '1',
+    ltv_before_bps: null, ltv_after_bps: null, tx_hash: '0x' + '05'.repeat(32), block_number: '1', created_at: new Date('2026-11-24T00:00:00Z') }] })) as never }).activity(20, account);
+  assert.equal(r.activity[0]?.asset, 'XAUt');
+});

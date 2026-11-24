@@ -341,7 +341,7 @@ export function defaultStrategyEarnChain(): StrategyEarnChain {
 }
 
 let cachedMainnetRates: ReturnType<typeof createMainnetRates> | undefined;
-const defaultMainnetRates = () => cachedMainnetRates ??= createMainnetRates({ listaSymbols: STRATEGY_EARN_97.markets.filter(m => m.protocol === 'lista').map(m => m.symbol) });
+const defaultMainnetRates = () => cachedMainnetRates ??= createMainnetRates({ markets: STRATEGY_EARN_97.markets.map(m => ({ symbol: m.symbol, protocol: m.protocol })) });
 
 export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
   const deps: StrategyEarnDeps = {

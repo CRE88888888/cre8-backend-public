@@ -173,6 +173,11 @@ test('safety line: reduce to the target ratio; a fill since the last borrow tops
   assert.deepEqual([d.action, d.reason, d.urgent, d.targetDebtUsd], ['reduce', 'safety_line', true, 1800]);
   d = one(s, held('QQQB', 20_000, key('lista', 'USDT'), 3000, 3, { ltvBps: 1500, deleverageLtvBps: 5000 }));
   assert.deepEqual([d.action, d.reason, d.targetDebtUsd, d.to?.loan], ['open', 'top_up', 6000, 'USDT']);
+  // 2% under the target is where the executor leaves it on purpose: no top-up for that, nor for a small price move.
+  d = one(s, held('QQQB', 10_000, key('lista', 'USDT'), 2940, 3));
+  assert.deepEqual([d.action, d.reason, d.targetDebtUsd], ['hold', 'best_route', 2940]);
+  d = one(s, held('QQQB', 10_000, key('lista', 'USDT'), 2840, 3));
+  assert.deepEqual([d.action, d.reason, d.targetDebtUsd], ['open', 'top_up', 3000]);
   d = one(s, { ...held('QQQB', 10_000, key('lista', 'USDT'), 3000, 3), enabled: false });
   assert.deepEqual([d.action, d.reason, d.targetDebtUsd], ['close', 'disabled', 0]);
 });

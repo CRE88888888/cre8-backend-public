@@ -13,6 +13,8 @@ import { dcaDepositCalls, dcaReceiptApproval, dcaReturnCalls, dcaVaults } from '
 import { YIELD_EXECUTOR_ABI } from '../src/yield-abi.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
 import { config, NOW, operation, OWNER, SENDER, TEST_SIGNER } from './fixtures/paymaster.js';
+import { maxDebtFor, v2Calls, v2ConsentCalls, v2ConsentOffCall, v2ExitCalls, v2PreSellCalls, V2_EXECUTOR_ABI, V2_REGISTRY_ABI } from '../src/strategy-earn-v2.js';
+import type { StrategyEarnV2 } from '../src/strategy-earn-v2.js';
 
 /**
  * Every user flow that ends in a sponsored UserOp, built with the same builders/calldata the frontend sends, run
@@ -54,9 +56,9 @@ async function renewal(): Promise<Call[]> {
 }
 
 type Kind = 'fund' | 'mix';
-function harness(kind: Kind, opts: { pendingChange?: boolean; reservedRaw?: bigint; observedRaw?: bigint; exiting?: 'triggered' | 'exited' | 'deleting'; rewardTokens?: Address[] } = {}) {
+function harness(kind: Kind, opts: { pendingChange?: boolean; reservedRaw?: bigint; observedRaw?: bigint; exiting?: 'triggered' | 'exited' | 'deleting'; rewardTokens?: Address[]; v2?: StrategyEarnV2 | null } = {}) {
   const seen = { locks: 0, reservations: 0, setups: 0, exits: 0 };
-  const service = createPaymasterService({ config: c, now: () => NOW, ...(opts.rewardTokens ? { rewardTokens: opts.rewardTokens } : {}),
+  const service = createPaymasterService({ config: c, now: () => NOW, ...(opts.rewardTokens ? { rewardTokens: opts.rewardTokens } : {}), strategyV2: opts.v2 ?? null,
     mixLock: async (_id, work) => { seen.locks++; return work(); },
     query: async (sql) => ({ rows: sql.includes('select s.owner') ? [{ owner, user_id: owner, mix_id: kind === 'mix' ? '5' : null }]
       : sql.includes('from mixes m where') ? [{ id: '5', owner, account, triggered_at: opts.exiting === 'triggered' ? new Date(NOW * 1000) : null,
@@ -293,4 +295,120 @@ test('reward tokens (LISTA / XVS): only a plain transfer to the owner wallet, on
     // Feature off (the default on every chain today): the same transfer is not sponsored.
     await assert.rejects(harness(kind).sponsor(payout), code('PAYMASTER_CALL_FORBIDDEN', 403), `${kind}: off`);
   }
+});
+
+/**
+ * Routing v2 (src/strategy-earn-v2.ts): every UserOp shape the app and the scheduler will send once v2 is deployed, for a
+ * fund account and a My mix account, built with the same builders. v2 is injected here; in production it is null until a
+ * deployment is configured, and then none of these are sponsored.
+ */
+const V2: StrategyEarnV2 = { chainId: 97, executor: '0x20000000000000000000000000000000000000e2', registry: '0x20000000000000000000000000000000000000e3',
+  venusComptroller: '0x20000000000000000000000000000000000000e4', moolah: '0x20000000000000000000000000000000000000e5',
+  loanTokens: { USDT: usdt.toLowerCase() as Address, USDC: '0x20000000000000000000000000000000000000a2' }, rewardTokens: ['0x2000000000000000000000000000000000000091'] };
+const R1 = ('0x' + 'a1'.repeat(32)) as Hex, R2 = ('0x' + 'a2'.repeat(32)) as Hex, VA = ('0x' + 'b1'.repeat(32)) as Hex, VB = ('0x' + 'b2'.repeat(32)) as Hex;
+async function renewalV2(): Promise<Call[]> {
+  const session = await buildSessionPermissions({ publicClient: offline as never, sessionKeyAddress: '0x2000000000000000000000000000000000000002',
+    executorAddress: executor, validUntil: NOW + 30 * 86400, yieldAccount: account, borrowAccount: account, routingV2: { executor: V2.executor, account } });
+  return session.initConfig.map((data) => ({ to: account, data: data as Hex, value: 0n }));
+}
+function v2Flows(r: Call[]): [string, Call[], 'risk' | 'settle'][] {
+  const deadline = BigInt(NOW + 600), E = 10n ** 18n;
+  const consent = v2ConsentCalls(V2, { maxDebtUsdRaw: maxDebtFor(5000), rewardRecipient: owner, venues: ['venus', 'lista'], collaterals: [asset], loanTokens: [V2.loanTokens.USDT!, V2.loanTokens.USDC!] }).map(asCall);
+  return [
+    ['buy with yield strategy: renewal (v2 scope) + consent', [...r, ...consent], 'risk'],
+    ['consent (key ready)', consent, 'risk'],
+    ['consent keeping rewards in the account', v2ConsentCalls(V2, { maxDebtUsdRaw: E, rewardRecipient: account, venues: ['lista'], collaterals: [asset] }).map(asCall), 'risk'],
+    ['open after the fill', [asCall(v2Calls.open(V2, account, R1, VA, 10n * E, 3n * E, deadline))], 'risk'],
+    ['top up: borrow only', [asCall(v2Calls.open(V2, account, R1, VA, 0n, E, deadline))], 'risk'],
+    ['two assets opened in one UserOp', [asCall(v2Calls.open(V2, account, R1, VA, E, E, deadline)), asCall(v2Calls.open(V2, account, R2, VB, E, E, deadline))], 'risk'],
+    ['migrate to a better route (atomic)', [asCall(v2Calls.migrate(V2, account, { routeId: R1, vaultId: VA }, { routeId: R2, vaultId: VB }, 3n * E, 0n, deadline))], 'risk'],
+    ['migrate: same route id is allowed when only the loan side moves vaults', [asCall(v2Calls.migrate(V2, account, { routeId: R1, vaultId: VA }, { routeId: R2, vaultId: VA }, 3n * E, E, deadline))], 'risk'],
+    ['switch vault only', [asCall(v2Calls.switchVault(V2, account, VA, VB, maxUint256, deadline))], 'risk'],
+    ['partial repay (negative carry / before a small sale)', [asCall(v2Calls.reduce(V2, account, R1, VA, E, 0n, 0n, deadline))], 'settle'],
+    ['repay and take shares back before a sale (scheduler session key)', v2PreSellCalls(V2, account, [{ routeId: R1, vaultId: VA }, { routeId: R2, vaultId: VB, cashRaw: E }], deadline).map(asCall), 'settle'],
+    ['two-step migrate, step 1: close with own cash', [asCall(v2Calls.close(V2, account, R1, VA, 5n * E, deadline))], 'settle'],
+    ['release what is left in a vault', [asCall(v2Calls.release(V2, account, VA, deadline))], 'settle'],
+    ['sweep rewards', [asCall(v2Calls.sweepRewards(V2, account, V2.rewardTokens[0]!, 0n, deadline))], 'settle'],
+    ['yield strategy off / sell all / delete: close all + release + sweep + consent off', v2ExitCalls(V2, account, { routes: [{ routeId: R1, vaultId: VA }, { routeId: R2, vaultId: VB }],
+      leftoverVaults: [VA], rewardTokens: [...V2.rewardTokens], deadline, withdrawConsent: true }).map(asCall), 'settle'],
+    ['consent off alone', [asCall(v2ConsentOffCall(V2))], 'settle'],
+  ];
+}
+
+for (const kind of ['fund', 'mix'] as const) {
+  test(`routing v2, ${kind} account: every v2 UserOp is sponsored when a v2 deployment is configured, none when it is not`, async () => {
+    for (const [name, calls] of v2Flows(await renewalV2())) {
+      const h = harness(kind, { v2: V2 });
+      await assert.doesNotReject(h.sponsor(calls), `${kind}: ${name}`);
+      assert.deepEqual([h.seen.reservations, h.seen.locks], [1, 0], `${kind}: ${name} (no mix lock: not an enrollment change)`);
+      const off = harness(kind);
+      await assert.rejects(off.sponsor(calls), code('PAYMASTER_CALL_FORBIDDEN', 403), `${kind}: ${name} with v2 off`);
+      assert.equal(off.seen.reservations, 0);
+    }
+    // The v1 chain-97 flows are untouched by a configured v2 (same executor-v1 calls, same renewal scope).
+    for (const [name, calls] of await flows(kind)) await assert.doesNotReject(harness(kind, { v2: V2 }).sponsor(calls), `${kind} with v2 on: ${name}`);
+  });
+
+  test(`routing v2, ${kind} account: the rules stay strict`, async () => {
+    const deadline = BigInt(NOW + 600), E = 10n ** 18n;
+    const ex = (functionName: string, args: readonly unknown[]): Call => ({ to: V2.executor, value: 0n, data: encodeFunctionData({ abi: V2_EXECUTOR_ABI, functionName: functionName as never, args: args as never }) });
+    const policy = (maxDebt: bigint, recipient: Address, enabled: boolean): Call => ({ to: V2.registry, value: 0n, data: encodeFunctionData({ abi: V2_REGISTRY_ABI, functionName: 'setStrategyPolicy', args: [maxDebt, recipient, enabled] }) });
+    const lending = (to: Address, fn: 'updateDelegate' | 'setAuthorization', who: Address): Call => ({ to, value: 0n, data: encodeFunctionData({ abi: STRATEGY_EARN_ABI, functionName: fn, args: [who, true] }) });
+    const strict: [string, Call[]][] = [
+      ['open for another account', [ex('executeOpen', [stranger, R1, VA, E, E, deadline])]],
+      ['reduce for another account', [ex('executeReduce', [stranger, R1, VA, E, E, 0n, deadline])]],
+      ['migrate for another account', [ex('executeMigrate', [stranger, R1, VA, R2, VB, E, 0n, deadline])]],
+      ['sweep for another account', [ex('executeSweepRewards', [stranger, V2.rewardTokens[0]!, 0n, deadline])]],
+      ['sweep of a portfolio asset', [ex('executeSweepRewards', [account, asset, E, deadline])]],
+      ['sweep of the loan token', [ex('executeSweepRewards', [account, usdt, E, deadline])]],
+      ['open with nothing', [ex('executeOpen', [account, R1, VA, 0n, 0n, deadline])]],
+      ['reduce with nothing', [ex('executeReduce', [account, R1, VA, 0n, 0n, 0n, deadline])]],
+      ['no deadline', [ex('executeOpen', [account, R1, VA, E, E, 0n])]],
+      ['migrate to the same route and vault', [ex('executeMigrate', [account, R1, VA, R1, VA, E, 0n, deadline])]],
+      ['switch to the same vault', [ex('executeSwitchVault', [account, VA, VA, E, deadline])]],
+      ['executeDeleverage through the account (anyone-callable: the keeper sends it, never sponsored)', [ex('executeDeleverage', [account, R1, VA, maxUint256])]],
+      ['trailing bytes on a v2 call', [{ ...ex('executeRelease', [account, VA, deadline]), data: (ex('executeRelease', [account, VA, deadline]).data + '00') as Hex }]],
+      ['unknown selector on the v2 executor', [{ to: V2.executor, value: 0n, data: '0x12345678' }]],
+      ['consent with a zero ceiling', [policy(0n, owner, true)]],
+      ['rewards sent to a stranger', [policy(E, stranger, true)]],
+      ['consent off naming a stranger', [policy(0n, stranger, false)]],
+      ['rate report from an account', [{ to: V2.registry, value: 0n, data: encodeFunctionData({ abi: V2_REGISTRY_ABI, functionName: 'reportRates', args: [[], []] }) }]],
+      ['Venus delegate to a stranger', [lending(V2.venusComptroller, 'updateDelegate', stranger)]],
+      ['Moolah authorization to a stranger', [lending(V2.moolah, 'setAuthorization', stranger)]],
+      ['Moolah call with the Venus function', [lending(V2.moolah, 'updateDelegate', V2.executor)]],
+      ['a token outside the portfolio approved to the v2 executor', [approve(stranger, V2.executor)]],
+      ['strategy vault shares (v1) approved to the v2 executor', [approve(S.earnVault as Address, V2.executor)]],
+      ['a portfolio asset approved to a stranger next to a v2 call', [approve(asset, stranger), ex('executeRelease', [account, VA, deadline])]],
+      ['native value on a v2 call', [{ ...ex('executeRelease', [account, VA, deadline]), value: 1n }]],
+      ['a v2 close with a token sent to a stranger', [ex('executeRelease', [account, VA, deadline]), transfer(usdt, stranger, 1n)]],
+    ];
+    for (const [name, calls] of strict) {
+      const h = harness(kind, { v2: V2 });
+      await assert.rejects(h.sponsor(calls), (e: unknown) => e instanceof AppError && e.status >= 400 && e.status < 500, `${kind}: ${name}`);
+      assert.equal(h.seen.reservations, 0, `${kind}: ${name}`);
+    }
+  });
+}
+
+test('routing v2 on a My mix: exiting / exited / deleting mixes only settle; a pending mix change makes it wait', async () => {
+  const flowsV2 = v2Flows(await renewalV2());
+  for (const exiting of ['triggered', 'exited', 'deleting'] as const) {
+    for (const [name, calls, kind] of flowsV2) {
+      const h = harness('mix', { v2: V2, exiting });
+      if (kind === 'risk') { await assert.rejects(h.sponsor(calls), code('PAYMASTER_CALL_FORBIDDEN', 403), `${exiting}: ${name}`); assert.equal(h.seen.reservations, 0); }
+      else { await h.sponsor(calls); assert.equal(h.seen.reservations, 1, `${exiting}: ${name} still settles`); }
+    }
+  }
+  for (const [name, calls] of flowsV2.slice(1)) await assert.rejects(harness('mix', { v2: V2, pendingChange: true }).sponsor(calls), code('MIX_BUSY', 409), name);
+});
+
+test('routing v2 on a My mix: a weight change re-enrolls into a new strategy, so the same owner UserOp re-consents (approval + enroll + v2 consent)', async () => {
+  const enroll = { to: T.contracts.registry as Address, value: 0n,
+    data: encodeFunctionData({ abi: [{ type: 'function', name: 'enroll', inputs: [{ type: 'address' }, { type: 'uint256' }, { type: 'uint16' }], outputs: [], stateMutability: 'nonpayable' }],
+      functionName: 'enroll', args: [account, 12n, 1] }) };
+  const calls = [approve(asset, executor), enroll, ...v2ConsentCalls(V2, { maxDebtUsdRaw: maxDebtFor(5000), rewardRecipient: owner, venues: ['lista'], collaterals: [asset] }).map(asCall)];
+  await assert.rejects(harness('mix', { v2: V2 }).sponsor(calls), code('PAYMASTER_CALL_FORBIDDEN', 403));
+  const h = harness('mix', { v2: V2, pendingChange: true });
+  await h.sponsor(calls);
+  assert.deepEqual([h.seen.setups, h.seen.locks, h.seen.reservations], [1, 1, 1]);
 });

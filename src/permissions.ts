@@ -1,3 +1,4 @@
+import { v2SessionPermissions } from './strategy-earn-v2.js';
 import { HDKey } from '@scure/bip32';
 import { signerToEcdsaValidator } from '@zerodev/ecdsa-validator';
 import { PolicyFlags, toInitConfig, toPermissionValidator } from '@zerodev/permissions';
@@ -237,7 +238,8 @@ type BuiltPolicies = { call: Policy; gas: Policy; timestamp: Policy };
 /** Default remains the original deployment policy: adding initConfig would move CREATE2 accounts.
  * Yield is installed only by owner renewal, once the existing account address is known.
  */
-export function sessionCallPermissions(executorAddress: Address, yieldAccount?: Address, borrowAccount?: Address, borrowMarkets?: readonly Hex[]) {
+export type RoutingV2Scope = { executor: Address; account: Address };
+export function sessionCallPermissions(executorAddress: Address, yieldAccount?: Address, borrowAccount?: Address, borrowMarkets?: readonly Hex[], routingV2?: RoutingV2Scope) {
   return [
     { target: executorAddress, selector: EXECUTOR_SELECTOR },
     ...(yieldAccount === undefined ? [] : YIELD_EXECUTION_SELECTORS.map(selector => ({
@@ -248,6 +250,9 @@ export function sessionCallPermissions(executorAddress: Address, yieldAccount?: 
     // whitelisted markets. Appended last so keys renewed before #204 rebuild the same permissionId. `borrowMarkets`
     // rebuilds an installed key exactly (keys renewed before cre8-contracts#67 hold the five #65 markets).
     ...(borrowAccount === undefined ? [] : borrowSessionPermissions(borrowAccount, borrowMarkets)),
+    // Routing v2 (src/strategy-earn-v2.ts): the six account functions on AtpBorrowExecutorV2, argument 0 pinned. Appended
+    // last so every key installed before v2 rebuilds the same permissionId.
+    ...(routingV2 === undefined ? [] : v2SessionPermissions(routingV2.executor, routingV2.account)),
   ];
 }
 
@@ -330,13 +335,13 @@ export function yieldAuthorization(snapshot: unknown, account: Address, executor
 }
 
 function buildPolicies(executorAddress: Address, validAfter: number, validUntil: number, chainId = configuredChainId(), yieldAccount?: Address, borrowAccount?: Address,
-  borrowMarkets?: readonly Hex[]): BuiltPolicies {
+  borrowMarkets?: readonly Hex[], routingV2?: RoutingV2Scope): BuiltPolicies {
   return {
     // Initial deployment remains legacy; an owner upgrade also pins yield argument 0 to this account.
     call: toCallPolicy({
       ...(chainId === 97 ? { policyAddress: TESTNET_97.contracts.callPolicy } : {}),
       policyVersion: SESSION_CALL_POLICY_VERSION,
-      permissions: sessionCallPermissions(executorAddress, yieldAccount, borrowAccount, borrowMarkets),
+      permissions: sessionCallPermissions(executorAddress, yieldAccount, borrowAccount, borrowMarkets, routingV2),
     }),
     gas: toGasPolicy({ allowed: SESSION_GAS_ALLOWED_WEI, ...(chainId === 97 ? { policyAddress: TESTNET_97.contracts.gasPolicy, enforcePaymaster: true, allowedPaymaster: TESTNET_97.contracts.paymaster } : {}) }),
     timestamp: toTimestampPolicy({ validAfter, validUntil, ...(chainId === 97 ? { policyAddress: TESTNET_97.contracts.timestampPolicy } : {}) }),
@@ -345,12 +350,12 @@ function buildPolicies(executorAddress: Address, validAfter: number, validUntil:
 
 /** 目前使用的三層 policy 參數（測試與 log 用）。`validUntil` 未給就用 `sessionValidUntil()`。 */
 export function describePolicies(args: { executorAddress: Address; validUntil?: number; chainId?: number; yieldAccount?: Address; borrowAccount?: Address;
-  borrowMarkets?: readonly Hex[] }): SessionPolicies {
+  borrowMarkets?: readonly Hex[]; routingV2?: RoutingV2Scope }): SessionPolicies {
   const executorAddress = assertAddressArg(args.executorAddress, 'executorAddress');
   const validUntil = args.validUntil ?? sessionValidUntil();
   assertValidUntil(validUntil);
 
-  const policies = buildPolicies(executorAddress, SESSION_VALID_AFTER, validUntil, args.chainId, args.yieldAccount, args.borrowAccount, args.borrowMarkets);
+  const policies = buildPolicies(executorAddress, SESSION_VALID_AFTER, validUntil, args.chainId, args.yieldAccount, args.borrowAccount, args.borrowMarkets, args.routingV2);
   return snapshotPolicies(policies);
 }
 
@@ -455,6 +460,8 @@ export type BuildSessionPermissionsArgs = {
   borrowAccount?: Address;
   /** Rebuilding an installed key: the market list it was installed with (`borrowKeyMarkets`). Default: today's table. */
   borrowMarkets?: readonly Hex[];
+  /** Owner upgrade only: routing v2 calls on AtpBorrowExecutorV2 pinned to this account (src/strategy-earn-v2.ts). */
+  routingV2?: RoutingV2Scope;
   /** 推導地址要用：`toPermissionValidator` 讀 `client.chain.id`（或打 eth_chainId）。 */
   publicClient: PublicClient;
   /** session key 的地址（由 `deriveSessionKey` 得到）。本函式不需要它的私鑰。 */
@@ -501,7 +508,9 @@ export async function buildSessionPermissions(args: BuildSessionPermissionsArgs)
   const borrowAccount = args.borrowAccount === undefined ? undefined : assertAddressArg(args.borrowAccount, 'borrowAccount');
   if (borrowAccount !== undefined && (chainId !== 97 || isAddressEqual(borrowAccount, zeroAddress) || yieldAccount === undefined ||
       !isAddressEqual(borrowAccount, yieldAccount))) throw new Error('策略加息升權只支援 chain 97 的既有帳戶，且必須與生息升權同一個帳戶');
-  const policies = buildPolicies(executorAddress, SESSION_VALID_AFTER, validUntil, chainId, yieldAccount, borrowAccount, args.borrowMarkets);
+  if (args.routingV2 !== undefined && (isAddressEqual(args.routingV2.account, zeroAddress) || isAddressEqual(args.routingV2.executor, zeroAddress) ||
+      isAddressEqual(args.routingV2.executor, executorAddress))) throw new Error('路由 v2 升權需要既有帳戶與 v2 executor（不能是 AtpExecutor）');
+  const policies = buildPolicies(executorAddress, SESSION_VALID_AFTER, validUntil, chainId, yieldAccount, borrowAccount, args.borrowMarkets, args.routingV2);
 
   // 型別理由同 src/kernel.ts：SDK 把 kernelVersion 收窄成 GetKernelVersion<"0.7">。
   const kernelVersion: GetKernelVersion<'0.7'> = KERNEL_V3_3;

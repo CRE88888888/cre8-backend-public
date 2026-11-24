@@ -36,6 +36,9 @@ export const ROUTING = {
   MAX_SOURCE_AGE_MS: 30 * 60_000,
   /** Positions that would borrow less than this are not opened. */
   MIN_BORROW_USD: 10,
+  /** An open position is topped up only when its debt is more than this far under the target (bps of the target): the
+   * executor borrows 2% under the target on purpose, and small price moves are not worth a transaction. */
+  TOP_UP_MIN_GAP_BPS: 500,
 } as const;
 
 export type RouteKey = { venue: 'venus' | 'lista'; marketId: string; loan: Stable; vault: { venue: Venue; address: string } };
@@ -255,7 +258,7 @@ export function planAccount(input: { snapshot: RoutingSnapshot; holdings: readon
     const ownDebt = Math.max(p.debtUsd, Math.min(targetDebt(h, route), p.debtUsd + room(route)));
     const nowYear = yearly(route, h.collateralUsd, ownDebt);
     const stay = (reason: Reason, why: string, numbers: Partial<Decision> = {}) => {
-      if (ownDebt - p.debtUsd >= ROUTING.MIN_BORROW_USD) {
+      if (ownDebt - p.debtUsd >= Math.max(ROUTING.MIN_BORROW_USD, targetDebt(h, route) * ROUTING.TOP_UP_MIN_GAP_BPS / 10_000)) {
         take(route, ownDebt, p.debtUsd);
         decisions.push({ ...base, ...numbers, action: 'open', reason: 'top_up', urgent: false, to: route, targetDebtUsd: ownDebt,
           rationale: `${h.symbol} open ${label(p.route)}: top up debt ${usd(p.debtUsd)} → ${usd(ownDebt)} at ratio ${pct(route.ratioBps)}; ${why}` });

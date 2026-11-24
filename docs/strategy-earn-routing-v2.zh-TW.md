@@ -1,0 +1,62 @@
+# 加息策略動態路由 v2：後端這一側
+
+合約規格：cre8-contracts `docs/borrow-routing-v2.zh-TW.md`（這裡對的是 **v2.0-draft1**）。選路線的規則：`docs/strategy-earn-mainnet-routing.zh-TW.md`。激勵代幣：`docs/strategy-earn-rewards.zh-TW.md`。
+實作：`src/strategy-earn-v2.ts`。測試：`test/strategy-earn-routing-v2.test.ts`、`test/sponsor-flows.test.ts`、`test/strategy-route-events.db.test.ts`。
+
+## 開關
+
+`strategyEarnV2(chainId)` 讀 `STRATEGY_EARN_V2_DEPLOYMENT`（JSON：`chainId`、`executor`、`registry`、`venusComptroller`、`moolah`、`loanTokens`、`rewardTokens`）。
+沒設（現在所有環境都沒設）就回 null：renewal 不多裝權限、paymaster 不贊助任何 v2 呼叫、排程器不重建 v2 權限。chain 97 的 v1 流程完全照舊。
+格式錯就 throw，不會用半套設定去組交易。
+
+## 已經做好、有測試的
+
+| 項目 | 位置 |
+| --- | --- |
+| route id／vault id（規格 §3） | `routeIdOf`、`vaultIdOf`、`routeIds` |
+| owner 簽一次的同意：帳戶層級上限（美元，所有借款幣合計）＋需要的借貸授權＋抵押品 approve | `v2ConsentCalls`、`maxDebtFor`（計畫總債務 +10%） |
+| 開倉、補借、還款、平倉、搬家、只換 vault、放回剩餘、送出激勵、減倉 | `v2Calls` |
+| 引擎的決定 → 交易 | `planExecution` |
+| 關閉加息／全部賣出／刪除（owner 一筆 UserOp） | `v2ExitCalls` |
+| 賣出前還款取回（session key） | `v2PreSellCalls` |
+| 一個帳戶一輪：決定＋執行＋每個決定一行 log | `runV2Account` |
+| paymaster 規則（基金帳戶與 My mix 帳戶同一支函式） | `v2SponsoredCall`，接在 `validateSponsoredCalls`、`mixStrategyCall` |
+| session key 權限範圍 | `v2SessionPermissions`、`v2Authorized`，接在 `sessionCallPermissions`／renewal／排程器重建 |
+| 利率回報（rateReporter＝operator） | `v2RateReport` |
+| 帳本與活動紀錄的一句話 | `v2RouteEvents`、`routeLedger`（db 0069）、`routeMessage` |
+
+### `planExecution` 的規則
+
+- 順序：平倉、還款先（釋放上限、不增加風險），再搬家，最後開倉。
+- 借款金額＝目標 × 98%（留 2% 給送出前累積的利息）。引擎只在債務低於目標 5% 以上才補借，所以不會每輪為了這 2% 送交易。
+- owner 的上限不夠：把新借款縮到上限以內，不送一筆會 `DebtAboveConsent` 的交易；`consentShort` 為 true，App 下次請 owner 重新同意。
+- 搬家：先送一筆 `executeMigrate`（整筆成功或整筆還原）。還原時（舊 vault 不夠還、新路線沒過條件）走兩步：`executeReduce` 全關（可用帳戶自己的同幣現金）→ `executeOpen`。關了之後開不成，就停在「沒借款」，下一輪再看。
+- 同一個借款市場、只換 vault：`executeSwitchVault`。
+- 減倉線：`executeDeleverage` 任何人可呼叫，由 operator 送（不經帳戶、不用贊助）。
+- Lista：部分還款後剩下的債不能低於 15 美元，會低於就改成全還。
+
+### paymaster 規則
+
+- v2 executor：只有六個帳戶函式（`executeOpen`／`Reduce`／`Migrate`／`SwitchVault`／`Release`／`SweepRewards`），第一個參數必須是送出的帳戶，要有 deadline，編碼必須標準；空的開倉／還款、搬到同一條路線、換到同一個 vault、送出非激勵代幣都拒絕。`executeDeleverage` 不贊助。route id／vault id 不限制，白名單在合約。
+- v2 registry：只有 `setStrategyPolicy`；開啟時上限不能是 0；激勵收款人只能是 owner、帳戶自己或 0。
+- Venus／Moolah：只有授權給（或取消）v2 executor。
+- `approve(v2 executor)`：只允許投資組合資產、白名單借款幣、激勵代幣。
+- My mix：正在退出／已退出／刪除中只能做「還款類」；有待簽的組合變更時等待（409 `MIX_BUSY`）；改比例會重新 enroll 到新策略，同一筆 owner UserOp 裡重新同意。
+
+### session key 權限
+
+v2 executor 上那六個函式，第一個參數釘死是這個帳戶。沒有市場清單（白名單在合約，新增市場不用續期）。不含 `setStrategyPolicy`、借貸授權、任何 approve。
+加在既有權限的最後面，所以 v2 之前安裝的 key 重建出來的 permissionId 不變。
+
+## 等合約部署後才能接的
+
+這些需要真的合約（至少 fork）才驗得了，沒有盲寫：
+
+1. **讀鏈**：`V2AccountState`（`routeStatus`／`vaultStatus`／`policy`／`accountRoutes`／`boxOf`）的讀取器。批次讀、只走公開節點、每輪快取。
+2. **排程器接線**：成交後自動開（`open` hook）、賣出前還款（`unwind` hook）、每輪重新評估（keeper round）改呼叫 `runV2Account`／`v2PreSellCalls`；`record` 寫 db 0069。
+3. **My mix 改比例的重新同意**：`mixes.ts` 目前組的是 v1 的 `mixStrategyConsentCalls`，要加 v2 版本（paymaster 這邊已經會放行）。
+4. **App 送的 owner UserOp**：開啟／關閉加息改用 `v2ConsentCalls`／`v2ExitCalls`（由 API 回傳 calls，跟 v1 一樣）。
+5. **策略盒的激勵簽名**：`boxRewardSignature` 的編碼是草稿，等合約端把盒子的 ERC-1271 格式寫進規格再對。
+6. **利率回報的排程**：`v2RateReport` 48 小時過期，operator 每天送一次。
+
+介面如果改版：`test/fixtures/borrow-routing-v2.signatures.json` 是從規格的 interface.json 抽出來的函式與事件簽名，測試會逐一比對這裡用到的每個簽名，改了會直接紅。

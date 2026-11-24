@@ -1,4 +1,6 @@
 import { sponsoredRewardTokens } from './strategy-rewards.js';
+import { strategyEarnV2, v2SponsoredCall } from './strategy-earn-v2.js';
+import type { StrategyEarnV2 } from './strategy-earn-v2.js';
 import { verifyEnrollmentSponsorship } from './enrollment-sponsorship.js';
 import { verifyMixOwnerCalls } from './mix-chain.js';
 import { MIX_COLUMNS, pendingMixSql, withMixLock, checkMixLock, mixBusy } from './mix-store.js';
@@ -83,6 +85,8 @@ type Query = (sql: string, params?: readonly unknown[]) => Promise<{ rows: unkno
 export type PaymasterDeps = {
   /** Reward tokens an owner may send to their wallet. Default: sponsoredRewardTokens(chainId) (mainnet, behind STRATEGY_REWARDS_ENABLED). */
   rewardTokens?: readonly Address[];
+  /** Routing v2 deployment whose calls may be sponsored. Default: strategyEarnV2(chainId) (null until v2 is deployed and configured). */
+  strategyV2?: StrategyEarnV2 | null;
   mixSetup?: typeof verifyMixOwnerCalls;
   mixLock?: typeof withMixLock;
   config?: PaymasterConfig | null;
@@ -177,7 +181,7 @@ export function canonicalKernelCalls(callData: Hex) { return sponsoredCalls({ ca
 
 /** Match the SDK's complete two-call toInitConfig, never a general-purpose self-call or delegatecall. */
 type RenewalScope = 'plain' | 'yield' | 'yield+borrow';
-function validateRenewal(install: Hex, grant: Hex, c: PaymasterConfig, account: Address, scope: RenewalScope = 'plain'): void {
+function validateRenewal(install: Hex, grant: Hex, c: PaymasterConfig, account: Address, scope: RenewalScope = 'plain', v2: StrategyEarnV2 | null = null): void {
   const decoded = decodeFunctionData({ abi: KernelV3_3AccountAbi, data: install });
   if (decoded.functionName !== 'installValidations') throw new Error('invalid install');
   const enableData = decoded.args[2][0];
@@ -195,7 +199,7 @@ function validateRenewal(install: Hex, grant: Hex, c: PaymasterConfig, account: 
     // 'yield+borrow' is what GET /renewal-params installs on chain 97 since backend#204 (src/renewal.ts): yield and
     // Strategy Earn calls, argument 0 pinned to this account, current market list.
     toCallPolicy({ policyVersion: CallPolicyVersion.V0_0_4, policyAddress: p.callPolicy, permissions: sessionCallPermissions(c.executor,
-      scope === 'plain' ? undefined : account, scope === 'yield+borrow' ? account : undefined) }),
+      scope === 'plain' ? undefined : account, scope === 'yield+borrow' ? account : undefined, undefined, v2 === null ? undefined : { executor: v2.executor, account }) }),
     toGasPolicy({ policyAddress: p.gasPolicy, allowed: SESSION_GAS_ALLOWED_WEI, enforcePaymaster: true, allowedPaymaster: c.address }),
     toTimestampPolicy({ policyAddress: p.timestampPolicy, validAfter, validUntil }),
   ];
@@ -217,9 +221,13 @@ function validateRenewal(install: Hex, grant: Hex, c: PaymasterConfig, account: 
 }
 
 /** Every session scope GET /renewal-params can install on this chain (chain 97: plain, yield, yield+borrow). */
-function validateAnyRenewal(install: Hex, grant: Hex, c: PaymasterConfig, account: Address): void {
+function validateAnyRenewal(install: Hex, grant: Hex, c: PaymasterConfig, account: Address, v2: StrategyEarnV2 | null = null): void {
   const scopes: RenewalScope[] = c.chainId === 97 ? ['plain', 'yield', 'yield+borrow'] : ['plain'];
-  if (!scopes.some((scope) => { try { validateRenewal(install, grant, c, account, scope); return true; } catch { return false; } })) {
+  // With a v2 deployment configured, /renewal-params installs today's scope plus the routing v2 calls (src/renewal.ts).
+  // Keys without it stay valid, so both forms are accepted.
+  const forms: [RenewalScope, StrategyEarnV2 | null][] = [...scopes.map((s): [RenewalScope, null] => [s, null]),
+    ...(v2 === null ? [] : [[c.chainId === 97 ? 'yield+borrow' : 'plain', v2] as [RenewalScope, StrategyEarnV2]])];
+  if (!forms.some(([scope, withV2]) => { try { validateRenewal(install, grant, c, account, scope, withV2); return true; } catch { return false; } })) {
     throw new Error('renewal matches no allowed session scope');
   }
 }
@@ -262,8 +270,10 @@ export function mixDcaCall(call: { target: Address; callData: Hex }, sender: Add
  * 'settle' = repays, takes shares back or withdraws consent.
  */
 export type MixStrategyCall = 'risk' | 'settle' | null;
-export function mixStrategyCall(call: { target: Address; callData: Hex }, c: PaymasterConfig): MixStrategyCall {
+export function mixStrategyCall(call: { target: Address; callData: Hex }, c: PaymasterConfig, v2?: { v2: StrategyEarnV2; sender: Address; owner?: Address }): MixStrategyCall {
   if (c.chainId !== 97) return null;
+  // Routing v2: same two classes. A v2 call that breaks a rule is not classified here; validateSponsoredCalls rejects it.
+  if (v2) { try { const kind = v2SponsoredCall(v2.v2, call, { sender: v2.sender, owner: v2.owner, assets: testnetAssets().map(a => a.address) }); if (kind !== null) return kind; } catch { return null; } }
   const S = STRATEGY_EARN_97;
   try {
     if (isAddressEqual(call.target, S.executor)) {
@@ -287,7 +297,7 @@ export function mixStrategyCall(call: { target: Address; callData: Hex }, c: Pay
   return null;
 }
 
-type CallContext = { owner?: Address; assets?: readonly Address[];
+type CallContext = { owner?: Address; assets?: readonly Address[]; v2?: StrategyEarnV2 | null;
   /** Yield strategy reward tokens (LISTA, XVS): the owner may send them from the account to their own wallet, nothing else. */
   rewardTokens?: readonly Address[] };
 const collateralOf = (symbol: string): Address => {
@@ -308,7 +318,10 @@ export function validateSponsoredCalls(op: PackedSponsorOperation, c: PaymasterC
       if (isAddressEqual(call.target, op.sender)) {
         const next = calls[++index];
         if (next === undefined || next.value !== 0n || !isAddressEqual(next.target, op.sender)) throw new Error('incomplete renewal');
-        validateAnyRenewal(call.callData, next.callData, c, op.sender);
+        validateAnyRenewal(call.callData, next.callData, c, op.sender, context.v2 ?? null);
+      } else if (context.v2 && v2SponsoredCall(context.v2, call, { sender: op.sender, owner: context.owner, assets }) !== null) {
+        // Routing v2 (src/strategy-earn-v2.ts): a valid call to the v2 executor / registry / lending delegation, or an approval
+        // to the v2 executor. An invalid one throws above and is rejected here like any other.
       } else if (isAddressEqual(call.target, c.executor)) {
         const inner = decodeFunctionData({ abi: EXECUTOR_ABI, data: call.callData });
         if (inner.functionName === 'executeSupply' || inner.functionName === 'executeWithdraw') {
@@ -1036,7 +1049,8 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
           isAddressEqual(call.target, TESTNET_97.contracts.usdt) && call.callData.startsWith(toFunctionSelector('transfer(address,uint256)')));
       // Yield strategy only (with an optional session renewal pair, like a fund's turn-on): owner consent/open/close or
       // the scheduler's session-key steps. Not an enrollment change, so no mix lock, like DCA.
-      const mixStrategy = (call: { target: Address; callData: Hex }) => mixStrategyCall(call, c);
+      const strategyV2 = deps.strategyV2 === undefined ? strategyEarnV2(c.chainId) : deps.strategyV2;
+      const mixStrategy = (call: { target: Address; callData: Hex }) => mixStrategyCall(call, c, strategyV2 ? { v2: strategyV2, sender: op.sender, owner: hex(owner.owner, 20) } : undefined);
       const strategyOnly = isMix && calls.some(call => mixStrategy(call) !== null) &&
         calls.every(call => mixStrategy(call) !== null || isAddressEqual(call.target, op.sender));
       const authorize = async () => {
@@ -1084,7 +1098,7 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
               const grant = calls[++i];
               if (!grant || !isAddressEqual(grant.target, op.sender) || grant.value !== 0n) throw rejected('PAYMASTER_CALL_FORBIDDEN', 403, 'my mix: incomplete renewal');
               // Same scopes as a fund account: /renewal-params installs yield+borrow on chain 97 (DCA needs the yield calls).
-              try { validateAnyRenewal(call.callData, grant.callData, c, op.sender); }
+              try { validateAnyRenewal(call.callData, grant.callData, c, op.sender, strategyV2); }
               catch (error) { throw rejected('PAYMASTER_CALL_FORBIDDEN', 403, `my mix: ${checkName(error)}`); }
             } else if (isAddressEqual(call.target, c.executor)) {
               if (mixDca(call) === 'redeem') continue;
@@ -1106,7 +1120,7 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
           return hex(address, 20);
         });
       }
-      validateSponsoredCalls(op, c, { owner: hex(owner.owner, 20), assets, rewardTokens });
+      validateSponsoredCalls(op, c, { owner: hex(owner.owner, 20), assets, rewardTokens, v2: strategyV2 });
       await bounded(checkFreeCash(op, calls, c, hex(owner.owner, 20), deps), c.timeoutMs);
       const cost = gasCost(op, c);
       if (cost.gasLimit > MAX_USER_OP_GAS) throw rejected('PAYMASTER_USER_OP_CAPACITY', 400);

@@ -247,8 +247,9 @@ export function rewardsWriter(env: NodeJS.ProcessEnv = process.env): RewardsWrit
 // ---------------------------------------------------------------------------
 export type RewardsRoundResult = { accounts: number; holders: number; pending: number; claimed: number; failed: number; writer: boolean };
 export type RewardsRoundDeps = { chainId: number; env?: NodeJS.ProcessEnv; now?: () => Date; fetch?: Fetcher; store?: RewardsStore; chain?: RewardsChain; writer?: RewardsWriter | null;
-  /** Other addresses that earn for this account (routing v2: its strategy box). */
-  extraHolders?: (account: Address) => Promise<Address[]>;
+  /** Other addresses that earn for this account (routing v2: its strategy box), each with the signature Lista must be sent for
+   * it: the box only validates the reward message and expects its own signature form (src/strategy-earn-v2.ts boxRewardSignature). */
+  extraHolders?: (account: Address, sig: RewardSignature) => Promise<{ holder: Address; sig: RewardSignature }[]>;
   /** Holders with a Venus position (XVS). */
   venusHolders?: (account: Address) => Promise<boolean> };
 let lastRoundAt = 0;
@@ -269,11 +270,12 @@ export async function runStrategyRewardsRound(args: { dryRun: boolean; log: (lin
   for (const a of await store.signed(deps.chainId, now)) {
     result.accounts++;
     try {
-      const holders = [a.account, ...(deps.extraHolders ? await deps.extraHolders(a.account) : [])];
+      const signedHolders = [{ holder: a.account, sig: a.sig }, ...(deps.extraHolders ? await deps.extraHolders(a.account, a.sig) : [])];
+      const holders = signedHolders.map(h => h.holder);
       const due: Claimable[] = [], notes: string[] = [];
-      for (const holder of holders) {
+      for (const { holder, sig } of signedHolders) {
         result.holders++;
-        for (const c of await fetchListaProofs(f, holder, a.sig)) {
+        for (const c of await fetchListaProofs(f, holder, sig)) {
           const claimed = await chain.claimed(c.source, holder, c.token);
           await store.savePending(deps.chainId, a.portfolioId, a.account, c, claimed);
           const open = c.totalRaw > claimed ? c.totalRaw - claimed : 0n;

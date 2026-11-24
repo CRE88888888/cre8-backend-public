@@ -9,6 +9,7 @@ import { runYieldRound } from './yield-service.js';
 import { runDcaRound } from './dca.js';
 import { STRATEGY_EARN_97 } from './strategy-earn-guard.js';
 import { runStrategyRewardsRound } from './strategy-rewards.js';
+import { strategyEarnV2, v2Authorized } from './strategy-earn-v2.js';
 import { dbStrategyEarnLedger, defaultStrategyEarnChain, runStrategyEarnRound, strategyEarnAutoOpen, strategyEarnUnwindForSale } from './strategy-earn.js';
 import type { Call as StrategyEarnCall, StrategyEarnSend, StrategyEarnTx } from './strategy-earn.js';
 import { assertUserOpCapacity, boundedCallGasLimit, executionBatchSize, MAX_USER_OP_STEPS, userOpGasOverhead } from './execution-batch.js';
@@ -493,6 +494,8 @@ export type SessionKeyRef = {
   borrowAccount?: Address;
   /** With `borrowAccount`: the market list the key was installed with (keys renewed before cre8-contracts#67 hold five). */
   borrowMarkets?: Hex[];
+  /** Present only when the owner renewal installed the routing v2 scope (src/strategy-earn-v2.ts). */
+  routingV2?: { executor: Address; account: Address };
   keyRef: `m/44'/60'/${string}`;
   permissionId: Hex;
   sessionKeyAddress: Address;
@@ -1136,6 +1139,12 @@ const SQL_ACTIVE_SESSION_KEYS = `
    order by (split_part(k.key_ref, '/', 6))::bigint desc
 `;
 
+/** A key's routing v2 grant as installed, when a v2 deployment is configured for this chain and the key carries its whole scope. */
+function routingV2Of(permissions: unknown, account: Address, chainId: number): Pick<SessionKeyRef, 'routingV2'> {
+  const v2 = strategyEarnV2(chainId);
+  return v2 !== null && v2Authorized(permissions, account, v2.executor) ? { routingV2: { executor: v2.executor, account } } : {};
+}
+
 /** A key's #204 borrow grant as installed: account plus the exact market list, so the policy rebuilds to the same id. */
 function borrowMarketsOf(permissions: unknown, account: Address): Pick<SessionKeyRef, 'borrowAccount' | 'borrowMarkets'> {
   const markets = borrowKeyMarkets(permissions, account);
@@ -1214,6 +1223,7 @@ async function resolveSessionKey(
         owner,
         ...(args.chainId === 97 && yieldAuthorization(row.permissions, args.account, TESTNET_97.contracts.executor).status === 'ready' ? { yieldAccount: args.account } : {}),
         ...(args.chainId === 97 ? borrowMarketsOf(row.permissions, args.account) : {}),
+        ...routingV2Of(row.permissions, args.account, args.chainId),
       },
     };
   }
@@ -1426,6 +1436,7 @@ export async function sessionKernelAccount(args: Pick<ExecuteArgs, 'account' | '
     ...(args.sessionKey.yieldAccount === undefined ? {} : { yieldAccount: args.sessionKey.yieldAccount }),
     ...(args.sessionKey.borrowAccount === undefined ? {} : { borrowAccount: args.sessionKey.borrowAccount }),
     ...(args.sessionKey.borrowMarkets === undefined ? {} : { borrowMarkets: args.sessionKey.borrowMarkets }),
+    ...(args.sessionKey.routingV2 === undefined ? {} : { routingV2: args.sessionKey.routingV2 }),
     signer: await toECDSASigner({ signer: keyAccount, ...(publicClient.chain?.id === 97 ? { signerContractAddress: getAddress(TESTNET_97.contracts.ecdsaSigner) } : {}) }),
   });
   if (permissions.permissionId.toLowerCase() !== args.sessionKey.permissionId.toLowerCase()) {

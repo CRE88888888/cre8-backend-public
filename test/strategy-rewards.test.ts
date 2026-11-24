@@ -14,6 +14,7 @@ const owner = '0x2000000000000000000000000000000000000002' as Address, stranger 
 const OTHER = '0x4000000000000000000000000000000000000004' as Address; // a second token paid by the multi distributor
 const proof = ['0x' + '11'.repeat(32), '0x' + '22'.repeat(32)] as Hex[];
 const sig: RewardSignature = { message: REWARD_MESSAGE(NOW.toISOString()), signature: ('0x' + 'ab'.repeat(65)) as Hex, signedAt: NOW };
+const boxSig: RewardSignature = { ...sig, signature: ('0x' + 'cd'.repeat(120)) as Hex };
 const E = 10n ** 18n;
 const transferLog = (token: Address, from: Address, to: Address, value: bigint, logIndex: number): Log =>
   ({ address: token, topics: encodeEventTopics({ abi: erc20Abi, eventName: 'Transfer', args: { from, to } }), data: encodeAbiParameters([{ type: 'uint256' }], [value]), logIndex } as unknown as Log);
@@ -23,7 +24,8 @@ function listaApi(by: Record<string, { one?: bigint; multi?: bigint }>, seen: st
   return async (url: string) => {
     seen.push(url);
     const u = new URL(url), who = u.searchParams.get('address')!;
-    assert.equal(u.searchParams.get('type'), 'safe'); assert.equal(u.searchParams.get('message'), sig.message); assert.equal(u.searchParams.get('signature'), sig.signature);
+    assert.equal(u.searchParams.get('type'), 'safe'); assert.equal(u.searchParams.get('message'), sig.message);
+    assert.equal(u.searchParams.get('signature'), who === box ? boxSig.signature : sig.signature); // the box is asked with its own signature form
     const d = by[who] ?? {};
     if (url.includes('userMultiProof')) return new Response(JSON.stringify({ code: '000000', data: d.multi ? [{ token: OTHER, tokenSymbol: 'slisBNB', amountWei: d.multi.toString(), proof }] : [] }));
     return new Response(JSON.stringify({ code: '000000', data: d.one ? { amountWei: d.one.toString(), proof } : null }));
@@ -113,7 +115,7 @@ test('round: stores pending for the account and its box, claims only what is wor
   const deps = { chainId: 56, env: { STRATEGY_REWARDS_ENABLED: '1' }, now: () => NOW, store: m.store,
     fetch: listaApi({ [account]: { one: 5n * E, multi: 2n * E }, [box]: { one: E / 100n } }, seen) as never,
     chain: { claimed: async (s: string, h: Address) => claimedOnChain[`${s}:${h}`] ?? 0n, venusAccrued: async () => 3n * E },
-    extraHolders: async () => [box], venusHolders: async () => true,
+    extraHolders: async () => [{ holder: box, sig: boxSig }], venusHolders: async () => true,
     writer: { send: async (to: Address, data: Hex) => { sent.push({ to, data });
       const logs = to === REWARDS.LISTA_DISTRIBUTOR ? [transferLog(REWARDS.LISTA as Address, to, account, 4n * E, 0)] : [transferLog(REWARDS.XVS as Address, to, account, 3n * E, 0)];
       return { hash: ('0x' + (to === REWARDS.LISTA_DISTRIBUTOR ? 'a1' : 'b2').repeat(32)) as Hex, blockNumber: 1n, logs }; } } };

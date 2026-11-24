@@ -1,3 +1,4 @@
+import { resumePausedJobsForMix, resumePausedJobsForPortfolio } from './strategy-job-recovery.js';
 import { configuredChainId } from './testnet-profile.js';
 import { createMixAssetList, createMixPreview } from './mix-preview.js';
 import { createUserMedia } from './user-media.js';
@@ -181,6 +182,9 @@ export const BUNDLER_TIMEOUT_MS = 30_000;
  * merged over the defaults, so a test can stub one dependency and leave the rest real.
  */
 export type ServerDeps = {
+  /** Tests: owner-action reset of paused strategy jobs (src/strategy-job-recovery.ts). */
+  resumePausedJobs?: (portfolioId: number) => Promise<number>;
+  resumePausedMixJobs?: (mixId: number, wallet: string) => Promise<number>;
   mixes: ReturnType<typeof createMixService>;
   mixPreview: ReturnType<typeof createMixPreview>;
   userMedia: ReturnType<typeof createUserMedia>;
@@ -551,7 +555,7 @@ async function route(
       if (method === 'PATCH') {
         const body = await readJsonBody(req);
         if (typeof body === 'object' && body !== null && 'assets' in body) await deps.rateLimiter.mixCreate(wallet, deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
-        sendJson(res, 200, await deps.mixes.patch(id, wallet, body)); return;
+        const patched = await deps.mixes.patch(id, wallet, body); await ownerActedOnMix(deps, id, wallet); sendJson(res, 200, patched); return;
       }
       return methodNotAllowed(res, ['GET', 'PATCH']);
     }
@@ -672,6 +676,7 @@ async function route(
       const result = action === 'funding-lots' ? await deps.portfolioStrategies.funding(id, wallet, input)
         : action === 'buy-funding' ? await deps.portfolioStrategies.buyFunding(id, wallet, input)
         : await deps.portfolioStrategies.executionState(id, wallet, input);
+      if (action !== 'execution-state') await ownerActed(deps, id);
       sendJson(res, 'state' in result && result.state === 'pending' ? 202 : 200, result);
     }
     return;
@@ -955,7 +960,9 @@ async function route(
         if (method !== 'POST') return methodNotAllowed(res, ['POST']);
         const closeWallet = await deps.auth.authenticate(req.headers.authorization);
         await deps.rateLimiter.wallet('close', closeWallet);
-        sendJson(res, 200, await deps.operatorClose(portfolioId(), closeWallet));
+        const closed = await deps.operatorClose(portfolioId(), closeWallet);
+        await ownerActed(deps, portfolioId());
+        sendJson(res, 200, closed);
         return;
       }
       if (segments[2] === 'redeem') {
@@ -1326,7 +1333,9 @@ async function redeemRoute(
     if (typeof sell !== 'string' || !/^[0-9]+$/.test(sell) || sell.length > 78 || BigInt(sell) <= 0n || BigInt(sell) >= 2n ** 256n) {
       throw new AppError(400, 'INVALID_AMOUNT', 'body.sellUsdE8 must be a positive E8 integer string');
     }
-    sendJson(res, 200, await deps.operatorRedeem(id, wallet, { sellUsdE8: BigInt(sell) }));
+    const redeemed = await deps.operatorRedeem(id, wallet, { sellUsdE8: BigInt(sell) });
+    await ownerActed(deps, id);
+    sendJson(res, 200, redeemed);
     return;
   }
   const usd = (body as { usd?: unknown }).usd;
@@ -1337,7 +1346,9 @@ async function redeemRoute(
   const scaled = Math.round(usd * 1e8);
   if (!Number.isSafeInteger(scaled) || scaled <= 0) throw new AppError(400, 'INVALID_AMOUNT', 'body.usd must fit a positive safe E8 integer');
   const usdE8 = BigInt(scaled);
-  sendJson(res, 200, await deps.operatorRedeem(id, wallet, usdE8));
+  const redeemed = await deps.operatorRedeem(id, wallet, usdE8);
+  await ownerActed(deps, id);
+  sendJson(res, 200, redeemed);
 }
 
 async function operatorRebalanceRoute(
@@ -1552,4 +1563,15 @@ function sendError(res: ServerResponse, err: unknown): void {
     }),
   );
   sendJson(res, 500, { error: { code: 'INTERNAL', message: 'internal server error' } });
+}
+
+/**
+ * The owner acted on a portfolio (buy, sell, edit; withdrawals in the paymaster): a strategy job paused after real
+ * failures runs again (src/strategy-job-recovery.ts). Never fails the owner's request.
+ */
+async function ownerActed(deps: ServerDeps, portfolioId: number): Promise<void> {
+  try { await (deps.resumePausedJobs ?? resumePausedJobsForPortfolio)(portfolioId); } catch { /* the next action or round retries */ }
+}
+async function ownerActedOnMix(deps: ServerDeps, mixId: number, wallet: string): Promise<void> {
+  try { await (deps.resumePausedMixJobs ?? resumePausedJobsForMix)(mixId, wallet); } catch { /* same */ }
 }

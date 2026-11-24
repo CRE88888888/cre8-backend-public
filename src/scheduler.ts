@@ -137,6 +137,8 @@ import type { PlanPartial, PlannedStep, RebalancePlan, RefreshFloorsResult } fro
 import { DEFAULT_THRESHOLD_BPS, planPortfolio } from './snapshot.js';
 import type { PortfolioPlan } from './snapshot.js';
 import type { MixRuntime } from './mix-runtime.js';
+import { listPausedJobs, resumeRetryablePausedJobs } from './strategy-job-recovery.js';
+let lastPausedLog = 0;
 import { MIN_INTERVAL_SECONDS } from './strategies.js';
 import { defaultNewMoneyDeps, prepareNewMoney, PinnedVersionChangedError } from './strategy-runtime.js';
 import { readBuyVersionWindow } from './registry-versioning.js';
@@ -578,6 +580,7 @@ export type SchedulerDeps = {
   yieldRound?: typeof runYieldRound;
   dcaRound?: typeof runDcaRound;
   strategyEarnRound?: typeof runStrategyEarnRound;
+  resumePausedJobs?: typeof resumeRetryablePausedJobs;
   /** backend#204 (chain 97): auto-open after a buy, and repay + take shares back before a sale, with the session key. */
   strategyEarn?: {
     /** `held`: collateral the planner saw in the account (lowercase); only those markets are read. */
@@ -2020,6 +2023,19 @@ export async function runSchedulerOnce(
   try { const result=await (deps.dcaRound??runDcaRound)({dryRun,limit,log:resolved.log}); if(result.checked||result.blocked)resolved.log('[dca] '+JSON.stringify(result)); } catch { resolved.log('[dca] 定投讀值／對帳未完成，下輪再試'); }
   // Strategy earn keeper (backend#199): anyone-callable deleverage/unwind and incentive claims for each account's own position.
   try { const result=await (deps.strategyEarnRound??runStrategyEarnRound)({dryRun,log:resolved.log}); if(result)resolved.log('[strategy-earn] '+JSON.stringify(result)); } catch { resolved.log('[strategy-earn] 健康度讀值未完成，下輪再試'); }
+  // Paused strategy jobs (three failed attempts): retryable pauses resume after their cool-down; the rest wait for the
+  // owner's next action (src/strategy-job-recovery.ts). Plain SQL, no chain reads. Still-paused ones are logged hourly.
+  if (!dryRun) {
+    try {
+      const resumed = await (deps.resumePausedJobs ?? resumeRetryablePausedJobs)(resolved.clock(), resolved.query as never);
+      for (const r of resumed) resolved.log(`[strategy-jobs] portfolio ${r.portfolioId} job ${r.jobId} 暫停原因可重試（未上鏈），已恢復`);
+      if (resolved.clock().getTime() - lastPausedLog >= 3_600_000) {
+        lastPausedLog = resolved.clock().getTime();
+        const paused = await listPausedJobs(resolved.query as never);
+        if (paused.length) resolved.log('[strategy-jobs] 仍暫停：' + paused.map(p => `portfolio ${p.portfolioId} job ${p.jobId}（${p.retryable ? '可重試，冷卻中' : '有上鏈失敗，等 owner 下一個動作'}，${p.pausedAt}）`).join('；'));
+      }
+    } catch { resolved.log('[strategy-jobs] 暫停工作檢查未完成，下輪再試'); }
+  }
 
   let executorPaused: boolean | null = null;
   try {

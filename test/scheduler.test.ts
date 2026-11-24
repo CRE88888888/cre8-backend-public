@@ -658,6 +658,18 @@ test('paymaster daily quota refusal (also wrapped by the bundler client) waits f
   }
 });
 
+test('each live round resumes retryable paused strategy jobs and logs them; dry-run never does', async () => {
+  const db = stubDb({ portfolios: [], sessionKeys: [] });
+  const chain = stubChain();
+  const logs: string[] = []; let calls = 0;
+  const options = { ...deps(db, chain), log: (l: string) => logs.push(l), resumePausedJobs: async () => { calls++; return [{ jobId: '7', portfolioId: '19' }]; } };
+  await runSchedulerOnce({ dryRun: false, now: new Date('2026-11-24T00:01:00Z') }, options);
+  assert.equal(calls, 1);
+  assert.ok(logs.some(l => l.includes('portfolio 19 job 7') && l.includes('已恢復')));
+  await runSchedulerOnce({ dryRun: true, now: new Date('2026-11-24T00:02:00Z') }, options);
+  assert.equal(calls, 1);
+});
+
 test('#75 crossing midnight uses the DB reservation day, not the scheduler round start', async () => {
   const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
   const chain = stubChain();

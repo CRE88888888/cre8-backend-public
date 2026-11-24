@@ -35,6 +35,7 @@ import { writeYieldState } from './yield-runtime-state.js';
 import { reservedCash } from './withdrawable-cash.js';
 import { NODE_LAG_BUDGET_MS } from './node-lag.js';
 import { rpcTransport } from './rpc-transport.js';
+import { resumePausedJobsForAccount } from './strategy-job-recovery.js';
 
 export type PackedSponsorOperation = {
   sender: Address; nonce: bigint; initCode: Hex; callData: Hex; accountGasLimits: Hex;
@@ -99,6 +100,8 @@ export type PaymasterDeps = {
   enrollmentLagMs?: number;
   /** Tests: the account's USDT balance (withdraw-to-wallet free cash check). */
   readCash?: (account: Address, config: PaymasterConfig) => Promise<bigint>;
+  /** Tests: owner-withdrawal reset of paused strategy jobs. */
+  resumePausedJobsForAccount?: (chainId: number, account: string) => Promise<number>;
 };
 export const KERNEL_EXECUTE_ABI = parseAbi(['function execute(bytes32 execMode,bytes executionCalldata) payable']);
 const TOKEN_ABI = parseAbi(['function approve(address spender,uint256 amount)', 'function transfer(address recipient,uint256 amount)']);
@@ -1150,6 +1153,11 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
           and (user_op_hash is null or user_op_hash=$2) and nonce=$3::numeric returning id`,
           [intentToSubmit.id, signed.userOpHash, op.nonce.toString()]), c.timeoutMs);
         if (saved.rows.length !== 1) throw rejected('PAYMASTER_DEPENDENCY_UNAVAILABLE', 503);
+      }
+      // A withdrawal to the owner is an owner action: a strategy job paused after real failures runs again
+      // (src/strategy-job-recovery.ts). Best effort, never fails the sponsorship.
+      if (onlyOwnerCash && c.chainId === 97) {
+        try { await bounded((deps.resumePausedJobsForAccount ?? resumePausedJobsForAccount)(c.chainId, op.sender), c.timeoutMs); } catch { /* next action or round */ }
       }
       return signed;
       };

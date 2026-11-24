@@ -52,8 +52,8 @@ async function fixture(kind:'hold'|'stack'='hold',cashWeight=0,slices=4,rebalanc
     values($1,$2,$3,'active','2030-01-01')`,[id,`m/44'/60'/0'/0/${id}`,JSON.stringify({permissionId:'0x12345678',sessionKeyAddress:owner,timestamp:{validUntil:1893456000}})]);
   const context:JobContext={chainId:97,portfolioId:id,strategyId,version,kind:'asset',execution,account,allocation,cash,now:new Date(start),reserve:R,
     caps:new Map(allocation.assets.filter(x=>x.address!==cash).map(x=>[x.address,null])),buyLimit:UINT256_MAX,observedCash:1000000n*U,enabled:true,marketOpen:true};
-  async function fund(amount:bigint,confirmedAt=new Date(start.getTime()-60000),effectiveOverride?:Record<string,number>,allocationOverride?:{weights:Record<string,number>;capped:string[]}){
-    const certificate=effectiveOverride?{minimum:50n*U,effectiveSlices:effectiveOverride}:planContribution(amount,execution,confirmedAt,R);assert.ok(certificate,'fixture contribution must meet the actual calendar minimum');
+  async function fund(amount:bigint,confirmedAt=new Date(start.getTime()-60000),effectiveOverride?:Record<string,number>,allocationOverride?:{weights:Record<string,number>;capped:string[]},minimum=50n*U){
+    const certificate=effectiveOverride?{minimum,effectiveSlices:effectiveOverride}:planContribution(amount,execution,confirmedAt,R);assert.ok(certificate,'fixture contribution must meet the actual calendar minimum');
     return withTransaction(async client=>{
       const lot=(await client.query<{id:string}>(`insert into strategy_funding_lots(chain_id,portfolio_id,strategy_id,version,kind,tx_hash,log_index,block_number,block_hash,amount_raw,minimum_contribution_raw,effective_slices,created_at,updated_at,effective_allocation,allocation_reason,capped_assets)
         values(97,$1,$2,$9,'asset',$3,0,10,$4,$5,$6,$7,$8,$8,$10,$11,$12) returning id`,[id,sid,hash(),hash(),amount.toString(),certificate.minimum.toString(),JSON.stringify(certificate.effectiveSlices),confirmedAt,version,
@@ -1341,4 +1341,124 @@ test('last-child fee DB: a child that cannot carry its fee at all is released in
   assert.equal(s.sends.length,0);assert.equal(await job(f),null);assert.equal(await jobState(waiting.id),'cancelled');
   assert.deepEqual(await balances(f),untouched,'the reserved principal and fee are back where they came from');
   assert.equal((await s.once(new Date(+start+120000))).results[0]?.outcome,'noop');assert.equal(s.sends.length,0);
+});
+
+// ---- 2026-11-24 [BASKET_WAITING] that never clears (portfolio 7; remainders that need several transactions) --------
+const sourceRows=async(f:Fixture)=>(await query<{asset:string;state:string;slices:string[]}>(`select a.asset,a.state,
+  array(select s.state from strategy_asset_slices s where s.lot_id=a.lot_id and s.asset=a.asset order by s.slice_index) as slices
+  from strategy_lot_assets a join strategy_funding_lots l on l.id=a.lot_id where l.portfolio_id=$1 and a.asset<>$2 order by a.lot_id,a.asset`,[f.id,cash])).rows;
+
+test('basket waiting DB: portfolio 7 — a private basket bought its open legs while the stock was closed; the stock leg left under 10 USDT is closed at the open and its cash left free, once',async()=>{
+  // 33.37 USDT, 74.16% crypto (a) and 25.84% stock (b): the stock leg alone is 8.62 USDT.
+  const f=await fixture('hold',0,4,'none',undefined,[7416,2584]);await f.fund(usdt('33.37'),new Date(+start-60000),{[a]:1,[b]:1},undefined,10n*U); // under the 50 USDT of a first buy, as on portfolio 7
+  const stockBudget=usdt('33.37')*2584n/10000n;assert.ok(stockBudget<10n*U);
+  const closed=(assets:readonly string[])=>assets.every(asset=>asset!==b),open=()=>true;
+  const mix=(now:Date,marketOpenFor:(assets:readonly string[])=>boolean)=>f.reserve({...f.context,personalMix:true,now,marketOpen:marketOpenFor([a,b]),marketOpenFor});
+  // Saturday: only the crypto leg is bought.
+  const first=(await mix(start,closed))?.job;assert.ok(first);assert.deepEqual(Object.keys(first.remaining_input),[a]);
+  await complete(f,first,first.remaining_input,R);
+  const waiting=await balances(f);assert.equal(waiting?.unallocated_hold_raw,stockBudget.toString());
+  // Still closed: the stock leg waits for its market, nothing is recorded.
+  for(const minutes of [5,600]){
+    const result=await mix(new Date(+start+minutes*60000),closed);
+    assert.equal(result?.job,null);assert.match(result?.reason??'',/\[MARKET_CLOSED\]/);
+  }
+  assert.deepEqual((await sourceRows(f)).find(r=>r.asset===b),{asset:b,state:'active',slices:[]});
+  // Monday's open. Before the fix every round from here on answered [BASKET_WAITING] with the same 8.62, for good.
+  const monday=new Date(+start+2*86400000+5400000);
+  const released=await mix(monday,open);
+  assert.equal(released?.job,null);assert.match(released?.reason??'',/\[BELOW_MIN_BATCH\].*8\.62.*可用現金/);
+  assert.deepEqual((await sourceRows(f)).find(r=>r.asset===b),{asset:b,state:'completed',slices:['skipped_window']},'the source is closed, so the basket no longer has new money pending');
+  const slice=(await query<{budget_raw:string;job_id:string|null;amount_raw:string}>(`select s.budget_raw::text,s.job_id,s.amount_raw::text from strategy_asset_slices s
+    join strategy_funding_lots l on l.id=s.lot_id where l.portfolio_id=$1 and s.asset=$2`,[f.id,b])).rows[0];
+  assert.deepEqual(slice,{budget_raw:stockBudget.toString(),job_id:null,amount_raw:'0'});
+  const free=await balances(f);assert.ok(free);
+  assert.equal(free.unallocated_hold_raw,stockBudget.toString(),'the cash did not move: it is simply no longer tied to a pending buy');
+  assert.equal(free.reserved_input_raw,'0');assert.equal(free.reserved_fee_raw,'0');assert.equal(free.stack_prefund_raw,'0');
+  assert.equal((await query("select 1 from strategy_jobs where portfolio_id=$1 and state<>'completed'",[f.id])).rows.length,0,'no job was created for it');
+  // Later rounds find nothing to do and change nothing.
+  for(const minutes of [1,30,1500]){
+    const again=await mix(new Date(+monday+minutes*60000),open);
+    assert.equal(again?.job,null);assert.match(again?.reason??'',/\[NO_DUE_SLOT\]/);
+  }
+  assert.deepEqual(await balances(f),free);assert.equal((await sourceRows(f)).flatMap(r=>r.slices).length,2);
+  // A later deposit buys by itself: both legs, only its own money.
+  await f.fund(100n*U,new Date(+monday+1600*60000));
+  const next=(await mix(new Date(+monday+1601*60000),open))?.job;assert.ok(next);
+  assert.deepEqual(Object.keys(next.remaining_input).sort(),[a,b].sort());assert.equal(BigInt(next.amount_raw)+BigInt(next.fee_reserve_raw),100n*U);
+  assert.equal((await balances(f))?.unallocated_hold_raw,stockBudget.toString());
+});
+
+test('basket waiting DB: an open part under 10 USDT keeps waiting while other legs are closed, then the whole deposit is bought together',async()=>{
+  const f=await fixture('hold',0,4,'none',undefined,[1500,8500]);await f.fund(50n*U);
+  const closed=(assets:readonly string[])=>assets.every(asset=>asset!==b),open=()=>true;
+  const mix=(now:Date,marketOpenFor:(assets:readonly string[])=>boolean)=>f.reserve({...f.context,personalMix:true,now,marketOpen:marketOpenFor([a,b]),marketOpenFor});
+  const before=await balances(f);
+  for(const minutes of [0,5,600]){
+    const result=await mix(new Date(+start+minutes*60000),closed);
+    assert.equal(result?.job,null);assert.match(result?.reason??'',/\[BASKET_WAITING\]/,'7.5 USDT of crypto waits for the stock leg');
+  }
+  assert.deepEqual((await sourceRows(f)).map(r=>[r.state,r.slices.length]),[['active',0],['active',0]]);assert.deepEqual(await balances(f),before);
+  const together=(await mix(new Date(+start+2*86400000),open))?.job;assert.ok(together);
+  assert.deepEqual(Object.keys(together.remaining_input).sort(),[a,b].sort());assert.equal(BigInt(together.amount_raw)+BigInt(together.fee_reserve_raw),50n*U);
+});
+
+test('basket waiting DB: one-time money that needs more transactions than it can fill is closed; depth or allowance limits keep waiting and buy later',async()=>{
+  // Seven assets, 50 USDT, one asset per transaction (as when many assets are already held): seven batches of 10 USDT are needed.
+  const f=await fixture('hold',0,4,'none',undefined,undefined,7);await f.fund(50n*U);
+  const before=await balances(f);
+  // Not enough buy allowance, or not enough depth: the same deposit can be bought later, so it waits and nothing is recorded.
+  for(const limited of [{...f.context,buyLimit:0n},{...f.context,caps:new Map([...f.context.caps.keys()].map(asset=>[asset,U/2n]))}]){
+    const result=await f.reserve(limited);assert.equal(result?.job,null);assert.match(result?.reason??'',/\[BASKET_WAITING\]/);
+  }
+  assert.ok((await sourceRows(f)).every(r=>r.state==='active'&&r.slices.length===0));assert.deepEqual(await balances(f),before);
+  const g=await fixture('hold',0,4,'none',undefined,undefined,7);await g.fund(50n*U);
+  const released=await g.reserve({...g.context,batchStepLimit:1});
+  assert.equal(released?.job,null);assert.match(released?.reason??'',/\[BELOW_MIN_BATCH\].*50 USDT.*7 個來源/);
+  const rows=await sourceRows(g);assert.equal(rows.length,7);
+  assert.ok(rows.every(r=>r.state==='completed'&&r.slices.length===1&&r.slices[0]==='skipped_window'));
+  const free=await balances(g);assert.equal(free?.unallocated_hold_raw,(50n*U).toString());assert.equal(free?.reserved_input_raw,'0');assert.equal(free?.reserved_fee_raw,'0');
+  assert.match((await g.reserve({...g.context,batchStepLimit:1,now:new Date(+start+60000)}))?.reason??'',/\[NO_DUE_SLOT\]/);
+  assert.deepEqual(await balances(g),free);
+  // The first portfolio, with its limits gone, buys the whole deposit.
+  const bought=(await f.reserve({...f.context,now:new Date(+start+120000)}))?.job;assert.ok(bought);
+  assert.equal(BigInt(bought.amount_raw)+BigInt(bought.fee_reserve_raw),50n*U);
+});
+
+test('basket waiting DB: a creator-scheduled (stack) period that cannot form a batch is left to its own window, never closed early',async()=>{
+  // Four daily periods of 50 USDT over seven assets, one asset per transaction: a period would need seven batches of 10 USDT.
+  const f=await fixture('stack',0,4,'none',undefined,undefined,7);await f.fund(200n*U);
+  const result=await f.reserve({...f.context,batchStepLimit:1});
+  assert.equal(result?.job,null);assert.match(result?.reason??'',/\[BASKET_WAITING\]/);
+  assert.ok((await sourceRows(f)).every(r=>r.state==='active'&&r.slices.length===0));
+});
+
+test('basket waiting DB: a started job whose remainder needs two transactions but cannot fill both is cancelled once and its cash released; one that can fill both keeps buying',async()=>{
+  const now=new Date('2026-11-16T15:00:00Z'); // US market hours: the seventeen assets include stock tokens
+  const f=await fixture('hold',0,4,'none',undefined,undefined,17);await f.fund(100n*U);
+  // 15 USDT over 17 assets with 0.05 fee left: above the 10 USDT single-batch rule, but 17 assets need two transactions.
+  const before=await spendDownTo(f,15n*U,usdt('0.05'));
+  const s=feeScheduler(f);
+  const result=await s.once(now);
+  assert.equal(result.results[0]?.outcome,'noop',result.results[0]?.reason);assert.match(result.results[0]?.reason??'',/\[BELOW_MIN_BATCH\].*17 個資產/);
+  assert.equal(s.sends.length,0);assert.equal(await job(f),null);assert.equal(await jobState(before.job.id),'cancelled');
+  assert.deepEqual([...new Set(await sliceStates(before.job.id))],['cancelled']);
+  const cash=await balances(f);assert.ok(cash);
+  assert.equal(cash.unallocated_hold_raw,usdt('15.05').toString(),'principal and fee are back in the free cash');
+  assert.equal(cash.reserved_input_raw,'0');assert.equal(cash.reserved_fee_raw,'0');
+  assert.equal(before.firstSpent+before.firstFee+BigInt(cash.unallocated_hold_raw)+BigInt(cash.allocated_cash_raw),100n*U,'deposit = bought + fees + released');
+  assert.deepEqual((await query<{state:string}>('select state from operations where portfolio_id=$1',[f.id])).rows.map(r=>r.state),['confirmed'],'no attempt was written for the cancelled remainder');
+  for(const minutes of [1,2,70]){
+    const next=await s.once(new Date(+now+minutes*60000));
+    assert.equal(next.results[0]?.outcome,'noop');assert.doesNotMatch(next.results[0]?.reason??'',/BELOW_MIN_BATCH|BASKET_WAITING/);
+  }
+  assert.equal(s.sends.length,0);assert.deepEqual(await balances(f),cash);
+  // 25 USDT over the same 17 assets fills two transactions: untouched by the rule, it buys in two sends and completes.
+  const g=await fixture('hold',0,4,'none',undefined,undefined,17);await g.fund(100n*U);
+  const kept=await spendDownTo(g,25n*U,usdt('0.05'));
+  const t=feeScheduler(g);
+  assert.equal((await t.once(now)).results[0]?.outcome,'executed');assert.ok((t.sends[0]?.steps.length??99)<=16);
+  assert.equal((await t.once(new Date(+now+60000))).results[0]?.outcome,'executed');
+  assert.equal(await job(g),null);assert.equal(await jobState(kept.job.id),'completed');
+  assert.equal(t.sends.reduce((sum,send)=>sum+send.steps.length,0),17);
 });

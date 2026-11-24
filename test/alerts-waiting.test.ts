@@ -13,8 +13,12 @@ test('drift alert: a portfolio the scheduler just looked at and is waiting on (m
   noteRoundOutcome(13, 'noop', 'Planner returned noop: 繼續原工作，後續期次不補扣', NOW); // a job that is not moving: not a known harmless wait
   noteRoundOutcome(14, 'blocked', '[STRATEGY_EXECUTION_UNAVAILABLE] 無法確認執行結果', NOW);
   noteRoundOutcome(15, 'failed', '[MARKET_CLOSED] but the round itself failed', NOW);
-  const found = await detectPortfolioStuck(stuckRows([7, 8, 9, 13, 14, 15, 16].map(id => ({ portfolio_id: id, hours_since: 72, gross_drift_bps: 2584 }))), 6, NOW);
-  assert.deepEqual(found.map(f => [f.portfolioId, f.severity]), [[7, 'warn'], [8, 'warn'], [9, 'warn'], [13, 'critical'], [14, 'critical'], [15, 'critical'], [16, 'critical']]);
+  noteRoundOutcome(17, 'noop', '下一次再平衡為 2026-11-25T00:00:00.000Z。', NOW); // a private basket between its rebalance dates
+  noteRoundOutcome(18, 'noop', 'Planner returned noop: [BELOW_MIN_BATCH] 待買入 8.62 USDT（1 個來源）湊不成每筆10 USDT的完整批次，已取消並留作可用現金', NOW);
+  noteRoundOutcome(19, 'noop', '目前無法確認組合價值，停利停損暫不觸發。', NOW); // a basket that cannot be valued still needs someone
+  const found = await detectPortfolioStuck(stuckRows([7, 8, 9, 13, 14, 15, 16, 17, 18, 19].map(id => ({ portfolio_id: id, hours_since: 72, gross_drift_bps: 2584 }))), 6, NOW);
+  assert.deepEqual(found.map(f => [f.portfolioId, f.severity]), [[7, 'warn'], [8, 'warn'], [9, 'warn'], [13, 'critical'], [14, 'critical'], [15, 'critical'], [16, 'critical'], [17, 'warn'], [18, 'warn'], [19, 'critical']]);
+  assert.match(found[7]!.detail, /waiting, nothing to fix: 下一次再平衡為 2026-11-25T00:00:00\.000Z。$/);
   assert.equal(found[0]!.detail, 'portfolio 7: last observation showed 2584 bps drift (still above the threshold) 72.0 hours ago, with no successful execution since — waiting, nothing to fix: [MARKET_CLOSED] 股票部分等待下一個開盤時段');
   assert.match(found[3]!.detail, /or the scheduler is not running$/); // unchanged wording for the ones that need someone
   // Under 24h everything is a warn as before; the waiting ones still say why.

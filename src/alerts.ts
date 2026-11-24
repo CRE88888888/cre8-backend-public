@@ -456,8 +456,12 @@ export async function detectPortfolioStuck(query: QueryFn, stuckHours: number, n
 export const FAILING_TAIL_CLEAN_HOURS = 6;
 /** A round outcome older than this says nothing about now. */
 export const ROUND_OUTCOME_TTL_MS = 2 * 60 * 60_000;
-/** Reasons a portfolio can sit above its drift threshold with nothing wrong: the scheduler is waiting, not failing. */
-const WAITING = /\[(MARKET_CLOSED|BASKET_WAITING|DEFERRED_MIN_ASSET|NO_DUE_SLOT|SLOT_RECORDED|BELOW_MIN_STEP|BELOW_MIN_BATCH|BELOW_MIN_DEPOSIT|[A-Z_]*BUDGET[A-Z_]*)\]|低於最小交易額|低於批次最小額|低於執行器最小步/;
+/**
+ * Reasons a portfolio can sit above its drift threshold with nothing wrong: the scheduler is waiting, not failing.
+ * 下一次再平衡為: a private basket between its own rebalance dates (portfolio 7 after its under-minimum stock leg was
+ * closed: the cash is free and the basket simply waits for its date).
+ */
+const WAITING = /\[(MARKET_CLOSED|BASKET_WAITING|DEFERRED_MIN_ASSET|NO_DUE_SLOT|SLOT_RECORDED|BELOW_MIN_STEP|BELOW_MIN_BATCH|BELOW_MIN_DEPOSIT|[A-Z_]*BUDGET[A-Z_]*)\]|低於最小交易額|低於批次最小額|低於執行器最小步|下一次再平衡為/;
 const roundOutcomes = new Map<number, { outcome: string; reason: string; at: number }>();
 /**
  * The scheduler reports every portfolio it processes (same process as the alert evaluation). The heartbeat saves the map

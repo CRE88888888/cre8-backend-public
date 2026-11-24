@@ -2,6 +2,7 @@ import { readCashWithdrawals } from './cash-reconciliation.js';
 import type { CashWithdrawal } from './cash-reconciliation.js';
 import { mixCashWithdrawals } from './mix-flows.js';
 import { executionBatchSize, executionInputGroups } from './execution-batch.js';
+import { formatUnits } from 'viem';
 import type { Address, PublicClient } from 'viem';
 import { EXECUTOR_ABI } from './chain.js';
 import { requireTypedVersion } from './strategies.js';
@@ -181,6 +182,11 @@ export async function prepareNewMoney(args:{due:DuePortfolio;plan:PortfolioPlan;
   const held=plan.snapshot.holdings.filter(h=>h.amountWei>0n&&h.asset.toLowerCase()!==cash&&plan.targets.some(a=>a.asset.toLowerCase()===h.asset.toLowerCase())).length;
   const stepLimit=executionBatchSize(held);
   if(stepLimit===0)return {job,context,rebalance:{kind:'blocked',reason:'[USER_OP_CAPACITY] 估值已超過單筆容量'}};
+  // The same rule for a remainder that needs several transactions (more assets than one UserOp carries): each of them
+  // has to reach the minimum by itself. Counting the whole fee that is left, the remainder still cannot be split that
+  // way, and only a send changes these numbers, so this used to report [BASKET_WAITING] every round for good.
+  if(newMode&&feeWindow&&maximumRemainingBatches(remaining,feeLeft,feeLeft,stepLimit,context.finalAssets,true)<1n)
+    return releaseJob(run,context,job,`[BELOW_MIN_BATCH] 剩餘本金 ${formatUnits(sumInputs(remaining),18)} USDT（${Object.keys(remaining).length} 個資產）湊不成每筆10 USDT的完整批次，已取消並退回可用現金`);
   const maximum=newMode?maximumRemainingBatches(remaining,BigInt(job.remaining_fee_raw),reserve,stepLimit,context.finalAssets,feeWindow):feeWindow?maxWindowBatches(remaining,reserve):maxBasketBatches(job.remaining_input,feeBatches);
   let count=newMode?newRemainingCount(remaining,policy.caps,policy.buyLimit,BigInt(job.remaining_fee_raw),reserve,stepLimit,context.finalAssets,feeWindow):feeWindow?windowBatchCountFor(remaining,reserve,policy.caps,policy.buyLimit):batchCountFor(job.remaining_input,policy.caps,policy.buyLimit,feeBatches);
   if(count===null)return {job,context,rebalance:{kind:'blocked',reason:'[BASKET_WAITING] 原向量無可行完整批次或費用預留'}};

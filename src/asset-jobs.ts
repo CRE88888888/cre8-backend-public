@@ -1,5 +1,6 @@
 import { reconcileCashWithdrawals } from './cash-reconciliation.js';
-import { MIN_ASSET_BATCH_RAW, maxAssetSlices, record as isRecord } from './strategy-execution.js';
+import { formatUnits } from 'viem';
+import { MIN_ASSET_BATCH_RAW, UINT256_MAX, maxAssetSlices, record as isRecord } from './strategy-execution.js';
 import type { AssetExecution, AssetMode } from './strategy-execution.js';
 import type { FundingLot, JobContext, StrategyJob } from './strategy-jobs.js';
 import { lockCash, readJob, unresolvedSql, cancelJob } from './strategy-jobs.js';
@@ -138,7 +139,24 @@ export async function prepareAssetJob(run:WithTransactionFn,c:JobContext,config:
   await completeAssetSchedules(query,c.portfolioId);
   if(!due.length)return {job:null,reason:'[DEFERRED_MIN_ASSET] 小於1 USDT，留至該資產下期'};
   const budget=assetBatchBudget(budgets,c.reserve,c.caps,c.buyLimit,c.batchStepLimit,finalAssets,c.chainId===97);
-  if(!budget)return {job:null,reason:'[BASKET_WAITING] 完整合單門檻、容量或額度不足'};
+  if(!budget){
+    // One-time (hold) money has no period that ends, so a batch that can never form used to wait for good
+    // (2026-11-24 portfolio 7, a private basket: its crypto legs were bought on a Saturday, the 8.62 USDT stock leg left
+    // for the open is under the 10 USDT batch minimum by itself and was refused every round for 76 hours).
+    // When every source still waiting on this portfolio is in this batch and the batch fails even with unlimited
+    // depth and allowance, only a later deposit could change the answer: close the sources and leave their cash free.
+    // Depth, allowance, creator periods and legs waiting for their market keep waiting as before.
+    if(due.every(s=>s.mode.kind==='hold')&&
+        assetBatchBudget(budgets,c.reserve,new Map(Object.keys(budgets).map(asset=>[asset,null])),UINT256_MAX,c.batchStepLimit,finalAssets,c.chainId===97)===null){
+      const waiting=(await sources(query,c)).filter(s=>s.index<s.effective_slices);
+      if(waiting.length===due.length&&waiting.every(w=>due.some(s=>s.lot_id===w.lot_id&&s.asset===w.asset))){
+        for(const s of due)await record(query,s,'skipped_window');
+        await completeAssetSchedules(query,c.portfolioId);
+        return {job:null,reason:`[BELOW_MIN_BATCH] 待買入 ${formatUnits(sumInputs(budgets),18)} USDT（${due.length} 個來源）湊不成每筆10 USDT的完整批次，已取消並留作可用現金`};
+      }
+    }
+    return {job:null,reason:'[BASKET_WAITING] 完整合單門檻、容量或額度不足'};
+  }
   const end=due.reduce((a,b)=>a.end<b.end?a:b).end;
   const prior=await query("select id from strategy_jobs where chain_id=$1 and portfolio_id=$2 and kind='asset' and slot_at=$3",[c.chainId,c.portfolioId,slot]);
   if(prior.rows.length)return {job:null,reason:'[SLOT_RECORDED] 原時點已記錄，不能另建同時點工作'};

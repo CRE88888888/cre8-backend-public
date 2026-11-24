@@ -50,6 +50,21 @@ export const SESSION_CALL_POLICY_VERSION = CallPolicyVersion.V0_0_4;
 
 /** 三層 policy 共用的 flag（對所有 validation 生效）。這個值也參與 permissionId 計算。 */
 export const SESSION_POLICY_FLAG = PolicyFlags.FOR_ALL_VALIDATION;
+/**
+ * The permission's own flag (the one stored with its signer; it is part of the permission id). `NOT_FOR_VALIDATE_SIG`:
+ * Kernel refuses this permission for ERC-1271 (`isValidSignature`), so a session key can only validate UserOps — it can
+ * never make the account "sign" a message (permit-style approvals, order-book orders, sign-in texts). Found 2026-11-24:
+ * with the old flag CallPolicy / GasPolicy / TimestampPolicy all pass `checkSignaturePolicy`, so any hash validated.
+ * The owner's own validator is untouched (the weekly Lista proof signature still works).
+ */
+export const SESSION_PERMISSION_FLAG = PolicyFlags.NOT_FOR_VALIDATE_SIG;
+/** Keys installed before that (snapshot has no `permissionFlag`): rebuilt exactly as installed until the owner renews. */
+export const SESSION_PERMISSION_FLAG_LEGACY = PolicyFlags.FOR_ALL_VALIDATION;
+/** The permission flag an installed key's snapshot says it carries. */
+export function sessionPermissionFlagOf(snapshot: unknown): Hex {
+  const flag: unknown = snapshot && typeof snapshot === 'object' ? Reflect.get(snapshot, 'permissionFlag') : undefined;
+  return flag === SESSION_PERMISSION_FLAG ? SESSION_PERMISSION_FLAG : SESSION_PERMISSION_FLAG_LEGACY;
+}
 
 /** HD 派生路徑的前綴；`portfolioId` 只佔最後一層（非 hardened，所以 index < 2^31）。 */
 export const SESSION_KEY_DERIVATION_PREFIX = "m/44'/60'/0'/0" as const;
@@ -220,6 +235,8 @@ export type SessionPolicies = {
   entryPoint: Address;
   kernelVersion: string;
   flag: Hex;
+  /** The permission's own flag (see SESSION_PERMISSION_FLAG). Absent on keys installed before it existed. */
+  permissionFlag?: Hex;
   call: SessionCallPolicySnapshot;
   gas: SessionGasPolicySnapshot;
   timestamp: SessionTimestampPolicySnapshot;
@@ -356,7 +373,7 @@ export function describePolicies(args: { executorAddress: Address; validUntil?: 
   assertValidUntil(validUntil);
 
   const policies = buildPolicies(executorAddress, SESSION_VALID_AFTER, validUntil, args.chainId, args.yieldAccount, args.borrowAccount, args.borrowMarkets, args.routingV2);
-  return snapshotPolicies(policies);
+  return { ...snapshotPolicies(policies), permissionFlag: SESSION_PERMISSION_FLAG };
 }
 
 /** 預設的 `validUntil`：`nowSeconds + 365 天`。純函式，測試可以自己指定 now。 */
@@ -460,6 +477,8 @@ export type BuildSessionPermissionsArgs = {
   borrowAccount?: Address;
   /** Rebuilding an installed key: the market list it was installed with (`borrowKeyMarkets`). Default: today's table. */
   borrowMarkets?: readonly Hex[];
+  /** Rebuilding an installed key: the permission flag it was installed with (`sessionPermissionFlagOf`). Default: SESSION_PERMISSION_FLAG. */
+  permissionFlag?: Hex;
   /** Owner upgrade only: routing v2 calls on AtpBorrowExecutorV2 pinned to this account (src/strategy-earn-v2.ts). */
   routingV2?: RoutingV2Scope;
   /** 推導地址要用：`toPermissionValidator` 讀 `client.chain.id`（或打 eth_chainId）。 */
@@ -514,6 +533,8 @@ export async function buildSessionPermissions(args: BuildSessionPermissionsArgs)
 
   // 型別理由同 src/kernel.ts：SDK 把 kernelVersion 收窄成 GetKernelVersion<"0.7">。
   const kernelVersion: GetKernelVersion<'0.7'> = KERNEL_V3_3;
+  const permissionFlag = args.permissionFlag ?? SESSION_PERMISSION_FLAG;
+  if (permissionFlag !== SESSION_PERMISSION_FLAG && permissionFlag !== SESSION_PERMISSION_FLAG_LEGACY) throw new Error('session permission flag 只接受目前或舊版的值');
 
   const permissionValidator = await toPermissionValidator(args.publicClient, {
     signer: args.signer ?? toEmptyECDSASigner(sessionKeyAddress, chainId === 97 ? getAddress(TESTNET_97.contracts.ecdsaSigner) : undefined),
@@ -521,7 +542,7 @@ export async function buildSessionPermissions(args: BuildSessionPermissionsArgs)
     policies: [policies.call, policies.gas, policies.timestamp],
     entryPoint: ENTRY_POINT,
     kernelVersion,
-    flag: SESSION_POLICY_FLAG,
+    flag: permissionFlag,
   });
 
   // 安裝權限的 calldata：只有這一段會改變 counterfactual 地址。
@@ -534,6 +555,7 @@ export async function buildSessionPermissions(args: BuildSessionPermissionsArgs)
     permissionId,
     policySnapshot: {
       ...snapshotPolicies(policies),
+      permissionFlag,
       permissionId,
       sessionKeyAddress,
       expiresAt: new Date(validUntil * 1000).toISOString(),

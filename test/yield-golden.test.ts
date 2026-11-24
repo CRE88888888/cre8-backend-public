@@ -33,3 +33,29 @@ test('#106 registry ABI contains reviewed reconciliation and identity/rate contr
   for (const name of ['reconcile', 'acknowledgeIdentity', 'marketIdentity', 'widenMaxRate', 'rateCheckpoint']) assert.ok(names.has(name), name);
   for (const name of ['reserveSupply', 'totalReserved']) assert.equal(names.has(name), false, name);
 });
+
+test('session permission cannot be used for ERC-1271: new installs carry NOT_FOR_VALIDATE_SIG; keys installed before rebuild to their old id', async () => {
+  const { createPublicClient, custom } = await import('viem');
+  const { bscTestnet } = await import('viem/chains');
+  const { mnemonicToAccount } = await import('viem/accounts');
+  const { PolicyFlags } = await import('@zerodev/permissions');
+  const { buildSessionPermissions, SESSION_PERMISSION_FLAG, SESSION_PERMISSION_FLAG_LEGACY, sessionPermissionFlagOf } = await import('../src/permissions.js');
+  const { TESTNET_97: T } = await import('../src/testnet-profile.js');
+  assert.deepEqual([SESSION_PERMISSION_FLAG, SESSION_PERMISSION_FLAG_LEGACY], [PolicyFlags.NOT_FOR_VALIDATE_SIG, PolicyFlags.FOR_ALL_VALIDATION]);
+  const client = createPublicClient({ chain: bscTestnet, transport: custom({ request: async () => { throw new Error('no RPC'); } }) });
+  const args = { publicClient: client, sessionKeyAddress: mnemonicToAccount('test test test test test test test test test test test junk', { addressIndex: 3 }).address,
+    executorAddress: T.contracts.executor as `0x${string}`, yieldAccount: '0x1000000000000000000000000000000000000005' as const, validUntil: 1_900_000_000 };
+  const fresh = await buildSessionPermissions(args);
+  assert.equal(fresh.permissionId, golden.permissionId);
+  assert.equal(fresh.policySnapshot.permissionFlag, '0x0002');
+  // The same key as installed before 2026-11-24 (this vector's id in the previous golden file): rebuilt byte for byte.
+  const legacy = await buildSessionPermissions({ ...args, permissionFlag: SESSION_PERMISSION_FLAG_LEGACY });
+  assert.equal(legacy.permissionId, '0xe2ff633f');
+  assert.notEqual(legacy.permissionId, fresh.permissionId);
+  assert.notDeepEqual(legacy.initConfig, fresh.initConfig);
+  // What the scheduler reads from a stored snapshot: old rows have no field -> legacy; anything unknown -> legacy; new rows -> new.
+  const { permissionFlag: _drop, ...oldRow } = legacy.policySnapshot;
+  assert.deepEqual([sessionPermissionFlagOf(oldRow), sessionPermissionFlagOf(null), sessionPermissionFlagOf({ permissionFlag: '0x0001' }), sessionPermissionFlagOf(fresh.policySnapshot)],
+    ['0x0000', '0x0000', '0x0000', '0x0002']);
+  await assert.rejects(buildSessionPermissions({ ...args, permissionFlag: '0x0001' }));
+});

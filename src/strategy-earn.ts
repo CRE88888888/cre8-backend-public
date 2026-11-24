@@ -8,7 +8,7 @@ import { AppError, ValidationError } from './errors.js';
 import { requireOwnedPortfolio } from './portfolios.js';
 import { TESTNET_97 } from './testnet-profile.js';
 import { STRATEGY_EARN_97 } from './strategy-earn-guard.js';
-import { borrowAuthorized } from './permissions.js';
+import { borrowAuthorized, SESSION_PERMISSION_FLAG, sessionPermissionFlagOf } from './permissions.js';
 import { rpcBatch, rpcTransport } from './rpc-transport.js';
 import { createMainnetRates, mainnetQuote } from './strategy-earn-mainnet.js';
 import type { MainnetRates } from './strategy-earn-mainnet.js';
@@ -423,7 +423,9 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
   async function borrowKeyReady(id: number, account: Address) {
     const rows = (await deps.query<{ permissions: unknown }>(`select permissions from session_keys where portfolio_id = $1 and status = 'active' and expires_at > now()
       order by (split_part(key_ref, '/', 6))::bigint desc limit 1`, [id])).rows;
-    return rows[0] !== undefined && borrowAuthorized(rows[0].permissions, account);
+    // A key installed before SESSION_PERMISSION_FLAG can still pass the account's ERC-1271: ask for the renewal (same owner
+    // UserOp as the consent, no extra screen) so it is replaced the next time the owner turns the yield strategy on.
+    return rows[0] !== undefined && borrowAuthorized(rows[0].permissions, account) && sessionPermissionFlagOf(rows[0].permissions) === SESSION_PERMISSION_FLAG;
   }
   function body(input: unknown, keys: readonly string[]) {
     if (typeof input !== 'object' || input === null || Array.isArray(input) || Object.keys(input).some(k => !keys.includes(k)) || keys.some(k => !(k in input))) {

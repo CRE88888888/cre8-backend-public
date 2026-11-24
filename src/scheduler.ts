@@ -133,7 +133,7 @@ import { getConfig, getSessionKeyConfig, requireSessionKeyConfig } from './confi
 import { errorMessage, query as dbQuery, withTransaction, withPortfolioLock } from './db.js';
 import { errorChain as describeErrorChain } from './errors.js';
 import { AppError } from './errors.js';
-import { borrowKeyMarkets, buildSessionPermissions, yieldAuthorization } from './permissions.js';
+import { borrowKeyMarkets, buildSessionPermissions, SESSION_PERMISSION_FLAG_LEGACY, sessionPermissionFlagOf, yieldAuthorization } from './permissions.js';
 import { DEFAULT_DEADLINE_SECONDS as PLAN_DEFAULT_DEADLINE_SECONDS, planRebalance, readMaxLegUsdE8, refreshFloors, minimumDepositUsdtWei, checkTradeMinimums, checkBuyFeeReserve } from './rebalance-plan.js';
 import { writeSnapshot as writeSnapshotImpl } from './snapshot.js';
 import type { PlanPartial, PlannedStep, RebalancePlan, RefreshFloorsResult } from './rebalance-plan.js';
@@ -495,6 +495,8 @@ export type SessionKeyRef = {
   borrowAccount?: Address;
   /** With `borrowAccount`: the market list the key was installed with (keys renewed before cre8-contracts#67 hold five). */
   borrowMarkets?: Hex[];
+  /** The permission flag the key was installed with (keys from before SESSION_PERMISSION_FLAG carry the legacy one). */
+  permissionFlag?: Hex;
   /** Present only when the owner renewal installed the routing v2 scope (src/strategy-earn-v2.ts). */
   routingV2?: { executor: Address; account: Address };
   keyRef: `m/44'/60'/${string}`;
@@ -1225,6 +1227,7 @@ async function resolveSessionKey(
         ...(args.chainId === 97 && yieldAuthorization(row.permissions, args.account, TESTNET_97.contracts.executor).status === 'ready' ? { yieldAccount: args.account } : {}),
         ...(args.chainId === 97 ? borrowMarketsOf(row.permissions, args.account) : {}),
         ...routingV2Of(row.permissions, args.account, args.chainId),
+        permissionFlag: sessionPermissionFlagOf(row.permissions),
       },
     };
   }
@@ -1438,6 +1441,8 @@ export async function sessionKernelAccount(args: Pick<ExecuteArgs, 'account' | '
     ...(args.sessionKey.borrowAccount === undefined ? {} : { borrowAccount: args.sessionKey.borrowAccount }),
     ...(args.sessionKey.borrowMarkets === undefined ? {} : { borrowMarkets: args.sessionKey.borrowMarkets }),
     ...(args.sessionKey.routingV2 === undefined ? {} : { routingV2: args.sessionKey.routingV2 }),
+    // A key reference without the field (tests, old callers) is a key from before the flag existed.
+    permissionFlag: args.sessionKey.permissionFlag ?? SESSION_PERMISSION_FLAG_LEGACY,
     signer: await toECDSASigner({ signer: keyAccount, ...(publicClient.chain?.id === 97 ? { signerContractAddress: getAddress(TESTNET_97.contracts.ecdsaSigner) } : {}) }),
   });
   if (permissions.permissionId.toLowerCase() !== args.sessionKey.permissionId.toLowerCase()) {

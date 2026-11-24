@@ -307,6 +307,7 @@ test('describePolicies 與 buildSessionPermissions 用的是同一組參數（�
 
   assert.deepEqual(described, {
     version: policySnapshot.version,
+    permissionFlag: policySnapshot.permissionFlag,
     entryPoint: policySnapshot.entryPoint,
     kernelVersion: policySnapshot.kernelVersion,
     flag: policySnapshot.flag,

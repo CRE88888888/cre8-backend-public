@@ -25,7 +25,7 @@ import type { PoolClient } from 'pg';
 import { query, withTransaction } from './db.js';
 import { AppError } from './errors.js';
 import { TESTNET_97, testnetAssets } from './testnet-profile.js';
-import { SESSION_GAS_ALLOWED_WEI, sessionCallPermissions } from './permissions.js';
+import { SESSION_GAS_ALLOWED_WEI, SESSION_PERMISSION_FLAG, sessionCallPermissions } from './permissions.js';
 import { YIELD_REGISTRY_ABI } from './yield-abi.js';
 import { BORROW_CALL_ABI, isStrategyMarketId, isStrategyVault, STRATEGY_EARN_97 } from './strategy-earn-guard.js';
 import { MAX_USER_OP_GAS } from './execution-batch.js';
@@ -204,7 +204,8 @@ function validateRenewal(install: Hex, grant: Hex, c: PaymasterConfig, account: 
     toTimestampPolicy({ policyAddress: p.timestampPolicy, validAfter, validUntil }),
   ];
   const signer = toEmptyECDSASigner(signerAddress, p.ecdsaSigner);
-  const flag = PolicyFlags.FOR_ALL_VALIDATION;
+  // Renewals install the permission that cannot be used for ERC-1271 (SESSION_PERMISSION_FLAG); the old form is no longer sponsored.
+  const flag = SESSION_PERMISSION_FLAG;
   const expectedEnableData = encodeAbiParameters(BYTES_ARRAY_ABI, [[
     ...policies.map((policy) => concatHex([policy.getPolicyInfoInBytes(), policy.getPolicyData()])),
     concatHex([flag, signer.signerContractAddress, signer.getSignerData()]),

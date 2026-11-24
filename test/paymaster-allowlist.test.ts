@@ -56,7 +56,7 @@ async function renewalCalls(options: RenewalOptions = {}): Promise<Call[]> {
   // Same SDK, policies and initConfig as kernel-smoke and backend renewal-params; no RPC is needed.
   const permission = await toPermissionValidator(client, {
     signer: toEmptyECDSASigner(options.signerAddress ?? SENDER, options.signerContract ?? C.ecdsaSigner), entryPoint: { address: C.entryPoint, version: '0.7' }, kernelVersion: KERNEL_V3_3,
-    flag: options.flag ?? PolicyFlags.FOR_ALL_VALIDATION,
+    flag: options.flag ?? PolicyFlags.NOT_FOR_VALIDATE_SIG,
     policies: [toCallPolicy({ policyVersion: CallPolicyVersion.V0_0_4, policyAddress: C.callPolicy,
       permissions: [{ target: C.executor, selector: EXECUTOR_SELECTOR }], ...options.callPolicy }),
     toGasPolicy({ policyAddress: C.gasPolicy, allowed: 10n ** 18n, enforcePaymaster: true, allowedPaymaster: C.paymaster, ...options.gas }),
@@ -159,6 +159,8 @@ for (const [name, options] of [
   ['foreign signer contract', { signerContract: asset }],
   ['zero session signer', { signerAddress: zeroAddress }],
   ['signer skips UserOp validation', { flag: PolicyFlags.NOT_FOR_VALIDATE_USEROP }],
+  // 2026-11-24: the old flag let the session key pass the account's ERC-1271 for any hash; renewals with it are no longer sponsored.
+  ['permission usable for ERC-1271 signing (legacy flag)', { flag: PolicyFlags.FOR_ALL_VALIDATION }],
 ] satisfies [string, RenewalOptions][]) {
   test('#71 renewal rejects ' + name, async () => {
     const callData = await encodeCallDataEpV07(await renewalCalls(options));

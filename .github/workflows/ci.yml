@@ -134,6 +134,7 @@ jobs:
           test/execution-batch.test.ts
           test/fee-window.test.ts
           test/new-money-plan.test.ts
+          test/last-child-fee.test.ts
           test/strategy-runtime.test.ts
           test/cash-reconciliation.test.ts
           test/mix-cash-withdrawal-source.test.ts

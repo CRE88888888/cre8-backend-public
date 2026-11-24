@@ -266,7 +266,7 @@ function scheduler(f:Fixture,extra:SchedulerDeps={}){
     readPermissionConfig:async()=>({signer:f.owner,policyCount:3}),deriveSessionKeyAddress:async()=>f.owner,readAllowance:async()=>UINT256_MAX,readBalance:async()=>UINT256_MAX,
     readRebalanceNonce:async()=>0n,checkTradingMinimums:async()=>null,hasBoughtBefore:async()=>true,refreshFloors:async i=>({ok:true,steps:[...i.steps],refreshes:[],note:'fresh'}),
     newMoney:{withdrawals:async()=>[],rebalanceReserve:async()=>R,version:(sid,v,onchainId,account,options)=>requireTypedVersion(sid,v,onchainId,account,{...options,verifyChain:false}),
-      policy:async()=>({reserve:R,caps:new Map(f.context.caps),buyLimit:UINT256_MAX,cash:10000n*U}),verifyLots:async()=>{},marketOpen:()=>true,
+      policy:async()=>({reserve:R,caps:new Map(f.context.caps),buyLimit:UINT256_MAX,cash:10000n*U}),verifyLots:async()=>{},marketOpen:()=>true,feeDue:async()=>async()=>0n,
       quote:async(_due,_plan,inputs,deadline)=>({kind:'ready',steps:Object.entries(inputs).map(([token,raw])=>({tokenIn:cash,tokenOut:token as Address,amountIn:BigInt(raw),amountOutMin:90n,oracleFloor:80n,venue:TESTNET_97.contracts.universalRouter,data:'0x'})),deadline,rationale:'test exact new money'})},
     executeRebalance:async args=>{await args.beforeSending?.();sends.push(args);args.onSending();await args.onSubmitted({userOpHash:userHash});return {status,userOpHash:userHash,txHash:status==='unknown'?null:txHash,gasUsed:'100',error:status==='success'?null:'receipt timeout'};},
     reconcileRebalance:async input=>({kind:'found',outcome:{status:'success',userOpHash:userHash,txHash,gasUsed:'100',error:null,
@@ -1160,4 +1160,185 @@ test('2026-11-23: an owner waiting for the shared DEX lane makes the scheduler y
     assert.equal(await owner,'owner');
     assert.equal(await withDexLock(97,async()=>'scheduler'),'scheduler','flag released after the owner ran');
   }finally{hold.release();}
+});
+
+// ---- 2026-11-24 last-child fee (portfolios 13 and 17) --------------------------------------------------------------
+// The executor's hourly fee window, as the contract computes it: T(c) = max(0, min(0.3, c x 1%) - c x 0.1%).
+function feeWindowModel(){
+  const minimum=3n*U/10n,w={start:0n,notional:0n,paid:0n};
+  const T=(c:bigint)=>{const m=c/100n<minimum?c/100n:minimum,p=c/1000n;return m>p?m-p:0n;};
+  const active=(at:bigint)=>w.start!==0n&&at<w.start+3600n;
+  const due=(n:bigint,at:bigint)=>{const owed=T(n+(active(at)?w.notional:0n)),paid=active(at)?w.paid:0n;return n===0n||paid>=owed?0n:owed-paid;};
+  const charge=(n:bigint,at:bigint)=>{if(!active(at)){w.start=at;w.notional=0n;w.paid=0n;}const d=due(n,at);w.notional+=n;w.paid+=d;return d;};
+  return {due,charge};
+}
+/** The scheduler harness with the fee window wired in: the planner reads it, and each landed send is charged by it. */
+function feeScheduler(f:Fixture,model=feeWindowModel(),extra:SchedulerDeps={}){
+  let at=0n;const fees=new Map<ExecuteArgs,bigint>();
+  const s=scheduler(f,extra);assert.ok(s.deps.newMoney);
+  s.deps.newMoney.feeDue=async()=>async n=>model.due(n,at);
+  const spent=(send:ExecuteArgs)=>Object.fromEntries(send.steps.map(step=>[step.tokenOut.toLowerCase(),step.amountIn.toString()]));
+  const reconcile=s.deps.reconcileRebalance;assert.ok(reconcile);
+  s.deps.reconcileRebalance=async input=>{
+    const result=await reconcile(input),send=s.sends.at(-1);
+    if(result.kind==='found'&&result.outcome.batchEvidence&&send){
+      if(!fees.has(send))fees.set(send,model.charge(sumInputs(spent(send)),at));
+      Object.assign(result.outcome.batchEvidence,{inputs:spent(send),feePaid:fees.get(send)});
+    }
+    return result;
+  };
+  return {...s,model,fees,spent,once:(now:Date)=>{at=BigInt(Math.floor(now.getTime()/1000));return s.once(now);}};
+}
+const usdt=(text:string)=>{const [whole,fraction='']=text.split('.');return BigInt(whole??'0')*U+BigInt((fraction+'0'.repeat(18)).slice(0,18));};
+/** Leave a started job with exactly `left` principal (split evenly) and `feeLeft`, as earlier fee windows would. */
+async function spendDownTo(f:Fixture,left:bigint,feeLeft:bigint){
+  const j=(await f.reserve())?.job;assert.ok(j);
+  const assets=Object.keys(j.remaining_input),each=left/BigInt(assets.length);
+  const remaining=Object.fromEntries(assets.map((asset,i)=>[asset,(each+(i===0?left-each*BigInt(assets.length):0n)).toString()]));
+  const spent=Object.fromEntries(assets.map(asset=>[asset,(BigInt(j.remaining_input[asset]??'0')-BigInt(remaining[asset]??'0')).toString()]));
+  await complete(f,j,spent,BigInt(j.remaining_fee_raw)-feeLeft);
+  const now=await job(f);assert.ok(now);assert.deepEqual(now.remaining_input,remaining);assert.equal(now.remaining_fee_raw,feeLeft.toString());
+  return {job:now,remaining,firstSpent:sumInputs(spent),firstFee:BigInt(j.remaining_fee_raw)-feeLeft};
+}
+const jobState=async(id:string)=>(await query<{state:string}>('select state from strategy_jobs where id=$1',[id])).rows[0]?.state;
+const sliceStates=async(id:string)=>(await query<{state:string}>('select state from strategy_asset_slices where job_id=$1',[id])).rows.map(r=>r.state);
+
+test('last-child fee DB: portfolio 17 numbers (18.7331 left, 0.1207 fee, 7 assets) buy 18.6856, pay 0.1682 and finish; deposit = bought + fees + cash',async()=>{
+  const f=await fixture('hold',0,4,'none',undefined,undefined,7);await f.fund(100n*U);
+  const before=await spendDownTo(f,usdt('18.7331'),usdt('0.1207'));
+  const s=feeScheduler(f),now=new Date('2026-11-16T15:00:00Z'); // US market hours: the seven assets include stock tokens
+  // Before the fix this child was refused before sending every round: the top-up is 0.1686 and 0.1207 was left.
+  assert.ok(s.model.due(usdt('18.7331'),0n)>usdt('0.1207'));
+  const result=await s.once(now);
+  assert.equal(result.results[0]?.outcome,'executed',result.results[0]?.reason);assert.equal(s.sends.length,1);
+  const send=s.sends[0];assert.ok(send);const bought=sumInputs(s.spent(send)),fee=s.fees.get(send);assert.ok(fee!==undefined);
+  assert.equal(send.steps.length,7);
+  assert.equal((bought+U/20000n)/(U/10000n),186856n,'buys 18.6856');assert.equal((fee+U/20000n)/(U/10000n),1682n,'pays 0.1682');
+  for(const step of send.steps)assert.ok(step.amountIn<BigInt(before.remaining[step.tokenOut.toLowerCase()]??'0'));
+  // The sender's fee check gets the fee the job had left plus the principal this child gave up, and that covers the charge.
+  assert.equal(send.feeBudget,usdt('0.1207')+usdt('18.7331')-bought);assert.ok(fee<=(send.feeBudget??0n));
+  assert.equal(await job(f),null);assert.equal(await jobState(before.job.id),'completed');
+  assert.deepEqual([...new Set(await sliceStates(before.job.id))],['completed']);
+  const batch=(await query<{input_raw:Record<string,string>;fee_paid_raw:string;state:string}>('select input_raw,fee_paid_raw::text,state from strategy_job_batches where job_id=$1 order by batch_index desc limit 1',[before.job.id])).rows[0];
+  assert.deepEqual(batch?.input_raw,before.remaining,'the batch records the principal taken from the job');
+  // The principal given up pays first; the job's fee budget pays the rest (all of it but the sizing remainder).
+  assert.equal(BigInt(batch?.fee_paid_raw??'0'),fee-(usdt('18.7331')-bought));assert.ok(usdt('0.1207')-BigInt(batch?.fee_paid_raw??'0')<U/100000n);assert.equal(batch?.state,'confirmed');
+  const cash=await balances(f);assert.ok(cash);
+  assert.equal(cash.reserved_input_raw,'0');assert.equal(cash.reserved_fee_raw,'0');assert.equal(cash.unallocated_hold_raw,'0');
+  assert.ok(BigInt(cash.allocated_cash_raw)<U/100000n,'under 0.00001 USDT is left as cash');
+  // Deposit = bought + fees + cash kept, to the raw unit.
+  assert.equal(before.firstSpent+bought+before.firstFee+fee+BigInt(cash.allocated_cash_raw),100n*U);
+  assert.equal((await query('select 1 from operations where portfolio_id=$1 and state<>$2',[f.id,'confirmed'])).rows.length,0,'no failed attempt');
+  assert.equal((await s.once(new Date(+now+60000))).results[0]?.outcome,'noop');assert.equal(s.sends.length,1);
+  assert.deepEqual(await balances(f),cash);
+});
+
+test('last-child fee DB: a job that runs into a second fee window pays that window from the child, finishes, and conserves the deposit',async()=>{
+  const f=await fixture();await f.fund(300n*U);const s=feeScheduler(f);assert.ok(s.deps.newMoney);
+  s.deps.newMoney.policy=async()=>({reserve:R,caps:new Map([[a,50n*U],[b,50n*U]]),buyLimit:100n*U,cash:10000n*U});
+  // Window 1: the first child's top-up (0.2001) fits the 0.27 the job reserved.
+  assert.equal((await s.once(start)).results[0]?.outcome,'executed');
+  const first=s.sends[0];assert.ok(first);const full=sumInputs(s.spent(first));
+  assert.equal(first.feeBudget,R);assert.equal(s.fees.get(first),3n*U/10n-full/1000n);
+  const afterFirst=await job(f);assert.ok(afterFirst);const feeLeft=BigInt(afterFirst.remaining_fee_raw);assert.equal(feeLeft,R-(s.fees.get(first)??0n));
+  // Window 2, two hours later: the same top-up is due again and only 0.07 is left. The child buys less and pays it.
+  const later=new Date(+start+7200000);
+  assert.ok(s.model.due(full,BigInt(later.getTime()/1000))>feeLeft);
+  assert.equal((await s.once(later)).results[0]?.outcome,'executed');
+  const second=s.sends[1];assert.ok(second);const reduced=sumInputs(s.spent(second)),secondFee=s.fees.get(second);assert.ok(secondFee!==undefined);
+  assert.ok(reduced<full&&full-reduced<U/5n);assert.equal(second.feeBudget,feeLeft+full-reduced);assert.ok(secondFee<=(second.feeBudget??0n));
+  const afterSecond=await job(f);assert.ok(afterSecond);assert.ok(BigInt(afterSecond.remaining_fee_raw)<U/100000n,'the fee budget is used up');assert.equal(afterSecond.failure_count,0);
+  assert.equal(sumInputs(afterSecond.remaining_input),sumInputs(afterFirst.remaining_input)-full,'the job gave the child its full principal');
+  // Same window, a minute later: the window is paid, so the last child buys everything that is left.
+  assert.equal((await s.once(new Date(+later+60000))).results[0]?.outcome,'executed');
+  const third=s.sends[2];assert.ok(third);assert.equal(sumInputs(s.spent(third)),sumInputs(afterSecond.remaining_input));assert.equal(s.fees.get(third),0n);
+  assert.equal(await job(f),null);assert.equal(await jobState(afterFirst.id),'completed');assert.equal(s.sends.length,3);
+  const cash=await balances(f);assert.ok(cash);assert.equal(cash.reserved_input_raw,'0');assert.equal(cash.reserved_fee_raw,'0');
+  const bought=s.sends.reduce((sum,send)=>sum+sumInputs(s.spent(send)),0n),fees=[...s.fees.values()].reduce((sum,fee)=>sum+fee,0n);
+  assert.equal(bought+fees+BigInt(cash.allocated_cash_raw),300n*U,'deposit = bought + fees + cash kept');
+  assert.ok(BigInt(cash.allocated_cash_raw)<U/1000n);
+  assert.equal((await query('select 1 from operations where portfolio_id=$1 and state<>$2',[f.id,'confirmed'])).rows.length,0,'no failed attempt in any window');
+});
+
+test('last-child fee DB: a fee-paying child whose receipt times out settles later from its own receipt, once',async()=>{
+  const f=await fixture('hold',0,4,'none',undefined,undefined,7);await f.fund(100n*U);
+  const before=await spendDownTo(f,usdt('18.7331'),usdt('0.1207'));
+  const s=feeScheduler(f),now=new Date('2026-11-16T15:00:00Z');s.setStatus('unknown');
+  assert.equal((await s.once(now)).results[0]?.outcome,'blocked');assert.equal(s.sends.length,1);
+  const send=s.sends[0];assert.ok(send);const bought=sumInputs(s.spent(send));assert.ok(bought<usdt('18.7331'));
+  const reserved=await balances(f);assert.equal(reserved?.reserved_input_raw,usdt('18.7331').toString());
+  // Restart: only the batch row (the principal taken) and the original UserOp are known.
+  const fee=s.model.charge(bought,BigInt(now.getTime()/1000));
+  const resumed=scheduler(f,{executeRebalance:async()=>{throw new Error('must reconcile instead of resending');},reconcileRebalance:async input=>{
+    assert.deepEqual(input.expectedInputs,before.remaining);const original=await s.deps.reconcileRebalance?.(input);assert.ok(original&&original.kind==='found'&&original.outcome.batchEvidence);
+    Object.assign(original.outcome.batchEvidence,{inputs:s.spent(send),feePaid:fee});return original;}});
+  assert.equal((await resumed.once(new Date(+now+60000))).results[0]?.outcome,'executed');assert.equal(resumed.sends.length,0);
+  assert.equal(await job(f),null);assert.equal(await jobState(before.job.id),'completed');
+  const cash=await balances(f);assert.ok(cash);assert.equal(cash.reserved_input_raw,'0');assert.equal(cash.reserved_fee_raw,'0');
+  assert.equal(before.firstSpent+bought+before.firstFee+fee+BigInt(cash.allocated_cash_raw),100n*U);
+  assert.equal((await resumed.once(new Date(+now+120000))).results[0]?.outcome,'noop');assert.deepEqual(await balances(f),cash);
+});
+
+test('last-child fee DB: principal set aside for a fee the window did not charge is kept as cash, never lost or re-bought',async()=>{
+  const f=await fixture();await f.fund(100n*U);
+  const before=await spendDownTo(f,20n*U,0n);
+  const s=feeScheduler(f),now=new Date(+start+60000);
+  // Sized against a fresh window (0.18 due on 20), but another batch opened and paid the window before this one landed.
+  const reconcile=s.deps.reconcileRebalance;assert.ok(reconcile);
+  s.deps.reconcileRebalance=async input=>{const result=await reconcile(input);if(result.kind==='found'&&result.outcome.batchEvidence)result.outcome.batchEvidence.feePaid=U/100n;return result;};
+  assert.equal((await s.once(now)).results[0]?.outcome,'executed');
+  const send=s.sends[0];assert.ok(send);const bought=sumInputs(s.spent(send));assert.ok(bought<20n*U);
+  assert.equal(await job(f),null);assert.equal(await jobState(before.job.id),'completed');
+  const cash=await balances(f);assert.ok(cash);assert.equal(cash.reserved_input_raw,'0');assert.equal(cash.reserved_fee_raw,'0');
+  assert.equal(BigInt(cash.allocated_cash_raw),20n*U-bought-U/100n);
+  assert.equal(before.firstSpent+bought+before.firstFee+U/100n+BigInt(cash.allocated_cash_raw),100n*U);
+  // A fee above what the child and the job set aside is still refused: the attempt stays in flight for reconciliation.
+  const g=await fixture();await g.fund(100n*U);await spendDownTo(g,20n*U,0n);
+  const t=feeScheduler(g),again=t.deps.reconcileRebalance;assert.ok(again);
+  t.deps.reconcileRebalance=async input=>{const result=await again(input);if(result.kind==='found'&&result.outcome.batchEvidence)result.outcome.batchEvidence.feePaid=U;return result;};
+  assert.notEqual((await t.once(now)).results[0]?.outcome,'executed');
+  assert.equal((await balances(g))?.reserved_input_raw,(20n*U).toString());assert.equal((await job(g))?.remaining_fee_raw,'0');
+});
+
+test('last-child fee DB: what is left under one minimum batch is cancelled once, its cash released, and never retried',async()=>{
+  const f=await fixture();await f.fund(100n*U);
+  // 9.90 principal + 0.05 fee = 9.95: under the 10 USDT batch minimum for good (the fee can only shrink).
+  const before=await spendDownTo(f,usdt('9.9'),usdt('0.05'));
+  const s=feeScheduler(f),now=new Date(+start+60000);
+  const result=await s.once(now);
+  assert.equal(result.results[0]?.outcome,'noop');assert.match(result.results[0]?.reason??'',/\[BELOW_MIN_BATCH\]/);
+  assert.equal(s.sends.length,0);assert.equal(await job(f),null);assert.equal(await jobState(before.job.id),'cancelled');
+  assert.deepEqual([...new Set(await sliceStates(before.job.id))],['cancelled']);
+  const cash=await balances(f);assert.ok(cash);
+  assert.equal(cash.unallocated_hold_raw,usdt('9.95').toString(),'principal and fee are back in the free cash');
+  assert.equal(cash.reserved_input_raw,'0');assert.equal(cash.reserved_fee_raw,'0');assert.equal(cash.stack_prefund_raw,'0');
+  assert.equal(before.firstSpent+before.firstFee+BigInt(cash.unallocated_hold_raw)+BigInt(cash.allocated_cash_raw),100n*U,'deposit = bought + fees + released');
+  const operations=(await query<{state:string}>('select state from operations where portfolio_id=$1',[f.id])).rows.map(r=>r.state);
+  assert.deepEqual(operations,['confirmed'],'no attempt was written for the cancelled remainder');
+  for(const minutes of [2,3,70]){
+    const next=await s.once(new Date(+start+minutes*60000));
+    assert.equal(next.results[0]?.outcome,'noop');assert.doesNotMatch(next.results[0]?.reason??'',/BELOW_MIN_BATCH/);
+  }
+  assert.equal(s.sends.length,0);assert.deepEqual(await balances(f),cash);
+  assert.equal((await query('select 1 from operations where portfolio_id=$1',[f.id])).rows.length,1);
+  assert.equal((await query("select 1 from strategy_jobs where portfolio_id=$1 and state in ('reserved','running','unknown','paused')",[f.id])).rows.length,0);
+  // A new deposit is no longer queued behind the dead job.
+  await f.fund(50n*U,new Date(+start+71*60000));
+  assert.equal((await s.once(new Date(+start+72*60000))).results[0]?.outcome,'executed');assert.equal(s.sends.length,1);
+});
+
+test('last-child fee DB: a child that cannot carry its fee at all is released instead of blocking every round; an unreadable fee changes nothing',async()=>{
+  const f=await fixture('stack');await f.fund(500n*U);const s=feeScheduler(f);assert.ok(s.deps.newMoney);
+  const untouched=await balances(f);
+  s.deps.newMoney.feeDue=async()=>{throw new Error('[MIN_FEE_UNAVAILABLE] 無法確認本批最低費，不買入');};
+  assert.equal((await s.once(start)).results[0]?.outcome,'blocked');assert.equal(s.sends.length,0);
+  const waiting=await job(f);assert.ok(waiting);assert.equal(waiting.state,'reserved');
+  assert.equal((await query('select 1 from operations where portfolio_id=$1',[f.id])).rows.length,0);
+  // The executor asks for more than the whole child holds.
+  s.deps.newMoney.feeDue=async()=>async()=>1000n*U;
+  const result=await s.once(new Date(+start+60000));
+  assert.equal(result.results[0]?.outcome,'noop');assert.match(result.results[0]?.reason??'',/\[FEE_OVER_BUDGET\]/);
+  assert.equal(s.sends.length,0);assert.equal(await job(f),null);assert.equal(await jobState(waiting.id),'cancelled');
+  assert.deepEqual(await balances(f),untouched,'the reserved principal and fee are back where they came from');
+  assert.equal((await s.once(new Date(+start+120000))).results[0]?.outcome,'noop');assert.equal(s.sends.length,0);
 });

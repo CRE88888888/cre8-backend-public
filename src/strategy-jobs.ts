@@ -22,7 +22,8 @@ type Instruction = { revision: string; amount_raw: string; start_at: Date; end_a
 export type JobContext = { personalMix?: boolean; chainId: number; portfolioId: number; strategyId: number; version: number; kind: 'hold' | 'stack' | 'asset'; asset_started_at?:Date|null;
   withdrawals?:readonly CashWithdrawal[]; finalAssets?:ReadonlySet<string>; batchStepLimit?: number; account: Address; allocation: Allocation; cash: Address; now: Date; reserve: bigint; caps: ReadonlyMap<string,bigint|null>;
   buyLimit: bigint; observedCash: bigint; enabled: boolean; marketOpen: boolean; execution?:AssetExecution; marketOpenFor?:(assets:readonly string[])=>boolean };
-export type BatchEvidence = { received: InputVector; fees: InputVector; feePaid: bigint; blockNumber: bigint; blockHash: Hex };
+/** `inputs`: what the swaps actually spent per asset, when read from the receipt (absent = exactly the batch row). */
+export type BatchEvidence = { received: InputVector; fees: InputVector; feePaid: bigint; inputs?: InputVector; blockNumber: bigint; blockHash: Hex };
 const activeJob = "state in ('reserved','running','unknown','paused')";
 export const unresolvedSql = "(state in ('pending','submitted') or (state='failed' and (tx_hash is not null or user_op_hash is not null)))";
 
@@ -248,19 +249,27 @@ export async function settleStrategyBatch(run:WithTransactionFn,c:Pick<JobContex
     const j=(await query('select * from strategy_jobs where id=$1 for update',[op.strategy_job_id])).rows[0] as StrategyJob;
     const b=(await query('select * from strategy_job_batches where job_id=$1 and batch_index=$2 for update',[j.id,op.strategy_batch_index])).rows[0] as {state:string;input_raw:InputVector};
     if(b.state==='confirmed')return;
-    if(!['pending','submitted'].includes(op.state)||e.feePaid>BigInt(j.remaining_fee_raw))throw new Error('inconsistent confirmation');
+    // The batch row is the principal this child took from the job. A child that had to pay part of the minimum fee
+    // from its own principal bought less than that (strategy-runtime fitChildToFee): the fee is charged to that part
+    // first and to the job's fee budget for the rest, and principal that was set aside but not charged becomes cash.
+    // So principal taken + fee budget used == swaps + fee paid + cash kept, whatever the window did in between.
+    if(e.inputs!==undefined&&(Object.keys(e.inputs).length!==Object.keys(b.input_raw).length||
+      Object.entries(e.inputs).some(([asset,v])=>b.input_raw[asset]===undefined||BigInt(v)>BigInt(b.input_raw[asset]))))throw new Error('inconsistent confirmation');
+    const fromPrincipal=e.inputs===undefined?0n:sumInputs(b.input_raw)-sumInputs(e.inputs);
+    const feeFromPrincipal=e.feePaid<fromPrincipal?e.feePaid:fromPrincipal,feeFromBudget=e.feePaid-feeFromPrincipal,kept=fromPrincipal-feeFromPrincipal;
+    if(!['pending','submitted'].includes(op.state)||feeFromBudget>BigInt(j.remaining_fee_raw))throw new Error('inconsistent confirmation');
     const remaining=subtractInputs(j.remaining_input,b.input_raw),done=sumInputs(remaining)===0n;
     await query("update operations set state='confirmed',updated_at=clock_timestamp() where id=$1",[operationId]);
     await query(`update strategy_job_batches set state='confirmed',confirmed_operation_id=$3,received_assets=$4,fee_assets=$5,fee_paid_raw=$6,
       block_number=$7,block_hash=$8,updated_at=clock_timestamp() where job_id=$1 and batch_index=$2`,
-      [j.id,op.strategy_batch_index,operationId,JSON.stringify(e.received),JSON.stringify(e.fees),e.feePaid.toString(),e.blockNumber.toString(),e.blockHash]);
-    const fee=BigInt(j.remaining_fee_raw)-e.feePaid;
+      [j.id,op.strategy_batch_index,operationId,JSON.stringify(e.received),JSON.stringify(e.fees),feeFromBudget.toString(),e.blockNumber.toString(),e.blockHash]);
+    const fee=BigInt(j.remaining_fee_raw)-feeFromBudget;
     if(done&&j.kind==='asset')await query("update strategy_asset_slices set state='completed',updated_at=clock_timestamp() where job_id=$1 and state='reserved'",[j.id]);
     await query(`update strategy_jobs set remaining_input=$2,remaining_fee_raw=$3,state=$4,failure_count=0,updated_at=clock_timestamp() where id=$1`,
       [j.id,JSON.stringify(remaining),fee.toString(),done?'completed':'running']);
     await query(`update strategy_cash_balances set reserved_input_raw=reserved_input_raw-$3::numeric,reserved_fee_raw=reserved_fee_raw-$4::numeric,
       allocated_cash_raw=allocated_cash_raw+$5::numeric,updated_at=clock_timestamp() where chain_id=$1 and portfolio_id=$2`,
-      [c.chainId,c.portfolioId,sumInputs(b.input_raw).toString(),(done?BigInt(j.remaining_fee_raw):e.feePaid).toString(),done?fee.toString():'0']);
+      [c.chainId,c.portfolioId,sumInputs(b.input_raw).toString(),(done?BigInt(j.remaining_fee_raw):feeFromBudget).toString(),((done?fee:0n)+kept).toString()]);
     if(done&&j.kind==='asset')await completeAssetSchedules(query,c.portfolioId);
     if(c.personalMix)await recordMixExecution(query,c.portfolioId,operationId,'new_money');
   });

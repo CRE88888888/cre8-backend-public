@@ -29,6 +29,57 @@ export function subtractInputs(a: InputVector, b: InputVector): InputVector {
   }
   return result;
 }
+/**
+ * Take `shortfall` out of one child's inputs so the child itself pays a minimum-fee top-up its job can no longer cover
+ * (2026-11-24, portfolios 13 and 17: a job that ran over several hourly fee windows paid a top-up in each and had too
+ * little fee left for its last child, which was then refused before sending, forever).
+ * Proportional to each leg; a leg that would fall under its floor (1 USDT unless it is a final installment) stays at
+ * the floor and the other legs carry its share. Null when the legs cannot give that much.
+ */
+export function reduceInputs(inputs: InputVector, shortfall: bigint, floorOf: (asset: string) => bigint): InputVector | null {
+  if (shortfall < 0n) throw new RangeError('invalid shortfall');
+  const result: Record<string, bigint> = Object.fromEntries(Object.entries(inputs).filter(([, raw]) => BigInt(raw) > 0n).map(([asset, raw]) => [asset, BigInt(raw)]));
+  const floor = (asset: string) => { const f = floorOf(asset), own = BigInt(inputs[asset] ?? '0'); return f < own ? f : own; };
+  let left = shortfall;
+  let free = Object.keys(result);
+  while (left > 0n) {
+    free = free.filter(asset => (result[asset] ?? 0n) > floor(asset));
+    const total = free.reduce((sum, asset) => sum + (result[asset] ?? 0n), 0n);
+    if (free.length === 0 || total === 0n) return null;
+    const before = left;
+    for (const asset of free) {
+      const value = result[asset] ?? 0n, room = value - floor(asset);
+      // Round up so the loop always makes progress; never take more than is still missing or than the leg can give.
+      let cut = (before * value + total - 1n) / total;
+      if (cut > room) cut = room;
+      if (cut > left) cut = left;
+      result[asset] = value - cut; left -= cut;
+    }
+  }
+  return Object.fromEntries(Object.entries(result).map(([asset, value]) => [asset, value.toString()]));
+}
+/**
+ * The largest principal n <= `principal` with n + due(n) <= `budget`, where `due` is the executor's own top-up figure
+ * for a batch of that size. `due` first rises with the size and falls past the 1% cap, so this walks the fixed point
+ * n = budget - due(n) and keeps the best size the executor itself confirmed. Null when no size fits.
+ */
+export async function principalWithinFee(principal: bigint, budget: bigint, due: (notional: bigint) => Promise<bigint>, reads = 4): Promise<{ principal: bigint; fee: bigint } | null> {
+  if (principal <= 0n || budget < principal) throw new RangeError('invalid fee budget');
+  let fee = await due(principal);
+  if (principal + fee <= budget) return { principal, fee };
+  let best: { principal: bigint; fee: bigint } | null = null;
+  for (let i = 0; i < reads; i++) {
+    const candidate = budget - fee;
+    if (candidate <= 0n) break;
+    const exact = await due(candidate);
+    const fits = candidate + exact <= budget;
+    if (fits && (best === null || candidate > best.principal)) best = { principal: candidate, fee: exact };
+    if (exact === fee) break;
+    // A miss means the fee is higher at the smaller size: step past it by the size of the miss to land on the safe side.
+    fee = fits ? exact : exact + (exact - fee);
+  }
+  return best;
+}
 /** Split every component by the same divisor, assigning raw remainders to the first batches. */
 export function basketBatch(vector: InputVector, count: bigint): InputVector {
   if (count <= 0n) throw new RangeError('invalid batch count');

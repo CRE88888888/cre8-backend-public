@@ -480,7 +480,10 @@ test('platform RPC HTTP timeout yields unknown state and does not retry', async 
   }
 });
 
-test('default public reader handles a down DB, unused signing configuration, missing settings and RPC errors safely', async () => {
+// Seven child processes, one after another, each importing the whole server (0.25 s locally, 0.7 s+ on a busy CI
+// runner): together they crossed bun's default 5 s test limit now and then and blocked merges (2026-11-24, twice).
+// Each child is already bounded at 10 s, so the test's own limit is the sum of those bounds, not the 5 s default.
+test('default public reader handles a down DB, unused signing configuration, missing settings and RPC errors safely', { timeout: 90_000 }, async () => {
   const rpc = platformRpc();
   const server = createHttpServer(async (req, res) => {
     let raw = '';

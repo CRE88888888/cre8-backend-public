@@ -102,7 +102,7 @@ for (const activeVersion of [2, 65535]) for (const dryRun of [false, true]) {
     const query: SchedulerQueryFn = async () => forbidden();
     const deps: NewMoneyDeps = { version: async () => forbidden(), policy: async () => forbidden(),
       withdrawals: async () => forbidden(), rebalanceReserve: async () => forbidden(), yieldHoldings: async () => forbidden(),
-      withdrawYield: async () => forbidden(), verifyLots: async () => forbidden(), quote: async () => forbidden(), marketOpen: forbidden };
+      withdrawYield: async () => forbidden(), verifyLots: async () => forbidden(), quote: async () => forbidden(), feeDue: async () => forbidden(), marketOpen: forbidden };
     for (const version of [1, undefined]) {
       await assert.rejects(prepareNewMoney({ due: { ...due, version }, plan, query, run: async () => forbidden(), chainId: 97, now, dryRun, deps }),
         /\[PINNED_VERSION_CHANGED\]/);

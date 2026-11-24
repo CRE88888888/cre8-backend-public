@@ -7,11 +7,11 @@ import { EXECUTOR_ABI } from './chain.js';
 import { requireTypedVersion } from './strategies.js';
 import type { StrategyVersion } from './strategies.js';
 import { MIN_ASSET_BATCH_RAW, numeraireFor } from './strategy-execution.js';
-import { basketBatch, batchCountFor, maxBasketBatches, sumInputs, windowBasketBatch, windowCapacityFits, maxWindowBatches, windowBatchCountFor } from './new-money-plan.js';
+import { basketBatch, batchCountFor, maxBasketBatches, sumInputs, windowBasketBatch, windowCapacityFits, maxWindowBatches, windowBatchCountFor, principalWithinFee, reduceInputs, USDT_UNIT } from './new-money-plan.js';
 import type { InputVector } from './new-money-plan.js';
-import { fundingLots, prepareStrategyJob, readJob } from './strategy-jobs.js';
+import { cancelJob, fundingLots, lockCash, prepareStrategyJob, readJob, unresolvedSql } from './strategy-jobs.js';
 import type { FundingLot, JobContext, StrategyJob } from './strategy-jobs.js';
-import { minimumFeeReserve, quoteNewMoney, readBuyBudget, readMaxLegUsdE8, newMoneyDepthCap, nominalSellQuote } from './rebalance-plan.js';
+import { minimumFeeReserve, quoteNewMoney, readBuyBudget, readMaxLegUsdE8, newMoneyDepthCap, nominalSellQuote, readFeeDue } from './rebalance-plan.js';
 import type { PlannedStep, RebalancePlan } from './rebalance-plan.js';
 import type { DuePortfolio, SchedulerQueryFn, WithTransactionFn } from './scheduler.js';
 import type { PortfolioPlan } from './snapshot.js';
@@ -28,6 +28,8 @@ export type NewMoneyDeps = {
   withdrawYield: (due:DuePortfolio,plan:PortfolioPlan,reserve:bigint,steps:readonly PlannedStep[])=>Promise<string|null>;
   verifyLots: (lots:readonly FundingLot[])=>Promise<void>;
   quote: (due:DuePortfolio,plan:PortfolioPlan,inputs:InputVector,deadline:bigint)=>Promise<RebalancePlan>;
+  /** Fee-window chains: the top-up the executor would charge this account for a buy of a given size (see readFeeDue). */
+  feeDue: (due:DuePortfolio,plan:PortfolioPlan)=>Promise<(notional:bigint)=>Promise<bigint>>;
   marketOpen: (version:StrategyVersion,now:Date)=>boolean;
 };
 export function defaultNewMoneyDeps(client:()=>PublicClient,executor:()=>Address,registry:()=>Address,query:SchedulerQueryFn,chainId:number):NewMoneyDeps {
@@ -94,6 +96,7 @@ export function defaultNewMoneyDeps(client:()=>PublicClient,executor:()=>Address
       return quoteNewMoney({publicClient,executor:executor(),registry:registry(),oracle,strategyId:BigInt(plan.pinnedVersion.onchainStrategyId),
         blockNumber:plan.snapshot.block,cash:numeraireFor(chainId) as Address,inputs,deadline});
     },
+    feeDue:(due,plan)=>readFeeDue(client(),executor(),due.account,BigInt(plan.pinnedVersion.onchainStrategyId),plan.snapshot.block),
     marketOpen:(version,now)=>{
       // Typed automation is opened on 97 only. Stock identity comes from the admitted manifest, never client display symbols.
       if(chainId!==97)return false;
@@ -107,7 +110,7 @@ export class PinnedVersionChangedError extends Error {
 }
 
 export async function prepareNewMoney(args:{due:DuePortfolio;plan:PortfolioPlan;query:SchedulerQueryFn;run:WithTransactionFn;
-  chainId:number;now:Date;dryRun:boolean;deps:NewMoneyDeps}):Promise<{job:StrategyJob|null;context:JobContext;rebalance:RebalancePlan;useTargetWeights?:boolean}>{
+  chainId:number;now:Date;dryRun:boolean;deps:NewMoneyDeps}):Promise<{job:StrategyJob|null;context:JobContext;rebalance:RebalancePlan;useTargetWeights?:boolean;batchBudget?:InputVector}>{
   const {due,plan,query,run,chainId,now,deps}=args;
   if(due.version===undefined||plan.pinnedVersion.version!==due.version)throw new PinnedVersionChangedError();
   const version=await deps.version(due.strategyId,due.version,plan.pinnedVersion.onchainStrategyId,due.account,{chainId,blockNumber:plan.snapshot.block});
@@ -168,6 +171,11 @@ export async function prepareNewMoney(args:{due:DuePortfolio;plan:PortfolioPlan;
   const reserve=feeWindow&&BigInt(job.remaining_fee_raw)<policy.reserve?BigInt(job.remaining_fee_raw):policy.reserve;
   context.reserve=reserve;
   const remaining=Object.fromEntries(Object.entries(job.remaining_input).filter(([,n])=>BigInt(n)>0n));
+  const feeLeft=BigInt(job.remaining_fee_raw);
+  // What is left, fee included, is under one minimum batch: no later round can change that (the fee only shrinks), so
+  // waiting would hold the cash forever. Release it instead.
+  if(newMode&&feeWindow&&sumInputs(remaining)+feeLeft<MIN_ASSET_BATCH_RAW)
+    return releaseJob(run,context,job,'[BELOW_MIN_BATCH] 剩餘本金含費用不足10 USDT，已取消並退回可用現金');
   // Include held assets removed from the active version: snapshot targets contain
   // the full effective history. Match the scheduler so it never truncates this child.
   const held=plan.snapshot.holdings.filter(h=>h.amountWei>0n&&h.asset.toLowerCase()!==cash&&plan.targets.some(a=>a.asset.toLowerCase()===h.asset.toLowerCase())).length;
@@ -181,11 +189,51 @@ export async function prepareNewMoney(args:{due:DuePortfolio;plan:PortfolioPlan;
     const vector=feeWindow?windowBasketBatch(newMode?remaining:job.remaining_input,count,reserve,minimumRound):basketBatch(newMode?remaining:job.remaining_input,count);
     const inputs=newMode?executionInputGroups(vector,stepLimit,reserve,context.finalAssets,feeWindow)?.[0]??{}:vector;
     if(newMode&&sumInputs(inputs)+reserve<MIN_ASSET_BATCH_RAW)return {job,context,rebalance:{kind:'blocked',reason:'[BASKET_WAITING] 子批不足10 USDT'}};
-    const rebalance=await deps.quote(due,plan,inputs,deadline);
-    if(rebalance.kind==='ready')return {job,context,rebalance:{...rebalance,rationale:`${rebalance.rationale}；新錢分批：剩餘 ${sumInputs(newMode?remaining:job.remaining_input)} 分 ${count} 批、本批 ${sumInputs(inputs)}，買入額度 ${policy.buyLimit}`}};
+    // The job's fee budget was sized for one fee window. A job that runs into later windows pays a top-up in each, so
+    // a child can owe more than the fee that is left: the difference comes out of that child's own principal.
+    let child=inputs,batchBudget:InputVector|undefined;
+    context.reserve=reserve;
+    if(feeWindow&&sumInputs(inputs)>0n){
+      const fitted=await fitChildToFee(inputs,feeLeft,await deps.feeDue(due,plan),newMode?context.finalAssets:undefined);
+      if(fitted===null){
+        if(newMode)return releaseJob(run,context,job,'[FEE_OVER_BUDGET] 本批扣除最低費後低於每資產 1 USDT，已取消並退回可用現金');
+        return {job,context,rebalance:{kind:'blocked',reason:'[MIN_FEE_RESERVE] 本批本金不足以支付最低費'}};
+      }
+      if(fitted.fromPrincipal>0n){child=fitted.inputs;batchBudget=inputs;context.reserve=feeLeft+fitted.fromPrincipal;}
+    }
+    const rebalance=await deps.quote(due,plan,child,deadline);
+    if(rebalance.kind==='ready')return {job,context,...(batchBudget?{batchBudget}:{}),rebalance:{...rebalance,rationale:`${rebalance.rationale}；新錢分批：剩餘 ${sumInputs(newMode?remaining:job.remaining_input)} 分 ${count} 批、本批 ${sumInputs(child)}${batchBudget?`（另由本金支付最低費 ${sumInputs(inputs)-sumInputs(child)}）`:''}，買入額度 ${policy.buyLimit}`}};
     if(rebalance.kind!=='blocked'||!rebalance.reason.includes('[BASKET_DEPTH]')||count===maximum)return {job,context,rebalance};
     count=count*2n>maximum?maximum:count*2n;
   }
+}
+
+/**
+ * Size one child so that what it buys plus the top-up it owes stays inside its own principal plus the job's remaining
+ * fee. Unchanged when the fee left already covers the top-up. Null when the legs cannot give the difference.
+ */
+export async function fitChildToFee(inputs:InputVector,feeLeft:bigint,due:(notional:bigint)=>Promise<bigint>,finalAssets:ReadonlySet<string>|undefined):Promise<{inputs:InputVector;fromPrincipal:bigint}|null>{
+  const principal=sumInputs(inputs);
+  const fit=await principalWithinFee(principal,principal+feeLeft,due);
+  if(fit===null)return null;
+  if(fit.principal===principal)return {inputs,fromPrincipal:0n};
+  // Per-asset children keep 1 USDT per leg (a final installment may be smaller); whole-basket children keep 5 USDT.
+  const reduced=reduceInputs(inputs,principal-fit.principal,asset=>finalAssets===undefined?5n*USDT_UNIT:finalAssets.has(asset)?1n:USDT_UNIT);
+  return reduced===null?null:{inputs:reduced,fromPrincipal:principal-fit.principal};
+}
+/** Cancel a job that can never send again and hand its remaining principal and fee back to the portfolio's free cash. */
+async function releaseJob(run:WithTransactionFn,context:JobContext,job:StrategyJob,reason:string):Promise<{job:StrategyJob|null;context:JobContext;rebalance:RebalancePlan}>{
+  const released=await run(async({query})=>{
+    await lockCash(query,context);
+    const current=await readJob(query,context);
+    // Same job, same budgets, nothing in flight: otherwise leave it for the next round.
+    if(!current||current.id!==job.id||!['reserved','running'].includes(current.state)||current.remaining_fee_raw!==job.remaining_fee_raw||
+      JSON.stringify(current.remaining_input)!==JSON.stringify(job.remaining_input))return false;
+    if((await query(`select id from operations where portfolio_id=$1 and ${unresolvedSql} limit 1`,[context.portfolioId])).rows.length)return false;
+    await cancelJob(query,context,current);
+    return true;
+  });
+  return released?{job:null,context,rebalance:{kind:'noop',reason}}:{job,context,rebalance:{kind:'blocked',reason:'[PREVIOUS_INFLIGHT] 原工作狀態已變更，下一輪再判斷'}};
 }
 
 /** Resume the frozen vector; fee leftovers never become new principal. */

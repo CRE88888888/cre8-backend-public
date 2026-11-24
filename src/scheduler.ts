@@ -2254,7 +2254,7 @@ const phaseTimes = new AsyncLocalStorage<Map<string, number>>();
 const TIMED_DEPS = ['planPortfolio', 'planRebalance', 'reconcileRebalance', 'checkTradingMinimums', 'mixRuntime', 'reconcileMix', 'dexGate',
   'prepareNewMoney', 'readBuyVersionWindow', 'hasBoughtBefore', 'refreshFloors', 'readPermissionConfig', 'readAllowance', 'readBalance',
   'readRebalanceNonce', 'readLatestBlockTimestamp', 'readEntryPointNonce', 'executeRebalance', 'writeSnapshot', 'query'] as const;
-const TIMED_NEW_MONEY = ['version', 'policy', 'verifyLots', 'withdrawals', 'quote', 'rebalanceReserve', 'yieldHoldings', 'withdrawYield'] as const;
+const TIMED_NEW_MONEY = ['version', 'policy', 'verifyLots', 'withdrawals', 'quote', 'feeDue', 'rebalanceReserve', 'yieldHoldings', 'withdrawYield'] as const;
 function timed<F>(name: string, fn: F): F {
   if (typeof fn !== 'function') return fn;
   // Keeps sync functions sync and the original return value (only the timing is added).
@@ -2915,7 +2915,7 @@ async function decideAndMaybeExecute(
   let gate: OperationGate;
   try {
     gate = await ctx.deps.withTransaction(async (client) => {
-      if (money?.job) return beginStrategyOperation(client.query,{...money.context,now:ctx.deps.clock()},money.job,steps,{idempotencyKey,payloadHash:planHash,deadline,nonce,clock:ctx.deps.clock});
+      if (money?.job) return beginStrategyOperation(client.query,{...money.context,now:ctx.deps.clock()},money.job,steps,{idempotencyKey,payloadHash:planHash,deadline,nonce,clock:ctx.deps.clock,...(money.batchBudget?{budget:money.batchBudget}:{})});
       await client.query('select id from portfolios where id = $1 for update', [due.portfolioId]);
       return beginOperation(client.query, { portfolioId: due.portfolioId, idempotencyKey, payloadHash: planHash, deadline, nonce });
     });
@@ -2953,7 +2953,7 @@ async function decideAndMaybeExecute(
     idempotencyKey,
     trackAllocatedCash:due.executionKind==='per_asset',
     ...(due.personalMix ? { personalMix: true, mixDue: due } : {}),
-    ...(money?.job ? { strategy: { context: money.context, job: money.job } } : {}),
+    ...(money?.job ? { strategy: { context: money.context, job: money.job, ...(money.batchBudget ? { budget: money.batchBudget } : {}) } } : {}),
   });
   if (execution.errorCode === 'PINNED_VERSION_CHANGED' || execution.errorCode === 'VERSION_ACTIVATION_IMMINENT' || execution.errorCode === 'VERSION_STATE_UNAVAILABLE') {
     return { ...withPlan, execution, outcome: 'blocked', reason: execution.error ?? '[VERSION_STATE_UNAVAILABLE] 不送買入' };
@@ -3187,7 +3187,10 @@ async function settleAllocatedCash(deps:ResolvedDeps,portfolioId:number,key:stri
   });
 }
 
-/** Exact business evidence from this UserOp's canonical logs, including actual token transfers. */
+/** Exact business evidence from this UserOp's canonical logs, including actual token transfers.
+ * `expected` is the batch's principal per asset: each swap spends exactly its signed step and never more than that
+ * principal. It spends less only when the child paid part of the minimum fee from its principal (beginStrategyOperation).
+ */
 export function strategyReceiptEvidence(receipt:UserOperationReceipt,steps:readonly {tokenIn:Address;tokenOut:Address;amountIn:bigint;amountOutMin:bigint}[],
   expected:InputVector,account:Address,executor:Address,cash:Address):BatchEvidence {
   const abi=parseAbi(['event SwapExecuted(address indexed account,address tokenIn,address tokenOut,uint256 amountIn,uint256 gross,uint256 fee,uint256 net,uint256 oracleFloor)',
@@ -3203,11 +3206,11 @@ export function strategyReceiptEvidence(receipt:UserOperationReceipt,steps:reado
       if(event.eventName==='SwapExecuted'){
         const a=event.args,key=a.tokenOut.toLowerCase(),step=steps.find(s=>s.tokenOut.toLowerCase()===key);
         if(a.account.toLowerCase()!==account.toLowerCase()||a.tokenIn.toLowerCase()!==cash.toLowerCase()||!step||inputs[key]!==undefined||
-          expected[key]!==a.amountIn.toString()||step.amountIn!==a.amountIn||a.gross<step.amountOutMin||a.gross-a.fee!==a.net||a.net<=0n)throw new Error('swap evidence mismatch');
+          expected[key]===undefined||BigInt(expected[key])<a.amountIn||step.amountIn!==a.amountIn||a.gross<step.amountOutMin||a.gross-a.fee!==a.net||a.net<=0n)throw new Error('swap evidence mismatch');
         inputs[key]=a.amountIn.toString();received[key]=a.net.toString();fees[key]=a.fee.toString();
       }else if(event.eventName==='MinFeeCharged'){
         const a=event.args;
-        if(a.account.toLowerCase()!==account.toLowerCase()||a.notional!==sumInputs(expected)||a.charged>a.due||++feeEvents>1)throw new Error('fee evidence mismatch');
+        if(a.account.toLowerCase()!==account.toLowerCase()||a.notional!==steps.reduce((sum,step)=>sum+step.amountIn,0n)||a.charged>a.due||++feeEvents>1)throw new Error('fee evidence mismatch');
         feePaid=a.charged;
       }
     } else if(topic===keccak256(toBytes('Transfer(address,address,uint256)'))&&(emitter===cash.toLowerCase()||expected[emitter]!==undefined)){
@@ -3218,9 +3221,9 @@ export function strategyReceiptEvidence(receipt:UserOperationReceipt,steps:reado
       }
     }
   }
-  if(Object.keys(inputs).length!==Object.keys(expected).length||Object.entries(received).some(([a,v])=>transfers[a]!==v)||
-    cashOut!==sumInputs(expected)+feePaid)throw new Error('receipt token differences mismatch');
-  return {received,fees,feePaid,blockNumber:receipt.receipt.blockNumber,blockHash:receipt.receipt.blockHash};
+  if(Object.keys(inputs).length!==Object.keys(expected).length||Object.keys(inputs).length!==steps.length||Object.entries(received).some(([a,v])=>transfers[a]!==v)||
+    cashOut!==sumInputs(inputs)+feePaid)throw new Error('receipt token differences mismatch');
+  return {received,fees,feePaid,inputs,blockNumber:receipt.receipt.blockNumber,blockHash:receipt.receipt.blockHash};
 }
 
 /** 送出 → 標 submitted → 等 receipt；任何送出後例外都保留在途，不降成可重試的 failed。 */
@@ -3230,7 +3233,8 @@ async function executeAndSettle(
     beforeSending?: () => Promise<void>;
     personalMix?: boolean;
     mixDue?: DuePortfolio;
-    strategy?: {context:JobContext;job:StrategyJob};
+    /** `budget`: the principal this child takes from the job when part of it pays the minimum fee (more than the steps buy). */
+    strategy?: {context:JobContext;job:StrategyJob;budget?:InputVector};
     trackAllocatedCash?:boolean;
     gasPurpose: 'ordinary' | 'exit';
     strategyId: bigint;
@@ -3287,7 +3291,8 @@ async function executeAndSettle(
     await args.beforeSending?.();
     const outcome = await deps.executeRebalance({
       ...(args.beforeSending === undefined ? {} : { beforeSending: args.beforeSending }),
-      ...(args.strategy?{feeBudget:BigInt(args.strategy.job.remaining_fee_raw)}:{}),
+      // The fee this child may pay: what the job has left, plus the principal it gave up for the fee.
+      ...(args.strategy?{feeBudget:BigInt(args.strategy.job.remaining_fee_raw)+(args.strategy.budget?sumInputs(args.strategy.budget)-args.steps.reduce((sum,step)=>sum+step.amountIn,0n):0n)}:{}),
       gasPurpose: args.gasPurpose,
       strategyId: args.strategyId,
       portfolioId: args.portfolioId,
@@ -3357,7 +3362,7 @@ async function executeAndSettle(
 }
 
 async function beginStrategyOperation(query:SchedulerQueryFn,c:JobContext,j:StrategyJob,steps:readonly PlannedStep[],
-  a:{idempotencyKey:string;payloadHash:Hex;deadline:string;nonce:bigint;clock?:()=>Date}):Promise<OperationGate>{
+  a:{idempotencyKey:string;payloadHash:Hex;deadline:string;nonce:bigint;clock?:()=>Date;budget?:InputVector}):Promise<OperationGate>{
   await lockCash(query,c);
   if((await unresolvedOperations(query,c.portfolioId)).length)return {proceed:false,outcome:'blocked',reason:'未知操作先對帳'};
   const current=await readJob(query,c);
@@ -3367,6 +3372,12 @@ async function beginStrategyOperation(query:SchedulerQueryFn,c:JobContext,j:Stra
     (current.kind!=='asset'&&Object.keys(current.remaining_input).filter(a=>BigInt(current.remaining_input[a]??'0')>0n).length!==steps.length)||
     steps.length===0||steps.length>MAX_USER_OP_STEPS||
     Object.entries(inputs).some(([a,v])=>BigInt(v)>BigInt(current.remaining_input[a]??'0')))throw new Error('basket identity changed');
+  // A child that pays part of the minimum fee from its own principal takes `budget` from the job and buys less
+  // (`inputs`). The batch row records the budget; settlement splits the difference between fee and leftover cash.
+  const budget=a.budget??inputs;
+  if(Object.keys(budget).length!==steps.length||Object.entries(inputs).some(([asset,v])=>budget[asset]===undefined||BigInt(v)>BigInt(budget[asset]))||
+    Object.entries(budget).some(([asset,v])=>BigInt(v)>BigInt(current.remaining_input[asset]??'0'))||
+    (a.budget!==undefined&&current.remaining_fee_raw!==j.remaining_fee_raw))throw new Error('basket identity changed');
   await query("update strategy_job_batches set state='cancelled',updated_at=clock_timestamp() where job_id=$1 and state='planned'",[j.id]);
   const indexRow=(await query('select coalesce(max(batch_index)+1,0) as n from strategy_job_batches where job_id=$1',[j.id])).rows[0] as {n:number}|undefined;
   const index=indexRow?.n??-1;
@@ -3376,7 +3387,7 @@ async function beginStrategyOperation(query:SchedulerQueryFn,c:JobContext,j:Stra
     const started=await query("update strategy_jobs set asset_started_at=$2,state='running',updated_at=clock_timestamp() where id=$1 and asset_started_at is null and slot_at<=$2 and window_end_at>$2 returning id",[j.id,startedAt]);
     if(started.rows.length!==1)return {proceed:false,outcome:'blocked',reason:'期次窗口已過，不開始舊期次'};
   }
-  await query('insert into strategy_job_batches(job_id,batch_index,input_raw) values($1,$2,$3)',[j.id,index,JSON.stringify(inputs)]);
+  await query('insert into strategy_job_batches(job_id,batch_index,input_raw) values($1,$2,$3)',[j.id,index,JSON.stringify(budget)]);
   const key=`${a.idempotencyKey}:job:${j.id}:batch:${index}`;
   const inserted=await query(`insert into operations(portfolio_id,type,state,idempotency_key,payload_hash,attempts,deadline,user_op_nonce,strategy_job_id,strategy_batch_index)
     values($1,'rebalance','pending',$2,$3,1,$4,$5,$6,$7) returning id`,[c.portfolioId,key,a.payloadHash,a.deadline,a.nonce.toString(),j.id,index]);

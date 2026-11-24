@@ -177,6 +177,36 @@ export async function minimumFeeReserve(client: PublicClient, executor: Address,
   } catch { throw new Error('[MIN_FEE_UNAVAILABLE] 無法確認最低費預留，不買入'); }
 }
 
+/** A fee window that closes within this many seconds is treated as already closed when sizing a buy. */
+export const FEE_WINDOW_ROLL_MARGIN_SECONDS = 600n;
+/**
+ * Fee-window chains: the minimum-fee top-up the executor would charge `account` for one buy batch of a given size,
+ * as the executor itself reports it (`minFeeDue`). One window read up front; then one read per size.
+ * When the account's open window closes soon (or the read cannot tell), the figure is the higher of "now" and "a fresh
+ * window" (`minFeeTopUp`): a batch sized against the open window can land just after it closes and be charged the
+ * fresh-window top-up instead, which its fee budget would not cover.
+ */
+export async function readFeeDue(client: PublicClient, executor: Address, account: Address, strategyId: bigint, blockNumber: bigint): Promise<(notional: bigint) => Promise<bigint>> {
+  try {
+    const [window, block] = await Promise.all([
+      client.readContract({ address: executor, abi: MIN_FEE_ABI, functionName: 'minFeeWindowOf', args: [account], blockNumber }),
+      client.getBlock({ blockNumber }),
+    ]);
+    const open = window[0] !== 0n && block.timestamp + FEE_WINDOW_ROLL_MARGIN_SECONDS < window[0] + 3600n;
+    return async (notional) => {
+      try {
+        if (notional <= 0n) return 0n;
+        const [now, fresh] = await Promise.all([
+          client.readContract({ address: executor, abi: MIN_FEE_ABI, functionName: 'minFeeDue', args: [account, notional], blockNumber }),
+          open ? 0n : client.readContract({ address: executor, abi: MIN_FEE_ABI, functionName: 'minFeeTopUp', args: [strategyId, notional], blockNumber }),
+        ]);
+        if (now < 0n || fresh < 0n) throw new Error('invalid fee due');
+        return now > fresh ? now : fresh;
+      } catch { throw new Error('[MIN_FEE_UNAVAILABLE] 無法確認本批最低費，不買入'); }
+    };
+  } catch { throw new Error('[MIN_FEE_UNAVAILABLE] 無法確認本批最低費，不買入'); }
+}
+
 export async function checkTradeMinimums(client: PublicClient, executor: Address, steps: readonly PlannedStep[], purpose: 'ordinary' | 'exit', blockNumber: bigint, assetBudgetRaw?: bigint, finalAssets:ReadonlySet<string>=new Set(), rebalanceReserveRaw?:bigint): Promise<string | null> {
   if (purpose === 'exit') return null;
   try {

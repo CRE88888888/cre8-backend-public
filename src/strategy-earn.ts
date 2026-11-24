@@ -109,6 +109,8 @@ export type StrategyEarnChain = {
   /** AtpRegistry.enrollments(account). A My mix weight change re-enrolls the same account into a new private strategy, which
    * voids consent given before it (AtpBorrowRegistry._consent: ConsentRequired). Absent in old test fakes = consent is current. */
   enrollment?(account: Address, block: bigint): Promise<{ strategyId: bigint; version: number }>;
+  /** A mined transaction's receipt (null = not mined yet / unknown to this node). */
+  receipt?(hash: Hex): Promise<(StrategyEarnTx & { success: boolean }) | null>;
   /** The portfolio's enrolled version on AtpRegistry: assets and weights (lowercase). */
   weights(account: Address, block: bigint): Promise<{ asset: Address; weightBps: number }[]>;
 };
@@ -144,6 +146,12 @@ export function createStrategyEarnChain(client: PublicClient): StrategyEarnChain
     async policy(account, marketId, block) {
       const [maxDebt, strategyId, version, enabled] = await read(S.registry, 'policies', [account, marketId], block) as readonly [bigint, bigint, number, boolean];
       return { maxDebt, enabled, strategyId, version: Number(version) };
+    },
+    async receipt(hash) {
+      try {
+        const r = await client.getTransactionReceipt({ hash });
+        return { hash: r.transactionHash, blockNumber: r.blockNumber, logs: r.logs, success: r.status === 'success' };
+      } catch (error) { if ((error as { name?: string }).name === 'TransactionReceiptNotFoundError') return null; throw error; }
     },
     async enrollment(account, block) {
       const [strategyId, version] = await read(TESTNET_97.contracts.registry as Address, 'enrollments', [account], block) as readonly [bigint, number, boolean];
@@ -312,7 +320,7 @@ export function splitVenusDebt<P extends { marketId: string; debtRaw?: string; v
 }
 
 const TEMPORARILY = 'Temporarily unavailable.';
-export type StrategyEarnDeps = { chainId: number; chain: () => StrategyEarnChain; owned: typeof requireOwnedPortfolio; now: () => Date;
+export type StrategyEarnDeps = { chainId: number; chain: () => StrategyEarnChain; owned: typeof requireOwnedPortfolio; now: () => Date; ledger?: StrategyEarnLedger;
   query: <T extends Record<string, unknown> = Record<string, unknown>>(sql: string, params?: unknown[]) => Promise<{ rows: T[] }> };
 
 let cachedChain: StrategyEarnChain | undefined;
@@ -510,6 +518,28 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
         return { kind: r.kind, asset: r.asset, amountRaw: r.amount_raw, collateralRaw: r.collateral_raw, ltvBeforeBps: r.ltv_before_bps, ltvAfterBps: r.ltv_after_bps,
           txHash: r.tx_hash, blockNumber: r.block_number, createdAt: new Date(r.created_at).toISOString(), message: strategyEarnMessage(e) };
       }) };
+    },
+    /**
+     * The owner's own UserOp (turn on, turn off, open after a fill) is mined: record its business events from the
+     * verified receipt, the same ledger the scheduler and the keeper write (db 0063). Only AtpBorrowExecutor (and the
+     * paying market's) events about THIS portfolio's account count (strategyEarnEvents), so any tx hash is safe to
+     * submit; a re-sent hash records nothing new (unique chain/tx/log). Not mined yet -> 'pending', ask again.
+     */
+    async confirm(id: number, wallet: string, input: unknown) {
+      const account = await owned(id, wallet);
+      const b = body(input, ['txHash']);
+      if (typeof b.txHash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(b.txHash)) throw new ValidationError('INVALID_TX_HASH', 'txHash 須為 0x 開頭的 32 位元組。');
+      let tx;
+      try {
+        const chain = deps.chain();
+        if (!chain.receipt) return { status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY };
+        tx = await chain.receipt(b.txHash.toLowerCase() as Hex);
+      } catch { return { status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY }; }
+      if (tx === null) return { status: 'pending' as const, recorded: 0 };
+      if (!tx.success) return { status: 'reverted' as const, recorded: 0 };
+      const events = strategyEarnEvents(tx, id, account);
+      await (deps.ledger ?? dbStrategyEarnLedger).record(97, events);
+      return { status: 'confirmed' as const, recorded: events.length, kinds: events.map(e => e.kind) };
     },
     /** Turn off / before selling: repay first (vault, then the account's own USDT), then withdraw all collateral. */
     /**

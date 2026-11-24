@@ -528,3 +528,25 @@ test('#67 XAUt (6 decimals): values, auto-open plan and the vault-short take-bac
   const take = decode(calls[1]!.data).args[2] as bigint;
   assert.ok(take > 9_698_000n && take < 9_699_000n, String(take));
 });
+
+test('POST confirm: the owner\'s own turn-on / turn-off is recorded from its verified receipt; pending, reverted and foreign events record nothing', async () => {
+  logIndex = 0;
+  const other = '0x' + '77'.repeat(20) as Address;
+  const mined = tx([log(ex, 'CollateralSupplied', 4, { account, marketId: nvda.marketId, amount: 2n * E18, collateral: 2n * E18 }),
+    log(ex, 'Borrowed', 5, { account, marketId: nvda.marketId, amount: 30n * E18, vaultShares: 1n, ltv: 1n }),
+    log(ex, 'Borrowed', 5, { account: other, marketId: nvda.marketId, amount: 99n * E18, vaultShares: 1n, ltv: 1n }),
+    log('0x' + '66'.repeat(20), 'Borrowed', 5, { account, marketId: nvda.marketId, amount: 1n, vaultShares: 1n, ltv: 1n })]);
+  const recorded: StrategyEarnEvent[] = [];
+  let receipt: (StrategyEarnTx & { success: boolean }) | null = null;
+  const earn = createStrategyEarn({ chainId: 97, owned: owned(), chain: () => ({ ...chainOf({}), receipt: async () => receipt }),
+    ledger: { record: async (_c, e) => { recorded.push(...e); } } });
+  const hash = '0x' + 'ab'.repeat(32);
+  assert.deepEqual(await earn.confirm(3, account, { txHash: hash }), { status: 'pending', recorded: 0 });
+  receipt = { ...mined, success: false };
+  assert.deepEqual(await earn.confirm(3, account, { txHash: hash }), { status: 'reverted', recorded: 0 });
+  receipt = { ...mined, success: true };
+  assert.deepEqual(await earn.confirm(3, account, { txHash: hash }), { status: 'confirmed', recorded: 1, kinds: ['open'] });
+  assert.deepEqual(recorded.map(e => [e.portfolioId, e.kind, e.asset, e.amountRaw, e.collateralRaw]), [[3, 'open', 'NVDAB', 30n * E18, 2n * E18]]);
+  await assert.rejects(earn.confirm(3, account, { txHash: '0x12' }), (e: unknown) => e instanceof AppError && e.status === 400);
+  await assert.rejects(earn.confirm(3, account, { hash }), (e: unknown) => e instanceof AppError && e.status === 400);
+});

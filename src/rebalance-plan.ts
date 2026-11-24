@@ -1703,6 +1703,40 @@ async function capLegByImpact(params: {
   };
 }
 
+/** Margin left on the volatile part of the executor's buy cap (oracle-valued assets and yield positions). */
+export const BUY_CAP_VOLATILE_MARGIN_BPS = 200n;
+
+/**
+ * Safe buy cap: the cap backed by the account's numeraire cash is kept whole, the rest is cut by
+ * `BUY_CAP_VOLATILE_MARGIN_BPS`. `AtpExecutor._buyCap` is account value x `maxBuyBps`, and the cash term of
+ * that value (`numeraire.balanceOf(account)`) is not re-priced between this read and the transaction; only
+ * the oracle-valued part can drift. A flat 98% on the whole cap made a first buy (~99.9% of a cash-only
+ * account) never fit, so every round split the basket in half (100 / 50 / 25 / 12.5).
+ */
+export function safeBuyCap(cap: bigint, cashCap: bigint): bigint {
+  if (cap < 0n || cashCap < 0n) throw new RangeError('invalid buy cap');
+  const cash = cashCap < cap ? cashCap : cap;
+  return cash + (cap - cash) * (10000n - BUY_CAP_VOLATILE_MARGIN_BPS) / 10000n;
+}
+
+/** Part of `cap` backed by numeraire cash. Any read failure counts as no cash: the whole cap keeps the margin. */
+async function readCashCap(args: Pick<PlanRebalanceArgs, 'publicClient' | 'executor' | 'account' | 'blockNumber'>, cap: bigint): Promise<bigint> {
+  try {
+    const { publicClient, executor, account, blockNumber } = args;
+    const [numeraire, bps] = await Promise.all([
+      publicClient.readContract({ address: executor, abi: EXECUTOR_BUY_ABI, functionName: 'numeraire', blockNumber }),
+      publicClient.readContract({ address: executor, abi: EXECUTOR_BUY_ABI, functionName: 'maxBuyBps', blockNumber }),
+    ]);
+    if (!isAddressLike(numeraire) || typeof bps !== 'number' || !Number.isInteger(bps) || bps < 0 || bps > 20000) return 0n;
+    const cash: unknown = await publicClient.readContract({ address: getAddress(numeraire), abi: [{ type: 'function', name: 'balanceOf',
+      stateMutability: 'view', inputs: [{ type: 'address' }], outputs: [{ type: 'uint256' }] }], functionName: 'balanceOf',
+      args: [account], blockNumber });
+    if (typeof cash !== 'bigint' || cash < 0n) return 0n;
+    const cashCap = cash * BigInt(bps) / 10000n;
+    return cashCap < cap ? cashCap : cap;
+  } catch { return 0n; }
+}
+
 type BuyBudget = { cap: bigint; bought: bigint; windowEndsAt: bigint; remaining: bigint; note: string };
 
 /** Fail closed without copying RPC errors (which may contain credentials) into API/logs. */
@@ -1717,10 +1751,11 @@ export async function readBuyBudget(args: Pick<PlanRebalanceArgs, 'publicClient'
     if (typeof cap !== 'bigint' || cap < 0n || cap >= 2n ** 256n ||
         typeof bought !== 'bigint' || bought < 0n || bought >= 2n ** 256n ||
         typeof windowEndsAt !== 'bigint' || windowEndsAt < 0n || windowEndsAt >= 2n ** 64n) throw new Error('invalid allowance');
-    // Margin applies to the total cap: remaining * 98% is unsafe near exhaustion.
-    const safeCap = cap * 9800n / 10000n;
+    // The executor re-values the account when the batch lands; only the non-cash part of that value can move.
+    const cashCap = await readCashCap(args, cap);
+    const safeCap = safeBuyCap(cap, cashCap);
     const remaining = safeCap > bought ? safeCap - bought : 0n;
-    const note = `買入額度：cap ${cap} × 98% − bought ${bought} → 可買 ${remaining}，windowEndsAt ${windowEndsAt}`;
+    const note = `買入額度：cap ${cap}（現金部分 ${cashCap} 不打折，其餘 × 98%）− bought ${bought} → 可買 ${remaining}，windowEndsAt ${windowEndsAt}`;
     if (remaining === 0n) return { kind: 'blocked', reason: `${note}；${windowEndsAt === 0n ? '沒有可等待的開啟窗口，沿用正常排程間隔' : '等待買入窗口結束'}`, buyWindowEndsAt: windowEndsAt };
     return { cap, bought, windowEndsAt, remaining, note };
   } catch (error) {

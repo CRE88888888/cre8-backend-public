@@ -26,7 +26,7 @@ import {
   amountOutMinWithBuffer,} from '../src/rebalance-plan.js';
 import { quoteNewMoney, newMoneyDepthCap } from '../src/rebalance-plan.js';
 import type { PlanRebalanceArgs, PlannedStep, RebalancePlan } from '../src/rebalance-plan.js';
-import { DEFAULT_MAX_IMPACT_BPS, resolveMaxImpactBps } from '../src/rebalance-plan.js';
+import { DEFAULT_MAX_IMPACT_BPS, resolveMaxImpactBps, safeBuyCap, BUY_CAP_VOLATILE_MARGIN_BPS } from '../src/rebalance-plan.js';
 import { capAmountInForImpact, estimateImpact } from '../src/impact.js';
 import type { PoolImpactState } from '../src/impact.js';
 import { twapPriceInUsdt } from '../src/pricing.js';
@@ -93,6 +93,9 @@ type StubChain = {
   routeQuotes?: boolean;
   minBatchFee?: bigint;
   buyAllowance?: unknown;
+  /** Executor `maxBuyBps` and the account's numeraire `balanceOf`; unset = the read reverts (no cash credit). */
+  maxBuyBps?: number;
+  accountCash?: bigint;
   executorNumeraire?: unknown;
   calls: ChainCall[];
   block: { number: bigint; timestamp: bigint };
@@ -202,6 +205,7 @@ function stubClient(chain: StubChain): PublicClient {
           if (chain.executorNumeraire instanceof Error) throw chain.executorNumeraire;
           return chain.executorNumeraire === undefined ? chain.oracle.token0 : chain.executorNumeraire;
         }
+        if (args.functionName === 'maxBuyBps' && chain.maxBuyBps !== undefined) return chain.maxBuyBps;
         if (args.functionName === 'buyAllowance') {
           if (chain.buyAllowance instanceof Error) throw chain.buyAllowance;
           return chain.buyAllowance === undefined ? [2n ** 192n - 1n, 0n, 0n] : chain.buyAllowance;
@@ -284,6 +288,9 @@ function stubClient(chain: StubChain): PublicClient {
         case 'effectiveFeeBps':
           return chain.registry.feeBps;
         case 'decimals': return 18;
+        case 'balanceOf':
+          if (chain.accountCash === undefined) throw new Error(`stub 沒有 ${args.functionName}`);
+          return chain.accountCash;
         default:
           throw new Error(`stub 沒有 ${args.functionName}`);
       }
@@ -2149,6 +2156,54 @@ for (const [cap, bought, expected] of ([[100n, 0n, 98n], [100n, 97n, 1n], [101n,
     assert.match(plan.rationale, /買入額度/);
   });
 }
+
+test('A10 safe buy cap keeps the cash-backed part whole and cuts only the volatile part by 2%', () => {
+  assert.equal(BUY_CAP_VOLATILE_MARGIN_BPS, 200n);
+  assert.equal(safeBuyCap(1000n, 0n), 980n, 'no cash: unchanged 98% of the whole cap');
+  assert.equal(safeBuyCap(1000n, 1000n), 1000n, 'all cash: no haircut');
+  assert.equal(safeBuyCap(1000n, 600n), 600n + 392n);
+  assert.equal(safeBuyCap(1000n, 5000n), 1000n, 'cash credit never exceeds the cap');
+  assert.equal(safeBuyCap(0n, 100n), 0n);
+  assert.throws(() => safeBuyCap(-1n, 0n));
+});
+
+// Regression (portfolio 20, 2026-11-24): a cash-only account buying ~99.9% of its value. The flat 98% cap
+// left ~2% short every round, so the batch planner split it 100 / 50 / 25 / 12.5. It must fit in one round.
+test('A10 first buy of ~99.9% of a cash-only account fits the allowance in one round', async () => {
+  const unit = 10n ** 18n;
+  const chain = hubChain();
+  chain.rate = { rateE18: unit, slippageBps: 100 };
+  chain.maxBuyBps = 10000;
+  chain.accountCash = 1000n * unit;
+  chain.buyAllowance = [1000n * unit, 0n, 0n];
+  const args = allowanceCase(chain);
+  args.holdings = [holding(USDT, 1000n * unit, 18, PRICE_1_USD)];
+  args.targets = [{ asset: USDT, weightBps: 10 }, { asset: WBNB, weightBps: 4995 }, { asset: TOKEN3, weightBps: 4995 }];
+  args.drift = computeDrift(args.holdings, args.targets, 100);
+  const plan = expectReady(await planRebalance(args));
+  const total = plan.steps.reduce((sum, step) => sum + step.amountIn, 0n);
+  assert.equal(total, 999n * unit, 'the whole ~99.9% basket, not a half');
+  // Protections unchanged: allowance still read at the planning block, executor cap never exceeded.
+  assert.ok(total <= 1000n * unit);
+  assert.ok(chain.calls.some((call) => call.functionName === 'buyAllowance' && call.blockNumber === chain.block.number));
+  assert.ok(chain.calls.some((call) => call.functionName === 'balanceOf' && call.blockNumber === chain.block.number));
+});
+
+test('A10 volatile account value keeps the 2% margin; failed cash reads fall back to the old 98%', async () => {
+  const unit = 10n ** 18n;
+  for (const [cash, expected] of ([[0n, 980n], [undefined, 980n], [500n, 990n]] satisfies [bigint | undefined, bigint][])) {
+    const chain = hubChain();
+    chain.rate = { rateE18: unit, slippageBps: 100 };
+    chain.maxBuyBps = 10000;
+    if (cash !== undefined) chain.accountCash = cash * unit;
+    chain.buyAllowance = [1000n * unit, 0n, 0n];
+    const args = allowanceCase(chain);
+    args.holdings = [holding(USDT, 2000n * unit, 18, PRICE_1_USD)];
+    args.drift = computeDrift(args.holdings, args.targets, 100);
+    const plan = expectReady(await planRebalance(args));
+    assert.equal(plan.steps.reduce((sum, step) => sum + step.amountIn, 0n), expected * unit, `cash ${String(cash)}`);
+  }
+});
 
 for (const [cap, bought, end] of ([[0n, 0n, 0n], [100n, 98n, 1800000000n], [100n, 100n, 1800000000n], [100n, 101n, 1800000000n], [1n, 0n, 0n]] satisfies [bigint, bigint, bigint][])) {
   test(`A10 exhausted or rounded-to-zero budget ${cap}/${bought}/${end} blocks without a quote`, async () => {

@@ -3403,7 +3403,8 @@ export function formatResult(result: PortfolioRunResult, dryRun: boolean): strin
     : `next_run_at ${result.nextRunAt.toISOString()}`;
   return (
     `[scheduler] portfolio ${result.portfolioId} → ${label[result.outcome]}${suffix}｜${nextRun}` +
-    `${dryRun ? '｜dry-run（沒有送出任何交易）' : ''}\n           ${result.reason}`
+    `${dryRun ? '｜dry-run（沒有送出任何交易）' : ''}\n           ${result.reason}` +
+    (result.plan === null || result.plan.rationale === '' ? '' : `\n           理由：${result.plan.rationale.replace(/\s+/g, ' ')}`)
   );
 }
 

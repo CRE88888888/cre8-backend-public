@@ -182,7 +182,7 @@ export async function prepareNewMoney(args:{due:DuePortfolio;plan:PortfolioPlan;
     const inputs=newMode?executionInputGroups(vector,stepLimit,reserve,context.finalAssets,feeWindow)?.[0]??{}:vector;
     if(newMode&&sumInputs(inputs)+reserve<MIN_ASSET_BATCH_RAW)return {job,context,rebalance:{kind:'blocked',reason:'[BASKET_WAITING] 子批不足10 USDT'}};
     const rebalance=await deps.quote(due,plan,inputs,deadline);
-    if(rebalance.kind==='ready')return {job,context,rebalance};
+    if(rebalance.kind==='ready')return {job,context,rebalance:{...rebalance,rationale:`${rebalance.rationale}；新錢分批：剩餘 ${sumInputs(newMode?remaining:job.remaining_input)} 分 ${count} 批、本批 ${sumInputs(inputs)}，買入額度 ${policy.buyLimit}`}};
     if(rebalance.kind!=='blocked'||!rebalance.reason.includes('[BASKET_DEPTH]')||count===maximum)return {job,context,rebalance};
     count=count*2n>maximum?maximum:count*2n;
   }

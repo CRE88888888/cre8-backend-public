@@ -32,13 +32,12 @@ export const SWAP_GAP_BUFFER_BPS = 50n;
  * Dust is only counted for a token the account no longer owes (while a route in that token is open its balance is the
  * repayment fallback, `maxCashIn`).
  */
-export function loanTokenNeeds(read: Pick<V2AccountRead, 'tokens' | 'routes' | 'vaults'>, numeraire: Address): LoanTokenNeed[] {
+export function loanTokenNeeds(read: Pick<V2AccountRead, 'tokens' | 'vaults'>, numeraire: Address): LoanTokenNeed[] {
   const needs: LoanTokenNeed[] = [];
   for (const [symbol, t] of Object.entries(read.tokens) as [Stable, V2AccountRead['tokens'][string]][]) {
     if (t.token.toLowerCase() === numeraire.toLowerCase()) continue;
-    const routes = read.routes.filter(r => r.route.loan === t.token);
-    // Venus reports the account's whole debt in the token on each of its routes: count it once, plus every Lista market.
-    const owed = (routes.find(r => r.route.venue === 'venus')?.debtRaw ?? 0n) + routes.filter(r => r.route.venue === 'lista').reduce((s, r) => s + r.debtRaw, 0n);
+    // The account's whole debt in the token (lens.tokenDebt): never a sum of the routes' shares.
+    const owed = t.debtRaw;
     const box = read.vaults.filter(v => v.vault.token === t.token).reduce((s, v) => s + v.assetsRaw, 0n) + t.idleRaw;
     if (owed === 0n) {
       if (t.cashRaw >= SWAP_DUST_MIN_RAW) needs.push({ symbol, token: t.token, kind: 'dust', amountRaw: t.cashRaw, why: `${symbol} left in the account after its routes closed` });

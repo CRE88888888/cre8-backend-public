@@ -484,7 +484,7 @@ for (const kind of ['fund', 'mix'] as const) {
     const v2f = v2Flows(await renewalV2(real), real);
     const before = process.env.STRATEGY_EARN_V2_AUDIENCE;
     try {
-      // The fixture owner is not on the canary list: every v2 UserOp is refused, v1 is untouched.
+      // Nobody is listed in the shipped deployment's canary list: every v2 UserOp is refused, v1 is untouched.
       delete process.env.STRATEGY_EARN_V2_AUDIENCE;
       assert.ok(!real.canaryOwners.includes(owner.toLowerCase() as Address));
       for (const [name, calls] of v2f) await assert.rejects(harness(kind, { wired: true }).sponsor(calls), code('PAYMASTER_CALL_FORBIDDEN', 403), `${kind}: ${name} outside the audience`);

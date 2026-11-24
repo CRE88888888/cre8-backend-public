@@ -134,8 +134,10 @@ async function recordRewards(args: Pick<V2StepArgs, 'v2' | 'ledger' | 'portfolio
 /** Sends a plain transaction with the keeper key and waits for its receipt. */
 export type V2KeeperSend = (to: Address, data: Hex) => Promise<V2Tx>;
 export type V2KeeperResult = { accounts: number; checked: number; deleveraged: number; collected: number; stranded: number; failed: number; writer: boolean };
-/** Reward tokens under this (raw, 18 decimals) wait in the box: not worth a transaction. */
+/** Reward tokens under this (raw, 18 decimals) wait in the box: not worth a transaction. Chain 97's simulated tokens are
+ * worth nothing and its positions are small, so the bar is ten times lower there (a test position shows a reward within the hour). */
 export const V2_MIN_COLLECT_RAW = 10n ** 16n;
+export const v2MinCollectRaw = (chainId: number) => chainId === 97 ? V2_MIN_COLLECT_RAW / 10n : V2_MIN_COLLECT_RAW;
 const MOCK_VAULT_ABI = parseAbi(['function claimReward(address account) returns (uint256)', 'function claimReward(bytes32 id, address account) returns (uint256)']);
 
 /**
@@ -148,7 +150,7 @@ const MOCK_VAULT_ABI = parseAbi(['function claimReward(address account) returns 
  */
 export async function runV2KeeperRound(args: { dryRun: boolean; log: (line: string) => void }, deps: { v2: StrategyEarnV2; reader: V2Reader; send: V2KeeperSend | null; ledger: V2Ledger;
   accounts: () => Promise<{ account: Address; portfolioId: number; owner: Address }[]> }): Promise<V2KeeperResult> {
-  const { v2, reader } = deps;
+  const { v2, reader } = deps, minCollect = v2MinCollectRaw(v2.chainId);
   const result: V2KeeperResult = { accounts: 0, checked: 0, deleveraged: 0, collected: 0, stranded: 0, failed: 0, writer: deps.send !== null };
   const accounts = await deps.accounts();
   if (accounts.length === 0) return result;
@@ -184,7 +186,7 @@ export async function runV2KeeperRound(args: { dryRun: boolean; log: (line: stri
       if (v2.chainId === 97) {
         for (const v of read.vaults.filter(x => x.vault.venue === 'lista' && x.assetsRaw > 0n)) {
           const pending = await reader.vaultReward(v.vault.target, read.box);
-          if (pending === null || pending < V2_MIN_COLLECT_RAW) continue;
+          if (pending === null || pending < minCollect) continue;
           const tx = await deps.send(v.vault.target, encodeFunctionData({ abi: MOCK_VAULT_ABI, functionName: 'claimReward', args: [read.box] }));
           await recordRewards(ctx, read, tx, a.owner); claimed = true;
           args.log(`[strategy-routing] ${a.account} 模擬 vault 激勵已發到策略盒 tx=${tx.hash}`);
@@ -195,14 +197,14 @@ export async function runV2KeeperRound(args: { dryRun: boolean; log: (line: stri
       if (v2.chainId === 97) {
         for (const r of read.routes.filter(x => x.collateralRaw > 0n)) {
           const pending = await reader.venueReward(r.route, a.account);
-          if (pending === null || pending < V2_MIN_COLLECT_RAW) continue;
+          if (pending === null || pending < minCollect) continue;
           const tx = r.route.venue === 'venus' ? await deps.send(r.route.collateralVToken, encodeFunctionData({ abi: MOCK_VAULT_ABI, functionName: 'claimReward', args: [a.account] }))
             : await deps.send(v2.moolah, encodeFunctionData({ abi: MOCK_VAULT_ABI, functionName: 'claimReward', args: [r.route.listaId, a.account] }));
           args.log(`[strategy-routing] ${a.account} ${r.route.symbol} 模擬場所激勵已發到帳戶（${pending}）tx=${tx.hash}`);
         }
       }
       if (claimed) read = await reader.account(a.account);
-      for (const r of read.rewards.filter(x => x.boxRaw >= V2_MIN_COLLECT_RAW)) {
+      for (const r of read.rewards.filter(x => x.boxRaw >= minCollect)) {
         const call = v2KeeperCall(v2, v2Calls.collectRewards(v2, a.account, r.token));
         const tx = await deps.send(call.to, call.data);
         result.collected++;

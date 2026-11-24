@@ -50,19 +50,25 @@ test('every v2 address comes from deployment configuration: the manifest file, o
   }
   // A build without the manifest has no v2 anywhere (v1 for everyone); a manifest that is there and broken throws.
   assert.equal(strategyEarnV2(97, { STRATEGY_EARN_V2_MANIFEST: '/nonexistent/strategy-earn-v2.json' }), null);
-  assert.equal(strategyEarnV2For(97, strategyEarnV2(97, {})!.canaryOwners[0], { STRATEGY_EARN_V2_MANIFEST: '/nonexistent/strategy-earn-v2.json' }), null);
+  assert.equal(strategyEarnV2For(97, owner, { STRATEGY_EARN_V2_MANIFEST: '/nonexistent/strategy-earn-v2.json', STRATEGY_EARN_V2_AUDIENCE: 'all' }), null);
   assert.throws(() => strategyEarnV2(97, { STRATEGY_EARN_V2_MANIFEST: new URL('./fixtures/borrow-routing-v2.signatures.json', import.meta.url).pathname }), /no deployments/);
 });
 
-test('audience: v2 is for the canary owners only until STRATEGY_EARN_V2_AUDIENCE says otherwise; everyone else stays on v1', () => {
-  const canary = strategyEarnV2(97, {})!.canaryOwners[0]!, other = A(0x1234);
-  assert.equal(strategyEarnV2For(97, canary, {})!.chainId, 97);
-  assert.equal(strategyEarnV2For(97, canary.toUpperCase().replace('0X', '0x'), {})!.chainId, 97);
-  for (const who of [other, null, undefined, 'not an address']) assert.equal(strategyEarnV2For(97, who, {}), null);
-  assert.equal(strategyEarnV2For(56, canary, {}), null); // no deployment on this chain
+test('audience: v2 is for the deployment\'s canary owners only until STRATEGY_EARN_V2_AUDIENCE says otherwise; everyone else stays on v1', () => {
+  // The manifest shipped today lists nobody: v2 is deployed on chain 97 but off for every owner (v1 for all).
+  assert.deepEqual(strategyEarnV2(97, {})!.canaryOwners, []);
+  const other = A(0x1234), canary = A(0xd3ab);
+  for (const who of [other, canary, owner, null, undefined, 'not an address']) assert.equal(strategyEarnV2For(97, who, {}), null);
+  // A deployment that lists a canary owner: that owner only, whatever the letter case.
+  const listed = { STRATEGY_EARN_V2_DEPLOYMENT: JSON.stringify({ ...JSON.parse(MANIFEST), chainId: 97, canaryOwners: [canary] }) };
+  assert.equal(strategyEarnV2For(97, canary, listed)!.chainId, 97);
+  assert.equal(strategyEarnV2For(97, canary.toUpperCase().replace('0X', '0x'), listed)!.chainId, 97);
+  for (const who of [other, null, undefined, 'not an address']) assert.equal(strategyEarnV2For(97, who, listed), null);
+  assert.equal(strategyEarnV2For(56, canary, listed), null); // no deployment on this chain
   assert.equal(v2Audience(97, other, { STRATEGY_EARN_V2_AUDIENCE: 'all' }), true);
   assert.equal(v2Audience(97, canary, { STRATEGY_EARN_V2_AUDIENCE: 'off' }), false);
-  assert.deepEqual([v2Audience(97, other, { STRATEGY_EARN_V2_AUDIENCE: `${A(1)}, ${other}` }), v2Audience(97, canary, { STRATEGY_EARN_V2_AUDIENCE: A(1) })], [true, false]);
+  assert.equal(v2Audience(97, canary, { ...listed, STRATEGY_EARN_V2_AUDIENCE: 'off' }), false);
+  assert.deepEqual([v2Audience(97, other, { STRATEGY_EARN_V2_AUDIENCE: `${A(1)}, ${other}` }), v2Audience(97, canary, { ...listed, STRATEGY_EARN_V2_AUDIENCE: A(1) })], [true, false]);
   assert.throws(() => v2Audience(97, other, { STRATEGY_EARN_V2_AUDIENCE: 'everyone' }));
 });
 

@@ -1,6 +1,6 @@
 # 加息策略動態路由 v2：後端這一側
 
-合約規格：cre8-contracts `docs/borrow-routing-v2.zh-TW.md`（這裡對的是 **v2.0-draft5**，含第三輪審查的三點補充）。選路線的規則：`docs/strategy-earn-mainnet-routing.zh-TW.md`。激勵代幣：`docs/strategy-earn-rewards.zh-TW.md`。
+合約規格：cre8-contracts `docs/borrow-routing-v2.zh-TW.md`（這裡對的是 **v2.0-draft6**；ABI 與 draft5 相同。測試網目前跑的是 draft5 的程式，後端的讀法兩版都對）。選路線的規則：`docs/strategy-earn-mainnet-routing.zh-TW.md`。激勵代幣：`docs/strategy-earn-rewards.zh-TW.md`。
 
 | 檔案 | 做什麼 |
 | --- | --- |
@@ -19,7 +19,9 @@
 兩層，都是設定，不是程式：
 
 1. **v2 在哪裡**：`strategyEarnV2(chainId)` 讀 `STRATEGY_EARN_V2_DEPLOYMENT`（一個 JSON 物件，有設就以它為準），沒設就讀 `deploy/strategy-earn-v2.json`。chain 97 已部署（2026-11-25），chain 56 沒有。session key 範圍、paymaster 允許清單、讀取用的 lens 全部跟著這份設定走；重新部署 executor 只要換這個檔案（或設變數）。格式錯就 throw。
-2. **誰可以用**：`strategyEarnV2For(chainId, owner)`。`STRATEGY_EARN_V2_AUDIENCE` 沒設＝部署設定裡的 `canaryOwners`（現在只有即時 e2e harness 的測試錢包）；`all`＝所有人；`off`＝沒有人；或逗號分隔的 owner 地址。
+2. **誰可以用**：`strategyEarnV2For(chainId, owner)`。`STRATEGY_EARN_V2_AUDIENCE` 沒設＝部署設定裡的 `canaryOwners`；`all`＝所有人；`off`＝沒有人；或逗號分隔的 owner 地址。
+
+**現況（2026-11-25）：`canaryOwners` 是空的，v2 對所有人關閉。** 測試網這套 v2（draft5 程式）即將換成 draft6 的修正版重新部署，地址會全部換掉，所以先不在舊合約上留任何部位。重新部署後把新地址寫進 `deploy/strategy-earn-v2.json`，同時把 e2e harness 的測試錢包放回 `canaryOwners`，再跑上鏈驗證。
 
 不在對象裡的 owner 完全走 v1：續期不裝 v2 權限、paymaster 不贊助任何 v2 呼叫、API 與排程器不會組 v2 的交易，也不會多讀任何鏈上資料（排程器只多一次有快取的 owner 查詢；持倉快照與 My mix 金流對帳只對對象內的 owner 讀 v2）。**對所有人開啟＝把 `STRATEGY_EARN_V2_AUDIENCE` 設成 `all`，這是產品決定，這次沒有做。**
 
@@ -38,7 +40,7 @@
 - 市場快照（每輪一次，60 秒快取）：每條路線的 `routeStatus(routeId, 0)`、`minLoan`、`minDebt`；每個 vault 的 `vaultStatus`。另外讀：ERC4626 vault 的 `maxDeposit`（0＝存不進去，不當目的地）、Venus 抵押市場的 `supplyCaps` 與已供應量（剩餘額度不夠放這筆抵押就不選）、Venus／Aave vault 的可領現金。轉成跟主網顯示同一個形狀的 `RoutingSnapshot` 給引擎。
 - 帳戶：`policy`、`accountRoutes`、`accountVaults`、`boxOf`、每條路線的 `routeStatus(routeId, account)`、每個 vault 的 `vaultStatus`、每種借款幣的 `idleOf`／帳戶餘額／allowance、激勵代幣餘額、可抵押資產的餘額與價格。
 - **淨值**＝策略盒各 vault 的 `assets`＋`idleOf`－負債（抵押品算在持倉裡）。
-- **負債不重複算**（第三輪審查）：某個幣的 Venus 本金還完只剩利息時，`lens.routeDebt` 在每條 Venus 路線都回整筆。帳戶層的負債用 `lens.debt`（同一個幣只算一次），各路線的份額加總不超過它。
+- **負債怎麼讀**（draft6 §5）：帳戶在某個幣的負債用 `lens.tokenDebt(account, token)`，不加總 `routeDebt`。`routeDebt` 只用來決定「這條路線送 `MAX` 會還多少」與畫面上怎麼分：某個幣的 Venus 本金還完只剩利息時，draft5 的 lens 每條同幣路線都回整筆，後端照 `accountRoutes` 的順序把份額壓到不超過 `lens.debt`（等於 draft6 的結果：整筆歸第一條，其餘 0）。`MAX` 只送給份額不為 0 的那條，份額 0 的只取回抵押。
 - 路線對新借款關閉（registry 暫停、停用）：可借額度當 0，已開的部位照常持有，不強迫退出；路線被退休（`retired`）才當成市場消失。
 - 一律走公開節點（`V2_PUBLIC_RPCS`，可用 `STRATEGY_EARN_V2_RPC_URLS` 換），節點之間自動切換，**不會退回付費 RPC**。公開節點都不回應時那一輪跳過。
 
@@ -48,7 +50,7 @@
 | --- | --- |
 | 成交後／每次輪到這個投資組合而沒有交易要做（`open` hook） | `v2AutoRound`：引擎決定 → session key 執行。開倉、補借、搬家、只換 vault、還款、關閉。這同時是「定期重新評估」 |
 | 賣出前（`unwind` hook） | `v2UnwindForSale`：要賣的資產先還款取回。策略盒＋帳戶同幣現金夠 → 全關；不夠 → 能還多少還多少、按比例少 2% 取回，賣掉之後下一輪還剩下的。全部退出時（賣光／刪除／停利停損）同一把 session key 把激勵代幣送到 owner 錢包 |
-| 每輪（keeper，`STRATEGY_EARN_KEEPER_PRIVATE_KEY`，跟 v1 keeper 同一把） | `runV2KeeperRound`：場所說到健康線（`shouldDeleverage`）才送 `executeDeleverage`；策略盒裡的激勵代幣 ≥ 0.01 → `collectRewards`。測試網另外代觸發模擬 vault／模擬場所的激勵發放 |
+| 每輪（keeper，`STRATEGY_EARN_KEEPER_PRIVATE_KEY`，跟 v1 keeper 同一把） | `runV2KeeperRound`：場所說到健康線（`shouldDeleverage`）才送 `executeDeleverage`；策略盒裡的激勵代幣 ≥ 0.01（測試網 0.001）→ `collectRewards`。測試網另外代觸發模擬 vault／模擬場所的激勵發放 |
 
 搬家規則（已定案，`ROUTING` 常數）：新路線加息高 ≥ 0.50%、30 天多賺 ≥ 3× 搬家成本、現路線已持有 ≥ 7 天。負利差、市場消失、vault 領不出來當輪處理。借款市場使用率上限 95% 由合約的 gate 擋。
 

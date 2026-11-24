@@ -8,7 +8,7 @@ import type { Costs, Decision, Holding, Liquidity, PricedRoute, RouteKey } from 
 import type { RoutingSnapshot, Stable, Venue } from './strategy-earn-mainnet.js';
 
 /**
- * Strategy Earn routing v2 (cre8-contracts docs/borrow-routing-v2, interface v2.0-draft5): the execution side of the
+ * Strategy Earn routing v2 (cre8-contracts docs/borrow-routing-v2, interface v2.0-draft6; same ABI as draft5): the execution side of the
  * routing engine. Deployed on chain 97 (2026-11-25); not on chain 56. Where it is comes from deployment configuration
  * (`strategyEarnV2`: deploy/strategy-earn-v2.json or STRATEGY_EARN_V2_DEPLOYMENT), never from an address in code. Who gets
  * it is decided per owner by `strategyEarnV2For` (a canary list today): everyone else keeps the v1 chain-97 flow. Apart
@@ -20,7 +20,7 @@ import type { RoutingSnapshot, Stable, Venue } from './strategy-earn-mainnet.js'
  * strategy box; consent is one account-level `setStrategyPolicy(maxDebt, rewardRecipient, enabled)`; no call takes a
  * receiver; every `execute*` except `executeDeleverage` needs `msg.sender == account`.
  */
-export const V2_INTERFACE_VERSION = 'v2.0-draft5';
+export const V2_INTERFACE_VERSION = 'v2.0-draft6';
 export type StrategyEarnV2 = {
   chainId: number; executor: Address; registry: Address;
   /** AtpBorrowLensV2 (`executor.lens()`): every venue read. */
@@ -90,7 +90,7 @@ export function strategyEarnV2(chainId: number, env: NodeJS.ProcessEnv = process
 }
 /**
  * Is routing v2 open to this owner's accounts? STRATEGY_EARN_V2_AUDIENCE: unset = the deployment's `canaryOwners`
- * (2026-11-25: the live e2e harness's throwaway test wallet, chain 97); `all` = every owner; `off` = nobody; otherwise a
+ * (empty today: v2 is off for everyone until an owner is listed there); `all` = every owner; `off` = nobody; otherwise a
  * comma-separated list of owner addresses (malformed entries throw). Everyone outside the audience stays on v1: no v2
  * session scope is installed for them, the paymaster sponsors no v2 call of theirs, the API and the scheduler build none.
  * Opening v2 to everyone is a product decision (set the variable to `all`); nothing in the code changes.

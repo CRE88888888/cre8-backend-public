@@ -123,8 +123,9 @@ export type V2AccountRead = { account: Address; box: Address; state: V2AccountSt
   routes: { route: V2Route; vault: V2Vault | null; collateralRaw: bigint; collateralValueUsd: bigint; debtRaw: bigint; routeDebtRaw: bigint; principalRaw: bigint; openedAt: number; shouldDeleverage: boolean;
     ltvBps: number; targetLtvBps: number; deleverageLtvBps: number; liquidationLtvBps: number; limits: RouteLimits }[];
   vaults: { vault: V2Vault; assetsRaw: bigint; since: number; shouldExit: boolean }[];
-  /** Per loan token: idle in the box (`lens.idleOf`), the account's own balance and its allowance to the executor. */
-  tokens: Record<string, { token: Address; idleRaw: bigint; cashRaw: bigint; allowanceRaw: bigint }>;
+  /** Per loan token: the account's whole debt in it (`lens.tokenDebt`: Venus plus every Lista position — never a sum of
+   * `routeDebt`s, spec §5), idle in the box (`lens.idleOf`), the account's own balance and its allowance to the executor. */
+  tokens: Record<string, { token: Address; debtRaw: bigint; idleRaw: bigint; cashRaw: bigint; allowanceRaw: bigint }>;
   rewards: { token: Address; boxRaw: bigint; accountRaw: bigint; allowanceRaw: bigint }[];
   /** Net value of the strategy money: vault holdings + idle − debt, loan tokens at 1 USD (18 decimals). Collateral is counted with the holdings. */
   earnNetUsd: bigint };
@@ -291,7 +292,7 @@ export function createV2Reader(deps: V2ReaderDeps) {
     const res = await multicall([
       ...routes.flatMap(r => [lens('routeStatus', [r.routeId, account]), lens('minLoan', [r.routeId]), lens('minDebt', [r.routeId])]),
       ...vaults.map(v => lens('vaultStatus', [v.vaultId, account])),
-      ...tokens.flatMap(([, t]) => [lens('idleOf', [account, t]), venue(t, 'balanceOf', [account]), venue(t, 'allowance', [account, v2.executor])]),
+      ...tokens.flatMap(([, t]) => [lens('idleOf', [account, t]), venue(t, 'balanceOf', [account]), venue(t, 'allowance', [account, v2.executor]), lens('tokenDebt', [account, t])]),
       ...v2.rewardTokens.flatMap(t => [venue(t, 'balanceOf', [box]), venue(t, 'balanceOf', [account]), venue(t, 'allowance', [account, v2.executor])]),
       ...eligible.flatMap(t => [venue(t, 'balanceOf', [account]), ...(oracle ? [venue(oracle, 'peek', [t])] : [])]),
       ...venusLoans.map(([, vToken]) => venue(vToken, 'borrowBalanceStored', [account])),
@@ -304,9 +305,11 @@ export function createV2Reader(deps: V2ReaderDeps) {
         shouldDeleverage: s.shouldDeleverage, ltvBps: bpsOf(s.ltv), targetLtvBps: bpsOf(s.targetLtv), deleverageLtvBps: bpsOf(s.deleverageLtv), liquidationLtvBps: bpsOf(s.liquidationLtv),
         limits: { minLoanRaw: minLoan ?? 0n, minDebtRaw: minDebt ?? 0n } };
     });
-    // Contracts review round 3: once a token's Venus principal is repaid and only interest is owed, `lens.routeDebt`
-    // answers the WHOLE debt on every Venus route of that token. The account's debt in a token is `lens.debt` (the same
-    // number on each of those routes), so the per-route shares are capped to add up to it and nothing is counted twice.
+    // Contracts review round 3: once a token's Venus principal is repaid and only interest is owed, the draft5 lens (what
+    // chain 97 runs) answers the WHOLE debt as `routeDebt` on every Venus route of that token; draft6 gives it to the
+    // account's first Venus position in that token and 0 to the rest. Capping the shares against `lens.debt` in route
+    // order yields the draft6 answer on either version: the shares never add up to more than the debt, and MAX is only
+    // ever sent on a route whose share is not 0 (a route with share 0 just gets its collateral back).
     for (const token of new Set(routeReads.filter(r => r.route.venue === 'venus').map(r => r.route.loan))) {
       const group = routeReads.filter(r => r.route.venue === 'venus' && r.route.loan === token);
       let left = group[0]!.debtRaw;
@@ -314,7 +317,8 @@ export function createV2Reader(deps: V2ReaderDeps) {
     }
     const vaultReads = vaults.map(vault => { const s = must<{ assets: bigint; since: bigint; shouldExit: boolean }>(res[at++], 'vaultStatus ' + vault.vaultId); return { vault, assetsRaw: s.assets, since: Number(s.since), shouldExit: s.shouldExit }; });
     const tokenReads: V2AccountRead['tokens'] = {};
-    for (const [symbol, token] of tokens) { tokenReads[symbol] = { token, idleRaw: must<bigint>(res[at], 'idleOf ' + symbol), cashRaw: must<bigint>(res[at + 1], 'balance ' + symbol), allowanceRaw: (res[at + 2] as bigint | null) ?? 0n }; at += 3; }
+    for (const [symbol, token] of tokens) { tokenReads[symbol] = { token, idleRaw: must<bigint>(res[at], 'idleOf ' + symbol), cashRaw: must<bigint>(res[at + 1], 'balance ' + symbol), allowanceRaw: (res[at + 2] as bigint | null) ?? 0n,
+      debtRaw: must<bigint>(res[at + 3], 'tokenDebt ' + symbol) }; at += 4; }
     const rewards = v2.rewardTokens.map(token => { const r = { token, boxRaw: (res[at] as bigint | null) ?? 0n, accountRaw: (res[at + 1] as bigint | null) ?? 0n, allowanceRaw: (res[at + 2] as bigint | null) ?? 0n }; at += 3; return r; });
     const free = new Map<string, { freeRaw: bigint; priceE8: bigint | null }>();
     for (const t of eligible) { free.set(t, { freeRaw: must<bigint>(res[at], 'balance ' + t), priceE8: oracle ? res[at + 1] as bigint | null : null }); at += oracle ? 2 : 1; }
@@ -343,11 +347,8 @@ export function createV2Reader(deps: V2ReaderDeps) {
     }
     // draft5 ForeignDebt: the account owes the token on Venus and holds no v2 Venus position in it.
     const foreignVenusLoans = venusLoans.map(([symbol]) => symbol).filter(symbol => (venusOwed.get(symbol) ?? 0n) > 0n && !routes.some(r => r.venue === 'venus' && r.loanSymbol === symbol));
-    // Venus reports the account's whole debt in a token on every route of that token: count it once, plus the Lista markets.
-    const debtTotal = [...new Set(routeReads.map(r => r.route.loan))].reduce((sum, token) => {
-      const venus = routeReads.find(r => r.route.loan === token && r.route.venue === 'venus')?.debtRaw ?? 0n;
-      return sum + venus + routeReads.filter(r => r.route.loan === token && r.route.venue === 'lista').reduce((s, r) => s + r.debtRaw, 0n);
-    }, 0n);
+    // The account's debt per token is lens.tokenDebt (draft6 §5 "how the backend reads debt"), never a sum of routeDebt.
+    const debtTotal = Object.values(tokenReads).reduce((sum, t) => sum + t.debtRaw, 0n);
     const boxTotal = vaultReads.reduce((s, v) => s + v.assetsRaw, 0n) + Object.values(tokenReads).reduce((s, t) => s + t.idleRaw, 0n);
     return { account, box, policy: { ...policy, rewardRecipient: lower(policy.rewardRecipient) }, enrollment, consent: enabled, routes: routeReads, vaults: vaultReads, tokens: tokenReads, rewards,
       earnNetUsd: boxTotal - debtTotal,

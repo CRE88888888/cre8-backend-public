@@ -306,7 +306,7 @@ test('GET /strategy-earn/markets is cached server-side: one chain read per windo
 test('routing v2 behind the same endpoints: only an owner in the v2 audience reaches it, and one account is answered by v1 or by v2, never both', async () => {
   const { strategyEarnV2 } = await import('../src/strategy-earn-v2.js');
   const v2 = strategyEarnV2(97, {})!;
-  const canary = v2.canaryOwners[0]!, asked: string[] = [];
+  const canary = '0xd3ab39b62e221bf9e8ba19fe19b2638767d3d6d9' as Address, asked: string[] = [];
   let active = false, broken = false;
   const api = {
     active: async () => { asked.push('active'); if (broken) throw new Error('public node down'); return active; },
@@ -321,7 +321,7 @@ test('routing v2 behind the same endpoints: only an owner in the v2 audience rea
   const f: Fake = { statuses: Object.fromEntries(markets.map(m => [m.marketId, status()])), ids: [], held: 10n * E18, collateral: 0n, prices: { [nvda.collateral]: 150n * 10n ** 8n }, rewards: { vault: 0n, collateral: 0n },
     weights: [{ asset: nvda.collateral, weightBps: 10_000 }] };
   const chain = { ...fakeChain(f), receipt: async () => ({ ...tx0, success: true }) };
-  const earn = (owner: Address) => createStrategyEarn({ chainId: 97, chain: () => chain, owned: ownedPortfolio({ ownerAddress: owner }) as never, v2Api: () => api as never, mainnetRates: noMainnet, ledger: noLedger,
+  const earn = (owner: Address) => createStrategyEarn({ chainId: 97, chain: () => chain, owned: ownedPortfolio({ ownerAddress: owner }) as never, v2: who => who.toLowerCase() === canary ? v2 : null, v2Api: () => api as never, mainnetRates: noMainnet, ledger: noLedger,
     query: (async () => ({ rows: [] })) as never });
   const vaultId = ('0x' + 'b1'.repeat(32)) as Hex;
 

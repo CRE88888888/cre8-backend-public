@@ -84,6 +84,9 @@ export function world() {
         return { open: s.open, rateOnChain: v.kind !== 1, rateKnown: s.rateKnown, utilizationKnown: s.utilizationKnown, shouldExit: h?.shouldExit ?? s.shouldExit, supplyRate: rate(s.supplyBps), incentiveRate: rate(s.incentiveBps), utilizationBps: BigInt(s.utilizationBps),
           assets: h?.assets ?? 0n, since: BigInt(h?.since ?? 0) }; }
       if (fn === 'idleOf') return state.idle.get(args[1] as Address) ?? 0n;
+      // The account's whole debt in a token: its Venus debt once (every Venus route of the token reports the same number) plus each Lista market.
+      if (fn === 'tokenDebt') { const ps = [...state.positions.entries()].map(([id, p]) => ({ r: routes.get(id)!, p })).filter(x => x.r.loan === args[1]);
+        return (ps.find(x => x.r.venue === 1)?.p.debt ?? 0n) + ps.filter(x => x.r.venue === 2).reduce((s, x) => s + x.p.debt, 0n); }
     }
     if (t === v2.executor && fn === 'boxOf') return W.box;
     if (t === W.atpRegistry && fn === 'enrollments') return state.enrollment;

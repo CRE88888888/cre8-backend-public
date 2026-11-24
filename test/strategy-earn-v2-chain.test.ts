@@ -6,7 +6,7 @@ import { planAccount } from '../src/strategy-earn-routing.js';
 import { createStrategyEarnV2Api } from '../src/strategy-earn-v2-api.js';
 import { createV2Reader, v2PublicRpcs } from '../src/strategy-earn-v2-chain.js';
 import { fromMainnetRates, fromTestnetMocks, reportCalldata, reportDue, runRateReport } from '../src/strategy-earn-v2-rates.js';
-import { runV2KeeperRound, v2AutoRound, v2RewardHolders, v2UnwindForSale } from '../src/strategy-earn-v2-scheduler.js';
+import { runV2KeeperRound, v2AutoRound, v2MinCollectRaw, v2RewardHolders, v2UnwindForSale } from '../src/strategy-earn-v2-scheduler.js';
 import type { V2Ledger, V2Tx } from '../src/strategy-earn-v2-scheduler.js';
 import { loanTokenNeeds, planLoanTokenSwaps } from '../src/strategy-earn-v2-swap.js';
 import { boxRewardSignature, V2_EXECUTOR_ABI, V2_REGISTRY_ABI } from '../src/strategy-earn-v2.js';
@@ -135,8 +135,13 @@ test('review round 3: with only interest left in a token, lens.routeDebt answers
   assert.equal(read.routes.reduce((s, r) => s + r.routeDebtRaw, 0n), dust);
   assert.equal(read.earnNetUsd, E18 - dust); // one vault holding minus the debt once
   assert.deepEqual(read.state.holdings.filter(h => h.position).map(h => h.position!.debtUsd), [0.205, 0]);
-  // The swap planner counts the token's debt once too.
+  // The account's debt in the token is lens.tokenDebt, read once (draft6 §5), and it is what the net value and the swap planner use.
+  assert.equal(read.tokens.USDT!.debtRaw, dust);
   assert.deepEqual(loanTokenNeeds(read, USDC), []);
+  // MAX goes only on the route that carries the share; the other one just gets its collateral back (repay 0).
+  const api = createStrategyEarnV2Api({ v2: W.v2, reader, now: () => NOW });
+  const off = await api.close(W.account, { symbols: ['NVDAB', 'QQQB'] });
+  assert.deepEqual(off.status === 'ready' && off.calls.filter(c => c.to === W.v2.executor).map(c => argsOf(c).slice(3, 5)), [[maxUint256, maxUint256], [0n, maxUint256]]);
 });
 
 test('draft5 ForeignDebt: a token owed on Venus without a v2 Venus position in it is reported; with one (even repaid to interest only) it is not', async () => {
@@ -286,9 +291,10 @@ test('keeper round: executeDeleverage only when the venue says the health line i
   w.setBalance(W.v2.rewardTokens[0]!, W.box, 2n * E18);
   const r2 = await run(true);
   assert.deepEqual([r2.collected, sent.map(s => `${s.name}@${s.to === W.listaUsdcVault ? 'vault' : s.to === W.v2.executor ? 'executor' : 'venue'}`)], [1, ['claimReward@vault', 'claimReward@venue', 'collectRewards@executor']]);
-  // Dust under 0.01 stays in the box.
-  sent.length = 0; w.state.vaultReward = 0n; w.setBalance(W.v2.rewardTokens[0]!, W.box, 10n ** 15n);
+  // Dust stays in the box: under 0.001 on chain 97 (simulated tokens, small test positions), under 0.01 elsewhere.
+  sent.length = 0; w.state.vaultReward = 0n; w.setBalance(W.v2.rewardTokens[0]!, W.box, 10n ** 15n - 1n);
   assert.deepEqual([(await run(true)).collected, sent.length], [0, 0]);
+  assert.deepEqual([v2MinCollectRaw(97), v2MinCollectRaw(56)], [10n ** 15n, 10n ** 16n]);
 });
 
 test('rewards round: the strategy box is an extra holder, signed for in its own form — abi.encode(message, account signature) — and only once it exists', async () => {

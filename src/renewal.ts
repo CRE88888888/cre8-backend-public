@@ -1,4 +1,4 @@
-import { strategyEarnV2 } from './strategy-earn-v2.js';
+import { strategyEarnV2For } from './strategy-earn-v2.js';
 import { withMixPortfolioLock, mixBusy } from './mix-store.js';
 import type { Address, Hex, PublicClient } from 'viem';
 import { KERNEL_V3_3_ADDRESSES, KERNEL_VERSION_STRING } from './addresses.js';
@@ -129,7 +129,8 @@ export async function buildRenewalKey(args: BuildRenewalKeyArgs): Promise<Renewa
   const validUntil = args.validUntil ?? sessionValidUntil();
 
   const chainId = args.publicClient.chain?.id ?? await args.publicClient.getChainId();
-  const v2 = strategyEarnV2(chainId);
+  // Routing v2 scope only for owners in its audience (a canary list today): everyone else renews exactly as before.
+  const v2 = strategyEarnV2For(chainId, args.owner);
   const session = await buildSessionPermissions({
     publicClient: args.publicClient,
     sessionKeyAddress: derived.address,
@@ -137,7 +138,6 @@ export async function buildRenewalKey(args: BuildRenewalKeyArgs): Promise<Renewa
     validUntil,
     // Chain 97 owner renewal installs yield and, since backend#204, the Strategy Earn calls on AtpBorrowExecutor.
     ...(chainId === 97 && args.accountAddress !== undefined ? { yieldAccount: args.accountAddress, borrowAccount: args.accountAddress } : {}),
-    // Routing v2: only when a v2 deployment is configured for this chain (none today, so renewals are unchanged).
     ...(v2 !== null && args.accountAddress !== undefined ? { routingV2: { executor: v2.executor, account: args.accountAddress } } : {}),
   });
 

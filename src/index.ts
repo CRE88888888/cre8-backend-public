@@ -33,6 +33,10 @@ async function main(): Promise<void> {
   }
 
   const server = createServer();
+  // Routing v2 rate reports (registry.reportRates, every 12 hours): sent by this service's operator key where a v2
+  // deployment exists and that key is the registry's rateReporter; otherwise nothing starts (src/strategy-earn-v2-rates.ts).
+  try { if ((await import('./strategy-earn-v2-rates.js')).startRateReports()) console.log(JSON.stringify({ level: 'info', msg: 'strategy rate reports scheduled' })); }
+  catch { console.warn(JSON.stringify({ level: 'warn', msg: 'strategy rate reports not started' })); }
   server.listen(config.port, () => {
     console.log(
       JSON.stringify({

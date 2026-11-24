@@ -302,3 +302,70 @@ test('GET /strategy-earn/markets is cached server-side: one chain read per windo
   t += 61_000;
   assert.equal((await earn.markets()).updatedAt, first.updatedAt); // a failed re-read never replaces the last good one
 });
+
+test('routing v2 behind the same endpoints: only an owner in the v2 audience reaches it, and one account is answered by v1 or by v2, never both', async () => {
+  const { strategyEarnV2 } = await import('../src/strategy-earn-v2.js');
+  const v2 = strategyEarnV2(97, {})!;
+  const canary = v2.canaryOwners[0]!, asked: string[] = [];
+  let active = false, broken = false;
+  const api = {
+    active: async () => { asked.push('active'); if (broken) throw new Error('public node down'); return active; },
+    portfolio: async (id: number, a: Address) => { asked.push('portfolio'); return { portfolioId: id, account: a, status: 'ok' as const, version: 2 as const, positions: [] }; },
+    auto: async (_a: Address, owner: Address, input: { budgetRaw: bigint; keyReady: boolean }) => { asked.push(`auto:${owner}:${input.budgetRaw}:${input.keyReady}`); return { status: 'ready' as const, version: 2 as const, calls: [], batches: [] }; },
+    open: async (_a: Address, _o: Address, input: { symbol: string; collateralRaw: bigint }) => { asked.push(`open:${input.symbol}:${input.collateralRaw}`); return input.collateralRaw > 5n ? { status: 'insufficient' as const, asset: input.symbol } : { status: 'ready' as const, version: 2 as const, calls: [] }; },
+    close: async (_a: Address, input: { symbols: readonly string[]; exit?: boolean }) => { asked.push(`close:${input.symbols.join(',')}:${input.exit === true}`); return { status: 'ready' as const, version: 2 as const, calls: [], batches: [] }; },
+    confirm: async () => { asked.push('confirm'); return { routes: 2, rewards: 1, kinds: ['open', 'close', 'reward_sweep'] }; },
+    rescue: async (_a: Address, vaultId: Hex) => { asked.push(`rescue:${vaultId}`); return { status: 'ready' as const, version: 2 as const, ownerOnly: true as const, calls: [], batches: [] }; },
+    reconsent: async () => [],
+  };
+  const f: Fake = { statuses: Object.fromEntries(markets.map(m => [m.marketId, status()])), ids: [], held: 10n * E18, collateral: 0n, prices: { [nvda.collateral]: 150n * 10n ** 8n }, rewards: { vault: 0n, collateral: 0n },
+    weights: [{ asset: nvda.collateral, weightBps: 10_000 }] };
+  const chain = { ...fakeChain(f), receipt: async () => ({ ...tx0, success: true }) };
+  const earn = (owner: Address) => createStrategyEarn({ chainId: 97, chain: () => chain, owned: ownedPortfolio({ ownerAddress: owner }) as never, v2Api: () => api as never, mainnetRates: noMainnet, ledger: noLedger,
+    query: (async () => ({ rows: [] })) as never });
+  const vaultId = ('0x' + 'b1'.repeat(32)) as Hex;
+
+  // Everyone else: v1 exactly as before, and the v2 side is never even asked.
+  const other = earn(account);
+  assert.equal((await other.portfolio(3, account)).status, 'ok');
+  assert.equal((await other.auto(3, account, { budgetRaw: '1000' })).status, 'ready');
+  assert.equal((await other.open(3, account, { asset: 'NVDAB', collateralRaw: String(E18) })).status, 'ready');
+  assert.equal((await other.close(3, account, { asset: 'NVDAB' })).status, 'ready');
+  await assert.rejects(other.rescue(3, account, { vaultId }), isError(404, 'STRATEGY_EARN_NOT_CONFIGURED'));
+  assert.deepEqual(asked, []);
+
+  // An audience owner's clean account: a new consent / open starts on v2; reads stay on v1's (empty) view until something exists.
+  const mine = earn(canary);
+  assert.equal('version' in await mine.portfolio(3, canary), false);
+  assert.deepEqual(await mine.auto(3, canary, { budgetRaw: '1000' }), { status: 'ready', version: 2, calls: [], batches: [] });
+  assert.equal((await mine.open(3, canary, { asset: 'NVDAB', collateralRaw: '3' })).status, 'ready');
+  await assert.rejects(mine.open(3, canary, { asset: 'NVDAB', collateralRaw: '9' }), isError(400, 'INSUFFICIENT_HOLDING'));
+  assert.deepEqual(asked.filter(x => x !== 'active'), ['auto:' + canary + ':1000:false', 'open:NVDAB:3', 'open:NVDAB:9']);
+
+  // The same owner, but v1 still holds something on this account (a consent waiting for a fill): v1 answers, v2 builds nothing.
+  asked.length = 0;
+  f.policies = { [nvda.marketId]: { maxDebt: 100n * E18, enabled: true } };
+  const onV1 = await mine.auto(3, canary, { budgetRaw: '1000' });
+  assert.equal('version' in onV1, false);
+  assert.equal(onV1.status, 'ready');
+  assert.deepEqual(asked, ['active']);
+  f.policies = undefined; f.ids = [nvda.marketId]; f.collateral = 5n * E18; // shares posted on v1
+  assert.equal('version' in await mine.open(3, canary, { asset: 'NVDAB', collateralRaw: String(E18) }), false);
+  f.ids = []; f.collateral = 0n;
+
+  // Once the account has anything on v2, every endpoint is v2's: the view, turn-off (with the exit flag), the receipt, the rescue.
+  asked.length = 0; active = true;
+  assert.equal((await mine.portfolio(3, canary) as { version?: number }).version, 2);
+  await mine.close(3, canary, { assets: ['NVDAB', 'QQQB'] });
+  await mine.close(3, canary, { assets: ['NVDAB'], exit: true });
+  await mine.auto(3, canary, { budgetRaw: '5' });
+  assert.deepEqual(await mine.confirm(3, canary, { txHash: tx0.hash }), { status: 'confirmed', recorded: 3, kinds: ['open', 'close', 'reward_sweep'] });
+  assert.equal((await mine.rescue(3, canary, { vaultId })).status, 'ready');
+  await assert.rejects(mine.rescue(3, canary, { vaultId: '0x12' }), (e: unknown) => e instanceof AppError && e.status === 400);
+  assert.deepEqual(asked.filter(x => x !== 'active'), ['portfolio', 'close:NVDAB,QQQB:false', 'close:NVDAB:true', `auto:${canary}:5:false`, 'confirm', `rescue:${vaultId}`]);
+
+  // Which generation holds the money is never guessed: when v2 cannot be read, the answer is "temporarily unavailable", not v1's.
+  broken = true;
+  assert.deepEqual([(await mine.portfolio(3, canary)).status, (await mine.auto(3, canary, { budgetRaw: '5' })).status, (await mine.close(3, canary, { asset: 'NVDAB' })).status,
+    (await mine.open(3, canary, { asset: 'NVDAB', collateralRaw: '1' })).status], ['unavailable', 'unavailable', 'unavailable', 'unavailable']);
+});

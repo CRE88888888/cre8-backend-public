@@ -53,6 +53,8 @@ export type PricedRoute = RouteKey & {
   /** carry × ratio + collateral incentive: APY on the holding. */
   extraBps: number;
   liquidityUsd: number | null;
+  /** USD of new collateral the venue can still take (Venus supply cap); null = no limit known. */
+  collateralRoomUsd?: number | null;
 };
 export type Holding = {
   symbol: string;
@@ -66,6 +68,11 @@ export type Holding = {
     since: number;
     /** On-chain LTV and safety line (bps), when read. */
     ltvBps?: number; deleverageLtvBps?: number;
+    /** The venue's own answer (routing v2 lens `shouldDeleverage`: debt value ≥ deleverage value; Venus is account-wide,
+     * so one position's LTV cannot be compared with its own line). When given it replaces the LTV comparison. */
+    shouldDeleverage?: boolean;
+    /** USD of this asset already posted on the route (the rest of `collateralUsd` is free in the account). */
+    postedUsd?: number;
   };
 };
 export type Costs = { /** USD per transaction (gas). */ gasUsdPerTx: number; /** Slippage of a move, bps of the debt moved; 0 for same-token routes. */ slippageBps?: number };
@@ -104,7 +111,8 @@ function price(o: RouteOption, v: RoutingVault): PricedRoute {
   const carryBps = v.apyBps - (o.borrowApyBps - o.incentiveBps);
   return { venue: o.venue, marketId: String(o.marketId).toLowerCase(), loan: o.loan, vault: { venue: v.venue, address: v.address.toLowerCase() },
     ratioBps: o.ratioBps, factorBps: o.factorBps, borrowApyBps: o.borrowApyBps, borrowIncentiveBps: o.incentiveBps, vaultApyBps: v.apyBps, vaultName: v.name,
-    carryBps, collateralIncentiveBps: o.collateralIncentiveBps, extraBps: Math.trunc(carryBps * o.ratioBps / 10_000) + o.collateralIncentiveBps, liquidityUsd: o.liquidityUsd };
+    carryBps, collateralIncentiveBps: o.collateralIncentiveBps, extraBps: Math.trunc(carryBps * o.ratioBps / 10_000) + o.collateralIncentiveBps, liquidityUsd: o.liquidityUsd,
+    collateralRoomUsd: o.collateralRoomUsd ?? null };
 }
 /** USD per year a holding earns on a route with `debtUsd` borrowed. */
 const yearly = (r: PricedRoute, collateralUsd: number, debtUsd: number) => (debtUsd * r.carryBps + collateralUsd * r.collateralIncentiveBps) / 10_000;
@@ -131,8 +139,9 @@ export function planAccount(input: { snapshot: RoutingSnapshot; holdings: readon
   const candidates = (symbol: string, venusLoan: Stable | null, avoidVault?: string): PricedRoute[] => (snapshot.options[symbol] ?? [])
     .filter(o => fresh(o.venue) && (o.venue !== 'venus' || o.loan === venusLoan) && bestVault(o.loan, avoidVault))
     .map(o => price(o, bestVault(o.loan, avoidVault)!)).filter(r => r.carryBps > 0);
-  /** A position's own route at today's rates; `problem` set when it has to be left at once; `stale` when it cannot be judged. */
-  const current = (h: Holding): { route: PricedRoute | null; problem: Reason | null; stale: boolean } => {
+  /** A position's own route at today's rates; `problem` set when it has to be left at once; `stale` when it cannot be judged.
+   * `marketOk`: the borrow market itself still pays with the best vault open to new deposits (so the problem is only the vault). */
+  const current = (h: Holding): { route: PricedRoute | null; problem: Reason | null; stale: boolean; marketOk?: boolean } => {
     const p = h.position!;
     if (!fresh(p.route.venue) || !fresh(p.route.vault.venue)) return { route: null, problem: null, stale: true };
     const o = (snapshot.options[h.symbol] ?? []).find(x => marketKey(x) === marketKey(p.route));
@@ -140,7 +149,7 @@ export function planAccount(input: { snapshot: RoutingSnapshot; holdings: readon
     const v = vaults.get(vaultKey(p.route.vault, p.route.loan));
     if (!v) return { route: null, problem: 'vault_unavailable', stale: false };
     const route = price(o, v);
-    if (route.carryBps <= 0) return { route, problem: 'negative_carry', stale: false };
+    if (route.carryBps <= 0) { const other = bestVault(p.route.loan); return { route, problem: 'negative_carry', stale: false, marketOk: other !== undefined && price(o, other).carryBps > 0 }; }
     if (v.liquidityUsd !== undefined && v.liquidityUsd !== null && v.liquidityUsd < p.debtUsd) return { route, problem: 'vault_liquidity', stale: false };
     return { route, problem: null, stale: false };
   };
@@ -154,6 +163,10 @@ export function planAccount(input: { snapshot: RoutingSnapshot; holdings: readon
       const have = own && marketKey(own) === marketKey(r) ? h.position?.debtUsd ?? 0 : 0;
       const fits = Math.min(want, have + room(r));
       if (needFull && fits < want) continue;
+      // A venue with a supply cap (Venus bStock markets) can only take what is left under it. What this holding already
+      // posted on the same venue and collateral market is inside the cap.
+      const posted = own && own.venue === r.venue ? h.position?.postedUsd ?? h.collateralUsd : 0;
+      if (r.collateralRoomUsd !== null && r.collateralRoomUsd !== undefined && h.collateralUsd - posted > r.collateralRoomUsd) continue;
       const perYear = yearly(r, h.collateralUsd, fits);
       if (!top || perYear > top.perYear) top = { route: r, debtUsd: fits, perYear };
     }
@@ -175,7 +188,8 @@ export function planAccount(input: { snapshot: RoutingSnapshot; holdings: readon
   else if (fresh('venus')) {
     const states = venusHeld.map(h => current(h));
     // The shared loan itself is the problem when no Venus position can stay on it; a single delisted collateral is handled per asset.
-    const broken = states.every(s => s.problem === 'market_unavailable' || s.problem === 'negative_carry') ? states[0] : undefined;
+    // A position whose own vault stopped paying while the same loan still pays into another vault is not that: it only changes vault.
+    const broken = states.every(s => s.problem === 'market_unavailable' || s.problem === 'negative_carry' && !s.marketOk) ? states[0] : undefined;
     const wanted = bestVenusLoan();
     if (broken) {
       // Every Venus position leaves this loan token now.
@@ -247,10 +261,10 @@ export function planAccount(input: { snapshot: RoutingSnapshot; holdings: readon
       continue;
     }
     const route = cur.route!;
-    if (p.ltvBps !== undefined && p.deleverageLtvBps !== undefined && p.ltvBps >= p.deleverageLtvBps) {
+    if (p.shouldDeleverage ?? (p.ltvBps !== undefined && p.deleverageLtvBps !== undefined && p.ltvBps >= p.deleverageLtvBps)) {
       const to = Math.min(p.debtUsd, targetDebt(h, route));
       decisions.push({ ...base, action: 'reduce', reason: 'safety_line', urgent: true, to: route, targetDebtUsd: to,
-        rationale: `${h.symbol} reduce ${label(p.route)}: LTV ${pct(p.ltvBps)} ≥ safety line ${pct(p.deleverageLtvBps)}, repay to ${usd(to)}` });
+        rationale: `${h.symbol} reduce ${label(p.route)}: ${p.ltvBps !== undefined && p.deleverageLtvBps !== undefined ? `LTV ${pct(p.ltvBps)} vs safety line ${pct(p.deleverageLtvBps)}` : 'at the safety line'}, repay to ${usd(to)}` });
       continue;
     }
     const b = best(h, venusLoan, true, p.route);

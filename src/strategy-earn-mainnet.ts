@@ -58,6 +58,8 @@ export type Route = { protocol: 'venus' | 'lista'; venue: 'venus' | 'lista'; rat
   liquidityUsd: number | null; lltvBps: number | null; limited: boolean; vault: SupplyVault; carryBps: number;
   /** Venus XVS supply incentive on the collateral (bps of collateral value); 0 on Lista. Already inside extraBps. */
   collateralIncentiveBps: number;
+  /** USD of new collateral the venue can still take under its supply cap (Venus); null / absent = no limit known. */
+  collateralRoomUsd?: number | null;
   /** Best borrow X → swap → deposit Y route, when it beats this one (unscaled carry gain, bps). Display only; we default to same token. */
   cross: { loan: Stable; deposit: Stable; gainBps: number } | null };
 export type MainnetRates = {
@@ -88,13 +90,13 @@ export async function readVenus(f: Fetcher) {
   const list: any[] = (await json(f, VENUS_API))?.result ?? [];
   const borrow: Partial<Record<Stable, { borrowApyBps: number; incentiveBps: number; address: string; liquidityUsd?: number }>> = {};
   const supply: Partial<Record<Stable, SupplyVault>> = {};
-  const incentives: Record<string, number> = {}, collateral: Record<string, { factorBps: number; address: string }> = {};
+  const incentives: Record<string, number> = {}, collateral: Record<string, { factorBps: number; address: string; roomUsd: number | null }> = {};
   for (const m of list) {
     const sym = m.underlyingSymbol;
     if (typeof sym === 'string') incentives[sym] = pctBps(num(m.supplyXvsApy ?? 0));
     const paused = Number(m.pausedActionsBitmap ?? 0);
     if (typeof sym === 'string' && m.canBeCollateral !== false && num(m.collateralFactorMantissa ?? 0) > 0 && !(paused & (VENUS_MINT | VENUS_ENTER_MARKET)))
-      collateral[sym] = { factorBps: Math.round(num(m.collateralFactorMantissa) / 1e14), address: String(m.address).toLowerCase() };
+      collateral[sym] = { factorBps: Math.round(num(m.collateralFactorMantissa) / 1e14), address: String(m.address).toLowerCase(), roomUsd: venusSupplyRoomUsd(m) };
     if (!isStable(sym)) continue;
     const address = String(m.address).toLowerCase();
     if (m.isBorrowable !== false && !(paused & VENUS_BORROW) && num(m.borrowApy ?? 0) > 0)
@@ -105,6 +107,21 @@ export async function readVenus(f: Fetcher) {
   }
   if (list.length === 0) throw new Error('Venus API empty');
   return { borrow, supply, incentives, collateral };
+}
+
+/**
+ * USD of collateral a Venus market can still take under its supply cap (cre8-contracts borrow-routing-v2 §11: vNVDAB was at
+ * 1,499.2 of 1,500 on 2026-11-24 — a full market reverts on mint, so it is not a route). Supplied = vToken supply × exchange
+ * rate. null = the API row does not carry the numbers (treated as no limit known); a cap of 0 means minting is not allowed.
+ */
+export function venusSupplyRoomUsd(m: { supplyCapsMantissa?: unknown; totalSupplyMantissa?: unknown; exchangeRateMantissa?: unknown; underlyingDecimal?: unknown; tokenPriceCents?: unknown }): number | null {
+  try {
+    if (m.supplyCapsMantissa === undefined || m.totalSupplyMantissa === undefined || m.exchangeRateMantissa === undefined || m.tokenPriceCents === undefined) return null;
+    const cap = BigInt(String(m.supplyCapsMantissa)), supplied = BigInt(String(m.totalSupplyMantissa)) * BigInt(String(m.exchangeRateMantissa)) / 10n ** 18n;
+    if (cap >= 2n ** 255n) return null; // unlimited
+    const room = cap > supplied ? cap - supplied : 0n;
+    return Number(room) / 10 ** Number(m.underlyingDecimal ?? 18) * num(m.tokenPriceCents) / 100;
+  } catch { return null; }
 }
 
 async function listaMarkets(f: Fetcher, zone: number): Promise<any[]> {
@@ -118,6 +135,22 @@ async function listaMarkets(f: Fetcher, zone: number): Promise<any[]> {
   return out;
 }
 
+/**
+ * Can this ERC4626 vault take a deposit right now? `maxDeposit(address)` over the public node: a Moolah vault whose supply
+ * queue is empty or whose caps are all reached answers 0 and its deposit reverts AllCapsReached (the Gauntlet USDT vault on
+ * 2026-11-24). null = could not be read (the vault is then judged on the other rules only).
+ */
+export async function vaultTakesDeposits(f: Fetcher, vault: string, rpc = PUBLIC_RPC_56): Promise<boolean | null> {
+  try {
+    const data = '0x402d267d' + '0'.repeat(63) + '1'; // maxDeposit(address(1))
+    const r = await json(f, rpc, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to: vault, data }, 'latest'] }) });
+    const hex: unknown = r?.result;
+    if (typeof hex !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(hex)) return null;
+    return BigInt(hex) > 0n;
+  } catch { return null; }
+}
+
 export async function readLista(f: Fetcher) {
   const [bstock, general, vaultList] = await Promise.all([listaMarkets(f, 5), listaMarkets(f, 0), json(f, LISTA_VAULTS_API)]);
   if (bstock.length + general.length === 0) throw new Error('Lista API empty');
@@ -127,7 +160,8 @@ export async function readLista(f: Fetcher) {
     if (!token) continue;
     const base = bps(num(v.apy)), inc = bps(num(v.emissionApy ?? 0)), tvl = num(v.depositsUsd);
     const cand: SupplyVault = { token, venue: 'lista', name: String(v.name), address: String(v.address).toLowerCase(), apyBps: base + inc, baseBps: base, incentiveBps: inc, tvlUsd: Math.round(tvl) };
-    const eligible = !(tvl < LISTA_VAULT_MIN_USD || /exclusive/i.test(String(v.name)) || inc > 3 * base);
+    // Only vaults that pass the cheap rules are asked on chain (a handful of eth_calls per refresh, public node).
+    const eligible = !(tvl < LISTA_VAULT_MIN_USD || /exclusive/i.test(String(v.name)) || inc > 3 * base) && await vaultTakesDeposits(f, cand.address) !== false;
     allVaults.push({ ...cand, eligible });
     if (!eligible) continue;
     if (!supply[token] || cand.apyBps > supply[token]!.apyBps) supply[token] = cand;
@@ -160,13 +194,15 @@ export function listaMarketFor(all: readonly ListaMarket[], collateral: string, 
 
 type RouteInput = { symbol: string; listaMarkets: readonly ListaMarket[];
   venusBorrow: Partial<Record<Stable, { borrowApyBps: number; incentiveBps: number; address: string; liquidityUsd?: number }>>;
-  venusCollateral?: Record<string, { factorBps: number; address: string }>; venusIncentives?: Record<string, number>;
+  venusCollateral?: Record<string, { factorBps: number; address: string; roomUsd?: number | null }>; venusIncentives?: Record<string, number>;
   vaults: Partial<Record<Stable, SupplyVault>> };
 export type RouteOption = Omit<Route, 'cross'>;
 /**
  * Every usable venue × token for this asset (Venus if it is collateral there, Lista for every open-term market on that
  * collateral), each with ≥ MIN_LIQUIDITY_USD available: extra = carry × min(tier cap, F/2) + Venus collateral incentive.
- * Carry may be ≤ 0. The routing engine (strategy-earn-routing.ts) reads the same list.
+ * Carry may be ≤ 0. The routing engine (strategy-earn-routing.ts) reads the same list. A Venus option carries what is left
+ * under the market's supply cap (`collateralRoomUsd`): the engine does not send new collateral that does not fit, and
+ * `chooseRoute` (display) leaves a full market out.
  */
 export function routeOptions(input: RouteInput): RouteOption[] {
   const collateral = LISTA_COLLATERAL[input.symbol] ?? input.symbol;
@@ -181,7 +217,8 @@ export function routeOptions(input: RouteInput): RouteOption[] {
       const inc = input.venusIncentives?.[input.symbol] ?? 0;
       options.push({ protocol: 'venus', venue: 'venus', ratioBps, factorBps: venusCf.factorBps, extraBps: Math.trunc(carryBps * ratioBps / 10_000) + inc, loan,
         marketId: b.address, borrowApyBps: b.borrowApyBps, incentiveBps: b.incentiveBps, netBorrowBps, liquidityUsd: b.liquidityUsd ?? null, lltvBps: venusCf.factorBps,
-        limited: b.liquidityUsd !== undefined && b.liquidityUsd < LISTA_LIMITED_USD, vault, carryBps, collateralIncentiveBps: inc });
+        limited: b.liquidityUsd !== undefined && b.liquidityUsd < LISTA_LIMITED_USD, vault, carryBps, collateralIncentiveBps: inc,
+        ...(venusCf.roomUsd === undefined ? {} : { collateralRoomUsd: venusCf.roomUsd }) });
     }
     for (const m of input.listaMarkets.filter(x => x.collateral === collateral && x.loan === loan && Number(x.termType ?? 0) === 0 && num(x.liquidityUsd) >= MIN_LIQUIDITY_USD)) {
       const borrowApyBps = bps(num(m.rate)), incentiveBps = bps(num(m.borrowEmissionApy ?? 0)), liquidityUsd = Math.round(num(m.liquidityUsd));
@@ -195,7 +232,8 @@ export function routeOptions(input: RouteInput): RouteOption[] {
 
 /** Highest extra among `routeOptions`. No usable market → null (no route). */
 export function chooseRoute(input: RouteInput): Route | null {
-  const options = routeOptions(input);
+  // A Venus market whose supply cap is (nearly) reached cannot take the collateral: not a route to show.
+  const options = routeOptions(input).filter(o => o.collateralRoomUsd === undefined || o.collateralRoomUsd === null || o.collateralRoomUsd >= MIN_LIQUIDITY_USD);
   const chosen = [...options].sort((a, b) => b.extraBps - a.extraBps)[0];
   if (!chosen) return null;
   // Cross-token (display only): the cheapest borrow on the chosen venue, deposited into the best vault overall.

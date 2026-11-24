@@ -13,8 +13,8 @@ import { dcaDepositCalls, dcaReceiptApproval, dcaReturnCalls, dcaVaults } from '
 import { YIELD_EXECUTOR_ABI } from '../src/yield-abi.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
 import { config, NOW, operation, OWNER, SENDER, TEST_SIGNER } from './fixtures/paymaster.js';
-import { maxDebtFor, v2Calls, v2ConsentCalls, v2ConsentOffCall, v2ExitCalls, v2PreSellCalls, V2_EXECUTOR_ABI, V2_REGISTRY_ABI } from '../src/strategy-earn-v2.js';
-import type { StrategyEarnV2 } from '../src/strategy-earn-v2.js';
+import { maxDebtFor, strategyEarnV2, v2Calls, v2ConsentCalls, v2ConsentOffCall, v2ExitBatches, v2ExitCalls, v2PreSellPlan, v2ReconsentCalls, v2RescueCall, V2_EXECUTOR_ABI, V2_REGISTRY_ABI } from '../src/strategy-earn-v2.js';
+import type { PreSellPosition, StrategyEarnV2 } from '../src/strategy-earn-v2.js';
 
 /**
  * Every user flow that ends in a sponsored UserOp, built with the same builders/calldata the frontend sends, run
@@ -56,9 +56,14 @@ async function renewal(): Promise<Call[]> {
 }
 
 type Kind = 'fund' | 'mix';
-function harness(kind: Kind, opts: { pendingChange?: boolean; reservedRaw?: bigint; observedRaw?: bigint; exiting?: 'triggered' | 'exited' | 'deleting'; rewardTokens?: Address[]; v2?: StrategyEarnV2 | null } = {}) {
-  const seen = { locks: 0, reservations: 0, setups: 0, exits: 0 };
-  const service = createPaymasterService({ config: c, now: () => NOW, ...(opts.rewardTokens ? { rewardTokens: opts.rewardTokens } : {}), strategyV2: opts.v2 ?? null,
+function harness(kind: Kind, opts: { pendingChange?: boolean; reservedRaw?: bigint; observedRaw?: bigint; exiting?: 'triggered' | 'exited' | 'deleting'; rewardTokens?: Address[]; v2?: StrategyEarnV2 | null;
+  /** Which generation of the yield strategy the account already uses (the paymaster's exclusivity check). */
+  inUse?: 'v1' | 'v2' | 'unreadable';
+  /** Leave the v2 deployment to production wiring (strategyEarnV2For: manifest + audience) instead of injecting it. */
+  wired?: boolean } = {}) {
+  const seen = { locks: 0, reservations: 0, setups: 0, exits: 0 }, asked: string[] = [];
+  const service = createPaymasterService({ config: c, now: () => NOW, ...(opts.rewardTokens ? { rewardTokens: opts.rewardTokens } : {}), ...(opts.wired ? {} : { strategyV2: opts.v2 ?? null }),
+    strategyGenerationActive: async (generation) => { asked.push(generation); if (opts.inUse === 'unreadable') throw new Error('rpc down'); return opts.inUse === generation; },
     mixLock: async (_id, work) => { seen.locks++; return work(); },
     query: async (sql) => ({ rows: sql.includes('select s.owner') ? [{ owner, user_id: owner, mix_id: kind === 'mix' ? '5' : null }]
       : sql.includes('from mixes m where') ? [{ id: '5', owner, account, triggered_at: opts.exiting === 'triggered' ? new Date(NOW * 1000) : null,
@@ -73,8 +78,9 @@ function harness(kind: Kind, opts: { pendingChange?: boolean; reservedRaw?: bigi
     readBudgetContext: async () => ({ purpose: 'ordinary', nativePrice: 60000000000n, priceSource: 'fixture:oracle' }),
     verifyYieldWithdraw: async () => { seen.exits++; return []; },
     reserve: async () => { seen.reservations++; } });
-  const sponsor = async (calls: Call[]) => service.sponsor({ userOperation: operation({ sender: account, callData: await encodeCallDataEpV07(calls) }) }, owner);
-  return { seen, sponsor };
+  // `nonce`: Kernel packs the validator into it — 0 is the owner's root validator; ROOT / SESSION below are the two real shapes.
+  const sponsor = async (calls: Call[], nonce = 0n) => service.sponsor({ userOperation: operation({ sender: account, nonce, callData: await encodeCallDataEpV07(calls) }) }, owner);
+  return { seen, asked, sponsor };
 }
 const code = (expected: string, status: number) => (e: unknown) => e instanceof AppError && e.code === expected && e.status === status;
 
@@ -302,18 +308,23 @@ test('reward tokens (LISTA / XVS): only a plain transfer to the owner wallet, on
  * fund account and a My mix account, built with the same builders. v2 is injected here; in production it is null until a
  * deployment is configured, and then none of these are sponsored.
  */
-const V2: StrategyEarnV2 = { chainId: 97, executor: '0x20000000000000000000000000000000000000e2', registry: '0x20000000000000000000000000000000000000e3',
+const V2: StrategyEarnV2 = { chainId: 97, executor: '0x20000000000000000000000000000000000000e2', registry: '0x20000000000000000000000000000000000000e3', lens: '0x20000000000000000000000000000000000000e6',
   venusComptroller: '0x20000000000000000000000000000000000000e4', moolah: '0x20000000000000000000000000000000000000e5',
-  loanTokens: { USDT: usdt.toLowerCase() as Address, USDC: '0x20000000000000000000000000000000000000a2' }, rewardTokens: ['0x2000000000000000000000000000000000000091'] };
+  loanTokens: { USDT: usdt.toLowerCase() as Address, USDC: '0x20000000000000000000000000000000000000a2' }, rewardTokens: ['0x2000000000000000000000000000000000000091'],
+  adapters: ['0x20000000000000000000000000000000000000e7'], canaryOwners: [] };
+/** Kernel v3 nonces: owner (root validator; the SDK writes the ECDSA validator's address in the id) and a session key (permission id). */
+const ROOT = (BigInt('0x845adb2c711129d4f3966735ed98a9f09fc4ce57') << 80n) | 3n, SESSION = (2n << 240n) | (0xdeadbeefn << 208n) | 3n;
 const R1 = ('0x' + 'a1'.repeat(32)) as Hex, R2 = ('0x' + 'a2'.repeat(32)) as Hex, VA = ('0x' + 'b1'.repeat(32)) as Hex, VB = ('0x' + 'b2'.repeat(32)) as Hex;
-async function renewalV2(): Promise<Call[]> {
+async function renewalV2(v2: StrategyEarnV2 = V2): Promise<Call[]> {
   const session = await buildSessionPermissions({ publicClient: offline as never, sessionKeyAddress: '0x2000000000000000000000000000000000000002',
-    executorAddress: executor, validUntil: NOW + 30 * 86400, yieldAccount: account, borrowAccount: account, routingV2: { executor: V2.executor, account } });
+    executorAddress: executor, validUntil: NOW + 30 * 86400, yieldAccount: account, borrowAccount: account, routingV2: { executor: v2.executor, account } });
   return session.initConfig.map((data) => ({ to: account, data: data as Hex, value: 0n }));
 }
-function v2Flows(r: Call[]): [string, Call[], 'risk' | 'settle'][] {
+function v2Flows(r: Call[], V2x: StrategyEarnV2 = V2): [string, Call[], 'risk' | 'settle'][] {
+  const V2 = V2x;
   const deadline = BigInt(NOW + 600), E = 10n ** 18n;
-  const consent = v2ConsentCalls(V2, { maxDebtUsdRaw: maxDebtFor(5000), rewardRecipient: owner, venues: ['venus', 'lista'], collaterals: [asset], loanTokens: [V2.loanTokens.USDT!, V2.loanTokens.USDC!] }).map(asCall);
+  const consent = v2ConsentCalls(V2, { maxDebtUsdRaw: maxDebtFor(5000), rewardRecipient: owner, venues: ['venus', 'lista'], collaterals: [asset], loanTokens: Object.values(V2.loanTokens) as Address[], rewardTokens: V2.rewardTokens }).map(asCall);
+  const selling = (o: Partial<PreSellPosition> & { routeId: Hex; vaultId: Hex }): PreSellPosition => ({ symbol: 'NVDAB', collateral: asset, freeCollateralRaw: 0n, postedRaw: 10n * E, routeDebtRaw: 1000n * E, venue: 'lista', loan: 'USDT', ...o });
   return [
     ['buy with yield strategy: renewal (v2 scope) + consent', [...r, ...consent], 'risk'],
     ['consent (key ready)', consent, 'risk'],
@@ -325,12 +336,21 @@ function v2Flows(r: Call[]): [string, Call[], 'risk' | 'settle'][] {
     ['migrate: same route id is allowed when only the loan side moves vaults', [asCall(v2Calls.migrate(V2, account, { routeId: R1, vaultId: VA }, { routeId: R2, vaultId: VA }, 3n * E, E, deadline))], 'risk'],
     ['switch vault only', [asCall(v2Calls.switchVault(V2, account, VA, VB, maxUint256, deadline))], 'risk'],
     ['partial repay (negative carry / before a small sale)', [asCall(v2Calls.reduce(V2, account, R1, VA, E, 0n, 0n, deadline))], 'settle'],
-    ['repay and take shares back before a sale (scheduler session key)', v2PreSellCalls(V2, account, [{ routeId: R1, vaultId: VA }, { routeId: R2, vaultId: VB, cashRaw: E }], deadline).map(asCall), 'settle'],
+    ['repay and take shares back before a sale (scheduler session key)', v2PreSellPlan(V2, account, [selling({ routeId: R1, vaultId: VA, vaultAssetsRaw: 1100n * E }), selling({ routeId: R2, vaultId: VB, loan: 'USDC', vaultAssetsRaw: 900n * E, cashRaw: 200n * E })], deadline).calls.map(asCall), 'settle'],
+    ['before a sale, the box is short: repay what it holds, take back part (scheduler session key)', v2PreSellPlan(V2, account, [selling({ routeId: R1, vaultId: VA, vaultAssetsRaw: 400n * E })], deadline).calls.map(asCall), 'settle'],
+    ['before a sale, nothing owed: only the shares come back', v2PreSellPlan(V2, account, [selling({ routeId: R1, vaultId: VA, routeDebtRaw: 0n })], deadline).calls.map(asCall), 'settle'],
+    ['only post collateral (ceiling reached): no vault named', [asCall(v2Calls.open(V2, account, R1, ('0x' + '00'.repeat(32)) as Hex, E, 0n, deadline))], 'risk'],
+    ['three markets in one session-key UserOp', [R1, R2, VA].map(route => asCall(v2Calls.open(V2, account, route, VB, E, E, deadline))), 'risk'],
+    ['My mix weight change tail / re-consent after a re-enroll', v2ReconsentCalls(V2, { maxDebtUsdRaw: maxDebtFor(800), rewardRecipient: owner, newCollaterals: [asset] }).map(asCall), 'risk'],
+    ['full exit: sweep the box and the account\'s own reward tokens', [asCall(v2Calls.sweepRewards(V2, account, V2.rewardTokens[0]!, maxUint256, deadline))], 'settle'],
+    ...v2ExitBatches(V2, account, { routes: [{ routeId: R1, vaultId: VA }, { routeId: R2, vaultId: VB, routeDebtRaw: 0n }, { routeId: VA, vaultId: VB }, { routeId: VB, vaultId: VA }], leftoverVaults: [VA],
+      rewards: [{ token: V2.rewardTokens[0]!, accountAmountRaw: maxUint256 }], deadline, withdrawConsent: true }, () => 500_000n)
+      .map((batch, i): [string, Call[], 'risk' | 'settle'] => [`turn off, batch ${i + 1} (three executor calls per UserOp, consent withdrawn last)`, batch.map(asCall), 'settle']),
     ['two-step migrate, step 1: close with own cash', [asCall(v2Calls.close(V2, account, R1, VA, 5n * E, deadline))], 'settle'],
     ['release what is left in a vault', [asCall(v2Calls.release(V2, account, VA, deadline))], 'settle'],
     ['sweep rewards', [asCall(v2Calls.sweepRewards(V2, account, V2.rewardTokens[0]!, 0n, deadline))], 'settle'],
     ['yield strategy off / sell all / delete: close all + release + sweep + consent off', v2ExitCalls(V2, account, { routes: [{ routeId: R1, vaultId: VA }, { routeId: R2, vaultId: VB }],
-      leftoverVaults: [VA], rewardTokens: [...V2.rewardTokens], deadline, withdrawConsent: true }).map(asCall), 'settle'],
+      leftoverVaults: [VA], rewards: V2.rewardTokens.map(token => ({ token, accountAmountRaw: 0n })), deadline, withdrawConsent: true }).map(asCall), 'settle'],
     ['consent off alone', [asCall(v2ConsentOffCall(V2))], 'settle'],
   ];
 }
@@ -412,3 +432,68 @@ test('routing v2 on a My mix: a weight change re-enrolls into a new strategy, so
   await h.sponsor(calls);
   assert.deepEqual([h.seen.setups, h.seen.locks, h.seen.reservations], [1, 1, 1]);
 });
+
+for (const kind of ['fund', 'mix'] as const) {
+  test(`routing v2, ${kind} account: executeRescue is sponsored only for the owner's own signature, never for a session key (draft5 rescueIsOwnerOnlyByPolicy)`, async () => {
+    const deadline = BigInt(NOW + 600), rescue = [asCall(v2RescueCall(V2, account, VA, deadline))];
+    const owned = harness(kind, { v2: V2 });
+    await owned.sponsor(rescue, ROOT);
+    assert.equal(owned.seen.reservations, 1);
+    for (const nonce of [SESSION, (1n << 240n) | 3n, (1n << 248n) | 3n]) {
+      const h = harness(kind, { v2: V2 });
+      await assert.rejects(h.sponsor(rescue, nonce), code('PAYMASTER_CALL_FORBIDDEN', 403), 'not root signed');
+      assert.equal(h.seen.reservations, 0);
+    }
+    // Owner-signed, but for another account / without a deadline / with v2 off: still refused.
+    await assert.rejects(harness(kind, { v2: V2 }).sponsor([asCall(v2RescueCall(V2, stranger, VA, deadline))], ROOT), code('PAYMASTER_CALL_FORBIDDEN', 403));
+    await assert.rejects(harness(kind, { v2: V2 }).sponsor([asCall(v2RescueCall(V2, account, VA, 0n))], ROOT), code('PAYMASTER_CALL_FORBIDDEN', 403));
+    await assert.rejects(harness(kind).sponsor(rescue, ROOT), code('PAYMASTER_CALL_FORBIDDEN', 403));
+    // Every ordinary v2 flow is the same whoever signs (the scheduler sends them with the session key).
+    for (const [name, calls] of v2Flows(await renewalV2()).slice(3, 8)) await assert.doesNotReject(harness(kind, { v2: V2 }).sponsor(calls, SESSION), `${kind}: ${name} (session key)`);
+  });
+
+  test(`routing v2, ${kind} account: one account uses v1 or v2, never both — adding risk on one generation is refused while the other is in use`, async () => {
+    const deadline = BigInt(NOW + 600), E = 10n ** 18n, market = markets[0]!;
+    const v2Risk = v2Flows(await renewalV2()).filter(f => f[2] === 'risk'), v2Settle = v2Flows(await renewalV2()).filter(f => f[2] === 'settle');
+    const v1Open = openCalls(market, account, E, E, 2n * E, deadline).map(asCall), v1Close = closeCalls(market, account, deadline).map(asCall);
+    // v1 still holds something: every v2 UserOp that adds risk (consent, open, move) is refused; exits are always sponsored.
+    for (const [name, calls] of v2Risk) {
+      const h = harness(kind, { v2: V2, inUse: 'v1' });
+      await assert.rejects(h.sponsor(calls), code('PAYMASTER_CALL_FORBIDDEN', 403), `${kind}: ${name}`);
+      assert.deepEqual([h.asked, h.seen.reservations], [['v1'], 0], name);
+    }
+    for (const [name, calls] of v2Settle) { const h = harness(kind, { v2: V2, inUse: 'v1' }); await h.sponsor(calls); assert.deepEqual(h.asked, [], `${kind}: ${name} is never checked`); }
+    // v2 holds something: v1 consent / post / borrow is refused for this owner; v1 repay and take-back still go through.
+    const blocked = harness(kind, { v2: V2, inUse: 'v2' });
+    await assert.rejects(blocked.sponsor(v1Open), code('PAYMASTER_CALL_FORBIDDEN', 403));
+    assert.deepEqual(blocked.asked, ['v2']);
+    await assert.doesNotReject(harness(kind, { v2: V2, inUse: 'v2' }).sponsor(v1Close));
+    // Neither in use: both generations may start (the API decides which one it offers).
+    await assert.doesNotReject(harness(kind, { v2: V2 }).sponsor(v1Open));
+    await assert.doesNotReject(harness(kind, { v2: V2 }).sponsor(v2Risk[1]![1]));
+    // The chain cannot be read: nothing is sponsored on a guess.
+    await assert.rejects(harness(kind, { v2: V2, inUse: 'unreadable' }).sponsor(v2Risk[1]![1]), code('PAYMASTER_DEPENDENCY_UNAVAILABLE', 503));
+    // An owner outside the v2 audience (v2 null) is never asked: v1 exactly as before, no extra read.
+    const plain = harness(kind);
+    await plain.sponsor(v1Open);
+    assert.deepEqual(plain.asked, []);
+  });
+
+  test(`routing v2, ${kind} account: production wiring — the deployment and the audience come from configuration; an owner outside the audience gets no v2 sponsorship`, async () => {
+    const real = strategyEarnV2(97, {})!;
+    const v2f = v2Flows(await renewalV2(real), real);
+    const before = process.env.STRATEGY_EARN_V2_AUDIENCE;
+    try {
+      // The fixture owner is not on the canary list: every v2 UserOp is refused, v1 is untouched.
+      delete process.env.STRATEGY_EARN_V2_AUDIENCE;
+      assert.ok(!real.canaryOwners.includes(owner.toLowerCase() as Address));
+      for (const [name, calls] of v2f) await assert.rejects(harness(kind, { wired: true }).sponsor(calls), code('PAYMASTER_CALL_FORBIDDEN', 403), `${kind}: ${name} outside the audience`);
+      for (const [name, calls] of await flows(kind)) await assert.doesNotReject(harness(kind, { wired: true }).sponsor(calls), `${kind} outside the audience: ${name}`);
+      // In the audience: the same UserOps against the configured executor / registry are sponsored.
+      process.env.STRATEGY_EARN_V2_AUDIENCE = owner;
+      for (const [name, calls] of v2f) { const h = harness(kind, { wired: true }); await assert.doesNotReject(h.sponsor(calls), `${kind}: ${name} in the audience`); assert.equal(h.seen.reservations, 1); }
+      // A v2 call aimed at any other "executor" is not a v2 call: refused.
+      await assert.rejects(harness(kind, { wired: true }).sponsor([asCall(v2Calls.release(V2, account, VA, BigInt(NOW + 600)))]), code('PAYMASTER_CALL_FORBIDDEN', 403));
+    } finally { if (before === undefined) delete process.env.STRATEGY_EARN_V2_AUDIENCE; else process.env.STRATEGY_EARN_V2_AUDIENCE = before; }
+  });
+}

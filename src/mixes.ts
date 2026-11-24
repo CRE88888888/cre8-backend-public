@@ -23,7 +23,7 @@ import type { MixRow, MixSnapshot } from './mix-store.js';
 import { mixAnchor, mixValue, saveMixValuation } from './mix-valuation.js';
 import type { MixValuation } from './mix-valuation.js';
 import { MIX_EXIT_DUST_RAW } from './mix-runtime.js';
-import { mixStrategyConsentCalls } from './strategy-earn.js';
+import { mixStrategyConsent } from './strategy-earn.js';
 
 export type MixServiceDeps = {
   query: typeof query; transaction: typeof withTransaction; lock: typeof withMixLock; now: () => Date; chainId: () => number;
@@ -32,14 +32,14 @@ export type MixServiceDeps = {
   preview: ReturnType<typeof createMixPreview>;
   maxAssets: () => Promise<number>; anchor: typeof mixAnchor; context: typeof mixIntentContext; findEnrollment: typeof findMixEnrollment;
   syncFlows: (m: MixRow, proof: import('./mix-store.js').MixEnrollmentProof) => Promise<void>;
-  /** Yield strategy consent to re-sign with a weight change (src/strategy-earn.ts mixStrategyConsentCalls); [] when off. */
-  strategyConsent: typeof mixStrategyConsentCalls;
+  /** Yield strategy consent to re-sign with a weight change (src/strategy-earn.ts mixStrategyConsent: v1 or routing v2, whichever the account is on); [] when off. */
+  strategyConsent: (input: Parameters<typeof mixStrategyConsent>[0]) => Promise<{ to: Address; data: Hex; value: '0' }[]>;
 };
 const defaults: MixServiceDeps = { query, transaction: withTransaction, lock: withMixLock, now: () => new Date(), chainId: configuredChainId,
   creationLock: withMixCreationLock, register: registerMixStrategy, prepareAccount: preparePortfolioEnrollment, enroll: enrollPortfolio, calls: prepareMixCalls,
   proof: readMixEnrollmentProof, plan: planPortfolio, anchor: mixAnchor, context: mixIntentContext, findEnrollment: findMixEnrollment, preview: createMixPreview(), syncFlows: async (m, proof) => {
     await syncMixEnrollmentFlows(getChain().publicClient, m, proof);
-  }, strategyConsent: (input) => mixStrategyConsentCalls(input), maxAssets: async () => Number(await getChain().publicClient.readContract({ address: getChain().registryAddress, abi: (await import('./registry-abi.js')).REGISTRY_VERSION_ABI, functionName: 'MAX_STRATEGY_ASSETS' })) };
+  }, strategyConsent: (input) => mixStrategyConsent(input), maxAssets: async () => Number(await getChain().publicClient.readContract({ address: getChain().registryAddress, abi: (await import('./registry-abi.js')).REGISTRY_VERSION_ABI, functionName: 'MAX_STRATEGY_ASSETS' })) };
 const MIX_CASH = TESTNET_97.contracts.usdt.toLowerCase();
 const notFound = () => new AppError(404, 'MIX_NOT_FOUND', '找不到這個私人組合或分享連結。');
 export function createMixService(overrides: Partial<MixServiceDeps> = {}) {
@@ -318,7 +318,7 @@ export function createMixService(overrides: Partial<MixServiceDeps> = {}) {
         const previous = [...Object.keys(prior.user_allocation), ...prior.exit_assets];
         // Yield strategy on: the enroll voids its consent, so the same signature re-consents for the new weights (after the
         // enroll). Read before anything is published, so an unreadable chain leaves no orphan strategy behind.
-        const consent = await deps.strategyConsent({ account: m.account, previousAssets: previous,
+        const consent = await deps.strategyConsent({ account: m.account, owner: m.owner, previousAssets: previous,
           assets: allocation.assets.filter(a => !allocation.sellOnlyAssets.includes(a.address)), totalValueUsd: plan.report.totalUsdE8 * 10n ** 10n })
           .catch(error => { throw mixUnavailable('strategy-consent', error); });
         // Cancel only known, unsent remaining work before preparing the owner intent.

@@ -69,7 +69,7 @@ import { rpcBatch, rpcTransport } from './rpc-transport.js';
 const REGISTRY_ABI = [...ENROLLMENT_ABI, ...REGISTRY_VERSION_ABI] as const;
 
 const SQL_PORTFOLIO = `
-  select p.id as portfolio_id, p.strategy_id, s.onchain_id, sa.address, s.is_personal_mix
+  select p.id as portfolio_id, p.strategy_id, s.onchain_id, sa.address, sa.owner, s.is_personal_mix
     from portfolios p
     join strategies s on s.id = p.strategy_id
     join smart_accounts sa on sa.portfolio_id = p.id
@@ -144,6 +144,8 @@ export type PlanDeps = {
   block?: bigint;
   /** Chain 97 Strategy Earn shares posted as collateral at `block` (backend#204). Default reads AtpBorrowRegistry. */
   strategyEarnCollateral?: (account: Address, block: bigint) => Promise<StrategyEarnCollateral[]>;
+  /** The same for routing v2 (AtpBorrowLensV2), read only for accounts of an owner in the v2 audience. */
+  strategyEarnV2Collateral?: (account: Address, block: bigint) => Promise<StrategyEarnCollateral[]>;
   /** Chain 97 per-account yield read; default `readYieldAccount`. */
   readYield?: (client: PublicClient, profile: YieldProfile, account: Address, options: { block: bigint; ignore?: readonly Hex[] }) => Promise<YieldRead>;
   /**
@@ -182,6 +184,31 @@ export async function readStrategyEarnCollateral(client: PublicClient, account: 
     if (amount > 0n) out.push({ asset: m.collateral, marketId: m.marketId, amount });
   }
   return out;
+}
+
+/**
+ * Shares posted through routing v2 at `block`: the account's routes from the v2 registry, each route's collateral from
+ * the lens. Venus routes of one collateral (they differ only in the loan token) share the same vTokens: counted once.
+ * One read (`accountRoutes`) for an account with nothing on v2. No v2 deployment on this chain = []. Only called for
+ * accounts of an owner in the v2 audience (planPortfolio): nobody else can have a v2 position, and they cost no read.
+ */
+export async function readStrategyEarnV2Collateral(client: PublicClient, account: Address, block: bigint): Promise<StrategyEarnCollateral[]> {
+  const { strategyEarnV2, V2_LENS_ABI, V2_REGISTRY_ABI } = await import('./strategy-earn-v2.js');
+  const v2 = strategyEarnV2(client.chain?.id ?? 97);
+  if (v2 === null) return [];
+  const routeIds = await client.readContract({ address: v2.registry, abi: V2_REGISTRY_ABI, functionName: 'accountRoutes', args: [account], blockNumber: block });
+  const out = new Map<string, StrategyEarnCollateral>(), seen = new Set<string>();
+  for (const routeId of routeIds) {
+    const [route, amount] = await Promise.all([client.readContract({ address: v2.registry, abi: V2_REGISTRY_ABI, functionName: 'route', args: [routeId], blockNumber: block }),
+      client.readContract({ address: v2.lens, abi: V2_LENS_ABI, functionName: 'collateral', args: [routeId, account], blockNumber: block })]);
+    const asset = route.collateral.toLowerCase() as Address, key = `${route.venue}:${asset}:${route.venue === 1 ? '' : routeId}`;
+    if (amount === 0n || seen.has(key)) continue;
+    seen.add(key);
+    // One entry per asset (the caller keys balances by asset): an asset posted on two venues is summed.
+    const had = out.get(asset);
+    out.set(asset, had ? { ...had, amount: had.amount + amount } : { asset, marketId: routeId.toLowerCase(), amount });
+  }
+  return [...out.values()];
 }
 
 function shortAddress(address: string): string {
@@ -248,14 +275,15 @@ async function loadPortfolioContext(
   query: QueryFn,
   portfolioId: number,
   chainId: number,
-): Promise<{ strategyId: number; onchainStrategyId: number | null; account: Address; personalMix: boolean }> {
+): Promise<{ strategyId: number; onchainStrategyId: number | null; account: Address; personalMix: boolean; owner: string | null }> {
   const result = await query(SQL_PORTFOLIO, [portfolioId, chainId]);
   const row = result.rows[0];
   if (row === undefined) {
     throw new Error(`portfolio ${portfolioId} 在 chain ${chainId} 上沒有 smart account，索引器無從讀取持倉`);
   }
-  const typed = row as { strategy_id?: unknown; onchain_id?: unknown; address?: unknown; is_personal_mix?: unknown };
+  const typed = row as { strategy_id?: unknown; onchain_id?: unknown; address?: unknown; is_personal_mix?: unknown; owner?: unknown };
   return {
+    owner: typeof typed.owner === 'string' ? typed.owner : null,
     personalMix: typed.is_personal_mix === true,
     strategyId: toInteger(typed.strategy_id, 'portfolios.strategy_id'),
     onchainStrategyId: typed.onchain_id === null || typed.onchain_id === undefined ? null : toInteger(typed.onchain_id, 'strategies.onchain_id'),
@@ -331,7 +359,7 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
   // head，同一塊重跑得到不同價格——一個看起來正常、其實每次都不一樣的漂移數字。
   const block = deps.block ?? (await client.getBlockNumber());
 
-  const { strategyId, onchainStrategyId, account, personalMix } = await loadPortfolioContext(query, portfolioId, chainId);
+  const { strategyId, onchainStrategyId, account, personalMix, owner } = await loadPortfolioContext(query, portfolioId, chainId);
   const mixBlockHash = personalMix ? (await client.getBlock({ blockNumber: block })).hash : null;
   if (onchainStrategyId === null) {
     throw new Error(`strategy ${strategyId} 沒有 onchain_id：它還沒鏡像到鏈上，索引器沒有目標權重可對齊`);
@@ -464,6 +492,13 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
     ? await (deps.strategyEarnCollateral ?? ((a: Address, b: bigint) => readStrategyEarnCollateral(client, a, b)))(account, block)
         .catch(() => { throw new Error('strategy earn collateral unavailable'); })
     : [];
+  // Routing v2 (one account is on v1 or v2, never both; only owners in the v2 audience can be on v2): the shares it posted
+  // are this portfolio's holding just the same. Unknown -> throw, as above.
+  if (chainId === 97 && (await import('./strategy-earn-v2.js')).v2Audience(chainId, owner)) {
+    const v2Posted = await (deps.strategyEarnV2Collateral ?? ((a: Address, b: bigint) => readStrategyEarnV2Collateral(client, a, b)))(account, block)
+      .catch(() => { throw new Error('strategy earn collateral unavailable'); });
+    for (const c of v2Posted) { const had = strategyEarn.find(x => x.asset === c.asset); if (had) had.amount += c.amount; else strategyEarn.push(c); }
+  }
   // The yield read only needs the account and the block, so it overlaps the balance read and the log scan.
   const yieldConfig = chainId===97 && !personalMix ? yieldProfile() : null;
   // DCA (定投, db 0064): the not-yet-invested money is the account's own vault position on a separate ledger.

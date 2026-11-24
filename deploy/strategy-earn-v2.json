@@ -1,0 +1,25 @@
+{
+  "note": "Strategy Earn routing v2 deployments (cre8-contracts deployments/*.json `borrowV2`). The backend reads every v2 address from here (or from STRATEGY_EARN_V2_DEPLOYMENT, which wins): executor, registry, lens, the session-key scope and the paymaster allowlist all follow this file. After a redeploy, replace the entry; routes and vaults are discovered from the registry, they are not listed here. `canaryOwners`: owners whose accounts use v2 while STRATEGY_EARN_V2_AUDIENCE is unset.",
+  "deployments": [
+    {
+      "chainId": 97,
+      "interfaceVersion": "v2.0-draft5",
+      "gitCommit": "1888572dc89cf7720bce50a9b96f6e28086474a8",
+      "deployedAtBlocks": [144626656, 144628034],
+      "executor": "0x494C106498e8221D3f72474f36995C191ACf6bB5",
+      "registry": "0x7eae73a76Ff2359fE1aB059A77Dd36840A32559E",
+      "lens": "0x18A55C04aE72A00ED7790577FbdA9159DAc94000",
+      "venusComptroller": "0x93AB77260c8C62b26698bBB0ee8da3E175b9ad8D",
+      "moolah": "0x993237aC050512f3749bfEE2dE759b6B86Aea653",
+      "adapters": ["0x3548A7641bae787A48E263f8aF053899e46fF02d", "0x861e91a0a3d46c391587323B3FE32A43E53CFe91", "0x432f96D0790f3bc3ceBed379Fd476F367CE63BAa"],
+      "loanTokens": {
+        "USDT": "0x7Ad6E310B0F6744B66d97Cb7cb525BD974501cb5",
+        "USDC": "0xB887Ca3379dC41F1155dD0cb1B2e3c1D85D17eD5",
+        "USD1": "0xEA13862CB4612d228BA89b4319fEEc60F05Ab3AC",
+        "U": "0xC71E4Efb5A36bD54ad8DE9E9742bFA8fBd750875"
+      },
+      "rewardTokens": ["0xFfE08AC6f45A4aE5Ae2a692f0965EA46CE7d822c"],
+      "canaryOwners": ["0xD3Ab39B62E221bF9E8bA19fE19b2638767d3D6D9"]
+    }
+  ]
+}

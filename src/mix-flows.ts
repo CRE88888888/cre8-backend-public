@@ -8,6 +8,7 @@ import { mixUnavailable } from './mix-store.js';
 import { TESTNET_97 as T } from './testnet-profile.js';
 import { findDeploymentBlock } from './holdings-scan.js';
 import { STRATEGY_EARN_INTERNAL } from './strategy-earn-guard.js';
+import { strategyEarnV2, v2Audience, v2InternalAddresses, V2_EXECUTOR_ABI } from './strategy-earn-v2.js';
 export type MixFlow = { kind: 'deposit' | 'withdrawal'; amountRaw: string; txHash: Hex; logIndex: number;
   blockNumber: bigint; blockHash: Hex; at: Date; asset: Address; quantityRaw: string; quote: MixFlowQuote };
 export type MixFlowQuote = { decimals: number; priceUsdE8: bigint; source: string; at: Date };
@@ -31,6 +32,9 @@ export function mixFlowDirection(from: string, to: string, m: MixFlowAccount): M
   if (sender === recipient) return null;
   // Yield strategy (posting/returning shares, repaying, the strategy vault and incentives) stays inside the mix.
   if (STRATEGY_EARN_INTERNAL.has(sender) || STRATEGY_EARN_INTERNAL.has(recipient)) return null;
+  // Routing v2: the same, through AtpBorrowExecutorV2 and its vault adapters (the account's strategy box: see readMixFlows).
+  const v2 = v2InternalAddresses(97);
+  if (v2.has(sender) || v2.has(recipient)) return null;
   if (recipient === m.account && sender !== T.contracts.executor) return 'deposit';
   if (sender === m.account && recipient !== T.contracts.executor) return 'withdrawal';
   return null;
@@ -44,6 +48,12 @@ export async function priceMixFlowAsset(client: PublicClient, asset: Address, bl
   if (quoted < 10n ** 10n) throw mixUnavailable();
   return { decimals, priceUsdE8: quoted / 10n ** 10n, source: `oracle:${T.contracts.router}`, at: new Date(Number(header.timestamp) * 1000) };
 }
+/** The account's routing v2 strategy box (`AtpBorrowExecutorV2.boxOf`, a pure CREATE2 address), lowercase; null without a v2 deployment. A failed read throws: a flow is never booked on a guess. */
+async function strategyBoxOf(client: PublicClient, account: Address): Promise<string | null> {
+  const v2 = strategyEarnV2(97);
+  if (v2 === null) return null;
+  return (await client.readContract({ address: v2.executor, abi: V2_EXECUTOR_ABI, functionName: 'boxOf', args: [account] })).toLowerCase();
+}
 export async function readMixFlows(client: PublicClient, m: MixFlowAccount, fromBlock: bigint, toBlock: bigint, options: MixFlowOptions = {}): Promise<MixFlow[]> {
   try {
   if (fromBlock < 0n || toBlock < fromBlock || await client.getChainId() !== 97) throw mixUnavailable();
@@ -51,6 +61,7 @@ export async function readMixFlows(client: PublicClient, m: MixFlowAccount, from
   const assets = [...new Set(options.assets ?? [T.contracts.usdt])];
   if (assets.length === 0) throw mixUnavailable();
   const prices = new Map<Address, MixFlowQuote>();
+  let box: Promise<string | null> | undefined;
   for (let from = fromBlock; from <= toBlock; from += 2000n) {
     const to = from + 1999n < toBlock ? from + 1999n : toBlock;
     const [incoming, outgoing] = await Promise.all([
@@ -62,6 +73,11 @@ export async function readMixFlows(client: PublicClient, m: MixFlowAccount, from
       const event = decodeEventLog({ abi: erc20Abi, eventName: 'Transfer', data: log.data, topics: log.topics });
       const kind = mixFlowDirection(event.args.from, event.args.to, m);
       if (kind === null || event.args.value === 0n) continue;
+      // Routing v2: the account's own strategy box pays idle strategy money back to it. Only an owner in the v2 audience can
+      // have a box, and the box is never the owner: an ordinary deposit and every other owner's mix cost no read. One `boxOf`
+      // read per call, only when some other address sent such an account tokens.
+      const sender = event.args.from.toLowerCase();
+      if (kind === 'deposit' && sender !== m.owner.toLowerCase() && v2Audience(97, m.owner)) { box ??= strategyBoxOf(client, m.account); if (sender === await box) continue; }
       const asset = log.address.toLowerCase() as Address;
       if (!assets.includes(asset)) throw mixUnavailable();
       const [receipt, block] = await Promise.all([client.getTransactionReceipt({ hash: log.transactionHash }), client.getBlock({ blockNumber: log.blockNumber })]);

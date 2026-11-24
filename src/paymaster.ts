@@ -1,5 +1,5 @@
 import { sponsoredRewardTokens } from './strategy-rewards.js';
-import { strategyEarnV2, v2SponsoredCall } from './strategy-earn-v2.js';
+import { isRootSignedNonce, strategyEarnV2For, v2SponsoredCall } from './strategy-earn-v2.js';
 import type { StrategyEarnV2 } from './strategy-earn-v2.js';
 import { verifyEnrollmentSponsorship } from './enrollment-sponsorship.js';
 import { verifyMixOwnerCalls } from './mix-chain.js';
@@ -85,8 +85,11 @@ type Query = (sql: string, params?: readonly unknown[]) => Promise<{ rows: unkno
 export type PaymasterDeps = {
   /** Reward tokens an owner may send to their wallet. Default: sponsoredRewardTokens(chainId) (mainnet, behind STRATEGY_REWARDS_ENABLED). */
   rewardTokens?: readonly Address[];
-  /** Routing v2 deployment whose calls may be sponsored. Default: strategyEarnV2(chainId) (null until v2 is deployed and configured). */
+  /** Routing v2 deployment whose calls may be sponsored. Default: strategyEarnV2For(chainId, owner) — null for every owner outside the v2 audience (a canary list today). */
   strategyV2?: StrategyEarnV2 | null;
+  /** Is this generation of the yield strategy in use on the account (a position, debt or consent)? Default reads the chain
+   * (src/strategy-earn.ts strategyGenerationActive). Only asked for owners in the v2 audience. */
+  strategyGenerationActive?: (generation: 'v1' | 'v2', account: Address, v2: StrategyEarnV2) => Promise<boolean>;
   mixSetup?: typeof verifyMixOwnerCalls;
   mixLock?: typeof withMixLock;
   config?: PaymasterConfig | null;
@@ -271,10 +274,10 @@ export function mixDcaCall(call: { target: Address; callData: Hex }, sender: Add
  * 'settle' = repays, takes shares back or withdraws consent.
  */
 export type MixStrategyCall = 'risk' | 'settle' | null;
-export function mixStrategyCall(call: { target: Address; callData: Hex }, c: PaymasterConfig, v2?: { v2: StrategyEarnV2; sender: Address; owner?: Address }): MixStrategyCall {
+export function mixStrategyCall(call: { target: Address; callData: Hex }, c: PaymasterConfig, v2?: { v2: StrategyEarnV2; sender: Address; owner?: Address; rootSigned?: boolean }): MixStrategyCall {
   if (c.chainId !== 97) return null;
   // Routing v2: same two classes. A v2 call that breaks a rule is not classified here; validateSponsoredCalls rejects it.
-  if (v2) { try { const kind = v2SponsoredCall(v2.v2, call, { sender: v2.sender, owner: v2.owner, assets: testnetAssets().map(a => a.address) }); if (kind !== null) return kind; } catch { return null; } }
+  if (v2) { try { const kind = v2SponsoredCall(v2.v2, call, { sender: v2.sender, owner: v2.owner, assets: testnetAssets().map(a => a.address), rootSigned: v2.rootSigned }); if (kind !== null) return kind; } catch { return null; } }
   const S = STRATEGY_EARN_97;
   try {
     if (isAddressEqual(call.target, S.executor)) {
@@ -320,7 +323,7 @@ export function validateSponsoredCalls(op: PackedSponsorOperation, c: PaymasterC
         const next = calls[++index];
         if (next === undefined || next.value !== 0n || !isAddressEqual(next.target, op.sender)) throw new Error('incomplete renewal');
         validateAnyRenewal(call.callData, next.callData, c, op.sender, context.v2 ?? null);
-      } else if (context.v2 && v2SponsoredCall(context.v2, call, { sender: op.sender, owner: context.owner, assets }) !== null) {
+      } else if (context.v2 && v2SponsoredCall(context.v2, call, { sender: op.sender, owner: context.owner, assets, rootSigned: isRootSignedNonce(op.nonce) }) !== null) {
         // Routing v2 (src/strategy-earn-v2.ts): a valid call to the v2 executor / registry / lending delegation, or an approval
         // to the v2 executor. An invalid one throws above and is rejected here like any other.
       } else if (isAddressEqual(call.target, c.executor)) {
@@ -1038,7 +1041,9 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
           owner.owner.toLowerCase() !== wallet.toLowerCase() || owner.user_id.toLowerCase() !== wallet.toLowerCase()) throw rejected('PAYMASTER_SENDER_FORBIDDEN', 403);
       const isMix = owner.mix_id !== null && owner.mix_id !== undefined;
       const mixDca = (call: { target: Address; callData: Hex }) => mixDcaCall(call, op.sender, hex(owner.owner, 20), c);
-      const rewardTokens = deps.rewardTokens ?? sponsoredRewardTokens(c.chainId);
+      // Routing v2 is decided per owner (strategyEarnV2For): outside its audience no v2 call, v2 renewal scope or v2 reward payout is sponsored.
+      const strategyV2 = deps.strategyV2 === undefined ? strategyEarnV2For(c.chainId, owner.owner) : deps.strategyV2;
+      const rewardTokens = deps.rewardTokens ?? [...sponsoredRewardTokens(c.chainId), ...(strategyV2?.rewardTokens ?? [])];
       const isRewardToken = (target: Address) => rewardTokens.some(token => isAddressEqual(target, token));
       // USDT and reward tokens (LISTA / XVS) going to the owner's wallet; the recipient is checked in validateSponsoredCalls.
       const onlyOwnerCash = calls.length > 0 && calls.every(call => (isAddressEqual(call.target, TESTNET_97.contracts.usdt) || isRewardToken(call.target)) &&
@@ -1050,8 +1055,7 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
           isAddressEqual(call.target, TESTNET_97.contracts.usdt) && call.callData.startsWith(toFunctionSelector('transfer(address,uint256)')));
       // Yield strategy only (with an optional session renewal pair, like a fund's turn-on): owner consent/open/close or
       // the scheduler's session-key steps. Not an enrollment change, so no mix lock, like DCA.
-      const strategyV2 = deps.strategyV2 === undefined ? strategyEarnV2(c.chainId) : deps.strategyV2;
-      const mixStrategy = (call: { target: Address; callData: Hex }) => mixStrategyCall(call, c, strategyV2 ? { v2: strategyV2, sender: op.sender, owner: hex(owner.owner, 20) } : undefined);
+      const mixStrategy = (call: { target: Address; callData: Hex }) => mixStrategyCall(call, c, strategyV2 ? { v2: strategyV2, sender: op.sender, owner: hex(owner.owner, 20), rootSigned: isRootSignedNonce(op.nonce) } : undefined);
       const strategyOnly = isMix && calls.some(call => mixStrategy(call) !== null) &&
         calls.every(call => mixStrategy(call) !== null || isAddressEqual(call.target, op.sender));
       const authorize = async () => {
@@ -1122,6 +1126,22 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
         });
       }
       validateSponsoredCalls(op, c, { owner: hex(owner.owner, 20), assets, rewardTokens, v2: strategyV2 });
+      // One account uses yield strategy v1 or routing v2, never both (cre8-contracts borrow-routing-v2 §12: the contract's
+      // ForeignDebt check can be walked around, so the rule is enforced here). Owners outside the v2 audience can only ever
+      // reach v1, so only an audience owner's UserOp that ADDS risk on one generation is checked against the other.
+      if (strategyV2) {
+        const v2Ctx = { sender: op.sender, owner: hex(owner.owner, 20), assets: testnetAssets().map(a => a.address), rootSigned: isRootSignedNonce(op.nonce) };
+        const adds = (generation: 'v1' | 'v2') => calls.some(call => {
+          try { return generation === 'v2' ? v2SponsoredCall(strategyV2, call, v2Ctx) === 'risk' : v2SponsoredCall(strategyV2, call, v2Ctx) === null && mixStrategyCall(call, c) === 'risk'; } catch { return false; }
+        });
+        for (const [wants, other] of [['v2', 'v1'], ['v1', 'v2']] as const) {
+          if (!adds(wants)) continue;
+          let busy: boolean;
+          try { busy = await bounded((deps.strategyGenerationActive ?? (async (g, account, v2) => (await import('./strategy-earn.js')).strategyGenerationActive(g, account, v2)))(other, op.sender, strategyV2), c.timeoutMs * 2); }
+          catch { throw rejected('PAYMASTER_DEPENDENCY_UNAVAILABLE', 503); }
+          if (busy) throw rejected('PAYMASTER_CALL_FORBIDDEN', 403, `yield strategy ${other} is still in use on this account`);
+        }
+      }
       await bounded(checkFreeCash(op, calls, c, hex(owner.owner, 20), deps), c.timeoutMs);
       const cost = gasCost(op, c);
       if (cost.gasLimit > MAX_USER_OP_GAS) throw rejected('PAYMASTER_USER_OP_CAPACITY', 400);

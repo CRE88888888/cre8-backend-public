@@ -157,7 +157,8 @@ export type RewardEvent = { portfolioId: number; account: Address; holder: Addre
 const SOURCE_OF: Record<string, RewardSource> = { [REWARDS.LISTA_DISTRIBUTOR]: 'lista', [REWARDS.LISTA_MULTI_DISTRIBUTOR]: 'lista_multi' };
 /**
  * Ledger rows from a verified receipt, read off the tokens' own Transfer logs (what actually moved, not what a claim
- * asked for): distributor / Venus -> holder is a claim; portfolio account -> its owner is a sweep. Anything else is ignored.
+ * asked for): distributor / Venus -> holder is a claim; a holder (the portfolio account or its strategy box) -> the owner is a
+ * sweep. Anything else is ignored (box -> account stays inside the portfolio).
  */
 export function rewardEvents(tx: RewardTx, p: { portfolioId: number; account: Address; holders: readonly Address[]; owner?: Address; tokens: readonly { symbol: string; address: Address }[] }): RewardEvent[] {
   const out: RewardEvent[] = [];
@@ -171,7 +172,8 @@ export function rewardEvents(tx: RewardTx, p: { portfolioId: number; account: Ad
     const base = { portfolioId: p.portfolioId, account: p.account, token: token.address, symbol: token.symbol, amountRaw: value, txHash: tx.hash, logIndex: log.logIndex, blockNumber: tx.blockNumber };
     if (p.holders.includes(to) && !p.holders.includes(from) && from !== p.owner)
       out.push({ ...base, holder: to, kind: 'claim', source: SOURCE_OF[from] ?? (token.address === REWARDS.XVS ? 'venus' : 'lista_multi'), recipient: null });
-    else if (from === p.account && p.owner !== undefined && to === p.owner) out.push({ ...base, holder: p.account, kind: 'sweep', source: null, recipient: to });
+    // Out to the owner's wallet: from the portfolio account, or (routing v2 executeSweepRewards) straight from its strategy box.
+    else if (p.holders.includes(from) && p.owner !== undefined && to === p.owner) out.push({ ...base, holder: from, kind: 'sweep', source: null, recipient: to });
   }
   return out;
 }

@@ -14,8 +14,11 @@ import { createMainnetRates, mainnetQuote } from './strategy-earn-mainnet.js';
 import type { MainnetRates } from './strategy-earn-mainnet.js';
 import { parseRewardSignature, rewardsStore, strategyRewardsEnabled } from './strategy-rewards.js';
 import type { RewardsStore, RewardsView } from './strategy-rewards.js';
-import { routeMessage, strategyEarnV2 } from './strategy-earn-v2.js';
+import { routeLedger, routeMessage, strategyEarnV2For, v2Authorized } from './strategy-earn-v2.js';
 import type { RouteEventKind, StrategyEarnV2 } from './strategy-earn-v2.js';
+import { createStrategyEarnV2Api } from './strategy-earn-v2-api.js';
+import type { StrategyEarnV2Api } from './strategy-earn-v2-api.js';
+import { defaultV2Reader, v2EstimateGas } from './strategy-earn-v2-chain.js';
 export { STRATEGY_EARN_97, assertNotStrategyVault, isStrategyVault } from './strategy-earn-guard.js';
 
 /**
@@ -328,7 +331,11 @@ export function splitVenusDebt<P extends { marketId: string; debtRaw?: string; v
 const TEMPORARILY = 'Temporarily unavailable.';
 /** Server-side cache for the public GET /strategy-earn/markets (31 status reads): one chain read per minute at most. */
 export const MARKETS_CACHE_MS = 60_000;
-export type StrategyEarnDeps = { chainId: number; chain: () => StrategyEarnChain; owned: typeof requireOwnedPortfolio; now: () => Date; rewards?: RewardsStore; rewardsEnabled?: boolean; v2?: StrategyEarnV2 | null; ledger?: StrategyEarnLedger;
+export type StrategyEarnDeps = { chainId: number; chain: () => StrategyEarnChain; owned: typeof requireOwnedPortfolio; now: () => Date; rewards?: RewardsStore; rewardsEnabled?: boolean; ledger?: StrategyEarnLedger;
+  /** Routing v2 for this owner; default `strategyEarnV2For(chainId, owner)` (the canary list). Tests pass a fixed deployment or null. */
+  v2?: StrategyEarnV2 | null | ((owner: string) => StrategyEarnV2 | null);
+  /** The v2 side of these endpoints (src/strategy-earn-v2-api.ts); default reads the chain through the public-node reader. */
+  v2Api?: (v2: StrategyEarnV2) => StrategyEarnV2Api;
   /** 0 = no cache (tests). Default MARKETS_CACHE_MS. */
   marketsCacheMs?: number;
   /** Real BSC mainnet rates for display (src/strategy-earn-mainnet.ts); null = none. */
@@ -342,6 +349,56 @@ export function defaultStrategyEarnChain(): StrategyEarnChain {
   if (!rpc) throw new Error('rpc unavailable');
   cachedChain = createStrategyEarnChain(createPublicClient({ chain: bscTestnet, ...rpcBatch(rpc), transport: rpcTransport('strategy-earn', rpc, { retryCount: 1, timeout: 8_000 }) }) as PublicClient);
   return cachedChain;
+}
+
+/**
+ * Does v1 (AtpBorrowExecutor) hold anything for this account: shares posted, debt, or a consent waiting for a fill?
+ * One account uses v1 or routing v2, never both (cre8-contracts borrow-routing-v2 §12; the contract's ForeignDebt check does
+ * not cover every path), so every place that would add v2 risk asks this first.
+ */
+export async function strategyEarnV1Active(chain: StrategyEarnChain, account: Address, block: bigint): Promise<boolean> {
+  const all = strategyMarkets();
+  const ids = await chain.accountMarkets(account, block);
+  const entered = all.filter(m => ids.includes(m.marketId));
+  if ((await Promise.all(entered.map(async m => (await chain.collateral(m.marketId, account, block)) > 0n || (await chain.status(m.marketId, account, block)).debt > 0n))).some(Boolean)) return true;
+  return (await consentedMarkets(chain, account, block, all)).size > 0;
+}
+/**
+ * The paymaster's and the scheduler's question before sponsoring / sending anything that adds risk on one generation: is
+ * the OTHER generation still in use on this account? Reads the chain; a failed read throws (never answered by a guess).
+ */
+export async function strategyGenerationActive(generation: 'v1' | 'v2', account: Address, v2: StrategyEarnV2): Promise<boolean> {
+  if (generation === 'v2') return defaultStrategyEarnV2Api(v2).active(account);
+  const chain = defaultStrategyEarnChain();
+  return strategyEarnV1Active(chain, account, (await chain.head()).number);
+}
+
+const defaultV2Apis = new Map<string, StrategyEarnV2Api>();
+/** The v2 side of the strategy-earn endpoints for a deployment: public-node reader, ledgers in this service's database. */
+export function defaultStrategyEarnV2Api(v2: StrategyEarnV2): StrategyEarnV2Api {
+  const key = `${v2.chainId}:${v2.executor}`;
+  let api = defaultV2Apis.get(key);
+  if (!api) {
+    const ledger = routeLedger((sql, params) => dbQuery(sql, params));
+    api = createStrategyEarnV2Api({ v2, reader: defaultV2Reader(v2), now: () => new Date(), estimateGas: (account, call) => v2EstimateGas(v2, account, call),
+      recordRoutes: (chainId, events) => ledger.record(chainId, events), recordRewards: (chainId, events) => rewardsStore().record(chainId, events) });
+    defaultV2Apis.set(key, api);
+  }
+  return api;
+}
+/**
+ * My mix weight change, either generation (one account uses v1 or v2, never both): an account that has anything on
+ * routing v2 re-consents there (`setStrategyPolicy` right after the enroll, in the same owner UserOp); every other account
+ * gets the v1 calls exactly as before. Only an owner in the v2 audience can reach the v2 branch.
+ */
+export async function mixStrategyConsent(input: Parameters<typeof mixStrategyConsentCalls>[0] & { owner?: string }, deps: { chain?: StrategyEarnChain; v2?: (owner: string) => StrategyEarnV2 | null;
+  v2Api?: (v2: StrategyEarnV2) => StrategyEarnV2Api } = {}): Promise<Call[]> {
+  const v2 = input.owner ? (deps.v2 ?? ((owner: string) => strategyEarnV2For(97, owner)))(input.owner) : null;
+  if (v2) {
+    const api = (deps.v2Api ?? defaultStrategyEarnV2Api)(v2), account = input.account.toLowerCase() as Address;
+    if (await api.active(account)) return api.reconsent(account, input.owner!.toLowerCase() as Address, { assets: input.assets, totalValueUsd: input.totalValueUsd });
+  }
+  return mixStrategyConsentCalls(input, deps.chain ?? defaultStrategyEarnChain());
 }
 
 let cachedMainnetRates: ReturnType<typeof createMainnetRates> | undefined;
@@ -364,6 +421,34 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
     return p.accountAddress.toLowerCase() as Address;
   };
   const ready = () => { if (deps.chainId !== 97) throw new AppError(404, 'STRATEGY_EARN_NOT_CONFIGURED', '策略加息目前僅開放測試網。'); };
+  // ---- Routing v2 (src/strategy-earn-v2*.ts): one account uses v1 or v2, never both (cre8-contracts borrow-routing-v2 §12).
+  // v2 answers only for an owner in the audience (strategyEarnV2For: a canary list today). For such an owner an account is
+  // on v2 when it already has anything there; a clean account starts on v2; an account with a v1 position or v1 consent stays
+  // on v1 until that is closed. Every other owner never reaches any of this.
+  const v2Of = (owner: string): StrategyEarnV2 | null => typeof deps.v2 === 'function' ? deps.v2(owner) : deps.v2 === undefined ? strategyEarnV2For(deps.chainId, owner) : deps.v2;
+  const v2ApiOf = (v2: StrategyEarnV2): StrategyEarnV2Api => deps.v2Api ? deps.v2Api(v2) : defaultStrategyEarnV2Api(v2);
+  const v1Active = (chain: StrategyEarnChain, account: Address, block: bigint) => strategyEarnV1Active(chain, account, block);
+  /**
+   * The v2 side for this account, or null (= v1 answers). `forNew`: the request wants to turn the strategy on, so a clean
+   * account of an audience owner starts on v2; otherwise only an account that already has something on v2 is v2.
+   * A read that fails throws: which generation holds the money is never guessed.
+   */
+  async function v2Side(account: Address, wallet: string, forNew: boolean): Promise<{ api: StrategyEarnV2Api; v2: StrategyEarnV2 } | null> {
+    const v2 = v2Of(wallet);
+    if (!v2) return null;
+    const api = v2ApiOf(v2);
+    if (await api.active(account)) return { api, v2 };
+    if (!forNew) return null;
+    const chain = deps.chain(), head = await chain.head();
+    return await v1Active(chain, account, head.number) ? null : { api, v2 };
+  }
+  const v2Unavailable = () => ({ status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY });
+  /** Newest active session key carries the whole routing v2 scope for this account (and the not-for-signatures flag). */
+  async function v2KeyReady(id: number, account: Address, v2: StrategyEarnV2) {
+    const rows = (await deps.query<{ permissions: unknown }>(`select permissions from session_keys where portfolio_id = $1 and status = 'active' and expires_at > now()
+      order by (split_part(key_ref, '/', 6))::bigint desc limit 1`, [id])).rows;
+    return rows[0] !== undefined && v2Authorized(rows[0].permissions, account, v2.executor) && sessionPermissionFlagOf(rows[0].permissions) === SESSION_PERMISSION_FLAG;
+  }
   const live = async () => { try { const chain = deps.chain(); return { chain, head: await chain.head() }; } catch { return null; } };
   // Where the money sits (public, for "Where your money goes"): the collateral market contract (Venus collateral vToken, or
   // Lista Moolah + market id), the USDT loan market (Venus vUSDT / the same Moolah market) and the strategy vault.
@@ -467,6 +552,8 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
     /** This portfolio's positions; net value = collateral + vault - debt, kept apart from cash and Cash Earn. */
     async portfolio(id: number, wallet: string) {
       const account = await owned(id, wallet);
+      try { const side = await v2Side(account, wallet, false); if (side) return await side.api.portfolio(id, account); }
+      catch { return { portfolioId: id, account, status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY, updatedAt: null, positions: [] }; }
       const l = await live();
       if (!l) return { portfolioId: id, account, status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY, updatedAt: null, positions: [] };
       const { chain, head } = l;
@@ -523,6 +610,13 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
     },
     /** Reward tokens of this portfolio from the ledger (no chain read): in the account, earned but not yet claimed, and whether a new signature is due. */
     async rewards(id: number, wallet: string): Promise<RewardsView & { portfolioId: number; account: Address }> {
+      // Routing v2 where there is no proof API (chain 97: the simulated vaults pay the box directly): the same ledger view,
+      // and no owner signature is ever asked for.
+      if (!rewardsOn() && v2Of(wallet)) {
+        const account = await owned(id, wallet);
+        const view = await (deps.rewards ?? rewardsStore()).view(deps.chainId, id, deps.now());
+        return { portfolioId: id, account, ...view, signature: { needed: false, signedAt: null } };
+      }
       const account = await rewardsAccount(id, wallet);
       return { portfolioId: id, account, ...await (deps.rewards ?? rewardsStore()).view(deps.chainId, id, deps.now()) };
     },
@@ -531,9 +625,20 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
       const account = await owned(id, wallet);
       await mixAccepting(id, wallet);
       const b = body(input, ['asset', 'collateralRaw']);
-      const market = findMarket(b.asset);
       if (typeof b.collateralRaw !== 'string' || !/^[1-9][0-9]{0,77}$/.test(b.collateralRaw)) throw new ValidationError('INVALID_AMOUNT', 'collateralRaw 須為正整數字串。');
       const collateralRaw = BigInt(b.collateralRaw);
+      let side: Awaited<ReturnType<typeof v2Side>>;
+      try { side = await v2Side(account, wallet, true); } catch { return { ...v2Unavailable(), asset: String(b.asset) }; }
+      if (side) {
+        if (typeof b.asset !== 'string' || !/^[A-Za-z0-9]{1,16}$/.test(b.asset)) throw new ValidationError('INVALID_ASSET', '這個資產沒有開放策略加息。');
+        try {
+          const chain = deps.chain(), head = await chain.head();
+          const r = await side.api.open(account, wallet.toLowerCase() as Address, { symbol: b.asset, collateralRaw, weights: await chain.weights(account, head.number), keyReady: await v2KeyReady(id, account, side.v2) });
+          if (r.status === 'insufficient') throw new ValidationError('INSUFFICIENT_HOLDING', '投資組合持有的數量不足。');
+          return r;
+        } catch (error) { if (error instanceof AppError) throw error; return { ...v2Unavailable(), asset: b.asset }; }
+      }
+      const market = findMarket(b.asset);
       const l = await live();
       const unavailable = (reason: string) => ({ status: 'unavailable' as const, asset: market.symbol, reason, message: TEMPORARILY });
       if (!l) return unavailable('data_unavailable');
@@ -566,6 +671,14 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
       const b = body(input, ['budgetRaw']);
       if (typeof b.budgetRaw !== 'string' || !/^(0|[1-9][0-9]{0,77})$/.test(b.budgetRaw)) throw new ValidationError('INVALID_AMOUNT', 'budgetRaw 須為非負整數字串。');
       const budget = BigInt(b.budgetRaw);
+      let side: Awaited<ReturnType<typeof v2Side>>;
+      try { side = await v2Side(account, wallet, true); } catch { return v2Unavailable(); }
+      if (side) {
+        try {
+          const chain = deps.chain(), head = await chain.head();
+          return await side.api.auto(account, wallet.toLowerCase() as Address, { budgetRaw: budget, weights: await chain.weights(account, head.number), keyReady: await v2KeyReady(id, account, side.v2) });
+        } catch { return v2Unavailable(); }
+      }
       const l = await live();
       if (!l) return { status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY };
       const { chain, head } = l;
@@ -600,7 +713,7 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
           txHash: r.tx_hash, blockNumber: r.block_number, createdAt: new Date(r.created_at).toISOString(), message: strategyEarnMessage(e) };
       });
       // Routing v2 (db 0069): route changes and the other v2 events, only when a v2 deployment is configured for this chain.
-      const v2 = deps.v2 === undefined ? strategyEarnV2(deps.chainId) : deps.v2;
+      const v2 = v2Of(wallet);
       if (!v2) return { portfolioId: id, activity: v1 };
       const moved = (await deps.query<{ kind: RouteEventKind; asset: string | null; reason: string | null; venue: string | null; loan: string | null; vault_venue: string | null;
         amount_raw: string; collateral_raw: string; tx_hash: string; block_number: string; created_at: Date | string }>(
@@ -633,7 +746,28 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
       if (!tx.success) return { status: 'reverted' as const, recorded: 0 };
       const events = strategyEarnEvents(tx, id, account);
       await (deps.ledger ?? dbStrategyEarnLedger).record(97, events);
+      // Routing v2: the same receipt may carry AtpBorrowExecutorV2 events of this account (db 0069) and reward movements (db 0068).
+      const v2 = v2Of(wallet);
+      if (v2) {
+        try {
+          const more = await v2ApiOf(v2).confirm(id, account, wallet.toLowerCase() as Address, tx);
+          return { status: 'confirmed' as const, recorded: events.length + more.routes + more.rewards, kinds: [...events.map(e => e.kind as string), ...more.kinds] };
+        } catch { return { status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY }; }
+      }
       return { status: 'confirmed' as const, recorded: events.length, kinds: events.map(e => e.kind) };
+    },
+    /**
+     * Routing v2, owner only (cre8-contracts borrow-routing-v2 §4): a vault or its adapter is broken — with no debt left in
+     * that vault's token, the strategy box's receipts go back to the account as they are. The paymaster sponsors the call
+     * only in a UserOp signed by the account's root validator; no session key and no operator key ever sends it.
+     */
+    async rescue(id: number, wallet: string, input: unknown) {
+      const account = await owned(id, wallet);
+      const b = body(input, ['vaultId']);
+      if (typeof b.vaultId !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(b.vaultId)) throw new ValidationError('INVALID_STRATEGY_EARN_REQUEST', 'vaultId 須為 0x 開頭的 32 位元組。');
+      const v2 = v2Of(wallet);
+      if (!v2) throw new AppError(404, 'STRATEGY_EARN_NOT_CONFIGURED', '這個帳戶沒有可救援的部位。');
+      try { return await v2ApiOf(v2).rescue(account, b.vaultId.toLowerCase() as Hex); } catch { return v2Unavailable(); }
     },
     /** Turn off / before selling: repay first (vault, then the account's own USDT), then withdraw all collateral. */
     /**
@@ -643,6 +777,16 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
      */
     async close(id: number, wallet: string, input: unknown) {
       const account = await owned(id, wallet);
+      // `exit: true` (routing v2 only; sell all / withdraw / delete): reward tokens also go to the owner's wallet.
+      const exit = typeof input === 'object' && input !== null && 'exit' in input && (input as { exit?: unknown }).exit === true;
+      if (typeof input === 'object' && input !== null && 'exit' in input) { const { exit: _exit, ...rest } = input as Record<string, unknown>; input = rest; }
+      let side: Awaited<ReturnType<typeof v2Side>>;
+      try { side = await v2Side(account, wallet, false); } catch { return { status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY }; }
+      if (side) {
+        const list = typeof input === 'object' && input !== null && 'assets' in input ? body(input, ['assets']).assets : [body(input, ['asset']).asset];
+        if (!Array.isArray(list) || list.length === 0 || list.length > 64 || list.some(a => typeof a !== 'string' || !/^[A-Za-z0-9]{1,16}$/.test(a))) throw new ValidationError('INVALID_STRATEGY_EARN_REQUEST', '請送出 asset 或 assets。');
+        try { return await side.api.close(account, { symbols: list as string[], exit }); } catch { return { status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY }; }
+      }
       const raw = typeof input === 'object' && input !== null && 'assets' in input ? body(input, ['assets']).assets : [body(input, ['asset']).asset];
       if (!Array.isArray(raw) || raw.length === 0 || raw.length > markets.length) throw new ValidationError('INVALID_STRATEGY_EARN_REQUEST', '請送出 asset 或 assets。');
       const chosen = [...new Set(raw)].map(findMarket);
@@ -691,6 +835,9 @@ export type StrategyKeeperWriter = {
   claim(target: Address, account: Address): Promise<StrategyEarnTx>;
   /** Lista Moolah: `claimReward(listaId, account)` (backend#204). */
   claimLista(listaId: Hex, account: Address): Promise<StrategyEarnTx>;
+  /** Any anyone-callable transaction with the same key (routing v2: executeDeleverage, collectRewards; the callers restrict
+   * what goes here, see v2KeeperCall). Gas = the node's estimate + 50%, at most 12M. */
+  send?(to: Address, data: Hex): Promise<StrategyEarnTx>;
 };
 export function strategyKeeperWriter(env: NodeJS.ProcessEnv = process.env): StrategyKeeperWriter | null {
   const raw = env.STRATEGY_EARN_KEEPER_PRIVATE_KEY?.trim();
@@ -711,6 +858,14 @@ export function strategyKeeperWriter(env: NodeJS.ProcessEnv = process.env): Stra
     deleverage: (account, marketId) => send(STRATEGY_EARN_97.executor, call(STRATEGY_EARN_97.executor, 'executeDeleverage', [account, marketId]).data),
     claim: (target, account) => send(target, encodeFunctionData({ abi: STRATEGY_EARN_ABI, functionName: 'claimReward', args: [account] })),
     claimLista: (listaId, account) => send(STRATEGY_EARN_97.listaMoolah, encodeFunctionData({ abi: STRATEGY_EARN_ABI, functionName: 'claimReward', args: [listaId, account] })),
+    async send(to, data) {
+      const estimate = await pub.estimateGas({ account: account.address, to, data });
+      const gas = estimate * 3n / 2n > 12_000_000n ? 12_000_000n : estimate * 3n / 2n;
+      const hash = await wallet.sendTransaction({ to, data, gas, gasPrice: await pub.getGasPrice() });
+      const receipt = await pub.waitForTransactionReceipt({ hash, timeout: 60_000 });
+      if (receipt.status !== 'success') throw new Error('reverted ' + hash);
+      return { hash, blockNumber: receipt.blockNumber, logs: receipt.logs };
+    },
   };
 }
 

@@ -91,3 +91,16 @@ test('#100 window partition never spends beyond a final one-raw-unit asset',()=>
   const child=windowBasketBatch(vector,2n,1n,101n);
   assert.doesNotThrow(()=>subtractInputs(vector,child));assert.equal(sumInputs(child),100n);
 });
+test('pre-send fee check: the stored message stays generic, the exact shortfall rides along as the cause (portfolio 13 / 17, 2026-11-24)',async()=>{
+  // A job whose remaining fee budget is smaller than the minimum-fee top-up due on its remaining buy in a fresh fee window.
+  const {state,args}=fixture();
+  state.cash=18853867606344450000n;state.allowance=2n**255n;state.fee=10;
+  const steps:PlannedStep[]=[{...args.steps[0]!,amountIn:18733125000000000000n}];
+  const error=await checkBuyFeeReserve({...args,steps,maximumReserve:120742606344450000n}).then(()=>null,e=>e as Error);
+  assert.ok(error);
+  assert.equal(error.message,'[MIN_FEE_RESERVE] 送出前無法確認現金與授權足以支付買入及最低費，不送交易');
+  assert.match(String((error.cause as Error).message),/^fee due 168598125000000000 exceeds the job's remaining fee budget 120742606344450000 \(notional 18733125000000000000\)$/);
+  // Enough budget but not enough cash: says which.
+  const cash=await checkBuyFeeReserve({...args,steps,maximumReserve:U}).then(()=>null,e=>e as Error);
+  assert.match(String((cash?.cause as Error).message),/^after buying 18733125000000000000: cash left 120742606344450000, allowance \d+, fee due 168598125000000000$/);
+});

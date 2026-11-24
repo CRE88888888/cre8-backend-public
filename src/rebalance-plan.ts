@@ -225,18 +225,19 @@ export async function checkBuyFeeReserve(params: {
     ]);
     if(reserve<0n)throw new Error('invalid fee due');
     if (!Number.isInteger(fee) || fee < 0 || fee >= 10000) throw new Error('invalid fee');
-    if(params.maximumReserve!==undefined&&reserve>params.maximumReserve)throw new Error('original fee budget insufficient');
+    if(params.maximumReserve!==undefined&&reserve>params.maximumReserve)throw new Error(`fee due ${reserve} exceeds the job's remaining fee budget ${params.maximumReserve} (notional ${notional})`);
     let cash = balance;
     let spent = 0n;
     for (const step of steps) {
       if (sameAsset(step.tokenIn, numeraire)) {
-        if (step.amountIn > cash) throw new Error('insufficient sequential cash');
+        if (step.amountIn > cash) throw new Error(`cash ${cash} is less than the next buy ${step.amountIn}`);
         cash -= step.amountIn; spent += step.amountIn;
       } else if (sameAsset(step.tokenOut, numeraire)) cash += step.amountOutMin - step.amountOutMin * BigInt(fee) / 10000n;
       else throw new Error('invalid route');
     }
-    if (cash < reserve || allowance < spent + reserve) throw new Error('minimum fee funding insufficient');
-  } catch { throw new Error('[MIN_FEE_RESERVE] 送出前無法確認現金與授權足以支付買入及最低費，不送交易'); }
+    if (cash < reserve || allowance < spent + reserve) throw new Error(`after buying ${spent}: cash left ${cash}, allowance ${allowance}, fee due ${reserve}`);
+  // The message stays as it was (it is stored and shown); the exact shortfall rides along as `cause` for the scheduler log.
+  } catch (error) { throw new Error('[MIN_FEE_RESERVE] 送出前無法確認現金與授權足以支付買入及最低費，不送交易', { cause: error }); }
 }
 
 export type PlannedStep = {

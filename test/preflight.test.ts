@@ -351,6 +351,10 @@ for (const strict of [false, true]) {
     for (const bps of [0, 9999]) assert.equal(checkBuyConfig(bps, usdt, strict)[0]?.level, strict ? 'fail' : 'warn');
     assert.equal(checkBuyConfig(10000, zeroAddress, strict)[1]?.level, strict ? 'fail' : 'warn');
     assert.ok(checkBuyConfig(null, null, strict).every((check) => check.level === 'fail'));
+    // chain 97 expects 20000 (2x); mainnet's 10000 is then a mismatch there, and 20000 is a mismatch on mainnet
+    assert.ok(checkBuyConfig(20000, usdt, strict, usdt, 20000).every((check) => check.level === 'ok'));
+    assert.equal(checkBuyConfig(10000, usdt, strict, usdt, 20000)[0]?.level, strict ? 'fail' : 'warn');
+    assert.equal(checkBuyConfig(20000, usdt, strict)[0]?.level, strict ? 'fail' : 'warn');
   });
 }
 

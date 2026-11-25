@@ -75,10 +75,11 @@ export function checkGlobalPaused(paused: boolean | null, strict: boolean): Chec
   };
 }
 
-export function checkBuyConfig(maxBuyBps: number | null, numeraire: Address | null, strict: boolean, expectedNumeraire: Address = USDT_ADDRESS): Check[] {
+/** `expectedMaxBuyBps`: mainnet 10000 (1x the account value per 24-hour window). Chain 97 runs at 20000 (2x, the contract ceiling, set 2026-11-25 tx 0x9946a9cf…10c5) so a sell-all followed by a same-day buy of the same amount fills. */
+export function checkBuyConfig(maxBuyBps: number | null, numeraire: Address | null, strict: boolean, expectedNumeraire: Address = USDT_ADDRESS, expectedMaxBuyBps = 10000): Check[] {
   return [
-    { name: 'executor.maxBuyBps', level: maxBuyBps === null ? 'fail' : maxBuyBps === 10000 ? 'ok' : strict ? 'fail' : 'warn',
-      detail: maxBuyBps === null ? '讀不到 maxBuyBps()' : `${maxBuyBps}（預期 10000）` },
+    { name: 'executor.maxBuyBps', level: maxBuyBps === null ? 'fail' : maxBuyBps === expectedMaxBuyBps ? 'ok' : strict ? 'fail' : 'warn',
+      detail: maxBuyBps === null ? '讀不到 maxBuyBps()' : `${maxBuyBps}（預期 ${expectedMaxBuyBps}）` },
     { name: 'executor.numeraire', level: numeraire === null ? 'fail' : sameAddress(numeraire, expectedNumeraire) ? 'ok' : strict ? 'fail' : 'warn',
       detail: numeraire === null ? '讀不到 numeraire()' : `${numeraire}（預期 USDT）` },
   ];
@@ -605,7 +606,7 @@ async function main(): Promise<number> {
     let numeraire: Address | null = null;
     try { maxBuyBps = await client.readContract({ address: executor, abi: EXECUTOR_BUY_ABI, functionName: 'maxBuyBps' }); } catch { /* unreadable fails */ }
     try { numeraire = await client.readContract({ address: executor, abi: EXECUTOR_BUY_ABI, functionName: 'numeraire' }); } catch { /* unreadable fails */ }
-    checkBuyConfig(maxBuyBps, numeraire, args.strict, config.chainId === 97 ? TESTNET_97.contracts.usdt : USDT_ADDRESS).forEach(record);
+    checkBuyConfig(maxBuyBps, numeraire, args.strict, config.chainId === 97 ? TESTNET_97.contracts.usdt : USDT_ADDRESS, config.chainId === 97 ? 20000 : 10000).forEach(record);
     const deploymentBlock = process.env.EXECUTOR_DEPLOYMENT_BLOCK?.trim();
     if (deploymentBlock === undefined || !/^\d+$/.test(deploymentBlock)) {
       fail('executor venues', '缺少合法的 EXECUTOR_DEPLOYMENT_BLOCK', '填 executor 部署 receipt 的 blockNumber，才能完整列出 venue 並避免從 genesis 掃描');

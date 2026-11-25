@@ -273,6 +273,15 @@ test('withdrawable cash = account USDT minus what a running buy / withdrawal / y
   assert.equal(withdrawableCash(2600202500000000000000n, row), 100n * 10n ** 18n);
   assert.equal(withdrawableCash(10n, null), 10n);
   assert.throws(() => reservedCash({ ...row, yield_raw: '-1' }));
+  // What a cash-swapper top-up may spend is stricter: nothing any bucket claims (funding waiting to be bought and the
+  // portfolio's own cash too) — only a transfer to the owner is ever reconciled, so spending claimed cash any other way
+  // leaves the ledger above the chain balance and stops the portfolio's jobs ([CASH_DEFICIT]).
+  const { claimedCash, CLAIMED_CASH_BUCKETS } = await import('../src/withdrawable-cash.js');
+  assert.equal(claimedCash(row), 2500202500000000000000n + 12n);
+  assert.deepEqual([...CLAIMED_CASH_BUCKETS].sort(), ['allocated_cash_raw', 'reserved_fee_raw', 'reserved_input_raw', 'stack_prefund_raw', 'unallocated_hold_raw', 'withdrawal_raw', 'yield_raw']);
+  assert.equal(claimedCash({ ...row, unclassified_raw: '999' }), claimedCash(row), 'unclassified cash is nobody\'s: it is what a top-up may use');
+  assert.equal(claimedCash(null), 0n);
+  assert.throws(() => claimedCash({ ...row, allocated_cash_raw: 'x' }));
 });
 
 test('My mix yield strategy: exiting / exited / deleting mixes can only settle; a pending mix change makes it wait; the rules stay strict', async () => {

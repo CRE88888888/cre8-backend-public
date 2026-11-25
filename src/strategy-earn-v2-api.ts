@@ -29,7 +29,7 @@ export type V2ApiDeps = { v2: StrategyEarnV2; reader: V2Reader; now: () => Date;
   recordRoutes?: (chainId: number, events: readonly RouteEvent[]) => Promise<void>;
   recordRewards?: (chainId: number, events: readonly RewardEvent[]) => Promise<void>;
   rewardSymbol?: (token: Address) => string | undefined;
-  /** USDT in the account a running buy job or a reservation still needs: an owner-signed top-up never spends it. Absent: none. */
+  /** USDT in the account that the cash ledger claims (src/withdrawable-cash.ts `claimedCash`): an owner-signed top-up never spends it. Absent: none. */
   reservedUsdt?: (account: Address) => Promise<bigint>;
   /** Where the cash swapper's events are written until the ledger has a table for them; default: stdout. */
   log?: (line: string) => void };
@@ -164,6 +164,7 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
       const approved = (q: SwapQuote | undefined) => q ? { swap: { ...q, usdtAllowanceRaw: maxUint256, tokenAllowanceRaw: maxUint256 } } : {};
       const routes: ExitRoute[] = chosen.map(r => { const t = read.tokens[r.route.loanSymbol]!; return { routeId: r.route.routeId, vaultId: (r.vault?.vaultId ?? ('0x' + '00'.repeat(32))) as Hex, routeDebtRaw: r.routeDebtRaw, cashRaw: t.cashRaw,
         loan: r.route.loanSymbol, vaultAssetsRaw: read.vaults.find(v => v.vault.vaultId === r.vault?.vaultId)?.assetsRaw ?? 0n, idleRaw: t.idleRaw, ...approved(t.swap),
+        // No route of this token stays open after this exit (which of the chosen ones is the last is the exit plan's to say).
         lastOfToken: !open.some(x => x.route.loan === r.route.loan && !chosen.includes(x)) }; });
       // Loan token other than USDT already in the account with nothing owed in it and no route of it being closed now: sold too.
       const cashOuts = Object.entries(read.tokens).filter(([symbol, t]) => t.swap !== undefined && t.debtRaw === 0n && t.cashRaw >= V2_CASH_OUT_MIN_RAW && !chosen.some(r => r.route.loanSymbol === symbol))

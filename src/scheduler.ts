@@ -13,7 +13,7 @@ import { runStrategyRewardsRound } from './strategy-rewards.js';
 import { routeLedger, strategyEarnV2, strategyEarnV2For, v2Audience, v2InstalledScope } from './strategy-earn-v2.js';
 import type { StrategyEarnV2 } from './strategy-earn-v2.js';
 import { defaultV2Reader } from './strategy-earn-v2-chain.js';
-import { reservedCash } from './withdrawable-cash.js';
+import { claimedCash } from './withdrawable-cash.js';
 import { runV2KeeperRound, v2AutoRound, v2RewardHolders, v2UnwindForSale } from './strategy-earn-v2-scheduler.js';
 import type { V2Ledger } from './strategy-earn-v2-scheduler.js';
 import { rewardsStore } from './strategy-rewards.js';
@@ -1676,9 +1676,10 @@ function defaultStrategyEarnSteps(deps: ResolvedDeps): NonNullable<SchedulerDeps
     const usable = key !== null && key.routingV2 !== undefined && isAddressEqual(key.routingV2.executor, v2.executor) &&
       (!v2.swapper || (key.routingV2.swapper !== undefined && isAddressEqual(key.routingV2.swapper, v2.swapper))) ? key : null;
     return { v2, reader: defaultV2Reader(v2), account: due.account, portfolioId: due.portfolioId, now: deps.clock(), dryRun, ...(held === undefined ? {} : { held }),
-      // A top-up (cash swapper) spends only free cash: never what a running buy job or a reservation holds.
-      reservedUsdt: async () => { const rows = (await deps.query('select reserved_input_raw::text,reserved_fee_raw::text,withdrawal_raw::text,yield_raw::text from strategy_cash_balances where chain_id = $1 and portfolio_id = $2',
-        [deps.chainId, due.portfolioId])).rows as Record<string, unknown>[]; return rows.reduce((sum, row) => sum + reservedCash(row), 0n); },
+      // A top-up (cash swapper) spends only USDT no bucket of the cash ledger claims (see claimedCash): taking claimed cash
+      // would leave the ledger above the chain balance and stop the portfolio's jobs with [CASH_DEFICIT].
+      reservedUsdt: async () => { const rows = (await deps.query(`select unallocated_hold_raw::text,stack_prefund_raw::text,allocated_cash_raw::text,reserved_input_raw::text,reserved_fee_raw::text,withdrawal_raw::text,yield_raw::text
+        from strategy_cash_balances where chain_id = $1 and portfolio_id = $2`, [deps.chainId, due.portfolioId])).rows as Record<string, unknown>[]; return rows.reduce((sum, row) => sum + claimedCash(row), 0n); },
       send: usable === null ? null : (calls: StrategyEarnCall[]) => sendStrategyEarnWithSessionKey(due.account, usable, calls, v2.swapper ? [v2.executor, v2.swapper] : [v2.executor]), ledger: v2SchedulerLedger(deps.query), log: deps.log };
   };
   const both = (notes: (string | null)[]) => { const said = notes.filter((n): n is string => n !== null); return said.length === 0 ? null : said.join('；'); };

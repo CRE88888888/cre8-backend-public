@@ -552,7 +552,7 @@ export function planExecution(input: { v2: StrategyEarnV2; account: Address; dec
   const minLoanOf = (r: RouteKey, routeId: Hex) => input.limits?.(routeId)?.minLoanRaw ?? (r.venue === 'lista' ? usdRaw(LISTA_MIN_LOAN_USD) : 0n);
   // Cash swapper (spec §17): a repayment in USDC / USD1 / U the box cannot cover is topped up from the account's USDT in the
   // same UserOp; a close of the last route in such a token sells what is left of it. One budget for the whole plan.
-  const budget = settleBudget(), closed = new Set<string>();
+  const budget = settleBudget(), closed = new Set<string>(), switched = new Map<string, string>();
   const settle = (p: PositionState, loan: string, repayRaw: bigint, close: boolean) => settleRepayment(v2, { loan, routeDebtRaw: p.routeDebtRaw ?? 0n, vaultAssetsRaw: p.vaultAssetsRaw ?? 0n,
     idleRaw: p.idleRaw ?? 0n, cashRaw: p.cashRaw ?? 0n, ...(p.swap ? { swap: p.swap } : {}),
     lastOfToken: !input.positions.some(x => x !== p && !closed.has(x.symbol) && x.loan === loan && ((x.routeDebtRaw ?? 0n) > 0n || (x.postedRaw ?? 0n) > 0n)) }, budget, { repayRaw, deadline, now, close });
@@ -604,6 +604,11 @@ export function planExecution(input: { v2: StrategyEarnV2; account: Address; dec
       } else if (d.action === 'migrate') {
         const from = idsOf(p, d.from!), to = idsOf(p, d.to!);
         if (from.routeId === to.routeId) {
+          // The box holds ONE position per vault for all the routes of a loan token: the first vault-only move already
+          // carries the whole holding, a second executeSwitchVault(MAX) of the same pair would find nothing and revert.
+          const pair = `${from.vaultId}>${to.vaultId}`, first = switched.get(pair);
+          if (first !== undefined) { steps.push({ ...base, via: 'session', calls: [], skipped: `moved with ${first}: one vault holds this loan token for both` }); continue; }
+          switched.set(pair, d.symbol);
           steps.push({ ...base, via: 'session', calls: [v2Calls.switchVault(v2, account, from.vaultId, to.vaultId, maxUint256, deadline)] });
           continue;
         }
@@ -690,10 +695,13 @@ export type ExitInput = { routes: readonly ExitRoute[]; leftoverVaults?: readonl
  */
 export function v2ExitPlan(v2: StrategyEarnV2, account: Address, input: ExitInput): { calls: Call[]; blocked: string[] } {
   const budget = settleBudget(), blocked: string[] = [], now = input.now ?? Date.now();
-  const closes = input.routes.flatMap(r => {
+  const closes = input.routes.flatMap((r, i) => {
     const close = closeCall(v2, account, r, r, input.deadline), debt = r.routeDebtRaw ?? 0n;
     if (r.loan === undefined || debt === 0n) return [close];
-    const s = settleRepayment(v2, { loan: r.loan, routeDebtRaw: debt, vaultAssetsRaw: r.vaultAssetsRaw ?? 0n, idleRaw: r.idleRaw ?? 0n, cashRaw: r.cashRaw ?? 0n, ...(r.swap ? { swap: r.swap } : {}), lastOfToken: r.lastOfToken === true },
+    // Routes of one loan token share the box's money for it: the vault's remainder (and so the leftover to sell) only
+    // reaches the account with the LAST of them in this list — and only when no other route of the token stays open.
+    const last = r.lastOfToken === true && !input.routes.slice(i + 1).some(x => x.loan === r.loan && (x.routeDebtRaw ?? 0n) > 0n);
+    const s = settleRepayment(v2, { loan: r.loan, routeDebtRaw: debt, vaultAssetsRaw: r.vaultAssetsRaw ?? 0n, idleRaw: r.idleRaw ?? 0n, cashRaw: r.cashRaw ?? 0n, ...(r.swap ? { swap: r.swap } : {}), lastOfToken: last },
       budget, { repayRaw: debt, deadline: input.deadline, now, close: true });
     if (s.blocked) { if (!s.blocked.noSwap) blocked.push(s.blocked.blocked); return [close]; }
     return [...s.before, close, ...s.after];
@@ -739,12 +747,14 @@ export function v2PreSellPlan(v2: StrategyEarnV2, account: Address, positions: r
   const budget = settleBudget();
   let retryAt: number | undefined;
   const left = (p: PreSellPosition) => ({ vault: budget.vault.get(p.loan) ?? p.vaultAssetsRaw ?? 0n, idle: budget.idle.get(p.loan) ?? p.idleRaw ?? 0n, cash: budget.cash.get(p.loan) ?? p.cashRaw ?? 0n });
-  for (const p of positions) {
+  for (const [i, p] of positions.entries()) {
     const debt = p.routeDebtRaw ?? 0n, posted = p.postedRaw ?? 0n;
     if (posted === 0n) continue;
     if (debt === 0n) { calls.push(v2Calls.reduce(v2, account, p.routeId, ZERO32, 0n, maxUint256, 0n, deadline)); notes.push(`${p.symbol} take back`); continue; }
+    // The leftover of a loan token is sold with the LAST position of that token in this plan (earlier closes leave the
+    // box's money for the later ones), and never when a route outside this sale still borrows it (`lastOfToken: false`).
     const before = left(p), route: SettleRoute = { loan: p.loan, routeDebtRaw: debt, vaultAssetsRaw: p.vaultAssetsRaw ?? 0n, idleRaw: p.idleRaw ?? 0n, cashRaw: p.cashRaw ?? 0n, ...(p.swap ? { swap: p.swap } : {}),
-      lastOfToken: !positions.some(x => x !== p && x.loan === p.loan && (x.routeDebtRaw ?? 0n) > 0n) && p.lastOfToken !== false };
+      lastOfToken: !positions.slice(i + 1).some(x => x.loan === p.loan && (x.routeDebtRaw ?? 0n) > 0n && (x.postedRaw ?? 0n) > 0n) && p.lastOfToken !== false };
     // The box (with a top-up from the account's USDT where the token is not USDT) and the account's own loan token cover
     // the debt -> close, and sell what is left of the loan token.
     const full = settleRepayment(v2, route, budget, { repayRaw: debt, deadline, now, close: true, strict: true });

@@ -36,8 +36,9 @@ export type V2StepArgs = { v2: StrategyEarnV2; reader: V2Reader; account: Addres
   /** Is yield strategy v1 still in use on this account (a position, debt or consent)? One account uses v1 or v2, never both:
    * while this answers true the round adds nothing on v2 (it only reports). */
   v1Active?: () => Promise<boolean>;
-  /** USDT in the account that a running buy job or a withdrawal / yield reservation still needs (src/withdrawable-cash.ts):
-   * a top-up never spends it. Absent: nothing is reserved. A read that throws: no USDT is spent on top-ups this round. */
+  /** USDT in the account that some bucket of the cash ledger claims (src/withdrawable-cash.ts `claimedCash`: funding waiting
+   * to be bought, the portfolio's own cash, running jobs, reservations): a top-up never spends it — the ledger would end up
+   * above the chain balance ([CASH_DEFICIT]). Absent: nothing is claimed. A read that throws: no USDT is spent this round. */
   reservedUsdt?: () => Promise<bigint> };
 
 const shortError = (error: unknown) => String((error as Error)?.message ?? error).split('\n')[0]!.slice(0, 160);
@@ -87,8 +88,8 @@ async function cashOutLeftovers(args: V2StepArgs, send: V2Send | null, leftovers
 }
 const deadlineOf = (now: Date) => BigInt(Math.floor(now.getTime() / 1000) + 30 * 60);
 /**
- * The USDT a top-up may spend is the account's free cash: what a running buy job or a reservation holds is taken off every
- * quote of this read (the quotes share the account's one USDT balance).
+ * The USDT a top-up may spend is what no bucket of the cash ledger claims: the claimed part is taken off every quote of
+ * this read (the quotes share the account's one USDT balance).
  */
 async function freeUsdtOnly(args: Pick<V2StepArgs, 'reservedUsdt' | 'log' | 'portfolioId'>, read: V2AccountRead): Promise<void> {
   const quotes = Object.values(read.tokens).flatMap(t => t.swap ? [t.swap] : []);

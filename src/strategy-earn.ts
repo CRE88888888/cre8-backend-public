@@ -19,7 +19,7 @@ import type { RouteEventKind, StrategyEarnV2 } from './strategy-earn-v2.js';
 import { createStrategyEarnV2Api } from './strategy-earn-v2-api.js';
 import type { StrategyEarnV2Api } from './strategy-earn-v2-api.js';
 import { defaultV2Reader, v2EstimateGas } from './strategy-earn-v2-chain.js';
-import { reservedCash } from './withdrawable-cash.js';
+import { claimedCash } from './withdrawable-cash.js';
 export { STRATEGY_EARN_97, assertNotStrategyVault, isStrategyVault } from './strategy-earn-guard.js';
 
 /**
@@ -383,9 +383,10 @@ export function defaultStrategyEarnV2Api(v2: StrategyEarnV2): StrategyEarnV2Api 
     const ledger = routeLedger((sql, params) => dbQuery(sql, params));
     api = createStrategyEarnV2Api({ v2, reader: defaultV2Reader(v2), now: () => new Date(), estimateGas: (account, call) => v2EstimateGas(v2, account, call),
       recordRoutes: (chainId, events) => ledger.record(chainId, events), recordRewards: (chainId, events) => rewardsStore().record(chainId, events),
-      reservedUsdt: async account => { const rows = (await dbQuery(`select b.reserved_input_raw::text,b.reserved_fee_raw::text,b.withdrawal_raw::text,b.yield_raw::text from strategy_cash_balances b
-        join smart_accounts s on (s.chain_id,s.portfolio_id)=(b.chain_id,b.portfolio_id) where s.chain_id=$1 and s.address=$2 and s.retired_at is null`, [v2.chainId, account.toLowerCase()])).rows as Record<string, unknown>[];
-        return rows.reduce((sum, row) => sum + reservedCash(row), 0n); } });
+      // An owner-signed top-up spends only USDT no bucket of the cash ledger claims (src/withdrawable-cash.ts claimedCash).
+      reservedUsdt: async account => { const rows = (await dbQuery(`select b.unallocated_hold_raw::text,b.stack_prefund_raw::text,b.allocated_cash_raw::text,b.reserved_input_raw::text,b.reserved_fee_raw::text,b.withdrawal_raw::text,b.yield_raw::text
+        from strategy_cash_balances b join smart_accounts s on (s.chain_id,s.portfolio_id)=(b.chain_id,b.portfolio_id) where s.chain_id=$1 and s.address=$2 and s.retired_at is null`, [v2.chainId, account.toLowerCase()])).rows as Record<string, unknown>[];
+        return rows.reduce((sum, row) => sum + claimedCash(row), 0n); } });
     defaultV2Apis.set(key, api);
   }
   return api;

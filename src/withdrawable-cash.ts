@@ -17,6 +17,22 @@ export function reservedCash(balances: Record<string, unknown> | null | undefine
     return sum + BigInt(value);
   }, 0n);
 }
+/**
+ * Every bucket of the cash ledger that claims USDT sitting in the account (all but `unclassified_raw`): funding waiting to
+ * be bought, the portfolio's own cash, running jobs, reservations. strategy-jobs refuses to work ([CASH_DEFICIT] 現金分類
+ * 與鏈上不符) as soon as their sum is above what the account holds, and only a transfer to the owner is ever reconciled
+ * as a withdrawal. So anything else that spends account USDT — a cash-swapper top-up (src/strategy-earn-v2.ts) — may only
+ * take what no bucket claims.
+ */
+export const CLAIMED_CASH_BUCKETS = ['unallocated_hold_raw', 'stack_prefund_raw', 'allocated_cash_raw', ...RESERVED_CASH_BUCKETS] as const;
+export function claimedCash(balances: Record<string, unknown> | null | undefined): bigint {
+  if (!balances) return 0n;
+  return CLAIMED_CASH_BUCKETS.reduce((sum, key) => {
+    const value = balances[key];
+    if (typeof value !== 'string' || !/^\d+$/.test(value)) throw new Error(`invalid cash bucket ${key}`);
+    return sum + BigInt(value);
+  }, 0n);
+}
 export function withdrawableCash(observed: bigint, balances: Record<string, unknown> | null | undefined): bigint {
   const reserved = reservedCash(balances);
   return observed > reserved ? observed - reserved : 0n;

@@ -707,3 +707,31 @@ test('cash swapper, records and failures: ToppedUp / CashedOut of this account b
   assert.equal(swapperErrorOf(new Error('reverted: PegExceeded(1003, 1000)')), 'PegExceeded');
   assert.deepEqual([swapperErrorOf(new Error('VaultShortfall')), swapperErrorOf(null)], [null, null]);
 });
+
+test('cash swapper, two routes in one loan token (they share the box): the leftover is sold once, after the LAST close; a vault-only move is one executeSwitchVault for both', () => {
+  // Live on chain 97 (portfolio 29, 2026-11-25): WBNB and BTCB both on Lista/USD1, one USD1 vault holding for the two.
+  const a = routeIds(VS, QQQ, listaUsdc), b = routeIds(VS, NVDA, { ...listaUsdc, marketId: LISTA_MARKET_2 });
+  const q = quote({ capRaw: 2_020n * E });
+  const route = (ids: typeof a) => ({ ...ids, routeDebtRaw: 1000n * E, cashRaw: 0n, loan: 'USDC', vaultAssetsRaw: 1999n * E, idleRaw: 0n, swap: q, lastOfToken: true });
+  // Owner exit: before the fix a cash-out followed the FIRST close too, where the account holds nothing yet (ZeroAmount -> the whole batch reverted).
+  const exit = v2ExitPlan(VS, account, { routes: [route(a), route(b)], deadline: DEADLINE, withdrawConsent: true, rewardRecipient: owner, now: SWAP_NOW });
+  assert.deepEqual([names(exit.calls), exit.blocked], [['executeReduce', 'topUp', 'executeReduce', 'cashOut', 'setStrategyPolicy'], []]);
+  // The second close finds what the first left (1,999 − 1,000.2) and buys only the difference.
+  const short = 1000n * E + (1000n * E / 5_000n + 1n) - (1999n * E - 1000n * E - (1000n * E / 5_000n + 1n));
+  assert.equal(swapCall(exit.calls[1]!).args[1], short + 1000n * E / 2_500n + 1n);
+  // Another route of the token stays open after the exit: nothing is sold at all.
+  assert.deepEqual(names(v2ExitPlan(VS, account, { routes: [{ ...route(a), lastOfToken: false }], deadline: DEADLINE, withdrawConsent: false, now: SWAP_NOW }).calls), ['executeReduce']);
+  // Before a sale (session key): the same — one cash-out, after the last position of the token.
+  const pos = (ids: typeof a, symbol: string, collateral: Address): PreSellPosition => ({ symbol, collateral, freeCollateralRaw: 0n, postedRaw: 10n * E, routeDebtRaw: 1000n * E, routeId: ids.routeId, vaultId: ids.vaultId, venue: 'lista', loan: 'USDC', vaultAssetsRaw: 1999n * E, swap: q });
+  assert.deepEqual(names(v2PreSellPlan(VS, account, [pos(a, 'QQQB', QQQ), pos(b, 'NVDAB', NVDA)], DEADLINE, SWAP_NOW).calls), ['executeReduce', 'topUp', 'executeReduce', 'cashOut']);
+  // Scheduler round closing both: the first close alone, the second with the top-up and the cash-out.
+  const steps = planExecution({ v2: VS, account, decisions: [decision('QQQB', 'close', 'negative_carry', listaUsdc, null, 0), decision('NVDAB', 'close', 'negative_carry', { ...listaUsdc, marketId: LISTA_MARKET_2 }, null, 0)],
+    positions: [state('QQQB', QQQ, { routeDebtRaw: 1000n * E, postedRaw: E, vaultAssetsRaw: 1999n * E, loan: 'USDC', swap: q }), state('NVDAB', NVDA, { routeDebtRaw: 1000n * E, postedRaw: E, vaultAssetsRaw: 1999n * E, loan: 'USDC', swap: q })],
+    deadline: DEADLINE, policyMaxDebtUsdRaw: 10_000n * E, principalUsdRaw: 2000n * E, now: SWAP_NOW }).steps;
+  assert.deepEqual(steps.map(x => names(x.calls)), [['executeReduce'], ['topUp', 'executeReduce', 'cashOut']]);
+  // The money of both sits in a vault that stopped paying: the engine says "move" for each, the box moves once.
+  const worse: RouteKey = { ...listaUsdc, vault: { venue: 'venus', address: A(0xb4) } };
+  const moved = planExecution({ v2: VS, account, decisions: [decision('QQQB', 'migrate', 'negative_carry', worse, listaUsdc, 1000), decision('NVDAB', 'migrate', 'negative_carry', { ...worse, marketId: LISTA_MARKET_2 }, { ...listaUsdc, marketId: LISTA_MARKET_2 }, 1000)],
+    positions: [state('QQQB', QQQ, { routeDebtRaw: 1000n * E, loan: 'USDC' }), state('NVDAB', NVDA, { routeDebtRaw: 1000n * E, loan: 'USDC' })], deadline: DEADLINE, policyMaxDebtUsdRaw: 10_000n * E, principalUsdRaw: 2000n * E, now: SWAP_NOW }).steps;
+  assert.deepEqual(moved.map(x => [x.symbol, names(x.calls), x.skipped]), [['QQQB', ['executeSwitchVault'], undefined], ['NVDAB', [], 'moved with QQQB: one vault holds this loan token for both']]);
+});

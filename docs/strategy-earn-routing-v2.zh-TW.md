@@ -97,11 +97,11 @@ executor 自己不換幣。借 USDC／USD1／U 的路線，vault 長得比負債
 
 - 讀值：`swapper.shortfall(account, token)` → `(gap, cap)`、`topUpCap`、`topUpWindowOf`，只對有負債的幣讀，自己一個 eth_call、gas 給 3,000 萬（規格：不要低於 1,000 萬；gas 不夠它會 revert，不會回錯的數字）。`shortfall` revert（有 vault 讀不到）→ `gap` 當成未知，vault 的存款不算數，改用 `cap`。
 - 買多少：還款額 +0.02%（接下來幾分鐘的利息）減掉策略盒（閒置＋vault）與帳戶自己的借款幣，不夠才買；買「差額 + max(差額的 1%, 還款額的 0.04%)」，不超過 `cap`。`maxUsdtIn = 數量 × 1.003`。數量一定明確（合約的 `topUp` 沒有 `MAX`）。
-- 用哪些 USDT：只用帳戶的**可動用現金**（餘額扣掉買入工作與提領／生息的保留款，`src/withdrawable-cash.ts`）；保留款讀不到這一輪就不補。
-- USDT 不夠：定期重新評估與 owner 的關閉 → 這一步不送、記原因（owner 的 `close` 回 `unavailable`／`top_up_unavailable`）；**賣出前**（`v2PreSellPlan`）→ 買得起多少買多少、還得起多少還多少、按比例少 2% 取回抵押品，賣掉之後下一輪再補、再關（「先賣資產」走的就是這條）。差的只有那 0.02% 的餘量、策略盒照讀值其實夠還時，照舊直接送（跟沒有 swapper 時一樣）。
+- 用哪些 USDT：只用**現金帳本沒有任何一格認領的 USDT**（鏈上餘額 − `strategy_cash_balances` 除了 `unclassified_raw` 以外的七格：等著買的入金、組合自己的現金、買入工作、提領／生息保留；`src/withdrawable-cash.ts` 的 `claimedCash`）。原因：帳本只認「帳戶 → owner」的轉帳是提領，其他方式花掉被認領的現金會讓帳本大於鏈上餘額，`strategy-jobs` 就以 `[CASH_DEFICIT]` 停掉這個投組的工作。帳本讀不到這一輪就不補。**所以賣出所得（進 `allocated_cash_raw`）目前不能拿來補差額**；要用得到，現金帳本得多一條規則（補差額扣 `allocated_cash_raw`、換回現金加回去），見最後一節。
+- USDT 不夠：定期重新評估與 owner 的關閉 → 這一步不送、記原因（owner 的 `close` 回 `unavailable`／`top_up_unavailable`）；**賣出前**（`v2PreSellPlan`）→ 買得起多少買多少、還得起多少還多少、按比例少 2% 取回抵押品。剩下的那一小段負債要等帳戶有沒被認領的 USDT（owner 直接轉一點進帳戶、之前換回現金留下的零頭）才補得了、關得掉。差的只有那 0.02% 的餘量、策略盒照讀值其實夠還時，照舊直接送（跟沒有 swapper 時一樣）。
 - vault 讀得到但領不出來：第一筆 `[topUp, 關閉, cashOut]` 整筆 revert 時，改送 `[topUp（只算閒置，買到負債 − 閒置，最多 cap）, 關閉]`（`Step.fallback`）；USDT 不夠買這麼多就只重送不帶 `cashOut` 的那一組。
 - `WindowExceeded`（這個幣 24 小時的額度用完）：計畫階段讀到 `cap` 不夠就不送，log 寫明 `topUpWindowOf.start + 86400` 的時間；真的送出才撞到的話記一次原因、這一輪不算失敗（不進 back-off），下一輪由計畫自己等視窗，**不會每輪重送**。
-- `PegExceeded`：池子偏離 1:1 超過合約上限，重送沒有用。寫一行結構化 log（`{"level":"error","msg":"strategy_peg_exceeded",…}`），這一輪以 `[STRATEGY_PEG_EXCEEDED]` 開頭的錯誤失敗，走既有的失敗告警（連續失敗 → `portfolio_failures`／`portfolio_stuck`，detail 帶這個標記）。
+- `PegExceeded`：池子偏離 1:1 超過合約上限，重送沒有用。寫一行結構化 log（`{"level":"error","msg":"strategy_peg_exceeded",…}`），這一輪以 `[STRATEGY_PEG_EXCEEDED]` 開頭的錯誤失敗：定期重新評估那條路會記成 `[STRATEGY_EARN_OPEN_FAILED] … [STRATEGY_PEG_EXCEEDED]` 並照既有的間隔退避（5、10、20、40、60 分鐘），賣出前那條路會讓這個投組的這一輪失敗（連續失敗就是既有的 `portfolio_repeatedly_failing`）。**目前的告警就是這行 error log**；要它進 `alerts` 表成為獨立的一種，需要 db 在 `alerts.kind` 的 CHECK 加一種（見最後一節）。
 
 **何時 `cashOut`**：
 - 跟關閉放同一個 UserOp：關掉的是這個幣的最後一條路線，而且「關完帳戶裡一定有剩」（帳戶原有的借款幣＋策略盒＋補進去的 − 負債 − 0.02% ≥ 0.000001）才帶。`cashOut(token, MAX, minUsdtOut = 這個下限 × 0.997)`；合約自己的錨定上限（0.25%）管其餘的部分。
@@ -121,7 +121,9 @@ executor 自己不換幣。借 USDC／USD1／U 的路線，vault 長得比負債
 ## 還沒做／要注意
 
 - **App（cre8-app）**：My mix 改比例的簽名前檢查（`checkStrategyConsentV2`）只認得「對 v2 executor 的 approve」。要讓改比例順便補簽 swapper 的授權，簽名資料的 `strategyV2` 要多宣告 `swapper`，App 在鏈上核對 `swapper.executor()` 就是宣告的 executor，並接受「USDT／借款幣對 swapper 的全額 approve」。在那之前後端的重新同意不送這幾筆（`v2ReconsentCalls` 的 `swapperApprovals` 沒有被 API 使用）。
+- **db**：`alerts.kind` 加一種（例如 `strategy_peg_exceeded`），`PegExceeded` 才能成為 `/health` 看得到的告警；現在只有 error log。
 - **db**：`strategy_route_events.kind` 加 `top_up`、`cash_out`（或另開 `strategy_cash_swaps` 表：chain_id、portfolio_id、account、kind、token、usdt_raw、token_raw、need_raw、tx_hash、log_index、block_number，`(chain_id, tx_hash, log_index)` 唯一）。現在只有 log。
 - 健康度接近減倉線、策略盒不夠還時「先 `topUp` 讓第三方的 `executeDeleverage` 有錢可還」（規格 §17 第 5 點）還沒做：keeper 那一輪只有任何人可呼叫的交易，`topUp` 要 session key。
-- 定期重新評估（不是賣出）要關一條非 USDT 路線而帳戶沒有可動用的 USDT 時，只會記原因等下一輪；不會為了補差額去賣資產。
+- **補差額用不到組合現金與賣出所得**（見上「用哪些 USDT」）：帳戶裡沒有帳本以外的 USDT 時，非 USDT 路線有差額就還不清（定期重新評估與 owner 關閉會等；全部賣出會剩一小段負債與對應的抵押品）。要補上需要決定現金帳本的規則：補差額從哪一格扣（建議 `allocated_cash_raw`，賣出所得就在這格）、換回現金記到哪一格，並在同一個交易確認時寫帳。這是動到資金帳本的決定，這次沒有做。
+- routing v2 既有的 USDT 路線還款把帳戶的整筆 USDT 當 `maxCashIn`（策略盒不夠時合約會直接拿帳戶現金），同樣可能動到被認領的現金；目前沒有擋，建議跟上一條一起處理。
 - 主網：可抵押資產的價格來源（測試網用共用的借貸 oracle）；Lista USD1 vault 的單筆操作約 670 萬 gas，乘 2 之後貼近單筆上限；`shortfall` 的 eth_call 在主網約 560–590 萬 gas（已給 3,000 萬）。

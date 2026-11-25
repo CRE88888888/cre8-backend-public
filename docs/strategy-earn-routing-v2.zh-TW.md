@@ -21,7 +21,7 @@
 1. **v2 在哪裡**：`strategyEarnV2(chainId)` 讀 `STRATEGY_EARN_V2_DEPLOYMENT`（一個 JSON 物件，有設就以它為準），沒設就讀 `deploy/strategy-earn-v2.json`。chain 97 已部署（2026-11-25），chain 56 沒有。session key 範圍、paymaster 允許清單、讀取用的 lens 全部跟著這份設定走；重新部署 executor 只要換這個檔案（或設變數）。格式錯就 throw。
 2. **誰可以用**：`strategyEarnV2For(chainId, owner)`。`STRATEGY_EARN_V2_AUDIENCE` 沒設＝部署設定裡的 `canaryOwners`；`all`＝所有人；`off`＝沒有人；或逗號分隔的 owner 地址。
 
-**現況（2026-11-25）：`canaryOwners` 只有 e2e harness 的測試錢包（`0xD3Ab…D6D9`），其他人全部維持 v1。** 測試網已換成 draft6 的修正版（executor `0xeddd…600F`、registry `0x2461…CC0D`、lens `0x4fC6…a27A`）並部署了 `AtpBorrowCashSwapper`（`0x9981…0798`）。舊那套（executor `0x494C…6bB5`）的 registry 已暫停新開倉，66 條路線的本金都是 0（2026-11-25 用公開節點逐條讀 `totalPrincipal`），沒有部位要搬。
+**現況（2026-11-25）：`canaryOwners` 只有 e2e harness 的測試錢包（`0xD3Ab…D6D9`），其他人全部維持 v1。** 當天在測試網用兩種帳戶跑過的流程與交易見 PR #285–#289 的說明。 測試網已換成 draft6 的修正版（executor `0xeddd…600F`、registry `0x2461…CC0D`、lens `0x4fC6…a27A`）並部署了 `AtpBorrowCashSwapper`（`0x9981…0798`）。舊那套（executor `0x494C…6bB5`）的 registry 已暫停新開倉，66 條路線的本金都是 0（2026-11-25 用公開節點逐條讀 `totalPrincipal`），沒有部位要搬。
 
 不在對象裡的 owner 完全走 v1：續期不裝 v2 權限、paymaster 不贊助任何 v2 呼叫、API 與排程器不會組 v2 的交易，也不會多讀任何鏈上資料（排程器只多一次有快取的 owner 查詢；持倉快照與 My mix 金流對帳只對對象內的 owner 讀 v2）。**對所有人開啟＝把 `STRATEGY_EARN_V2_AUDIENCE` 設成 `all`，這是產品決定，這次沒有做。**
 
@@ -102,7 +102,7 @@ executor 自己不換幣。借 USDC／USD1／U 的路線，vault 長得比負債
 - vault 讀得到但領不出來：第一筆 `[topUp, 關閉, cashOut]` 整筆 revert 時，改送 `[topUp（只算閒置，買到負債 − 閒置，最多 cap）, 關閉]`（`Step.fallback`）；USDT 不夠買這麼多就只重送不帶 `cashOut` 的那一組。
 - **賣出不會被 swapper 擋住**：賣出前那一筆裡的 `topUp`／`cashOut` 送不出去（`PegExceeded`、`WindowExceeded`、預估落空）時，同一輪改用「沒有 swapper」的算法重排一次（重新讀鏈；還得起多少還多少、按比例取回），剩下的借款幣留給之後的輪次。
 - `WindowExceeded`（這個幣 24 小時的額度用完）：計畫階段讀到 `cap` 不夠就不送，log 寫明 `topUpWindowOf.start + 86400` 的時間；真的送出才撞到的話記一次原因、這一輪不算失敗（不進 back-off），下一輪由計畫自己等視窗，**不會每輪重送**。
-- `PegExceeded`：池子偏離 1:1 超過合約上限，重送沒有用。寫一行結構化 log（`{"level":"error","msg":"strategy_peg_exceeded",…}`），這一輪以 `[STRATEGY_PEG_EXCEEDED]` 開頭的錯誤失敗：定期重新評估那條路會記成 `[STRATEGY_EARN_OPEN_FAILED] … [STRATEGY_PEG_EXCEEDED]` 並照既有的間隔退避（5、10、20、40、60 分鐘），賣出前那條路會讓這個投組的這一輪失敗（連續失敗就是既有的 `portfolio_repeatedly_failing`）。**目前的告警就是這行 error log**；要它進 `alerts` 表成為獨立的一種，需要 db 在 `alerts.kind` 的 CHECK 加一種（見最後一節）。
+- `PegExceeded`：池子偏離 1:1 超過合約上限，重送沒有用。寫一行結構化 log（`{"level":"error","msg":"strategy_peg_exceeded",…}`），定期重新評估那條路以 `[STRATEGY_PEG_EXCEEDED]` 開頭的錯誤失敗，記成 `[STRATEGY_EARN_OPEN_FAILED] … [STRATEGY_PEG_EXCEEDED]` 並照既有的間隔退避（5、10、20、40、60 分鐘）；賣出前那條路寫完這行 log 之後照上一點改走不補差額的還款取回，賣出不會被擋。**目前的告警就是這行 error log**；要它進 `alerts` 表成為獨立的一種，需要 db 在 `alerts.kind` 的 CHECK 加一種（見最後一節）。
 
 **何時 `cashOut`**：
 - 跟關閉放同一個 UserOp：關掉的是這個幣的最後一條路線，而且「關完帳戶裡一定有剩」（帳戶原有的借款幣＋策略盒＋補進去的 − 負債 − 0.02% ≥ 0.000001）才帶。`cashOut(token, MAX, minUsdtOut = 這個下限 × 0.997)`；合約自己的錨定上限（0.25%）管其餘的部分。
@@ -124,6 +124,7 @@ executor 自己不換幣。借 USDC／USD1／U 的路線，vault 長得比負債
 - **App（cre8-app）**：My mix 改比例的簽名前檢查（`checkStrategyConsentV2`）只認得「對 v2 executor 的 approve」。要讓改比例順便補簽 swapper 的授權，簽名資料的 `strategyV2` 要多宣告 `swapper`，App 在鏈上核對 `swapper.executor()` 就是宣告的 executor，並接受「USDT／借款幣對 swapper 的全額 approve」。在那之前後端的重新同意不送這幾筆（`v2ReconsentCalls` 的 `swapperApprovals` 沒有被 API 使用）。
 - **db**：`alerts.kind` 加一種（例如 `strategy_peg_exceeded`），`PegExceeded` 才能成為 `/health` 看得到的告警；現在只有 error log。
 - **db**：`strategy_route_events.kind` 加 `top_up`、`cash_out`（或另開 `strategy_cash_swaps` 表：chain_id、portfolio_id、account、kind、token、usdt_raw、token_raw、need_raw、tx_hash、log_index、block_number，`(chain_id, tx_hash, log_index)` 唯一）。現在只有 log。
+- 測試網的模擬 Lista 市場把場所激勵（抵押／借款激勵）以測試 USDT 發到帳戶（keeper 代觸發），不是 LISTA；只有 earn vault 的激勵是 LISTA、先到策略盒。主網兩者都走 Lista 的領取流程。
 - 健康度接近減倉線、策略盒不夠還時「先 `topUp` 讓第三方的 `executeDeleverage` 有錢可還」（規格 §17 第 5 點）還沒做：keeper 那一輪只有任何人可呼叫的交易，`topUp` 要 session key。
 - **補差額用不到組合現金與賣出所得**（見上「用哪些 USDT」）：帳戶裡沒有帳本以外的 USDT 時，非 USDT 路線有差額就還不清（定期重新評估與 owner 關閉會等；全部賣出會剩一小段負債與對應的抵押品）。要補上需要決定現金帳本的規則：補差額從哪一格扣（建議 `allocated_cash_raw`，賣出所得就在這格）、換回現金記到哪一格，並在同一個交易確認時寫帳。這是動到資金帳本的決定，這次沒有做。
 - USDT 路線的還款同理：給合約的 `maxCashIn`（策略盒不夠時合約可以直接拿帳戶的 USDT）只給帳本沒認領的那一段（排程器、賣出前、owner 關閉都是）。策略盒差一點、帳戶又沒有帳本以外的 USDT 時，這筆還款會 `VaultShortfall`、下一輪再試；要用組合現金補，同樣要等上一條的帳本規則。

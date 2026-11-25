@@ -6,7 +6,7 @@ import { detectSellAllOverdue, resetRoundOutcomes } from '../src/alerts.js';
 import { closePool, getPool, migrate, query } from '../src/db.js';
 import { claimDuePortfolios } from '../src/scheduler.js';
 import { singlePortfolioClaim } from '../src/operator.js';
-import { CANCEL_SELL_ALL_SQL, NEW_MONEY_ENDS_SELL_ALL_SQL, SELL_ALL_KIND, SELL_ALL_OF_PORTFOLIO_SQL, requestSellAll, sellAllRetryAt, settleSellAll } from '../src/sell-all-intent.js';
+import { CANCEL_SELL_ALL_SQL, NEW_MONEY_ENDS_SELL_ALL_SQL, SELL_ALL_KIND, SELL_ALL_OF_PORTFOLIO_SQL, requestSellAll, sellAllRetryAt, settleSellAll, sharesTakenBack, withdrawSellAll } from '../src/sell-all-intent.js';
 import { canonicalConfigHash, validateAssetConfig } from '../src/strategy-execution.js';
 import type { Allocation } from '../src/strategies.js';
 import { TESTNET_97 } from '../src/testnet-profile.js';
@@ -64,8 +64,10 @@ test('sell all request (real Postgres): written once per request, read by the cl
   const id = await portfolio();
   assert.equal((await claimed(id))?.sellAll, undefined, 'no request: an ordinary portfolio');
   // `/close` twice (and twice at the same moment): one open request.
-  assert.equal(await requestSellAll(run, 97, id), true);
-  assert.deepEqual(await Promise.all([requestSellAll(run, 97, id), requestSellAll(run, 97, id)]), [true, true]);
+  const first = await requestSellAll(run, 97, id);
+  assert.equal(first.open, true); assert.match(first.created ?? '', /^\d+$/, 'this call wrote the row');
+  // Calling again finds the request open and writes nothing: it is not this call's to take back.
+  assert.deepEqual(await Promise.all([requestSellAll(run, 97, id), requestSellAll(run, 97, id)]), [{ open: true, created: null }, { open: true, created: null }]);
   assert.deepEqual(await requests(id), ['#1 pending']);
   // The caller is still here: not claimed for 90 seconds after its call, then claimed as "sell all".
   assert.equal(await claimed(id, 60), undefined);
@@ -86,7 +88,7 @@ test('sell all request (real Postgres): written once per request, read by the cl
   // The row is written once: its life only moves forward (the table's own trigger).
   await assert.rejects(query(`update user_notifications set state='pending' where portfolio_id=$1 and kind=$2`, [id, SELL_ALL_KIND]), /invalid notification transition/);
   // A later "sell all" on the same portfolio is a new request.
-  assert.equal(await requestSellAll(run, 97, id), true);
+  assert.equal((await requestSellAll(run, 97, id)).open, true);
   assert.deepEqual(await requests(id), ['#1 delivered', '#2 pending']);
 }));
 
@@ -148,10 +150,44 @@ test('sell all request (real Postgres): the single-portfolio claims of /close, /
   assert.deepEqual(await own(close), [[id, false]]);
 }));
 
+test('sell all request (real Postgres): the call whose round did nothing takes its own request back; an earlier call\'s request is not touched', { skip: !DB }, tidy(async () => {
+  await migrate();
+  // First call, market closed: the row it wrote is withdrawn — nothing is pending and the scheduler sees an ordinary portfolio.
+  const id = await portfolio();
+  const first = await requestSellAll(run, 97, id);
+  assert.ok(first.created);
+  await withdrawSellAll(run, first.created);
+  assert.deepEqual(await requests(id), ['#1 failed']);
+  assert.equal((await claimed(id))?.sellAll, undefined);
+  assert.equal((await state(id)).schedule_state, 'active');
+  // Withdrawing again (a retry) changes nothing, and never reopens.
+  await withdrawSellAll(run, first.created);
+  assert.deepEqual(await requests(id), ['#1 failed']);
+  // A second call writes a new request; a third call (held up) wrote none, so it has nothing to take back: #2 stays open.
+  const second = await requestSellAll(run, 97, id);
+  const third = await requestSellAll(run, 97, id);
+  assert.ok(second.created); assert.deepEqual(third, { open: true, created: null });
+  await withdrawSellAll(run, first.created); // an old id never reaches the open request
+  assert.deepEqual(await requests(id), ['#1 failed', '#2 pending']);
+  assert.equal((await claimed(id))?.sellAll, true);
+}));
+
+test('sharesTakenBack: less posted of any asset than before the round means a repay-and-take-back landed', () => {
+  const a1 = '0x00000000000000000000000000000000000000a1', b1 = '0x00000000000000000000000000000000000000b1';
+  const row = (asset: string, amount: bigint) => ({ asset, amount });
+  assert.equal(sharesTakenBack([row(a1, 5n)], [row(a1, 5n)]), false, 'unchanged');
+  assert.equal(sharesTakenBack([row(a1, 5n)], [row(a1.toUpperCase().replace('0X', '0x'), 5n)]), false, 'address case does not matter');
+  assert.equal(sharesTakenBack([row(a1, 5n)], []), true, 'all taken back');
+  assert.equal(sharesTakenBack([row(a1, 5n), row(b1, 7n)], [row(a1, 5n), row(b1, 6n)]), true, 'part of one asset');
+  assert.equal(sharesTakenBack([row(a1, 2n), row(a1, 3n)], [row(a1, 5n)]), false, 'two markets of one asset are summed');
+  assert.equal(sharesTakenBack([row(a1, 5n)], [row(a1, 9n), row(b1, 1n)]), false, 'more posted is not a take-back');
+  assert.equal(sharesTakenBack([], [row(a1, 1n)]), false, 'nothing was posted');
+});
+
 test('sell all request (real Postgres): a portfolio without a cash ledger row holds no request and /close works as before (untracked pause)', { skip: !DB }, tidy(async () => {
   await migrate();
   const id = await portfolio({ ledger: false });
-  assert.equal(await requestSellAll(run, 97, id), false);
+  assert.deepEqual(await requestSellAll(run, 97, id), { open: false, created: null });
   assert.deepEqual(await requests(id), []);
   await settleSellAll(run, id, { outcome: 'executed', over: false, tracked: false });
   assert.equal((await state(id)).schedule_state, 'paused');
@@ -229,7 +265,7 @@ test('sell all request: a My mix that already exits on its own (exiting, exited,
     await mix(14, 'deleted_at=now()');             // deleted
     await mix(15, '', true);                       // the old portfolio of a re-enrolled mix
     const asked: [number, boolean][] = [];
-    for (const id of [10, 11, 12, 13, 14, 15]) asked.push([id, await requestSellAll(on, 97, id)]);
+    for (const id of [10, 11, 12, 13, 14, 15]) asked.push([id, (await requestSellAll(on, 97, id)).open]);
     assert.deepEqual(asked, [[10, true], [11, false], [12, false], [13, false], [14, false], [15, false]]);
     // A request left open on a mix that started its own exit afterwards: new money ends the request but does not resume it.
     await client.query("update mixes set triggered_at=now() where id=10");

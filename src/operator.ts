@@ -33,7 +33,7 @@ import { countSwapExecuted, PARTIAL_FOLLOW_UP_SECONDS, runSchedulerOnce, SCHEDUL
 import type { ExecutionOutcome, PortfolioRunResult, WithTransactionFn } from './scheduler.js';
 import { planPortfolio } from './snapshot.js';
 import { RESUME_PAUSED_SQL } from './sell-all-resume.js';
-import { CANCEL_SELL_ALL_SQL, requestSellAll, sellAllCallerIsHere, sellAllOver, settleSellAll } from './sell-all-intent.js';
+import { CANCEL_SELL_ALL_SQL, requestSellAll, sellAllCallerIsHere, sellAllOver, settleSellAll, sharesTakenBack, withdrawSellAll } from './sell-all-intent.js';
 import { buildRoutedStep, capAssetLeg, DEFAULT_DEADLINE_SECONDS, minGrossFor, nominalSellQuote, numeraireDecimals, readMaxLegUsdE8 } from './rebalance-plan.js';
 import type { PlannedStep, RebalancePlan } from './rebalance-plan.js';
 import type { RebalancePlanningInput } from './scheduler.js';
@@ -754,6 +754,8 @@ export type RebalanceDeps = {
   releaseRunningBuy?: ((portfolioId: number) => Promise<void>) | null;
   /** Sell all: what is left cannot be sold at all (default: mix-runtime `mixBelowExecutorMinimum`, chain 97 only). */
   belowExecutorMinimum?: (plan: PortfolioPlan) => Promise<boolean>;
+  /** Sell all: what the account has posted for Strategy Earn right now (default: one observation of the account). */
+  postedShares?: (portfolioId: number) => Promise<NonNullable<PortfolioPlan['snapshot']['strategyEarnCollateral']>>;
 };
 
 /**
@@ -1340,8 +1342,9 @@ export type RedeemResult = {
   batched: boolean;
   /**
    * Sell all only: the request is still open after this call (src/sell-all-intent.ts) — the scheduler goes on selling
-   * without another call, and calling again just continues. False once nothing is left, or when the portfolio cannot
-   * hold a request (then only further calls sell).
+   * without another call, and calling again just continues. False once nothing is left, when this call's round did
+   * nothing on chain (the request is taken back: nothing is sold later on its own), or when the portfolio cannot hold a
+   * request (then only further calls sell).
    */
   sellAllPending?: boolean;
 };
@@ -1365,6 +1368,8 @@ export async function runOperatorRedeem(portfolioId: number, wallet: string, amo
   return runOperatorSell(portfolioId, wallet, amount, deps);
 }
 
+const postedSharesNow = async (portfolioId: number) => (await planPortfolio(portfolioId, { observeOnly: true })).snapshot.strategyEarnCollateral ?? [];
+
 async function runOperatorSell(portfolioId: number, wallet: string, request: SellRequest, deps: RebalanceDeps): Promise<RedeemResult> {
   await (deps.requireOwnedPortfolio ?? requireOwnedPortfolio)(portfolioId, wallet);
   const closing = typeof request === 'object' && 'close' in request;
@@ -1378,8 +1383,12 @@ async function runOperatorSell(portfolioId: number, wallet: string, request: Sel
   // Sell all: the request outlives this call (src/sell-all-intent.ts). If the client goes away after this round, the
   // scheduler goes on selling instead of rebalancing or opening Strategy Earn again; calling again just continues.
   let tracked = false;
+  /** The request row this very call wrote (null: none, or an earlier call's request is still open). */
+  let created: string | null = null;
+  /** Shares posted for Strategy Earn when the round planned (null: the round never got that far). */
+  let posted: NonNullable<PortfolioPlan['snapshot']['strategyEarnCollateral']> | null = null;
   if (closing) {
-    try { tracked = await requestSellAll(query, configuredChainId(), portfolioId); }
+    try { ({ open: tracked, created } = await requestSellAll(query, configuredChainId(), portfolioId)); }
     catch (error) { (deps.log ?? console.warn)(`[close] portfolio ${portfolioId}: sell-all request not recorded, this call sells on its own (${errorChain(error)})`); }
   }
   const planning: { result: RedeemPlanningResult | null } = { result: null };
@@ -1394,7 +1403,7 @@ async function runOperatorSell(portfolioId: number, wallet: string, request: Sel
       planRebalance: async (input) => {
         const built = await buildRedeemPlan(input, request, deps);
         planning.result = built;
-        if (closing) over ??= await sellAllOver(input.plan, built.plan, deps.belowExecutorMinimum);
+        if (closing) { posted ??= input.plan.snapshot.strategyEarnCollateral ?? []; over ??= await sellAllOver(input.plan, built.plan, deps.belowExecutorMinimum); }
         return built.plan;
       },
       forcePlan: true,
@@ -1423,6 +1432,31 @@ async function runOperatorSell(portfolioId: number, wallet: string, request: Sel
     } catch {
       // A successful transaction must stay visible even if the subsequent scheduling write fails.
       reason += closing ? '；清倉結果已確認，但 DB 暫停／警示更新失敗，請檢查排程狀態' : '；賣出已確認，但 DB 延後排程失敗，請暫停排程後再續作';
+    }
+  }
+  // A request this call wrote stays only if this round did something on chain: a sale that landed (or whose outcome is
+  // not known yet), or shares repaid and taken back. Otherwise it is taken back and nothing is sold later on its own
+  // (src/sell-all-intent.ts withdrawSellAll). Decided here, when the round is over — whether or not the client is still
+  // waiting for the answer. A request an earlier call left open is never taken back by a call that was merely held up.
+  if (tracked && created !== null && over !== true) {
+    const execution = result?.execution ?? null;
+    let acted = outcome === 'executed' || execution !== null && (execution.status === 'success' || execution.status === 'unknown' ||
+      execution.status === 'error' && (execution.userOpHash !== null || execution.txHash !== null));
+    const before = posted as NonNullable<PortfolioPlan['snapshot']['strategyEarnCollateral']> | null;
+    if (!acted && before !== null && before.length > 0) {
+      // The repay step names every transaction that landed (`tx=0x…`, also in its failure note). Otherwise ask the chain:
+      // less posted than when the round planned means a take-back landed (a node that lags by a block could miss it,
+      // which is why the note is read first).
+      try { acted = /\[STRATEGY_EARN_UNWIND(ING|_FAILED)\]/.test(reason) && /tx=0x[0-9a-fA-F]{64}/.test(reason) || sharesTakenBack(before, await (deps.postedShares ?? postedSharesNow)(portfolioId)); }
+      catch (error) {
+        // Shares were posted and the account cannot be read: the repay may have landed, so the request stays.
+        acted = true;
+        (deps.log ?? console.warn)(`[close] portfolio ${portfolioId}: posted shares unreadable after the round, sell-all request kept (${errorChain(error)})`);
+      }
+    }
+    if (!acted) {
+      try { await withdrawSellAll(query, created); tracked = false; }
+      catch (error) { (deps.log ?? console.warn)(`[close] portfolio ${portfolioId}: sell-all request not withdrawn (${errorChain(error)})`); }
     }
   }
   // The round may have taken a while: the scheduler takes over only after the caller has been silent since now.

@@ -160,6 +160,8 @@ type StubDb = {
   failTransaction: boolean;
   /** Portfolios with an open "sell all" request (src/sell-all-intent.ts): the `user_notifications` rows in state `pending`. */
   sellAll: Set<number>;
+  /** Every request row ever written, by id (the id `/close` uses to take its own request back). */
+  sellAllRows: Map<string, number>;
   /** What the retry guard reads for a portfolio with an open request (failed sends since the request). */
   sellAllStreak?: { failures: number; lastFailureAt: Date };
 };
@@ -174,6 +176,7 @@ function stubDb(overrides: Partial<StubDb> = {}): StubDb {
     inTransaction: false,
     failTransaction: false,
     sellAll: new Set(),
+    sellAllRows: new Map(),
     ...overrides,
   };
 }
@@ -250,7 +253,19 @@ function stubQuery(db: StubDb): SchedulerQueryFn {
     // "Sell all" request rows (src/sell-all-intent.ts), by what each statement does.
     if (text.includes("'sell_all_requested'")) {
       const pause = (id: number) => { const row = db.portfolios.find((entry) => entry.id === id); if (row !== undefined) row.state = 'paused'; };
-      if (text.includes('insert into user_notifications')) { db.sellAll.add(Number(params[1])); return { rows: [] }; }
+      if (text.includes('insert into user_notifications')) {
+        const portfolioId = Number(params[1]);
+        if (db.sellAll.has(portfolioId)) return { rows: [] };
+        const id = String(db.sellAllRows.size + 1);
+        db.sellAll.add(portfolioId); db.sellAllRows.set(id, portfolioId);
+        return { rows: [{ id }] };
+      }
+      if (text.includes('where n.id = $1')) {
+        const portfolioId = db.sellAllRows.get(String(params[0]));
+        // Only the newest row of a portfolio can still be the open one.
+        if (portfolioId !== undefined && [...db.sellAllRows].filter(([, p]) => p === portfolioId).at(-1)?.[0] === String(params[0])) db.sellAll.delete(portfolioId);
+        return { rows: [] };
+      }
       if (text.startsWith('select 1 from user_notifications')) return { rows: db.sellAll.has(Number(params[1])) ? [{}] : [] };
       if (text.includes("set schedule_state = 'paused'")) { if (db.sellAll.has(Number(params[0]))) pause(Number(params[0])); return { rows: [] }; }
       if (text.includes('set next_run_at = now() + interval')) {
@@ -3506,7 +3521,9 @@ for (const gate of ['global', 'chain', 'inflight'] as const) {
     assert.equal(c.f.state.reads.length, 0);
     assert.equal(c.chain.executeCalls.length, 0);
     assert.equal(c.f.state.writes.length, 0);
-    assert.ok(c.db.sellAll.has(PORTFOLIO_ID), 'the request is recorded before the round: the scheduler goes on once the block clears');
+    assert.equal(c.db.sellAllRows.size, 1, 'the request was recorded before the round');
+    assert.equal(c.db.sellAll.size, 0, 'and taken back: the round did nothing, so nothing is sold later on its own');
+    assert.equal(result.sellAllPending, false);
   });
 }
 
@@ -3552,11 +3569,13 @@ test('sell all, Strategy Earn on (v1 note), client gone after the repay round: t
   let opens = 0;
   const strategyEarn: NonNullable<SchedulerDeps['strategyEarn']> = {
     open: async () => { opens += 1; return 'opened'; },
-    unwind: async (_due, _steps, _dry, exit) => { unwinds.push(exit); return unwinds.length === 1 ? '[STRATEGY_EARN_UNWINDING] 賣出前已還款取回：DOGE 先還清再取回 tx=0xabc；下一輪再賣' : null; },
+    unwind: async (_due, _steps, _dry, exit) => { unwinds.push(exit); return unwinds.length === 1 ? `[STRATEGY_EARN_UNWINDING] 賣出前已還款取回：DOGE 先還清再取回 tx=0x${'ab'.repeat(32)}；下一輪再賣` : null; },
   };
   const c = sellAllCase('active', { strategyEarn });
   c.chain.plan.snapshot.strategyEarnCollateral = [{ asset: DOGE_HELD(c).asset as Address, marketId: MARKET, amount: DOGE_HELD(c).amountWei }];
-  const first = await runOperatorClose(PORTFOLIO_ID, OWNER, c.options);
+  // The repay note names the transaction that landed, so the request stays without another look at the chain (a node
+  // one block behind would still show the shares posted).
+  const first = await runOperatorClose(PORTFOLIO_ID, OWNER, { ...c.options, postedShares: async () => { throw new Error('not needed: the note carries the transaction'); } });
   assert.equal(first.outcome, 'blocked'); assert.match(first.reason, /STRATEGY_EARN_UNWINDING.*下一輪再賣/);
   assert.equal(c.chain.executeCalls.length, 0);
   assert.equal(c.db.portfolios[0]?.state, 'active', 'nothing sold yet: not paused');
@@ -3590,6 +3609,76 @@ test('sell all, Strategy Earn on (v1 note), client gone after the repay round: t
   const again = await runOperatorClose(PORTFOLIO_ID, OWNER, c.options);
   assert.deepEqual([again.outcome, again.reason, again.sellAllPending], ['noop', 'nothing to sell', false]);
   assert.equal(c.db.sellAll.size, 0); assert.equal(c.chain.executeCalls.length, 2);
+});
+
+test('sell all whose first round did nothing on chain (no price, sponsorship refused, a revert, an unwind that could not send): the request is taken back and the scheduler never sells on its own', async () => {
+  const held = { asset: '', amount: 0n };
+  const cases: { name: string; arrange: (c: ReturnType<typeof sellAllCase>) => void; extra?: SchedulerDeps; outcome: string }[] = [
+    // The market-closed shape: the sell planner refuses before anything is sent.
+    { name: 'no price', arrange: (c) => { c.f.state.fail = 'previewSwap'; }, outcome: 'blocked' },
+    { name: 'sponsorship refused', arrange: (c) => { c.chain.executeResult = { ...c.chain.executeResult, status: 'error', userOpHash: null, txHash: null, error: 'PAYMASTER_QUOTA_EXCEEDED' }; }, outcome: 'failed' },
+    { name: 'reverted', arrange: (c) => { c.chain.executeResult = { ...c.chain.executeResult, status: 'reverted', error: 'BelowFloor' }; }, outcome: 'reverted' },
+    // Shares are posted but the repay could not even be sent (no session scope): they are all still posted afterwards.
+    { name: 'unwind not sent', arrange: (c) => { c.chain.plan.snapshot.strategyEarnCollateral = [{ asset: DOGE_HELD(c).asset as Address, marketId: MARKET, amount: DOGE_HELD(c).amountWei }]; },
+      extra: { strategyEarn: { open: async () => null, unwind: async () => '[STRATEGY_EARN_UNWINDING] 賣出前需先還款取回：DOGE（沒有策略加息 session 權限，等 owner 續期，未送出）' } }, outcome: 'blocked' },
+  ];
+  for (const each of cases) {
+    const c = sellAllCase('active', each.extra);
+    each.arrange(c);
+    Object.assign(held, { asset: DOGE_HELD(c).asset, amount: DOGE_HELD(c).amountWei });
+    const first = await runOperatorClose(PORTFOLIO_ID, OWNER, { ...c.options, postedShares: async () => [{ asset: held.asset as Address, marketId: MARKET, amount: held.amount }] });
+    assert.equal(first.outcome, each.outcome, `${each.name}: ${first.reason}`);
+    assert.equal(first.sellAllPending, false, each.name);
+    assert.equal(c.db.sellAllRows.size, 1, `${each.name}: the request was written before the round`);
+    assert.equal(c.db.sellAll.size, 0, `${each.name}: and taken back when the round ended`);
+    assert.equal(c.db.portfolios[0]?.state, 'active', each.name);
+    // Later, with the market open again: the scheduler's rounds are ordinary ones (the regular planner), never a sale.
+    c.f.state.fail = ''; c.chain.executeResult = { ...c.chain.executeResult, status: 'success', error: null };
+    c.chain.rebalance = { kind: 'noop', reason: 'nothing to trade' };
+    const sent = c.chain.executeCalls.length;
+    const s = sellAllRounds(c, { planSellAll: async () => { throw new Error(`${each.name}: no sell-all round without a request`); } });
+    assert.deepEqual(outcomes(await s.round()), ['noop'], each.name);
+    assert.deepEqual(outcomes(await s.round()), ['noop'], each.name);
+    assert.equal(c.chain.executeCalls.length, sent, `${each.name}: nothing is sold on its own`);
+  }
+});
+
+test('a sell-all request an earlier call left open is not taken back by a later call that was held up; an outcome that is not known yet keeps it too', async () => {
+  // First call sold a batch: the request is a standing order from here on.
+  const c = sellAllCase();
+  assert.equal((await runOperatorClose(PORTFOLIO_ID, OWNER, c.options)).outcome, 'executed');
+  assert.deepEqual([c.db.sellAll.size, c.db.sellAllRows.size], [1, 1]);
+  // The next call is held up (no price): it wrote no row of its own, so there is nothing for it to take back.
+  c.chain.plan = c.f.plan(stubPlan(), 50n, 1950n);
+  c.f.state.fail = 'previewSwap';
+  const heldUp = await runOperatorClose(PORTFOLIO_ID, OWNER, c.options);
+  assert.equal(heldUp.outcome, 'blocked');
+  assert.equal(heldUp.sellAllPending, true, 'the backend still finishes the sale');
+  assert.deepEqual([c.db.sellAll.size, c.db.sellAllRows.size], [1, 1]);
+  // And the scheduler does finish it once the price is back.
+  c.f.state.fail = '';
+  const s = sellAllRounds(c);
+  assert.deepEqual(outcomes(await s.round()), ['executed']);
+  // A first call whose send has no known outcome yet (receipt timeout): it may land, so the request stays.
+  const u = sellAllCase('active', { reconcileRebalance: async () => ({ kind: 'incomplete', reason: 'missing receipt' }) });
+  u.chain.executeResult = { ...u.chain.executeResult, status: 'unknown', error: 'receipt timeout' };
+  const unknown = await runOperatorClose(PORTFOLIO_ID, OWNER, u.options);
+  assert.equal(unknown.outcome, 'blocked');
+  assert.deepEqual([unknown.sellAllPending, u.db.sellAll.size], [true, 1]);
+  // A first call that repaid and took shares back, but only some of them (the rest failed, and the note has no full hash):
+  // the chain shows less posted than before, so the request stays.
+  const p = sellAllCase('active', { strategyEarn: { open: async () => null, unwind: async () => { throw new Error('已完成 1 筆（tx=0xabc），其餘未完成：bundler down'); } } });
+  p.chain.plan.snapshot.strategyEarnCollateral = [{ asset: DOGE_HELD(p).asset as Address, marketId: MARKET, amount: 120n * 10n ** 8n }];
+  const partial = await runOperatorClose(PORTFOLIO_ID, OWNER, { ...p.options, postedShares: async () => [{ asset: DOGE_HELD(p).asset as Address, marketId: MARKET, amount: 70n * 10n ** 8n }] });
+  assert.match(partial.reason, /STRATEGY_EARN_UNWIND_FAILED/);
+  assert.deepEqual([partial.sellAllPending, p.db.sellAll.size], [true, 1]);
+  // Shares were posted and the account cannot be read after the round: the repay may have landed, so the request stays.
+  const r = sellAllCase('active', { strategyEarn: { open: async () => null, unwind: async () => '[STRATEGY_EARN_UNWINDING] fixture' } });
+  r.chain.plan.snapshot.strategyEarnCollateral = [{ asset: DOGE_HELD(r).asset as Address, marketId: MARKET, amount: 120n * 10n ** 8n }];
+  const lines: string[] = [];
+  const unreadable = await runOperatorClose(PORTFOLIO_ID, OWNER, { ...r.options, log: (line: string) => lines.push(line), postedShares: async () => { throw new Error('rpc down'); } });
+  assert.deepEqual([unreadable.sellAllPending, r.db.sellAll.size], [true, 1]);
+  assert.ok(lines.some((line) => /posted shares unreadable/.test(line)), lines.join('\n'));
 });
 
 test('sell all, routing v2 (shares that cannot be freed yet): /close sells the free part, the scheduler frees and sells the rest in later rounds', async () => {

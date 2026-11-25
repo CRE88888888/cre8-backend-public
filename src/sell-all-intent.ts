@@ -13,7 +13,8 @@ import { numeraireFor } from './strategy-execution.js';
  * (a 30 second proxy timeout on a 28.5 second round), the scheduler's next round saw consent still on and idle shares
  * and opened the strategy again. Nothing was sold and the strategy was back on.
  *
- * The request is now a row. `/close` writes it before its first round and the scheduler reads it when it claims:
+ * The request is now a row. `/close` writes it before its first round — and takes it back if that round did nothing on
+ * chain (withdrawSellAll): only a sale that has started is finished by the backend. The scheduler reads it when it claims:
  *   - a portfolio with an open request is run as "sell all" (the same plan and pipeline as `/close`), never as a
  *     rebalance, a new-money buy, a DCA buy or a Strategy Earn open. It is claimed while paused too, because `/close`
  *     pauses after its first executed batch;
@@ -60,7 +61,8 @@ const REQUEST_SQL = `insert into user_notifications (chain_id, portfolio_id, own
    where c.chain_id = $1 and c.portfolio_id = $2
      and not exists(select 1 from user_notifications n where n.chain_id = c.chain_id and n.portfolio_id = c.portfolio_id and ${OPEN})
      and not ${MIX_OWN_EXIT('c.portfolio_id')}
-  on conflict (chain_id, kind, dedup_key) do nothing`;
+  on conflict (chain_id, kind, dedup_key) do nothing
+  returning id::text as id`;
 const IS_OPEN_SQL = `select 1 from user_notifications n where n.chain_id = $1 and n.portfolio_id = $2 and ${OPEN} limit 1`;
 const close = (state: 'delivered' | 'failed') => `update user_notifications n set state = '${state}', updated_at = clock_timestamp()
    where n.portfolio_id = $1 and ${OPEN}`;
@@ -95,10 +97,29 @@ type Run = (sql: string, params?: readonly unknown[]) => Promise<{ rows: unknown
  * `/close`: record the owner's request. True when a request is open afterwards (this one or an earlier one); false when
  * the portfolio cannot hold one (see the file header) — the caller then finishes the sale within its own calls, as before.
  */
-export async function requestSellAll(run: Run, chainId: number, portfolioId: number): Promise<boolean> {
-  await run(REQUEST_SQL, [chainId, portfolioId]);
+export async function requestSellAll(run: Run, chainId: number, portfolioId: number): Promise<{ open: boolean; created: string | null }> {
+  const written = (await run(REQUEST_SQL, [chainId, portfolioId])).rows[0] as { id?: unknown } | undefined;
   await run(CALLER_IS_HERE_SQL, [portfolioId]);
-  return (await run(IS_OPEN_SQL, [chainId, portfolioId])).rows.length > 0;
+  return { open: (await run(IS_OPEN_SQL, [chainId, portfolioId])).rows.length > 0, created: typeof written?.id === 'string' ? written.id : null };
+}
+
+/**
+ * A request is a standing order only once something was done for it. The call that wrote it takes it back when its own
+ * round did nothing on chain at all (market closed, no price, sponsorship refused, lock or queue busy): the app shows
+ * that round's error and the owner believes nothing was ordered, so nothing may be sold later on its own (2026-11-26).
+ * `$1`: the id `requestSellAll` returned as `created` — a request an earlier call wrote is never taken back this way.
+ */
+const WITHDRAW_SQL = `update user_notifications n set state = 'failed', updated_at = clock_timestamp() where n.id = $1 and ${OPEN}`;
+export async function withdrawSellAll(run: Run, requestId: string): Promise<void> {
+  await run(WITHDRAW_SQL, [requestId]);
+}
+
+type Posted = readonly { asset: string; amount: bigint }[];
+/** True when less of some asset is posted for Strategy Earn now than before the round: a repay-and-take-back landed, in whole or in part. */
+export function sharesTakenBack(before: Posted, now: Posted): boolean {
+  const total = (rows: Posted) => { const by = new Map<string, bigint>(); for (const r of rows) by.set(r.asset.toLowerCase(), (by.get(r.asset.toLowerCase()) ?? 0n) + r.amount); return by; };
+  const after = total(now);
+  return [...total(before)].some(([asset, amount]) => (after.get(asset) ?? 0n) < amount);
 }
 
 /** `/close`, after its round: the request is still open and the caller may call again (see SELL_ALL_CALLER_SECONDS). */

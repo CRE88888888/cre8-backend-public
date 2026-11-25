@@ -13,7 +13,7 @@
 | `src/strategy-earn-v2-swap.ts` | USDC／USD1／U ↔ USDT（`AtpBorrowCashSwapper`）：關閉後留在帳戶的借款幣換回 USDT；補差額的計畫在 `strategy-earn-v2.ts` 的 `planTopUp`／`settleRepayment`（見下） |
 | `src/strategy-cash-swaps.ts` | 現金帳本的規則：補差額／USDT 路線的還款從投組自己的現金（`allocated_cash_raw`）扣、換回來的加回去，每個事件只記一次；漏記的補記（`recoverCashSwaps`） |
 
-測試：`test/strategy-earn-routing-v2.test.ts`、`test/strategy-earn-v2-chain.test.ts`、`test/sponsor-flows.test.ts`（兩種帳戶的每一種 UserOp 過 `sponsor()`，含 swapper）、`test/strategy-earn.test.ts`（同一組 endpoint 由 v1 或 v2 回答）、`test/strategy-earn-v2.test.ts`（排程器：補現金的小額賣出、全部賣出時先賣閒置的部分）、`test/strategy-cash-swaps.db.test.ts`（真 SQL：現金帳本的規則）、`test/strategy-earn-v2.fork.ts`（chain 97 fork，真合約：含已部署的 CallPolicy 對 swapper 兩個 selector 的放行與其餘的拒絕、非 USDT 路線負利差 → `topUp` → 關閉 → `cashOut`；**帳戶沒有任何帳本外的 USDT** 時的關加息與全部賣出，基金帳戶／自建組合帳戶 × USD1／USDT 路線共四組）。
+測試：`test/strategy-earn-routing-v2.test.ts`、`test/strategy-earn-v2-chain.test.ts`、`test/sponsor-flows.test.ts`（兩種帳戶的每一種 UserOp 過 `sponsor()`，含 swapper）、`test/strategy-earn.test.ts`（同一組 endpoint 由 v1 或 v2 回答）、`test/strategy-earn-v2.test.ts`（排程器：補現金的小額賣出、全部賣出時先賣閒置的部分）、`test/strategy-cash-swaps.db.test.ts`（真 SQL：現金帳本的規則）、`test/strategy-earn-v2.fork.ts`（chain 97 fork，真合約：含已部署的 CallPolicy 對 swapper 兩個 selector 的放行與其餘的拒絕、非 USDT 路線負利差 → `topUp` → 關閉 → `cashOut`；**帳戶沒有任何帳本外的 USDT** 時的關加息與全部賣出，基金帳戶／自建組合帳戶 × USD1／USDT 路線共四組；補現金的小額賣出另有一組用真的贖回規劃器報價、由真的 `AtpExecutor` 成交：要 1 USDT、賣出約 0.0000147 BTCB、到手 0.9895 USDT）。
 
 ## 開關：誰用 v2
 

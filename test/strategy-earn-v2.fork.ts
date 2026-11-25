@@ -27,6 +27,9 @@ const OPERATOR = '0xd8ce3295e05ca138e0d0d7214c4fd630c43f9d7f' as Address; // reg
 const KEEPER = '0x4a07cdac26afdc89eb47d653a95b8abf6b1f4b0a' as Address;
 const NVDAB = T.assets.NVDAB.token as Address;
 const skip = rpc ? false : 'FORK_RPC_URL not set';
+const FUND_ACCOUNT = '0x3a761e26ed26d417c7d59e259473f1b0ddcd04e5' as Address; // fund 40's account of the canary owner (testnet portfolio 12): enrolled in a public fund
+const MIX_ACCOUNT = '0xc1f64db181e29912dcf8ffd1d70f6e1821ef97c1' as Address; // My mix 16's account of the same owner (testnet portfolio 30): enrolled in its own private strategy
+const CANARY = '0xd3ab39b62e221bf9e8ba19fe19b2638767d3d6d9' as Address;
 /** V2_FORK_TRACE=1 prints each step as it starts (a fork that has to fetch state can be slow; this shows where). */
 const mark = (label: string) => { if (process.env.V2_FORK_TRACE === '1') console.error(`[v2 fork] ${new Date().toISOString().slice(11, 19)} ${label}`); };
 
@@ -71,6 +74,114 @@ function setup() {
 const names = (calls: readonly Call[], v2: { executor: Address; swapper?: Address | null }) => calls.map(c => c.to === v2.executor ? decodeFunctionData({ abi: V2_EXECUTOR_ABI, data: c.data }).functionName
   : c.to === v2.swapper ? decodeFunctionData({ abi: V2_SWAPPER_ABI, data: c.data }).functionName : c.data.startsWith('0x095ea7b3') ? 'approve' : c.to);
 const ERC20 = parseAbi(['function balanceOf(address) view returns (uint256)', 'function allowance(address,address) view returns (uint256)', 'function transfer(address,uint256) returns (bool)', 'function mint(address to, uint256 amount)']);
+
+/**
+ * The cash raise as the scheduler sends it: `planCashRaise` with the real redeem planner (oracle floor, routed step) and
+ * the sale executed by the real AtpExecutor from the account — no played sale. A plain turn-off on a mix account that
+ * holds no USDT at all: the owner repays what the box holds, the round reports the USDT it is short of, the portfolio sells
+ * about 1 USDT of its free shares, and the next round tops up, closes and sells the leftover.
+ * No months of time travel here: the price feeds must stay fresh for the sale (the fork's clock is held near its fork block),
+ * which is also why this test comes first in the file — the ones below move the fork's clock by months.
+ */
+test('routing v2 fork, cash raise through the real AtpExecutor: a turn-off with no USDT at all ends clean after one small sale of free shares', { skip }, async () => {
+  const { planCashRaise, cashRaiseUsdE8 } = await import('../src/scheduler.js');
+  const { buildRedeemPlan } = await import('../src/operator.js');
+  const { EXECUTOR_ABI } = await import('../src/chain.js');
+  const s = setup(), { v2, reader, client } = s;
+  const X = MIX_ACCOUNT, send = s.sender(X), lines: string[] = [];
+  const USDT = v2.loanTokens.USDT!, USD1 = v2.loanTokens.USD1!, C = (T.assets.BTCB.token as string).toLowerCase() as Address, POOL = T.assets.BTCB.pool as Address, ATP = T.contracts.executor as Address;
+  const bal = (token: Address, who: Address = X) => client.readContract({ address: token, abi: ERC20, functionName: 'balanceOf', args: [who] });
+  const move = async (token: Address, from: Address, to: Address, amount: bigint) => { if (amount === 0n) return; const w = await s.from(from); const r = await mined(client, await w.writeContract({ address: token, abi: ERC20, functionName: 'transfer', args: [to, amount], gas: 300_000n })); assert.equal(r.status, 'success'); };
+  const SINK = '0x000000000000000000000000000000000000dEaD' as Address;
+  // Hold the fork's clock just after its fork block (anvil would otherwise stamp new blocks with the wall clock, hours later).
+  const forked = await client.getBlock();
+  await s.local.setNextBlockTimestamp({ timestamp: forked.timestamp + 12n }); await s.local.mine({ blocks: 1 });
+  const multicall = v2Multicall(client), operator = s.sender(OPERATOR), chainNow = (await s.now()).getTime();
+  await runRateReport({ v2, reader, multicall, now: () => chainNow, rates: book => fromTestnetMocks(v2, book, multicall), signer: { address: OPERATOR, send: async (to, data) => (await operator([{ to, data, value: '0' }])).hash } });
+  reader.invalidate();
+  const m = await reader.market();
+  const before = await reader.account(X);
+  assert.ok(before.enrollment !== null && before.routes.length === 0);
+  const cash = { own: 0n };
+  const booked: string[] = [];
+  const ledger: V2Ledger = { ...s.ledger, swaps: async (_p, _a, events) => { for (const e of events) { booked.push(e.kind); const out = e.kind === 'top_up' || e.kind === 'repay_cash'; cash.own = out ? (cash.own > e.usdtRaw ? cash.own - e.usdtRaw : 0n) : cash.own + e.usdtRaw; } } };
+  const cashClaims = async () => ({ claimedRaw: cash.own, ownRaw: cash.own });
+  const needs: bigint[] = [], sent: string[][] = [];
+  const tracked = async (calls: Call[]) => { sent.push(names(calls, v2) as string[]); return send(calls); };
+  const step = async () => ({ v2, reader, account: X, portfolioId: 1, now: await s.now(), dryRun: false, send: tracked, ledger, log: (l: string) => lines.push(l), held: [C], cashClaims, onCashNeed: (n: bigint) => { needs.push(n); } });
+  const api = createStrategyEarnV2Api({ v2, reader, now: s.clock, cashClaims, bookSwaps: (id, account, events) => ledger.swaps!(id, account, events), log: () => {} });
+
+  mark('raise: fund, consent, open on Lista/USD1, move the money to the 0% vault, ten minutes');
+  for (const token of [USDT, USD1, v2.loanTokens.USDC!, v2.loanTokens.U!, C]) await move(token, X, SINK, await bal(token));
+  await move(C, POOL, X, await bal(C, POOL) / 2_000n);
+  let read = await reader.account(X, [C]);
+  let held = read.state.holdings.find(h => h.collateral === C)!;
+  if (held.collateralUsd > 600 || held.collateralUsd < 300) {
+    const want = held.freeCollateralRaw * 400n / BigInt(Math.max(1, Math.round(held.collateralUsd)));
+    if (want < held.freeCollateralRaw) await move(C, X, SINK, held.freeCollateralRaw - want); else await move(C, POOL, X, want - held.freeCollateralRaw);
+    read = await reader.account(X, [C]); held = read.state.holdings.find(h => h.collateral === C)!;
+  }
+  const total = held.freeCollateralRaw;
+  const auto = await api.auto(X, CANARY, { budgetRaw: 0n, weights: [{ asset: C, weightBps: 10_000 }], keyReady: true });
+  if (auto.status !== 'ready') throw new Error('consent unavailable');
+  await send(auto.calls!);
+  const route = m.routes.find(r => r.symbol === 'BTCB' && r.venue === 'lista' && r.loanSymbol === 'USD1')!;
+  const zeroVault = m.vaults.find(v => v.venue === 'venus' && v.tokenSymbol === 'USD1')!;
+  const goodVault = m.vaults.filter(v => v.tokenSymbol === 'USD1' && v.eligible && v.vaultId !== zeroVault.vaultId)[0]!;
+  const soon = async () => BigInt(Math.floor((await s.now()).getTime() / 1000) + 600);
+  await send([v2Calls.open(v2, X, route.routeId, goodVault.vaultId, total, BigInt(Math.round(held.collateralUsd * route.targetLtvBps / 10_000 * 0.9 * 1e6)) * 10n ** 12n, await soon())]);
+  await send([v2Calls.switchVault(v2, X, goodVault.vaultId, zeroVault.vaultId, maxUint256, await soon())]);
+  await s.local.increaseTime({ seconds: 600 }); await s.local.mine({ blocks: 1 });
+  await s.now();
+  read = await reader.account(X, [C]);
+  const debt0 = read.tokens.USD1!.debtRaw;
+  assert.ok(debt0 > read.vaults.reduce((sum, v) => sum + v.assetsRaw, 0n) && await bal(USDT) === 0n, 'a small gap, and no USDT at all in the account');
+
+  mark('raise: the owner turns the strategy off');
+  const off = await api.close(X, { symbols: ['BTCB'] });
+  if (off.status !== 'ready') throw new Error('close not ready');
+  assert.deepEqual(names(off.calls, v2), ['executeReduce', v2.registry]);
+  for (const batch of off.batches) await send(batch);
+  assert.equal(await v2AutoRound(await step()), null);
+  assert.deepEqual([sent.length, needs.length], [0, 1]);
+  const need = needs[0]!;
+
+  mark('raise: planCashRaise with the real redeem planner, executed by the real AtpExecutor');
+  read = await reader.account(X, [C]);
+  const posted = read.routes[0]!.collateralRaw, free = await bal(C);
+  assert.ok(posted > 0n && free > total * 97n / 100n);
+  const oracle = await client.readContract({ address: ATP, abi: EXECUTOR_ABI, functionName: 'oracle' });
+  const [unit] = await client.readContract({ address: oracle, abi: parseAbi(['function previewSwap(address,address,uint256) view returns(uint256,uint256)']), functionName: 'previewSwap', args: [C, USDT, 10n ** 18n] });
+  const block = await client.getBlockNumber(), at = await s.now();
+  // The scheduler's own view of the portfolio: holdings include the posted shares, which the plan must not offer.
+  const holdings = [{ asset: C, amountWei: free + posted, decimals: 18, usdPriceE8: unit / 10n ** 10n, priceSource: 'oracle' as const }, { asset: USDT, amountWei: 0n, decimals: 18, usdPriceE8: 100_000_000n, priceSource: 'numeraire' as const }];
+  const totalUsdE8 = (free + posted) * (unit / 10n ** 10n) / 10n ** 18n;
+  const input = { portfolioId: 1, account: X, plan: { portfolioId: 1, strategyId: 1, account: X, chainId: 97, snapshot: { portfolioId: 1, block, nativeBalanceWei: 0n, holdings, unpriced: [], strategyEarnCollateral: [{ asset: C, marketId: route.routeId, amount: posted }] },
+    targets: [{ asset: C, weightBps: 10_000 }, { asset: USDT, weightBps: 0 }], report: { totalUsdE8 }, thresholdBps: 100, blocked: [], pinnedVersion: { version: 1, onchainStrategyId: Number(before.enrollment!.strategyId), paused: false } } } as never;
+  const plan = await planCashRaise(input, need, { chainId: 97, now: at, sell: async (i, usd) => (await buildRedeemPlan(i, { sellUsdE8: usd }, { publicClient: client as never, executor: ATP, registry: T.contracts.registry as Address, now: () => at })).plan });
+  assert.equal(plan.kind, 'ready', JSON.stringify(plan, (_k, v) => typeof v === 'bigint' ? v.toString() : v));
+  if (plan.kind !== 'ready') return;
+  assert.deepEqual([plan.steps.length, plan.steps[0]!.tokenIn.toLowerCase(), plan.steps[0]!.tokenOut.toLowerCase(), plan.purpose], [1, C, USDT.toLowerCase(), undefined]);
+  assert.ok(plan.steps[0]!.amountIn < free / 100n, 'a small part of the free shares');
+  const wallet = await s.from(X);
+  const sale = await mined(client, await wallet.writeContract({ address: ATP, abi: EXECUTOR_ABI, functionName: 'executeRebalance', args: [X, plan.steps.map(st => ({ tokenIn: st.tokenIn, tokenOut: st.tokenOut, amountIn: st.amountIn, amountOutMin: st.amountOutMin, venue: st.venue, data: st.data })), plan.deadline], gas: 3_000_000n }));
+  assert.equal(sale.status, 'success', 'the small sale goes through the executor (floor, fee, venue allowlist)');
+  const proceeds = await bal(USDT);
+  cash.own += proceeds; // settleAllocatedCash: the receipt's cash delta becomes the portfolio's own cash
+  assert.deepEqual([await bal(C), proceeds >= need, proceeds > 9n * 10n ** 17n && proceeds < 11n * 10n ** 17n], [free - plan.steps[0]!.amountIn, true, true], `sold ${plan.steps[0]!.amountIn} for ${proceeds} USDT (asked ${cashRaiseUsdE8(need)} e8, need ${need})`);
+
+  mark('raise: the next round tops up, closes and sells the leftover');
+  assert.match(await v2AutoRound(await step()) ?? '', /已執行：BTCB close\(disabled\)/);
+  // Ten minutes of interest is a debt of a few 1e-5 USD1: the top-up's buffer leaves less than 0.000001 USD1 behind, which is
+  // not worth a swap (it can come back as 0 USDT, spec §17) — so no cash-out here; anything of 0.000001 or more would be sold.
+  assert.deepEqual([sent.flat().slice(0, 2), sent.flat().slice(2).every(n => n === 'cashOut'), booked[0]], [['topUp', 'executeReduce'], true, 'top_up']);
+  read = await reader.account(X, [C]);
+  assert.deepEqual([read.routes.filter(x => x.collateralRaw > 0n || x.routeDebtRaw > 0n).length, read.tokens.USD1!.debtRaw, read.tokens.USD1!.idleRaw, read.vaults.reduce((sum, v) => sum + v.assetsRaw, 0n), read.policy.enabled], [0, 0n, 0n, 0n, false]);
+  const dust = await bal(USD1);
+  assert.ok(dust < V2_CASH_OUT_MIN_RAW, `USD1 left in the account: ${dust} raw (under 0.000001)`);
+  assert.deepEqual([await bal(C), await bal(USDT)], [total - plan.steps[0]!.amountIn, cash.own], 'every share but the sold ones is back, ledger == chain');
+  console.log(JSON.stringify({ cashRaise: { needUsdt: need.toString(), askedUsdE8: cashRaiseUsdE8(need).toString(), soldRaw: plan.steps[0]!.amountIn.toString(), proceedsUsdt: proceeds.toString(), debt: debt0.toString(), ownCashAfter: cash.own.toString(), usd1DustRaw: dust.toString(), sent } }));
+});
 
 test('routing v2 fork: consent -> open on the best route -> hold -> vault left on a 0% vault is switched back -> rewards box -> account -> rate report -> deleverage at the health line -> repay before a sale -> full exit', { skip }, async () => {
   const s = setup(), { v2, reader, client } = s;
@@ -451,9 +562,6 @@ test('routing v2 fork, cash swapper: a USD1 route whose vault earned less than t
  * the sold shares out and its USDT proceeds in (booked as the portfolio's own cash, as settleAllocatedCash does), and the
  * cash ledger by the two numbers the strategy reads from it. Everything on the v2 side is the real code on the real contracts.
  */
-const FUND_ACCOUNT = '0x3a761e26ed26d417c7d59e259473f1b0ddcd04e5' as Address; // fund 40's account of the canary owner (testnet portfolio 12): enrolled in a public fund
-const MIX_ACCOUNT = '0xc1f64db181e29912dcf8ffd1d70f6e1821ef97c1' as Address; // My mix 16's account of the same owner (testnet portfolio 30): enrolled in its own private strategy
-const CANARY = '0xd3ab39b62e221bf9e8ba19fe19b2638767d3d6d9' as Address;
 for (const [kind, loan] of [['fund', 'USD1'], ['mix', 'USDT'], ['mix', 'USD1'], ['fund', 'USDT']] as const) {
   test(`routing v2 fork, no USDT outside the cash ledger (${kind} account, ${loan} route): turn-off and sell-all with the strategy on both end with no debt, no posted collateral, no loan token left and a ledger equal to the chain balance`, { skip }, async () => {
     const { cashRaiseUsdE8 } = await import('../src/scheduler.js');

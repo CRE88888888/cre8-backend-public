@@ -1365,6 +1365,7 @@ test('listPortfolioActivity：join 前後快照、新到舊、沒有快照的輪
       rows: [
         {
           id: '12',
+          type: 'rebalance',
           state: 'confirmed',
           tx_hash: '0xabc',
           user_op_hash: '0xdef',
@@ -1374,9 +1375,12 @@ test('listPortfolioActivity：join 前後快照、新到舊、沒有快照的輪
           drift_after: 6,
           usd_before: '500000000000',
           usd_after: '499469000000',
+          cash_before: '330000000000',
+          cash_after: '30000000',
         },
         {
           id: '11',
+          type: 'withdraw',
           state: 'noop',
           tx_hash: null,
           user_op_hash: null,
@@ -1386,6 +1390,8 @@ test('listPortfolioActivity：join 前後快照、新到舊、沒有快照的輪
           drift_after: null,
           usd_before: null,
           usd_after: null,
+          cash_before: null,
+          cash_after: null,
         },
       ],
       rowCount: 2,
@@ -1409,7 +1415,14 @@ test('listPortfolioActivity：join 前後快照、新到舊、沒有快照的輪
   assert.equal(activity[1]?.usdAfterE8, null);
   assert.match(seen[0]?.sql ?? '', /left join portfolio_snapshots b/);
   assert.match(seen[0]?.sql ?? '', /order by o\.id desc/);
-  assert.deepEqual(seen[0]?.params, [1682, 20]);
+  // 種類與前後現金：前端靠這兩樣寫出「買入／賣出」與成交額（總值在買賣前後幾乎不變，不能當成交額）。
+  assert.deepEqual([activity[0]?.type, activity[0]?.cashBeforeE8, activity[0]?.cashAfterE8], ['rebalance', '330000000000', '30000000']);
+  assert.deepEqual([activity[1]?.type, activity[1]?.cashBeforeE8, activity[1]?.cashAfterE8], ['withdraw', null, null]);
+  assert.match(seen[0]?.sql ?? '', /o\.type/);
+  assert.match(seen[0]?.sql ?? '', /lower\(c\.asset\) = \$3/);
+  // 現金＝這條鏈的 numeraire（小寫地址）；測試環境是 chain 97 的 USDT。
+  assert.deepEqual(seen[0]?.params.slice(0, 2), [1682, 20]);
+  assert.match(String(seen[0]?.params[2]), /^0x[0-9a-f]{40}$/);
 });
 
 // 回歸（實測踩到）：`GET /assets` 回 500，因為 probe 的**每一次** `oracleOf` 都是鏈上讀取，

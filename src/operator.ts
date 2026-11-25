@@ -1,6 +1,6 @@
 import { assetsMarketOpen } from './trading-calendar.js';
 import { MAX_USER_OP_STEPS } from './execution-batch.js';
-import { MIN_BATCH_USDT } from './strategy-execution.js';
+import { MIN_BATCH_USDT, numeraireFor } from './strategy-execution.js';
 import { configuredChainId, TESTNET_97, testnetAssets } from './testnet-profile.js';
 import { cancelJob, lockCash, readJob, unresolvedSql } from './strategy-jobs.js';
 import { OWNER_DEX_WAIT_MS, withDexLock } from './dex-queue.js';
@@ -1062,6 +1062,11 @@ export async function previewOperatorRebalance(
 
 export type PortfolioActivity = {
   id: number;
+  /**
+   * `operations.type`。`rebalance` = 一輪交易（買入、賣出、再平衡都是這個值，方向看下面的現金差）；
+   * `withdraw` = USDT 離開帳戶回到 owner 錢包（鏈上對帳補記的，沒有快照）。
+   */
+  type: string;
   state: string;
   txHash: string | null;
   userOpHash: string | null;
@@ -1073,6 +1078,13 @@ export type PortfolioActivity = {
   /** 前後總值（USD，1e8 定點）。差額就是這一輪的成本。 */
   usdBeforeE8: string | null;
   usdAfterE8: string | null;
+  /**
+   * 前後快照裡的現金（numeraire，USD 1e8 定點）。`after − before`：負的 = 這一輪用掉這麼多現金買入，
+   * 正的 = 賣出收回這麼多。總值（usd*E8）在買賣前後幾乎不變，不能拿來當成交額。
+   * `null` = 那一邊沒有快照；有快照但帳上沒有現金是 `"0"`。
+   */
+  cashBeforeE8: string | null;
+  cashAfterE8: string | null;
 };
 
 export type ActivityDeps = {
@@ -1082,6 +1094,7 @@ export type ActivityDeps = {
 
 type ActivityRow = {
   id: unknown;
+  type: unknown;
   state: unknown;
   tx_hash: unknown;
   user_op_hash: unknown;
@@ -1091,6 +1104,8 @@ type ActivityRow = {
   drift_after: unknown;
   usd_before: unknown;
   usd_after: unknown;
+  cash_before: unknown;
+  cash_after: unknown;
 };
 
 /**
@@ -1111,9 +1126,15 @@ export async function listPortfolioActivity(
   await owned(portfolioId, wallet, undefined);
 
   const { rows } = await find<ActivityRow>(
-    `select o.id, o.state, o.tx_hash, o.user_op_hash, o.attempts, o.created_at,
+    `select o.id, o.type, o.state, o.tx_hash, o.user_op_hash, o.attempts, o.created_at,
             b.gross_drift_bps as drift_before, a.gross_drift_bps as drift_after,
-            b.total_usd_e8 as usd_before, a.total_usd_e8 as usd_after
+            b.total_usd_e8 as usd_before, a.total_usd_e8 as usd_after,
+            case when b.block is null then null else coalesce((select trunc(c.usd_value * 100000000)::text
+              from positions_snapshots c where c.portfolio_id = o.portfolio_id and c.block = b.block and c.phase = 'before'
+               and lower(c.asset) = $3 and c.usd_value is not null limit 1), '0') end as cash_before,
+            case when a.block is null then null else coalesce((select trunc(c.usd_value * 100000000)::text
+              from positions_snapshots c where c.portfolio_id = o.portfolio_id and c.block = a.block and c.phase = 'after'
+               and lower(c.asset) = $3 and c.usd_value is not null limit 1), '0') end as cash_after
        from operations o
        left join portfolio_snapshots b
               on b.portfolio_id = o.portfolio_id and b.operation_id = o.id and b.phase = 'before'
@@ -1122,7 +1143,7 @@ export async function listPortfolioActivity(
       where o.portfolio_id = $1
       order by o.id desc
       limit $2`,
-    [portfolioId, limit],
+    [portfolioId, limit, numeraireFor(configuredChainId()).toLowerCase()],
   );
 
   return rows.map((row) => {
@@ -1130,6 +1151,7 @@ export async function listPortfolioActivity(
     const text = (value: unknown): string | null => (typeof value === 'string' ? value : null);
     return {
       id: Number(row.id),
+      type: String(row.type),
       state: String(row.state),
       txHash: text(row.tx_hash),
       userOpHash: text(row.user_op_hash),
@@ -1139,6 +1161,8 @@ export async function listPortfolioActivity(
       driftAfterBps: num(row.drift_after),
       usdBeforeE8: text(row.usd_before),
       usdAfterE8: text(row.usd_after),
+      cashBeforeE8: text(row.cash_before),
+      cashAfterE8: text(row.cash_after),
     };
   });
 }

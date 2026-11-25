@@ -71,6 +71,14 @@ USDT 在連續買入間逐筆檢查；所有 mint／approve／swap／push 都記
 | `network` | RPC／網路層：任何 HTTP 狀態（403、429、5xx…）、回傳不是 JSON、timeout、連線錯誤、節點端的 JSON-RPC 錯誤（限流、額度、內部錯誤） | 退避重試，不停止 |
 | `retry` | 其他全部：合約 revert、與其他交易者的競態（`pool changed since inspection`、`swap result mismatch`）、舊區塊／區塊不前進、觀測值不合理、未知錯誤 | 同上，退避重試，不停止 |
 
+主迴圈裡會走到「已停止，請手動重啟」的只剩這幾條（`classifyKeeperError` 回 `fatal`）：RPC 回報的 chain id 不是 97（`chain 97 only`）、
+預撥 USDT 低於門檻（`prefunded USDT inventory below minimum`／`USDT inventory must be prefunded`）、gas 餘額不足（`insufficient funds`）。
+設定、劇本、manifest、鏈上角色的錯誤只會在啟動時出現，同樣是 `fatal`。
+
+其餘執行中的原因全部重試，包含檢查完池子到送出成交之間被別人動過的良性競態（2026-11-25 16:43、18:55 UTC 各讓舊版停一次）：
+`pool changed since inspection`、報價／估 gas 因價格變動而 revert、`swap budget cannot reach target`、成交上鏈但因滑價 revert（`transaction not confirmed`）、
+`swap result mismatch`，以及 nonce 衝突／replacement 被拒（當成寫入結果不明處理）。這一檔這一輪跳過，其他市場與 feed 照常，下一輪重新檢查再做。
+
 - 退避：5 秒 → 15 秒 → 60 秒 → 90 秒 → 之後每 120 秒。每次重試都從新的 head 與全體 inspection 開始，
   成交頻率仍由鏈上 observation 時間限制，不重播原本的指令。
 - 啟動時的鏈上核對（verify）用同一套：RPC 拒絕或逾時就等，不讓行程結束（不會變成 CRASHED）。

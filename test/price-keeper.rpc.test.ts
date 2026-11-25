@@ -172,7 +172,7 @@ test('keeper HTTP RPC timeout is bounded and never retried', async () => {
 });
 
 test('keeper writes require a successful canonical receipt; a lost broadcast or receipt is an unknown outcome and is never sent again', async () => {
-  for (const fault of ['', 'broadcast', 'reverted', 'replaced', 'reorg', 'receipt RPC', 'broadcast HTTP', 'receipt timeout']) {
+  for (const fault of ['', 'broadcast', 'reverted', 'replaced', 'reorg', 'receipt RPC', 'broadcast HTTP', 'receipt timeout', 'nonce too low', 'replacement transaction underpriced']) {
     const manifest = parseManifest(manifestInput());
     const market = manifest.markets[0]; assert.ok(market);
     const hash = `0x${'ab'.repeat(32)}`;
@@ -189,6 +189,8 @@ test('keeper writes require a successful canonical receipt; a lost broadcast or 
           sends++;
           if (fault === 'broadcast') throw new Error('secret credential in unknown broadcast');
           if (fault === 'broadcast HTTP') throw new HttpRequestError({ url: 'https://private-token.invalid/key', status: 503 });
+          // A nonce clash with a transaction still in the pool: not a reason to stop, the engine waits for it to settle.
+          if (fault === 'nonce too low' || fault === 'replacement transaction underpriced') throw new RpcRequestError({ body: {}, url: 'https://private-token.invalid/key', error: { code: -32000, message: fault } });
           return hash;
         case 'eth_getTransactionByHash':
           if (fault === 'receipt RPC') throw new Error('secret credential in receipt RPC');

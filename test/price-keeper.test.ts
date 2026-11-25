@@ -375,6 +375,85 @@ test('a dead RPC ends the round after three failed markets instead of waiting ou
   assert.equal(reads, 3); assert.equal(f.state.swaps.length, 0); assert.equal(f.state.pushes.length, 0);
 });
 
+test('2026-11-25 18:55: another trade moving a pool between inspection and swap skips that market for one round and never stops the keeper', async () => {
+  const rpc = (message: string) => new RpcRequestError({ body: {}, url: 'https://private-token.invalid/key', error: { code: -32000, message } });
+  const races: [string, () => Error, RegExp][] = [
+    ['pool moved before the swap', () => new Error('pool changed since inspection'), /swap BTCB: pool changed since inspection; class=retry/],
+    ['quote or gas estimate reverts on the moved price', () => new Error('private-token wrapper', { cause: new ContractFunctionRevertedError({ abi: parseAbi(['function fail()']), functionName: 'fail', data: '0x' }) }), /swap BTCB: ContractFunctionRevertedError; class=retry/],
+    ['node reports the revert as a plain RPC error', () => rpc('execution reverted: SPL private-token'), /swap BTCB: RpcRequestError code=-32000; class=retry/],
+    ['budget no longer reaches the target', () => new Error('swap budget cannot reach target'), /swap BTCB: swap budget cannot reach target; class=retry/],
+    ['swap mined but reverted on slippage', () => new Error('transaction not confirmed'), /swap BTCB: transaction not confirmed; class=retry/],
+    ['pool moved again right after the swap', () => new Error('swap result mismatch'), /swap BTCB: swap result mismatch; class=retry/],
+  ];
+  for (const [name, fault, line] of races) {
+    const f = fixture(); f.state.balances.set(addr(1), 10n ** 30n); const swap = f.io.swap; let pending = 1;
+    f.io.swap = async (o, target, budget) => {
+      if (o.market.symbol === 'BTCB' && pending > 0) { pending--; throw fault(); }
+      await swap(o, target, budget); o.lastObservation = f.state.head.timestamp;
+    };
+    await retried(f, line);
+    assert.equal(f.state.swaps.length, 104, name); assert.ok(!f.state.swaps.includes('BTCB'), name);
+    assert.equal(f.state.pushes.length, 12, `${name}: the other markets and the feed set are not held back`);
+    const inspections = f.state.inspections;
+    f.state.now += 5000; f.state.head = { number: 101n, timestamp: 1065n };
+    await f.keeper.round();
+    assert.ok(f.state.inspections > inspections, `${name}: the next round inspects again`);
+    assert.equal(f.state.swaps.length, 105, name); assert.equal(f.state.swaps.at(-1), 'BTCB', name);
+    assert.equal(f.keeper.retryDelayMs, 0, name); assert.equal(f.state.alerts.length, 0, name);
+    assert.doesNotMatch(f.state.logs.join('\n'), /private-token|https:/, name);
+  }
+  // A nonce clash or a replacement refused by the node: the outcome of that write is unknown, so the round ends,
+  // the keeper waits until nothing of its own is pending and then carries on by itself.
+  for (const message of ['nonce too low', 'replacement transaction underpriced', 'already known']) {
+    const f = fixture(); f.state.balances.set(addr(1), 10n ** 30n); const swap = f.io.swap; let pending = 1;
+    f.io.swap = async (o, target, budget) => {
+      if (o.market.symbol === 'BTCB' && pending > 0) { pending--; throw new Error(UNSETTLED, { cause: rpc(`${message} private-token`) }); }
+      await swap(o, target, budget); o.lastObservation = f.state.head.timestamp;
+    };
+    await retried(f, /swap BTCB: transaction outcome unknown; RpcRequestError code=-32000; class=retry/);
+    f.state.now += 5000; f.state.head = { number: 101n, timestamp: 1065n };
+    await f.keeper.round();
+    assert.equal(f.state.settledReads, 1, message); assert.equal(new Set(f.state.swaps).size, 105, message);
+    assert.equal(f.keeper.retryDelayMs, 0, message); assert.equal(f.state.alerts.length, 0, message);
+  }
+  // The same pool racing every round for more than half an hour: one report, the keeper and the other 104 markets keep going.
+  const f = fixture(); f.state.balances.set(addr(1), 10n ** 30n); const swap = f.io.swap; let racing = true; let block = 100n;
+  f.io.swap = async (o, target, budget) => {
+    if (o.market.symbol === 'BTCB' && racing) throw new Error('pool changed since inspection');
+    await swap(o, target, budget); o.lastObservation = f.state.head.timestamp;
+  };
+  const started = f.state.now; let rounds = 0;
+  while (f.state.now - started <= 1_900_000) {
+    await f.keeper.round(); rounds++;
+    f.state.now += f.keeper.retryDelayMs; f.state.head = { number: ++block, timestamp: BigInt(Math.floor(f.state.now / 1000)) };
+  }
+  // The retries 5 s and 15 s after the first round fall inside the 60 s per-pool interval, so those two trade nothing.
+  assert.ok(rounds > 15); assert.equal(f.state.swaps.length, (rounds - 2) * 104, 'every later round still trades the other 104 markets');
+  assert.ok(!f.state.swaps.includes('BTCB'));
+  assert.equal(f.state.alerts.length, 1); assert.match(f.state.alerts[0] ?? '', /已連續失敗 3\d 分鐘：swap BTCB: pool changed since inspection（class=retry）；行程沒有停止/);
+  racing = false; await f.keeper.round();
+  assert.ok(f.state.swaps.includes('BTCB')); assert.equal(f.keeper.retryDelayMs, 0);
+  assert.equal(f.state.alerts.length, 2); assert.match(f.state.alerts[1] ?? '', /已恢復/);
+});
+
+test('only configuration, roles and funds reach "已停止": every other runtime reason the keeper can raise is retried', async () => {
+  // Reasons the engine and the chain adapter raise while running (src/keeper/engine.ts, src/keeper/chain.ts).
+  const retried = ['invalid block time', 'block progress unavailable', 'old block', 'incomplete market observations', 'invalid market observation',
+    'invalid feed observation', 'invalid observation time', 'invalid replay time or asset', 'invalid price', 'feed precision unavailable',
+    'TWAP unavailable after swaps', 'recovery price precision unavailable', 'inventory precision unavailable', 'invalid inventory',
+    'mint balance mismatch', 'mint balance verification unavailable', 'transaction not confirmed', UNSETTLED, 'keeper transaction still pending',
+    'invalid gas price', 'invalid sqrt price inputs', 'sqrt price out of range', 'invalid pool price', 'feed unavailable', 'unexpected mock USDT/USD',
+    'pool observation capacity unavailable', 'missing observation', 'pool changed since inspection', 'swap budget cannot reach target',
+    'swap inventory too low', 'swap result mismatch', 'swap result verification unavailable'];
+  for (const reason of retried) {
+    assert.equal(classifyKeeperError(new Error(reason)), 'retry', reason);
+    assert.equal(safeReason(new Error(reason)), reason, `${reason}: named in the log`);
+  }
+  // These stop the keeper: a person has to change the RPC, refill USDT or refill gas.
+  for (const reason of ['chain 97 only', 'prefunded USDT inventory below minimum', 'USDT inventory must be prefunded']) assert.equal(classifyKeeperError(new Error(reason)), 'fatal', reason);
+  assert.equal(classifyKeeperError(new RpcRequestError({ body: {}, url: 'http://127.0.0.1:1', error: { code: -32000, message: 'insufficient funds for gas * price + value' } })), 'fatal');
+});
+
 test('a write lost in transit ends the round; nothing is sent until no keeper transaction is pending', async () => {
   const f = fixture(); const swap = f.io.swap; let lost = true;
   f.io.swap = async (o, target, budget) => {

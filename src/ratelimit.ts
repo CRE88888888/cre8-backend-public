@@ -58,7 +58,7 @@ export class MemoryRateLimitStore implements RateLimitStore {
   }
 }
 
-export type WalletAction = 'strategies' | 'versions' | 'portfolios' | 'plan' | 'redeem' | 'close' | 'assets' | 'enrollment-params' | 'enrollment-confirm';
+export type WalletAction = 'strategies' | 'versions' | 'portfolios' | 'plan' | 'read' | 'redeem' | 'close' | 'assets' | 'enrollment-params' | 'enrollment-confirm';
 
 async function consumeDaily(client: PoolClient, owner: string, action: string, limit: number): Promise<RateLimitDecision> {
   if (!/^0x[0-9a-f]{40}$/.test(owner) || /^0x0{40}$/.test(owner) ||
@@ -182,6 +182,7 @@ export class RequestRateLimiter {
       versions: { limit: this.config.versionsPerDay, windowMs: DAY_MS },
       portfolios: { limit: this.config.portfoliosPerDay, windowMs: DAY_MS },
       plan: { limit: this.config.planPerMinute, windowMs: MINUTE_MS },
+      read: { limit: this.config.readPerMinute, windowMs: MINUTE_MS },
       redeem: { limit: this.config.redeemPerMinute, windowMs: MINUTE_MS },
       close: { limit: this.config.closePerMinute, windowMs: MINUTE_MS },
       assets: { limit: this.config.assetsPerMinute, windowMs: MINUTE_MS },

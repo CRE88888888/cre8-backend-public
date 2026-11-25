@@ -596,3 +596,55 @@ test("DCA round for one portfolio (an owner's own buy): only the plan of that po
   asked.length = 0; await run();
   assert.deepEqual(asked, [[false, 10]]);
 });
+
+test('DCA list (GET /me/dca): every portfolio of the owner keyed by id, each entry identical to its own GET; the vaults are read once', async () => {
+  const stock = T.assets.NVDAB?.token ?? Object.values(T.assets)[0]?.token;
+  assert.ok(stock);
+  const other = '0x00000000000000000000000000000000000000b2' as Address;
+  const h = harness({ allocation: [stock], keyReady: true });
+  h.state.shares = 20n * E18; h.state.value = 20n * E18;
+  // Portfolio 7 (the harness account) has an open plan that is due; portfolio 9 (another account of the same owner) has none.
+  h.plans.push({ id: '1', chain_id: '97', portfolio_id: '7', account, owner, vault_id: 'lista_usdt', market_id: lista.marketId, total_raw: (20n * E18).toString(),
+    periods: 2, frequency: 'daily', tranche_raw: (10n * E18).toString(), start_at: new Date('2026-11-23T14:59:00Z'), state: 'active', periods_done: 0,
+    deposited_raw: (20n * E18).toString(), deposit_tx_hash: '0x' + 'd1'.repeat(32), deposited_at: new Date(), invested_raw: '0', returned_raw: '0',
+    close_reason: null, closed_at: null, created_at: new Date('2026-11-23T14:58:00Z') });
+  const inner = h.deps.query as unknown as (sql: string, params?: unknown[]) => Promise<{ rows: Row[] }>;
+  const listSql: unknown[][] = [];
+  h.deps.query = (async (sql: string, params: unknown[] = []) => {
+    const s = sql.replace(/\s+/g, ' ');
+    if (s.startsWith('select p.id::text,p.strategy_id::text,p.version,a.address from portfolios p join smart_accounts a')) {
+      listSql.push(params);
+      return { rows: params[0] === owner ? [{ id: '7', strategy_id: '3', version: 1, address: account }, { id: '9', strategy_id: '3', version: 1, address: other }] : [] };
+    }
+    // Plans belong to an account: the second portfolio's account has none.
+    if (s.includes('from dca_plans') && s.includes('order by (state in')) return { rows: h.plans.filter(p => p.account === params[0]).reverse().slice(0, 1) };
+    return inner(sql, params);
+  }) as unknown as DcaDeps['query'];
+  h.deps.owned = (async (id: number, wallet: string): Promise<OwnedPortfolio> => {
+    if (wallet.toLowerCase() !== owner) throw new AppError(403, 'FORBIDDEN', 'x');
+    return { id, userId: 'u', strategyId: 3, version: 1, scheduleState: 'active', createdAt: '', chainId: 97, accountAddress: id === 7 ? account : other, ownerAddress: owner, existingKeyRefs: [] };
+  }) as DcaDeps['owned'];
+  let heads = 0;
+  const base = (h.deps.chain as () => DcaChain)(), counted = { ...base, earn: { ...base.earn, head: async () => { heads += 1; return base.earn.head(); } } };
+  h.deps.chain = () => counted;
+  const dca = createDca(h.deps);
+  const listed = await dca.list(owner.toUpperCase().replace('0X', '0x'));
+  assert.equal(heads, 1, 'one vault read for the whole list');
+  assert.deepEqual(listSql, [[owner]]);
+  assert.deepEqual(Object.keys(listed.portfolios), ['7', '9']);
+  assert.equal(listed.owner, owner);
+  // Each entry is the single endpoint's answer, field for field.
+  assert.deepEqual(listed.portfolios['7'], await dca.get(7, owner));
+  assert.deepEqual(listed.portfolios['9'], await dca.get(9, owner));
+  assert.equal(listed.portfolios['7']?.plan?.state, 'active'); assert.equal(listed.portfolios['7']?.plan?.remainingRaw, (20n * E18).toString());
+  assert.deepEqual([listed.portfolios['9']?.status, listed.portfolios['9']?.plan, listed.portfolios['9']?.account], ['none', null, other]);
+  assert.equal(listed.updatedAt, listed.portfolios['7']?.updatedAt);
+  // An owner without portfolios: an empty map and no chain read at all.
+  heads = 0;
+  assert.deepEqual(await dca.list('0x00000000000000000000000000000000000000c3'), { owner: '0x00000000000000000000000000000000000000c3', portfolios: {}, updatedAt: null });
+  assert.equal(heads, 0);
+  // The vaults cannot be read: the list still answers (same as the single endpoint: plan fields that need the chain are null).
+  h.deps.chain = () => ({ ...counted, earn: { ...counted.earn, head: async () => { throw new Error('rpc down'); } } });
+  const offline = await createDca(h.deps).list(owner);
+  assert.deepEqual([offline.updatedAt, offline.portfolios['7']?.offer, offline.portfolios['7']?.plan?.remainingRaw, offline.portfolios['7']?.plan?.state], [null, null, null, 'active']);
+});

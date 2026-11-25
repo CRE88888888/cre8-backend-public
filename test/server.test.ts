@@ -1291,3 +1291,44 @@ test('#124 pending account deployment returns 202 and a retry hint without setup
     assert.deepEqual(await response.json(), { accountDeployed: false, retryAfterSeconds: 3, error: { code: 'ACCOUNT_DEPLOYMENT_PENDING', message: 'original account deployment is pending' } });
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
 });
+
+test('GET /me/dca: one request for every portfolio of the owner; display reads have their own budget, apart from writes and sponsorship', async () => {
+  const account = privateKeyToAccount(generatePrivateKey());
+  const calls: string[] = [];
+  const body = { owner: account.address.toLowerCase(), portfolios: { '7': { portfolioId: 7, status: 'none', plan: null } }, updatedAt: null };
+  const dca = {
+    list: async (wallet: string) => { calls.push(`list:${wallet.toLowerCase()}`); return body; },
+    get: async (id: number) => { calls.push(`get:${id}`); return { portfolioId: id, status: 'none', plan: null }; },
+    create: async (id: number) => { calls.push(`create:${id}`); return { status: 'unavailable', reason: 'no_open_vault', message: 'x' }; },
+  } as unknown as ServerDeps['dca'];
+  const mixes = { list: async () => { calls.push('mixes'); return { mixes: [] }; } } as unknown as ServerDeps['mixes'];
+  await withBudgetServer(async (base) => {
+    const token = await budgetToken(base, account);
+    const call = (path: string, method = 'GET') => fetch(base + path, { method, headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' }, ...(method === 'POST' ? { body: '{}' } : {}) });
+    assert.equal((await fetch(base + '/me/dca')).status, 401);
+    assert.equal((await call('/me/dca', 'POST')).status, 405);
+    const listed = await call('/me/dca');
+    assert.equal(listed.status, 200);
+    assert.equal(listed.headers.get('cache-control'), 'no-store');
+    assert.deepEqual(await listed.json(), body);
+    assert.deepEqual(calls, [`list:${account.address.toLowerCase()}`]);
+    // Display reads share the read budget (4 here): the list, a single portfolio's DCA, My mixes.
+    assert.deepEqual([(await call('/portfolios/7/dca')).status, (await call('/me/mixes')).status, (await call('/me/dca')).status], [200, 200, 200]);
+    const refused = await call('/me/dca');
+    assert.equal(refused.status, 429);
+    assert.equal((await call('/portfolios/7/dca')).status, 429);
+    // …and using it up leaves the write budget (plan, 1 here) untouched: starting a DCA still goes through, once.
+    assert.equal((await call('/portfolios/7/dca', 'POST')).status, 200);
+    assert.equal((await call('/portfolios/7/dca', 'POST')).status, 429);
+    assert.deepEqual(calls.slice(1), ['get:7', 'mixes', `list:${account.address.toLowerCase()}`, 'create:7']);
+  }, { dca, mixes, rateLimiter: new RequestRateLimiter({ ...loadRateLimitConfig({}), planPerMinute: 1, readPerMinute: 4 }, new MemoryRateLimitStore(), () => 1_000) });
+  // The other way round: a used-up write budget does not refuse the reads.
+  calls.length = 0;
+  await withBudgetServer(async (base) => {
+    const token = await budgetToken(base, account);
+    const call = (path: string, method = 'GET') => fetch(base + path, { method, headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' }, ...(method === 'POST' ? { body: '{}' } : {}) });
+    assert.equal((await call('/portfolios/7/dca', 'POST')).status, 429);
+    assert.deepEqual([(await call('/me/dca')).status, (await call('/portfolios/7/dca')).status], [200, 200]);
+  }, { dca, mixes, rateLimiter: new RequestRateLimiter({ ...loadRateLimitConfig({}), planPerMinute: 0, readPerMinute: 4 }, new MemoryRateLimitStore(), () => 1_000) });
+  assert.deepEqual([loadRateLimitConfig({}).planPerMinute, loadRateLimitConfig({}).readPerMinute, loadRateLimitConfig({ RATE_LIMIT_READ_PER_MINUTE: '45' }).readPerMinute], [30, 120, 45]);
+});

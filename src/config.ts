@@ -194,6 +194,8 @@ export type RateLimitConfig = {
   versionsPerDay: number;
   portfoliosPerDay: number;
   planPerMinute: number;
+  /** Display reads the App makes on every load (GET of My mixes, cash Earn, DCA, Strategy Earn): their own budget, apart from the writes in `plan`. */
+  readPerMinute: number;
   redeemPerMinute: number;
   closePerMinute: number;
   assetsPerMinute: number;
@@ -217,6 +219,7 @@ export function loadRateLimitConfig(env: NodeJS.ProcessEnv = process.env): RateL
     versionsPerDay: budget('RATE_LIMIT_VERSIONS_PER_DAY', 50),
     portfoliosPerDay: budget('RATE_LIMIT_PORTFOLIOS_PER_DAY', 20),
     planPerMinute: budget('RATE_LIMIT_PLAN_PER_MINUTE', 30),
+    readPerMinute: budget('RATE_LIMIT_READ_PER_MINUTE', 120),
     redeemPerMinute: budget('RATE_LIMIT_REDEEM_PER_MINUTE', 30),
     closePerMinute: budget('RATE_LIMIT_CLOSE_PER_MINUTE', 30),
     assetsPerMinute: budget('RATE_LIMIT_ASSETS_PER_MINUTE', 120),

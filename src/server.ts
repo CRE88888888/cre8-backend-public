@@ -523,7 +523,7 @@ async function route(
 
   if (root === 'me' && segments[1] === 'earn' && segments.length <= 3) {
     const wallet = await deps.auth.authenticate(req.headers.authorization);
-    await deps.rateLimiter.wallet('plan', wallet);
+    await deps.rateLimiter.wallet(displayRead(method), wallet);
     if (segments.length === 2) {
       if (method !== 'GET') return methodNotAllowed(res, ['GET']);
       sendJson(res, 200, await deps.cashEarn.account(wallet)); return;
@@ -541,7 +541,7 @@ async function route(
   if (root === 'me' && segments[1] === 'mixes' && segments.length >= 2 && segments.length <= 4) {
     const wallet = await deps.auth.authenticate(req.headers.authorization);
     if (segments.length === 2) {
-      if (method === 'GET') { await deps.rateLimiter.wallet('plan', wallet); sendJson(res, 200, await deps.mixes.list(wallet)); return; }
+      if (method === 'GET') { await deps.rateLimiter.wallet('read', wallet); sendJson(res, 200, await deps.mixes.list(wallet)); return; }
       if (method === 'POST') {
         sendJson(res, 201, await deps.mixes.create(await readJsonBody(req), wallet, req.headers['idempotency-key'],
           () => deps.rateLimiter.mixCreate(wallet, deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for'])))); return;
@@ -549,7 +549,7 @@ async function route(
       return methodNotAllowed(res, ['GET', 'POST']);
     }
     const id = parsePositiveInteger(segments[2] ?? '', 'mixId');
-    await deps.rateLimiter.wallet('plan', wallet);
+    await deps.rateLimiter.wallet(segments.length === 3 ? displayRead(method) : 'plan', wallet);
     if (segments.length === 3) {
       if (method === 'GET') { sendJson(res, 200, await deps.mixes.get(id, wallet)); return; }
       if (method === 'PATCH') {
@@ -609,7 +609,7 @@ async function route(
   }
   if (root === 'portfolios' && segments[2] === 'strategy-earn' && (segments.length === 3 || segments.length === 4)) {
     const wallet = await deps.auth.authenticate(req.headers.authorization);
-    await deps.rateLimiter.wallet('plan', wallet);
+    await deps.rateLimiter.wallet(displayRead(method), wallet);
     const id = parsePositiveInteger(segments[1] ?? '', 'portfolioId');
     if (segments.length === 3) {
       if (method !== 'GET') return methodNotAllowed(res, ['GET']);
@@ -640,10 +640,19 @@ async function route(
     }
   }
 
+  // DCA of every portfolio of the signed-in owner in one request: `portfolios[<id>]` = the body of GET /portfolios/<id>/dca.
+  if (root === 'me' && segments[1] === 'dca' && segments.length === 2) {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    await deps.rateLimiter.wallet('read', wallet);
+    sendJson(res, 200, await deps.dca.list(wallet), { 'cache-control': 'no-store' });
+    return;
+  }
+
   // DCA (定投, docs/dca.zh-TW.md): the not-yet-invested total sits in a vault owned by the portfolio account.
   if (root === 'portfolios' && segments[2] === 'dca' && (segments.length === 3 || segments.length === 4)) {
     const wallet = await deps.auth.authenticate(req.headers.authorization);
-    await deps.rateLimiter.wallet('plan', wallet);
+    await deps.rateLimiter.wallet(segments.length === 3 ? displayRead(method) : 'plan', wallet);
     const id = parsePositiveInteger(segments[1] ?? '', 'portfolioId');
     if (segments.length === 3) {
       if (method === 'GET') { sendJson(res, 200, await deps.dca.get(id, wallet)); return; }
@@ -1545,6 +1554,17 @@ function parseBoolean(raw: string | null, name: string): boolean | undefined {
   if (raw === 'true') return true;
   if (raw === 'false') return false;
   throw new ValidationError('INVALID_QUERY', `${name} must be "true" or "false"`);
+}
+
+/**
+ * Which wallet budget a request on a display route uses. The App reads these on every load and after every action
+ * (My mixes, cash Earn, DCA, Strategy Earn): a GET counts against `read` (120/min by default). Everything else on
+ * the same routes stays in `plan` (30/min), which the writes and the paymaster's sponsorship share. Before 2026-11-26
+ * the reads were in `plan` too: 25 portfolios = 26 reads per load, and the 429 that followed also refused the next
+ * sponsorship request.
+ */
+function displayRead(method: string): 'read' | 'plan' {
+  return method === 'GET' ? 'read' : 'plan';
 }
 
 function methodNotAllowed(res: ServerResponse, allowed: string[]): void {

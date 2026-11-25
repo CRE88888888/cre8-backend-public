@@ -188,6 +188,9 @@ export function usdtTransfers(logs: readonly { address: Address; topics: readonl
   return total;
 }
 
+/** What the read side needs of a portfolio (an `OwnedPortfolio` has all of it). */
+type Listed = Pick<OwnedPortfolio, 'id' | 'strategyId' | 'version' | 'accountAddress'>;
+const LIST_AT_ONCE = 6;
 const big = (v: string | null) => v === null ? null : BigInt(v);
 const lower = (a: string) => a.toLowerCase() as Address;
 const usdt = (raw: bigint) => `${(raw / 10n ** 18n).toLocaleString('en-US')}.${((raw % 10n ** 18n) / 10n ** 16n).toString().padStart(2, '0')}`;
@@ -232,7 +235,7 @@ export function createDca(overrides: Partial<DcaDeps> = {}) {
     return { chain, head, readings, views };
   }
   /** Smallest per-period amount: one complete 10 USDT fee-inclusive batch (no 50 USDT one-time minimum). */
-  async function minimumPerPeriod(p: OwnedPortfolio): Promise<bigint> {
+  async function minimumPerPeriod(p: Listed): Promise<bigint> {
     const row = (await deps.query<{ execution: unknown; allocation: unknown }>('select execution,allocation from strategy_versions where strategy_id=$1 and version=$2',
       [p.strategyId, p.version])).rows[0];
     const execution = row?.execution as AssetExecution | null | undefined;
@@ -250,7 +253,7 @@ export function createDca(overrides: Partial<DcaDeps> = {}) {
       ? ((row.allocation as { assets: { address?: unknown }[] }).assets).flatMap(a => typeof a.address === 'string' ? [a.address] : []) : [];
     return assetsMarketOpen(97, assets, deps.now(), owner);
   }
-  async function view(p: OwnedPortfolio, plan: PlanRow, l: Awaited<ReturnType<typeof live>> | null) {
+  async function view(p: Listed, plan: PlanRow, l: Awaited<ReturnType<typeof live>> | null) {
     const vault = vaultOf(plan.vault_id), i = deps.vaults.indexOf(vault), reading = l?.readings[i] ?? null, v = l?.views[i] ?? null;
     let remaining: bigint | null = null, maxWithdraw: bigint | null = null;
     if (l && reading && plan.state !== 'closed') {
@@ -282,15 +285,43 @@ export function createDca(overrides: Partial<DcaDeps> = {}) {
     return best ? { vaultId: best.id, name: best.name, apyBps: best.apyBps } : null;
   };
 
+  /** One portfolio's DCA state: the body of `GET /portfolios/:id/dca`, and one entry of `GET /me/dca`. */
+  async function state(p: Listed, l: Awaited<ReturnType<typeof live>> | null) {
+    const plan = await latestPlan(p.accountAddress);
+    return { portfolioId: p.id, account: lower(p.accountAddress), status: plan?.state ?? 'none', minimumPerPeriodRaw: (await minimumPerPeriod(p)).toString(),
+      frequencies: DCA_FREQUENCIES, minPeriods: DCA_MIN_PERIODS, maxPeriods: DCA_MAX_PERIODS, offer: offer(l?.views ?? null),
+      plan: plan ? await view(p, plan, l) : null, updatedAt: l ? new Date(Number(l.head.timestamp) * 1000).toISOString() : null };
+  }
+
   return {
     async get(id: number, wallet: string) {
       const p = await owned(id, wallet);
       let l: Awaited<ReturnType<typeof live>> | null = null;
       try { l = await live(); } catch { l = null; }
-      const plan = await latestPlan(p.accountAddress);
-      return { portfolioId: id, account: lower(p.accountAddress), status: plan?.state ?? 'none', minimumPerPeriodRaw: (await minimumPerPeriod(p)).toString(),
-        frequencies: DCA_FREQUENCIES, minPeriods: DCA_MIN_PERIODS, maxPeriods: DCA_MAX_PERIODS, offer: offer(l?.views ?? null),
-        plan: plan ? await view(p, plan, l) : null, updatedAt: l ? new Date(Number(l.head.timestamp) * 1000).toISOString() : null };
+      return state(p, l);
+    },
+    /**
+     * Every portfolio of this owner in one request (`GET /me/dca`): `portfolios[<id>]` is exactly what
+     * `GET /portfolios/<id>/dca` returns for it. The App asked once per portfolio on every load (25 portfolios = 25
+     * requests, each with its own vault reads); here the vaults are read once and shared.
+     */
+    async list(wallet: string) {
+      ready();
+      const owner = lower(wallet);
+      const rows = (await deps.query<{ id: string; strategy_id: string; version: number; address: string }>(`select p.id::text,p.strategy_id::text,p.version,a.address
+        from portfolios p join smart_accounts a on a.portfolio_id=p.id and a.chain_id=97 and a.retired_at is null
+        where lower(p.user_id)=$1 and lower(a.owner)=$1 order by p.id`, [owner])).rows;
+      let l: Awaited<ReturnType<typeof live>> | null = null;
+      if (rows.length > 0) try { l = await live(); } catch { l = null; }
+      const listed: Listed[] = rows.map(r => ({ id: Number(r.id), strategyId: Number(r.strategy_id), version: r.version, accountAddress: r.address }));
+      const portfolios: Record<string, Awaited<ReturnType<typeof state>>> = {};
+      // A few portfolios at a time: each one is a handful of small queries (and one position read when a plan is open).
+      for (let at = 0; at < listed.length; at += LIST_AT_ONCE) {
+        const part = listed.slice(at, at + LIST_AT_ONCE);
+        const states = await Promise.all(part.map(p => state(p, l)));
+        part.forEach((p, i) => { const s = states[i]; if (s) portfolios[String(p.id)] = s; });
+      }
+      return { owner, portfolios, updatedAt: l ? new Date(Number(l.head.timestamp) * 1000).toISOString() : null };
     },
     /** Returns the owner-signed calls (one UserOp from the portfolio account) that put the whole total into the vault. */
     async create(id: number, wallet: string, input: unknown) {

@@ -28,10 +28,13 @@
 | 方法與路徑 | body | 回應重點 |
 | --- | --- | --- |
 | `GET /portfolios/:id/dca` | — | `{portfolioId, account, status:"none"\|"awaiting_deposit"\|"active"\|"paused"\|"completed"\|"closed", minimumPerPeriodRaw, frequencies, minPeriods:2, maxPeriods:365, offer:{vaultId,name,apyBps}\|null, plan, updatedAt}`；`plan`＝`{id, state, vaultId, vaultName, apyBps, frequency, periods, periodsDone, totalRaw, trancheRaw, startAt, nextRunAt, waitingForMarket, waitingReason, buying, depositedRaw, investedRaw, returnedRaw, remainingRaw, maxWithdrawRaw, earnedRaw, authorization:"ready"\|"renewal_required", createdAt, closedAt, closeReason}` |
+| `GET /me/dca` | — | 登入錢包在這條鏈上所有投組的定投，一次回完：`{owner, portfolios:{"<portfolioId>": <與 GET /portfolios/:id/dca 完全相同的物件>}, updatedAt}`。沒有投組回空的 `portfolios`。App 載入時用這支，不要每個投組各打一次 |
 | `POST /portfolios/:id/dca` | `{totalRaw, periods, frequency, startAt?, vaultId?}`；`startAt`＝第一期日期（ISO），可選今天（不早於現在 24 小時，容許各時區的「今天」；早於現在視為現在）到一年內，省略＝現在；之後各期沿用它的時刻 | `{status:"ready", planId, authorization, vaultId, vaultName, apyBps, totalRaw, periods, frequency, trancheRaw, startAt, calls}`；vault 不收新錢回 `{status:"unavailable", reason, message}`（200） |
 | `POST /portfolios/:id/dca/confirm` | `{txHash}` | 存入：`{status:"confirmed", state:"active"}`；領回：`{status:"confirmed", state:"closed", returnedRaw}`；還沒上鏈／非 canonical／份額還在：`{status:"pending", state}` |
 | `POST /portfolios/:id/dca/pause`、`/resume` | `{}` | `{status:"ok", state}` |
 | `POST /portfolios/:id/dca/withdraw` | `{}` | `{status:"ready", amountRaw, calls}`；流動性不足 `{status:"limited", maxWithdrawRaw, message}`；vault 已空或還沒存入 `{status:"closed", calls:[]}` |
+
+限流：`GET /me/dca`、`GET /portfolios/:id/dca` 屬於顯示用讀取，算在 `read` 額度（每個錢包每分鐘 120 次，`RATE_LIMIT_READ_PER_MINUTE`）；`POST` 的開始／確認／暫停／領回算在 `plan` 額度（每分鐘 30 次，與其他寫入、代付共用）。
 
 `calls` 的格式同 Cash Earn：`{to, data, value:"0", gas}`，由組合帳戶（Kernel）送出，不是錢包。`vaultId` 省略時用目前合計 APY 最高、可存入的那個（Venus／Lista／Aave）。`earnedRaw`＝剩餘＋已投入＋已領回−存入，負數（帳本不完整）回 `null`。`waitingForMarket:true`＝這期到了、在等美股開盤。`waitingReason`＝這期到了但沒在買的原因，順序同排程器：`"portfolio_paused"`（組合暫停，或「全部賣出」還沒賣完）→ `"market_closed"`（等美股開盤）→ `"authorization_required"`（要 owner 更新授權）；`null`＝沒有在等（還沒到期、正在買，或下一輪排程器就會買）。
 

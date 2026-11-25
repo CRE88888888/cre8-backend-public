@@ -89,3 +89,32 @@ test('drift alert: restoring ignores stale, future-dated and malformed entries, 
   assert.ok(saved); assert.ok(!/secret-key-value|user:pw|rpc\.invalid|db\.invalid/.test(saved.reason)); assert.ok(saved.reason.length <= 301);
   assert.deepEqual(roundOutcomeSnapshot(new Date(NOW.getTime() + ROUND_OUTCOME_TTL_MS + 1)), {});
 });
+
+test('drift alert: scheduled principal that is not due yet is left out (portfolio 4: 8 weekly periods, 8755 bps until the last one was bought)', async () => {
+  const { pendingScheduleDrift } = await import('../src/alerts.js');
+  const E8 = 10n ** 8n, E18 = 10n ** 18n;
+  // 800 USDT portfolio, first of 8 periods bought: 700 waits as cash for the 7 periods to come.
+  assert.deepEqual(pendingScheduleDrift(8755, (800n * E8).toString(), (700n * E18).toString()), { driftBps: 40, pendingBps: 8750 });
+  // One period overdue and unbought (600 still not due): (8755 − 7500) / (1 − 0.75).
+  assert.deepEqual(pendingScheduleDrift(8755, (800n * E8).toString(), (600n * E18).toString()), { driftBps: 5020, pendingBps: 7500 });
+  // Nothing pending, or a row without the numbers (older stubs): the alert is left exactly as it was.
+  for (const [total, pending] of [[(800n * E8).toString(), '0'], [(800n * E8).toString(), undefined], [undefined, (700n * E18).toString()], ['0', '1'], ['x', 'y'], [(800n * E8).toString(), '9999999999']] as const)
+    assert.equal(pendingScheduleDrift(8755, total, pending), null, `${String(total)}/${String(pending)}`);
+  // More pending than the snapshot's total, or more than the observed drift: nothing left to report, never negative.
+  assert.deepEqual(pendingScheduleDrift(8755, (800n * E8).toString(), (900n * E18).toString()), { driftBps: 0, pendingBps: 10_000 });
+  assert.deepEqual(pendingScheduleDrift(300, (800n * E8).toString(), (700n * E18).toString()), { driftBps: 0, pendingBps: 8750 });
+
+  const seen: unknown[][] = [];
+  const rows = [
+    { portfolio_id: 4, hours_since: 25.7, gross_drift_bps: 8755, threshold_bps: 100, total_usd_e8: (800n * E8).toString(), pending_raw: (700n * E18).toString() }, // waiting for its periods
+    { portfolio_id: 5, hours_since: 25.7, gross_drift_bps: 8755, threshold_bps: 100, total_usd_e8: (800n * E8).toString(), pending_raw: (600n * E18).toString() }, // one period overdue
+    { portfolio_id: 6, hours_since: 25.7, gross_drift_bps: 8755, threshold_bps: 100, total_usd_e8: (800n * E8).toString(), pending_raw: '0' },                     // no schedule: real drift
+    { portfolio_id: 7, hours_since: 25.7, gross_drift_bps: 8755 },                                                                                                  // a row without the new columns
+  ];
+  const found = await detectPortfolioStuck(async (_sql: string, params: readonly unknown[] = []) => { seen.push([...params]); return { rows }; }, 6, NOW);
+  assert.deepEqual(seen, [[6, NOW.toISOString()]], 'the query gets the alert window and the evaluation time');
+  assert.deepEqual(found.map(f => f.portfolioId), [5, 6, 7], 'portfolio 4 no longer alerts');
+  assert.match(String(found[0]!.detail), /^portfolio 5: last observation showed 5020 bps drift \(8755 bps observed; 7500 bps of the portfolio is scheduled principal not due yet and is left out\) \(still above the threshold\) 25\.7 hours ago/);
+  for (const f of found.slice(1)) assert.match(String(f.detail), /last observation showed 8755 bps drift \(still above the threshold\) 25\.7 hours ago/);
+  assert.deepEqual(found.map(f => f.severity), ['critical', 'critical', 'critical']);
+});

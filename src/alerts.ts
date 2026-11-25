@@ -427,29 +427,59 @@ export async function detectPortfolioFailures(query: QueryFn, failingOps: number
  * 做不了事）與**排程器根本沒在跑**。
  */
 export async function detectPortfolioStuck(query: QueryFn, stuckHours: number, now: Date = new Date()): Promise<AlertFinding[]> {
-  const { rows } = await query(SQL_STUCK, [stuckHours]);
+  const { rows } = await query(SQL_STUCK, [stuckHours, now.toISOString()]);
 
-  return rows.map((row) => {
+  return rows.flatMap((row) => {
     const fields = row as Record<string, unknown>;
     const portfolioId = toInteger(fields.portfolio_id, 'portfolio_id');
     const hours = Number(fields.hours_since);
-    const drift = toInteger(fields.gross_drift_bps, 'gross_drift_bps');
+    const observed = toInteger(fields.gross_drift_bps, 'gross_drift_bps');
+    // Scheduled buying (定投): principal whose periods are not due yet waits in the account as cash on purpose. The snapshot
+    // counts it as drift (testnet portfolio 4: 8 weekly periods, 8755 bps, a warn until the last period was bought).
+    const pending = pendingScheduleDrift(observed, fields.total_usd_e8, fields.pending_raw);
+    const drift = pending === null ? observed : pending.driftBps;
+    if (pending !== null && drift <= thresholdOf(fields.threshold_bps)) return [];
+    const left = pending === null ? '' : ` (${observed} bps observed; ${pending.pendingBps} bps of the portfolio is scheduled principal not due yet and is left out)`;
     // 一天沒進展不是「今天運氣不好」：24 小時是「需要有人去看」的門檻。
     // The scheduler looked at it recently and is waiting for a known, harmless reason (market closed, below the minimum
     // trade, budget used up): nobody has to act, so it is a warn that says why, whatever its age.
     const waiting = waitingReason(portfolioId, now);
     const severity: AlertSeverity = waiting === null && Number.isFinite(hours) && hours >= 24 ? 'critical' : 'warn';
-    return {
+    return [{
       kind: 'portfolio_stuck',
       severity,
       portfolioId,
       detail:
-        `portfolio ${portfolioId}: last observation showed ${drift} bps drift (still above the threshold) ` +
+        `portfolio ${portfolioId}: last observation showed ${drift} bps drift${left} (still above the threshold) ` +
         `${Number.isFinite(hours) ? hours.toFixed(1) : '?'} hours ago, with no successful execution since — ` +
         (waiting !== null ? `waiting, nothing to fix: ${waiting}`
           : 'the market may be making the impact budget unusable (see `GET /portfolios/:id/plan`), or the scheduler is not running'),
-    } satisfies AlertFinding;
+    } satisfies AlertFinding];
   });
+}
+
+/** The snapshot's own threshold; a row without one (older callers / stubs) falls back to the default 100 bps. */
+function thresholdOf(value: unknown): number {
+  const n = typeof value === 'number' ? value : typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : NaN;
+  return Number.isInteger(n) && n >= 0 && n <= 10_000 ? n : 100;
+}
+/**
+ * Drift with the not-yet-due scheduled principal taken out of the portfolio. `pendingRaw`: numeraire raw units (18 decimals
+ * on BSC, mainnet and testnet); `totalUsdE8`: the snapshot's total. The header has no per-asset rows, so this assumes the
+ * rest of the drift is spread like the targets — exact for the case it is for (cash waiting next to holdings bought in
+ * proportion): cash share c, pending share p -> (c − p) / (1 − p). Returns null when nothing is pending or the row lacks
+ * the numbers (the alert then behaves exactly as before).
+ */
+export function pendingScheduleDrift(observedBps: number, totalUsdE8: unknown, pendingRaw: unknown): { driftBps: number; pendingBps: number } | null {
+  const digits = (v: unknown) => typeof v === 'string' && /^\d+$/.test(v) ? BigInt(v) : typeof v === 'bigint' && v >= 0n ? v : typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? BigInt(v) : null;
+  const total = digits(totalUsdE8), raw = digits(pendingRaw);
+  if (total === null || raw === null || total === 0n) return null;
+  const pendingE8 = raw / 10n ** 10n;
+  if (pendingE8 === 0n) return null;
+  const pendingBps = Number((pendingE8 > total ? total : pendingE8) * 10_000n / total);
+  if (pendingBps === 0) return null;
+  if (pendingBps >= 10_000 || observedBps <= pendingBps) return { driftBps: 0, pendingBps };
+  return { driftBps: Math.round((observedBps - pendingBps) * 10_000 / (10_000 - pendingBps)), pendingBps };
 }
 
 /** A failing tail stops alerting once its newest operation is this old and the scheduler has checked the portfolio since without writing a new one. */
@@ -513,17 +543,42 @@ export function waitingReason(portfolioId: number, now: Date): string | null {
   return WAITING.test(last.reason) ? truncate(last.reason.replace(/^Planner returned noop: /, ''), 160) : null;
 }
 
+/**
+ * `pending_raw`: scheduled (stack) principal of this portfolio whose periods are not overdue — per source, the per-period
+ * amount × the periods that are neither recorded yet nor overdue (period i is due at first_slot_at + i × daily/weekly, the
+ * same calendar as asset-jobs `dueSource`). Overdue = due for more than the alert's own N hours ($1) at $2: a period that
+ * came due a minute ago is not "stuck" yet, one still unbought N hours later is exactly what this alert is for and is NOT
+ * taken out. Only lots confirmed before the snapshot (their money is in its total).
+ */
 const SQL_STUCK = `
   with latest as (
-    select distinct on (portfolio_id) portfolio_id, created_at, needs_rebalance, gross_drift_bps
+    select distinct on (portfolio_id) portfolio_id, created_at, needs_rebalance, gross_drift_bps, total_usd_e8, threshold_bps
       from portfolio_snapshots
      order by portfolio_id, created_at desc
   )
   select l.portfolio_id,
          l.gross_drift_bps,
+         l.threshold_bps,
+         l.total_usd_e8::text as total_usd_e8,
+         pending.raw::text as pending_raw,
          extract(epoch from (now() - l.created_at)) / 3600.0 as hours_since
     from latest l
     join portfolios p on p.id = l.portfolio_id
+    left join lateral (
+      select coalesce(sum(trunc(a.budget_raw / a.effective_slices) * greatest(0, a.effective_slices - greatest(done.n, due.n))), 0) as raw
+        from strategy_funding_lots f
+        join strategy_lot_assets a on a.lot_id = f.id
+        join strategy_versions v on (v.strategy_id, v.version) = (f.strategy_id, f.version)
+        cross join lateral jsonb_array_elements(v.execution->'assets') e
+        cross join lateral (select count(*)::int as n from strategy_asset_slices s where s.lot_id = a.lot_id and s.asset = a.asset) done
+        cross join lateral (select $2::timestamptz - make_interval(hours => $1::int) as at) cutoff
+        cross join lateral (select case when cutoff.at < a.first_slot_at then 0
+          else floor(extract(epoch from (cutoff.at - a.first_slot_at))
+            / case when e.value->'execution'->>'every' = 'daily' then 86400 else 604800 end)::int + 1 end as n) due
+       where f.portfolio_id = l.portfolio_id and f.state = 'confirmed' and f.kind = 'asset' and f.created_at <= l.created_at
+         and a.state = 'active' and a.effective_slices > 0 and a.first_slot_at is not null
+         and e.value->>'asset' = a.asset and e.value->'execution'->>'kind' = 'stack'
+    ) pending on true
    where p.schedule_state = 'active'
      and l.needs_rebalance
      and l.created_at < now() - make_interval(hours => $1::int)

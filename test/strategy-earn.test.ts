@@ -331,6 +331,7 @@ test('routing v2 behind the same endpoints: only an owner in the v2 audience rea
   // Everyone else: v1 exactly as before, and the v2 side is never even asked.
   const other = earn(account);
   assert.equal((await other.portfolio(3, account)).status, 'ok');
+  assert.equal('strategyV2' in await other.portfolio(3, account), false);
   assert.equal((await other.auto(3, account, { budgetRaw: '1000' })).status, 'ready');
   assert.equal((await other.open(3, account, { asset: 'NVDAB', collateralRaw: String(E18) })).status, 'ready');
   assert.equal((await other.close(3, account, { asset: 'NVDAB' })).status, 'ready');
@@ -340,6 +341,8 @@ test('routing v2 behind the same endpoints: only an owner in the v2 audience rea
   // An audience owner's clean account: a new consent / open starts on v2; reads stay on v1's (empty) view until something exists.
   const mine = earn(canary);
   assert.equal('version' in await mine.portfolio(3, canary), false);
+  // …but the view says where turning it on would go: the v2 addresses, so the app does not describe v1's contracts.
+  assert.deepEqual((await mine.portfolio(3, canary) as { strategyV2?: unknown }).strategyV2, { registry: v2.registry, executor: v2.executor, ...(v2.swapper ? { cashSwapper: v2.swapper } : {}) });
   assert.deepEqual(await mine.auto(3, canary, { budgetRaw: '1000' }), { status: 'ready', version: 2, calls: [], batches: [] });
   assert.equal((await mine.open(3, canary, { asset: 'NVDAB', collateralRaw: '3' })).status, 'ready');
   await assert.rejects(mine.open(3, canary, { asset: 'NVDAB', collateralRaw: '9' }), isError(400, 'INSUFFICIENT_HOLDING'));
@@ -352,8 +355,10 @@ test('routing v2 behind the same endpoints: only an owner in the v2 audience rea
   assert.equal('version' in onV1, false);
   assert.equal(onV1.status, 'ready');
   assert.deepEqual(asked, ['active']);
+  assert.equal('strategyV2' in await mine.portfolio(3, canary), false); // a v1 consent: turning it on stays on v1
   f.policies = undefined; f.ids = [nvda.marketId]; f.collateral = 5n * E18; // shares posted on v1
   assert.equal('version' in await mine.open(3, canary, { asset: 'NVDAB', collateralRaw: String(E18) }), false);
+  assert.equal('strategyV2' in await mine.portfolio(3, canary), false); // a v1 position: same
   f.ids = []; f.collateral = 0n;
 
   // Once the account has anything on v2, every endpoint is v2's: the view, turn-off (with the exit flag), the receipt, the rescue.

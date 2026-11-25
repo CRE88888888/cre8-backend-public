@@ -14,7 +14,7 @@ import { createMainnetRates, mainnetQuote } from './strategy-earn-mainnet.js';
 import type { MainnetRates } from './strategy-earn-mainnet.js';
 import { parseRewardSignature, rewardsStore, strategyRewardsEnabled } from './strategy-rewards.js';
 import type { RewardsStore, RewardsView } from './strategy-rewards.js';
-import { routeLedger, routeMessage, strategyEarnV2, strategyEarnV2For, v2Audience, v2Authorized, v2MayOpen } from './strategy-earn-v2.js';
+import { routeLedger, routeMessage, strategyEarnV2, strategyEarnV2For, strategyV2Addresses, v2Audience, v2Authorized, v2MayOpen } from './strategy-earn-v2.js';
 import type { RouteEventKind, StrategyEarnV2 } from './strategy-earn-v2.js';
 import { createStrategyEarnV2Api } from './strategy-earn-v2-api.js';
 import type { StrategyEarnV2Api } from './strategy-earn-v2-api.js';
@@ -635,8 +635,16 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
       // After a finished "sell all" the consent left on chain is not one (src/strategy-earn-after-sell-all.ts).
       const autoOpen = positions.some(p => p.status === 'on') ? false
         : await consentedMarkets(chain, account, head.number, markets).then(async c => c.size > 0 && !consentIsStale(await sinceSellAll(account), Object.fromEntries(c))).catch(() => false);
+      // `strategyV2` on v1's view: this account has nothing on either generation and its owner may start on v2 now, so
+      // turning the strategy on would go to v2 (the rule of `v2Side(…, forNew)`). The app then describes v2, not v1's
+      // vault / executor / registry. Same object as a v2 position's status carries, but without `version: 2` (nothing is on
+      // v2 yet). Absent for everyone else: no v2 deployment, an owner who may not open, a v1 position or consent, or an
+      // unreadable chain (never guessed).
+      const v2 = v2Of(wallet);
+      const startsOnV2 = v2 !== null && v2Open(wallet).mayOpen && !positions.some(p => p.status === 'on')
+        && !(await v1Active(chain, account, head.number).catch(() => true));
       return { portfolioId: id, account, status: 'ok' as const, reason: null, message: null, updatedAt: new Date(Number(head.timestamp) * 1000).toISOString(),
-        earnNetUsd: earnNetUsd.toString(), autoOpen, positions };
+        earnNetUsd: earnNetUsd.toString(), autoOpen, positions, ...(startsOnV2 ? { strategyV2: strategyV2Addresses(v2)! } : {}) };
     },
     /**
      * The owner's signature for Lista's reward proof API (docs/strategy-earn-rewards.zh-TW.md): `{ signedAt, signature }`, the

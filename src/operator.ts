@@ -564,37 +564,42 @@ async function computeStatus(portfolioId: number, deps: StatusDeps, joinedVersio
         };
 
   // 唯讀的附加資訊：讀不到也只記進 `sessionKey.error`，不讓一份算得出來的狀態變成 503。
-  const sessionKey = await resolveStatusSessionKey(plan.portfolioId, plan.account, deps);
-  let flags: number | null = null;
-  let sources: PauseSource[] | null = null;
-  try {
-    const readFlags = deps.readPauseFlags ?? (async (account: Address, blockNumber: bigint) => {
-      const registry = getConfig().registryAddress;
-      if (registry === null) throw new Error('REGISTRY_ADDRESS 未設定');
-      return (deps.publicClient ?? defaultPublicClient()).readContract({
-        address: registry as Address, abi: REGISTRY_ABI, functionName: 'pauseFlags', args: [account], blockNumber,
-      });
-    });
-    const observed = await readFlags(plan.account, plan.snapshot.block);
-    sources = pauseSources(observed);
-    flags = observed;
-  } catch {
-    // Do not report zero when a missing ABI, RPC timeout or unknown flag makes the sources unknown.
-  }
+  // The session key, the pause flags and the gas balance do not depend on each other: asked together (they were three
+  // reads in a row after the plan). None of them throws.
   const executor = deps.executor ?? getSessionKeyConfig().executorAddress ?? null;
-  // gas 讀不到（RPC 掛）不該讓整份狀態變 503：留 null，前端顯示「未知」。
-  const gas = await (async () => {
-    try {
-      const client = deps.publicClient;
-      const readBalance = deps.accountGasBalance ?? (client === undefined ? getAccountGasBalance : (address: Address) => client.getBalance({ address }));
-      const readPrice = deps.gasPrice ?? (client === undefined ? getGasPriceWei : () => client.getGasPrice());
-      const minimumWei = deps.minGasWei ?? getGasConfig().minSessionGasWei;
-      const [balanceWei, gasPriceWei] = await Promise.all([readBalance(plan.account), readPrice()]);
-      return describeGasStatus({ address: plan.account, balanceWei, minimumWei, gasPriceWei });
-    } catch {
-      return null;
-    }
-  })();
+  const [sessionKey, pause, gas] = await Promise.all([
+    resolveStatusSessionKey(plan.portfolioId, plan.account, deps),
+    (async (): Promise<{ flags: number; sources: PauseSource[] } | null> => {
+      try {
+        const readFlags = deps.readPauseFlags ?? (async (account: Address, blockNumber: bigint) => {
+          const registry = getConfig().registryAddress;
+          if (registry === null) throw new Error('REGISTRY_ADDRESS 未設定');
+          return (deps.publicClient ?? defaultPublicClient()).readContract({
+            address: registry as Address, abi: REGISTRY_ABI, functionName: 'pauseFlags', args: [account], blockNumber,
+          });
+        });
+        const observed = await readFlags(plan.account, plan.snapshot.block);
+        return { sources: pauseSources(observed), flags: observed };
+      } catch {
+        // Do not report zero when a missing ABI, RPC timeout or unknown flag makes the sources unknown.
+        return null;
+      }
+    })(),
+    // gas 讀不到（RPC 掛）不該讓整份狀態變 503：留 null，前端顯示「未知」。
+    (async () => {
+      try {
+        const client = deps.publicClient;
+        const readBalance = deps.accountGasBalance ?? (client === undefined ? getAccountGasBalance : (address: Address) => client.getBalance({ address }));
+        const readPrice = deps.gasPrice ?? (client === undefined ? getGasPriceWei : () => client.getGasPrice());
+        const minimumWei = deps.minGasWei ?? getGasConfig().minSessionGasWei;
+        const [balanceWei, gasPriceWei] = await Promise.all([readBalance(plan.account), readPrice()]);
+        return describeGasStatus({ address: plan.account, balanceWei, minimumWei, gasPriceWei });
+      } catch {
+        return null;
+      }
+    })(),
+  ]);
+  const flags = pause?.flags ?? null, sources = pause?.sources ?? null;
 
   return {
     portfolioId: plan.portfolioId,
@@ -1371,6 +1376,7 @@ export async function runOperatorRedeem(portfolioId: number, wallet: string, amo
 const postedSharesNow = async (portfolioId: number) => (await planPortfolio(portfolioId, { observeOnly: true })).snapshot.strategyEarnCollateral ?? [];
 
 async function runOperatorSell(portfolioId: number, wallet: string, request: SellRequest, deps: RebalanceDeps): Promise<RedeemResult> {
+  const started = performance.now();
   await (deps.requireOwnedPortfolio ?? requireOwnedPortfolio)(portfolioId, wallet);
   const closing = typeof request === 'object' && 'close' in request;
   const release = deps.releaseRunningBuy !== undefined ? deps.releaseRunningBuy
@@ -1395,8 +1401,10 @@ async function runOperatorSell(portfolioId: number, wallet: string, request: Sel
   // From the first plan of the round only: a second one leaves out shares that stay posted for now (V2UnwindWait).
   let over: boolean | null = null;
   const round = await (deps.runSchedulerOnce ?? runSchedulerOnce)(
-    { dryRun: false, limit: 1, skipAlerts: true },
+    // skipKeepers / afterSnapshotInBackground: the owner is waiting for this one sale (see their notes in scheduler.ts).
+    { dryRun: false, limit: 1, skipAlerts: true, skipKeepers: true },
     {
+      afterSnapshotInBackground: true,
       withTransaction: singlePortfolioClaim(portfolioId, deps.withTransaction, { allowPaused: closing, preserveNextRunAt: true }),
       ...(deps.withTransaction === undefined ? { withDexLock: <T>(chainId: number, fn: () => Promise<T>) => withDexLock(chainId, fn, { waitMs: OWNER_DEX_WAIT_MS }) } : {}),
       ...(deps.query === undefined ? {} : { query: deps.query }),
@@ -1461,6 +1469,8 @@ async function runOperatorSell(portfolioId: number, wallet: string, request: Sel
   }
   // The round may have taken a while: the scheduler takes over only after the caller has been silent since now.
   if (tracked && over !== true) { try { await sellAllCallerIsHere(query, portfolioId); } catch { /* the scheduler just comes a little earlier */ } }
+  // One line per owner sale: the whole call as the owner waited for it (the round's own phases are in the scheduler line).
+  (deps.log ?? console.info)(JSON.stringify({ msg: 'owner_sell_round', portfolioId, kind: closing ? 'close' : 'redeem', outcome, totalMs: Math.round(performance.now() - started) }));
   return {
     portfolioId, outcome, reason,
     txHash: result?.execution?.txHash ?? null,
@@ -1469,6 +1479,16 @@ async function runOperatorSell(portfolioId: number, wallet: string, request: Sel
     batched: details !== null && details.requestedSellUsdE8 !== null && details.plannedSellUsdE8 < details.requestedSellUsdE8,
     ...(closing ? { sellAllPending: tracked && over !== true } : {}),
   };
+}
+
+/** A promise that never rejects: lets independent reads start together while each failure still surfaces where it is awaited. */
+type Settled<T> = { ok: true; value: T } | { ok: false; error: unknown };
+function settled<T>(promise: Promise<T>): Promise<Settled<T>> {
+  return promise.then((value) => ({ ok: true as const, value }), (error: unknown) => ({ ok: false as const, error }));
+}
+function unsettle<T>(result: Settled<T>): T {
+  if (!result.ok) throw result.error;
+  return result.value;
 }
 
 const ORACLE_ABI = [
@@ -1596,11 +1616,20 @@ export async function buildRedeemPlan(input: RebalancePlanningInput, request: Se
     const executor = deps.executor ?? getSessionKeyConfig().executorAddress;
     if (executor === null) return reply({ kind: 'blocked', reason: '沒有設定 EXECUTOR_ADDRESS' });
     const blockNumber = snapshot.block;
+    // Reads that depend on nothing but the block start together (one Multicall3 round trip instead of one each); each is
+    // still awaited where it always was, so an early return or an earlier failure reads the same as before.
+    const feeBpsRead = settled(readExecutorFeeBps(client, BigInt(pinnedVersion.onchainStrategyId), blockNumber, deps.registry));
+    const blockRead = settled(client.getBlock({ blockNumber }));
     const router = await client.readContract({ address: executor, abi: [{ type: 'function', name: 'oracle', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] }], functionName: 'oracle', blockNumber });
     const decimals = await numeraireDecimals(client, numeraire, snapshot.holdings, blockNumber);
     const scale = 10n ** BigInt(decimals);
     const limits = await readMaxLegUsdE8(holdings.map((holding) => holding.asset), query, client.chain?.id);
     const notes: string[] = [];
+    // A first batch also prices each holding's requested share; it is asked in the same round trip as the full amounts.
+    const desiredRead = typeof request !== 'bigint' ? null : settled(Promise.all(holdings.map((holding) => {
+      const amount = holding.amountWei * request / totalE8;
+      return amount === 0n ? 0n : nominalSellQuote(client, router, holding.asset as Address, numeraire, amount, blockNumber);
+    })));
     const nominal = await Promise.all(holdings.map(async (holding) => {
       try { return await nominalSellQuote(client, router, holding.asset as Address, numeraire, holding.amountWei, blockNumber); }
       catch (error) {
@@ -1619,18 +1648,16 @@ export async function buildRedeemPlan(input: RebalancePlanningInput, request: Se
     if (first) {
       // Price the exact original token quantities after token rounding; otherwise sub-token
       // dust would become a phantom continuation amount that cannot ever be sold.
-      const desired = await Promise.all(availableHoldings.map((holding) => {
-        const amount = holding.amountWei * request / totalE8;
-        return amount === 0n ? 0n : nominalSellQuote(client, router, holding.asset as Address, numeraire, amount, blockNumber);
-      }));
+      // (`unavailable` returned above, so every holding has a full quote: `availableHoldings` is `holdings`.)
+      const desired = unsettle(await desiredRead!);
       const desiredRaw = desired.reduce((sum, value) => sum + value, 0n);
       requestedSellUsdE8 = (desiredRaw * 100_000_000n + scale - 1n) / scale;
     } else if ('close' in request) requestedSellUsdE8 = unavailable ? null : allUsdE8;
     const wanted = requestedSellUsdE8 ?? allUsdE8;
     if (wanted === 0n) return reply(unavailable ? { kind: 'blocked', reason: notes.join('；') } : { kind: 'noop', reason: '提領比例換算後待賣代幣量為 0' });
     const budget = wanted < allUsdE8 ? wanted : allUsdE8;
-    const feeBps = await readExecutorFeeBps(client, BigInt(pinnedVersion.onchainStrategyId), blockNumber, deps.registry);
-    const { timestamp } = await client.getBlock({ blockNumber });
+    const feeBps = unsettle(await feeBpsRead);
+    const { timestamp } = unsettle(await blockRead);
     const wall = BigInt(Math.floor(Date.now() / 1000));
     const deadline = (timestamp > wall ? timestamp : wall) + BigInt(DEFAULT_DEADLINE_SECONDS);
     const steps: PlannedStep[] = [];
@@ -1667,32 +1694,59 @@ export async function buildRedeemPlan(input: RebalancePlanningInput, request: Se
         if (amounts.every((amount) => amount === 0n)) return reply({ kind: 'noop', reason: `[BELOW_MIN_STEP] 待賣量換算後為 0：待賣 ${wanted} E8 湊不成一步至少 ${SELL_MIN_STEP_USD_E8} E8 的賣單，不送交易` });
       }
     }
-    for (const [index, holding] of availableHoldings.entries()) {
-      if (steps.length === MAX_USER_OP_STEPS) break;
-      let amountIn = amounts[index] ?? 0n;
-      if (amountIn === 0n) continue;
-      const limit = limits.get(holding.asset.toLowerCase());
-      if (limit === undefined) return reply({ kind: 'blocked', reason: '[MAX_LEG_UNAVAILABLE] 缺少單筆限額' });
-      const capped = await capAssetLeg({ publicClient: client, oracle: router, numeraire, tokenIn: holding.asset as Address, tokenOut: numeraire, amountIn, limitUsdE8: limit, decimals, blockNumber });
-      if ('blocked' in capped) { notes.push(`${holding.asset}: ${capped.blocked}`); continue; }
-      amountIn = capped.amountIn;
-      const quoted = await client.readContract({ address: router, abi: ORACLE_ABI, functionName: 'previewSwap', args: [holding.asset as Address, numeraire, amountIn], blockNumber }).catch(async (error: unknown) => {
-        const failure = await describePriceSourceError(error, client, { oracle: router, asset: holding.asset as Address, blockNumber });
-        if (failure === null) throw error;
-        notes.push(failure.detail); return null;
+    /**
+     * One holding's leg, read on its own: the cap, the oracle quote, the reference pool's fee and the routed step do not
+     * depend on any other holding, so every leg of a batch is read at once (a four-asset sale used to wait for ~20 round
+     * trips per asset, one asset after the other). What does depend on the other legs (the running total against the
+     * request, the step limit, the order of the notes) is applied below, in holding order, exactly as before.
+     */
+    const quoteLeg = async (holding: (typeof availableHoldings)[number], requested: bigint, limit: bigint | null):
+      Promise<{ note: string } | { quotedOut: bigint; overLimit: boolean; step: Promise<Settled<PlannedStep | null>> | null }> => {
+      const asset = holding.asset as Address;
+      const preview = (amount: bigint) => settled(client.readContract({ address: router, abi: ORACLE_ABI, functionName: 'previewSwap', args: [asset, numeraire, amount], blockNumber }));
+      // Asked next to the cap's own quote (same round trip); it stands when the cap leaves the amount as it is.
+      const uncapped = preview(requested);
+      const poolFeeRead = settled(readPoolFee(client, router, asset, blockNumber));
+      const capped = await capAssetLeg({ publicClient: client, oracle: router, numeraire, tokenIn: asset, tokenOut: numeraire, amountIn: requested, limitUsdE8: limit, decimals, blockNumber });
+      if ('blocked' in capped) return { note: `${holding.asset}: ${capped.blocked}` };
+      const amountIn = capped.amountIn;
+      const read = await (amountIn === requested ? uncapped : preview(amountIn));
+      if (!read.ok) {
+        const failure = await describePriceSourceError(read.error, client, { oracle: router, asset, blockNumber });
+        if (failure === null) throw read.error;
+        return { note: failure.detail };
+      }
+      const [quotedOut, floor] = read.value;
+      if (quotedOut <= 0n || floor <= 0n) return { note: `${holding.asset}: oracle 沒有有效地板` };
+      const overLimit = limit !== null && quotedOut * 100_000_000n > limit * scale;
+      // Built ahead of the running-total check below; a leg that check drops simply never looks at it.
+      const step = overLimit ? null : settled((async () => buildRoutedStep({ publicClient: client, executor, tokenIn: asset, tokenOut: numeraire, amountIn, oracleFloor: floor, oracleQuoted: quotedOut,
+        minGross: minGrossFor(floor, feeBps), poolFee: unsettle(await poolFeeRead), feeBps, deadline, blockNumber }, deps))());
+      return { quotedOut, overLimit, step };
+    };
+    const selling = availableHoldings.map((holding, index) => ({ holding, amountIn: amounts[index] ?? 0n })).filter((leg) => leg.amountIn > 0n);
+    for (let next = 0; next < selling.length && steps.length < MAX_USER_OP_STEPS;) {
+      // Never more legs than steps still fit: a leg past the step limit was never read, and still is not.
+      const batch = selling.slice(next, next + MAX_USER_OP_STEPS - steps.length);
+      next += batch.length;
+      const legs = batch.map(({ holding, amountIn }) => {
+        const limit = limits.get(holding.asset.toLowerCase());
+        return limit === undefined ? null : settled(quoteLeg(holding, amountIn, limit));
       });
-      if (quoted === null) continue;
-      const [quotedOut, floor] = quoted;
-      if (quotedOut <= 0n || floor <= 0n) { notes.push(`${holding.asset}: oracle 沒有有效地板`); continue; }
-      // Independent final check: integer rounding or a malformed oracle must never exceed the total request.
-      const nextRaw = soldRaw + quotedOut;
-      if (nextRaw * 100_000_000n > wanted * scale) { notes.push(`${holding.asset}: oracle 名義額超過剩餘待賣量`); continue; }
-      if (limit !== null && quotedOut * 100_000_000n > limit * scale) { notes.push(`${holding.asset}: oracle 名義額超過單筆上限`); continue; }
-      const poolFee = await readPoolFee(client, router, holding.asset as Address, blockNumber);
-      const step = await buildRoutedStep({ publicClient: client, executor, tokenIn: holding.asset as Address, tokenOut: numeraire, amountIn, oracleFloor: floor, oracleQuoted: quotedOut, minGross: minGrossFor(floor, feeBps), poolFee, feeBps, deadline, blockNumber }, deps);
-      if (step === null) { notes.push(`${holding.asset}: 沒有符合地板的白名單路徑`); continue; }
-      steps.push(step);
-      soldRaw = nextRaw;
+      for (const [index, pending] of legs.entries()) {
+        const holding = batch[index]!.holding;
+        if (pending === null) return reply({ kind: 'blocked', reason: '[MAX_LEG_UNAVAILABLE] 缺少單筆限額' });
+        const leg = unsettle(await pending);
+        if ('note' in leg) { notes.push(leg.note); continue; }
+        // Independent final check: integer rounding or a malformed oracle must never exceed the total request.
+        const nextRaw = soldRaw + leg.quotedOut;
+        if (nextRaw * 100_000_000n > wanted * scale) { notes.push(`${holding.asset}: oracle 名義額超過剩餘待賣量`); continue; }
+        if (leg.overLimit || leg.step === null) { notes.push(`${holding.asset}: oracle 名義額超過單筆上限`); continue; }
+        const step = unsettle(await leg.step);
+        if (step === null) { notes.push(`${holding.asset}: 沒有符合地板的白名單路徑`); continue; }
+        steps.push(step);
+        soldRaw = nextRaw;
+      }
     }
     if (steps.length === 0) return reply({ kind: 'blocked', reason: `沒有可執行的賣出步驟：${notes.join('；') || '待賣量換算後為 0'}` });
     // Subtract the ceiling of aggregate nominal sold, so repeated E8 continuation never oversells by truncation.

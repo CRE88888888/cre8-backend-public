@@ -178,12 +178,10 @@ export async function readStrategyEarnCollateral(client: PublicClient, account: 
   const { createStrategyEarnChain, strategyMarkets } = await import('./strategy-earn.js');
   const chain = createStrategyEarnChain(client);
   const ids = await chain.accountMarkets(account, block);
-  const out: StrategyEarnCollateral[] = [];
-  for (const m of strategyMarkets().filter(x => ids.includes(x.marketId))) {
-    const amount = await chain.collateral(m.marketId, account, block);
-    if (amount > 0n) out.push({ asset: m.collateral, marketId: m.marketId, amount });
-  }
-  return out;
+  const markets = strategyMarkets().filter(x => ids.includes(x.marketId));
+  // One round trip for all of the account's markets (they were read one after the other).
+  const amounts = await Promise.all(markets.map(m => chain.collateral(m.marketId, account, block)));
+  return markets.flatMap((m, index) => { const amount = amounts[index] ?? 0n; return amount > 0n ? [{ asset: m.collateral, marketId: m.marketId, amount }] : []; });
 }
 
 /**
@@ -384,17 +382,51 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
     throw new Error(`strategy ${strategyId} 沒有 onchain_id：它還沒鏡像到鏈上，索引器沒有目標權重可對齊`);
   }
 
-  const enrollment = await client.readContract({
+  // Everything below is pinned to `block` and needs only the account or the strategy id, so it is all asked at once
+  // (one Multicall3 round trip) instead of one read after the other; a four-asset fund waited ~10 round trips here before
+  // the balances were even requested. Each result is still awaited at the place it always was, with the same error, so
+  // a failure reads exactly as before. The strategy id is the DB's until the enrollment confirms it (a mismatch throws
+  // below, as before; only then is the active version asked again for the enrolled id).
+  const early = <T>(promise: Promise<T>): Promise<T> => { promise.catch(() => {}); return promise; };
+  const enrollmentRead = early(client.readContract({
     address: registryAddress,
     abi: REGISTRY_ABI,
     functionName: 'enrollments',
     args: [account],
     blockNumber: block,
-  }).catch(() => { throw new Error('registry enrollment unavailable'); });
+  }));
+  const activeVersionOf = (id: number) => client.readContract({ address: registryAddress, abi: REGISTRY_VERSION_ABI,
+    functionName: 'activeVersion', args: [BigInt(id)], blockNumber: block });
+  const pinnedRead = early(activeVersionOf(onchainStrategyId));
+  const historyRead = early(client.readContract({ address: registryAddress, abi: REGISTRY_VERSION_ABI,
+    functionName: 'historicalAssets', args: [BigInt(onchainStrategyId)], blockNumber: block }));
+  const cashRead = early(client.readContract({ address: registryAddress, abi: ENROLLMENT_ABI, functionName: 'numeraire', blockNumber: block }));
+  // Strategy Earn (backend#204): posted shares are still this portfolio's holding. Unknown -> throw (never value them as 0).
+  // My mix too: without them a posted asset would read as sold, the planner would buy it again and the return would jump.
+  const strategyEarnRead = chainId !== 97 ? null
+    : early((deps.strategyEarnCollateral ?? ((a: Address, b: bigint) => readStrategyEarnCollateral(client, a, b)))(account, block));
+  // Routing v2 (one account is on v1 or v2, never both; only owners in the v2 audience can be on v2): the shares it posted
+  // are this portfolio's holding just the same. Unknown -> throw, as above.
+  const v2Read = chainId !== 97 ? null : early((async () => (await import('./strategy-earn-v2.js')).v2Audience(chainId, owner)
+    ? (deps.strategyEarnV2Collateral ?? ((a: Address, b: bigint) => readStrategyEarnV2Collateral(client, a, b)))(account, block)
+        .catch(() => { throw new Error('strategy earn collateral unavailable'); })
+    : null)());
+  // The yield read only needs the account and the block, so it overlaps every read above and below. It is the longest
+  // one (30 markets, at most YIELD_READ_CONCURRENCY calls in flight), so starting it here hides the rest behind it.
+  const yieldConfig = chainId===97 && !personalMix ? yieldProfile() : null;
+  // DCA (定投, db 0064): the not-yet-invested money is the account's own vault position on a separate ledger.
+  // It is neither portfolio value nor rebalance cash, so its markets are left out of the yield read.
+  const yieldRead: Promise<YieldRead | null> | null = yieldConfig === null ? null : early((async () => {
+    const dcaMarkets = await readDcaMarkets(query, chainId, account);
+    return (deps.readYield ?? readYieldAccount)(client, yieldConfig, account, { block, ...(dcaMarkets.length ? { ignore: dcaMarkets } : {}) })
+      .catch((error: unknown) => { if (deps.yieldOptional === true) return null; throw error; });
+  })());
+
+  const enrollment = await enrollmentRead.catch(() => { throw new Error('registry enrollment unavailable'); });
   const enrolledStrategyId = toInteger(enrollment[0].toString(), 'enrollment.strategyId');
   const accepted = toInteger(enrollment[1], 'enrollment.version');
-  const pinned = await client.readContract({ address: registryAddress, abi: REGISTRY_VERSION_ABI,
-    functionName: 'activeVersion', args: [BigInt(enrolledStrategyId)], blockNumber: block }).catch(() => { throw new Error('registry active version unavailable'); });
+  const pinned = await (enrolledStrategyId === onchainStrategyId ? pinnedRead : activeVersionOf(enrolledStrategyId))
+    .catch(() => { throw new Error('registry active version unavailable'); });
   if (enrolledStrategyId === 0) {
     throw new Error(`${account} 在 registry 上沒有 enroll 紀錄（enrollments 全為 0）`);
   }
@@ -410,6 +442,13 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
 
   if (pinned < 1 || pinned > 65535) throw new Error('registry has no effective version');
 
+  const versionRead = early(client.readContract({
+    address: registryAddress,
+    abi: REGISTRY_ABI,
+    functionName: 'version',
+    args: [BigInt(enrolledStrategyId), pinned],
+    blockNumber: block,
+  }));
   const allocationRow = (await query(SQL_ALLOCATION, [strategyId, pinned])).rows[0];
   if (allocationRow === undefined) {
     throw new Error(`DB 沒有 strategy_versions(${strategyId}, ${pinned})：最新生效版本還沒鏡像到 off-chain`);
@@ -427,13 +466,7 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
     symbolByAddress,
   );
 
-  const onchainVersion = await client.readContract({
-    address: registryAddress,
-    abi: REGISTRY_ABI,
-    functionName: 'version',
-    args: [BigInt(enrolledStrategyId), pinned],
-    blockNumber: block,
-  }).catch(() => { throw new Error('registry version config unavailable'); });
+  const onchainVersion = await versionRead.catch(() => { throw new Error('registry version config unavailable'); });
   const chainTargets: TargetWeight[] = onchainVersion.assets.map((asset, index) => ({
     asset: asset.toLowerCase(),
     weightBps: toInteger(onchainVersion.weightsBps[index], `registry.version().weightsBps[${index}]`),
@@ -458,13 +491,12 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
   const allocationCheck: AllocationCheck = { consistent: mismatches.length === 0, chain: chainTargets, mismatches };
 
   // P11 歷史資產去重後以零權重加入；最新版本以外的資產永不產生買入需求。
-  const history = await client.readContract({ address: registryAddress, abi: REGISTRY_VERSION_ABI,
-    functionName: 'historicalAssets', args: [BigInt(enrolledStrategyId)], blockNumber: block }).catch(() => { throw new Error('registry historical assets unavailable'); });
+  const history = await historyRead.catch(() => { throw new Error('registry historical assets unavailable'); });
   const historicalAssets = [...new Set(history.map(asset => asset.toLowerCase()))];
   for (const asset of historicalAssets) if (!targets.some(t => t.asset === asset)) {
     targets.push({ asset, weightBps: 0, symbol: symbolByAddress.get(asset) ?? shortAddress(asset) });
   }
-  const cash = (await client.readContract({ address: registryAddress, abi: ENROLLMENT_ABI, functionName: 'numeraire', blockNumber: block }).catch(() => { throw new Error('registry numeraire unavailable'); })).toLowerCase();
+  const cash = (await cashRead.catch(() => { throw new Error('registry numeraire unavailable'); })).toLowerCase();
   if (!targets.some(t => t.asset === cash)) targets.push({ asset: cash, weightBps: 0, symbol: 'USDT' });
   const priceTable = await loadPriceTable(query, chainId);
   const symbolsByAsset = new Map(targets.map((target) => [target.asset, target.symbol]));
@@ -505,27 +537,13 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
   // 「同一份觀測」就不成立。
   // 兩者互不相依，所以並行；`scanPortfolioHoldings` 成功時會自己推進游標（那是觀測證據，不是排程
   // 決策），漂移與快照仍然只有 `writeSnapshot` 會寫——那是本函式「不寫任何東西」的唯一例外。
-  // Strategy Earn (backend#204): posted shares are still this portfolio's holding. Unknown -> throw (never value them as 0).
-  // My mix too: without them a posted asset would read as sold, the planner would buy it again and the return would jump.
-  const strategyEarn = chainId === 97
-    ? await (deps.strategyEarnCollateral ?? ((a: Address, b: bigint) => readStrategyEarnCollateral(client, a, b)))(account, block)
-        .catch(() => { throw new Error('strategy earn collateral unavailable'); })
-    : [];
-  // Routing v2 (one account is on v1 or v2, never both; only owners in the v2 audience can be on v2): the shares it posted
-  // are this portfolio's holding just the same. Unknown -> throw, as above.
-  if (chainId === 97 && (await import('./strategy-earn-v2.js')).v2Audience(chainId, owner)) {
-    const v2Posted = await (deps.strategyEarnV2Collateral ?? ((a: Address, b: bigint) => readStrategyEarnV2Collateral(client, a, b)))(account, block)
-      .catch(() => { throw new Error('strategy earn collateral unavailable'); });
+  // (Both collateral reads and the yield read were started with the registry reads above.)
+  const strategyEarn = strategyEarnRead === null ? []
+    : [...await strategyEarnRead.catch(() => { throw new Error('strategy earn collateral unavailable'); })];
+  const v2Posted = v2Read === null ? null : await v2Read;
+  if (v2Posted !== null) {
     for (const c of v2Posted) { const had = strategyEarn.find(x => x.asset === c.asset); if (had) had.amount += c.amount; else strategyEarn.push(c); }
   }
-  // The yield read only needs the account and the block, so it overlaps the balance read and the log scan.
-  const yieldConfig = chainId===97 && !personalMix ? yieldProfile() : null;
-  // DCA (定投, db 0064): the not-yet-invested money is the account's own vault position on a separate ledger.
-  // It is neither portfolio value nor rebalance cash, so its markets are left out of the yield read.
-  const dcaMarkets = yieldConfig === null ? [] : await readDcaMarkets(query, chainId, account);
-  const yieldRead: Promise<YieldRead | null> | null = yieldConfig === null ? null
-    : (deps.readYield ?? readYieldAccount)(client, yieldConfig, account, { block, ...(dcaMarkets.length ? { ignore: dcaMarkets } : {}) })
-        .catch((error: unknown) => { if (deps.yieldOptional === true) return null; throw error; });
   const [snapshot, scan, lending] = await Promise.all([
     readPositions(client, {
       portfolioId,

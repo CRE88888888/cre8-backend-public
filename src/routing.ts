@@ -105,6 +105,35 @@ function v3Path(tokens: readonly Address[], fees: readonly number[]): Hex {
 }
 
 /**
+ * Pool existence shared by every call in this process (chain 56 / 97 only; forks and unit-test clients are never cached).
+ *
+ * `factory.getPool(a, b, fee)` was asked up to 12 times per leg on every plan (4 fee tiers × direct / via-in / via-out),
+ * each its own gas-bounded eth_call: for a four-asset sale that was 48 of the round's 80 calls and most of its planning
+ * time, on a public node that rate-limits us. A V3 pool never goes away once created, so a "yes" is kept; a "no" is asked
+ * again after POOL_ABSENT_TTL_MS, because someone may create the pool. Only the list of candidate paths comes from here:
+ * every candidate is still quoted on-chain at the plan's block, and the oracle floor is unchanged.
+ */
+export const POOL_ABSENT_TTL_MS = 10 * 60_000;
+const knownPools = new Map<string, true | number>();
+/** Off under `bun test` (mock clients reuse the same addresses with different pools) unless a test turns it on. */
+let sharedPools = process.env.NODE_ENV !== 'test';
+function sharedPoolAnswer(chainId: number | undefined, key: string, now = Date.now()): boolean | undefined {
+  if (!sharedPools || (chainId !== 56 && chainId !== 97)) return undefined;
+  const hit = knownPools.get(key);
+  if (hit === undefined) return undefined;
+  if (hit === true) return true;
+  if (now - hit < POOL_ABSENT_TTL_MS) return false;
+  knownPools.delete(key);
+  return undefined;
+}
+function rememberPool(chainId: number | undefined, key: string, exists: boolean, now = Date.now()): void {
+  if (!sharedPools || (chainId !== 56 && chainId !== 97)) return;
+  knownPools.set(key, exists ? true : now);
+}
+/** Test hook: turns the shared answers on or off and forgets them. */
+export function setKnownPools(enabled: boolean): void { sharedPools = enabled; knownPools.clear(); }
+
+/**
  * 挑最佳路徑。找不到任何可用路徑（所有候選都報不出價）時回 `null`，
  * 呼叫端應該退回「oracle 釘住的那個池」而不是跳過這一步。
  */
@@ -131,15 +160,21 @@ export async function chooseBestPath(
 
   /** 池子存在性快取：同一個 (a,b,fee) 在一輪裡會被問很多次。 */
   const poolCache = new Map<string, boolean>();
+  const chainId = client.chain?.id;
   const hasPool = async (a: Address, b: Address, fee: number): Promise<boolean> => {
     const key = `${a.toLowerCase()}-${b.toLowerCase()}-${fee}`;
     const cached = poolCache.get(key);
     if (cached !== undefined) return cached;
+    const sharedKey = `${chainId}:${params.factory.toLowerCase()}:${key}`;
+    const known = sharedPoolAnswer(chainId, sharedKey);
+    if (known !== undefined) { poolCache.set(key, known); return known; }
     const pool = await client
       .readContract({ address: params.factory, abi: FACTORY_ABI, functionName: 'getPool', args: [a, b, fee], ...(blockNumber === undefined ? {} : { blockNumber }) })
       .catch(() => null);
     const exists = typeof pool === 'string' && isAddress(pool) && getAddress(pool) !== ZERO;
     poolCache.set(key, exists);
+    // Only an answer the factory actually gave is remembered; a failed read is "not usable this time", never "no pool".
+    if (typeof pool === 'string' && isAddress(pool)) rememberPool(chainId, sharedKey, exists);
     return exists;
   };
 

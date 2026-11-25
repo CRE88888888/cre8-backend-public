@@ -1607,6 +1607,23 @@ test('部分賣出：7 檔各 18.4、賣 20（前端送 21.276596）按比例 7 
   assert.ok(built.plannedSellUsdE8 > usdE8(21.27) && built.plannedSellUsdE8 <= usdE8(21.276596));
 });
 
+test('賣出多檔：每一檔的報價一起讀（不再一檔讀完才讀下一檔），步驟與說明仍照持倉順序', async () => {
+  const f = sellFixture();
+  const p = partialSalePlan(f, ['40', '30', '20', '10']);
+  // 第二檔的 oracle 報不出價：它的說明要排在原本的位置，其餘三檔照順序成交。
+  f.state.quoteErrors.set(p.holdings[1]!.asset.toLowerCase(), secondaryRevert('StaleFeed'));
+  const built = await buildRedeemPlan({ portfolioId: PORTFOLIO_ID, account: ACCOUNT, plan: p.plan }, { close: true }, { ...f.deps, quoteAggregator: async () => null });
+  assert.ok(built.plan.kind === 'ready');
+  assert.deepEqual(built.plan.steps.map((step) => step.tokenIn.toLowerCase()), [0, 2, 3].map((i) => p.holdings[i]!.asset.toLowerCase()));
+  assert.deepEqual(p.sold(built.plan.steps), [p.wei('40'), 0n, p.wei('20'), p.wei('10')], '全部賣出：賣的量就是持倉量');
+  assert.match(built.plan.rationale, /StaleFeed/);
+  // 逐檔讀的時候，第二檔的 previewSwap 一定排在第一檔的路徑報價之後；一起讀就全部排在任何路徑報價之前。
+  const names = f.state.reads.map((read) => read.functionName);
+  assert.ok(names.includes('quoteExactInput'));
+  assert.ok(names.lastIndexOf('previewSwap') < names.indexOf('quoteExactInput'), '每一檔的 oracle 報價都在第一筆路徑報價之前發出');
+  assert.ok(f.state.reads.every((read) => read.block === '0x7e'), '所有讀取仍釘在持倉那一塊');
+});
+
 test('部分賣出：賣 10（送 10.638298）按比例會有一檔不到 1 USDT，改成集中賣其餘幾檔，整筆照樣成交', async () => {
   const f = sellFixture();
   const p = partialSalePlan(f, ['63', '63', '63.1', '9.87']);

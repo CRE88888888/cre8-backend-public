@@ -139,7 +139,7 @@ export async function readYieldAccount(client: PublicClient, fullProfile: YieldP
         return { nav, direct: values.reduce((n, v) => n + v, 0n) };
       } catch { return null; }
     })();
-    const identities = await Promise.all(profile.markets.map(m => identity(m)));
+    const identities = await identitiesOf(profile.markets);
     const groups = new Map<string, MarketIdentity[]>();
     const positions: YieldPosition[] = [], risks: YieldRisk[] = [];
     for (const i of identities) {
@@ -222,33 +222,74 @@ export async function readYieldAccount(client: PublicClient, fullProfile: YieldP
     if (!fresh(observation.at, deps.now())) throw unavailable(`stale-after-read:${observation.block}:age-${deps.now().getTime() - observation.at.getTime()}ms`);
     return { profile, positions, risks, accountValue: positions.some(p=>p.state==='unknown')?null:nav, observation };
 
-    async function identity(m: YieldMarket): Promise<MarketIdentity | null> {
-      try {
-        const v = await deps.batch(client, observation.block, [
-          { target: profile.registry, name: 'market', args: [m.marketId] },
-          { target: profile.registry, name: 'totalUnits', args: [m.marketId] },
-          { target: m.asset, name: 'decimals' }, { target: m.receipt, name: 'decimals' },
-        ]);
-        const r = object(v[0]);
-        if (integer(r.chainId) !== 97n || num(r.kind) !== ({ venus: 1, lista: 2, aave_v3: 3 })[m.protocol] ||
-          address(r.asset) !== m.asset || address(r.receipt) !== m.receipt || address(r.target) !== m.target ||
-          typeof r.supplyEnabled !== 'boolean' || typeof r.retired !== 'boolean') throw unavailable();
-        const queues: Hex[] = [];
-        if (m.protocol === 'lista') {
-          const lengths = await deps.batch(client, observation.block, [{ target: m.target, name: 'supplyQueueLength' }, { target: m.target, name: 'withdrawQueueLength' }]);
-          const s = num(lengths[0]), w = num(lengths[1]);
+    /**
+     * Every market's registry row, units and decimals in one eth_call, then the Lista queue lengths in one and the queue
+     * entries in one: at most three calls for the whole profile instead of one to three per market (38 of the ~140
+     * calls of one account read on chain 97, queued eight at a time). These are plain views of unrelated contracts, so
+     * nothing has to be synced first and nothing is shared between them; a market whose own reads fail or do not match
+     * is still the only one that turns unknown (null), exactly as when each market was asked on its own.
+     */
+    async function identitiesOf(markets: readonly YieldMarket[]): Promise<(MarketIdentity | null)[]> {
+      const rows = await deps.batch(client, observation.block, markets.flatMap((m): ReadCall[] => [
+        { target: profile.registry, name: 'market', args: [m.marketId] },
+        { target: profile.registry, name: 'totalUnits', args: [m.marketId] },
+        { target: m.asset, name: 'decimals' }, { target: m.receipt, name: 'decimals' },
+      ])).catch(() => null);
+      const parsed = markets.map((m, index) => {
+        try {
+          if (rows === null) throw unavailable();
+          const v = rows.slice(index * 4, index * 4 + 4);
+          const r = object(v[0]);
+          if (integer(r.chainId) !== 97n || num(r.kind) !== ({ venus: 1, lista: 2, aave_v3: 3 })[m.protocol] ||
+            address(r.asset) !== m.asset || address(r.receipt) !== m.receipt || address(r.target) !== m.target ||
+            typeof r.supplyEnabled !== 'boolean' || typeof r.retired !== 'boolean') throw unavailable();
+          return { m, r, v };
+        } catch { return null; }
+      });
+      // Lista: the vault's supply / withdraw queues (asked only for the Lista markets whose registry row matched).
+      const lista = parsed.flatMap((p, index) => p !== null && p.m.protocol === 'lista' ? [index] : []);
+      const lengths = lista.length === 0 ? [] : await deps.batch(client, observation.block, lista.flatMap((index): ReadCall[] => {
+        const target = markets[index]!.target;
+        return [{ target, name: 'supplyQueueLength' }, { target, name: 'withdrawQueueLength' }];
+      })).catch(() => null);
+      const sizes = new Map<number, { s: number; w: number }>();
+      lista.forEach((index, n) => {
+        try {
+          if (lengths === null) throw unavailable();
+          const s = num(lengths[n * 2]), w = num(lengths[n * 2 + 1]);
           if (s < 1 || s > 16 || w > 16) throw unavailable();
-          const entries = await deps.batch(client, observation.block, [
-            ...Array.from({ length: s }, (_, n): ReadCall => ({ target: m.target, name: 'supplyQueue', args: [BigInt(n)] })),
-            ...Array.from({ length: w }, (_, n): ReadCall => ({ target: m.target, name: 'withdrawQueue', args: [BigInt(n)] })),
-          ]);
-          queues.push(...new Set(entries.map(hash)));
-        }
-        const underlyingDecimals = num(v[2]), receiptDecimals = num(v[3]);
-        if (underlyingDecimals > 255 || receiptDecimals > 255) throw unavailable();
-        return { market: m, riskSource: address(r.riskSource), configuration: hash(r.configuration), totalUnits: integer(v[1]),
-          minRate: integer(r.minRate), maxRate: integer(r.maxRate), retired:r.retired, supplyOpen: base[2]===false && r.supplyEnabled && !r.retired, underlyingDecimals, receiptDecimals, queues };
-      } catch { return null; }
+          sizes.set(index, { s, w });
+        } catch { /* this market stays without queues -> null below */ }
+      });
+      const queued = [...sizes];
+      const entries = queued.length === 0 ? [] : await deps.batch(client, observation.block, queued.flatMap(([index, { s, w }]): ReadCall[] => {
+        const target = markets[index]!.target;
+        return [...Array.from({ length: s }, (_, n): ReadCall => ({ target, name: 'supplyQueue', args: [BigInt(n)] })),
+          ...Array.from({ length: w }, (_, n): ReadCall => ({ target, name: 'withdrawQueue', args: [BigInt(n)] }))];
+      })).catch(() => null);
+      const queuesOf = new Map<number, Hex[]>();
+      let offset = 0;
+      for (const [index, { s, w }] of queued) {
+        const own = entries === null ? null : entries.slice(offset, offset + s + w);
+        offset += s + w;
+        try { if (own === null) throw unavailable(); queuesOf.set(index, [...new Set(own.map(hash))]); } catch { /* null below */ }
+      }
+      return parsed.map((p, index): MarketIdentity | null => {
+        try {
+          if (p === null) return null;
+          const { m, r, v } = p;
+          const queues: Hex[] = [];
+          if (m.protocol === 'lista') {
+            const own = queuesOf.get(index);
+            if (own === undefined) return null;
+            queues.push(...own);
+          }
+          const underlyingDecimals = num(v[2]), receiptDecimals = num(v[3]);
+          if (underlyingDecimals > 255 || receiptDecimals > 255) throw unavailable();
+          return { market: m, riskSource: address(r.riskSource), configuration: hash(r.configuration), totalUnits: integer(v[1]),
+            minRate: integer(r.minRate), maxRate: integer(r.maxRate), retired: r.retired === true, supplyOpen: base[2]===false && r.supplyEnabled === true && r.retired !== true, underlyingDecimals, receiptDecimals, queues };
+        } catch { return null; }
+      });
     }
     function unknownPosition(m: YieldMarket, i?: MarketIdentity): YieldPosition {
       return { ...observation, market: m, state: 'unknown', reason: 'market_data_unavailable', receipt: null, observedUnits: null, trackedUnits: null,

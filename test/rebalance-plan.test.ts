@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
 import { createPublicClient, custom, decodeAbiParameters, decodeFunctionData, encodeFunctionResult, encodePacked, getAddress, http, isHex, parseAbi, zeroAddress } from 'viem';
 import type { Address, Hex, PublicClient } from 'viem';
-import { bsc } from 'viem/chains';
+import { bsc, bscTestnet } from 'viem/chains';
 import { computeDrift } from '../src/drift.js';
 import type { DriftReport, Holding, TargetWeight } from '../src/drift.js';
 import {
@@ -31,6 +31,7 @@ import { capAmountInForImpact, estimateImpact } from '../src/impact.js';
 import type { PoolImpactState } from '../src/impact.js';
 import { twapPriceInUsdt } from '../src/pricing.js';
 import { validateAllocation } from '../src/strategies.js';
+import { chooseBestPath, POOL_ABSENT_TTL_MS, setKnownPools } from '../src/routing.js';
 import { loadTradingConfig } from '../src/config.js';
 import { readNativeBudgetPrice } from '../src/paymaster.js';
 
@@ -3469,4 +3470,68 @@ test('My mix target pass never spends cash held for closed asset sources', async
   const ready = expectReady(await planRebalance({ ...args, cashBudgetRaw: 50n * 10n ** 18n }));
   assert.equal(ready.steps[0]?.amountIn, 50n * 10n ** 18n);
   for (const raw of [-1n, 101n * 10n ** 18n]) assert.equal((await planRebalance({ ...args, cashBudgetRaw: raw })).kind, 'blocked');
+});
+
+test('pool existence is asked once per process: a pool that exists is never asked again, a missing one only after its TTL, a failed read is not remembered', async () => {
+  const FACTORY = '0x0000000000000000000000000000000000000f01' as Address, QUOTER = '0x0000000000000000000000000000000000000f02' as Address;
+  const abi = parseAbi(['function getPool(address,address,uint24) view returns(address)', 'function quoteExactInput(bytes,uint256) returns(uint256,uint160[])']);
+  const state = { getPool: 0, quotes: 0, failing: false, pools: new Set(['500']) };
+  const client = (chain: typeof bscTestnet | undefined) => createPublicClient({ ...(chain === undefined ? {} : { chain }), transport: custom({ request: async ({ params }) => {
+    assert.ok(Array.isArray(params)); const call: unknown = params[0]; assert.ok(typeof call === 'object' && call !== null);
+    const data: unknown = Reflect.get(call, 'data'); assert.ok(typeof data === 'string' && isHex(data));
+    const decoded = decodeFunctionData({ abi, data });
+    if (decoded.functionName === 'quoteExactInput') { state.quotes += 1; return encodeFunctionResult({ abi, functionName: 'quoteExactInput', result: [130n, []] }); }
+    state.getPool += 1;
+    if (state.failing) throw new Error('RPC unavailable');
+    const direct = decoded.args[0].toLowerCase() === WBNB && decoded.args[1].toLowerCase() === USDT;
+    return encodeFunctionResult({ abi, functionName: 'getPool', result: direct && state.pools.has(String(decoded.args[2])) ? WBNB_USDT_POOL : zeroAddress });
+  } }, { retryCount: 0 }) });
+  const route = (chain?: typeof bscTestnet) => chooseBestPath(client(chain), { tokenIn: WBNB, tokenOut: USDT, amountIn: 1n, via: null, factory: FACTORY, pinnedFee: null, quoter: QUOTER, blockNumber: 42n });
+  const realNow = Date.now;
+  try {
+    setKnownPools(true);
+    // A client without a real chain (unit tests, local forks) is never remembered: four fee tiers asked every time.
+    await route(); await route();
+    assert.equal(state.getPool, 8);
+    // Chain 97: the first plan asks the four tiers, the second asks nothing and still quotes the same single path.
+    state.getPool = 0; state.quotes = 0;
+    const first = await route(bscTestnet), second = await route(bscTestnet);
+    assert.equal(state.getPool, 4);
+    assert.equal(state.quotes, 2, 'every candidate is still quoted on-chain each time');
+    assert.deepEqual(second, first); assert.ok(first?.kind === 'v3' && first.amountOut === 130n);
+    // A pool created later is found once the "no" has aged out; the pool that exists is not asked again.
+    state.pools.add('2500');
+    await route(bscTestnet);
+    assert.equal(state.getPool, 4);
+    Date.now = () => realNow() + POOL_ABSENT_TTL_MS + 1;
+    await route(bscTestnet);
+    assert.equal(state.getPool, 7, 'the three missing tiers are asked again, the existing one is not');
+    assert.equal(state.quotes, 5, 'now two candidates: the old pool and the new one');
+    // A failed read says nothing about the pool: nothing is remembered, the next plan asks again.
+    setKnownPools(true); state.getPool = 0; state.failing = true;
+    assert.equal(await route(bscTestnet), null);
+    state.failing = false;
+    assert.ok(await route(bscTestnet));
+    assert.equal(state.getPool, 8);
+  } finally { Date.now = realNow; setKnownPools(false); }
+});
+
+test('the floor refresh asks every step at once and still reports the first step that fails', async () => {
+  const ORACLE_ADDRESS = '0x0000000000000000000000000000000000000a11' as Address;
+  const abi = parseAbi(['function previewSwap(address,address,uint256) view returns(uint256,uint256)']);
+  const asked: bigint[] = []; let inFlight = 0, widest = 0;
+  const client = createPublicClient({ transport: custom({ request: async ({ params }) => {
+    assert.ok(Array.isArray(params)); const call: unknown = params[0]; assert.ok(typeof call === 'object' && call !== null);
+    const data: unknown = Reflect.get(call, 'data'); assert.ok(typeof data === 'string' && isHex(data));
+    const amount = decodeFunctionData({ abi, data }).args[2]; asked.push(amount);
+    inFlight += 1; widest = Math.max(widest, inFlight);
+    // The first step answers last: what is reported must follow the step order, not which answer came back first.
+    await new Promise((resolve) => setTimeout(resolve, amount === 1n ? 40 : 5));
+    inFlight -= 1;
+    return encodeFunctionResult({ abi, functionName: 'previewSwap', result: [amount * 100n, 0n] });
+  } }, { retryCount: 0 }) });
+  const step = (amountIn: bigint): PlannedStep => ({ tokenIn: WBNB, tokenOut: USDT, amountIn, amountOutMin: amountIn * 99n, oracleFloor: amountIn * 99n, venue: USDT, data: '0x' });
+  const result = await refreshFloors({ publicClient: client, oracle: ORACLE_ADDRESS, steps: [step(1n), step(2n), step(3n)], feeBps: 0, blockNumber: 42n });
+  assert.ok(!result.ok); assert.match(result.reason, /step#0 的 minimum 是 0/);
+  assert.deepEqual([...asked].sort(), [1n, 2n, 3n]); assert.equal(widest, 3, 'the three floors were in flight together');
 });

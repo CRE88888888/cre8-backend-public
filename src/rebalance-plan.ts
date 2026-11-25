@@ -1132,10 +1132,16 @@ export async function refreshFloors(params: {
   const rebuilt: PlannedStep[] = [];
   let usedFallback = false;
 
-  for (const [index, step] of steps.entries()) {
+  type Failed = Extract<RefreshFloorsResult, { ok: false }>;
+  /**
+   * One step's fresh floor and re-quoted route. A step reads nothing of the other steps, so all of them are asked at
+   * once (they were asked one after the other, ~3 round trips per step, while the price kept moving). The results are
+   * taken in step order below, so the first step that fails is still the one reported, exactly as before.
+   */
+  const refreshStep = async (step: PlannedStep, index: number): Promise<{ fail: Failed } | { refresh: FloorRefresh; step: PlannedStep; fallback: boolean }> => {
     const identity = isAddressEqual(step.venue, PANCAKE_UR) ? decodeStepIdentity(step) : null;
     if (identity !== null && 'problem' in identity) {
-      return { ok: false, kind: 'quote-failed', reason: `送出前重問地板失敗：step#${index} ${identity.problem}` };
+      return { fail: { ok: false, kind: 'quote-failed', reason: `送出前重問地板失敗：step#${index} ${identity.problem}` } };
     }
 
     const quote = await publicClient
@@ -1153,31 +1159,31 @@ export async function refreshFloors(params: {
       // （oracle 的 revert 或 `NoFloor`）—— 那是把「這一輪不做」變成一次花 gas 的失敗。
       const secondary = await describePriceSourceError(quote.error, publicClient, { oracle, tokenIn: step.tokenIn, tokenOut: step.tokenOut, ...(params.blockNumber === undefined ? {} : { blockNumber: params.blockNumber }) });
       const name = secondary?.detail ?? revertNameOf(quote.error);
-      return {
+      return { fail: {
         ok: false,
         kind: 'quote-failed',
         reason:
           `送出前重問地板失敗：step#${index} previewSwap(${short(step.tokenIn)} → ${short(step.tokenOut)}, ${step.amountIn})` +
           `（${name ?? 'RPC 無法取得地板'}）` +
           '——沒有新鮮的地板就不送（舊值等於一個已經過期的下限）',
-      };
+      } };
     }
     const [quoted, minimum] = quote.result;
     // 合約對 `minimum === 0` 是 revert NoFloor：不是「地板是 0」，是「沒有地板」。
     if (minimum === 0n) {
-      return {
+      return { fail: {
         ok: false,
         kind: 'quote-failed',
         reason: `送出前重問地板失敗：step#${index} 的 minimum 是 0（合約會 revert NoFloor）`,
-      };
+      } };
     }
 
     const freshCost=step.costBudgetBps===undefined?undefined:identity!==null&&'path' in identity&&identity.path!==null?Math.min(step.costBudgetBps,pathCostBudget(identity.path)):step.costBudgetBps;
     let freshAmountOutMin: bigint;
     try { freshAmountOutMin = minGrossFor(freshCost === undefined ? minimum : costFloor(quoted, minimum, freshCost), feeBps); }
-    catch { return {ok:false,kind:'quote-failed',reason:'送出前成本預算或報價無效，不送交易'}; }
+    catch { return { fail: {ok:false,kind:'quote-failed',reason:'送出前成本預算或報價無效，不送交易'} }; }
     const deltaBps = floorDeltaBps(step.oracleFloor, minimum);
-    refreshes.push({
+    const refresh: FloorRefresh = {
       index,
       tokenIn: step.tokenIn,
       tokenOut: step.tokenOut,
@@ -1186,16 +1192,16 @@ export async function refreshFloors(params: {
       plannedAmountOutMin: step.amountOutMin,
       freshAmountOutMin,
       deltaBps,
-    });
-    if (deltaBps <= -maxWorseningBps) return { ok: false, kind: 'floor-collapsed',
-      reason: `送出前重問地板：step#${index} 差 ${deltaBps} bps 已超過惡化上限 ${maxWorseningBps} bps，不送交易` };
+    };
+    if (deltaBps <= -maxWorseningBps) return { fail: { ok: false, kind: 'floor-collapsed',
+      reason: `送出前重問地板：step#${index} 差 ${deltaBps} bps 已超過惡化上限 ${maxWorseningBps} bps，不送交易` } };
     const pancake = await quotePancake({ publicClient, tokenIn: step.tokenIn, tokenOut: step.tokenOut,
       amountIn: step.amountIn, poolFee: identity?.poolFee ?? null,
       ...(identity?.path === undefined || identity.path === null ? {} : { path: identity.path }),
       ...(params.blockNumber === undefined ? {} : { blockNumber: params.blockNumber }) });
     if (identity === null) {
-      if ((publicClient.chain?.id ?? configuredChainId()) === 97) return { ok: false, kind: 'quote-failed', reason: 'chain 97 only supports Pancake V3' };
-      if (params.executor === undefined || params.deadline === undefined) return { ok: false, kind: 'quote-failed', reason: '聚合器刷新缺少 executor/deadline，不送交易' };
+      if ((publicClient.chain?.id ?? configuredChainId()) === 97) return { fail: { ok: false, kind: 'quote-failed', reason: 'chain 97 only supports Pancake V3' } };
+      if (params.executor === undefined || params.deadline === undefined) return { fail: { ok: false, kind: 'quote-failed', reason: '聚合器刷新缺少 executor/deadline，不送交易' } };
       let failure: AggregatorFailure = 'api-failed';
       const buffered = amountOutMinWithBuffer(freshAmountOutMin);
       const candidate = await (params.quoteAggregator ?? quoteKyberSwap)({ publicClient, executor: params.executor,
@@ -1204,26 +1210,24 @@ export async function refreshFloors(params: {
         onFailure: (reason) => { failure = reason; },
         ...(params.blockNumber === undefined ? {} : { blockNumber: params.blockNumber }) }).catch(() => null);
       if (candidate !== null && candidate.amountOut >= buffered && isAddressEqual(candidate.venue, step.venue)) {
-        rebuilt.push({ ...step, venue: candidate.venue, data: candidate.data, oracleFloor: minimum,
-          amountOutMin: quoteBoundMinimum(buffered, candidate.amountOut, pancake?.amountOut) });
+        return { refresh, fallback: false, step: { ...step, venue: candidate.venue, data: candidate.data, oracleFloor: minimum,
+          amountOutMin: quoteBoundMinimum(buffered, candidate.amountOut, pancake?.amountOut) } };
       } else {
         if (candidate !== null) failure = !isAddressEqual(candidate.venue, step.venue) ? 'venue-changed' : 'below-floor';
         const label = { 'api-failed': 'API 失敗／逾時', 'below-floor': '低於地板', 'venue-changed': 'venue 改變' }[failure];
         const diagnostic = `step#${index} 聚合器刷新 ${failure}（${label}），退回 Pancake`;
         (params.log ?? console.log)(`[routing] ${diagnostic}`);
         const fallback = await pancakeFallback({ ...params, executor: params.executor, step, minimum, quoted, minGross: freshAmountOutMin, route: pancake });
-        if (fallback === null) return { ok: false, kind: 'quote-failed', reason: `${diagnostic}；Pancake 沒有符合新鮮地板的白名單報價，不送交易` };
-        rebuilt.push(fallback);
-        usedFallback = true;
+        if (fallback === null) return { fail: { ok: false, kind: 'quote-failed', reason: `${diagnostic}；Pancake 沒有符合新鮮地板的白名單報價，不送交易` } };
+        return { refresh, fallback: true, step: fallback };
       }
-      continue;
     }
     if (pancake === null || pancake.amountOut < amountOutMinWithBuffer(freshAmountOutMin) ||
         (identity.v2Tokens !== null && (pancake.kind !== 'v2' ||
           pancake.tokens.map((token) => token.toLowerCase()).join() !== identity.v2Tokens.map((token) => token.toLowerCase()).join()))) {
-      return { ok: false, kind: 'quote-failed', reason: `送出前重問地板失敗：step#${index} 沒有符合地板的原路徑報價，不送交易` };
+      return { fail: { ok: false, kind: 'quote-failed', reason: `送出前重問地板失敗：step#${index} 沒有符合地板的原路徑報價，不送交易` } };
     }
-    rebuilt.push(
+    return { refresh, fallback: false, step:
       {...buildStep({
         chainId: publicClient.chain?.id,
         executor: identity.recipient,
@@ -1236,19 +1240,31 @@ export async function refreshFloors(params: {
         poolFee: identity.poolFee,
         // 逐字保留原本的路徑（V3 可能多跳；V2 是 address[]）。
         ...(identity.v2Tokens === null ? { path: identity.path } : { v2Tokens: identity.v2Tokens }),
-      }), ...(step.costBudgetBps === undefined ? {} : {costBudgetBps:freshCost})},
-    );
+      }), ...(step.costBudgetBps === undefined ? {} : {costBudgetBps:freshCost})} };
+  };
+  const settle = <T>(promise: Promise<T>) => promise.then((value) => ({ ok: true as const, value }), (error: unknown) => ({ ok: false as const, error }));
+  for (const outcome of await Promise.all(steps.map((step, index) => settle(refreshStep(step, index))))) {
+    if (!outcome.ok) throw outcome.error;
+    if ('fail' in outcome.value) return outcome.value.fail;
+    refreshes.push(outcome.value.refresh);
+    rebuilt.push(outcome.value.step);
+    if (outcome.value.fallback) usedFallback = true;
   }
 
-  for(const [index,step] of rebuilt.entries()){
-    if(step.costBudgetBps===undefined||!isAddressEqual(step.venue,PANCAKE_UR))continue;
+  // The actual route's impact, per step: independent reads again, asked together and judged in step order.
+  const impacts = await Promise.all(rebuilt.map(async (step): Promise<'skip' | 'unidentified' | number | null> => {
+    if(step.costBudgetBps===undefined||!isAddressEqual(step.venue,PANCAKE_UR))return 'skip';
     const identity=decodeStepIdentity(step);
-    if('problem' in identity||identity.path===null)return {ok:false,kind:'quote-failed',reason:'[ROUTE_IMPACT_UNAVAILABLE] 無法確認實際路徑衝擊'};
+    if('problem' in identity||identity.path===null)return 'unidentified';
     let timer:ReturnType<typeof setTimeout>|undefined;
-    const impact=await Promise.race([
+    return Promise.race([
       routeImpactBps(publicClient,{path:identity.path,amountIn:step.amountIn,...(params.blockNumber===undefined?{}:{blockNumber:params.blockNumber})}).catch(()=>null),
       new Promise<null>(resolve=>{timer=setTimeout(()=>resolve(null),PANCAKE_QUOTE_TIMEOUT_MS);}),
     ]).finally(()=>clearTimeout(timer));
+  }));
+  for(const [index,impact] of impacts.entries()){
+    if(impact==='skip')continue;
+    if(impact==='unidentified')return {ok:false,kind:'quote-failed',reason:'[ROUTE_IMPACT_UNAVAILABLE] 無法確認實際路徑衝擊'};
     if(impact===null||impact>DEFAULT_MAX_IMPACT_BPS)return {ok:false,kind:'quote-failed',reason:`[ROUTE_IMPACT] step#${index} 實際路徑衝擊超過80 bps或資料不可用，不送交易`};
   }
   if (usedFallback) {

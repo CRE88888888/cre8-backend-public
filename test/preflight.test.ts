@@ -614,7 +614,9 @@ test('#76 the final floor refresh decodes nested TWAP data, identifies the symbo
   const result = await refreshFloors({ publicClient: f.client, oracle: ORACLE, steps: [step, step], feeBps: 0, blockNumber: 42n });
   assert.ok(!result.ok); assert.match(result.reason, /ORACLE_UNAVAILABLE:TEST/);
   assert.doesNotMatch(result.reason, /private-token/);
-  assert.equal(f.state.calls.filter((call) => call.name === 'previewSwap').length, 1);
+  // Every step's floor is asked in the same round trip now; the first failing step is still the one that refuses the batch.
+  assert.match(result.reason, /step#0/); assert.doesNotMatch(result.reason, /step#1/);
+  assert.equal(f.state.calls.filter((call) => call.name === 'previewSwap').length, 2);
 });
 
 test('#76 monitoring handles token/quote boundaries and missing metadata without claiming recovery', async () => {

@@ -4115,3 +4115,73 @@ test('each portfolio logs how long it took and where the time went (slow phases 
   assert.ok(timing, lines.join('\n'));
   assert.match(timing, /planPortfolio \d+/);
 });
+
+test("an owner's own sale skips the account-wide keeper passes; the executor pause still gates it and background rounds keep them", async () => {
+  for (const skipKeepers of [undefined, true]) {
+    for (const paused of [false, true]) {
+      const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+      const chain = stubChain({ rebalance: readyPlan([step()]) });
+      const ran: string[] = [];
+      const round = await runSchedulerOnce({ dryRun: false, now: NOW, skipAlerts: true, ...(skipKeepers ? { skipKeepers } : {}) }, deps(db, chain, {
+        readGlobalPaused: async () => paused,
+        yieldRound: async () => { ran.push('yield'); return { checked: 0, blocked: 0 }; },
+        dcaRound: async () => { ran.push('dca'); return { checked: 0, credited: 0, blocked: 0 }; },
+        strategyEarnRound: async () => { ran.push('strategy-earn'); return null; },
+        strategyV2Round: async () => { ran.push('strategy-v2'); return null; },
+        strategyRewardsRound: async () => { ran.push('rewards'); return null; },
+        resumePausedJobs: async () => { ran.push('paused-jobs'); return []; },
+      }));
+      assert.deepEqual(ran, skipKeepers ? [] : ['yield', 'dca', 'strategy-earn', 'strategy-v2', 'rewards', 'paused-jobs']);
+      assert.deepEqual(outcomes(round), [paused ? 'blocked' : 'executed'], 'the round itself is unchanged');
+      assert.equal(chain.executeCalls.length, paused ? 0 : 1, 'skipping the keepers never skips the global pause');
+    }
+  }
+});
+
+test("an owner's own sale returns before the after-snapshot is read; the snapshot is still written, and background rounds still wait for it", async () => {
+  for (const background of [false, true]) {
+    const chain = stubChain({ rebalance: readyPlan([encodableStep()]) });
+    const db = stubDb({ portfolios: [portfolio({ nextRunAt: null })], sessionKeys: [sessionKey()] });
+    const base = deps(db, chain);
+    const written: string[] = [];
+    let releaseAfter: () => void = () => {};
+    const afterRead = new Promise<void>((resolve) => { releaseAfter = resolve; });
+    let afterStarted = false, settled = false;
+    const round = runSchedulerOnce({ dryRun: false, now: NOW, skipAlerts: true }, deps(db, chain, {
+      ...(background ? { afterSnapshotInBackground: true } : {}),
+      query: async (text, params) => {
+        if (text.includes('from operations where idempotency_key')) return { rows: [{ id: '42' }] };
+        return base.query!(text, params);
+      },
+      planPortfolio: async (id) => {
+        // The second read is the after-snapshot's: hold it until the test lets go.
+        if (chain.planPortfolioCalls.length >= 1) { afterStarted = true; await afterRead; }
+        return base.planPortfolio!(id);
+      },
+      writeSnapshot: async (_snapshot, _report, options) => { written.push(options?.phase ?? 'manual'); return { headerInserted: true, inserted: 0, updated: 0 }; },
+    })).then((result) => { settled = true; return result; });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(afterStarted, true, 'the after-snapshot read starts as soon as the transaction has landed');
+    assert.equal(settled, background, background ? 'the owner already has the answer' : 'a background round waits for its snapshot');
+    assert.deepEqual(written, ['before']);
+    releaseAfter();
+    assert.deepEqual(outcomes(await round), ['executed']);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.deepEqual(written, ['before', 'after'], 'the after-snapshot is written either way');
+  }
+});
+
+test('pre-checks read every step in one go and still list the failures step by step, allowance before balance', async () => {
+  const steps = [step(), step({ tokenIn: TOKEN_OUT, tokenOut: TOKEN_IN })];
+  const chain = stubChain({ rebalance: readyPlan(steps) });
+  const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+  let inFlight = 0, widest = 0;
+  const read = async (): Promise<bigint> => { inFlight += 1; widest = Math.max(widest, inFlight); await new Promise((resolve) => setTimeout(resolve, 5)); inFlight -= 1; return 0n; };
+  const round = await runSchedulerOnce({ dryRun: false, now: NOW, skipAlerts: true }, deps(db, chain, { readAllowance: read, readBalance: read }));
+  const reason = round.results[0]?.reason ?? '';
+  assert.deepEqual(outcomes(round), ['blocked']);
+  assert.deepEqual([...reason.matchAll(/\[(ALLOWANCE_TOO_LOW|INSUFFICIENT_BALANCE)\] step#(\d)/g)].map((m) => `${m[2]}:${m[1]}`),
+    ['0:ALLOWANCE_TOO_LOW', '0:INSUFFICIENT_BALANCE', '1:ALLOWANCE_TOO_LOW', '1:INSUFFICIENT_BALANCE']);
+  assert.equal(widest, 4, 'both reads of both steps were in flight together');
+  assert.equal(chain.executeCalls.length, 0);
+});

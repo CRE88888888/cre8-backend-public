@@ -134,7 +134,7 @@ import { hdKeyToAccount } from 'viem/accounts';
 import { createBundlerClient, entryPoint07Abi, formatUserOperation, formatUserOperationReceipt, getUserOperationHash } from 'viem/account-abstraction';
 import type { GetUserOperationReturnType, UserOperationReceipt } from 'viem/account-abstraction';
 import { rpcBatch, rpcTransport } from './rpc-transport.js';
-import { activeChain } from './chain-object.js';
+import { activeChain, RECEIPT_POLLING_MS } from './chain-object.js';
 import { testnetAssets, TESTNET_97 } from './testnet-profile.js';
 import { signPreparedOperation } from './user-operation.js';
 import { KERNEL_V3_3_ADDRESSES, kernelAddressesForChain } from './addresses.js';
@@ -202,6 +202,13 @@ const ENTRY_POINT = { address: KERNEL_V3_3_ADDRESSES.entryPointV07, version: '0.
 
 /** 交易送出後等 receipt 的上限（毫秒）。超過仍在途，下一輪先對帳，不能重送。 */
 const USER_OP_RECEIPT_TIMEOUT_MS = 180_000;
+/**
+ * How often the bundler is asked for the receipt of a UserOp we just sent. Without it viem uses the client's 4 s
+ * default: the first question is asked the instant the op is submitted (never there yet), the next one 4 s later, on a
+ * chain whose blocks take under a second. Every sale (and every repay-and-take-back before one) waited those 4 s.
+ * Same interval as the other receipt waits (`RECEIPT_POLLING_MS`); the bundler is our own, the cost is a few lookups.
+ */
+const USER_OP_RECEIPT_POLL_MS = RECEIPT_POLLING_MS;
 
 const RELEASE_MARGIN_SECONDS = 300n;
 const MAX_USER_OP_NONCE = (1n << 256n) - 1n;
@@ -643,6 +650,12 @@ export type SchedulerDeps = {
    * 所以在對齊的投組上它會被門檻短路掉，變成永遠 noop（實測：drift 2 bps 時 redeem 回 noop）。
    */
   forcePlan?: boolean;
+  /**
+   * An owner's own sale: the audit snapshot after a landed transaction is read and written after the result is returned
+   * instead of before it. It is a fresh read of the whole portfolio (several seconds) that the caller's answer does not
+   * depend on; the block it reads is still chosen the moment the transaction has landed. Background rounds keep waiting.
+   */
+  afterSnapshotInBackground?: boolean;
   /** 認領用的 DB 介面（測試換成記憶體 stub）。 */
   withTransaction?: WithTransactionFn;
   query?: SchedulerQueryFn;
@@ -697,6 +710,13 @@ export type SchedulerDeps = {
 export type RunSchedulerArgs = {
   /** HTTP single-portfolio calls omit global monitoring; background rounds retain it by default. */
   skipAlerts?: boolean;
+  /**
+   * An owner's own sale of one portfolio: leave the account-wide keeper passes (mix intents, yield, DCA, Strategy Earn,
+   * routing v2, rewards, paused jobs) to the background scheduler. They read every account, none of them is about this
+   * portfolio (the yield and mix passes pick theirs by a rotating cursor), and the owner waited about 10 s for them
+   * before the sale even started. The executor's global pause is still read: that is this round's own gate.
+   */
+  skipKeepers?: boolean;
   /** **預設 true**（省略即 dry run）。要送交易必須明確給 false。 */
   dryRun?: boolean;
   limit?: number;
@@ -1417,8 +1437,14 @@ async function runPrechecks(
   if (derivationFailure !== null) return { failures: [derivationFailure], sessionKey: null };
 
   const failures: PrecheckFailure[] = [];
+  // Every step's allowance and balance in one round trip (they were read one after the other, two reads per step); the
+  // failures are still listed step by step, allowance before balance.
+  const reads = await Promise.all(args.steps.map((step) => Promise.all([
+    deps.readAllowance({ token: step.tokenIn, owner: args.account, spender: args.executor }),
+    deps.readBalance({ token: step.tokenIn, owner: args.account }),
+  ])));
   for (const [index, step] of args.steps.entries()) {
-    const allowance = await deps.readAllowance({ token: step.tokenIn, owner: args.account, spender: args.executor });
+    const [allowance, balance] = reads[index]!;
     if (allowance < step.amountIn) {
       failures.push({
         code: 'ALLOWANCE_TOO_LOW',
@@ -1427,7 +1453,6 @@ async function runPrechecks(
           `< amountIn ${step.amountIn}：執行器的 safeTransferFrom 一定 revert`,
       });
     }
-    const balance = await deps.readBalance({ token: step.tokenIn, owner: args.account });
     if (balance < step.amountIn) {
       failures.push({
         code: 'INSUFFICIENT_BALANCE',
@@ -1515,9 +1540,13 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
   const publicClient = defaultPublicClient();
   let paymaster: ReturnType<typeof schedulerPaymaster>;
   let budgetKey: string | null = null;
+  // Where the time of one send goes (the round's phase line): `send:account` … `send:receipt`.
+  let lap = performance.now();
+  const mark = (name: string) => { notePhase(name, lap); lap = performance.now(); };
   try {
     const network = activeChain();
     const account = await sessionKernelAccount(args);
+    mark('send:account');
     const data = encodeFunctionData({
       abi: EXECUTOR_ABI,
       functionName: 'executeRebalance',
@@ -1562,6 +1591,7 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
     // 而 gas 不足的後果不是 revert，是「success = false 但 tx.status = 1」—— 錢扣了、幣沒換。
     const estimate = await client.estimateUserOperationGas({ calls, nonce: args.nonce,
       ...(paymaster === undefined ? {} : { paymaster: estimationPaymaster(paymaster) }) });
+    mark('send:estimate');
     let numeraire: Address;
     try {
       numeraire = await publicClient.readContract({ address: args.executor, abi: EXECUTOR_BUY_ABI, functionName: 'numeraire' });
@@ -1604,6 +1634,7 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
           `不花錢買一個 success=false 的 op。原因：${a10ErrorMessage(error) ?? errorMessage(error)}`,
       );
     }
+    mark('send:simulate');
 
     // 只覆寫 `callGasLimit`：其餘欄位（verificationGasLimit / preVerificationGas）仍由 alto 估算，
     // 它們與「執行路徑有多長」無關。
@@ -1625,13 +1656,16 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
     const signed = await signPreparedOperation(prepared, (operation) => account.signUserOperation(operation));
     await args.beforeSending?.();
     await assertDexLock();
+    mark('send:sponsor+sign');
     args.onSending();
     const userOpHash = await client.sendUserOperation(signed);
     // alto 有 simulation：被拒的 op **不會**回 userOpHash。所以拿到 hash = 這一筆被接受了。
     await args.onSubmitted({ userOpHash });
     await settleGasBudget(budgetKey, 'submitted');
+    mark('send:submit');
 
-    const receipt = await client.waitForUserOperationReceipt({ hash: userOpHash, timeout: USER_OP_RECEIPT_TIMEOUT_MS });
+    const receipt = await client.waitForUserOperationReceipt({ hash: userOpHash, timeout: USER_OP_RECEIPT_TIMEOUT_MS, pollingInterval: USER_OP_RECEIPT_POLL_MS });
+    mark('send:receipt');
     await settleGasBudget(budgetKey, receipt.success ? 'confirmed' : 'failed');
 
     // ---- ③ 三層判定（§8.16）：只驗 receipt.status 就是把「上鏈但什麼都沒換」記成成功 -----------------
@@ -1791,7 +1825,7 @@ async function sendStrategyEarnWithSessionKey(accountAddress: Address, sessionKe
     const signed = await signPreparedOperation(prepared, op => account.signUserOperation(op));
     const hash = await client.sendUserOperation(signed);
     await settleGasBudget(budgetKey, 'submitted');
-    const receipt = await client.waitForUserOperationReceipt({ hash, timeout: USER_OP_RECEIPT_TIMEOUT_MS });
+    const receipt = await client.waitForUserOperationReceipt({ hash, timeout: USER_OP_RECEIPT_TIMEOUT_MS, pollingInterval: USER_OP_RECEIPT_POLL_MS });
     await settleGasBudget(budgetKey, receipt.success ? 'confirmed' : 'failed');
     if (receipt.receipt.status !== 'success' || receipt.success !== true) throw new Error(`strategy earn UserOp failed tx=${receipt.receipt.transactionHash}`);
     return { hash: receipt.receipt.transactionHash, blockNumber: receipt.receipt.blockNumber, logs: receipt.logs };
@@ -1973,6 +2007,7 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
     log: provided.log ?? ((line: string) => console.log(line)),
     /** 稽核快照的writer。可注入，所以排程器測試不必真的寫 DB。 */
     writeSnapshot: provided.writeSnapshot ?? writeSnapshotImpl,
+    afterSnapshotInBackground: provided.afterSnapshotInBackground === true,
     planPortfolio:
       provided.planPortfolio ??
       ((portfolioId: number) =>
@@ -2148,24 +2183,25 @@ export async function runSchedulerOnce(
   const limit = assertLimit(args.limit ?? DEFAULT_ROUND_LIMIT);
   const thresholdBps = args.thresholdBps ?? DEFAULT_THRESHOLD_BPS;
   const resolved = withPhaseTiming(resolveDeps({ thresholdBps }, {...deps,clock:deps.clock??(args.now?()=>new Date(now):()=>new Date())}));
-  if (!dryRun && resolved.chainId === 97) {
+  const keepers = args.skipKeepers !== true;
+  if (!dryRun && resolved.chainId === 97 && keepers) {
     try { await reconcilePendingMixes(resolved.query, limit); }
     catch { resolved.log('[mix] 意圖對帳未完成，保留原排他與證據。'); }
   }
 
   // Yield exits/recovery have their own account lock and precede DEX queues, buy throttles and price gates.
-  try { const result=await (deps.yieldRound??runYieldRound)({dryRun,limit}); resolved.log('[yield] '+JSON.stringify(result)); } catch (error) { resolved.log(`[yield] 生息讀值／對帳未完成，保留原部位與預留：${errorChain(error)}`); }
+  if (keepers) try { const result=await (deps.yieldRound??runYieldRound)({dryRun,limit}); resolved.log('[yield] '+JSON.stringify(result)); } catch (error) { resolved.log(`[yield] 生息讀值／對帳未完成，保留原部位與預留：${errorChain(error)}`); }
   // DCA (定投, db 0064): redeem due tranches from each plan's vault and credit them as funding lots before the buy round.
-  try { const result=await (deps.dcaRound??runDcaRound)({dryRun,limit,log:resolved.log}); if(result.checked||result.blocked)resolved.log('[dca] '+JSON.stringify(result)); } catch { resolved.log('[dca] 定投讀值／對帳未完成，下輪再試'); }
+  if (keepers) try { const result=await (deps.dcaRound??runDcaRound)({dryRun,limit,log:resolved.log}); if(result.checked||result.blocked)resolved.log('[dca] '+JSON.stringify(result)); } catch { resolved.log('[dca] 定投讀值／對帳未完成，下輪再試'); }
   // Strategy earn keeper (backend#199): anyone-callable deleverage/unwind and incentive claims for each account's own position.
-  try { const result=await (deps.strategyEarnRound??runStrategyEarnRound)({dryRun,log:resolved.log}); if(result)resolved.log('[strategy-earn] '+JSON.stringify(result)); } catch { resolved.log('[strategy-earn] 健康度讀值未完成，下輪再試'); }
+  if (keepers) try { const result=await (deps.strategyEarnRound??runStrategyEarnRound)({dryRun,log:resolved.log}); if(result)resolved.log('[strategy-earn] '+JSON.stringify(result)); } catch { resolved.log('[strategy-earn] 健康度讀值未完成，下輪再試'); }
   // Routing v2 keeper (anyone-callable executeDeleverage at the health line, reward tokens box -> account): only accounts of owners in the v2 audience.
-  try { const result=await (deps.strategyV2Round??((a)=>defaultStrategyV2Round(a,{chainId:resolved.chainId,query:resolved.query})))({dryRun,log:resolved.log}); if(result)resolved.log('[strategy-routing] '+JSON.stringify(result)); } catch (error) { resolved.log(`[strategy-routing] keeper 讀值未完成，下輪再試：${oneLine(error)}`); }
+  if (keepers) try { const result=await (deps.strategyV2Round??((a)=>defaultStrategyV2Round(a,{chainId:resolved.chainId,query:resolved.query})))({dryRun,log:resolved.log}); if(result)resolved.log('[strategy-routing] '+JSON.stringify(result)); } catch (error) { resolved.log(`[strategy-routing] keeper 讀值未完成，下輪再試：${oneLine(error)}`); }
   // Strategy rewards (LISTA / XVS, db 0068): mainnet only and off unless STRATEGY_REWARDS_ENABLED=1; returns null otherwise (no I/O).
-  try { const result=await (deps.strategyRewardsRound??((a)=>{ const chainId=getConfig().chainId, v2=strategyEarnV2(chainId); return runStrategyRewardsRound(a,{chainId,...(v2===null?{}:{extraHolders:v2RewardHolders(account=>defaultV2Reader(v2).box(account))})}); }))({dryRun,log:resolved.log}); if(result)resolved.log('[strategy-rewards] '+JSON.stringify(result)); } catch { resolved.log('[strategy-rewards] 激勵領取未完成，下輪再試'); }
+  if (keepers) try { const result=await (deps.strategyRewardsRound??((a)=>{ const chainId=getConfig().chainId, v2=strategyEarnV2(chainId); return runStrategyRewardsRound(a,{chainId,...(v2===null?{}:{extraHolders:v2RewardHolders(account=>defaultV2Reader(v2).box(account))})}); }))({dryRun,log:resolved.log}); if(result)resolved.log('[strategy-rewards] '+JSON.stringify(result)); } catch { resolved.log('[strategy-rewards] 激勵領取未完成，下輪再試'); }
   // Paused strategy jobs (three failed attempts): retryable pauses resume after their cool-down; the rest wait for the
   // owner's next action (src/strategy-job-recovery.ts). Plain SQL, no chain reads. Still-paused ones are logged hourly.
-  if (!dryRun) {
+  if (!dryRun && keepers) {
     try {
       const resumed = await (deps.resumePausedJobs ?? resumeRetryablePausedJobs)(resolved.clock(), resolved.query as never);
       for (const r of resumed) resolved.log(`[strategy-jobs] portfolio ${r.portfolioId} job ${r.jobId} 暫停原因可重試（未上鏈），已恢復`);
@@ -2412,6 +2448,11 @@ function timed<F>(name: string, fn: F): F {
     return result;
   }) as F;
 }
+/** Adds the time since `started` to the current portfolio's phase line; a no-op outside a round. Durations only. */
+function notePhase(name: string, started: number): void {
+  const times = phaseTimes.getStore();
+  if (times) times.set(name, (times.get(name) ?? 0) + (performance.now() - started));
+}
 function withPhaseTiming(deps: ResolvedDeps): ResolvedDeps {
   const wrapped = { ...deps } as Record<string, unknown>;
   for (const key of TIMED_DEPS) wrapped[key] = timed(key === 'query' ? 'db' : key, (deps as Record<string, unknown>)[key]);
@@ -2570,8 +2611,10 @@ async function runOne(
     } else if (ctx.dryRun) {
       result = await decideAndMaybeExecute(due, ctx, base);
     } else {
+      // `lockWait`: how long this round stood behind another round's portfolio lock or the shared DEX lane.
+      const queued = performance.now();
       result = await (due.personalMix ? ctx.deps.withMixPortfolioLock : ctx.deps.withPortfolioLock)(due.portfolioId, async () =>
-        await ctx.deps.withDexLock(ctx.deps.chainId, () => decideAndMaybeExecute(due, ctx, base))
+        await ctx.deps.withDexLock(ctx.deps.chainId, () => { notePhase('lockWait', queued); return decideAndMaybeExecute(due, ctx, base); })
           ?? { ...base, outcome: 'blocked' as const, reason: '[DEX_QUEUED] 共用市場正處理另一基金，稍後重報價' })
         ?? { ...base, outcome: 'blocked', reason: '[PORTFOLIO_LOCK_BUSY] 投組已被另一輪鎖定，這一輪不規劃、不送交易' };
     }
@@ -3017,7 +3060,8 @@ async function decideAndMaybeExecute(
   const sharesPosted = (plan.snapshot.strategyEarnCollateral?.length ?? 0) > 0, exitSale = (rebalance.purpose ?? 'ordinary') === 'exit';
   if (sharesPosted || exitSale && ctx.deps.chainId === 97) {
     let pending: string | V2UnwindWait | null;
-    try { pending = await strategyEarnSteps(ctx.deps).unwind(due, rebalance.steps, ctx.dryRun, exitSale, sharesPosted); }
+    const unwinding = performance.now();
+    try { pending = await strategyEarnSteps(ctx.deps).unwind(due, rebalance.steps, ctx.dryRun, exitSale, sharesPosted).finally(() => notePhase('strategyEarnUnwind', unwinding)); }
     catch (error) { return { ...base, outcome: 'blocked', reason: `[STRATEGY_EARN_UNWIND_FAILED] 賣出前還款取回未完成，下一輪重試：${oneLine(error)}` }; }
     if (pending !== null && typeof pending === 'object') {
       // Routing v2: some posted shares cannot be freed this round (the box is used up and the top-up has no USDT, or has
@@ -3262,20 +3306,25 @@ async function decideAndMaybeExecute(
   // 落地後再記一張 —— **重新讀鏈**，不沿用送出前的觀測：這一張的全部意義就是「交易真的改變了什麼」。
   // 只有真的上鏈（success / reverted）才有 after；送出失敗（error）時鏈上沒變，寫一張相同的只是噪音。
   if (execution.status === 'success' || execution.status === 'reverted') {
-    try {
-      const afterPlan = await ctx.deps.planPortfolio(due.portfolioId);
-      await recordAuditSnapshot({
-        safeErrors: due.executionKind!==undefined,
-        deps: ctx.deps,
-        portfolioId: due.portfolioId,
-        phase: 'after',
-        plan: afterPlan,
-        idempotencyKey,
-        thresholdBps: ctx.thresholdBps,
-      });
-    } catch (error) {
-      ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} 的 after 快照讀鏈失敗：${due.executionKind===undefined?oneLine(error):'RPC unavailable'}（這一輪照常）`);
-    }
+    const recordAfter = async () => {
+      try {
+        const afterPlan = await ctx.deps.planPortfolio(due.portfolioId);
+        await recordAuditSnapshot({
+          safeErrors: due.executionKind!==undefined,
+          deps: ctx.deps,
+          portfolioId: due.portfolioId,
+          phase: 'after',
+          plan: afterPlan,
+          idempotencyKey,
+          thresholdBps: ctx.thresholdBps,
+        });
+      } catch (error) {
+        ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} 的 after 快照讀鏈失敗：${due.executionKind===undefined?oneLine(error):'RPC unavailable'}（這一輪照常）`);
+      }
+    };
+    // An owner's own sale does not wait for it (see SchedulerDeps.afterSnapshotInBackground); it never throws.
+    if (ctx.deps.afterSnapshotInBackground) void recordAfter();
+    else await recordAfter();
   }
   if (execution.status === 'success') {
     return {

@@ -273,9 +273,9 @@ test('DCA confirm/pause/withdraw: deposit must equal the total; the rest goes ba
 test('DCA scheduler: redeems only the due tranche(s) via the executor, waits for the US market, credits one funding lot each', async () => {
   const stock = T.assets.NVDAB?.token ?? Object.values(T.assets)[0]?.token;
   assert.ok(stock);
-  const setup = (now?: Date) => {
+  const setup = (now?: Date, planOwner: string = owner) => {
     const h = harness({ allocation: [stock], ...(now ? { now } : {}) });
-    h.plans.push({ id: '1', chain_id: '97', portfolio_id: '7', account, owner, vault_id: 'lista_usdt', market_id: lista.marketId, total_raw: (1_000n * E18).toString(),
+    h.plans.push({ id: '1', chain_id: '97', portfolio_id: '7', account, owner: planOwner, vault_id: 'lista_usdt', market_id: lista.marketId, total_raw: (1_000n * E18).toString(),
       periods: 10, frequency: 'daily', tranche_raw: (100n * E18).toString(), start_at: new Date('2026-11-21T15:00:00Z'), state: 'active', periods_done: 0,
       deposited_raw: (1_000n * E18).toString(), deposit_tx_hash: '0x' + 'd1'.repeat(32), deposited_at: new Date(), invested_raw: '0', returned_raw: '0',
       close_reason: null, closed_at: null, created_at: new Date() });
@@ -290,6 +290,12 @@ test('DCA scheduler: redeems only the due tranche(s) via the executor, waits for
   // Sunday: three periods are due but the stock market is closed, so they wait in the vault.
   t = setup(new Date('2026-11-22T15:00:00Z')); withAllowance(t.h); await t.run();
   assert.match(t.logs.join('\n'), /MARKET_CLOSED/); assert.equal(t.h.submitted.length, 0);
+  // Same Sunday, a plan of the chain-97 market-hours bypass wallet (deploy/market-hours-bypass.json): the due periods are redeemed now.
+  t = setup(new Date('2026-11-22T15:00:00Z'), '0xD3Ab39B62E221bF9E8bA19fE19b2638767d3D6D9'.toLowerCase()); withAllowance(t.h); await t.run(true);
+  assert.doesNotMatch(t.logs.join('\n'), /MARKET_CLOSED/); assert.match(t.logs.join('\n'), /DCA_DUE\] dry-run：第 2\/10 期/);
+  // The owner's view says the same: waiting for the market, except for the bypass wallet's plan.
+  assert.equal((await createDca(setup(new Date('2026-11-22T15:00:00Z')).h.deps).get(7, owner)).plan?.waitingForMarket, true);
+  assert.equal((await createDca(t.h.deps).get(7, owner)).plan?.waitingForMarket, false);
   // Monday open: periods 1-3 are caught up in one redemption of 300 USDT (fake ERC4626: 0.9 shares per USDT).
   t = setup(); withAllowance(t.h);
   await t.run(true);

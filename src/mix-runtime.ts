@@ -56,7 +56,7 @@ export async function recordMixSwitchResidual(m: MixRuntime, due: DuePortfolio, 
         plan.account.toLowerCase() !== due.account.toLowerCase() || plan.blocked.length || plan.report === null ||
         plan.snapshot.unpriced.some(h => h.amountWei > 0n)) return false;
     const held = plan.snapshot.holdings.filter(h => m.exits.has(h.asset.toLowerCase()) && h.amountWei > 0n);
-    if (held.length === 0 || !assetsMarketOpen(97, held.map(h => h.asset), now) ||
+    if (held.length === 0 || !assetsMarketOpen(97, held.map(h => h.asset), now, m.owner) ||
         held.some(h => h.usdPriceE8 <= 0n || !Number.isInteger(h.decimals) || h.decimals < 0 || h.decimals > 255 ||
           typeof h.priceSource !== 'string' || h.priceSource.length === 0)) return false;
     const policy = loadTradingConfig();

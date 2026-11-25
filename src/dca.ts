@@ -239,11 +239,11 @@ export function createDca(overrides: Partial<DcaDeps> = {}) {
       order by (split_part(key_ref,'/',6))::bigint desc limit 1`, [portfolioId])).rows;
     return rows[0] !== undefined && yieldAuthorization(rows[0].permissions, lower(account), deps.executor).status === 'ready';
   }
-  async function marketOpen(p: Pick<OwnedPortfolio, 'strategyId' | 'version'>): Promise<boolean> {
+  async function marketOpen(p: Pick<OwnedPortfolio, 'strategyId' | 'version'>, owner: string): Promise<boolean> {
     const row = (await deps.query<{ allocation: unknown }>('select allocation from strategy_versions where strategy_id=$1 and version=$2', [p.strategyId, p.version])).rows[0];
     const assets = row && typeof row.allocation === 'object' && row.allocation !== null && Array.isArray((row.allocation as { assets?: unknown }).assets)
       ? ((row.allocation as { assets: { address?: unknown }[] }).assets).flatMap(a => typeof a.address === 'string' ? [a.address] : []) : [];
-    return assetsMarketOpen(97, assets, deps.now());
+    return assetsMarketOpen(97, assets, deps.now(), owner);
   }
   async function view(p: OwnedPortfolio, plan: PlanRow, l: Awaited<ReturnType<typeof live>> | null) {
     const vault = vaultOf(plan.vault_id), i = deps.vaults.indexOf(vault), reading = l?.readings[i] ?? null, v = l?.views[i] ?? null;
@@ -256,7 +256,7 @@ export function createDca(overrides: Partial<DcaDeps> = {}) {
     const inflight = (await deps.query<{ id: string }>(`select id::text from dca_actions where plan_id=$1 and state in ${INFLIGHT} limit 1`, [plan.id])).rows.length > 0;
     return { id: plan.id, state: plan.state, vaultId: vault.id, vaultName: vault.name, apyBps: v?.apyBps ?? null, frequency: plan.frequency,
       periods: plan.periods, periodsDone: done, totalRaw: plan.total_raw, trancheRaw: plan.tranche_raw, startAt: plan.start_at.toISOString(),
-      nextRunAt: next?.toISOString() ?? null, waitingForMarket: next !== null && next <= deps.now() && !await marketOpen(p),
+      nextRunAt: next?.toISOString() ?? null, waitingForMarket: next !== null && next <= deps.now() && !await marketOpen(p, plan.owner),
       buying: inflight, depositedRaw: plan.deposited_raw, investedRaw: plan.invested_raw, returnedRaw: plan.returned_raw,
       remainingRaw: remaining?.toString() ?? null, maxWithdrawRaw: maxWithdraw?.toString() ?? null,
       earnedRaw: dcaEarned(big(plan.deposited_raw), BigInt(plan.invested_raw), BigInt(plan.returned_raw), remaining)?.toString() ?? null,
@@ -499,7 +499,7 @@ async function step(d: RoundDeps, plan: PlanRow, portfolioId: number): Promise<s
   const assets = allocation && typeof allocation === 'object' && Array.isArray((allocation as { assets?: unknown }).assets)
     ? (allocation as { assets: { address?: unknown }[] }).assets.flatMap(a => typeof a.address === 'string' ? [a.address] : []) : null;
   if (!assets) return '[DCA_VERSION_UNAVAILABLE]';
-  if (!assetsMarketOpen(97, assets, now)) return '[MARKET_CLOSED] 美股休市，本期留在 vault 到開盤';
+  if (!assetsMarketOpen(97, assets, now, plan.owner)) return '[MARKET_CLOSED] 美股休市，本期留在 vault 到開盤';
   const chain = d.chain(), head = await chain.earn.head(), account = lower(plan.account);
   const reading = await chain.earn.vault(vault, head.number, head.timestamp);
   const pos = await chain.earn.position(vault, account, head.number, head.timestamp, reading);

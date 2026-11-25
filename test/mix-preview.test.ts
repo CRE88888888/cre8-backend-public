@@ -96,3 +96,22 @@ test('#189 previews a mix of former non-lineup assets: crypto open on a weekend,
   assert.equal(crypto.message, '所有成分目前都在可交易時段。');
   await assert.rejects(preview({ assets: [{ assetId: T.assets.USDC.token, weightBps: 10000 }] }), /這個資產暫時無法加入私人組合/);
 });
+
+test('market-hours bypass: the listed test wallet previews every market as open; any other viewer, or none, sees the calendar', async () => {
+  const canary = '0xD3Ab39B62E221bF9E8bA19fE19b2638767d3D6D9', other = '0x00000000000000000000000000000000000000a1';
+  const input = { assets: [{ assetId: T.assets.WBNB.token, weightBps: 5000 }, { ...stock, weightBps: 5000 }] };
+  const preview = createMixPreview({ chainId: 97, now, gasPrice: async () => 2n, model: async () => emptyModel() });
+  const anonymous = await preview(input);
+  assert.deepEqual(anonymous.markets.map(m => [m.open, m.nextOpenAt]), [[true, null], [false, '2026-11-23T14:30:00.000Z']]);
+  assert.equal(anonymous.message, '美股收盘中，开盘后完成买入。');
+  for (const viewer of [async () => other, async () => null, async () => { throw new Error('session expired'); }]) assert.deepEqual(await preview(input, viewer), anonymous);
+  const listed = await preview(input, async () => canary);
+  assert.deepEqual(listed.markets.map(m => [m.open, m.nextOpenAt]), [[true, null], [true, null]]);
+  assert.equal(listed.message, '所有成分目前都在可交易時段。');
+  assert.deepEqual({ ...listed, markets: null, message: null }, { ...anonymous, markets: null, message: null });
+  // Nothing is closed (crypto only, or the session is open): the viewer is never asked.
+  let asked = 0; const viewer = async () => { asked++; return canary; };
+  await preview({ assets: [{ assetId: T.assets.WBNB.token, weightBps: 10000 }] }, viewer);
+  await createMixPreview({ chainId: 97, now: () => new Date('2026-11-23T15:00:00Z'), gasPrice: async () => 2n, model: async () => emptyModel() })(input, viewer);
+  assert.equal(asked, 0);
+});

@@ -110,3 +110,32 @@ for (const activeVersion of [2, 65535]) for (const dryRun of [false, true]) {
     assert.equal(calls, 0);
   });
 }
+
+test('market-hours bypass: new money of the listed test wallet counts stocks as open on chain 97; chain 56 never does', () => {
+  const canary = '0xD3Ab39B62E221bF9E8bA19fE19b2638767d3D6D9', other = '0x00000000000000000000000000000000000000a1';
+  const closed = new Date('2026-11-26T16:00:00Z'), open = new Date('2026-11-23T15:00:00Z');
+  const version = { allocation: { assets: [{ address: P.assets.NVDAB.token, weightBps: 5000 }, { address: P.assets.BTCB.token, weightBps: 5000 }] } } as unknown as Parameters<NewMoneyDeps['marketOpen']>[0];
+  const none = () => { throw new Error('unused'); };
+  const on = (chainId: number) => defaultNewMoneyDeps(none, none, none, none as unknown as SchedulerQueryFn, chainId).marketOpen;
+  assert.equal(on(97)(version, closed), false); assert.equal(on(97)(version, closed, other), false); assert.equal(on(97)(version, closed, null), false);
+  assert.equal(on(97)(version, closed, canary), true); assert.equal(on(97)(version, closed, canary.toLowerCase()), true);
+  assert.equal(on(97)(version, open), true); assert.equal(on(97)(version, open, other), true);
+  // Typed automation stays off outside chain 97, listed owner or not, open session or not.
+  for (const at of [closed, open]) for (const owner of [canary, other, undefined]) assert.equal(on(56)(version, at, owner), false);
+});
+
+test('market-hours bypass: prepareNewMoney decides the session with the owner it is given', async () => {
+  const { yieldFixture, yieldRebalancePlan } = await import('./fixtures/yield.js');
+  const f = yieldFixture(['venus']), plan = yieldRebalancePlan(f), closed = new Date('2026-11-26T16:00:00Z');
+  const due: DuePortfolio = { portfolioId: 1, strategyId: 1, version: 1, executionKind: 'hold', scheduleState: 'active',
+    account: f.account, accountType: 'KERNEL', intervalSeconds: 60, unsupportedReason: null, nextRunAt: closed };
+  const none = () => { throw new Error('unused'); };
+  const real = defaultNewMoneyDeps(none, none, none, none as unknown as SchedulerQueryFn, 97);
+  const version = { execution: { kind: 'hold' }, allocation: { assets: [{ address: P.assets.NVDAB.token, weightBps: 10000 }] } } as unknown as Awaited<ReturnType<NewMoneyDeps['version']>>;
+  const deps: NewMoneyDeps = { ...real, version: async () => version, policy: async () => ({ reserve: 0n, caps: new Map(), buyLimit: 0n, cash: 0n }), verifyLots: async () => {} };
+  const query: SchedulerQueryFn = async () => ({ rows: [] });
+  const marketOpen = async (owner?: string | null) => (await prepareNewMoney({ due, plan, query, run: none, chainId: 97, now: closed, dryRun: true, deps,
+    ...(owner === undefined ? {} : { owner }) })).context.marketOpen;
+  assert.equal(await marketOpen(), false); assert.equal(await marketOpen(null), false); assert.equal(await marketOpen('0x00000000000000000000000000000000000000a1'), false);
+  assert.equal(await marketOpen('0xd3ab39b62e221bf9e8ba19fe19b2638767d3d6d9'), true);
+});

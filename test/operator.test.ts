@@ -1717,6 +1717,21 @@ test('#96 closed-market stock redemption blocks first, continuation and close wi
   }
 });
 
+test('market-hours bypass: a closed-market stock redemption waits for any other owner and is planned for the listed test wallet',async()=>{
+  const f=sellFixture();const base=f.plan(samplePlan());
+  const stock=TESTNET_97.assets.AAPLB.token;
+  const holding=base.snapshot.holdings.find(h=>h.asset.toLowerCase()!==CASH.toLowerCase());assert.ok(holding);
+  f.state.extraLimits=[{address:stock,max_leg_usdt:'150'}];
+  const stockPlan:PortfolioPlan={...base,chainId:97,snapshot:{...base.snapshot,holdings:[{...holding,asset:stock,amountWei:200n*10n**18n,decimals:18},{asset:CASH,amountWei:100n*10n**18n,decimals:18,usdPriceE8:100000000n,priceSource:NUMERAIRE_PRICE_SOURCE}]}};
+  const closed={...f.deps,now:()=>new Date('2026-11-15T16:00:00Z')};
+  // Owner known but not on the list (deploy/market-hours-bypass.json): the same wait, before any quote.
+  const stranger=await buildRedeemPlan({portfolioId:PORTFOLIO_ID,account:ACCOUNT,plan:stockPlan,owner:'0x00000000000000000000000000000000000000a1'},{close:true},closed);
+  assert.equal(stranger.plan.kind,'blocked');if(stranger.plan.kind==='blocked')assert.match(stranger.plan.reason,/MARKET_CLOSED/);
+  assert.equal(f.state.reads.length,0);
+  const listed=await buildRedeemPlan({portfolioId:PORTFOLIO_ID,account:ACCOUNT,plan:stockPlan,owner:'0xD3Ab39B62E221bF9E8bA19fE19b2638767d3D6D9'},{close:true},closed);
+  assert.equal(listed.plan.kind,'ready',listed.plan.kind==='blocked'?listed.plan.reason:'the bypass wallet sells stock while the session is closed');
+});
+
 for (const joinedVersion of [1, 2]) {
   test(`#124 status exposes joined ${joinedVersion}/active 2 buying pause separately from valuation and exits`, async () => {
     const reader = createPortfolioStatusReader({

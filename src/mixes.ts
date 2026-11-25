@@ -114,7 +114,7 @@ export function createMixService(overrides: Partial<MixServiceDeps> = {}) {
       residualCash: h && h.residual_cash_raw !== '0' ? { amountRaw: h.residual_cash_raw, reason: h.residual_cash_reason,
         message: '這筆承接現金低於交易門檻，保留在帳戶，計入組合價值，不算新入金。' } : null,
       markets: userMixAssets(settings).map(a => {
-        const open = assetsMarketOpen(97, [a.assetId], deps.now());
+        const open = assetsMarketOpen(97, [a.assetId], deps.now(), m.owner);
         return { assetId: a.assetId, open, nextOpenAt: open ? null : nextMixMarketOpen(a.assetId, deps.now())?.toISOString() ?? null };
       }),
       selling: settings.exit_assets.filter(asset => valuedHoldings === null || valuedHoldings.some(h => h.asset.toLowerCase() === asset &&

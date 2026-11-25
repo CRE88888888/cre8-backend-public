@@ -165,6 +165,12 @@ test('switch residuals require open markets, complete same-account valuation and
   const { state, plan } = mixRuntimeFixture(); state.last = null; state.exits = new Set([T.assets.NVDAB.token]);
   for (const h of plan.snapshot.holdings) h.amountWei = h.asset === T.assets.NVDAB.token ? 2n * WAD : 0n;
   const due = { portfolioId: 1, strategyId: 1, account: T.roles.keeper, accountType: 'KERNEL', intervalSeconds: 60, unsupportedReason: null, nextRunAt: open };
+  // Closed session: the residual of the market-hours bypass wallet's basket is judged now (it reaches the anchor read); anyone else's waits.
+  for (const [owner, reached] of [[T.roles.keeper, false], ['0xD3Ab39B62E221bF9E8bA19fE19b2638767d3D6D9', true]] as const) {
+    let anchors = 0;
+    const result = recordMixSwitchResidual({ ...state, owner }, due, plan, mixClock, work => work({ query: async () => ({ rows: [] }) }), async () => { anchors++; return { hash: zeroHash, at: mixClock }; });
+    assert.equal(await result, false); assert.equal(anchors > 0, reached, owner);
+  }
   for (const fault of ['rpc', 'db', 'reorg'] as const) {
     let reads = 0, writes = 0;
     await assert.rejects(recordMixSwitchResidual(state, due, plan, open, async () => { writes++; throw new Error('private DB'); }, async () => {

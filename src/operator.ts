@@ -1599,7 +1599,7 @@ export async function buildRedeemPlan(input: RebalancePlanningInput, request: Se
   });
   try {
     const { snapshot, report, pinnedVersion } = input.plan;
-    if(!assetsMarketOpen(input.plan.chainId,snapshot.holdings.filter(h=>h.amountWei>0n).map(h=>h.asset),(deps.now??(()=>new Date()))()))return reply({kind:'blocked',reason:'[MARKET_CLOSED] 股票休市，等待交易時段'});
+    if(!assetsMarketOpen(input.plan.chainId,snapshot.holdings.filter(h=>h.amountWei>0n).map(h=>h.asset),(deps.now??(()=>new Date()))(),input.owner))return reply({kind:'blocked',reason:'[MARKET_CLOSED] 股票休市，等待交易時段'});
     const query = deps.query ?? dbQuery;
     const numeraire = await readNumeraireAddress(query, deps.publicClient?.chain?.id ?? configuredChainId());
     const totalE8 = report?.totalUsdE8;

@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { TESTNET_ASSETS } from './keeper/assets.js';
 import { testnetAssets } from './testnet-profile.js';
 
@@ -33,9 +35,42 @@ export function testnetAssetKind(symbol: string): TestnetAssetKind {
   return spec?.hasFeed || TESTNET_CRYPTO_WITHOUT_FEED.has(symbol) ? 'crypto' : 'stock';
 }
 
-/** Asset identity comes from the admitted chain manifest, never a request symbol. */
-export function assetsMarketOpen(chainId:number,assets:readonly string[],now:Date):boolean {
+/**
+ * deploy/market-hours-bypass.json: `{ chainId: 97, owners: [...] }`, the test wallets whose portfolios skip the stock
+ * session on chain 97. Only a file that says `chainId: 97` names anyone; a missing or malformed file, another chain id
+ * or a malformed entry names nobody (the calendar then applies to everyone, which is the safe side).
+ */
+export function parseMarketHoursBypass(text:string|null):ReadonlySet<string> {
+  if(text===null)return new Set();
+  let file:unknown;
+  try{file=JSON.parse(text);}catch{return new Set();}
+  if(typeof file!=='object'||file===null)return new Set();
+  const {chainId,owners}=file as {chainId?:unknown;owners?:unknown};
+  if(chainId!==97||!Array.isArray(owners)||owners.some(o=>typeof o!=='string'||!/^0x[0-9a-fA-F]{40}$/.test(o)))return new Set();
+  return new Set((owners as string[]).map(o=>o.toLowerCase()));
+}
+let bypassOwners:ReadonlySet<string>|undefined;
+function marketHoursBypassOwners():ReadonlySet<string> {
+  if(bypassOwners===undefined){
+    let text:string|null=null;
+    try{text=readFileSync(fileURLToPath(new URL('../deploy/market-hours-bypass.json',import.meta.url)),'utf8');}catch{/* no file in this build: nobody */}
+    bypassOwners=parseMarketHoursBypass(text);
+  }
+  return bypassOwners;
+}
+/**
+ * Does this owner's portfolio skip the stock session? Chain 97 only, whatever the list says: on chain 56 (and any other
+ * chain) the answer is always no. `owner` is `smart_accounts.owner` (the wallet the user signs in with), never a request field.
+ */
+export function marketHoursBypassed(chainId:number,owner:string|null|undefined,owners:ReadonlySet<string>=marketHoursBypassOwners()):boolean {
+  return chainId===97&&typeof owner==='string'&&owners.has(owner.toLowerCase());
+}
+
+/** Asset identity comes from the admitted chain manifest, never a request symbol.
+ * `owner`: the portfolio's owner, when the caller has one; an owner on the chain-97 bypass list is always open. */
+export function assetsMarketOpen(chainId:number,assets:readonly string[],now:Date,owner?:string|null):boolean {
   if(chainId!==97)return true;
+  if(marketHoursBypassed(chainId,owner))return true;
   const stocks=new Set<string>(TESTNET_ASSETS.filter(a=>testnetAssetKind(a.symbol)==='stock').map(a=>a.symbol));
   const addresses=new Set<string>(testnetAssets().filter(a=>stocks.has(a.symbol)).map(a=>a.address));
   return !assets.some(a=>addresses.has(a.toLowerCase()))||stockMarketOpen(now);

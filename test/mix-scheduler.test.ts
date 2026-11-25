@@ -377,3 +377,27 @@ for (const failure of ['rpc', 'db', 'missing', 'unpriced', 'blocked'] as const) 
   assert.doesNotMatch(result.results[0]?.reason ?? '', /private|credential/);
   assert.equal(settled, 0); assert.equal(f.state.last, null); assert.equal(f.sends(), 0);
 });
+
+test('market-hours bypass: the listed test wallet\'s basket buys and sells its stock legs while the session is closed; other baskets wait', async () => {
+  const canary = '0xd3ab39b62e221bf9e8ba19fe19b2638767d3d6d9';
+  for (const [owner, account, open] of [[canary, '0x' + 'c7'.repeat(20), true], ['0x00000000000000000000000000000000000000a1', '0x' + 'c8'.repeat(20), false]] as const) {
+    const f = fixture(); f.plan.account = account as `0x${string}`; f.state.owner = owner;
+    f.state.last = null; f.state.newMoney = true; f.state.takeProfit = null; f.state.stopLoss = null;
+    const crypto = f.plan.snapshot.holdings.find(h => h.asset === T.assets.WBNB.token); assert.ok(crypto); crypto.amountWei *= 2n;
+    const query = f.deps.query; assert.ok(query);
+    f.deps.query = (sql, params) => sql.includes('select owner from smart_accounts') ? Promise.resolve({ rows: [{ owner }] })
+      : sql.includes('from strategy_cash_balances') ? Promise.resolve({ rows: [{ allocated_cash_raw: '0', unallocated_hold_raw: '0', stack_prefund_raw: '0',
+        reserved_input_raw: '0', reserved_fee_raw: '0', withdrawal_raw: '0', yield_raw: '0', unclassified_raw: '0' }] }) : query(sql, params);
+    const seen: unknown[] = [];
+    // New money: the scheduler hands the owner to the buy planner (strategy-runtime.ts decides the session with it).
+    f.deps.prepareNewMoney = async args => { seen.push(['buy', args.owner]); return { job: null, context: { chainId: 97, portfolioId: 1, strategyId: 1, version: 1, kind: 'asset',
+      account: f.plan.account, allocation: { assets: [] }, cash: T.contracts.usdt, now: mixClock, reserve: 0n, caps: new Map(), buyLimit: 0n,
+      observedCash: 0n, enabled: true, marketOpen: open }, rebalance: { kind: 'noop', reason: '[BASKET_WAITING] fixture' } }; };
+    // The basket's own rebalance: the per-asset session filter says the stock leg can trade for the listed wallet only.
+    f.deps.planRebalance = async input => { seen.push(['rebalance', input.owner, input.canTradeAsset?.(T.assets.NVDAB.token), input.canTradeAsset?.(T.assets.WBNB.token)]);
+      return { kind: 'blocked', reason: 'fixture stop' }; };
+    const result = await runSchedulerOnce({ dryRun: false, now: mixClock, skipAlerts: true }, f.deps);
+    assert.match(result.results[0]?.reason ?? '', /fixture stop/);
+    assert.deepEqual(seen, [['buy', owner], ['rebalance', owner, open, true]]);
+  }
+});

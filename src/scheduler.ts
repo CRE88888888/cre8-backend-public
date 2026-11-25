@@ -577,7 +577,10 @@ export type ExecutionOutcome = {
 };
 
 /** 決策所需的輸入：portfolio 與它的 drift 計畫（`planPortfolio` 的產物）。 */
-export type RebalancePlanningInput = { cashBudgetRaw?: bigint; purpose?: 'exit'; sellOnlyAssets?: ReadonlySet<string>; canTradeAsset?: (asset: string) => boolean; portfolioId: number; account: Address; plan: PortfolioPlan; inclusiveFeeReserveRaw?:bigint; idleCashBuys?: boolean };
+export type RebalancePlanningInput = {
+  /** `smart_accounts.owner` of the account, for the chain-97 market-hours bypass list (trading-calendar.ts). Absent: the calendar applies. */
+  owner?: string | null;
+  cashBudgetRaw?: bigint; purpose?: 'exit'; sellOnlyAssets?: ReadonlySet<string>; canTradeAsset?: (asset: string) => boolean; portfolioId: number; account: Address; plan: PortfolioPlan; inclusiveFeeReserveRaw?:bigint; idleCashBuys?: boolean };
 
 /** 送出前重問地板的輸入。`executor` 是 chain 上 `oracle()` 的讀取點，`strategyId` 是 `effectiveFeeBps` 的 key。 */
 export type FloorRefreshInput = {
@@ -2733,7 +2736,7 @@ export async function planCashRaise(input: RebalancePlanningInput, needUsdtRaw: 
   const sellUsdE8 = cashRaiseUsdE8(needUsdtRaw);
   const free = snapshot.holdings.flatMap(h => {
     const key = h.asset.toLowerCase(), amount = h.amountWei - (posted.get(key) ?? 0n);
-    if (key === cash || amount <= 0n || !assetsMarketOpen(deps.chainId, [h.asset], deps.now)) return [];
+    if (key === cash || amount <= 0n || !assetsMarketOpen(deps.chainId, [h.asset], deps.now, input.owner)) return [];
     return [{ holding: { ...h, amountWei: amount }, usdE8: amount * h.usdPriceE8 / 10n ** BigInt(h.decimals) }];
   }).sort((a, b) => (b.usdE8 > a.usdE8 ? 1 : b.usdE8 < a.usdE8 ? -1 : 0))[0];
   if (!free || free.usdE8 < sellUsdE8) return { kind: 'blocked', reason: '[STRATEGY_CASH_RAISE] 加息還款還差一點 USDT，但帳戶裡目前沒有可賣的閒置資產（休市或都還抵押著），等下一輪' };
@@ -2953,8 +2956,12 @@ async function decideAndMaybeExecute(
     };
   }
 
+  // Chain 97 only: an owner on the market-hours bypass list (deploy/market-hours-bypass.json, test wallets) trades stock
+  // tokens around the clock. The owner goes to every session check below; unknown owner = the calendar applies.
+  let owner: string | null = null;
+  if (ctx.deps.chainId === 97) try { owner = await accountOwner(ctx.deps.query, ctx.deps.chainId, due.account); } catch { /* the calendar applies */ }
   const money = due.executionKind === undefined || ctx.forcePlan === true || mixTick !== null && mixTick.mode !== 'new_money' ? null : await ctx.deps.prepareNewMoney({due,plan,query:ctx.deps.query,
-    run:ctx.deps.withTransaction,chainId:ctx.deps.chainId,now:ctx.now,dryRun:ctx.dryRun,deps:ctx.deps.newMoney});
+    run:ctx.deps.withTransaction,chainId:ctx.deps.chainId,now:ctx.now,dryRun:ctx.dryRun,deps:ctx.deps.newMoney,owner});
   let waitingSourceTarget = false;
   let cashBudgetRaw: bigint | undefined;
   if (mix && mixTick?.mode === 'new_money' && money?.job === null && money.rebalance.kind === 'noop' &&
@@ -2970,10 +2977,10 @@ async function decideAndMaybeExecute(
   const yieldRebalance=money?.useTargetWeights===true&&plan.snapshot.yieldPositions?.some(p=>p.receipt===null||p.receipt>0n)===true;
   // This projection is only for quoting capped inputs. Actual balances remain authoritative for withdrawal and execution.
   const quotePlan=yieldRebalance?await ctx.deps.newMoney.yieldHoldings(plan):plan;
-  const planning: RebalancePlanningInput = { portfolioId: due.portfolioId, account: due.account, plan:quotePlan,
+  const planning: RebalancePlanningInput = { portfolioId: due.portfolioId, account: due.account, plan:quotePlan, owner,
     ...(mixTick?.mode === 'exit' ? { purpose: 'exit' } : {}),
     ...(cashBudgetRaw === undefined ? {} : { cashBudgetRaw }),
-    ...(mix ? { sellOnlyAssets: mix.exits, canTradeAsset: (asset: string) => assetsMarketOpen(ctx.deps.chainId, [asset], ctx.now) } : {}),
+    ...(mix ? { sellOnlyAssets: mix.exits, canTradeAsset: (asset: string) => assetsMarketOpen(ctx.deps.chainId, [asset], ctx.now, owner) } : {}),
     // A basket's own rebalance buys its idle cash back under the buy minimum, like a fund's (see PlanRebalanceArgs).
     ...(mix && mixTick?.mode !== 'exit' && !ctx.cashRaise ? { idleCashBuys: true } : {}),
     ...(money?.useTargetWeights?{inclusiveFeeReserveRaw:money.context.reserve}:{}) };
@@ -3045,7 +3052,7 @@ async function decideAndMaybeExecute(
   if(limit===0)return {...base,outcome:'blocked',reason:'[USER_OP_CAPACITY] 無可行的安全批次'};
   if(rebalance.steps.length>limit)rebalance={...rebalance,steps:rebalance.steps.slice(0,limit),
     partial:{...rebalance.partial,remainingDriftBps:null,shrunk:rebalance.partial?.shrunk??[],maxLegBatched:true},rationale:rebalance.rationale+'；交易容量分批，剩餘依下一輪持倉續作'};
-  if(!assetsMarketOpen(ctx.deps.chainId,rebalance.steps.flatMap(step=>[step.tokenIn,step.tokenOut]),ctx.now))return {...base,outcome:'blocked',reason:'[MARKET_CLOSED] 股票休市，等待交易時段'};
+  if(!assetsMarketOpen(ctx.deps.chainId,rebalance.steps.flatMap(step=>[step.tokenIn,step.tokenOut]),ctx.now,owner))return {...base,outcome:'blocked',reason:'[MARKET_CLOSED] 股票休市，等待交易時段'};
   if(yieldRebalance){
     const pending=await ctx.deps.newMoney.withdrawYield(due,plan,money.context.reserve,rebalance.steps);
     if(pending!==null)return {...base,outcome:'blocked',reason:`[YIELD_REBALANCE_PENDING] ${pending}`};
@@ -3072,7 +3079,7 @@ async function decideAndMaybeExecute(
       const again = await ctx.deps.planRebalance({ ...planning, plan: withoutPosted(planning.plan, wait.stuck) });
       if (again.kind !== 'ready' || again.steps.length === 0) return { ...base, outcome: 'blocked', reason: wait.note };
       if (again.steps.some(step => !isAddressEqual(step.tokenOut, batchCash))) return { ...base, outcome: 'blocked', reason: '[INVALID_EXIT] 退出計畫包含買入，不送交易' };
-      if (!assetsMarketOpen(ctx.deps.chainId, again.steps.flatMap(step => [step.tokenIn, step.tokenOut]), ctx.now)) return { ...base, outcome: 'blocked', reason: '[MARKET_CLOSED] 股票休市，等待交易時段' };
+      if (!assetsMarketOpen(ctx.deps.chainId, again.steps.flatMap(step => [step.tokenIn, step.tokenOut]), ctx.now, owner)) return { ...base, outcome: 'blocked', reason: '[MARKET_CLOSED] 股票休市，等待交易時段' };
       ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} ${wait.note}；先賣出帳戶裡閒置的部分，之後的輪次再還款取回其餘`);
       rebalance = { ...again, purpose: 'exit', steps: again.steps.slice(0, limit),
         partial: { ...again.partial, remainingDriftBps: null, shrunk: again.partial?.shrunk ?? [], maxLegBatched: true }, rationale: `${again.rationale}；加息抵押中的部分之後的輪次還款取回再賣` };

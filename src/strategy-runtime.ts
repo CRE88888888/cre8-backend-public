@@ -31,7 +31,8 @@ export type NewMoneyDeps = {
   quote: (due:DuePortfolio,plan:PortfolioPlan,inputs:InputVector,deadline:bigint)=>Promise<RebalancePlan>;
   /** Fee-window chains: the top-up the executor would charge this account for a buy of a given size (see readFeeDue). */
   feeDue: (due:DuePortfolio,plan:PortfolioPlan)=>Promise<(notional:bigint)=>Promise<bigint>>;
-  marketOpen: (version:StrategyVersion,now:Date)=>boolean;
+  /** `owner`: the portfolio's owner, for the chain-97 market-hours bypass list (trading-calendar.ts). */
+  marketOpen: (version:StrategyVersion,now:Date,owner?:string|null)=>boolean;
 };
 export function defaultNewMoneyDeps(client:()=>PublicClient,executor:()=>Address,registry:()=>Address,query:SchedulerQueryFn,chainId:number):NewMoneyDeps {
   return {
@@ -98,10 +99,10 @@ export function defaultNewMoneyDeps(client:()=>PublicClient,executor:()=>Address
         blockNumber:plan.snapshot.block,cash:numeraireFor(chainId) as Address,inputs,deadline});
     },
     feeDue:(due,plan)=>readFeeDue(client(),executor(),due.account,BigInt(plan.pinnedVersion.onchainStrategyId),plan.snapshot.block),
-    marketOpen:(version,now)=>{
+    marketOpen:(version,now,owner)=>{
       // Typed automation is opened on 97 only. Stock identity comes from the admitted manifest, never client display symbols.
       if(chainId!==97)return false;
-      return assetsMarketOpen(chainId,version.allocation.assets.filter(a=>a.weightBps>0).map(a=>a.address),now);
+      return assetsMarketOpen(chainId,version.allocation.assets.filter(a=>a.weightBps>0).map(a=>a.address),now,owner);
     },
   };
 }
@@ -111,7 +112,7 @@ export class PinnedVersionChangedError extends Error {
 }
 
 export async function prepareNewMoney(args:{due:DuePortfolio;plan:PortfolioPlan;query:SchedulerQueryFn;run:WithTransactionFn;
-  chainId:number;now:Date;dryRun:boolean;deps:NewMoneyDeps}):Promise<{job:StrategyJob|null;context:JobContext;rebalance:RebalancePlan;useTargetWeights?:boolean;batchBudget?:InputVector}>{
+  chainId:number;now:Date;dryRun:boolean;deps:NewMoneyDeps;owner?:string|null}):Promise<{job:StrategyJob|null;context:JobContext;rebalance:RebalancePlan;useTargetWeights?:boolean;batchBudget?:InputVector}>{
   const {due,plan,query,run,chainId,now,deps}=args;
   if(due.version===undefined||plan.pinnedVersion.version!==due.version)throw new PinnedVersionChangedError();
   const version=await deps.version(due.strategyId,due.version,plan.pinnedVersion.onchainStrategyId,due.account,{chainId,blockNumber:plan.snapshot.block});
@@ -136,9 +137,9 @@ export async function prepareNewMoney(args:{due:DuePortfolio;plan:PortfolioPlan;
   const batchStepLimit=executionBatchSize(plan.historicalAssetCount ?? version.allocation.assets.filter(a=>a.address!==cash).length);
   if(batchStepLimit===0)throw new Error('[USER_OP_CAPACITY] 無可行買入批次');
   const context:JobContext={...(due.personalMix ? { personalMix: true } : {}),batchStepLimit,chainId,portfolioId:due.portfolioId,strategyId:due.strategyId,version:due.version,kind:version.execution.kind==='per_asset'?'asset':version.execution.kind,
-    ...(version.execution.kind==='per_asset'?{execution:version.execution,marketOpenFor:(selected:readonly string[])=>deps.marketOpen({...version,allocation:{assets:version.allocation.assets.filter(a=>selected.includes(a.address))}},now)}:{}),
+    ...(version.execution.kind==='per_asset'?{execution:version.execution,marketOpenFor:(selected:readonly string[])=>deps.marketOpen({...version,allocation:{assets:version.allocation.assets.filter(a=>selected.includes(a.address))}},now,args.owner)}:{}),
     account:due.account,allocation:version.allocation,cash,now,reserve:policy.reserve,caps:policy.caps,buyLimit:policy.buyLimit,
-    observedCash:policy.cash,enabled:due.scheduleState!=='paused',marketOpen:deps.marketOpen(version,now)};
+    observedCash:policy.cash,enabled:due.scheduleState!=='paused',marketOpen:deps.marketOpen(version,now,args.owner)};
   const lots=await fundingLots(query,context);
   // Existing sources also remain canonical after partial completion/restart.
   const prior=(await query(`select l.* from strategy_funding_lots l join strategy_job_lot_inputs i on i.lot_id=l.id

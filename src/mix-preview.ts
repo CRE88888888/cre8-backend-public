@@ -35,12 +35,15 @@ export type MixPreviewDeps = {
 /** Account-free preview reuses the exact hold admission and historical-price reader.
  * Cost is a rate and native-gas estimate: no imaginary turnover or claimed all-in USD cost.
  * The testnet sponsors gas; the estimate still shows its real native cost separately.
+ * `viewer`: who is asking, when the request carried a session (the route passes it lazily). It is only asked for while
+ * some picked asset is outside its session, and only decides the chain-97 market-hours bypass list (trading-calendar.ts):
+ * a listed test wallet sees every market as open, like its trades do. Anyone else gets the same answer as before.
  */
 export function createMixPreview(deps: MixPreviewDeps = {}) {
   let active = 0;
   const timeoutMs = deps.timeoutMs ?? 2000;
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 15000) throw new RangeError('invalid mix preview timeout');
-  return async (input: unknown) => {
+  return async (input: unknown, viewer?: () => Promise<string | null>) => {
     if ((deps.chainId ?? configuredChainId()) !== 97) throw new AppError(503, 'MIX_CHAIN_UNAVAILABLE', '私人組合目前僅開放測試網。');
     if (!record(input)) throw new AppError(400, 'INVALID_MIX_PREVIEW', '請選擇組合的資產與比例。');
     mixKeys(input, ['assets'], 'INVALID_MIX_PREVIEW');
@@ -65,8 +68,10 @@ export function createMixPreview(deps: MixPreviewDeps = {}) {
         timer = setTimeout(() => reject(new AppError(503, 'MIX_PREVIEW_TIMEOUT', '試算逾時，請稍後重試。')), timeoutMs);
       })]);
       const minimumRaw = minimumAssetContributionFromAllocation({ assets: assets.map(asset => ({ address: asset.assetId, weightBps: asset.weightBps })) }, 97);
+      let owner: string | null = null;
+      if (viewer && !assetsMarketOpen(97, assets.map(asset => asset.assetId), now)) try { owner = await viewer(); } catch { /* anonymous */ }
       const markets = assets.map(asset => {
-        const open = assetsMarketOpen(97, [asset.assetId], now);
+        const open = assetsMarketOpen(97, [asset.assetId], now, owner);
         return { assetId: asset.assetId, symbol: MIX_ASSETS.find(candidate => candidate.address === asset.assetId)?.symbol,
           open, nextOpenAt: open ? null : nextMixMarketOpen(asset.assetId, now)?.toISOString() ?? null };
       });

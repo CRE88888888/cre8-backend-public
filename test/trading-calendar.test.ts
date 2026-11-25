@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
-import {assetsMarketOpen,stockMarketOpen,testnetAssetKind,TESTNET_CRYPTO_WITHOUT_FEED} from '../src/trading-calendar.js';
+import {readFileSync} from 'node:fs';
+import {assetsMarketOpen,marketHoursBypassed,parseMarketHoursBypass,stockMarketOpen,testnetAssetKind,TESTNET_CRYPTO_WITHOUT_FEED} from '../src/trading-calendar.js';
 import {TESTNET_97 as T} from '../src/testnet-profile.js';
 import {TESTNET_ASSETS} from '../src/keeper/assets.js';
 test('#83 NYSE session equality, exclusive close, weekend, holidays, early close and DST',()=>{
@@ -37,4 +38,38 @@ test('#189 crypto without a secondary feed trades around the clock; stocks/ETFs 
   // Exact partition of the 105 manifest assets: 25 crypto, 1 gold, 79 stocks/ETFs.
   const kinds=TESTNET_ASSETS.map(a=>testnetAssetKind(a.symbol));
   assert.deepEqual([kinds.filter(k=>k==='crypto').length,kinds.filter(k=>k==='gold').length,kinds.filter(k=>k==='stock').length],[25,1,79]);
+});
+
+test('market-hours bypass: a listed test wallet trades stocks while the session is closed on chain 97; nobody else, and never on chain 56',()=>{
+  const canary='0xD3Ab39B62E221bF9E8bA19fE19b2638767d3D6D9', other='0x00000000000000000000000000000000000000a1';
+  const closed=new Date('2026-11-26T16:00:00Z'), open=new Date('2026-11-23T15:00:00Z'), stock=T.assets.NVDAB.token;
+  assert.equal(stockMarketOpen(closed),false,'Thanksgiving');
+  // The committed list: exactly the e2e harness wallet, chain 97.
+  const text=readFileSync(new URL('../deploy/market-hours-bypass.json',import.meta.url),'utf8');
+  assert.deepEqual(JSON.parse(text).chainId,97);
+  assert.deepEqual([...parseMarketHoursBypass(text)],[canary.toLowerCase()]);
+  // Listed owner (any letter case): open. Everyone else, and a caller without an owner: the calendar, unchanged.
+  for(const owner of [canary,canary.toLowerCase(),canary.toUpperCase().replace('0X','0x')]){
+    assert.equal(assetsMarketOpen(97,[stock],closed,owner),true,owner);
+    assert.equal(assetsMarketOpen(97,[T.assets.Cake.token,stock],closed,owner),true,owner);
+  }
+  for(const owner of [other,null,undefined,'','0x','not an address']){
+    assert.equal(assetsMarketOpen(97,[stock],closed,owner),false,String(owner));
+    assert.equal(assetsMarketOpen(97,[stock],open,owner),true,String(owner));
+    assert.equal(marketHoursBypassed(97,owner),false,String(owner));
+  }
+  assert.equal(assetsMarketOpen(97,[stock],closed),false);
+  // Chain 97 only, whatever the list says: a list that names the owner never bypasses on chain 56 (or any other chain) ...
+  const listed=new Set([canary.toLowerCase()]);
+  assert.equal(marketHoursBypassed(97,canary,listed),true);
+  for(const chainId of [56,1,0,970,NaN])assert.equal(marketHoursBypassed(chainId,canary,listed),false,String(chainId));
+  assert.equal(marketHoursBypassed(56,canary),false);
+  // ... and a file written for another chain (or a broken one) names nobody at all.
+  const file=(chainId:unknown,owners:unknown)=>parseMarketHoursBypass(JSON.stringify({chainId,owners}));
+  assert.equal(file(97,[canary]).size,1);
+  for(const chainId of [56,'97',null,undefined,[97]])assert.equal(file(chainId,[canary]).size,0,String(chainId));
+  assert.equal(file(97,[canary,'0x1234']).size,0,'one malformed entry voids the list');
+  assert.equal(file(97,canary).size,0); assert.equal(file(97,undefined).size,0);
+  for(const text of [null,'','{broken','null','[]','"x"'])assert.equal(parseMarketHoursBypass(text).size,0,String(text));
+  assert.equal(marketHoursBypassed(97,canary,file(56,[canary])),false);
 });

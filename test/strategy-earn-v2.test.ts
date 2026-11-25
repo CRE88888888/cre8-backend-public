@@ -456,6 +456,47 @@ test('2026-11-25 portfolio 33: an open "sell all" keeps the scheduler from auto-
   assert.ok(done.writes.some(sql => sql.includes("set schedule_state = 'paused'")) && done.writes.some(sql => sql.includes("set state = 'delivered'")), done.writes.join('\n'));
 });
 
+test('market-hours bypass: with the stock session closed the scheduler still rebalances and sells for the listed test wallet, and for nobody else', async () => {
+  const sunday = new Date('2026-11-22T16:00:00Z'), canary = '0xd3ab39b62e221bf9e8ba19fe19b2638767d3d6d9', other = '0x00000000000000000000000000000000000000a1';
+  const NVDA = T.assets.NVDAB.token as Address;
+  // `smart_accounts.owner` is looked up once per account per process, so every case has its own account.
+  let n = 0;
+  const scheduler = (owner: string | null, sellAll: boolean) => {
+    const base = mixRuntimeFixture().plan, account = ('0x' + (0xb0 + n++).toString(16).repeat(20)) as Address;
+    const plan = { ...base, account, report: { ...base.report!, needsRebalance: true } };
+    const f = legacyScheduler(plan, [{ tokenIn: NVDA, amountIn: E18 }]), owners: (string | null | undefined)[] = [];
+    const query: SchedulerQueryFn = async (sql, params) => {
+      if (sql.includes('select owner from smart_accounts')) { assert.deepEqual(params, [97, account.toLowerCase()]); return { rows: owner === null ? [] : [{ owner }] }; }
+      const result = await f.deps.query!(sql, params);
+      return sql.includes('for update of p skip locked') ? { rows: result.rows.map(row => ({ ...(row as object), sell_all: sellAll })) } : result;
+    };
+    const planRebalance = f.deps.planRebalance!;
+    const deps: SchedulerDeps = { ...f.deps, query, withTransaction: work => work({ query }),
+      planRebalance: async input => { owners.push(input.owner); return planRebalance(input); },
+      planSellAll: async input => { owners.push(input.owner); return { ...await planRebalance(input), purpose: 'exit' } as RebalancePlan; },
+      strategyEarn: { open: async () => null, unwind: async () => null } };
+    return { deps, calls: f.calls, owners };
+  };
+  for (const sellAll of [false, true]) {
+    for (const owner of [other, null]) {
+      const s = scheduler(owner, sellAll), round = await runSchedulerOnce({ dryRun: false, now: sunday, skipAlerts: true }, s.deps);
+      assert.equal(round.results[0]?.outcome, 'blocked'); assert.equal(round.results[0]?.reason, '[MARKET_CLOSED] 股票休市，等待交易時段');
+      assert.deepEqual(s.calls, []); assert.deepEqual(s.owners, [owner]);
+    }
+    // The listed wallet: the same stock sale passes the session check and goes on to the ordinary checks.
+    const s = scheduler(canary, sellAll), round = await runSchedulerOnce({ dryRun: false, now: sunday, skipAlerts: true }, s.deps);
+    assert.equal(round.results[0]?.reason, '[FIXTURE_STOP] stop before quoting'); assert.deepEqual(s.calls, ['minimums']); assert.deepEqual(s.owners, [canary]);
+  }
+  // Chain 56 has no stock calendar and no bypass: the owner is not even looked up there.
+  const mainnet = scheduler(canary, false);
+  const query = mainnet.deps.query!;
+  mainnet.deps.chainId = 56;
+  mainnet.deps.query = async (sql, params) => { assert.ok(!sql.includes('select owner from smart_accounts'), 'no owner lookup on chain 56'); return query(sql, params); };
+  mainnet.deps.withTransaction = work => work({ query: mainnet.deps.query! });
+  await runSchedulerOnce({ dryRun: false, now: sunday, skipAlerts: true }, mainnet.deps);
+  assert.deepEqual(mainnet.owners, [null]);
+});
+
 // ---- cre8-contracts#67: every launch-fund holding has a market --------------------------------------------------
 
 const bySymbol = (symbol: string) => { const m = markets.find(x => x.symbol === symbol); assert.ok(m, symbol); return m; };
@@ -651,6 +692,9 @@ test('routing v2 scheduler: a quiet round whose repayment is short of USDT sells
   const sunday = new Date('2026-11-22T15:30:00Z');
   const stocksOnly = { ...plan, snapshot: { ...plan.snapshot, holdings: plan.snapshot.holdings.filter(h => h.asset !== T.assets.WBNB.token) } };
   assert.equal((await planCashRaise({ portfolioId: 1, account: plan.account, plan: stocksOnly }, need, { chainId: 97, now: sunday, sell })).kind, 'blocked');
+  // The chain-97 market-hours bypass wallet (deploy/market-hours-bypass.json) sells its stock on a Sunday too; any other owner does not.
+  assert.equal((await planCashRaise({ portfolioId: 1, account: plan.account, plan: stocksOnly, owner: '0x00000000000000000000000000000000000000a1' }, need, { chainId: 97, now: sunday, sell })).kind, 'blocked');
+  assert.equal((await planCashRaise({ portfolioId: 1, account: plan.account, plan: stocksOnly, owner: '0xD3Ab39B62E221bF9E8bA19fE19b2638767d3D6D9' }, need, { chainId: 97, now: sunday, sell })).kind, 'ready');
 
   // withoutPosted: the plan a full exit sells from while some shares stay posted — only those assets, by the snapshot's own numbers.
   const cut = withoutPosted(posted, [NVDA]);

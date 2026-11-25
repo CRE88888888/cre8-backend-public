@@ -581,7 +581,9 @@ async function route(
   if (root === 'mixes' && segments.length === 2 && segments[1] === 'preview') {
     if (method !== 'POST') return methodNotAllowed(res, ['POST']);
     await deps.rateLimiter.mixPreview(deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
-    sendJson(res, 200, await deps.mixPreview(await readJsonBody(req)));
+    // Account-free. A session, when one is sent, only matters to the chain-97 market-hours bypass list (see createMixPreview).
+    const session = req.headers.authorization;
+    sendJson(res, 200, await deps.mixPreview(await readJsonBody(req), session === undefined ? undefined : () => deps.auth.authenticate(session)));
     return;
   }
 

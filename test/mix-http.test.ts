@@ -166,3 +166,31 @@ test('POST /me/mixes/:id/delete authenticates, rate-limits and returns the delet
     assert.equal(calls.length, 1);
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
 });
+
+test('mix preview HTTP: a session is optional and only the market-hours bypass wallet gets a different answer', async () => {
+  const canary = '0xd3ab39b62e221bf9e8ba19fe19b2638767d3d6d9', other = '0x00000000000000000000000000000000000000a1';
+  let lookups = 0, clock = new Date('2026-11-21T12:00:00Z');
+  const server = createServer({
+    mixPreview: createMixPreview({ chainId: 97, now: () => clock, gasPrice: async () => 1n, model: async () => emptyModel() }),
+    rateLimiter: new RequestRateLimiter(loadRateLimitConfig({}), new MemoryRateLimitStore(), () => 1000),
+    auth: { authenticate: async header => { lookups++; if (header === 'Bearer canary') return canary; if (header === 'Bearer other') return other; throw new UnauthorizedError('missing or invalid session token'); },
+      issueNonce: () => { throw new Error('unused'); }, login: async () => { throw new Error('unused'); }, logout: async () => {} },
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  const ask = async (authorization?: string) => {
+    const response = await fetch(`http://127.0.0.1:${address.port}/mixes/preview`, { method: 'POST', body, ...(authorization === undefined ? {} : { headers: { authorization } }) });
+    assert.equal(response.status, 200);
+    return (await response.json() as { markets: { open: boolean; nextOpenAt: string | null }[] }).markets.map(m => [m.open, m.nextOpenAt]);
+  };
+  try {
+    const closed = [[false, '2026-11-23T14:30:00.000Z']];
+    assert.deepEqual(await ask(), closed); assert.equal(lookups, 0, 'no session, no lookup');
+    assert.deepEqual(await ask('Bearer other'), closed);
+    assert.deepEqual(await ask('Bearer stale'), closed, 'a bad session is still an anonymous preview, never a 401');
+    assert.deepEqual(await ask('Bearer canary'), [[true, null]]);
+    assert.equal(lookups, 3);
+    clock = new Date('2026-11-23T15:00:00Z');
+    assert.deepEqual(await ask('Bearer other'), [[true, null]]); assert.equal(lookups, 3, 'session open: nobody is looked up');
+  } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+});

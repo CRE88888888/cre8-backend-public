@@ -22,6 +22,7 @@ import { assetsMarketOpen } from './trading-calendar.js';
 import type { SavedYieldOperation, YieldEvidence, YieldOperationJournal, YieldPlan, YieldReceiptResult, YieldSubmitArgs } from './yield-execution.js';
 import { yieldSessionAvailable } from './yield-session.js';
 import { rpcTransport } from './rpc-transport.js';
+import { accountHoldsOnlyCash, pausedBySellAll, RESUME_AFTER_SELL_ALL_SQL } from './sell-all-resume.js';
 
 /**
  * DCA (定投, docs/dca.zh-TW.md, db 0064). The user moves the whole total into the portfolio's own smart account,
@@ -120,6 +121,8 @@ export type DcaDeps = {
   publicClient: () => PublicClient;
   /** Newest active session key that carries the executor yield permissions for this account (owner renewal). */
   sessionKey: (portfolioId: number, account: Address, now: Date) => Promise<{ sessionKey: SessionKeyRef; policies: unknown } | null>;
+  /** The account holds nothing but cash right now (src/sell-all-resume.ts). Read only for a paused portfolio. */
+  holdsOnlyCash: (portfolioId: number) => Promise<boolean>;
 };
 
 let cachedClient: PublicClient | undefined;
@@ -134,7 +137,7 @@ function defaults(): DcaDeps {
   return {
     chainId: Number(process.env.CHAIN_ID?.trim() || '56'), vaults: dcaVaults(), executor: TESTNET_97.contracts.executor as Address,
     query: dbQuery, transaction: withTransaction, owned: requireOwnedPortfolio, chain: () => createDcaChain(liveClient()), now: () => new Date(),
-    lock: withMixPortfolioLock, publicClient: liveClient,
+    lock: withMixPortfolioLock, publicClient: liveClient, holdsOnlyCash: accountHoldsOnlyCash,
     sessionKey: (portfolioId, account, now) => usableSessionKey(dbQuery, liveClient(), TESTNET_97.contracts.executor as Address, portfolioId, account, now),
     submit: async args => (await import('./yield-execution.js')).submitYieldAction(args),
     reconcile: async saved => (await import('./yield-execution.js')).reconcileYieldOperation(liveClient(), resolveBundlerUrl(), saved),
@@ -358,6 +361,9 @@ export function createDca(overrides: Partial<DcaDeps> = {}) {
         if (deposited !== BigInt(plan.total_raw)) throw new AppError(409, 'DCA_DEPOSIT_MISMATCH', '存入金額與定投總額不同。');
         await deps.query(`update dca_plans set state='active',deposited_raw=$2,deposit_tx_hash=$3,deposited_at=clock_timestamp(),updated_at=clock_timestamp()
           where id=$1 and state='awaiting_deposit'`, [plan.id, deposited.toString(), hash]);
+        // "Sell all" paused this portfolio and a paused portfolio's DCA waits in the vault ([DCA_PORTFOLIO_PAUSED]): the
+        // owner's deposit resumes it (src/sell-all-resume.ts), so the periods are bought like on a first buy.
+        if (await pausedBySellAll(p, deps.holdsOnlyCash)) await deps.query(RESUME_AFTER_SELL_ALL_SQL, [id]);
         return { status: 'confirmed' as const, state: 'active' };
       }
       const account = lower(plan.account), owner = lower(plan.owner);

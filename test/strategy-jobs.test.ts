@@ -1231,11 +1231,49 @@ test('2026-11-25 portfolios 28/30/32: the withdrawal after "sell all" is booked 
   await runPausedCashRound(backlog);assert.equal(plans,6);
 });
 
+test('2026-11-25 portfolio 32: booking the withdrawal of a paused My mix also saves the valuation its list shows; a fund has none and a failed save books the withdrawal all the same',async()=>{
+  const setup=async()=>{
+    const f=await fixture('hold');await f.fund(100n*U);
+    const j=(await f.reserve())?.job;assert.ok(j);await complete(f,j,j.remaining_input,R);
+    await query('update strategy_cash_balances set allocated_cash_raw=$2,updated_at=clock_timestamp() where portfolio_id=$1',[f.id,(99n*U).toString()]);
+    await query("update portfolios set schedule_state='paused' where id=$1",[f.id]);
+    return f;
+  };
+  const claimed=async(id:number)=>BigInt((await query<{n:string}>(`select (unallocated_hold_raw+stack_prefund_raw+allocated_cash_raw+reserved_input_raw+reserved_fee_raw+withdrawal_raw+yield_raw)::text as n from strategy_cash_balances where portfolio_id=$1`,[id])).rows[0]?.n??'-1');
+  const fund=await setup(),mix=await setup(),broken=await setup();
+  const mixes=new Set([mix.id,broken.id]),accounts=new Set([fund.account,mix.account,broken.account]);
+  const saved:[number,bigint][]=[];
+  const deps:PausedCashDeps={chainId:97,withTransaction:run,log:()=>{},readCash:async account=>accounts.has(account)?0n:UINT256_MAX,
+    // The list query as written; the three portfolios of this test are marked the way a My mix strategy would be.
+    query:async(text,params)=>{const r=await query(text,params===undefined?[]:[...params]);
+      return {rows:r.rows.map((row:Record<string,unknown>)=>'personal_mix' in row&&mixes.has(Number(row.portfolio_id))?{...row,personal_mix:true}:row)};},
+    planPortfolio:async id=>{const p=plan(fund);return {...p,portfolioId:id,snapshot:{...p.snapshot,holdings:[]}};},
+    withdrawals:async()=>[{txHash:hash(),blockNumber:12n,blockHash:hash(),logIndex:0,amount:99n*U}],
+    lock:(p,work)=>withPortfolioLock(p.portfolioId,work),
+    saveMixValue:async(p,observed)=>{assert.equal(p.personalMix,true);if(p.portfolioId===broken.id)throw new Error('valuation unavailable');
+      saved.push([p.portfolioId,observed.snapshot.holdings.reduce((sum,h)=>sum+h.amountWei,0n)]);}};
+  resetPausedCashMemory();
+  for(let i=0;i<3&&(await claimed(fund.id)>0n||await claimed(mix.id)>0n||await claimed(broken.id)>0n);i++)await runPausedCashRound(deps);
+  assert.deepEqual([await claimed(fund.id),await claimed(mix.id),await claimed(broken.id)],[0n,0n,0n]);
+  assert.deepEqual(saved,[[mix.id,0n]],'the observation after the withdrawal: nothing left in the account');
+  // Without the optional hook (tests, other callers) nothing changes.
+  const plain=await setup();accounts.add(plain.account);mixes.add(plain.id);resetPausedCashMemory();
+  const {saveMixValue:_unused,...rest}=deps;
+  for(let i=0;i<3&&await claimed(plain.id)>0n;i++)await runPausedCashRound(rest);
+  assert.equal(await claimed(plain.id),0n);assert.equal(saved.length,1);
+});
+
 test('2026-11-25 the paused-portfolio reconciliation runs in background live rounds on chain 97 only',async()=>{
-  const f=await fixture('hold');const calls:number[]=[];
-  const s=scheduler(f,{pausedCashRound:async d=>{calls.push(d.chainId);assert.equal(await d.readCash(f.account),UINT256_MAX);return {checked:0,reconciled:0,unresolved:0};}});
+  const f=await fixture('hold');const calls:number[]=[],cached:unknown[]=[];
+  const s=scheduler(f,{pausedCashRound:async d=>{calls.push(d.chainId);assert.equal(await d.readCash(f.account),UINT256_MAX);
+      // My mix valuation: saved under the mix this portfolio currently belongs to; a portfolio without one saves nothing.
+      for(const portfolioId of [f.id,f.id+1_000_000])await d.saveMixValue?.({portfolioId,strategyId:f.strategyId,account:f.account,personalMix:true},plan(f));
+      return {checked:0,reconciled:0,unresolved:0};},
+    cacheMix:async(id,due)=>{cached.push([id,due.portfolioId,due.personalMix]);},
+    query:async(text,params)=>/from mix_portfolio_history where portfolio_id=\$1 and ended_at is null/.test(text)?{rows:params?.[0]===f.id?[{id:'77'}]:[]}:query(text,params===undefined?[]:[...params])});
   await s.once();await s.once(start,true);assert.deepEqual(calls,[],'an owner call for one portfolio and a dry run leave it to the background round');
   await runSchedulerOnce({dryRun:false,now:start,limit:1},{...s.deps,priceSourceChecks:async()=>[]});assert.deepEqual(calls,[97]);
+  assert.deepEqual(cached,[['77',f.id,true]]);
   await runSchedulerOnce({dryRun:true,now:start,limit:1},{...s.deps,priceSourceChecks:async()=>[]});
   await runSchedulerOnce({dryRun:false,now:start,limit:1},{...s.deps,chainId:56,priceSourceChecks:async()=>[]});assert.deepEqual(calls,[97]);
 });

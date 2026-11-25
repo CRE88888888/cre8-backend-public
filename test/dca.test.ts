@@ -12,6 +12,8 @@ import type { OwnedPortfolio } from '../src/portfolios.js';
 import type { YieldPlan } from '../src/yield-execution.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
 import { config, kernelCall, operation, SENDER, TEST_SIGNER } from './fixtures/paymaster.js';
+import { holdsOnlyCash, RESUME_AFTER_SELL_ALL_SQL } from '../src/sell-all-resume.js';
+import type { PortfolioPlan } from '../src/snapshot.js';
 
 const E18 = 10n ** 18n;
 const vaults = dcaVaults();
@@ -317,6 +319,73 @@ test('DCA scheduler: confirmed redemption advances the plan and becomes exactly 
   assert.deepEqual((h.credited[0] as { id: number; own: string }).id, 7);
   assert.equal(((h.credited[0] as { evidence: { amountRaw: string } }).evidence).amountRaw, (301n * E18).toString());
   assert.equal((await runDcaRound({ dryRun: false, limit: 10, log: () => undefined }, h.deps)).credited, 0, 'never credited twice');
+});
+
+test('2026-11-25 "sell all" then a new DCA: the deposit resumes the paused portfolio and the periods are bought; a paused portfolio that still holds assets waits', async () => {
+  const stock = T.assets.NVDAB?.token ?? Object.values(T.assets)[0]?.token;
+  assert.ok(stock);
+  const setup = (onlyCash: boolean | 'unreadable') => {
+    const h = harness({ balance: 1_000n * E18, allocation: [stock] });
+    const base = h.deps.query as unknown as (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }>;
+    const asked: number[] = [], logs: string[] = [];
+    let schedule = 'paused';
+    h.deps.query = (async (sql: string, params: unknown[] = []) => {
+      const s = sql.replace(/\s+/g, ' ');
+      if (s === RESUME_AFTER_SELL_ALL_SQL.replace(/\s+/g, ' ')) { assert.deepEqual(params, [7]); schedule = 'active'; return { rows: [] }; }
+      if (s.startsWith('select schedule_state,strategy_id')) return { rows: [{ schedule_state: schedule, strategy_id: '3', version: 1 }] };
+      return base(sql, params);
+    }) as unknown as DcaDeps['query'];
+    h.deps.owned = (async (): Promise<OwnedPortfolio> => ({ id: 7, userId: 'u', strategyId: 3, version: 1, scheduleState: schedule, createdAt: '', chainId: 97,
+      accountAddress: account, ownerAddress: owner, existingKeyRefs: [] })) as DcaDeps['owned'];
+    h.deps.holdsOnlyCash = async id => { asked.push(id); if (onlyCash === 'unreadable') throw new Error('rpc down'); return onlyCash; };
+    const chain = (h.deps.chain as () => DcaChain)(), allowed = { ...chain, earn: { ...chain.earn, allowance: async () => maxUint256 } };
+    h.deps.chain = () => allowed;
+    h.deps.sessionKey = async () => ({ sessionKey: { keyRef: "m/44'/60'/0'/0/1", permissionId: '0x01020304', sessionKeyAddress: owner, validUntil: 1, owner }, policies: {} });
+    const dca = createDca(h.deps), deposit = '0x' + 'd1'.repeat(32);
+    const open = async () => {
+      assert.equal((await dca.create(7, owner, { totalRaw: (1_000n * E18).toString(), periods: 10, frequency: 'daily', vaultId: 'lista_usdt' })).status, 'ready');
+      h.state.receipts.set(deposit, { status: 'success', from: owner, blockNumber: 101n, blockHash: '0x' + 'bb'.repeat(32), logs: [transferLog(account, lista.custody, 1_000n * E18)] });
+      const confirmed = await dca.confirm(7, owner, { txHash: deposit });
+      h.state.shares = 1_000n * E18; h.state.value = 1_000n * E18;
+      return confirmed;
+    };
+    return { h, asked, logs, open, schedule: () => schedule, pause: () => { schedule = 'paused'; }, confirm: () => dca.confirm(7, owner, { txHash: deposit }),
+      round: () => runDcaRound({ dryRun: false, limit: 10, log: l => logs.push(l) }, h.deps) };
+  };
+  // Sold out, then the owner opens a DCA: active from the deposit on, and the first period is redeemed and credited.
+  let t = setup(true);
+  assert.deepEqual(await t.open(), { status: 'confirmed', state: 'active' });
+  assert.deepEqual([t.schedule(), t.asked], ['active', [7]]);
+  const bought = await t.round();
+  assert.deepEqual(t.h.submitted, [{ marketId: lista.marketId, kind: 'withdraw', amount: 90n * E18 }]);
+  assert.equal(bought.credited, 1); assert.equal(t.h.plans[0]?.periods_done, 1);
+  // The same deposit confirmed again is not new money: a portfolio paused since then stays paused.
+  t.pause(); assert.deepEqual(await t.confirm(), { status: 'confirmed', state: 'active' });
+  assert.deepEqual([t.schedule(), t.asked], ['paused', [7]]);
+  // Paused with assets in the account (the owner's own pause), or an account that cannot be read: the DCA is recorded and waits in the vault.
+  for (const state of [false, 'unreadable'] as const) {
+    t = setup(state);
+    const warn = console.warn; console.warn = () => {};
+    try { assert.deepEqual(await t.open(), { status: 'confirmed', state: 'active' }); } finally { console.warn = warn; }
+    assert.deepEqual([t.schedule(), t.asked], ['paused', [7]]);
+    await t.round();
+    assert.match(t.logs.join('\n'), /DCA_PORTFOLIO_PAUSED/); assert.equal(t.h.submitted.length, 0);
+  }
+});
+
+test('2026-11-25 "holds nothing but cash": wallet balances, posted shares and yield positions of other assets below 0.01 USDT in total', () => {
+  const stock = (T.assets.NVDAB?.token ?? Object.values(T.assets)[0]?.token ?? '').toLowerCase(), usdt = T.contracts.usdt.toLowerCase();
+  const held = (asset: string, amountWei: bigint) => ({ asset, amountWei, decimals: 18, usdPriceE8: 100_000_000n });
+  const plan = (snapshot: Record<string, unknown>) => ({ chainId: 97, snapshot: { holdings: [], unpriced: [], ...snapshot } }) as unknown as PortfolioPlan;
+  assert.equal(holdsOnlyCash(plan({})), true, 'empty account');
+  assert.equal(holdsOnlyCash(plan({ holdings: [held(usdt, 70n * E18)] })), true, 'the sale proceeds and the new money are cash');
+  assert.equal(holdsOnlyCash(plan({ holdings: [held(usdt, 70n * E18), held(stock, 9n * 10n ** 15n)] })), true, 'dust left by the sale');
+  assert.equal(holdsOnlyCash(plan({ holdings: [held(stock, 10n ** 16n)] })), false, '0.01 USDT of an asset is a holding (posted shares are in holdings too)');
+  assert.equal(holdsOnlyCash(plan({ unpriced: [{ asset: stock, amountWei: 0n }] })), true, 'no price and no balance');
+  assert.equal(holdsOnlyCash(plan({ unpriced: [{ asset: stock, amountWei: 1n }] })), false, 'held without a price');
+  assert.equal(holdsOnlyCash(plan({ yieldPositions: [{ market: { asset: stock }, value: 5n * E18 }] })), false, 'supplied to a yield market');
+  assert.equal(holdsOnlyCash(plan({ yieldPositions: [{ market: { asset: stock }, value: null }] })), false, 'yield position of unknown value');
+  assert.equal(holdsOnlyCash(plan({ yieldPositions: [{ market: { asset: stock }, value: 0n }, { market: { asset: usdt }, value: 5n * E18 }] })), true, 'cash earning yield is cash');
 });
 
 test('DCA Venus: take the rest back = redeem to the account + forward the quoted value; accrued dust becomes allocated cash, not unclassified', async () => {

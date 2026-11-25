@@ -65,7 +65,7 @@
 ## 查詢、分享、試算與退出
 
 - `GET /me/mixes`：`{mixes:[...]}`；`GET /me/mixes/:id` 回名稱、建立日期、assets、rebalance、exit、account／portfolioId、status、pendingChange、currentValueRaw、netInputRaw、performanceInputRaw、returnBps、performanceStartedAt、valuedAt、performanceMessage、nextRebalanceAt、residualCash、markets、selling、events。
-- 列表不拿組合鎖、不執行 planPortfolio，只讀最近一次估值快照；valuedAt 表示該快照的區塊時間。明細即時估值，忙碌或 RPC 暫時不可用時回舊快照，缺快照回 null。兩條讀取路由共用每錢包 plan 預算。
+- 列表不拿組合鎖、不執行 planPortfolio，只讀最近一次估值快照；valuedAt 表示該快照的區塊時間。快照由排程器輪次與明細寫入；暫停中的組合（全部賣出後）在領回錢包被記帳的那一輪也會寫一次（`src/paused-cash.ts`）。明細即時估值，忙碌或 RPC 暫時不可用時回舊快照，缺快照回 null。兩條讀取路由共用每錢包 plan 預算。
 - `status`：awaiting_enrollment、active、exiting、exited。價值不可確認時 currentValueRaw／returnBps 為 null，不視為零、不觸發停損。events 是永久通知的白話投影，保留跨段落的建立、買入／再平衡、改比例、退出觸發。
 - `GET /mixes/shared/:code` 免登入，只回公開設定、建立日期、回測、copies；不含 account、owner、portfolioId 或金額。`POST /me/mixes` 帶 `{"importCode":"分享代碼"}` 建立獨立組合；開始日一律是今天 UTC（即使來源是歷史日期），並複製停利停損；來源被刪或不存在回 404，之後雙方改動不同步。
 - `POST /mixes/preview` 免登入，只接受 `{assets:[...]}`。回 minimumDepositRaw、modelReturns／modelNav／modelComponents、estimatedRebalanceCost、markets 與白話 message；沿用 model-returns 歷史價格與新上市規則。最低外部申購沿用既有 50 USDT 規則；估算交易費 10 bp、gasWei 另列、gasSponsored=true。公開分享／preview 合用每 IP 30 次／分鐘預算與 preview 並行／逾時限制。

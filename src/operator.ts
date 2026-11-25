@@ -31,6 +31,7 @@ import { getGasConfig } from './config.js';
 import { countSwapExecuted, PARTIAL_FOLLOW_UP_SECONDS, runSchedulerOnce, SCHEDULER_ACTIVE_PREDICATE, SCHEDULER_LEGACY_ACTIVE_PREDICATE } from './scheduler.js';
 import type { ExecutionOutcome, PortfolioRunResult, WithTransactionFn } from './scheduler.js';
 import { planPortfolio } from './snapshot.js';
+import { RESUME_PAUSED_SQL } from './sell-all-resume.js';
 import { buildRoutedStep, capAssetLeg, DEFAULT_DEADLINE_SECONDS, minGrossFor, nominalSellQuote, numeraireDecimals, readMaxLegUsdE8 } from './rebalance-plan.js';
 import type { PlannedStep, RebalancePlan } from './rebalance-plan.js';
 import type { RebalancePlanningInput } from './scheduler.js';
@@ -911,7 +912,7 @@ export async function runOperatorRebalance(
   // 排程器只認領 `schedule_state = 'active'`，不接回來的話「入金後再也不會自動再平衡」。
   // 只在使用者端（owner）做：營運端的 Run round 不該改變使用者設定的排程狀態。
   if (deps.resumeIfPaused === true) {
-    await (deps.query ?? dbQuery)(`update portfolios set schedule_state = 'active' where id = $1 and schedule_state = 'paused'`, [
+    await (deps.query ?? dbQuery)(RESUME_PAUSED_SQL, [
       portfolioId,
     ]);
   }

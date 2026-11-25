@@ -8,6 +8,7 @@ import { assetsMarketOpen } from './trading-calendar.js';
 import { runYieldRound } from './yield-service.js';
 import { runDcaRound } from './dca.js';
 import { runPausedCashRound } from './paused-cash.js';
+import type { PausedCashPortfolio } from './paused-cash.js';
 import { numeraireFor } from './strategy-execution.js';
 import { STRATEGY_EARN_97 } from './strategy-earn-guard.js';
 import { noteRoundOutcome, noteStrategyPegExceeded } from './alerts.js';
@@ -2201,12 +2202,18 @@ export async function runSchedulerOnce(
   // (src/paused-cash.ts). After the claimed portfolios, so no buy waits for it. Background rounds only: an owner's
   // single-portfolio call (skipAlerts) leaves it to the next one.
   if (!dryRun && resolved.chainId === 97 && args.skipAlerts !== true) {
+    const pausedDue = (p: PausedCashPortfolio): DuePortfolio => ({ portfolioId: p.portfolioId, strategyId: p.strategyId, account: p.account, intervalSeconds: 0, accountType: 'KERNEL',
+      unsupportedReason: null, nextRunAt: now, ...(p.personalMix ? { personalMix: true } : {}) });
     try {
       await (deps.pausedCashRound ?? runPausedCashRound)({ chainId: resolved.chainId, query: resolved.query, withTransaction: resolved.withTransaction, log: resolved.log,
         readCash: account => resolved.readBalance({ token: numeraireFor(resolved.chainId) as Address, owner: account }),
         planPortfolio: resolved.planPortfolio,
-        withdrawals: (p, plan) => resolved.newMoney.withdrawals({ portfolioId: p.portfolioId, strategyId: p.strategyId, account: p.account, intervalSeconds: 0, accountType: 'KERNEL',
-          unsupportedReason: null, nextRunAt: now, ...(p.personalMix ? { personalMix: true } : {}) }, plan),
+        withdrawals: (p, plan) => resolved.newMoney.withdrawals(pausedDue(p), plan),
+        saveMixValue: async (p, plan) => {
+          const mix: unknown = (await resolved.query('select mix_id::text as id from mix_portfolio_history where portfolio_id=$1 and ended_at is null', [p.portfolioId])).rows[0];
+          const id: unknown = typeof mix === 'object' && mix !== null ? Reflect.get(mix, 'id') : null;
+          if (typeof id === 'string') await resolved.cacheMix(id, pausedDue(p), plan);
+        },
         lock: (p, work) => (p.personalMix ? resolved.withMixPortfolioLock : resolved.withPortfolioLock)(p.portfolioId, work) });
     } catch { resolved.log('[paused-cash] 暫停投組的提領對帳未完成，下輪再試'); }
   }

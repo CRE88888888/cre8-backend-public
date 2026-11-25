@@ -77,6 +77,8 @@ enroll、投入及執行均核對 pinned 版本、chain、allocation、scheduleH
 | POST `/portfolios/:id/funding-lots` | `{source:{kind:"faucet_claim",claimId:"123"}}` 或 `{source:{kind:"welcome_grant",grantId:"123"}}`；回永久事件、effectiveSlices、confirmedAt、fundingStatus、replayed |
 | POST `/portfolios/:id/execution-state` | `{enabled:false}` 暫停新買入；true 恢復；漏期不追扣，未知先對帳 |
 
+「全部賣出」（`/close`）成功後組合是暫停的。之後本人再放錢進來（`funding-lots`／`buy-funding` 建出新的 lot、或定投存入確認），帳戶鏈上只剩 USDT（其他資產含抵押中與生息中合計不到 0.01 USDT）時自動恢復，不必再呼叫 `/rebalance`；帳戶還有資產的暫停組合（例如用 `execution-state` 暫停的）、已退出／刪除中的自建組合、重送同一個來源、定投領出的那一筆都不會恢復（`src/sell-all-resume.ts`）。
+
 `stack-instructions`／`stack-instruction-state` HTTP 路由已移除（404）；持有人不能覆寫創作者排程。舊 revision 仍供歷史稽核。
 
 cash 讀同一區塊的 USDT，顯示未分類與短缺，不憑 balance 差造 lot。所有 raw 為 USDT 原生 18 decimals 字串；token received／fee 向量用該 token 自己 decimals。ID／block 等大整數用字串。

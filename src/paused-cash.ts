@@ -31,6 +31,12 @@ export type PausedCashDeps = {
   planPortfolio: (portfolioId: number) => Promise<PortfolioPlan>;
   /** Proven withdrawals up to the plan's block: what a scheduler round of this portfolio reconciles. */
   withdrawals: (portfolio: PausedCashPortfolio, plan: PortfolioPlan) => Promise<CashWithdrawal[]>;
+  /**
+   * My mix only: save this observation as the mix's valuation. `/me/mixes` lists the last saved one, and only a scheduler
+   * round of the portfolio or opening the mix saves it, so a paused mix kept listing what it was worth before the money
+   * left (portfolio 32: 99.65 USDT listed after everything was withdrawn). Never fails the reconciliation.
+   */
+  saveMixValue?: (portfolio: PausedCashPortfolio, plan: PortfolioPlan) => Promise<void>;
   /** The portfolio's round lock; null = busy (an owner action is running), tried again next round. */
   lock: <T>(portfolio: PausedCashPortfolio, work: () => Promise<T>) => Promise<T | null>;
   log: (line: string) => void;
@@ -94,7 +100,7 @@ export async function runPausedCashRound(d: PausedCashDeps): Promise<PausedCashR
         const plan = await d.planPortfolio(portfolioId);
         const observedCash = plan.snapshot.holdings.find(h => h.asset.toLowerCase() === cashToken)?.amountWei ?? 0n;
         const events = await d.withdrawals(portfolio, plan);
-        return d.withTransaction(async ({ query }) => {
+        const booked = await d.withTransaction(async ({ query }) => {
           await lockCash(query, { chainId: d.chainId, portfolioId });
           const state = (await query(SQL_STATE, [d.chainId, portfolioId])).rows[0];
           // Resumed, a job started or an operation is in flight since the list was read: the scheduler's own round reconciles.
@@ -104,6 +110,10 @@ export async function runPausedCashRound(d: PausedCashDeps): Promise<PausedCashR
           const after = amount(field((await query(SQL_STATE, [d.chainId, portfolioId])).rows[0], 'claimed'));
           return { before, after, observedCash };
         });
+        if (booked !== null && portfolio.personalMix && d.saveMixValue) {
+          try { await d.saveMixValue(portfolio, plan); } catch { /* the list keeps the previous valuation and its time */ }
+        }
+        return booked;
       });
       if (done === null) continue;
       if (done.after < done.before) {

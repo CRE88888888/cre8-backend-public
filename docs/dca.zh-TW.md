@@ -18,7 +18,7 @@
 2. `POST /portfolios/:id/dca` → 回 `calls`（帳戶 owner 簽一個 UserOp）：USDT approve（不足才有）＋存入 vault＋vault 份額 approve 給 executor（只第一次）。`authorization:"renewal_required"` 時同時簽 renewal（同策略加息）。
 3. 上鏈後 `POST /portfolios/:id/dca/confirm {txHash}`：核對同一筆交易裡「帳戶 → vault」的 USDT 剛好等於總額，定投開始。
 4. scheduler 每輪（`runDcaRound`，在買入之前）：到期的期數（第一期＝使用者選的開始日 `startAt`；選今天就是下一輪，美股成分等開盤）用 session key 領出 `每期 × 到期期數`；最後一期領出全部（含利息）。美股成分在休市時**不領**，開盤後一次補齊到期的期數。領出確認後記成一筆 funding lot，並把組合 `next_run_at` 拉到現在，由原本的買入流程照權重買。
-5. 暫停／恢復隨時可以；暫停時錢留在 vault。組合本身暫停（execution-state enabled=false）時也不領。
+5. 暫停／恢復隨時可以；暫停時錢留在 vault。組合本身暫停（execution-state enabled=false）時也不領。「全部賣出」留下的暫停不算：帳戶裡只剩 USDT 的暫停組合，在第 3 步存入確認時自動恢復（`src/sell-all-resume.ts`），之後照期數買；帳戶還有資產的暫停組合維持暫停。
 6. 領回剩餘：`POST /portfolios/:id/dca/withdraw` → 定投轉暫停並回 `calls`（owner 簽），把 vault 裡全部直接領回錢包；上鏈後 `POST /dca/confirm {txHash}`，帳戶份額歸零就結束（`closed`）。
 
 一個帳戶同時只有一個進行中的定投。My mix 換組合會換 portfolio id，但帳戶不變；定投綁帳戶，scheduler 每次用帳戶目前的 portfolio 記 funding lot。

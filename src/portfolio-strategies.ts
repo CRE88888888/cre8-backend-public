@@ -24,6 +24,7 @@ import { defaultAmountUsdt, exactKeys, minimumAllocationRaw, record, usdtRaw, ut
 import type { AssetExecution } from './strategy-execution.js';
 import { reservedCash, withdrawableCash } from './withdrawable-cash.js';
 import { rpcTransport } from './rpc-transport.js';
+import { accountHoldsOnlyCash, pausedBySellAll, RESUME_AFTER_SELL_ALL_SQL } from './sell-all-resume.js';
 
 export type FundingSource = { kind: 'faucet_claim'; claimId: string } | { kind: 'welcome_grant'; grantId: string }
   | { kind: 'wallet_transfer'; txHash: Hex }
@@ -95,6 +96,8 @@ export type PortfolioStrategyDeps = {
   now: () => Date;
   feeReserve: (portfolio: OwnedPortfolio, version: StrategyVersion) => Promise<bigint>;
   exposure: typeof readAssetExposure;
+  /** The account holds nothing but cash right now (src/sell-all-resume.ts). Read only for a paused portfolio. */
+  holdsOnlyCash: (portfolioId: number) => Promise<boolean>;
 };
 
 function positiveId(value: unknown, zero = false): string {
@@ -146,7 +149,7 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
   const deps: PortfolioStrategyDeps = { query, transaction: withTransaction, lock: withMixPortfolioLock, owned: requireOwnedPortfolio,
     version: requireTypedVersion, evidence: readFaucetFundingEvidence, walletEvidence: readWalletFundingEvidence, cash: readAccountCash, settleClaim: settleFaucetClaim,
     welcome: createWelcomeService(), welcomeGrant: findWelcomeGrant, welcomeEvidence: readWelcomeFundingEvidence, settleWelcome: settleWelcomeGrant,
-    chainId: configuredChainId, now: () => new Date(), exposure: readAssetExposure, feeReserve: async (p) => {
+    chainId: configuredChainId, now: () => new Date(), exposure: readAssetExposure, holdsOnlyCash: accountHoldsOnlyCash, feeReserve: async (p) => {
       const chain = getChain();
       const block = await chain.publicClient.getBlockNumber({cacheTime:0});
       const sid = (await query<{onchain_id:string}>('select onchain_id from strategies where id=$1',[p.strategyId])).rows[0];
@@ -253,6 +256,9 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
     const confirmedAt = evidence.confirmedAt;
     const feeReserve = version.execution.kind === 'per_asset' && version.execution.assets.some(a=>a.asset!==numeraireFor(p.chainId)) ? await deps.feeReserve(p,version) : 0n;
     if(feeReserve<0n||feeReserve>CONTRIBUTION_FEE_RESERVE_RAW)throw new AppError(503,'MIN_FEE_UNAVAILABLE','contribution fee bound unavailable');
+    // "Sell all" paused this portfolio and the scheduler only claims active ones: the owner's new money resumes it
+    // (src/sell-all-resume.ts). A DCA tranche is not the owner putting money in, so it never does.
+    const resume = source.kind !== 'dca_tranche' && await pausedBySellAll(p, deps.holdsOnlyCash);
     const result = await deps.transaction(async (client) => {
       await cashLock(client, p);
       await checkReorg(client, p);
@@ -308,6 +314,7 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
           allocation?.effectiveAllocation ? JSON.stringify(allocation.effectiveAllocation) : null, allocation?.allocationReason ?? 'version', JSON.stringify(allocation?.cappedAssets ?? [])]);
       // New money wakes an idle-backed-off portfolio (scheduler IDLE_BACKOFF_SECONDS) for the next round.
       if (inserted.rows.length === 1) await client.query('update portfolios set next_run_at=null where id=$1', [id]);
+      if (inserted.rows.length === 1 && resume) await client.query(RESUME_AFTER_SELL_ALL_SQL, [id]);
       const lot = (await client.query<LotRow>('select * from strategy_funding_lots where chain_id=$1 and tx_hash=$2 and log_index=$3',
         [p.chainId, evidence.txHash, evidence.logIndex])).rows[0];
       if (!lot || Number(lot.portfolio_id) !== id || Number(lot.strategy_id) !== p.strategyId || lot.version !== p.version || lot.kind !== kind ||

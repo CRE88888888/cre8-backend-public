@@ -7,6 +7,7 @@ import { closePool, getPool, migrate, query, withConnection, withTransaction } f
 import { createPortfolioStrategyService, readWalletFundingEvidence } from '../src/portfolio-strategies.js';
 import { setAssetExposureCap, readAssetExposure } from '../src/asset-exposure.js';
 import type { PortfolioStrategyDeps } from '../src/portfolio-strategies.js';
+import { RESUME_AFTER_SELL_ALL_SQL } from '../src/sell-all-resume.js';
 import { createStrategy, getStrategy, publishVersion, requireTypedVersion, validateAllocation, previewContribution } from '../src/strategies.js';
 import { assertVersionOnchain, readAccountCash } from '../src/chain.js';
 import { enrollPortfolio, requireOwnedPortfolio, strategyMinimumDeposit } from '../src/portfolios.js';
@@ -15,7 +16,7 @@ import { canonicalConfigHash, UINT256_MAX, usdtRaw, validateAssetConfig } from '
 import type { AssetExecution, AssetSetting } from '../src/strategy-execution.js';
 import { AppError } from '../src/errors.js';
 import { TESTNET_97 } from '../src/testnet-profile.js';
-import { strategyRpc, TEST_AMOUNT, OTHER_HASH } from './fixtures/strategy-rpc.js';
+import { strategyRpc, TEST_AMOUNT, OTHER_HASH, BLOCK_HASH } from './fixtures/strategy-rpc.js';
 import { claimDuePortfolios } from '../src/scheduler.js';
 import { previewContributionAsync } from '../src/contribution-preview.js';
 import { fundingLots, prepareStrategyJob } from '../src/strategy-jobs.js';
@@ -58,7 +59,7 @@ async function fixture(kind: 'hold' | 'stack' = 'stack', cashWeight=5000, amount
   assert.ok(claim); fixtureClaimIds.push(claim.id);
   const rpc=strategyRpc(allocation,configHash,activeAt,hash);
   rpc.state.to=account;rpc.state.strategyId=BigInt(onchainId);rpc.state.amount=amount;rpc.state.cashRaw=amount;
-  const deps: Partial<PortfolioStrategyDeps>={chainId:()=>97,feeReserve:async()=>27n*10n**16n,
+  const deps: Partial<PortfolioStrategyDeps>={chainId:()=>97,feeReserve:async()=>27n*10n**16n,holdsOnlyCash:async()=>false,
     owned:(portfolioId,wallet)=>requireOwnedPortfolio(portfolioId,wallet,{chainId:97}),
     version:(sid,v,chainSid,acct,options)=>requireTypedVersion(sid,v,chainSid,acct,{...options,chainId:97,
       assertOnchain:(onchainId,index,expected,account,readOptions)=>assertVersionOnchain(onchainId,index,expected,account,{...readOptions,client:rpc.client,registry:TESTNET_97.contracts.registry})}),
@@ -292,6 +293,88 @@ test('#151 wallet lots feed the ordinary hold/stack scheduler with the original 
     assert.ok(job); assert.equal(job.kind, 'asset'); assert.equal(job.state, 'reserved');
     assert.ok(BigInt(job.remaining_input[TESTNET_97.assets.AAPLB.token] ?? '0') > 0n);
     assert.deepEqual(f.rpc.state.broadcasts, []);
+  }
+});
+
+test('2026-11-25 portfolio 32: the owner\'s new money after "sell all" resumes the paused portfolio and is bought; a paused portfolio that still holds assets stays paused', async () => {
+  const run: WithTransactionFn = fn => withTransaction(client => fn({ query: (sql, params) => client.query(sql, params === undefined ? [] : [...params]) }));
+  const state = async (id: number) => (await query<{ schedule_state: string; next_run_at: Date | null }>('select schedule_state,next_run_at from portfolios where id=$1', [id])).rows[0];
+  const claimed = async (id: number) => (await withTransaction(client => claimDuePortfolios(100000, new Date(), { chainId: 97, advance: false, withTransaction: async work => work(client) }))).some(row => row.portfolioId === id);
+  // "Sell all" paused it (the fixture's portfolio is paused) and the account holds nothing but USDT.
+  const f = await walletFixture('hold');
+  const asked: number[] = [];
+  const sold = createPortfolioStrategyService({ ...f.deps, holdsOnlyCash: async id => { asked.push(id); return true; } });
+  assert.equal(await claimed(f.id), false, 'a paused portfolio is not claimed');
+  const lot = await sold.funding(f.id, f.owner, f.source);
+  assert.equal(lot.replayed, false); assert.deepEqual(asked, [f.id]);
+  assert.deepEqual(await state(f.id), { schedule_state: 'active', next_run_at: null });
+  assert.equal(await claimed(f.id), true, 'the scheduler claims it at its next round');
+  const c: JobContext = { chainId: 97, portfolioId: f.id, strategyId: f.strategyId, version: 1, kind: 'asset', execution: f.execution,
+    account: f.account, allocation: f.allocation, cash: TESTNET_97.contracts.usdt, now: new Date('2026-11-15T14:00:00Z'),
+    reserve: 27n * 10n ** 16n, caps: new Map([[TESTNET_97.assets.AAPLB.token, null]]), buyLimit: UINT256_MAX,
+    observedCash: TEST_AMOUNT, enabled: true, marketOpen: true };
+  const { job } = await prepareStrategyJob(run, c, await fundingLots(query, c));
+  assert.ok(job); assert.equal(job.state, 'reserved'); assert.ok(BigInt(job.remaining_input[TESTNET_97.assets.AAPLB.token] ?? '0') > 0n);
+  // The same source sent again is not new money: a portfolio paused since then stays paused.
+  await query("update portfolios set schedule_state='paused' where id=$1", [f.id]);
+  assert.equal((await sold.funding(f.id, f.owner, f.source)).replayed, true);
+  assert.equal((await state(f.id))?.schedule_state, 'paused');
+  // A DCA tranche is not the owner putting money in: the account is not even read.
+  asked.length = 0;
+  const tranche = await sold.creditDcaTranche(f.id, f.owner, { txHash: txHash(), logIndex: 7, blockNumber: 130n, blockHash: BLOCK_HASH, amountRaw: (100n * 10n ** 18n).toString(), confirmedAt: activeAt });
+  assert.equal(tranche.replayed, false); assert.deepEqual(asked, []);
+  assert.equal((await state(f.id))?.schedule_state, 'paused');
+
+  // Paused by the owner (`execution-state`) with assets in the account: the money is recorded, the pause stays.
+  const g = await walletFixture('hold');
+  const holding = createPortfolioStrategyService({ ...g.deps, holdsOnlyCash: async () => false });
+  assert.deepEqual(await holding.executionState(g.id, g.owner, { enabled: false }), { portfolioId: g.id, enabled: false });
+  assert.equal((await holding.funding(g.id, g.owner, g.source)).replayed, false);
+  assert.equal((await state(g.id))?.schedule_state, 'paused'); assert.equal(await claimed(g.id), false);
+
+  // The account cannot be read: the money is still recorded and nothing else changes.
+  const u = await walletFixture('hold');
+  const unreadable = createPortfolioStrategyService({ ...u.deps, holdsOnlyCash: async () => { throw new Error('rpc down'); } });
+  const warn = console.warn; const lines: unknown[] = []; console.warn = (line: unknown) => { lines.push(line); };
+  try { assert.equal((await unreadable.funding(u.id, u.owner, u.source)).replayed, false); } finally { console.warn = warn; }
+  assert.equal((await state(u.id))?.schedule_state, 'paused'); assert.equal(lines.length, 1);
+
+  // An active portfolio is never read for this.
+  const a = await walletFixture('hold');
+  await query("update portfolios set schedule_state='active' where id=$1", [a.id]);
+  const active = createPortfolioStrategyService({ ...a.deps, holdsOnlyCash: async () => { throw new Error('must not be asked'); } });
+  assert.equal((await active.funding(a.id, a.owner, a.source)).replayed, false);
+  assert.equal((await state(a.id))?.schedule_state, 'active');
+  await query("update portfolios set schedule_state='paused' where id=any($1::bigint[])", [[f.id, a.id]]);
+});
+
+test('2026-11-25 the resume after "sell all" leaves My mix portfolios that were paused on purpose alone', async () => {
+  // Temp tables shadow the real ones for this connection only: the statement is exercised as written.
+  const client = await getPool().connect();
+  try {
+    await client.query('create temp table portfolios (id bigint primary key, schedule_state text)');
+    await client.query('create temp table mixes (id bigint primary key, status text, triggered_at timestamptz, delete_requested_at timestamptz, deleted_at timestamptz)');
+    await client.query('create temp table mix_portfolio_history (mix_id bigint, portfolio_id bigint, ended_at timestamptz)');
+    const mix = async (portfolio: number, state: string, patch: string, ended = false) => {
+      await client.query('insert into portfolios values($1,$2)', [portfolio, state]);
+      await client.query(`insert into mixes(id,status) values($1,'active')`, [portfolio]);
+      if (patch) await client.query(`update mixes set ${patch} where id=$1`, [portfolio]);
+      await client.query('insert into mix_portfolio_history values($1,$1,$2)', [portfolio, ended ? new Date() : null]);
+    };
+    await client.query("insert into portfolios values(1,'paused'),(2,'active'),(3,'idle')"); // fund accounts: no mix rows
+    await mix(10, 'paused', '');                              // My mix after "sell all"
+    await mix(11, 'paused', "status='exited'");               // take profit / stop loss / delete finished
+    await mix(12, 'paused', 'triggered_at=now()');            // exit in progress (retry guard)
+    await mix(13, 'paused', 'delete_requested_at=now()');     // deleting
+    await mix(14, 'paused', 'deleted_at=now()');              // deleted
+    await mix(15, 'paused', '', true);                        // the old portfolio of a re-enrolled mix
+    for (const id of [1, 2, 3, 10, 11, 12, 13, 14, 15]) await client.query(RESUME_AFTER_SELL_ALL_SQL, [id]);
+    const rows = (await client.query<{ n: number; schedule_state: string }>('select id::int as n,schedule_state from portfolios order by id')).rows;
+    assert.deepEqual(rows.map(r => [r.n, r.schedule_state]), [[1, 'active'], [2, 'active'], [3, 'idle'], [10, 'active'],
+      [11, 'paused'], [12, 'paused'], [13, 'paused'], [14, 'paused'], [15, 'paused']]);
+  } finally {
+    await client.query('discard temp').catch(() => {});
+    client.release();
   }
 });
 

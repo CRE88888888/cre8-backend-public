@@ -7,6 +7,8 @@ import { mixAnchor, saveMixValuation } from './mix-valuation.js';
 import { assetsMarketOpen } from './trading-calendar.js';
 import { runYieldRound } from './yield-service.js';
 import { runDcaRound } from './dca.js';
+import { runPausedCashRound } from './paused-cash.js';
+import { numeraireFor } from './strategy-execution.js';
 import { STRATEGY_EARN_97 } from './strategy-earn-guard.js';
 import { noteRoundOutcome, noteStrategyPegExceeded } from './alerts.js';
 import { runStrategyRewardsRound } from './strategy-rewards.js';
@@ -594,6 +596,8 @@ export type SchedulerDeps = {
   readBuyVersionWindow?: (strategyId: bigint) => Promise<BuyVersionWindow>;
   yieldRound?: typeof runYieldRound;
   dcaRound?: typeof runDcaRound;
+  /** Books withdrawals of paused portfolios (src/paused-cash.ts). Background live rounds on chain 97 only. */
+  pausedCashRound?: typeof runPausedCashRound;
   strategyEarnRound?: typeof runStrategyEarnRound;
   strategyRewardsRound?: (args: { dryRun: boolean; log: (line: string) => void }) => Promise<unknown>;
   resumePausedJobs?: typeof resumeRetryablePausedJobs;
@@ -2191,6 +2195,20 @@ export async function runSchedulerOnce(
     noteRoundOutcome(due.portfolioId, result.outcome, result.reason, now);
     resolved.log(formatResult(result, dryRun));
     resolved.log(`[scheduler] portfolio ${due.portfolioId} ${Math.round(performance.now() - started)} ms${times.size ? `：${formatPhases(times)}` : ''}`);
+  }
+
+  // "Sell all" pauses a portfolio and the scheduler never claims it again, so the withdrawal that follows was never booked
+  // (src/paused-cash.ts). After the claimed portfolios, so no buy waits for it. Background rounds only: an owner's
+  // single-portfolio call (skipAlerts) leaves it to the next one.
+  if (!dryRun && resolved.chainId === 97 && args.skipAlerts !== true) {
+    try {
+      await (deps.pausedCashRound ?? runPausedCashRound)({ chainId: resolved.chainId, query: resolved.query, withTransaction: resolved.withTransaction, log: resolved.log,
+        readCash: account => resolved.readBalance({ token: numeraireFor(resolved.chainId) as Address, owner: account }),
+        planPortfolio: resolved.planPortfolio,
+        withdrawals: (p, plan) => resolved.newMoney.withdrawals({ portfolioId: p.portfolioId, strategyId: p.strategyId, account: p.account, intervalSeconds: 0, accountType: 'KERNEL',
+          unsupportedReason: null, nextRunAt: now, ...(p.personalMix ? { personalMix: true } : {}) }, plan),
+        lock: (p, work) => (p.personalMix ? resolved.withMixPortfolioLock : resolved.withPortfolioLock)(p.portfolioId, work) });
+    } catch { resolved.log('[paused-cash] 暫停投組的提領對帳未完成，下輪再試'); }
   }
 
   // ---- 一輪的尾端：告警（偵測 → 寫入 → 解除 → 一行 stdout）----

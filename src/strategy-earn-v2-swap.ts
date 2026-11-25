@@ -27,12 +27,14 @@ export type Leftover = { symbol: string; token: Address;
  * a route in the token is open, the account's balance is that route's repayment fallback (`maxCashIn`). `amountIn` = all
  * the account holds, `minUsdtOut` = the balance read × 0.997 (the contract's own bound is 0.25% off 1:1).
  * `unapproved`: balances that cannot be sold because the owner never approved the token to the swapper.
+ * `minRaw`: the smallest balance sold. The default is for cash-outs that ride in a UserOp sent anyway; a caller whose
+ * cash-outs would be a UserOp of their own passes `V2_CASH_OUT_ALONE_MIN_RAW`.
  */
-export function leftoverCashOuts(v2: StrategyEarnV2, leftovers: readonly Leftover[], deadline: bigint): { calls: Call[]; sold: Leftover[]; unapproved: Leftover[] } {
+export function leftoverCashOuts(v2: StrategyEarnV2, leftovers: readonly Leftover[], deadline: bigint, minRaw: bigint = V2_CASH_OUT_MIN_RAW): { calls: Call[]; sold: Leftover[]; unapproved: Leftover[] } {
   const out = { calls: [] as Call[], sold: [] as Leftover[], unapproved: [] as Leftover[] };
   if (!v2.swapper) return out;
   for (const l of leftovers) {
-    if (l.debtRaw > 0n || l.cashRaw < V2_CASH_OUT_MIN_RAW) continue;
+    if (l.debtRaw > 0n || l.cashRaw < minRaw) continue;
     if (l.allowanceRaw < l.cashRaw) { out.unapproved.push(l); continue; }
     out.calls.push(v2Calls.cashOut(v2, l.token, maxUint256, cashOutMinUsdt(l.cashRaw), deadline));
     out.sold.push(l);

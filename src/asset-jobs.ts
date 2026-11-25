@@ -142,7 +142,25 @@ export async function prepareAssetJob(run:WithTransactionFn,c:JobContext,config:
   if(!(c.marketOpenFor?.(due.map(s=>s.asset))??c.marketOpen))return {job:null,reason:'[MARKET_CLOSED] 同一批等待所有資產交易時段'};
   const balance=(await query(`select unallocated_hold_raw::text,stack_prefund_raw::text,(unallocated_hold_raw+stack_prefund_raw+allocated_cash_raw+reserved_input_raw+reserved_fee_raw+withdrawal_raw+yield_raw)::text as total from strategy_cash_balances where chain_id=$1 and portfolio_id=$2`,[c.chainId,c.portfolioId])).rows[0] as {total:string;unallocated_hold_raw:string;stack_prefund_raw:string}|undefined;
   if(!balance)throw new Error('missing cash row');
-  const holdDue=due.filter(s=>s.mode.kind==='hold').reduce((n,s)=>n+s.budget,0n),stackDue=due.filter(s=>s.mode.kind==='stack').reduce((n,s)=>n+s.budget,0n);
+  let holdDue=due.filter(s=>s.mode.kind==='hold').reduce((n,s)=>n+s.budget,0n);const stackDue=due.filter(s=>s.mode.kind==='stack').reduce((n,s)=>n+s.budget,0n);
+  // A withdrawal that took one-time money before it was bought leaves that deposit's sources unaffordable. They used to
+  // drag a later deposit down with them: everything due was skipped for good and the new money never bought (a "sell
+  // all" that also returned funding still waiting to be bought, then a new buy: testnet portfolios 14 / 27 / 30,
+  // 2026-11-25). The cash that is gone is counted against the oldest deposits: those are skipped, the newer ones that
+  // the bucket still covers buy. Only once the ledger agrees with the chain; nothing changes when no deposit fits.
+  if(BigInt(balance.total)<=c.observedCash&&holdDue>BigInt(balance.unallocated_hold_raw)&&stackDue<=BigInt(balance.stack_prefund_raw)){
+    const lots=[...new Map(due.filter(s=>s.mode.kind==='hold').map(s=>[s.lot_id,s.created_at])).entries()]
+      .sort((x,y)=>x[1].getTime()-y[1].getTime()||(BigInt(x[0])<BigInt(y[0])?-1:1));
+    const gone:Due[]=[];let left=holdDue;
+    for(const [lot] of lots){
+      if(left<=BigInt(balance.unallocated_hold_raw))break;
+      for(const s of due)if(s.mode.kind==='hold'&&s.lot_id===lot){gone.push(s);left-=s.budget;}
+    }
+    if(left>0n&&left<=BigInt(balance.unallocated_hold_raw)){
+      await recordInsufficient(query,c,gone);
+      due=due.filter(s=>!gone.includes(s));holdDue=left;
+    }
+  }
   // One-time (hold) money is never skipped for a classification ahead of the chain: that is a withdrawal not reconciled
   // yet (2026-11-23 portfolio 12: a 300 USDT buy right after "sell all" was skipped for good). Wait a round instead.
   // Creator-scheduled (stack) periods keep the no-catch-up skip.

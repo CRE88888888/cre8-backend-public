@@ -424,6 +424,10 @@ export const V2_TOPUP_BUFFER_BPS = 100n;
 const driftOf = (repayRaw: bigint) => repayRaw / 5_000n + 1n;
 /** Loan token under this (raw, 18 decimals: 0.000001) is not sold: one or two raw units can come back as 0 USDT (spec §17). */
 export const V2_CASH_OUT_MIN_RAW = 10n ** 12n;
+/** A cash-out that would need a UserOp of its own (nothing else to send with it) is only worth one from here (raw, 18
+ * decimals: 0.01). Under it the token stays where it is until a UserOp that is sent anyway can carry the cash-out
+ * (2026-11-25: a sponsored UserOp was spent on selling 0.0000026 USD1). */
+export const V2_CASH_OUT_ALONE_MIN_RAW = 10n ** 16n;
 export type TopUp = { amountRaw: bigint; maxUsdtInRaw: bigint;
   /** The purchase covers the whole gap (false: a partial purchase, only asked for with `partial`). */
   covers: boolean };

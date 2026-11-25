@@ -4,7 +4,7 @@ import { planAccount } from './strategy-earn-routing.js';
 import type { Costs, Decision, Holding } from './strategy-earn-routing.js';
 import { marketIdOf } from './strategy-earn-v2-chain.js';
 import type { V2AccountRead, V2Market, V2Reader } from './strategy-earn-v2-chain.js';
-import { BORROW_BUFFER_BPS, V2_CASH_OUT_MIN_RAW, V2_SWAPPER_ABI, V2_SWAPPER_SELECTORS, maxDebtFor, planExecution, strategyV2Addresses, swapEventLine, v2ConsentCalls, v2ExitBatches, v2ExitPlan, v2MissingSwapperApprovals, v2ReconsentCalls, v2RescueCall, v2CashEvents, v2RouteEvents } from './strategy-earn-v2.js';
+import { BORROW_BUFFER_BPS, V2_CASH_OUT_ALONE_MIN_RAW, V2_CASH_OUT_MIN_RAW, V2_SWAPPER_ABI, V2_SWAPPER_SELECTORS, maxDebtFor, planExecution, strategyV2Addresses, swapEventLine, v2ConsentCalls, v2ExitBatches, v2ExitPlan, v2MissingSwapperApprovals, v2ReconsentCalls, v2RescueCall, v2CashEvents, v2RouteEvents } from './strategy-earn-v2.js';
 import type { Call, ExitInput, ExitRoute, RouteEvent, StrategyEarnV2, SwapEvent, SwapQuote } from './strategy-earn-v2.js';
 import { rewardEvents } from './strategy-rewards.js';
 import type { RewardEvent } from './strategy-rewards.js';
@@ -192,14 +192,16 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
         postedRaw: r.collateralRaw, minDebtRaw: r.limits.minDebtRaw,
         // No route of this token stays open after this exit (which of the chosen ones is the last is the exit plan's to say).
         lastOfToken: !open.some(x => x.route.loan === r.route.loan && !chosen.includes(x)) }; });
-      // Loan token other than USDT already in the account with nothing owed in it and no route of it being closed now: sold too.
-      const cashOuts = Object.entries(read.tokens).filter(([symbol, t]) => t.swap !== undefined && t.debtRaw === 0n && t.cashRaw >= V2_CASH_OUT_MIN_RAW && !chosen.some(r => r.route.loanSymbol === symbol))
-        .map(([, t]) => ({ token: t.token, amountRaw: t.cashRaw }));
       // What stays in the box once every route of a token is closed: vaults other than the one each close names.
       const named = new Set(routes.map(r => r.vaultId));
       const leftoverVaults = all ? read.vaults.filter(v => v.assetsRaw > 0n && (!named.has(v.vault.vaultId) || !chosen.some(r => r.route.loan === v.vault.token))).map(v => v.vault.vaultId) : [];
       const rewards = input.exit && all ? read.rewards.filter(r => r.boxRaw > 0n || r.accountRaw > 0n && r.allowanceRaw >= r.accountRaw)
         .map(r => ({ token: r.token, accountAmountRaw: r.accountRaw > 0n && r.allowanceRaw >= r.accountRaw ? maxUint256 : 0n })) : [];
+      // Loan token other than USDT already in the account with nothing owed in it and no route of it being closed now: sold too.
+      // When this exit has nothing else to send, the cash-out would be a UserOp of its own: only above V2_CASH_OUT_ALONE_MIN_RAW.
+      const cashOutMin = routes.length > 0 || leftoverVaults.length > 0 || rewards.length > 0 || (all && read.policy.enabled) ? V2_CASH_OUT_MIN_RAW : V2_CASH_OUT_ALONE_MIN_RAW;
+      const cashOuts = Object.entries(read.tokens).filter(([symbol, t]) => t.swap !== undefined && t.debtRaw === 0n && t.cashRaw >= cashOutMin && !chosen.some(r => r.route.loanSymbol === symbol))
+        .map(([, t]) => ({ token: t.token, amountRaw: t.cashRaw }));
       const planned: ExitInput = { routes, leftoverVaults, rewards, cashOuts, deadline: deadline(), withdrawConsent: all && read.policy.enabled, rewardRecipient: read.policy.rewardRecipient, now: deps.now().getTime() };
       // A route in USDC / USD1 / U whose box is short, and no way to top it up now (the portfolio has no USDT it may spend,
       // or the token's 24-hour window is used up): its close would only revert, so it is not handed out. The owner's UserOp

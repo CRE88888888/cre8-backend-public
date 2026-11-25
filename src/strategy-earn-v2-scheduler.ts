@@ -3,7 +3,7 @@ import type { Address, Hex, Log } from 'viem';
 import type { Costs } from './strategy-earn-routing.js';
 import { V2_DEFAULT_COSTS } from './strategy-earn-v2-api.js';
 import type { V2AccountRead, V2Market, V2Reader } from './strategy-earn-v2-chain.js';
-import { boxRewardSignature, runV2Account, strandedSmallPosition, swapEventLine, swapperErrorOf, v2Batches, v2CashEvents, v2Calls, v2KeeperCall, v2PreSellPlan, v2RouteEvents } from './strategy-earn-v2.js';
+import { V2_CASH_OUT_ALONE_MIN_RAW, boxRewardSignature, runV2Account, strandedSmallPosition, swapEventLine, swapperErrorOf, v2Batches, v2CashEvents, v2Calls, v2KeeperCall, v2PreSellPlan, v2RouteEvents } from './strategy-earn-v2.js';
 import type { Call, PreSellPosition, RouteEvent, Step, StrategyEarnV2, SwapEvent } from './strategy-earn-v2.js';
 import { leftoverCashOuts } from './strategy-earn-v2-swap.js';
 import type { Leftover } from './strategy-earn-v2-swap.js';
@@ -119,7 +119,8 @@ async function bookSwaps(args: Pick<V2StepArgs, 'v2' | 'portfolioId' | 'account'
  * to sell (or it could not be sent: logged, the next round tries again — it never blocks anything).
  */
 async function cashOutLeftovers(args: V2StepArgs, send: V2Send | null, leftovers: readonly Leftover[]): Promise<string | null> {
-  const plan = leftoverCashOuts(args.v2, leftovers, deadlineOf(args.now));
+  // This follow-up is a UserOp of its own: only for a balance worth one (V2_CASH_OUT_ALONE_MIN_RAW).
+  const plan = leftoverCashOuts(args.v2, leftovers, deadlineOf(args.now), V2_CASH_OUT_ALONE_MIN_RAW);
   for (const n of plan.unapproved) args.log(`[strategy-routing] portfolio ${args.portfolioId}: holds ${n.cashRaw} ${n.symbol} it cannot sell for USDT yet — the owner has not approved it to the cash swapper (the next consent adds it)`);
   if (plan.calls.length === 0) return null;
   const what = plan.sold.map(x => x.symbol).join('、');
@@ -256,7 +257,6 @@ export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tok
     // A full exit also sells loan token already sitting in the account with nothing owed in it (left by an earlier close),
     // so the owner takes back USDT only. Tokens this plan closes are sold in the same UserOp as their close (v2PreSellPlan).
     const closing = new Set(positions.map(p => p.loan));
-    const cashOuts = args.exit && swapper && v2.swapper ? leftoverCashOuts(v2, leftoversOf(read).filter(l => !closing.has(l.symbol)), deadline).calls : [];
     // A full exit also sends the reward tokens on (the account's own only when the owner approved them at consent). The
     // contract sends to the policy's recipient; without one it only moves box -> account, and a sweep of the account's own
     // tokens alone would revert (nothing moves), so that part is only asked for when there is a recipient.
@@ -265,6 +265,9 @@ export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tok
       const fromAccount = toOwner && r.accountRaw > 0n && r.allowanceRaw >= r.accountRaw;
       return r.boxRaw > 0n || fromAccount ? [v2Calls.sweepRewards(v2, account, r.token, fromAccount ? maxUint256 : 0n, deadline)] : [];
     }) : [];
+    // With nothing else to send in this UserOp the cash-out would be one of its own: only above V2_CASH_OUT_ALONE_MIN_RAW.
+    const cashOuts = args.exit && swapper && v2.swapper ? leftoverCashOuts(v2, leftoversOf(read).filter(l => !closing.has(l.symbol)), deadline,
+      plan.calls.length > 0 || sweeps.length > 0 ? undefined : V2_CASH_OUT_ALONE_MIN_RAW).calls : [];
     return { read, plan, cashOuts, sweeps, toOwner, calls: [...plan.calls, ...cashOuts, ...sweeps], blocking: plan.notes.length > 0 };
   };
   /** Nothing of these positions can be repaid this round: the sale is not held back for them (it is what brings the USDT in). */

@@ -22,6 +22,8 @@ import {TESTNET_97} from '../src/testnet-profile.js';
 import {withDexLock,assertDexLock,createDexGate} from '../src/dex-queue.js';
 import {withdrawableCash} from '../src/withdrawable-cash.js';
 import {checkTradeMinimums} from '../src/rebalance-plan.js';
+import {runPausedCashRound,resetPausedCashMemory,PAUSED_CASH_RECONCILES_PER_ROUND} from '../src/paused-cash.js';
+import type {PausedCashDeps} from '../src/paused-cash.js';
 const address=():Address=>`0x${randomBytes(20).toString('hex')}`;
 const hash=():Hex=>`0x${randomBytes(32).toString('hex')}`;
 const cash=TESTNET_97.contracts.usdt,a=TESTNET_97.assets.WBNB.token,b=TESTNET_97.assets.ETH.token;
@@ -1145,6 +1147,97 @@ test('2026-11-23 portfolio 12: one-time money is not skipped while a withdrawal 
   assert.equal((await query("select id from strategy_asset_slices s join strategy_funding_lots l on l.id=s.lot_id where l.portfolio_id=$1 and s.state like 'skipped%'",[f.id])).rows.length,0);
   const job=(await f.reserve({...f.context,observedCash:200n*U}))?.job;
   assert.ok(job,'buys as soon as the cash matches');
+});
+
+test('2026-11-25 a deposit made after a withdrawal took an older, still unbought deposit is bought: the cash that left is counted against the oldest deposits',async()=>{
+  // "Sell all" also returned 100 USDT of funding that was still waiting to be bought; then the owner buys again with 50.
+  const f=await fixture('hold');const old=await f.fund(100n*U);
+  const withdrawals=[{txHash:hash(),blockNumber:12n,blockHash:hash(),logIndex:0,amount:100n*U}];
+  const fresh=await f.fund(50n*U,new Date(start.getTime()+3600000));
+  const c={...f.context,now:new Date(start.getTime()+7200000),observedCash:50n*U,withdrawals};
+  const j=(await f.reserve(c))?.job;assert.ok(j,'the new deposit is not skipped together with the old one');
+  assert.equal(BigInt(j.amount_raw)+BigInt(j.fee_reserve_raw),50n*U);
+  const states=async(lot:string)=>(await query<{state:string}>('select state from strategy_asset_slices where lot_id=$1 order by asset',[lot])).rows.map(r=>r.state);
+  assert.deepEqual([await states(old),await states(fresh)],[['skipped_insufficient_funds','skipped_insufficient_funds'],['reserved','reserved']]);
+  const after=await balances(f);assert.ok(after);
+  assert.deepEqual([after.unallocated_hold_raw,BigInt(after.reserved_input_raw)+BigInt(after.reserved_fee_raw)],['0',50n*U]);
+  assert.equal((await f.reserve(c))?.job?.id,j.id,'a restart resumes the same job');
+  // Three deposits, 120 of 210 gone: the two oldest are skipped, the newest (50) buys; what is left over stays free cash.
+  const g=await fixture('hold');const lots=[await g.fund(100n*U),await g.fund(60n*U,new Date(start.getTime()+60000)),await g.fund(50n*U,new Date(start.getTime()+120000))];
+  const gj=(await g.reserve({...g.context,now:new Date(start.getTime()+7200000),observedCash:90n*U,withdrawals:[{txHash:hash(),blockNumber:12n,blockHash:hash(),logIndex:0,amount:120n*U}]}))?.job;assert.ok(gj);
+  assert.equal(BigInt(gj.amount_raw)+BigInt(gj.fee_reserve_raw),50n*U);
+  assert.deepEqual(await Promise.all(lots.map(states)),[['skipped_insufficient_funds','skipped_insufficient_funds'],['skipped_insufficient_funds','skipped_insufficient_funds'],['reserved','reserved']]);
+  assert.equal((await balances(g))?.unallocated_hold_raw,(40n*U).toString());
+  // No deposit fits what is left (one deposit of 100, 30 withdrawn): skipped as before, nothing bought, the 70 stays.
+  const h=await fixture('hold');await h.fund(100n*U);
+  const none=await h.reserve({...h.context,observedCash:70n*U,withdrawals:[{txHash:hash(),blockNumber:12n,blockHash:hash(),logIndex:0,amount:30n*U}]});
+  assert.match(none?.reason??'',/SKIPPED_INSUFFICIENT_FUNDS/);assert.equal(none?.job,null);
+  assert.equal((await balances(h))?.unallocated_hold_raw,(70n*U).toString());
+  // A withdrawal whose evidence is not in yet still waits (never skips anything).
+  const p=await fixture('hold');await p.fund(100n*U);await p.fund(50n*U,new Date(start.getTime()+60000));
+  assert.match((await p.reserve({...p.context,observedCash:50n*U}))?.reason??'',/CASH_RECONCILIATION_PENDING/);
+  assert.equal((await query("select s.lot_id from strategy_asset_slices s join strategy_funding_lots l on l.id=s.lot_id where l.portfolio_id=$1",[p.id])).rows.length,0);
+});
+
+test('2026-11-25 portfolios 28/30/32: the withdrawal after "sell all" is booked while the portfolio stays paused; a later buy and the free-cash check see an empty ledger',async()=>{
+  resetPausedCashMemory();
+  const f=await fixture('hold');await f.fund(100n*U);
+  const j=(await f.reserve())?.job;assert.ok(j);await complete(f,j,j.remaining_input,R);
+  // The sale's 99 USDT is the portfolio's own cash.
+  await query('update strategy_cash_balances set allocated_cash_raw=$2,updated_at=clock_timestamp() where portfolio_id=$1',[f.id,(99n*U).toString()]);
+  const events=[{txHash:hash(),blockNumber:12n,blockHash:hash(),logIndex:0,amount:99n*U}];
+  const lines:string[]=[];let held=99n*U,plans=0,busy=false,proof=events;
+  const deps:PausedCashDeps={chainId:97,query,withTransaction:run,log:l=>lines.push(l),readCash:async account=>account===f.account?held:UINT256_MAX,
+    planPortfolio:async()=>{plans++;const p=plan(f);return {...p,snapshot:{...p.snapshot,holdings:[{asset:cash,amountWei:held,decimals:18,usdPriceE8:100000000n,priceSource:TWAP_PRICE_SOURCE}]}};},
+    withdrawals:async(p)=>{assert.deepEqual(p,{portfolioId:f.id,strategyId:f.strategyId,account:f.account,personalMix:false});return proof;},
+    lock:(p,work)=>busy?Promise.resolve(null):withPortfolioLock(p.portfolioId,work)};
+  const claimed=async()=>BigInt((await query<{n:string}>(`select (unallocated_hold_raw+stack_prefund_raw+allocated_cash_raw+reserved_input_raw+reserved_fee_raw+withdrawal_raw+yield_raw)::text as n from strategy_cash_balances where portfolio_id=$1`,[f.id])).rows[0]?.n??'-1');
+  // Not paused: the scheduler's own round reconciles it, this step does not look.
+  held=0n;await runPausedCashRound(deps);assert.deepEqual([await claimed(),plans],[99n*U,0]);
+  // Paused by the close, USDT still in the account: one balance read, nothing else.
+  await query("update portfolios set schedule_state='paused' where id=$1",[f.id]);
+  held=99n*U;await runPausedCashRound(deps);assert.deepEqual([await claimed(),plans],[99n*U,0]);
+  // The owner took it to the wallet. Busy lock, an unresolved operation: left for the next round.
+  held=0n;busy=true;await runPausedCashRound(deps);busy=false;assert.deepEqual([await claimed(),plans],[99n*U,0]);
+  const pending=(await query<{id:string}>("insert into operations(portfolio_id,type,state,idempotency_key) values($1,'rebalance','pending',$2) returning id",[f.id,hash()])).rows[0];assert.ok(pending);
+  await runPausedCashRound(deps);assert.equal(await claimed(),99n*U);
+  await query('delete from operations where id=$1',[pending.id]);
+  // No proven transfer to the owner: the ledger is kept, and the heavy read is not repeated until something changes.
+  proof=[];resetPausedCashMemory();plans=0;
+  await runPausedCashRound(deps);await runPausedCashRound(deps);assert.deepEqual([await claimed(),plans],[99n*U,1]);
+  assert.ok(lines.some(l=>l.includes(`portfolio ${f.id} `)&&/仍高於鏈上/.test(l)));
+  // With the evidence: booked, exactly once, and the portfolio is still paused.
+  proof=events;resetPausedCashMemory();
+  assert.ok((await runPausedCashRound(deps)).reconciled>=1);
+  assert.equal(await claimed(),0n);
+  assert.ok(lines.some(l=>l.includes(`portfolio ${f.id} 領回錢包的 99 USDT 已入帳`)));
+  assert.deepEqual((await query<{type:string;state:string;tx_hash:string}>("select type,state,tx_hash from operations where portfolio_id=$1 and idempotency_key like 'cash-withdrawal:%'",[f.id])).rows,[{type:'withdraw',state:'confirmed',tx_hash:events[0]?.txHash}]);
+  assert.equal((await query<{schedule_state:string}>('select schedule_state from portfolios where id=$1',[f.id])).rows[0]?.schedule_state,'paused');
+  plans=0;await runPausedCashRound(deps);assert.equal(plans,0,'an empty ledger is not read again');
+  // The owner buys again (the buy resumes the portfolio): the round of that buy sees the same evidence and reserves the new money.
+  await query("update portfolios set schedule_state='active' where id=$1",[f.id]);
+  await f.fund(50n*U,new Date(start.getTime()+3600000));
+  const again=(await f.reserve({...f.context,now:new Date(start.getTime()+7200000),observedCash:50n*U,withdrawals:events}))?.job;assert.ok(again);
+  assert.equal(BigInt(again.amount_raw)+BigInt(again.fee_reserve_raw),50n*U);
+  // A backlog is spread over rounds: five full observations per round, the rest next round.
+  const many=new Set<string>();
+  for(let i=0;i<6;i++){const g=await fixture('hold');many.add(g.account);
+    await query("update strategy_cash_balances set allocated_cash_raw=$2,updated_at=clock_timestamp() where portfolio_id=$1",[g.id,U.toString()]);
+    await query("update portfolios set schedule_state='paused' where id=$1",[g.id]);}
+  resetPausedCashMemory();plans=0;
+  const backlog:PausedCashDeps={...deps,readCash:async account=>many.has(account)?0n:UINT256_MAX,withdrawals:async()=>[],
+    planPortfolio:async id=>{plans++;const p=plan(f);return {...p,portfolioId:id,snapshot:{...p.snapshot,holdings:[]}};}};
+  await runPausedCashRound(backlog);assert.equal(plans,PAUSED_CASH_RECONCILES_PER_ROUND);
+  await runPausedCashRound(backlog);assert.equal(plans,6);
+});
+
+test('2026-11-25 the paused-portfolio reconciliation runs in background live rounds on chain 97 only',async()=>{
+  const f=await fixture('hold');const calls:number[]=[];
+  const s=scheduler(f,{pausedCashRound:async d=>{calls.push(d.chainId);assert.equal(await d.readCash(f.account),UINT256_MAX);return {checked:0,reconciled:0,unresolved:0};}});
+  await s.once();await s.once(start,true);assert.deepEqual(calls,[],'an owner call for one portfolio and a dry run leave it to the background round');
+  await runSchedulerOnce({dryRun:false,now:start,limit:1},{...s.deps,priceSourceChecks:async()=>[]});assert.deepEqual(calls,[97]);
+  await runSchedulerOnce({dryRun:true,now:start,limit:1},{...s.deps,priceSourceChecks:async()=>[]});
+  await runSchedulerOnce({dryRun:false,now:start,limit:1},{...s.deps,chainId:56,priceSourceChecks:async()=>[]});assert.deepEqual(calls,[97]);
 });
 
 test('2026-11-23: an owner waiting for the shared DEX lane makes the scheduler yield, then gets the lane',async()=>{

@@ -8,7 +8,7 @@ import { createV2Reader, v2PublicRpcs } from '../src/strategy-earn-v2-chain.js';
 import { fromMainnetRates, fromTestnetMocks, reportCalldata, reportDue, runRateReport } from '../src/strategy-earn-v2-rates.js';
 import { runV2KeeperRound, v2AutoRound, v2MinCollectRaw, v2RewardHolders, v2UnwindForSale } from '../src/strategy-earn-v2-scheduler.js';
 import type { V2Ledger, V2Tx } from '../src/strategy-earn-v2-scheduler.js';
-import { boxRewardSignature, cashOutMinUsdt, topUpMaxUsdtIn, v2ConsentCalls, V2_EXECUTOR_ABI, V2_REGISTRY_ABI, V2_SWAPPER_ABI } from '../src/strategy-earn-v2.js';
+import { boxRewardSignature, cashOutMinUsdt, topUpMaxUsdtIn, v2ConsentCalls, V2_CASH_OUT_ALONE_MIN_RAW, V2_EXECUTOR_ABI, V2_REGISTRY_ABI, V2_SWAPPER_ABI } from '../src/strategy-earn-v2.js';
 import type { Call, RouteEvent, SwapEvent } from '../src/strategy-earn-v2.js';
 import type { RewardEvent } from '../src/strategy-rewards.js';
 import { toFunctionSelector } from 'viem';
@@ -595,6 +595,33 @@ test('cash swapper, scheduler: loan token a close left in the account is sold by
   sent.length = 0;
   assert.equal(await v2UnwindForSale({ ...args, steps: [{ tokenIn: W.NVDA, amountIn: E18 }] }), null);
   assert.equal(sent.length, 0);
+});
+
+test('cash swapper: a cash-out that would be a UserOp of its own needs 0.01 of the token; a smaller leftover is still sold when it rides in a UserOp that is sent anyway', async () => {
+  const w = world(WS), reader = createV2Reader(w.readerDeps), sent: Call[][] = [], led = ledger(), LISTA = WS.rewardTokens[0]!;
+  w.state.policy = { maxDebt: 0n, rewardRecipient: W.owner, strategyId: 57n, enabled: false };
+  w.setAllowance(USDC, W.account, SWAPPER, maxUint256);
+  const args = { v2: WS, reader, account: W.account, portfolioId: 9, now: NOW, dryRun: false, ledger: led.l, log: () => {}, send: async (calls: Call[]) => { sent.push(calls); return tx(sent.length); } };
+  const exit = { ...args, steps: [{ tokenIn: W.NVDA, amountIn: E18 }], exit: true };
+  const api = createStrategyEarnV2Api({ v2: WS, reader, now: () => NOW });
+  const ownerCalls = async () => { const r = await api.close(W.account, { symbols: [], exit: true }); if (r.status !== 'ready') throw new Error('close not ready'); return r.calls.map(swapFn); };
+  // 2026-11-25: 0.0000026 USD1 was sold in a sponsored UserOp of its own. Alone: nothing is sent under 0.01 —
+  // the scheduler's follow-up round, a full exit with nothing else to do, and the owner-signed exit.
+  for (const raw of [2_600_000_000_000n, V2_CASH_OUT_ALONE_MIN_RAW - 1n]) {
+    w.setBalance(USDC, W.account, raw);
+    assert.deepEqual([await v2AutoRound(args), await v2UnwindForSale(exit), await ownerCalls(), sent.length], [null, null, [], 0]);
+  }
+  // The same dust rides along when the UserOp is sent anyway (here: the reward tokens of a full exit).
+  w.setBalance(USDC, W.account, 2_600_000_000_000n); w.setBalance(LISTA, W.box, 3n * E18);
+  assert.equal(await v2UnwindForSale(exit), null);
+  assert.deepEqual(sent.map(c => c.map(swapFn)), [['cashOut', 'executeSweepRewards']]);
+  assert.deepEqual(await ownerCalls(), ['cashOut', 'executeSweepRewards']);
+  // From 0.01 it is worth a UserOp of its own.
+  sent.length = 0; w.setBalance(LISTA, W.box, 0n); w.setBalance(USDC, W.account, V2_CASH_OUT_ALONE_MIN_RAW);
+  assert.match((await v2AutoRound(args))!, /USDC 已換回 USDT/);
+  assert.deepEqual([sent.map(c => c.map(swapFn)), await ownerCalls()], [[['cashOut']], ['cashOut']]);
+  assert.equal(await v2UnwindForSale(exit), null);
+  assert.deepEqual(sent.map(c => c.map(swapFn)), [['cashOut'], ['cashOut']]);
 });
 
 test('cash swapper, before a sale (session key): top-up + close + cash-out; with too little free USDT the part it can free; pools are internal to the portfolio', async () => {

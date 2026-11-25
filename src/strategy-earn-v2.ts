@@ -406,7 +406,7 @@ export type SwapQuote = { token: Address;
 /** Bought on top of a gap: 1% of it (the contract's own `bufferBps` default), and never less than 0.04% of the repayment —
  * the interest that accrues on the WHOLE debt until the UserOp lands is what a tiny gap's own 1% cannot cover. */
 export const V2_TOPUP_BUFFER_BPS = 100n;
-/** A repayment is planned as short when the box and the account hold less than the debt + 0.02% (interest of the next minutes). */
+/** Interest of the next minutes on a repayment (0.02%): added to a purchase, and taken off what a close is certain to leave. */
 const driftOf = (repayRaw: bigint) => repayRaw / 5_000n + 1n;
 /** Loan token under this (raw, 18 decimals: 0.000001) is not sold: one or two raw units can come back as 0 USDT (spec §17). */
 export const V2_CASH_OUT_MIN_RAW = 10n ** 12n;
@@ -420,33 +420,39 @@ export type TopUpBlocked = { blocked: string;
   retryAt?: number };
 /**
  * What to buy before a repayment of `repayRaw` (spec §17 "how the backend uses it"): null when the box and the account
- * already cover it; otherwise `min(gap + buffer, cap)` with `maxUsdtIn = amount × 1.003`, or why it cannot be bought.
+ * cover it as read (gap 0: nothing is bought and the repayment does not depend on the pool); otherwise
+ * `min(gap + buffer, cap)` with `maxUsdtIn = amount × 1.003`, or why it cannot be bought.
  * `haveRaw`: what the repayment can draw on — the box (idle + vault, or idle alone when the vault cannot be counted on)
  * plus the account's own balance of the loan token. `partial`: buy what the USDT and the cap allow even if that does not
  * cover the gap (a sale that frees collateral step by step).
  */
 export function planTopUp(input: { repayRaw: bigint; haveRaw: bigint; swap: SwapQuote | undefined; usdtRaw: bigint; capRaw: bigint; now: number; partial?: boolean }): TopUp | TopUpBlocked | null {
-  const short = input.repayRaw + driftOf(input.repayRaw) - input.haveRaw;
-  if (short <= 0n) return null;
+  // Spec §17: gap == 0 -> nothing changes (no purchase, no dependence on the pool). Only a repayment the box and the
+  // account cannot cover as read is topped up.
+  const gap = input.repayRaw - input.haveRaw;
+  if (gap <= 0n) return null;
   const { swap } = input;
-  if (!swap) return { blocked: `short of ${short} of the loan token`, noSwap: true };
+  if (!swap) return { blocked: `short of ${gap} of the loan token`, noSwap: true };
   if (swap.usdtAllowanceRaw === 0n) return { blocked: 'the owner has not approved USDT to the cash swapper yet (the next consent adds it)' };
-  const buffer = short * V2_TOPUP_BUFFER_BPS / 10_000n, floor = input.repayRaw / 2_500n;
+  // Buy the gap, the interest of the next minutes on the whole repayment (0.02%), and a buffer on top.
+  const short = gap + driftOf(input.repayRaw), buffer = short * V2_TOPUP_BUFFER_BPS / 10_000n, floor = input.repayRaw / 2_500n;
   const want = short + (buffer > floor ? buffer : floor) + 1n;
-  if (input.capRaw < short && !input.partial) {
+  const capped = (): TopUpBlocked => {
     const waits = swap.windowEndsAt * 1000 > input.now;
-    return { blocked: waits ? `the 24-hour top-up window is used up (cap ${input.capRaw}, gap ${short}); it resets at ${new Date(swap.windowEndsAt * 1000).toISOString()}` : `the top-up cap ${input.capRaw} is below the gap ${short}`,
+    return { blocked: waits ? `the 24-hour top-up window is used up (cap ${input.capRaw}, gap ${gap}); it resets at ${new Date(swap.windowEndsAt * 1000).toISOString()}` : `the top-up cap ${input.capRaw} is below the gap ${gap}`,
       ...(waits ? { retryAt: swap.windowEndsAt } : {}) };
-  }
+  };
+  // The cap does not cover the gap: wait for the window (a partial repayment still buys what the cap allows, when that is worth a swap).
+  if (input.capRaw < gap && (!input.partial || input.capRaw < V2_CASH_OUT_MIN_RAW)) return capped();
   let amount = want < input.capRaw ? want : input.capRaw;
   const spendable = input.usdtRaw < swap.usdtAllowanceRaw ? input.usdtRaw : swap.usdtAllowanceRaw;
   if (topUpMaxUsdtIn(amount) > spendable) {
+    // Not enough USDT for the buffer too: what it buys still serves when it covers the gap itself (or a partial repayment).
     const afford = spendable * 1_000n / 1_003n;
-    if (!input.partial || afford < V2_CASH_OUT_MIN_RAW) return { blocked: `needs ${topUpMaxUsdtIn(amount) - spendable} more USDT in the account to buy ${amount} of the loan token` };
+    if (afford < gap && (!input.partial || afford < V2_CASH_OUT_MIN_RAW)) return { blocked: `needs ${topUpMaxUsdtIn(gap) - spendable} more USDT in the account to buy the ${gap} of the loan token it is short of` };
     amount = afford;
   }
-  if (amount < V2_CASH_OUT_MIN_RAW && amount < short) return { blocked: `the top-up cap ${input.capRaw} is below the gap ${short}` };
-  return { amountRaw: amount, maxUsdtInRaw: topUpMaxUsdtIn(amount), covers: amount >= short };
+  return { amountRaw: amount, maxUsdtInRaw: topUpMaxUsdtIn(amount), covers: amount >= gap };
 }
 /** Shared over one plan: what earlier repayments of the same loan token already drew from the box, the account, its USDT and the top-up cap. */
 export type SettleBudget = { vault: Map<string, bigint>; idle: Map<string, bigint>; cash: Map<string, bigint>; cap: Map<string, bigint>; usdt: bigint | null };
@@ -467,7 +473,7 @@ export type Settlement = {
   toppedUpRaw: bigint };
 /**
  * A repayment of `repayRaw` on a route (the whole route debt for a close), with the cash swapper where the box is short:
- * - short (less than the debt + 0.02%) and a swapper: `topUp` first (same UserOp; about 0.35–0.4M gas);
+ * - short as read (the box and the account hold less than the debt) and a swapper: `topUp` first (same UserOp; about 0.35–0.4M gas);
  * - a full close of the last route in a token other than USDT: `cashOut` of what will certainly be left in the account
  *   (its own balance, the vault's surplus, the unused part of the buffer), `minUsdtOut` = that lower bound × 0.997;
  * - `vaultFails`: what to buy instead when the first attempt reverts although the vault read as enough.
@@ -483,10 +489,9 @@ export function settleRepayment(v2: StrategyEarnV2, r: SettleRoute, budget: Sett
   let first = top(swap ? swap.gapRaw !== null : true);
   if (first !== null && 'blocked' in first) {
     // Nothing can be bought. Without a swapper for the token the caller decides, as before the swapper existed. With one:
-    // when the box and the account do hold the debt as read (only the margin for the next minutes' interest, or a vault
-    // that could not be read, is missing) the repayment goes out without a top-up, as it always did — a vault that earns
-    // more than the loan costs is ahead again by the time it lands, and one that is not fails the simulation and is
-    // planned again next round. A debt nothing on chain can repay gets the reason back.
+    // a debt nothing on chain can repay gets the reason back; when only a vault that could not be read is in doubt
+    // (`shortfall` reverted) and the box does hold the debt as last read, the repayment goes out without a top-up, as it
+    // always did (it fails the simulation if the vault really cannot pay, and is planned again next round).
     if (first.noSwap || D > vault + idle + cash) return { before: [], after: [], maxCashInRaw: cash, blocked: first, toppedUpRaw: 0n };
     first = null;
   }

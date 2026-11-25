@@ -496,29 +496,33 @@ const lowerArgs = (args: readonly unknown[]) => args.map(x => typeof x === 'stri
 const swapCall = (c: Call) => { const d = decodeFunctionData({ abi: V2_SWAPPER_ABI, data: c.data }); return { functionName: d.functionName, args: lowerArgs(d.args as readonly unknown[]) }; };
 const names = (calls: readonly Call[], v2 = VS) => calls.map(c => c.to === v2.swapper ? swapCall(c).functionName : c.to === v2.registry ? 'setStrategyPolicy' : c.to === v2.executor ? decode(c.data).functionName : `approve:${c.to}`);
 
-test('cash swapper, what to buy: nothing when the box covers the debt; the gap + 1% (never under 0.04% of the debt) up to the cap, maxUsdtIn 0.3% over; why not, otherwise', () => {
+test('cash swapper, what to buy: nothing when the box covers the debt as read (gap 0, spec §17); otherwise the gap + drift + buffer up to the cap, maxUsdtIn 0.3% over; why not, otherwise', () => {
   const top = (o: Partial<Parameters<typeof planTopUp>[0]>) => planTopUp({ repayRaw: 1000n * E, haveRaw: 990n * E, swap: quote(), usdtRaw: 500n * E, capRaw: 1_010n * E, now: SWAP_NOW, ...o });
-  // Covered with the 0.02% drift margin to spare: nothing is bought. Just under it: a top-up.
-  assert.equal(top({ haveRaw: 1000n * E + 1000n * E / 5_000n + 1n }), null);
-  assert.ok(top({ haveRaw: 1000n * E }) !== null);
-  // 990 against 1,000: short 10.2 (+0.02% drift) -> buy that + max(1% of it, 0.04% of the debt) + 1 wei; pay at most 0.3% over.
-  const short = 1000n * E + 1000n * E / 5_000n + 1n - 990n * E, want = short + 1000n * E / 2_500n + 1n;
+  // gap == 0: nothing is bought — the repayment does not depend on the pool at all. One wei short: a top-up.
+  assert.equal(top({ haveRaw: 1000n * E }), null);
+  assert.equal(top({ haveRaw: 2000n * E }), null);
+  assert.ok(top({ haveRaw: 1000n * E - 1n }) !== null);
+  // 990 against 1,000: gap 10 -> buy the gap + 0.02% of the repayment (interest of the next minutes) + max(1% of that, 0.04% of the repayment) + 1 wei; pay at most 0.3% over.
+  const drift = 1000n * E / 5_000n + 1n, short = 10n * E + drift, want = short + 1000n * E / 2_500n + 1n;
   assert.deepEqual(top({}), { amountRaw: want, maxUsdtInRaw: (want * 1_003n + 999n) / 1_000n, covers: true });
   assert.equal(topUpMaxUsdtIn(1_000n), 1_003n);
   assert.equal(topUpMaxUsdtIn(1n), 2n); // rounded up
-  // A large gap: its own 1% is the buffer.
-  const big = top({ haveRaw: 0n, usdtRaw: 5_000n * E }) as { amountRaw: bigint };
-  const bigShort = 1000n * E + 1000n * E / 5_000n + 1n;
-  assert.equal(big.amountRaw, 1_010n * E < bigShort + bigShort / 100n + 1n ? 1_010n * E : bigShort + bigShort / 100n + 1n); // capped by topUpCap
+  // A large gap: its own 1% is the buffer, and topUpCap is the ceiling.
+  const bigShort = 1000n * E + drift;
+  assert.equal((top({ haveRaw: 0n, usdtRaw: 5_000n * E, capRaw: 2_000n * E }) as { amountRaw: bigint }).amountRaw, bigShort + bigShort / 100n + 1n);
+  assert.equal((top({ haveRaw: 0n, usdtRaw: 5_000n * E }) as { amountRaw: bigint }).amountRaw, 1_010n * E);
   // USDT (or no swapper): nothing to buy with — the caller falls back to the account's own loan token.
-  assert.deepEqual(top({ swap: undefined }), { blocked: `short of ${short} of the loan token`, noSwap: true });
+  assert.deepEqual(top({ swap: undefined }), { blocked: `short of ${10n * E} of the loan token`, noSwap: true });
   // The owner never approved USDT to the swapper: not sent to revert.
   assert.match((top({ swap: quote({ usdtAllowanceRaw: 0n }) }) as { blocked: string }).blocked, /not approved USDT/);
   // The 24-hour window is used up (cap below the gap): wait for it, with the time it resets.
   const waits = top({ capRaw: E, swap: quote({ windowEndsAt: SWAP_NOW / 1000 + 3600 }) }) as { blocked: string; retryAt?: number };
   assert.deepEqual([/24-hour top-up window is used up/.test(waits.blocked), waits.retryAt], [true, SWAP_NOW / 1000 + 3600]);
   assert.equal((top({ capRaw: 0n }) as { retryAt?: number }).retryAt, undefined); // no window open: just the cap
-  // Not enough USDT in the account: blocked for a close...
+  // USDT for the gap but not for the whole buffer: buy what it affords (it covers the gap).
+  const lean = top({ usdtRaw: 10_040n * E / 1_000n }) as { amountRaw: bigint; covers: boolean };
+  assert.deepEqual([lean.amountRaw, lean.covers], [10_040n * E / 1_000n * 1_000n / 1_003n, true]);
+  // Not even the gap: blocked for a close...
   assert.match((top({ usdtRaw: 5n * E }) as { blocked: string }).blocked, /more USDT in the account/);
   // ...and for a sale that frees collateral step by step, what the USDT buys (5 / 1.003).
   assert.deepEqual(top({ usdtRaw: 5n * E, partial: true }), { amountRaw: 5n * E * 1_000n / 1_003n, maxUsdtInRaw: topUpMaxUsdtIn(5n * E * 1_000n / 1_003n), covers: false });
@@ -547,8 +551,11 @@ test('cash swapper, planner: a close of a USDC route the box cannot cover tops u
   const rich = run({ vaultAssetsRaw: 1005n * E, cashRaw: 2n * E });
   assert.deepEqual(names(rich.calls), ['executeReduce', 'cashOut']);
   assert.equal(swapCall(rich.calls[1]!).args[2], cashOutMinUsdt(1005n * E + 2n * E - 1000n * E - (1000n * E / 5_000n + 1n)));
-  // Barely covered and nothing of its own: a leftover that is not certain is not sold here (the next round does it).
+  // Covered as read (gap 0), even by nothing to spare: no top-up — the close does not depend on the pool (spec §17) — and
+  // a leftover that is not certain is not sold here (the next round does it). One wei short: the top-up is back.
   assert.deepEqual(names(run({ vaultAssetsRaw: 1000n * E + 1000n * E / 5_000n + 2n }).calls), ['executeReduce']);
+  assert.deepEqual(names(run({ vaultAssetsRaw: 1000n * E }).calls), ['executeReduce']);
+  assert.deepEqual(names(run({ vaultAssetsRaw: 1000n * E - 1n }).calls), ['topUp', 'executeReduce', 'cashOut']);
   // `shortfall` reverted (a vault cannot be read): the vault is not counted on — buy the whole debt less the idle, up to the cap.
   const blind = run({ swap: quote({ gapRaw: null, usdtRaw: 5_000n * E }), idleRaw: 100n * E });
   assert.deepEqual(names(blind.calls), ['topUp', 'executeReduce', 'cashOut']);

@@ -607,6 +607,30 @@ test('cash swapper, before a sale (session key): top-up + close + cash-out; with
   } finally { if (env === undefined) delete process.env.STRATEGY_EARN_V2_DEPLOYMENT; else process.env.STRATEGY_EARN_V2_DEPLOYMENT = env; }
 });
 
+test('cash swapper, before a sale: when the top-up cannot go through (pool off its peg, window used up) the sale is not held back — the same round repays and frees without the swapper', async () => {
+  for (const [name, selector] of [['PegExceeded', 'PegExceeded(uint256,uint256)'], ['WindowExceeded', 'WindowExceeded(uint256,uint256)']] as const) {
+    const w = world(WS), reader = createV2Reader(w.readerDeps), sent: Call[][] = [], lines: string[] = [], led = ledger();
+    shortUsdc(w);
+    const note = await v2UnwindForSale({ v2: WS, reader, account: W.account, portfolioId: 9, now: NOW, dryRun: false, ledger: led.l, log: l => lines.push(l), steps: [{ tokenIn: W.QQQ, amountIn: E18 }],
+      send: async calls => {
+        // The pool refuses every swap; everything else lands.
+        if (calls.some(c => c.to === SWAPPER)) throw new Error(`UserOperation reverted during simulation with reason: ${toFunctionSelector(selector)}${'00'.repeat(64)}`);
+        sent.push(calls); return tx(sent.length);
+      } });
+    // What landed: the plan without the swapper — repay what the box holds (280 of 300, less 1 wei) and take back that share less 2%.
+    assert.deepEqual(sent.map(c => c.map(swapFn)), [['executeReduce']], name);
+    assert.deepEqual((argsOf(sent[0]![0]!) as readonly unknown[]).slice(3, 5), [280n * E18 - 1n, 2n * E18 * (280n * E18 - 1n) / (300n * E18) * 9_800n / 10_000n], name);
+    assert.match(note!, /賣出前已還款取回：QQQB short of USDC: repay \d+, take back \d+ of \d+; the sale pays the rest tx=0x0+1；下一輪再賣$/, name);
+    assert.ok(lines.some(l => new RegExp(`補差額／換回現金這一輪做不了（${name}），這次賣出改走不補差額的還款取回`).test(l)), lines.join('\n'));
+    if (name === 'PegExceeded') assert.ok(lines.some(l => /"msg":"strategy_peg_exceeded"/.test(l)), 'the alert line is still written');
+  }
+  // A failure that has nothing to do with the swapper (no swapper call in the plan) is reported as before.
+  const w = world(), reader = createV2Reader(w.readerDeps), led = ledger();
+  openVenus(w, { debt: 441n * E18, vault: 442n * E18 });
+  await assert.rejects(v2UnwindForSale({ v2: W.v2, reader, account: W.account, portfolioId: 9, now: NOW, dryRun: false, ledger: led.l, log: () => {}, steps: [{ tokenIn: W.NVDA, amountIn: 10n * E18 }],
+    send: async () => { throw new Error('PAYMASTER_QUOTA_EXCEEDED'); } }), /PAYMASTER_QUOTA_EXCEEDED/);
+});
+
 test('cash swapper, owner API: consent adds the swapper approvals an account lacks; an owner close signs them with its top-up and cash-out; a close it cannot cover is not handed out', async () => {
   const w = world(WS), reader = createV2Reader(w.readerDeps);
   const api = createStrategyEarnV2Api({ v2: WS, reader, now: () => NOW, reservedUsdt: async () => w.state.vaultReward });

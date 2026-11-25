@@ -415,6 +415,47 @@ test('#204 scheduler: noop runs auto-open; a sale with posted shares unwinds and
   void parseAbi; void encodeFunctionData;
 });
 
+test('2026-11-25 portfolio 33: an open "sell all" keeps the scheduler from auto-opening again — the round only sells, as a full exit', async () => {
+  const at = new Date('2026-11-23T15:30:00Z'); // US market hours
+  const { plan } = mixRuntimeFixture();
+  // After the `/close` round repaid and took the shares back: consent still on, the shares idle in the account, weights on target.
+  const idle = { ...plan, report: { ...plan.report!, needsRebalance: false } };
+  const sale: RebalancePlan = { kind: 'ready', purpose: 'exit', deadline: 2_000_000_000n, rationale: 'sell all',
+    steps: [{ tokenIn: T.assets.NVDAB.token as Address, tokenOut: T.contracts.usdt as Address, amountIn: E18, amountOutMin: 1n, oracleFloor: 1n, venue: T.contracts.executor as Address, data: '0x' as Hex }] };
+  const scheduler = (request: boolean, planSellAll: () => Promise<RebalancePlan>) => {
+    const f = legacyScheduler(idle, null), calls: string[] = [], writes: string[] = [];
+    const query: SchedulerQueryFn = async (sql, params) => {
+      const result = await f.deps.query!(sql, params);
+      if (sql.includes('for update of p skip locked')) return { rows: result.rows.map(row => ({ ...(row as object), sell_all: request })) };
+      if (sql.includes('sell_all_requested') || sql.includes('schedule_state')) writes.push(sql.replace(/\s+/g, ' '));
+      return result;
+    };
+    const deps: SchedulerDeps = { ...f.deps, query, withTransaction: work => work({ query }), planSellAll,
+      strategyEarn: { open: async () => { calls.push('open'); return 'opened'; }, unwind: async (_d, steps, _dry, exit) => { calls.push(`unwind:${steps.length}:exit=${exit}`); return null; } } };
+    return { deps, calls, writes, fixture: f.calls };
+  };
+  // What happened on 2026-11-25: no request anywhere, so the next quiet round opened the strategy again.
+  const before = scheduler(false, async () => { throw new Error('not a sell-all round'); });
+  assert.equal((await runSchedulerOnce({ dryRun: false, now: at, skipAlerts: true }, before.deps)).results[0]?.outcome, 'noop');
+  assert.deepEqual(before.calls, ['open']);
+  // With the request open the same account is not opened: the round plans the sale, unwinds as a full exit and goes on to the sale's own checks.
+  const selling = scheduler(true, async () => sale);
+  const round = await runSchedulerOnce({ dryRun: false, now: at, skipAlerts: true }, selling.deps);
+  assert.equal(round.results[0]?.reason, '[FIXTURE_STOP] stop before quoting');
+  assert.deepEqual(selling.calls, ['unwind:1:exit=true']); assert.deepEqual(selling.fixture, ['minimums']);
+  // A round that cannot sell (market closed, oracle down) does not open either, and the request stays as it is.
+  const closed = scheduler(true, async () => ({ kind: 'blocked', reason: '[MARKET_CLOSED] 股票休市，等待交易時段' }));
+  const waiting = await runSchedulerOnce({ dryRun: false, now: at, skipAlerts: true }, closed.deps);
+  assert.equal(waiting.results[0]?.outcome, 'blocked'); assert.match(waiting.results[0]?.reason ?? '', /MARKET_CLOSED/);
+  assert.deepEqual(closed.calls, []);
+  assert.ok(!closed.writes.some(sql => /set state = '(delivered|failed)'|set schedule_state/.test(sql)), closed.writes.join('\n'));
+  // Nothing left but cash: the request is closed and the portfolio is left paused, without opening.
+  const done = scheduler(true, async () => ({ kind: 'noop', reason: 'nothing to sell' }));
+  const last = await runSchedulerOnce({ dryRun: false, now: at, skipAlerts: true }, done.deps);
+  assert.match(last.results[0]?.reason ?? '', /SELL_ALL_DONE/); assert.deepEqual(done.calls, []);
+  assert.ok(done.writes.some(sql => sql.includes("set schedule_state = 'paused'")) && done.writes.some(sql => sql.includes("set state = 'delivered'")), done.writes.join('\n'));
+});
+
 // ---- cre8-contracts#67: every launch-fund holding has a market --------------------------------------------------
 
 const bySymbol = (symbol: string) => { const m = markets.find(x => x.symbol === symbol); assert.ok(m, symbol); return m; };

@@ -25,6 +25,7 @@ import type { AssetExecution } from './strategy-execution.js';
 import { reservedCash, withdrawableCash } from './withdrawable-cash.js';
 import { rpcTransport } from './rpc-transport.js';
 import { accountHoldsOnlyCash, pausedBySellAll, RESUME_AFTER_SELL_ALL_SQL } from './sell-all-resume.js';
+import { CANCEL_SELL_ALL_SQL, NEW_MONEY_ENDS_SELL_ALL_SQL } from './sell-all-intent.js';
 
 export type FundingSource = { kind: 'faucet_claim'; claimId: string } | { kind: 'welcome_grant'; grantId: string }
   | { kind: 'wallet_transfer'; txHash: Hex }
@@ -315,6 +316,8 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
       // New money wakes an idle-backed-off portfolio (scheduler IDLE_BACKOFF_SECONDS) for the next round.
       if (inserted.rows.length === 1) await client.query('update portfolios set next_run_at=null where id=$1', [id]);
       if (inserted.rows.length === 1 && resume) await client.query(RESUME_AFTER_SELL_ALL_SQL, [id]);
+      // The same new money while a "sell all" is still unfinished ends that request (src/sell-all-intent.ts).
+      if (inserted.rows.length === 1 && source.kind !== 'dca_tranche') await client.query(NEW_MONEY_ENDS_SELL_ALL_SQL, [id]);
       const lot = (await client.query<LotRow>('select * from strategy_funding_lots where chain_id=$1 and tx_hash=$2 and log_index=$3',
         [p.chainId, evidence.txHash, evidence.logIndex])).rows[0];
       if (!lot || Number(lot.portfolio_id) !== id || Number(lot.strategy_id) !== p.strategyId || lot.version !== p.version || lot.kind !== kind ||
@@ -451,6 +454,8 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
         await cashLock(client, p);
         if (enabled) await checkReorg(client, p);
         await client.query('update portfolios set schedule_state=$2 where id=$1', [id, enabled ? 'active' : 'paused']);
+        // The owner sets the state by hand: an unfinished "sell all" no longer decides it (src/sell-all-intent.ts).
+        await client.query(CANCEL_SELL_ALL_SQL, [id]);
         return { portfolioId: id, enabled };
       }));
     }),

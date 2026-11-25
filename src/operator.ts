@@ -33,6 +33,7 @@ import { countSwapExecuted, PARTIAL_FOLLOW_UP_SECONDS, runSchedulerOnce, SCHEDUL
 import type { ExecutionOutcome, PortfolioRunResult, WithTransactionFn } from './scheduler.js';
 import { planPortfolio } from './snapshot.js';
 import { RESUME_PAUSED_SQL } from './sell-all-resume.js';
+import { CANCEL_SELL_ALL_SQL, requestSellAll, sellAllCallerIsHere, sellAllOver, settleSellAll } from './sell-all-intent.js';
 import { buildRoutedStep, capAssetLeg, DEFAULT_DEADLINE_SECONDS, minGrossFor, nominalSellQuote, numeraireDecimals, readMaxLegUsdE8 } from './rebalance-plan.js';
 import type { PlannedStep, RebalancePlan } from './rebalance-plan.js';
 import type { RebalancePlanningInput } from './scheduler.js';
@@ -751,6 +752,8 @@ export type RebalanceDeps = {
   log?: (line: string) => void;
   /** Sell all releases a running buy job first (default: on in production, off when tests inject DB stubs). */
   releaseRunningBuy?: ((portfolioId: number) => Promise<void>) | null;
+  /** Sell all: what is left cannot be sold at all (default: mix-runtime `mixBelowExecutorMinimum`, chain 97 only). */
+  belowExecutorMinimum?: (plan: PortfolioPlan) => Promise<boolean>;
 };
 
 /**
@@ -916,6 +919,9 @@ export async function runOperatorRebalance(
     await (deps.query ?? dbQuery)(RESUME_PAUSED_SQL, [
       portfolioId,
     ]);
+    // The owner buys again: an unfinished "sell all" (src/sell-all-intent.ts) is over, so this round is a normal one.
+    try { await (deps.query ?? dbQuery)(CANCEL_SELL_ALL_SQL, [portfolioId]); }
+    catch (error) { (deps.log ?? console.warn)(`[close] portfolio ${portfolioId}: open sell-all not cancelled (${errorChain(error)})`); }
   }
 
   const run = deps.runSchedulerOnce ?? runSchedulerOnce;
@@ -1332,6 +1338,12 @@ export type RedeemResult = {
   /** 非現金待賣名義額；尚未規劃、只對帳或送出結果未知時為 null，不能當成可重送量。 */
   remainingUsdE8: string | null;
   batched: boolean;
+  /**
+   * Sell all only: the request is still open after this call (src/sell-all-intent.ts) — the scheduler goes on selling
+   * without another call, and calling again just continues. False once nothing is left, or when the portfolio cannot
+   * hold a request (then only further calls sell).
+   */
+  sellAllPending?: boolean;
 };
 
 /**
@@ -1362,7 +1374,17 @@ async function runOperatorSell(portfolioId: number, wallet: string, request: Sel
     try { await release(portfolioId); }
     catch (error) { (deps.log ?? console.warn)(`[close] portfolio ${portfolioId}: running buy not released (${errorChain(error)})`); }
   }
+  const query = deps.query ?? dbQuery;
+  // Sell all: the request outlives this call (src/sell-all-intent.ts). If the client goes away after this round, the
+  // scheduler goes on selling instead of rebalancing or opening Strategy Earn again; calling again just continues.
+  let tracked = false;
+  if (closing) {
+    try { tracked = await requestSellAll(query, configuredChainId(), portfolioId); }
+    catch (error) { (deps.log ?? console.warn)(`[close] portfolio ${portfolioId}: sell-all request not recorded, this call sells on its own (${errorChain(error)})`); }
+  }
   const planning: { result: RedeemPlanningResult | null } = { result: null };
+  // From the first plan of the round only: a second one leaves out shares that stay posted for now (V2UnwindWait).
+  let over: boolean | null = null;
   const round = await (deps.runSchedulerOnce ?? runSchedulerOnce)(
     { dryRun: false, limit: 1, skipAlerts: true },
     {
@@ -1372,6 +1394,7 @@ async function runOperatorSell(portfolioId: number, wallet: string, request: Sel
       planRebalance: async (input) => {
         const built = await buildRedeemPlan(input, request, deps);
         planning.result = built;
+        if (closing) over ??= await sellAllOver(input.plan, built.plan, deps.belowExecutorMinimum);
         return built.plan;
       },
       forcePlan: true,
@@ -1389,12 +1412,11 @@ async function runOperatorSell(portfolioId: number, wallet: string, request: Sel
   let reason = result?.reason ?? `排程器沒有認領 portfolio ${portfolioId}（排程狀態或 smart account 不允許）`;
   const nothingToSell = details?.plan.kind === 'noop' && details.plan.reason === 'nothing to sell';
   if (nothingToSell) reason = 'nothing to sell';
-  const query = deps.query ?? dbQuery;
-  if (outcome === 'executed' || (outcome === 'noop' && nothingToSell && closing)) {
+  if (outcome === 'executed' || closing && over === true) {
     try {
       if (closing) {
-        await query("update portfolios set schedule_state = 'paused' where id = $1", [portfolioId]);
-        await query('update scheduler_alerts set resolved_at = now() where portfolio_id = $1 and resolved_at is null', [portfolioId]);
+        // Paused once a batch is sold or nothing is left, as before; the request closes when nothing is left.
+        await settleSellAll(query, portfolioId, { outcome, over: over === true, tracked });
       } else {
         await query("update portfolios set next_run_at = greatest(next_run_at, now() + $2::int * interval '1 second') where id = $1", [portfolioId, PARTIAL_FOLLOW_UP_SECONDS]);
       }
@@ -1403,12 +1425,15 @@ async function runOperatorSell(portfolioId: number, wallet: string, request: Sel
       reason += closing ? '；清倉結果已確認，但 DB 暫停／警示更新失敗，請檢查排程狀態' : '；賣出已確認，但 DB 延後排程失敗，請暫停排程後再續作';
     }
   }
+  // The round may have taken a while: the scheduler takes over only after the caller has been silent since now.
+  if (tracked && over !== true) { try { await sellAllCallerIsHere(query, portfolioId); } catch { /* the scheduler just comes a little earlier */ } }
   return {
     portfolioId, outcome, reason,
     txHash: result?.execution?.txHash ?? null,
     steps: (result?.plan?.steps ?? []).map((step) => ({ tokenIn: step.tokenIn, tokenOut: step.tokenOut, amountIn: step.amountIn, amountOutMin: step.amountOutMin, venue: step.venue })),
     redeemedUsdE8: requested.toString(), remainingUsdE8: remaining?.toString() ?? null,
     batched: details !== null && details.requestedSellUsdE8 !== null && details.plannedSellUsdE8 < details.requestedSellUsdE8,
+    ...(closing ? { sellAllPending: tracked && over !== true } : {}),
   };
 }
 

@@ -45,7 +45,7 @@ import type {
   ReconcileInput,
 } from '../src/scheduler.js';
 import type { PortfolioPlan } from '../src/snapshot.js';
-import { runOperatorClose, runOperatorRedeem, runOperatorRebalance } from '../src/operator.js';
+import { buildRedeemPlan, runOperatorClose, runOperatorRedeem, runOperatorRebalance } from '../src/operator.js';
 import { sellFixture } from './fixtures/max-leg.js';
 
 /**
@@ -158,6 +158,10 @@ type StubDb = {
   inTransaction: boolean;
   /** true = 下一次 withTransaction 在 fn 之後拋錯（模擬 crash）。 */
   failTransaction: boolean;
+  /** Portfolios with an open "sell all" request (src/sell-all-intent.ts): the `user_notifications` rows in state `pending`. */
+  sellAll: Set<number>;
+  /** What the retry guard reads for a portfolio with an open request (failed sends since the request). */
+  sellAllStreak?: { failures: number; lastFailureAt: Date };
 };
 
 function stubDb(overrides: Partial<StubDb> = {}): StubDb {
@@ -169,6 +173,7 @@ function stubDb(overrides: Partial<StubDb> = {}): StubDb {
     pendingNextRunAt: new Map(),
     inTransaction: false,
     failTransaction: false,
+    sellAll: new Set(),
     ...overrides,
   };
 }
@@ -220,7 +225,8 @@ function stubQuery(db: StubDb): SchedulerQueryFn {
       const now = params[0] as Date;
       const limit = Number(params[2]);
       const due = db.portfolios
-        .filter((row) => (row.state === 'active' || (text.includes("in ('active', 'paused')") && row.state === 'paused')) &&
+        .filter((row) => (row.state === 'active' || (text.includes("in ('active', 'paused')") && row.state === 'paused') ||
+            (text.includes("p.schedule_state = 'paused' and exists(select 1 from user_notifications") && row.state === 'paused' && db.sellAll.has(row.id))) &&
           (text.includes('p.id = $4') ? row.id === Number(params[3]) : row.nextRunAt === null || row.nextRunAt.getTime() <= now.getTime()))
         .sort((left, right) => {
           const lt = left.nextRunAt?.getTime() ?? Number.NEGATIVE_INFINITY;
@@ -236,9 +242,39 @@ function stubQuery(db: StubDb): SchedulerQueryFn {
           address: row.account,
           account_type: row.accountType,
           schedule: row.schedule,
+          sell_all: db.sellAll.has(row.id),
         })),
       };
     }
+
+    // "Sell all" request rows (src/sell-all-intent.ts), by what each statement does.
+    if (text.includes("'sell_all_requested'")) {
+      const pause = (id: number) => { const row = db.portfolios.find((entry) => entry.id === id); if (row !== undefined) row.state = 'paused'; };
+      if (text.includes('insert into user_notifications')) { db.sellAll.add(Number(params[1])); return { rows: [] }; }
+      if (text.startsWith('select 1 from user_notifications')) return { rows: db.sellAll.has(Number(params[1])) ? [{}] : [] };
+      if (text.includes("set schedule_state = 'paused'")) { if (db.sellAll.has(Number(params[0]))) pause(Number(params[0])); return { rows: [] }; }
+      if (text.includes('set next_run_at = now() + interval')) {
+        const row = db.portfolios.find((entry) => entry.id === Number(params[0]));
+        if (row !== undefined && db.sellAll.has(row.id)) row.nextRunAt = new Date(NOW.getTime() + Number(/interval '(\d+) seconds'/.exec(text)?.[1]) * 1000);
+        return { rows: [] };
+      }
+      if (text.includes("set schedule_state = 'active'")) {
+        const row = db.portfolios.find((entry) => entry.id === Number(params[0]));
+        if (db.sellAll.delete(Number(params[0])) && row !== undefined && row.state === 'paused') { row.state = 'active'; row.nextRunAt = null; }
+        return { rows: [] };
+      }
+      if (text.includes("set state = 'delivered'") || text.includes("set state = 'failed'")) { db.sellAll.delete(Number(params[0])); return { rows: [] }; }
+      if (text.includes('as last_failure_at')) {
+        return { rows: db.sellAll.has(Number(params[1])) ? [{ since: new Date(0), failures: db.sellAllStreak?.failures ?? 0, last_failure_at: db.sellAllStreak?.lastFailureAt ?? null }] : [] };
+      }
+      if (text.includes('group by n.portfolio_id')) return { rows: [] };
+    }
+    if (text.includes("update portfolios set schedule_state = 'paused' where id = $1")) {
+      const row = db.portfolios.find((entry) => entry.id === Number(params[0]));
+      if (row !== undefined) row.state = 'paused';
+      return { rows: [] };
+    }
+    if (text.includes('update scheduler_alerts set resolved_at = now() where portfolio_id = $1')) return { rows: [] };
 
     if (text.includes('set next_run_at = claimed.next_run_at') || text.includes('set next_run_at = greatest(p.next_run_at, claimed.next_run_at)')) {
       const ids = params[0] as number[];
@@ -3425,6 +3461,8 @@ function exitCase(state: StubPortfolio['state'] = 'paused', extra: SchedulerDeps
     createdAt: NOW.toISOString(), chainId: TEST_CHAIN_ID, accountAddress: ACCOUNT, ownerAddress: OWNER, existingKeyRefs: [] });
   const options = { ...f.deps, requireOwnedPortfolio: owned, withTransaction: stubWithTransaction(db),
     query: async (sql: string, params?: readonly unknown[]) => {
+      // The "sell all" request rows live in the scheduler's database (src/sell-all-intent.ts).
+      if (sql.includes("'sell_all_requested'")) return stubQuery(db)(sql, params);
       if (sql.includes("set schedule_state = 'paused'")) { const row = db.portfolios[0]; assert.ok(row); row.state = 'paused'; }
       return query(sql, params);
     },
@@ -3468,6 +3506,7 @@ for (const gate of ['global', 'chain', 'inflight'] as const) {
     assert.equal(c.f.state.reads.length, 0);
     assert.equal(c.chain.executeCalls.length, 0);
     assert.equal(c.f.state.writes.length, 0);
+    assert.ok(c.db.sellAll.has(PORTFOLIO_ID), 'the request is recorded before the round: the scheduler goes on once the block clears');
   });
 }
 
@@ -3482,6 +3521,179 @@ test('#42 receipt timeout then another close is blocked and sends only once', as
   assert.equal(second.outcome, 'blocked');
   assert.equal(c.f.state.reads.length, reads, 'in-flight guard precedes the sell planner');
   assert.equal(c.chain.executeCalls.length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// "Sell all" stays with the backend (src/sell-all-intent.ts; 2026-11-25, testnet portfolio 33)
+// ---------------------------------------------------------------------------
+
+/** The `/close` fixture without the aggregator quote (a real HTTP call with a one second timeout in the default). */
+function sellAllCase(state: StubPortfolio['state'] = 'active', extra: SchedulerDeps = {}) {
+  const c = exitCase(state, extra);
+  return { ...c, options: { ...c.options, quoteAggregator: async () => null } };
+}
+const DOGE_HELD = (c: ReturnType<typeof exitCase>) => c.chain.plan.snapshot.holdings[0]!;
+const MARKET: Hex = `0x${'aa'.repeat(32)}`;
+/** The scheduler's own rounds on the `/close` fixture: same database, same chain, the plan `/close` uses. */
+function sellAllRounds(c: ReturnType<typeof sellAllCase>, extra: SchedulerDeps = {}) {
+  const logs: string[] = [];
+  let at = NOW.getTime();
+  const round = async () => {
+    at += (ONE_DAY_SECONDS + 1) * 1000; // every round is due again
+    return runSchedulerOnce({ dryRun: false, now: new Date(at), skipAlerts: true }, deps(c.db, c.chain, {
+      planSellAll: async (input) => (await buildRedeemPlan(input, { close: true }, c.options)).plan, log: (line) => logs.push(line), ...extra }));
+  };
+  return { round, logs, now: () => new Date(at) };
+}
+
+test('sell all, Strategy Earn on (v1 note), client gone after the repay round: the scheduler never rebalances or re-opens, sells the rest itself and leaves the portfolio paused', async () => {
+  // The first unwind call is the `/close` round (repay and take the shares back, "下一輪再賣"); afterwards nothing is posted.
+  const unwinds: (boolean | undefined)[] = [];
+  let opens = 0;
+  const strategyEarn: NonNullable<SchedulerDeps['strategyEarn']> = {
+    open: async () => { opens += 1; return 'opened'; },
+    unwind: async (_due, _steps, _dry, exit) => { unwinds.push(exit); return unwinds.length === 1 ? '[STRATEGY_EARN_UNWINDING] 賣出前已還款取回：DOGE 先還清再取回 tx=0xabc；下一輪再賣' : null; },
+  };
+  const c = sellAllCase('active', { strategyEarn });
+  c.chain.plan.snapshot.strategyEarnCollateral = [{ asset: DOGE_HELD(c).asset as Address, marketId: MARKET, amount: DOGE_HELD(c).amountWei }];
+  const first = await runOperatorClose(PORTFOLIO_ID, OWNER, c.options);
+  assert.equal(first.outcome, 'blocked'); assert.match(first.reason, /STRATEGY_EARN_UNWINDING.*下一輪再賣/);
+  assert.equal(c.chain.executeCalls.length, 0);
+  assert.equal(c.db.portfolios[0]?.state, 'active', 'nothing sold yet: not paused');
+  assert.ok(c.db.sellAll.has(PORTFOLIO_ID), 'the request outlives the call');
+  assert.equal(first.sellAllPending, true, 'the response says the backend goes on by itself');
+  // The client never calls again. The shares are back in the account (nothing posted any more).
+  delete c.chain.plan.snapshot.strategyEarnCollateral;
+  const s = sellAllRounds(c, { strategyEarn });
+  const one = await s.round();
+  assert.deepEqual(outcomes(one), ['executed'], one.results[0]?.reason);
+  assert.equal(c.chain.planRebalanceCalls, 0, 'the regular planner (rebalance / buy back) is never asked');
+  assert.ok(c.chain.executeCalls[0]?.steps.every((leg) => leg.tokenOut.toLowerCase() === c.chain.plan.snapshot.holdings[1]!.asset.toLowerCase()), 'sells only');
+  assert.equal(c.db.portfolios[0]?.state, 'paused', 'paused after the first batch, like /close');
+  assert.ok(c.db.sellAll.has(PORTFOLIO_ID), 'one capped batch is not the end');
+  // Paused, yet still claimed: the second batch.
+  c.chain.plan = c.f.plan(stubPlan(), 50n, 1950n);
+  assert.deepEqual(outcomes(await s.round()), ['executed']);
+  assert.equal(c.chain.executeCalls.length, 2);
+  // The account holds only cash: the request is over, the portfolio stays paused, and it is not claimed again.
+  c.chain.plan = c.f.plan(stubPlan(), 0n, 2000n);
+  const done = await s.round();
+  assert.deepEqual(outcomes(done), ['noop']); assert.match(done.results[0]?.reason ?? '', /SELL_ALL_DONE/);
+  assert.equal(c.db.sellAll.size, 0);
+  assert.equal(c.db.portfolios[0]?.state, 'paused');
+  assert.equal((await s.round()).claimed, 0);
+  assert.equal(c.chain.executeCalls.length, 2);
+  assert.equal(opens, 0, 'Strategy Earn is never opened again on the way');
+  assert.deepEqual(unwinds, [true], 'the repay round was a full exit; afterwards nothing is posted');
+  assert.equal(c.chain.planRebalanceCalls, 0);
+  // The owner pressing "sell all" once more afterwards: nothing to sell, nothing sent, no new request left behind.
+  const again = await runOperatorClose(PORTFOLIO_ID, OWNER, c.options);
+  assert.deepEqual([again.outcome, again.reason, again.sellAllPending], ['noop', 'nothing to sell', false]);
+  assert.equal(c.db.sellAll.size, 0); assert.equal(c.chain.executeCalls.length, 2);
+});
+
+test('sell all, routing v2 (shares that cannot be freed yet): /close sells the free part, the scheduler frees and sells the rest in later rounds', async () => {
+  let stuck = true;
+  const strategyEarn: NonNullable<SchedulerDeps['strategyEarn']> = {
+    open: async () => { throw new Error('Strategy Earn must not be opened while everything is being sold'); },
+    unwind: async (due) => stuck ? { note: '[STRATEGY_EARN_UNWINDING] DOGE 補差額的 24 小時額度用完', stuck: [DOGE_HELD(c).asset.toLowerCase() as Address], needUsdtRaw: 0n }
+      : (assert.equal(due.sellAll, true), null),
+  };
+  const c = sellAllCase('active', { strategyEarn }); c.f.state.limit = null;
+  // 200 USD of DOGE, 120 of it posted: 80 is free.
+  c.chain.plan.snapshot.strategyEarnCollateral = [{ asset: DOGE_HELD(c).asset as Address, marketId: MARKET, amount: 120n * 10n ** 8n }];
+  const first = await runOperatorClose(PORTFOLIO_ID, OWNER, c.options);
+  assert.equal(first.outcome, 'executed', first.reason);
+  assert.equal(c.chain.executeCalls[0]?.steps[0]?.amountIn, 80n * 10n ** 8n, 'only what the account holds free');
+  assert.equal(c.db.portfolios[0]?.state, 'paused');
+  assert.ok(c.db.sellAll.has(PORTFOLIO_ID), 'posted shares are still there: not done');
+  // Client gone. The posted part stays stuck for one more round, then is freed and sold by the scheduler.
+  c.chain.plan = c.f.plan(stubPlan(), 120n, 1880n);
+  c.chain.plan.snapshot.strategyEarnCollateral = [{ asset: DOGE_HELD(c).asset as Address, marketId: MARKET, amount: 120n * 10n ** 8n }];
+  const s = sellAllRounds(c, { strategyEarn });
+  const waiting = await s.round();
+  assert.deepEqual(outcomes(waiting), ['blocked']); assert.match(waiting.results[0]?.reason ?? '', /STRATEGY_EARN_UNWINDING/);
+  assert.ok(c.db.sellAll.has(PORTFOLIO_ID));
+  stuck = false; delete c.chain.plan.snapshot.strategyEarnCollateral;
+  assert.deepEqual(outcomes(await s.round()), ['executed']);
+  assert.equal(c.chain.executeCalls[1]?.steps[0]?.amountIn, 120n * 10n ** 8n);
+  c.chain.plan = c.f.plan(stubPlan(), 0n, 2000n);
+  assert.match((await s.round()).results[0]?.reason ?? '', /SELL_ALL_DONE/);
+  assert.equal(c.db.sellAll.size, 0); assert.equal(c.db.portfolios[0]?.state, 'paused');
+});
+
+test('sell all is idempotent: calling /close again mid-way continues with the next batch and keeps one request', async () => {
+  const c = sellAllCase();
+  assert.equal((await runOperatorClose(PORTFOLIO_ID, OWNER, c.options)).outcome, 'executed');
+  const s = sellAllRounds(c);
+  c.chain.plan = c.f.plan(stubPlan(), 50n, 1950n);
+  const second = await runOperatorClose(PORTFOLIO_ID, OWNER, c.options);
+  assert.deepEqual([second.outcome, second.remainingUsdE8], ['executed', '0']);
+  assert.equal(c.db.statements.filter((entry) => entry.sql.includes('insert into user_notifications')).length, 2, 'asked twice');
+  assert.deepEqual([...c.db.sellAll], [PORTFOLIO_ID], 'still one request');
+  // The scheduler then only has to see that nothing is left.
+  c.chain.plan = c.f.plan(stubPlan(), 0n, 2000n);
+  assert.match((await s.round()).results[0]?.reason ?? '', /SELL_ALL_DONE/);
+  assert.equal(c.chain.executeCalls.length, 2, 'no batch is sold twice');
+  assert.equal(c.db.sellAll.size, 0);
+});
+
+test('while the caller keeps calling /close the scheduler stays out of its way; 90 seconds after the last call it takes over', async () => {
+  const c = sellAllCase();
+  assert.equal((await runOperatorClose(PORTFOLIO_ID, OWNER, c.options)).outcome, 'executed');
+  c.chain.plan = c.f.plan(stubPlan(), 50n, 1950n);
+  const after = (seconds: number) => runSchedulerOnce({ dryRun: false, now: new Date(NOW.getTime() + seconds * 1000), skipAlerts: true }, deps(c.db, c.chain, {
+    planSellAll: async (input) => (await buildRedeemPlan(input, { close: true }, c.options)).plan }));
+  assert.equal((await after(60)).claimed, 0, 'the app may still be sending its next batch');
+  assert.equal(c.chain.executeCalls.length, 1);
+  assert.deepEqual(outcomes(await after(91)), ['executed'], 'the caller went away: the scheduler sells the next batch');
+  assert.equal(c.chain.executeCalls.length, 2);
+});
+
+test('sell all retry guard: after 5 failed sends the scheduler waits (5 min, 15 min, 1 h, 6 h) instead of sending again; rounds that send nothing are not counted', async () => {
+  const c = sellAllCase();
+  c.db.sellAll.add(PORTFOLIO_ID);
+  const s = sellAllRounds(c);
+  // Market closed / oracle down style rounds send nothing: tried every round, no guard.
+  c.f.state.fail = 'previewSwap';
+  assert.deepEqual(outcomes(await s.round()), ['blocked']); assert.deepEqual(outcomes(await s.round()), ['blocked']);
+  assert.equal(c.chain.planPortfolioCalls.length, 2);
+  c.f.state.fail = '';
+  // Five failed sends in a row, the last one a minute ago: no plan is read and nothing is sent.
+  const reads = c.chain.planPortfolioCalls.length;
+  c.db.sellAllStreak = { failures: 5, lastFailureAt: new Date(s.now().getTime() + ONE_DAY_SECONDS * 1000) };
+  const held = await s.round();
+  assert.deepEqual(outcomes(held), ['blocked']); assert.match(held.results[0]?.reason ?? '', /^\[SELL_ALL_BACKOFF\] .*連續 5 次/);
+  assert.equal(c.chain.planPortfolioCalls.length, reads); assert.equal(c.chain.executeCalls.length, 0);
+  assert.ok(c.db.sellAll.has(PORTFOLIO_ID), 'the request stays: it is retried, not dropped');
+  // Five minutes after the last failure it goes again.
+  c.db.sellAllStreak = { failures: 5, lastFailureAt: new Date(s.now().getTime() + ONE_DAY_SECONDS * 1000 - 5 * 60_000) };
+  assert.deepEqual(outcomes(await s.round()), ['executed']);
+  // The eighth failure waits six hours.
+  c.db.sellAllStreak = { failures: 9, lastFailureAt: new Date(s.now().getTime() + ONE_DAY_SECONDS * 1000 - 5 * 3_600_000) };
+  assert.match((await s.round()).results[0]?.reason ?? '', /SELL_ALL_BACKOFF/);
+});
+
+test('the owner buys again before the sale is finished: the request ends and the portfolio is rebalanced / bought as usual', async () => {
+  const c = sellAllCase();
+  assert.equal((await runOperatorClose(PORTFOLIO_ID, OWNER, c.options)).outcome, 'executed');
+  assert.deepEqual([c.db.portfolios[0]?.state, c.db.sellAll.size], ['paused', 1]);
+  // `/portfolios/:id/rebalance` (the owner's buy): resumes, ends the request, and that round is an ordinary one.
+  c.chain.plan = c.f.plan(stubPlan(), 50n, 1950n); // off its weights: an ordinary round asks the regular planner
+  c.chain.rebalance = { kind: 'noop', reason: 'nothing to trade' };
+  const bought = await runOperatorRebalance(PORTFOLIO_ID, OWNER, { ...c.options, resumeIfPaused: true,
+    query: async (sql: string, params?: readonly unknown[]) => {
+      if (sql.includes("'sell_all_requested'")) return stubQuery(c.db)(sql, params);
+      if (sql.includes("set schedule_state = 'active'")) { c.db.portfolios[0]!.state = 'active'; return { rows: [] }; }
+      return c.options.query(sql, params);
+    } });
+  assert.equal(bought.outcome, 'noop');
+  assert.deepEqual([c.db.portfolios[0]?.state, c.db.sellAll.size], ['active', 0]);
+  assert.equal(c.chain.planRebalanceCalls, 1, 'the regular planner again');
+  // A later scheduler round is a normal round too.
+  const s = sellAllRounds(c, { planSellAll: async () => { throw new Error('no sell-all round without a request'); } });
+  assert.deepEqual(outcomes(await s.round()), ['noop']);
+  assert.equal(c.chain.planRebalanceCalls, 2);
 });
 
 test('#42 confirmed close then immediate empty close sends exactly once', async () => {

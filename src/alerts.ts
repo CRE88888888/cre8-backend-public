@@ -1,4 +1,5 @@
 import { yieldProfile } from './yield-domain.js';
+import { SELL_ALL_OVERDUE_SQL } from './sell-all-intent.js';
 import { createPublicClient, http } from 'viem';
 import type { Address, Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
@@ -352,6 +353,13 @@ export async function detectAlerts(
     if (prior) { prior.severity = 'critical'; prior.detail += '；' + finding.detail; }
     else stuck.push(finding);
   }
+  // An owner's "sell all" the scheduler has not finished within the stuck threshold (src/sell-all-intent.ts). Same key as
+  // the drift alert, so it joins that row.
+  for (const finding of await detectSellAllOverdue(query, thresholds.stuckHours, now)) {
+    const prior = stuck.find(item => item.portfolioId === finding.portfolioId);
+    if (prior) { if (finding.severity === 'critical') prior.severity = 'critical'; prior.detail += '；' + finding.detail; }
+    else stuck.push(finding);
+  }
   if(chainIdFromEnv(env)===97&&yieldProfile()!==null)for(const finding of await detectYieldAttention(query)){
     const prior=stuck.find(s=>s.portfolioId===finding.portfolioId);if(prior)prior.detail+='；'+finding.detail;else stuck.push(finding);
   }
@@ -516,6 +524,27 @@ export function pendingScheduleDrift(observedBps: number, totalUsdE8: unknown, p
   if (pendingBps >= 10_000 || observedBps <= pendingBps) return { driftBps: 0, pendingBps };
   return { driftBps: Math.round((observedBps - pendingBps) * 10_000 / (10_000 - pendingBps)), pendingBps };
 }
+
+/**
+ * "Sell all" that is still open after `hours`: the scheduler keeps selling on its own, so a request this old means it
+ * cannot. A warn while the latest round waits for a known harmless reason (the stock market is closed); critical
+ * otherwise, and always once sends keep failing (the retry guard of sellAllRetryAt is then spacing them out).
+ */
+export async function detectSellAllOverdue(query: QueryFn, hours: number, now: Date = new Date()): Promise<AlertFinding[]> {
+  const { rows } = await query(SELL_ALL_OVERDUE_SQL, [now.toISOString(), hours]);
+  return rows.flatMap((row) => {
+    const fields = row as Record<string, unknown>;
+    const portfolioId = Number(fields.portfolio_id), failures = Number(fields.failures ?? 0);
+    if (!Number.isSafeInteger(portfolioId) || portfolioId <= 0 || !(fields.since instanceof Date)) return [];
+    const waiting = failures >= SELL_ALL_FAILING ? null : waitingReason(portfolioId, now);
+    return [{ kind: 'portfolio_stuck', severity: waiting === null ? 'critical' : 'warn', portfolioId,
+      detail: `[SELL_ALL_PENDING] portfolio ${portfolioId} 的全部賣出從 ${fields.since.toISOString()} 起（${((now.getTime() - fields.since.getTime()) / 3_600_000).toFixed(1)} 小時）還沒賣完` +
+        (failures > 0 ? `，連續 ${failures} 次送出失敗` : '') +
+        (waiting !== null ? `；等待中，不需處理：${waiting}` : '；排程器會繼續重試（連續失敗時拉長間隔），需要人查看原因') } satisfies AlertFinding];
+  });
+}
+/** Failed sends in a row from which an overdue "sell all" is critical whatever the latest round said (the retry guard's line). */
+const SELL_ALL_FAILING = 5;
 
 /** A failing tail stops alerting once its newest operation is this old and the scheduler has checked the portfolio since without writing a new one. */
 export const FAILING_TAIL_CLEAN_HOURS = 6;

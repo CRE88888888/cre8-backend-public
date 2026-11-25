@@ -20,6 +20,7 @@ import { claimedCash } from './withdrawable-cash.js';
 import { recoverCashSwaps, settleCashSwaps } from './strategy-cash-swaps.js';
 import { computeDrift } from './drift.js';
 import { runV2KeeperRound, v2AutoRound, v2RewardHolders, v2UnwindForSale } from './strategy-earn-v2-scheduler.js';
+import { SELL_ALL_OPEN_SQL, sellAllOver, sellAllRetryAt, settleSellAll } from './sell-all-intent.js';
 import type { V2Ledger, V2UnwindWait } from './strategy-earn-v2-scheduler.js';
 import { rewardsStore } from './strategy-rewards.js';
 import { dbStrategyEarnLedger, defaultStrategyEarnChain, runStrategyEarnRound, strategyEarnAutoOpen, strategyEarnUnwindForSale, strategyEarnV1Active, strategyKeeperWriter } from './strategy-earn.js';
@@ -395,6 +396,8 @@ export type WithTransactionFn = <T>(fn: (client: { query: SchedulerQueryFn }) =>
  * 那種 portfolio 一定會帶著 `unsupportedReason` 回來，不可能被執行。
  */
 export type DuePortfolio = {
+  /** The owner's "sell all" is still open (src/sell-all-intent.ts): this round only goes on selling. */
+  sellAll?: true;
   personalMix?: boolean;
   executionKind?: 'hold' | 'stack' | 'per_asset';
   version?: number;
@@ -589,6 +592,8 @@ export type FloorRefreshInput = {
 export type SchedulerDeps = {
   mixExitFailure?: typeof recordMixExitFailure;
   mixExitMinimum?: typeof mixBelowExecutorMinimum;
+  /** The plan of a "sell all" round the scheduler continues (default: operator.ts buildRedeemPlan `{ close: true }`). */
+  planSellAll?: (input: RebalancePlanningInput) => Promise<RebalancePlan>;
   mixSwitchResidual?: typeof recordMixSwitchResidual;
   reconcileMix?: (portfolioId: number, exit?: boolean) => Promise<boolean>;
   cacheMix?: (id: string, due: DuePortfolio, plan: PortfolioPlan) => Promise<void>;
@@ -784,9 +789,11 @@ export function idempotencyKeyFor(portfolioId: number, planHash: Hex): string {
  * 被鎖住的列，而不是等它。鎖在 transaction 結束時釋放，而 `next_run_at` 已經在**commit 之前**
  * 推進，所以「認領」與「已經排到下一輪」是同一個原子事件。
  */
-export const SCHEDULER_LEGACY_ACTIVE_PREDICATE = `where (p.schedule_state = 'active' or (sv.execution_schema_version in (1,2) and p.schedule_state = 'paused'
+// `/close` pauses after its first executed batch: a paused portfolio whose "sell all" is still open stays claimable.
+const SELL_ALL_PAUSED_PREDICATE = `(p.schedule_state = 'paused' and ${SELL_ALL_OPEN_SQL})`;
+export const SCHEDULER_LEGACY_ACTIVE_PREDICATE = `where (p.schedule_state = 'active' or ${SELL_ALL_PAUSED_PREDICATE} or (sv.execution_schema_version in (1,2) and p.schedule_state = 'paused'
      and exists(select 1 from strategy_jobs j where j.portfolio_id=p.id and j.state in ('reserved','running','unknown','paused'))))`;
-export const SCHEDULER_ACTIVE_PREDICATE = `where (p.schedule_state = 'active' or (sv.execution_schema_version in (1,2) and p.schedule_state = 'paused'
+export const SCHEDULER_ACTIVE_PREDICATE = `where (p.schedule_state = 'active' or ${SELL_ALL_PAUSED_PREDICATE} or (sv.execution_schema_version in (1,2) and p.schedule_state = 'paused'
      and (exists(select 1 from strategy_jobs j where j.portfolio_id=p.id and j.state in ('reserved','running','unknown','paused'))
        or exists(select 1 from mixes m join mix_portfolio_history h on h.mix_id=m.id and h.ended_at is null
          where h.portfolio_id=p.id and m.status='active' and m.deleted_at is null and m.triggered_at is not null
@@ -799,7 +806,8 @@ const SQL_CLAIM_DUE = `
          sa.address,
          sa.account_type,
          sv.schedule, sv.execution, sv.execution_schema_version, p.version, p.schedule_state,
-         (select (to_jsonb(s)->>'is_personal_mix')::boolean from strategies s where s.id=p.strategy_id) as personal_mix
+         (select (to_jsonb(s)->>'is_personal_mix')::boolean from strategies s where s.id=p.strategy_id) as personal_mix,
+         ${SELL_ALL_OPEN_SQL} as sell_all
     from portfolios p
     join smart_accounts sa
       on sa.portfolio_id = p.id
@@ -908,6 +916,7 @@ export async function claimDuePortfolios(
 
     for (const row of rows) {
       const typed = row as {
+        sell_all?: unknown;
         personal_mix?: unknown;
         portfolio_id?: unknown;
         strategy_id?: unknown;
@@ -926,6 +935,7 @@ export async function claimDuePortfolios(
         schedule.kind === 'interval' ? schedule.intervalSeconds : UNSUPPORTED_SCHEDULE_BACKOFF_SECONDS;
 
       claimed.push({
+        ...(typed.sell_all === true ? { sellAll: true as const } : {}),
         ...(typed.personal_mix === true ? { personalMix: true } : {}),
         ...(executionKind === undefined ? {} : { executionKind, version: toInteger(typed.version,'portfolios.version'), scheduleState: String(typed.schedule_state) }),
         portfolioId,
@@ -1903,6 +1913,7 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
     query,
     mixExitFailure: provided.mixExitFailure ?? recordMixExitFailure,
     mixExitMinimum: provided.mixExitMinimum ?? mixBelowExecutorMinimum,
+    planSellAll: provided.planSellAll ?? null,
     mixSwitchResidual: provided.mixSwitchResidual ?? recordMixSwitchResidual,
     reconcileMix: provided.reconcileMix ?? ((id, exit) => createMixService().reconcilePortfolio(id, exit)),
     cacheMix: provided.cacheMix ?? (async (id, due, plan) => {
@@ -2190,7 +2201,10 @@ export async function runSchedulerOnce(
     // `forcePlan` 要一路傳到 runOne：它決定「漂移低於門檻時要不要照樣規劃」（redeem 用）。
     const times = new Map<string, number>();
     const started = performance.now();
-    const result = await phaseTimes.run(times, () => runOne(due, { dryRun, now, thresholdBps, deps: resolved, forcePlan: deps.forcePlan === true, roundBlockReason }));
+    // An open "sell all" (src/sell-all-intent.ts) replaces whatever this round would have done. A caller that brings its
+    // own plan (`/close`, `/redeem`) already says what to sell.
+    const ctx = { dryRun, now, thresholdBps, deps: resolved, forcePlan: deps.forcePlan === true, roundBlockReason };
+    const result = await phaseTimes.run(times, () => due.sellAll && deps.forcePlan !== true ? runSellAll(due, ctx) : runOne(due, ctx));
     results.push(result);
     // Alerts (same process, end of the round) read this to tell "waiting for a harmless reason" from "stuck".
     noteRoundOutcome(due.portfolioId, result.outcome, result.reason, now);
@@ -2496,6 +2510,43 @@ function buyDeadline(window: BuyVersionWindow, plannedVersion: number, deadline:
   const result = deadline < bound ? deadline : bound;
   if (result <= window.timestamp || result <= BigInt(Math.floor(now.getTime()/1000))) throw activationImminent();
   return result;
+}
+
+/**
+ * One round of an open "sell all": the plan `/close` uses, through the same pipeline (`forcePlan`: no rebalance, no
+ * new-money or DCA buy, no Strategy Earn open), then the same bookkeeping as `/close` — and the request is closed once
+ * the account holds nothing but cash. Repeated failed sends wait (sellAllRetryAt) instead of spending another UserOp.
+ */
+async function runSellAll(
+  due: DuePortfolio,
+  ctx: { dryRun: boolean; now: Date; thresholdBps: number; deps: ResolvedDeps; roundBlockReason: string | null },
+): Promise<PortfolioRunResult> {
+  if (!ctx.dryRun && ctx.roundBlockReason === null) {
+    let wait: Awaited<ReturnType<typeof sellAllRetryAt>> = null;
+    try { wait = await sellAllRetryAt(ctx.deps.query, ctx.deps.chainId, due.portfolioId, ctx.now); } catch { /* unreadable: this round goes ahead */ }
+    if (wait !== null) {
+      return { portfolioId: due.portfolioId, strategyId: due.strategyId, account: due.account, nextRunAt: due.nextRunAt, plan: null, execution: null, partial: null,
+        outcome: 'blocked', reason: `[SELL_ALL_BACKOFF] 全部賣出已連續 ${wait.failures} 次送出失敗，${wait.at.toISOString()} 之後再試` };
+    }
+  }
+  // Only the first plan of the round sees the whole account: a second one leaves out shares that stay posted for now
+  // (decideAndMaybeExecute, V2UnwindWait) and says nothing about whether the sale is over.
+  let over: boolean | null = null;
+  const planRebalance: ResolvedDeps['planRebalance'] = async input => {
+    const built = await (ctx.deps.planSellAll ?? (async i => (await (await import('./operator.js')).buildRedeemPlan(i, { close: true })).plan))(input);
+    over ??= await sellAllOver(input.plan, built, ctx.deps.mixExitMinimum);
+    return built;
+  };
+  const result = await runOne(due, { ...ctx, forcePlan: true, deps: { ...ctx.deps, planRebalance } });
+  if (ctx.dryRun) return result;
+  try {
+    await settleSellAll(ctx.deps.query, due.portfolioId, { outcome: result.outcome, over: over === true, tracked: true });
+    if (over) ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} [SELL_ALL_DONE] 全部賣出完成：帳戶只剩現金，投組暫停，等 owner 領回`);
+  } catch (error) {
+    // The trade stands; the next round finds the same state and writes it again.
+    ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} 全部賣出的排程狀態寫回失敗，下一輪再寫：${oneLine(error)}`);
+  }
+  return over && result.outcome !== 'executed' ? { ...result, outcome: 'noop', reason: `[SELL_ALL_DONE] 全部賣出完成，帳戶只剩現金；${result.reason}` } : result;
 }
 
 async function runOne(

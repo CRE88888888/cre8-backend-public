@@ -23,6 +23,7 @@ import { rebalanceWithdrawals, yieldRebalanceDue } from './yield-rebalance.js';
 import { randomInt } from 'node:crypto';
 import { readYieldState, writeYieldState } from './yield-runtime-state.js';
 import { yieldSessionAvailable } from './yield-session.js';
+import { SELL_ALL_OF_PORTFOLIO_SQL } from './sell-all-intent.js';
 import { stackLiquidityReserve, prefundWithdrawal, recordPrefundWait } from './yield-prefund.js';
 import type { PrefundWaitReason } from './yield-prefund.js';
 
@@ -289,8 +290,9 @@ export function createYieldService(overrides:Partial<YieldServiceDeps>={}){
         }
       }
       if(state.accountValue===null)return '帳戶估值未知，停止新供給';
-      const current=(await deps.query<{strategy_id:string;onchain_id:string|null;version:number;schedule_state:string;execution:unknown}>(`select p.strategy_id::text,(select onchain_id::text from strategies where id=p.strategy_id) as onchain_id,p.version,p.schedule_state,v.execution from portfolios p join strategy_versions v on (v.strategy_id,v.version)=(p.strategy_id,p.version) where p.id=$1`,[p.portfolioId])).rows[0];
-      if(!current||!current.onchain_id||current.schedule_state!=='active')return '帳戶停止新供給';
+      // An unfinished "sell all" (src/sell-all-intent.ts) counts as not active: nothing new is supplied while everything is being sold.
+      const current=(await deps.query<{strategy_id:string;onchain_id:string|null;version:number;schedule_state:string;execution:unknown;selling?:boolean}>(`select p.strategy_id::text,(select onchain_id::text from strategies where id=p.strategy_id) as onchain_id,p.version,p.schedule_state,v.execution,${SELL_ALL_OF_PORTFOLIO_SQL} as selling from portfolios p join strategy_versions v on (v.strategy_id,v.version)=(p.strategy_id,p.version) where p.id=$1`,[p.portfolioId])).rows[0];
+      if(!current||!current.onchain_id||current.schedule_state!=='active'||current.selling===true)return '帳戶停止新供給';
       const execution=object(current.execution);if(execution.kind!=='per_asset'||!Array.isArray(execution.assets))return '此版本未選生息市場';
       // Persisted monthly anchor / fresh drift survive restarts. Do not re-supply redeemed inputs before the swap round.
       if(execution.rebalance==='monthly'||execution.rebalance==='drift'||execution.rebalance==='monthly_drift'){

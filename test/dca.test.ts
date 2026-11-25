@@ -13,6 +13,7 @@ import type { YieldPlan } from '../src/yield-execution.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
 import { config, kernelCall, operation, SENDER, TEST_SIGNER } from './fixtures/paymaster.js';
 import { holdsOnlyCash, RESUME_AFTER_SELL_ALL_SQL } from '../src/sell-all-resume.js';
+import { NEW_MONEY_ENDS_SELL_ALL_SQL } from '../src/sell-all-intent.js';
 import type { PortfolioPlan } from '../src/snapshot.js';
 
 const E18 = 10n ** 18n;
@@ -170,6 +171,8 @@ function harness(opts: { balance?: bigint; classified?: bigint; shares?: bigint;
     if (s.includes('from operations')) return { rows: [] };
     if (s.startsWith('select owner from smart_accounts')) return { rows: [{ owner }] };
     if (s.startsWith('update portfolios set next_run_at') || s.startsWith('set local')) return { rows: [] };
+    // No "sell all" request is open in this harness (src/sell-all-intent.ts): ending one changes nothing.
+    if (s === NEW_MONEY_ENDS_SELL_ALL_SQL.replace(/\s+/g, ' ')) return { rows: [] };
     throw new Error(`unexpected sql: ${s}`);
   }) as unknown as DcaDeps['query'];
   const earn: CashEarnChain = {
@@ -328,11 +331,13 @@ test('2026-11-25 "sell all" then a new DCA: the deposit resumes the paused portf
     const h = harness({ balance: 1_000n * E18, allocation: [stock] });
     const base = h.deps.query as unknown as (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }>;
     const asked: number[] = [], logs: string[] = [];
-    let schedule = 'paused';
+    let schedule = 'paused', selling = false;
     h.deps.query = (async (sql: string, params: unknown[] = []) => {
       const s = sql.replace(/\s+/g, ' ');
       if (s === RESUME_AFTER_SELL_ALL_SQL.replace(/\s+/g, ' ')) { assert.deepEqual(params, [7]); schedule = 'active'; return { rows: [] }; }
-      if (s.startsWith('select schedule_state,strategy_id')) return { rows: [{ schedule_state: schedule, strategy_id: '3', version: 1 }] };
+      // An open "sell all" request: the owner's deposit ends it and the portfolio `/close` paused on the way is managed again.
+      if (s === NEW_MONEY_ENDS_SELL_ALL_SQL.replace(/\s+/g, ' ')) { assert.deepEqual(params, [7]); if (selling) { selling = false; schedule = 'active'; } return { rows: [] }; }
+      if (s.startsWith('select schedule_state,strategy_id')) return { rows: [{ schedule_state: schedule, strategy_id: '3', version: 1, selling }] };
       return base(sql, params);
     }) as unknown as DcaDeps['query'];
     h.deps.owned = (async (): Promise<OwnedPortfolio> => ({ id: 7, userId: 'u', strategyId: 3, version: 1, scheduleState: schedule, createdAt: '', chainId: 97,
@@ -349,7 +354,8 @@ test('2026-11-25 "sell all" then a new DCA: the deposit resumes the paused portf
       h.state.shares = 1_000n * E18; h.state.value = 1_000n * E18;
       return confirmed;
     };
-    return { h, asked, logs, open, schedule: () => schedule, pause: () => { schedule = 'paused'; }, confirm: () => dca.confirm(7, owner, { txHash: deposit }),
+    return { h, asked, logs, open, schedule: () => schedule, pause: () => { schedule = 'paused'; }, sellAll: (state: string) => { selling = true; schedule = state; }, selling: () => selling,
+      confirm: () => dca.confirm(7, owner, { txHash: deposit }),
       round: () => runDcaRound({ dryRun: false, limit: 10, log: l => logs.push(l) }, h.deps) };
   };
   // Sold out, then the owner opens a DCA: active from the deposit on, and the first period is redeemed and credited.
@@ -371,6 +377,18 @@ test('2026-11-25 "sell all" then a new DCA: the deposit resumes the paused portf
     await t.round();
     assert.match(t.logs.join('\n'), /DCA_PORTFOLIO_PAUSED/); assert.equal(t.h.submitted.length, 0);
   }
+  // A "sell all" the scheduler has not finished (assets still in the account, the portfolio already paused by the first
+  // batch): the owner's new DCA ends that request, so the portfolio is managed again and the first period is bought.
+  t = setup(false); t.sellAll('paused');
+  assert.deepEqual(await t.open(), { status: 'confirmed', state: 'active' });
+  assert.deepEqual([t.schedule(), t.selling()], ['active', false]);
+  assert.equal((await t.round()).credited, 1);
+  // While a "sell all" is open (the portfolio still active, before its first batch) no period is bought: it waits in the vault.
+  t = setup(true);
+  assert.deepEqual(await t.open(), { status: 'confirmed', state: 'active' });
+  t.sellAll('active');
+  await t.round();
+  assert.match(t.logs.join('\n'), /DCA_PORTFOLIO_PAUSED/); assert.equal(t.h.submitted.length, 0);
 });
 
 test('2026-11-25 "holds nothing but cash": wallet balances, posted shares and yield positions of other assets below 0.01 USDT in total', () => {

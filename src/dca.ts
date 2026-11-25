@@ -23,6 +23,7 @@ import type { SavedYieldOperation, YieldEvidence, YieldOperationJournal, YieldPl
 import { yieldSessionAvailable } from './yield-session.js';
 import { rpcTransport } from './rpc-transport.js';
 import { accountHoldsOnlyCash, pausedBySellAll, RESUME_AFTER_SELL_ALL_SQL } from './sell-all-resume.js';
+import { NEW_MONEY_ENDS_SELL_ALL_SQL, SELL_ALL_OF_PORTFOLIO_SQL } from './sell-all-intent.js';
 
 /**
  * DCA (定投, docs/dca.zh-TW.md, db 0064). The user moves the whole total into the portfolio's own smart account,
@@ -364,6 +365,8 @@ export function createDca(overrides: Partial<DcaDeps> = {}) {
         // "Sell all" paused this portfolio and a paused portfolio's DCA waits in the vault ([DCA_PORTFOLIO_PAUSED]): the
         // owner's deposit resumes it (src/sell-all-resume.ts), so the periods are bought like on a first buy.
         if (await pausedBySellAll(p, deps.holdsOnlyCash)) await deps.query(RESUME_AFTER_SELL_ALL_SQL, [id]);
+        // The same deposit while a "sell all" is still unfinished ends that request (src/sell-all-intent.ts).
+        await deps.query(NEW_MONEY_ENDS_SELL_ALL_SQL, [id]);
         return { status: 'confirmed' as const, state: 'active' };
       }
       const account = lower(plan.account), owner = lower(plan.owner);
@@ -483,8 +486,9 @@ async function step(d: RoundDeps, plan: PlanRow, portfolioId: number): Promise<s
     }
   }
   if (plan.state !== 'active') return '[DCA_NOT_ACTIVE]';
-  const portfolio = (await d.query<{ schedule_state: string; strategy_id: string; version: number }>('select schedule_state,strategy_id::text,version from portfolios where id=$1', [portfolioId])).rows[0];
-  if (!portfolio || portfolio.schedule_state !== 'active') return '[DCA_PORTFOLIO_PAUSED] 組合暫停中，餘額留在 vault';
+  // An unfinished "sell all" (src/sell-all-intent.ts) counts as paused: no tranche is bought while everything is being sold.
+  const portfolio = (await d.query<{ schedule_state: string; strategy_id: string; version: number; selling?: boolean }>(`select schedule_state,strategy_id::text,version,${SELL_ALL_OF_PORTFOLIO_SQL} as selling from portfolios p where p.id=$1`, [portfolioId])).rows[0];
+  if (!portfolio || portfolio.schedule_state !== 'active' || portfolio.selling === true) return '[DCA_PORTFOLIO_PAUSED] 組合暫停中，餘額留在 vault';
   if ((await d.query(`select id from operations where portfolio_id=$1 and (state in ('pending','submitted') or (state='failed' and (tx_hash is not null or user_op_hash is not null))) limit 1`, [portfolioId])).rows.length) {
     return '[PREVIOUS_INFLIGHT] 帳戶其他操作待對帳';
   }

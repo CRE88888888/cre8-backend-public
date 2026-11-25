@@ -179,3 +179,35 @@ test('PegExceeded on a top-up or a cash-out is a critical alert on that portfoli
   assert.deepEqual(strategyPegFindings(new Date(NOW.getTime() + 60_000 + STRATEGY_PEG_TTL_MS + 1)), []);
   resetStrategyPegSightings();
 });
+
+test('a "sell all" the scheduler has not finished after the stuck threshold is an alert: a warn while the market is closed, critical when nothing explains it or sends keep failing', async () => {
+  const { detectAlerts, detectSellAllOverdue } = await import('../src/alerts.js');
+  resetRoundOutcomes();
+  const since = new Date(NOW.getTime() - 9 * 3_600_000);
+  const seen: unknown[][] = [];
+  const rows = [{ portfolio_id: '33', since, failures: 0 }, { portfolio_id: '34', since, failures: 0 }, { portfolio_id: '35', since, failures: 6 }];
+  const query = async (sql: string, params: readonly unknown[] = []) => {
+    if (!/sell_all_requested/.test(sql)) return { rows: [] };
+    seen.push([...params]);
+    return { rows };
+  };
+  // 33 and 35: the latest round waited for the stock market; 34: the latest round failed.
+  noteRoundOutcome(33, 'blocked', '規劃器擋下（不執行）：[MARKET_CLOSED] 股票休市，等待交易時段', NOW);
+  noteRoundOutcome(35, 'blocked', '規劃器擋下（不執行）：[MARKET_CLOSED] 股票休市，等待交易時段', NOW);
+  noteRoundOutcome(34, 'blocked', '[STRATEGY_EARN_UNWIND_FAILED] 賣出前還款取回未完成，下一輪重試：bundler down', NOW);
+  const found = await detectSellAllOverdue(query, 6, NOW);
+  assert.deepEqual(seen, [[NOW.toISOString(), 6]], 'only requests older than the threshold are asked for');
+  assert.deepEqual(found.map(f => [f.kind, f.severity, f.portfolioId]), [['portfolio_stuck', 'warn', 33], ['portfolio_stuck', 'critical', 34], ['portfolio_stuck', 'critical', 35]]);
+  assert.match(found[0]!.detail, /^\[SELL_ALL_PENDING\] portfolio 33 的全部賣出從 .*（9\.0 小時）還沒賣完；等待中，不需處理：.*MARKET_CLOSED/);
+  assert.match(found[1]!.detail, /還沒賣完；排程器會繼續重試/);
+  assert.match(found[2]!.detail, /連續 6 次送出失敗；排程器會繼續重試/, 'failing sends are critical whatever the latest round said');
+  // In the whole evaluation it joins the portfolio's drift row (one row per kind and portfolio) and raises it to critical.
+  const all = (await detectAlerts(async (sql, params) => /from latest l/.test(sql)
+    ? { rows: [{ portfolio_id: 34, hours_since: 3, gross_drift_bps: 900, threshold_bps: 100, total_usd_e8: '100000000000', pending_raw: '0', cash_raw: null }] }
+    : query(sql, params), { now: NOW, env: { CHAIN_ID: '56', PAYMASTER_URL: '' }, readNativeBalance: async () => 10n ** 18n, readGasPrice: async () => 1n })).filter(f => f.kind === 'portfolio_stuck');
+  assert.deepEqual(all.map(f => [f.portfolioId, f.severity]), [[34, 'critical'], [33, 'warn'], [35, 'critical']]);
+  assert.match(all[0]!.detail, /900 bps drift.*；\[SELL_ALL_PENDING\]/);
+  // A row that is not a request (another shape) is ignored rather than reported.
+  assert.deepEqual(await detectSellAllOverdue(async () => ({ rows: [{ portfolio_id: 7, release_count: 3 }] }), 6, NOW), []);
+  resetRoundOutcomes();
+});

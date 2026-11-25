@@ -263,6 +263,8 @@ DB numeric 以字串轉為 E8，超出八位的小數向下取整。資料缺漏
 但不會解除全域／鏈上暫停，也不改 #38 在途對帳。已無非現金部位回 HTTP 200，
 `outcome: "noop"`、`reason: "nothing to sell"`、`remainingUsdE8: "0"`，不送交易。
 DB 延後／暫停失敗時仍回報已確認交易與進度，並在 `reason` 提示排程更新失敗，避免把成交當作未成交重做。
+「全部賣出」的要求會留在後端：呼叫端不再呼叫時由 scheduler 接續賣完（不再平衡、不買入、不重開加息），
+賣完後組合維持暫停；細節與結束條件見 `docs/strategy-api.zh-TW.md` 與 `src/sell-all-intent.ts`。
 
 獨立 DOGE fork 驗收只接受 anvil **8586**、DB **cre8_x1e**（此 lane 的 API 埠 **8122**）：
 在本 worktree 的 `.bun-cache/contracts-40` 解出 contracts 已合併的 `d62d1c3` 並執行 `forge build`，

@@ -79,6 +79,8 @@ enroll、投入及執行均核對 pinned 版本、chain、allocation、scheduleH
 
 「全部賣出」（`/close`）成功後組合是暫停的。之後本人再放錢進來（`funding-lots`／`buy-funding` 建出新的 lot、或定投存入確認），帳戶鏈上只剩 USDT（其他資產含抵押中與生息中合計不到 0.01 USDT）時自動恢復，不必再呼叫 `/rebalance`；帳戶還有資產的暫停組合（例如用 `execution-state` 暫停的）、已退出／刪除中的自建組合、重送同一個來源、定投領出的那一筆都不會恢復（`src/sell-all-resume.ts`）。
 
+「全部賣出」的要求會留在後端（`src/sell-all-intent.ts`，2026-11-25 testnet portfolio 33）：`/close` 在第一輪之前把要求記成一列（`user_notifications`，kind `sell_all_requested`，`pending`＝還在賣、`delivered`＝賣完、`failed`＝本人中途又放錢進來）。呼叫端還在一批一批呼叫 `/close` 時排程器不插手（每次呼叫把下一輪排到 90 秒後，免得鎖住組合讓下一批回 `[PORTFOLIO_LOCK_BUSY]`）；呼叫端斷線、逾時、沒有再呼叫滿 90 秒後，排程器每一輪看到這一列就只做賣出（與 `/close` 同一份計畫與管線），不做再平衡、不買新入金或定投、不重新開加息；`/close` 第一批成交後組合就是暫停的，有這一列的暫停組合照樣會被認領。某一輪看到帳戶只剩現金（其他資產合計不到 0.01 USDT，或剩下的不到 1 USDT 且執行器地板為 0）就結束這一列，組合維持暫停，等本人把 USDT 領回。再呼叫 `/close` 只是接續，不會重複賣；回應多一個 `sellAllPending`（true＝後端會自己做完）。本人再買（`/rebalance`）、新的入金 lot、定投存入確認、`execution-state` 都會結束這一列並照常管理。送出連續失敗 5 次後依 5 分鐘、15 分鐘、1 小時、6 小時拉長間隔（從 `operations` 算，重啟不歸零）；沒送出的輪次（休市、沒有報價、抵押品還取不回）每輪重試不計次；超過 `ALERT_STUCK_HOURS`（預設 6 小時）還沒賣完進 `portfolio_stuck` 告警（休市等待是 warn，其餘 critical）。沒有現金帳列的舊式組合、自己在退出／刪除的自建組合不記這一列，行為同以前。
+
 `stack-instructions`／`stack-instruction-state` HTTP 路由已移除（404）；持有人不能覆寫創作者排程。舊 revision 仍供歷史稽核。
 
 cash 讀同一區塊的 USDT，顯示未分類與短缺，不憑 balance 差造 lot。所有 raw 為 USDT 原生 18 decimals 字串；token received／fee 向量用該 token 自己 decimals。ID／block 等大整數用字串。

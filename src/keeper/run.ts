@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createKeeperChain, parseManifest, signingAccount, amountSetting } from './chain.js';
-import { isTransientRpcError, maintenanceSeconds, PriceKeeper, RpcRetry, safeReason } from './engine.js';
+import { classifyKeeperError, maintenanceSeconds, PriceKeeper, retryLine, RpcRetry, safeReason, stillFailingLine } from './engine.js';
 import { parseScenario, positiveAmount } from './scenario.js';
 import { sendTelegram } from '../notify.js';
 
@@ -26,11 +26,13 @@ export function loadKeeperSettings(env: NodeJS.ProcessEnv) {
   const timeout = env.PRICE_KEEPER_RPC_FAILURE_TIMEOUT_SECONDS ?? '1800';
   const rpcFailureTimeoutSeconds = Number(timeout);
   if (!/^[0-9]+$/.test(timeout) || !Number.isInteger(rpcFailureTimeoutSeconds) || rpcFailureTimeoutSeconds < 1 || rpcFailureTimeoutSeconds > 86_400) throw new Error('PRICE_KEEPER_RPC_FAILURE_TIMEOUT_SECONDS must be an integer between 1 and 86400');
+  const fallback = env.PRICE_KEEPER_PUBLIC_FALLBACK ?? '1';
+  if (fallback !== '0' && fallback !== '1') throw new Error('PRICE_KEEPER_PUBLIC_FALLBACK requires 0 or 1');
   const maintenance = env.PRICE_KEEPER_MAINTENANCE_SECONDS ?? '1800';
   if (!/^[0-9]+$/.test(maintenance)) throw new Error('PRICE_KEEPER_MAINTENANCE_SECONDS must be an integer between 600 and 3000');
   const settings = { start, minimumUsdtE18, inventoryUsdtE18, swapBudgetUsdtE18, stallSeconds: 90, rpcFailureTimeoutSeconds,
     maintenanceSeconds: maintenanceSeconds(Number(maintenance)) };
-  return { rpc, manifestPath, scenarioPath, account: signingAccount(env.PRICE_KEEPER_PRIVATE_KEY), settings };
+  return { rpc, manifestPath, scenarioPath, account: signingAccount(env.PRICE_KEEPER_PRIVATE_KEY), settings, publicFallback: fallback === '1' };
 }
 
 async function readJson(path: string, kind: 'scenario' | 'manifest'): Promise<unknown> {
@@ -45,6 +47,10 @@ export async function runPriceKeeper(args: string[], env: NodeJS.ProcessEnv = pr
   const alert = (line: string) => sendTelegram(line, {
     env, log: (message) => log(message.replace('警示已保留在 DB', 'keeper 已停止，警示請見行程 log')),
   });
+  const notify = async (line: string) => {
+    log(line);
+    try { await alert(line); } catch { log('[price-keeper] Telegram 通知失敗'); }
+  };
   let stopping = false;
   const abort = new AbortController();
   const stop = () => { stopping = true; abort.abort(); };
@@ -56,6 +62,8 @@ export async function runPriceKeeper(args: string[], env: NodeJS.ProcessEnv = pr
   try {
     let keeper: PriceKeeper;
     let stepSeconds: number;
+    let primaryDownSeconds: () => number;
+    let alertSeconds: number;
     let stage = 'configuration';
     try {
       if (args.some((arg) => arg !== '--once') || args.length > 1) throw new Error('usage: price-keeper [--once]');
@@ -66,29 +74,39 @@ export async function runPriceKeeper(args: string[], env: NodeJS.ProcessEnv = pr
       stage = 'manifest';
       const manifest = parseManifest(await readJson(config.manifestPath, 'manifest'));
       stage = 'verify';
-      const chain = createKeeperChain(config.rpc, config.account, manifest, log);
+      const chain = createKeeperChain(config.rpc, config.account, manifest, log, undefined, config.publicFallback);
       const retry = new RpcRetry(config.settings.rpcFailureTimeoutSeconds);
+      // Only a wrong manifest, role or configuration ends the process. An RPC that refuses, times out or answers
+      // garbage is waited out here, so the service never exits (and never shows as CRASHED) for an outage.
       while (!stopping) {
-        retry.check();
         try { await chain.verify(); break; }
         catch (error) {
-          if (!isTransientRpcError(error)) throw error;
+          if (classifyKeeperError(error) === 'fatal') throw error;
           const delayMs = retry.fail();
-          log(`[price-keeper][warning] startup ${stage}: ${safeReason(error)}; retryMs=${delayMs}`);
+          log(retryLine(`startup ${stage}`, error, retry, delayMs));
+          if (retry.shouldAlert()) await notify(stillFailingLine(`startup ${stage}`, error, retry));
           await wait(delayMs);
         }
       }
       if (stopping) return;
       keeper = new PriceKeeper(chain.io, scenario, manifest.usdt, manifest.cashFeed, config.settings, log, alert);
       stepSeconds = scenario.stepSeconds;
+      primaryDownSeconds = chain.primaryDownSeconds;
+      alertSeconds = config.settings.rpcFailureTimeoutSeconds;
     } catch (error) {
-      const message = `[price-keeper][critical] chain 97 行情 keeper 啟動失敗：${stage}: ${safeReason(error)}；請檢查設定、劇本、manifest 與鏈上權限`;
-      log(message);
-      try { await alert(message); } catch { log('[price-keeper] Telegram 通知失敗'); }
+      await notify(`[price-keeper][critical] chain 97 行情 keeper 啟動失敗：${stage}: ${safeReason(error)}；請檢查設定、劇本、manifest 與鏈上權限`);
       throw new Error('price keeper startup failed');
     }
+    let primaryAlerted = false;
     do {
       await keeper.round();
+      // Rounds keep succeeding on the public node, so a primary RPC that stays down needs its own report.
+      const down = primaryDownSeconds();
+      if (down === 0) primaryAlerted = false;
+      else if (!primaryAlerted && down > alertSeconds) {
+        primaryAlerted = true;
+        await notify(`[price-keeper][critical] chain 97 行情 keeper 的主要 RPC 已連續失敗 ${Math.floor(down / 60)} 分鐘；目前靠公開節點維持報價，請檢查 RPC 供應商`);
+      }
       if (args.includes('--once') || stopping) break;
       await wait(keeper.retryDelayMs || Math.min(stepSeconds, 15) * 1000);
     } while (!stopping);

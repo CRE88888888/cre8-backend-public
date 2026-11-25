@@ -1,4 +1,4 @@
-import { ContractFunctionRevertedError, HttpRequestError, RpcRequestError, SocketClosedError, TimeoutError } from 'viem';
+import { ContractFunctionRevertedError, HttpRequestError, InsufficientFundsError, RpcRequestError, SocketClosedError, TimeoutError } from 'viem';
 import type { Address } from 'viem';
 import { boundedTarget, canSwap, targetAt } from './scenario.js';
 import type { Scenario } from './scenario.js';
@@ -16,6 +16,8 @@ export type KeeperIO = {
   mint(token: Address, amount: bigint): Promise<void>;
   swap(observation: Observation, targetE18: bigint, budgetUsdtE18: bigint): Promise<void>;
   push(feed: Address, answerE8: bigint): Promise<void>;
+  /** False while a keeper transaction is still in the pool (pending nonce ahead of the mined nonce). */
+  settled(): Promise<boolean>;
 };
 export type KeeperSettings = { start: bigint; minimumUsdtE18: bigint; inventoryUsdtE18: bigint; swapBudgetUsdtE18: bigint; stallSeconds: number; rpcFailureTimeoutSeconds?: number; maintenanceSeconds?: number };
 
@@ -51,24 +53,19 @@ export function feedDue(observation: Observation, headTimestamp: bigint, stepSec
   return gap * 10_000n >= FEED_DRIFT_BPS * feedAnswerE8;
 }
 
-const LOCAL_REASONS = new Set([
-  'invalid block time', 'block progress unavailable', 'old block', 'incomplete market observations',
-  'invalid market observation', 'invalid feed observation', 'invalid observation time', 'invalid replay time or asset',
-  'invalid price', 'integer out of range', 'feed precision unavailable', 'TWAP unavailable after swaps',
-  'recovery price precision unavailable', 'inventory precision unavailable', 'invalid inventory',
-  'prefunded USDT inventory below minimum', 'mint balance mismatch', 'chain 97 only',
-  'transaction not confirmed', 'invalid sqrt price inputs', 'sqrt price out of range', 'invalid pool price',
-  'feed unavailable', 'unexpected mock USDT/USD', 'pool observation capacity unavailable', 'missing observation',
-  'USDT inventory must be prefunded', 'pool changed since inspection', 'swap budget cannot reach target',
-  'swap inventory too low', 'swap result mismatch', 'invalid gas price',
-  'mint balance verification unavailable', 'swap result verification unavailable',
-  'RPC failure timeout exceeded', 'PRICE_KEEPER_MAINTENANCE_SECONDS must be an integer between 600 and 3000',
+/** A write whose broadcast or receipt was lost: it may or may not be on chain. */
+export const UNSETTLED = 'transaction outcome unknown';
+
+/** Needs a person: configuration, scenario/manifest, on-chain roles or funds. The keeper stops and reports critical. */
+const FATAL_REASONS = new Set([
+  'chain 97 only', 'insufficient funds', 'prefunded USDT inventory below minimum', 'USDT inventory must be prefunded',
+  'PRICE_KEEPER_MAINTENANCE_SECONDS must be an integer between 600 and 3000',
   'PRICE_KEEPER_ENABLED requires 0 or 1', 'PRICE_KEEPER_RPC_URL is required', 'invalid keeper RPC configuration',
   'PRICE_KEEPER_MANIFEST and PRICE_KEEPER_SCENARIO are required', 'invalid replay start', 'invalid inventory thresholds',
-  'invalid keeper signing configuration', 'usage: price-keeper [--once]',
+  'invalid keeper signing configuration', 'usage: price-keeper [--once]', 'PRICE_KEEPER_PUBLIC_FALLBACK requires 0 or 1',
   'PRICE_KEEPER_RPC_FAILURE_TIMEOUT_SECONDS must be an integer between 1 and 86400',
   'invalid scenario JSON', 'invalid manifest JSON', 'expected object', 'expected positive decimal amount',
-  'amount out of range', 'unexpected or missing fields', 'invalid timeline', 'invalid mode',
+  'amount out of range', 'unexpected or missing fields', 'invalid timeline', 'invalid mode', 'integer out of range',
   'inactive segment must have zero movement', 'timeline too long', 'unsupported scenario version',
   'baseline differs from TestnetAssets', 'unknown override asset', 'invalid manifest address',
   'manifest must be chain 97', `manifest requires ${TESTNET_ASSETS.length} markets`, 'unexpected secondary', 'duplicate manifest contracts',
@@ -76,41 +73,72 @@ const LOCAL_REASONS = new Set([
   'market configuration mismatch', 'secondary mismatch', 'feed configuration mismatch', 'feed keeper mismatch',
 ]);
 
-const CONNECTION_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'EHOSTUNREACH',
-  'ENETUNREACH', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_SOCKET']);
-const FILE_CODES = new Set(['ENOENT', 'EACCES', 'EPERM', 'EISDIR', 'ENOTDIR']);
+/** Chain state, races with other traders and bad node answers: named in logs, retried from a fresh inspection. */
+const RETRY_REASONS = new Set([
+  'invalid block time', 'block progress unavailable', 'old block', 'incomplete market observations', 'invalid market observation',
+  'invalid feed observation', 'invalid replay time or asset', 'inventory precision unavailable',
+  'invalid observation time', 'invalid price', 'feed precision unavailable', 'TWAP unavailable after swaps',
+  'recovery price precision unavailable', 'invalid inventory', 'mint balance mismatch', 'transaction not confirmed',
+  'invalid sqrt price inputs', 'sqrt price out of range', 'invalid pool price', 'feed unavailable', 'unexpected mock USDT/USD',
+  'pool observation capacity unavailable', 'missing observation', 'pool changed since inspection',
+  'swap budget cannot reach target', 'swap inventory too low', 'swap result mismatch', 'invalid gas price',
+  'mint balance verification unavailable', 'swap result verification unavailable', UNSETTLED, 'keeper transaction still pending',
+]);
 
-/** Inspect types/codes only; unknown, configuration and contract errors fail closed. */
-export function isTransientRpcError(error: unknown): boolean {
-  let transient = false;
+const CONNECTION_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'EHOSTUNREACH',
+  'ENETUNREACH', 'EAI_AGAIN', 'ENOTFOUND', 'EPROTO', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_SOCKET']);
+const FILE_CODES = new Set(['ENOENT', 'EACCES', 'EPERM', 'EISDIR', 'ENOTDIR']);
+const NODE_BUSY = /rate limit|too many requests|exceeds? (?:the )?(?:defined )?limit|limit exceeded|quota|capacity|forbidden|unauthori[sz]ed|access denied|api key|temporarily unavailable|server (?:error|busy)|node (?:is )?(?:unavailable|busy)|timeout|timed out/i;
+const NO_FUNDS = /insufficient funds|exceeds transaction sender account balance/i;
+
+/**
+ * fatal   — needs a person (configuration, scenario/manifest, on-chain roles, funds): stop and report critical.
+ * network — the RPC or the network is the problem: any HTTP status (403, 429, 5xx…), a non-JSON body, timeouts,
+ *           connection errors and node-side JSON-RPC errors. Retried with backoff; the process never stops for these.
+ * retry   — everything else (reverts, races with other traders, inconsistent node answers, unknown errors):
+ *           retried the same way, from a fresh head and inspection.
+ */
+export type FailureClass = 'fatal' | 'network' | 'retry';
+
+export function classifyKeeperError(error: unknown): FailureClass {
+  let network = false;
+  let reverted = false;
   for (let depth = 0; error instanceof Error && depth < 16; depth++, error = error.cause) {
-    if (LOCAL_REASONS.has(error.message) || error instanceof ContractFunctionRevertedError) return false;
-    if (error instanceof TimeoutError || error instanceof SocketClosedError) transient = true;
-    if (error instanceof HttpRequestError || error instanceof RpcRequestError) {
-      const status = error.status;
-      if (status !== undefined && status !== 408 && status !== 429 && (status < 500 || status > 599)) return false;
-      if (error instanceof HttpRequestError) transient = true;
-      else {
-        // -32000 is also used for reverts/invalid input. Only known node/limit text qualifies.
-        if (error.data !== undefined && error.data !== null && error.data !== '0x') return false;
-        if (/revert|permission|unauthori[sz]ed|forbidden|invalid|insufficient funds/i.test(error.details)) return false;
-        if ([-32603, -32002, -32005].includes(error.code) ||
-          (error.code === -32000 && /rate limit|too many requests|temporarily unavailable|server (?:error|busy)|node (?:is )?(?:unavailable|busy)|timeout|timed out/i.test(error.details))) transient = true;
-        else return false;
-      }
+    if (FATAL_REASONS.has(error.message) || error instanceof InsufficientFundsError) return 'fatal';
+    if (error instanceof ContractFunctionRevertedError) reverted = true;
+    if (error instanceof HttpRequestError || error instanceof TimeoutError || error instanceof SocketClosedError) network = true;
+    if ('code' in error && typeof error.code === 'string' && CONNECTION_CODES.has(error.code)) network = true;
+    if (error instanceof RpcRequestError) {
+      if (NO_FUNDS.test(error.details)) return 'fatal';
+      // -32000 is also used for reverts and rejected input: only node/provider wording counts as a network fault.
+      if ((error.data !== undefined && error.data !== null && error.data !== '0x') || /revert/i.test(error.details)) reverted = true;
+      else if ([-32603, -32002, -32005].includes(error.code) || NODE_BUSY.test(error.details)) network = true;
     }
-    if ('code' in error && typeof error.code === 'string' && CONNECTION_CODES.has(error.code)) transient = true;
   }
-  return transient;
+  return reverted ? 'retry' : network ? 'network' : 'retry';
+}
+
+export const isNetworkError = (error: unknown): boolean => classifyKeeperError(error) === 'network';
+
+/** The node executed the call and it reverted: nothing was broadcast. */
+export function isRevert(error: unknown): boolean {
+  for (let depth = 0; error instanceof Error && depth < 16; depth++, error = error.cause) if (error instanceof ContractFunctionRevertedError) return true;
+  return false;
+}
+
+export function hasReason(error: unknown, reason: string): boolean {
+  for (let depth = 0; error instanceof Error && depth < 16; depth++, error = error.cause) if (error.message === reason) return true;
+  return false;
 }
 
 /** Upstream message/shortMessage/details may contain keys, RPC credentials or request bodies. */
 export function safeReason(error: unknown): string {
   const reasons = new Set<string>();
   for (let depth = 0; error instanceof Error && depth < 8; depth++, error = error.cause) {
-    if (LOCAL_REASONS.has(error.message)) reasons.add(error.message);
+    if (FATAL_REASONS.has(error.message) || RETRY_REASONS.has(error.message)) reasons.add(error.message);
     if (error instanceof TimeoutError) reasons.add('TimeoutError');
     if (error instanceof SocketClosedError) reasons.add('SocketClosedError');
+    if (error instanceof InsufficientFundsError || (error instanceof RpcRequestError && NO_FUNDS.test(error.details))) reasons.add('insufficient funds');
     if ('code' in error && typeof error.code === 'string' && (CONNECTION_CODES.has(error.code) || FILE_CODES.has(error.code))) reasons.add(error.code);
     if (error instanceof HttpRequestError) reasons.add(`HttpRequestError${Number.isInteger(error.status) ? ` status=${error.status}` : ''}`);
     if (error instanceof RpcRequestError) reasons.add(`RpcRequestError${Number.isInteger(error.code) ? ` code=${error.code}` : ''}`);
@@ -123,42 +151,69 @@ export function safeReason(error: unknown): string {
   return [...reasons].join('; ') || 'upstream error (details redacted)';
 }
 
-/** One outage window spans partial rounds and skipped blocks; only full success resets it. */
+/** 5 s, 15 s, 60 s, 90 s, then every 120 s for as long as the failure lasts. */
+export const RETRY_DELAYS_MS = [5_000, 15_000, 60_000, 90_000, 120_000];
+
+/**
+ * One failure window spans partial rounds and skipped blocks; only full success resets it. The window never stops
+ * the keeper: once it is longer than `alertSeconds` the caller reports critical once and keeps retrying.
+ */
 export class RpcRetry {
   private failedSince: number | undefined;
   private failures = 0;
   private retryAt = 0;
+  private alerted = false;
 
-  constructor(private readonly timeoutSeconds = 1800, private readonly now: () => number = Date.now) {
-    if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > 86_400) throw new Error('PRICE_KEEPER_RPC_FAILURE_TIMEOUT_SECONDS must be an integer between 1 and 86400');
+  constructor(private readonly alertSeconds = 1800, private readonly now: () => number = Date.now) {
+    if (!Number.isInteger(alertSeconds) || alertSeconds < 1 || alertSeconds > 86_400) throw new Error('PRICE_KEEPER_RPC_FAILURE_TIMEOUT_SECONDS must be an integer between 1 and 86400');
   }
 
   get pending(): boolean { return this.failedSince !== undefined; }
   get delayMs(): number { return Math.max(0, this.retryAt - this.now()); }
-  check(): void {
-    if (this.failedSince !== undefined && this.now() - this.failedSince > this.timeoutSeconds * 1000) throw new Error('RPC failure timeout exceeded');
-  }
-  beginFailure(): void {
-    this.failedSince ??= this.now();
-    this.check();
-  }
+  get attempts(): number { return this.failures; }
+  get failingSeconds(): number { return this.failedSince === undefined ? 0 : Math.floor((this.now() - this.failedSince) / 1000); }
+  get alertSent(): boolean { return this.alerted; }
+  beginFailure(): void { this.failedSince ??= this.now(); }
   fail(): number {
     this.beginFailure();
-    this.failures = Math.min(this.failures + 1, 6);
-    const delayMs = Math.min(2000 * 2 ** (this.failures - 1), 60_000);
+    this.failures++;
+    const delayMs = RETRY_DELAYS_MS[Math.min(this.failures, RETRY_DELAYS_MS.length) - 1] ?? 120_000;
     this.retryAt = this.now() + delayMs;
     return delayMs;
   }
-  reset(): void { this.failedSince = undefined; this.failures = 0; this.retryAt = 0; }
+  /** True exactly once per failure window, after it has lasted longer than the alert threshold. */
+  shouldAlert(): boolean {
+    if (this.alerted || this.failedSince === undefined || this.now() - this.failedSince <= this.alertSeconds * 1000) return false;
+    this.alerted = true;
+    return true;
+  }
+  reset(): void { this.failedSince = undefined; this.failures = 0; this.retryAt = 0; this.alerted = false; }
 }
 
-/** No DB or scheduler state. Unknown writes still halt; fresh reads may recover on a later round. */
+/** Shared by the startup check and the rounds: what failed, which class, and for how long it has been failing. */
+export function retryLine(stage: string, error: unknown, retry: RpcRetry, delayMs: number): string {
+  return `[price-keeper][warning] ${stage}: ${safeReason(error)}; class=${classifyKeeperError(error)} failing=${retry.failingSeconds}s attempt=${retry.attempts} retryMs=${delayMs}`;
+}
+
+export function stillFailingLine(stage: string, error: unknown, retry: RpcRetry): string {
+  return `[price-keeper][critical] chain 97 行情 keeper 已連續失敗 ${Math.floor(retry.failingSeconds / 60)} 分鐘：${stage}: ${safeReason(error)}（class=${classifyKeeperError(error)}）；行程沒有停止，仍每 60–120 秒重試，恢復後自動繼續`;
+}
+
+/** How many markets may fail on the network in one round before the round ends and backs off. */
+export const NETWORK_SKIPS_PER_ROUND = 3;
+
+/**
+ * No DB or scheduler state. Every round starts from a fresh head and inspection, so a failed round is simply
+ * retried: only a fatal error (see classifyKeeperError) stops the keeper.
+ */
 export class PriceKeeper {
   private stopped = false;
   private running = false;
   private previous: Head | undefined;
   private nonProgressRounds = 0;
   private lastRoundTimestamp: bigint | undefined;
+  /** A write was lost in transit: no new round until the keeper has no transaction left in the pool. */
+  private unsettled = false;
   private readonly retry: RpcRetry;
   private readonly maintenance: bigint;
 
@@ -183,7 +238,6 @@ export class PriceKeeper {
     this.running = true;
     let stage = 'head';
     try {
-      this.retry.check();
       if (this.retry.delayMs > 0) return;
       const head = await this.io.head();
       const wallMs = this.now();
@@ -193,13 +247,18 @@ export class PriceKeeper {
       if (previous && (head.number <= previous.number || head.timestamp < previous.timestamp)) {
         this.nonProgressRounds++;
         this.log(`[price-keeper] skip block=${head.number} timestamp=${head.timestamp} previousBlock=${previous.number} previousTimestamp=${previous.timestamp} nonProgress=${this.nonProgressRounds}/5`);
-        if (this.nonProgressRounds >= 5) throw new Error('block progress unavailable');
+        if (this.nonProgressRounds >= 5) { this.nonProgressRounds = 0; throw new Error('block progress unavailable'); }
         return;
       }
       if (wallSeconds - head.timestamp > BigInt(this.settings.stallSeconds)) throw new Error('old block');
       this.previous = { ...head };
       this.nonProgressRounds = 0;
       if (!this.retry.pending && this.lastRoundTimestamp !== undefined && head.timestamp - this.lastRoundTimestamp < BigInt(this.scenario.stepSeconds)) return;
+      if (this.unsettled) {
+        stage = 'pending transactions';
+        if (!await this.io.settled()) throw new Error('keeper transaction still pending');
+        this.unsettled = false;
+      }
       // Read/validate every feed and oracle before the first mint or swap of a round.
       stage = 'inspect';
       const observations = await this.io.inspect(head);
@@ -209,17 +268,19 @@ export class PriceKeeper {
       await this.inventory(this.usdt, 'USDT', 18, 10n ** 18n);
       const recovery = observations.filter((o) => o.twapE18 === null);
       let marketFailure: { stage: string; error: unknown } | undefined;
+      let networkSkips = 0;
+      // One market's failure must not hold back the others. A lost write or a dead RPC ends the round instead.
       const skipMarket = (error: unknown) => {
-        if (!isTransientRpcError(error)) throw error;
+        const kind = classifyKeeperError(error);
+        if (kind === 'fatal' || hasReason(error, UNSETTLED) || (kind === 'network' && ++networkSkips >= NETWORK_SKIPS_PER_ROUND)) throw error;
         this.retry.beginFailure();
         marketFailure ??= { stage, error };
-        this.log(`[price-keeper][warning] skip ${stage}: ${safeReason(error)}`);
+        this.log(`[price-keeper][warning] skip ${stage}: ${safeReason(error)}; class=${kind}`);
       };
       if (recovery.length > 0) {
         // Recover only the affected pools. Never publish spot or run script trades in this round.
         for (const observation of recovery) {
           try {
-            this.retry.check();
             if (!canSwap(head.timestamp, observation.lastObservation, this.scenario.stepSeconds)) continue;
             const target = observation.spotE18 * 10_001n / 10_000n;
             if (target <= observation.spotE18) throw new Error('recovery price precision unavailable');
@@ -227,20 +288,18 @@ export class PriceKeeper {
             await this.inventory(observation.market.token, observation.market.symbol, observation.market.decimals, observation.spotE18);
             await this.inventory(this.usdt, 'USDT', 18, 10n ** 18n);
             stage = `recover swap ${observation.market.symbol}`;
-            this.retry.check();
             await this.io.swap(observation, target, this.settings.swapBudgetUsdtE18);
             this.log(`[price-keeper] recover ${observation.market.symbol} TwapUnavailable targetE18=${target}`);
           } catch (error) { skipMarket(error); }
         }
         if (marketFailure) { stage = marketFailure.stage; throw marketFailure.error; }
-        this.retry.reset();
+        await this.succeeded();
         this.log('[price-keeper] recovery round complete; revalidate TWAP next round');
         return;
       }
       let feedsDue = false;
       for (const observation of observations) {
         try {
-          this.retry.check();
           const { market, spotE18, lastObservation } = observation;
           const target = targetAt(this.scenario, market.symbol, this.settings.start, head.timestamp);
           stage = `inventory ${market.symbol}`;
@@ -260,7 +319,6 @@ export class PriceKeeper {
           // All markets share cash inventory. Check between trades, including a near-empty late round.
           if (bounded > spotE18) await this.inventory(this.usdt, 'USDT', 18, 10n ** 18n);
           stage = `swap ${market.symbol}`;
-          this.retry.check();
           await this.io.swap(observation, bounded, this.settings.swapBudgetUsdtE18);
           this.log(`[price-keeper] swap ${market.symbol} targetE18=${bounded}`);
         } catch (error) { skipMarket(error); }
@@ -274,7 +332,6 @@ export class PriceKeeper {
         this.validateObservations(refreshed, latest);
         if (refreshed.some((o) => o.twapE18 === null)) throw new Error('TWAP unavailable after swaps');
         stage = 'push USDT/USD';
-        this.retry.check();
         await this.io.push(this.cashFeed, 100_000_000n);
         this.log('[price-keeper] push USDT/USD');
         for (const observation of refreshed) {
@@ -284,30 +341,42 @@ export class PriceKeeper {
           if (observation.twapE18 === null) throw new Error('TWAP unavailable after swaps');
           const answer = observation.twapE18 / 10n ** 10n;
           if (answer <= 0n) throw new Error('feed precision unavailable');
-          this.retry.check();
           await this.io.push(observation.market.feed, answer);
           this.log(`[price-keeper] push ${observation.market.symbol}/USD answerE8=${answer}`);
         }
       }
       if (marketFailure) { stage = marketFailure.stage; throw marketFailure.error; }
-      this.retry.reset();
+      await this.succeeded();
       this.log(`[price-keeper] round block=${head.number} timestamp=${head.timestamp}`);
     } catch (error) {
-      if (isTransientRpcError(error)) {
-        try {
-          const delayMs = this.retry.fail();
-          this.log(`[price-keeper][warning] ${stage}: ${safeReason(error)}; retryMs=${delayMs}`);
-          return;
-        } catch (timeout) { error = timeout; }
+      if (classifyKeeperError(error) !== 'fatal') {
+        if (hasReason(error, UNSETTLED)) this.unsettled = true;
+        this.log(retryLine(stage, error, this.retry, this.retry.fail()));
+        if (this.retry.shouldAlert()) await this.notify(stillFailingLine(stage, error, this.retry));
+        return;
       }
       this.stopped = true;
       const message = `[price-keeper][critical] chain 97 行情 keeper 已停止：${stage}: ${safeReason(error)}；請檢查後手動重啟`;
-      this.log(message);
-      try { await this.alert(message); } catch { this.log('[price-keeper] Telegram 通知失敗'); }
+      await this.notify(message);
       throw new Error('price keeper halted');
     } finally {
       this.running = false;
     }
+  }
+
+  private async notify(message: string): Promise<void> {
+    this.log(message);
+    try { await this.alert(message); } catch { this.log('[price-keeper] Telegram 通知失敗'); }
+  }
+
+  /** A complete round closes the failure window; a window that was reported critical is reported as recovered. */
+  private async succeeded(): Promise<void> {
+    if (!this.retry.pending) return;
+    const line = `[price-keeper] recovered after ${this.retry.failingSeconds}s attempts=${this.retry.attempts}`;
+    const alerted = this.retry.alertSent;
+    this.retry.reset();
+    if (alerted) await this.notify(`${line}；chain 97 行情 keeper 已恢復`);
+    else this.log(line);
   }
 
   private validateObservations(observations: Observation[], head: Head): void {
@@ -333,13 +402,12 @@ export class PriceKeeper {
     if (balance < minimum) {
       if (token.toLowerCase() === this.usdt.toLowerCase()) throw new Error('prefunded USDT inventory below minimum');
       const amount = target - balance;
-      this.retry.check();
       await this.io.mint(token, amount);
       try {
         if (await this.io.balance(token) !== target) throw new Error('mint balance mismatch');
       } catch (error) {
-        // Do not abandon exact-result validation after a confirmed mint.
-        if (isTransientRpcError(error)) throw new Error('mint balance verification unavailable', { cause: error });
+        // The mint is confirmed; name the lost check. The next round reads the balance again before any top-up.
+        if (isNetworkError(error)) throw new Error('mint balance verification unavailable', { cause: error });
         throw error;
       }
       this.log(`[price-keeper] mint ${symbol} amountRaw=${amount} balanceRaw=${target}`);

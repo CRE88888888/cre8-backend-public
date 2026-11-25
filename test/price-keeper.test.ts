@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { ContractFunctionRevertedError, getAddress, HttpRequestError, parseAbi, RpcRequestError, SocketClosedError, TimeoutError } from 'viem';
 import { TESTNET_ASSETS } from '../src/keeper/assets.js';
 import { boundedTarget, canSwap, parseScenario, targetAt } from '../src/keeper/scenario.js';
-import { feedDue, isTransientRpcError, maintenanceSeconds, PriceKeeper, RpcRetry, safeReason } from '../src/keeper/engine.js';
+import { classifyKeeperError, feedDue, isNetworkError, maintenanceSeconds, PriceKeeper, RETRY_DELAYS_MS, RpcRetry, safeReason, UNSETTLED } from '../src/keeper/engine.js';
 import type { Head, KeeperIO, Observation } from '../src/keeper/engine.js';
 import { loadKeeperSettings } from '../src/keeper/run.js';
 import { sqrtPriceFor, spotPrice, validateFeed, signingAccount } from '../src/keeper/chain.js';
@@ -19,7 +19,7 @@ function rawScenario() {
 
 function fixture(rpcFailureTimeoutSeconds = 1800) {
   const scenario = parseScenario(rawScenario());
-  const state = { head: { number: 100n, timestamp: 1060n }, now: 1_060_000, fail: '', refreshMissing: false, inspections: 0,
+  const state = { head: { number: 100n, timestamp: 1060n }, now: 1_060_000, fail: '', refreshMissing: false, inspections: 0, settled: true, settledReads: 0,
     swaps: [] as string[], targets: [] as bigint[], pushes: [] as bigint[], mints: [] as string[], logs: [] as string[], alerts: [] as string[], balances: new Map<string, bigint>([[addr(1), BigInt(TESTNET_ASSETS.length) * 20_000n * unit]]) };
   const observations: Observation[] = TESTNET_ASSETS.map((spec, index) => ({
     market: { symbol: spec.symbol, token: addr(index + 10), pool: addr(index + 1000), oracle: addr(index + 2000),
@@ -42,12 +42,22 @@ function fixture(rpcFailureTimeoutSeconds = 1800) {
       if (cash !== undefined && target > o.spotE18) { assert.ok(cash >= 10_000n * unit, 'cash must cover the next swap'); state.balances.set(addr(1), cash - 10_000n * unit); }
     },
     push: async (_feed, answer) => { fail('push'); state.pushes.push(answer); },
+    settled: async () => { fail('settled'); state.settledReads += 1; return state.settled; },
   };
   const keeper = new PriceKeeper(io, scenario, addr(1), addr(2), {
     start: 1000n, minimumUsdtE18: 10_000n * unit, inventoryUsdtE18: 100_000n * unit,
     swapBudgetUsdtE18: 10_000n * unit, stallSeconds: 90, rpcFailureTimeoutSeconds,
   }, (line) => state.logs.push(line), async (line) => { state.alerts.push(line); fail('alert'); }, () => state.now);
   return { scenario, state, observations, keeper, io };
+}
+
+/** A failed round does not stop the keeper: it logs the reason, alerts nobody and waits before the next attempt. */
+async function retried(f: ReturnType<typeof fixture>, reason?: RegExp): Promise<void> {
+  const alerts = f.state.alerts.length;
+  await f.keeper.round();
+  assert.ok(f.keeper.retryDelayMs > 0, 'the failed round must be retried');
+  assert.equal(f.state.alerts.length, alerts);
+  if (reason) assert.match(f.state.logs.join('\n'), reason);
 }
 
 // docs/research/2026-11-20-launch-lineup/新增模擬資產.csv raw-token prices;
@@ -176,8 +186,8 @@ test('#97 keeper never mints USDT: zero and below minimum halt; equality covers 
 });
 
 test('keeper refuses incomplete refreshed observations instead of publishing a partial feed set', async () => {
-  const { state, keeper } = fixture(); state.refreshMissing = true;
-  await assert.rejects(keeper.round(), /halted/); assert.equal(state.pushes.length, 0); assert.equal(state.alerts.length, 1);
+  const f = fixture(); f.state.refreshMissing = true;
+  await retried(f, /refresh inspect: incomplete market observations/); assert.equal(f.state.pushes.length, 0);
 });
 
 test('keeper closed/paused assets keep their pool price while their secondary feed stays fresh', async () => {
@@ -199,13 +209,34 @@ test('keeper inventory only mints below threshold; threshold equality and exact 
   assert.equal(next.state.balances.get(token.market.token), 100_000n * unit * unit / token.spotE18);
 });
 
-test('keeper RPC/read/write failures halt permanently, alert once and redact upstream errors', async () => {
+test('unknown read/write failures are retried from a fresh round, never stop the keeper and redact upstream errors', async () => {
   for (const failure of ['head', 'inspect', 'balance', 'mint', 'swap', 'push']) {
-    const { state, keeper } = fixture(); state.fail = failure;
-    await assert.rejects(keeper.round(), /halted/);
-    assert.equal(state.alerts.length, 1); assert.doesNotMatch(state.logs.join('\n') + state.alerts.join('\n'), /secret|credential/);
-    await assert.rejects(keeper.round(), /stopped/); assert.equal(state.alerts.length, 1);
+    const f = fixture(); const { state, keeper } = f; state.fail = failure;
+    await retried(f, /class=retry failing=0s attempt=1 retryMs=5000/);
+    assert.doesNotMatch(state.logs.join('\n'), /secret|credential/);
     if (failure === 'head' || failure === 'inspect') { assert.equal(state.mints.length, 0); assert.equal(state.swaps.length, 0); }
+    state.fail = ''; state.now += 5000; state.head = { number: 101n, timestamp: 1065n };
+    await keeper.round(); assert.equal(keeper.retryDelayMs, 0, failure); assert.equal(state.alerts.length, 0);
+    assert.match(state.logs.join('\n'), /recovered after 5s attempts=1/);
+  }
+});
+
+test('2026-11-25: HTTP 403 at head or inspect is retried with 5/15/60 s backoff and the keeper resumes by itself', async () => {
+  for (const stage of ['head', 'inspect'] as const) {
+    const f = fixture(); const { head, inspect } = f.io; let refused = true; let calls = 0;
+    const guard = () => { calls++; if (refused) throw new HttpRequestError({ url: 'https://private-token.invalid/key', status: 403 }); };
+    if (stage === 'head') f.io.head = async () => { guard(); return head(); };
+    else f.io.inspect = async (block) => { guard(); return inspect(block); };
+    for (const [attempt, delay] of [5000, 15_000, 60_000].entries()) {
+      f.state.head = { number: 100n + BigInt(attempt), timestamp: BigInt(Math.floor(f.state.now / 1000)) };
+      await retried(f, new RegExp(`${stage}: HttpRequestError status=403; class=network failing=\\d+s attempt=${attempt + 1} retryMs=${delay}`));
+      f.state.now += delay;
+    }
+    assert.equal(calls, 3); assert.equal(f.state.swaps.length, 0);
+    refused = false; f.state.head = { number: 110n, timestamp: BigInt(Math.floor(f.state.now / 1000)) };
+    await f.keeper.round();
+    assert.equal(f.keeper.retryDelayMs, 0); assert.equal(f.state.swaps.length, 105); assert.equal(f.state.alerts.length, 0);
+    assert.doesNotMatch(f.state.logs.join('\n'), /private-token|https:/);
   }
 });
 
@@ -233,21 +264,29 @@ test('#162 one transient market inventory failure skips that market and recovers
   assert.doesNotMatch(f.state.logs.join('\n'), /private-token|https:/);
 });
 
-test('#162 transient RPC failure window starts at zero, survives equality and halts only beyond 30 minutes', async () => {
+test('a failure window beyond 30 minutes reports critical once, keeps retrying and reports the recovery', async () => {
   const f = fixture(); f.state.now = 0;
-  let reads = 0;
-  f.io.head = async () => { reads++; throw new HttpRequestError({ url: 'http://127.0.0.1:1', status: 503 }); };
+  let reads = 0; let failing = true;
+  f.io.head = async () => {
+    reads++;
+    if (failing) throw new HttpRequestError({ url: 'https://private-token.invalid/key', status: 503 });
+    return f.state.head;
+  };
   await f.keeper.round(); assert.equal(f.state.alerts.length, 0);
-  f.state.now = 1_799_999; await f.keeper.round(); assert.equal(f.state.alerts.length, 0);
-  f.state.now = 1_800_000; await f.keeper.round(); assert.equal(f.state.alerts.length, 0);
-  const before = reads;
-  f.state.now = 1_800_001; await assert.rejects(f.keeper.round(), /halted/);
-  assert.equal(reads, before); assert.equal(f.state.alerts.length, 1);
-  assert.match(f.state.logs.join('\n'), /RPC failure timeout exceeded/);
-  await assert.rejects(f.keeper.round(), /stopped/); assert.equal(f.state.alerts.length, 1);
+  f.state.now = 1_800_000; await f.keeper.round(); assert.equal(reads, 2); assert.equal(f.state.alerts.length, 0); // Exactly 30 minutes.
+  f.state.now += 15_000; await f.keeper.round(); assert.equal(reads, 3);
+  assert.deepEqual(f.state.alerts.map((line) => line.replace(/^.*已連續失敗/, '已連續失敗')), ['已連續失敗 30 分鐘：head: HttpRequestError status=503（class=network）；行程沒有停止，仍每 60–120 秒重試，恢復後自動繼續']);
+  for (const delay of [60_000, 90_000, 120_000, 120_000]) { f.state.now += delay; await f.keeper.round(); }
+  assert.equal(reads, 7); assert.equal(f.state.alerts.length, 1, 'one report per failure window');
+  failing = false; f.state.now += 120_000; f.state.head = { number: 101n, timestamp: BigInt(f.state.now / 1000) };
+  await f.keeper.round();
+  assert.equal(f.state.swaps.length, 105); assert.equal(f.state.alerts.length, 2); assert.match(f.state.alerts[1] ?? '', /recovered after 2325s attempts=7；chain 97 行情 keeper 已恢復/);
+  failing = true; f.state.now += 60_000; await f.keeper.round(); f.state.now += 5000; await f.keeper.round();
+  assert.equal(f.state.alerts.length, 2, 'a new window starts its own 30 minutes');
+  assert.doesNotMatch(f.state.logs.join('\n') + f.state.alerts.join('\n'), /private-token|https:/);
 });
 
-test('#162 backoff prevents early RPC calls, grows exponentially to 60 seconds and resets after full success', async () => {
+test('backoff prevents early RPC calls, grows 5/15/60/90 s to 120 seconds and resets after full success', async () => {
   const f = fixture(); const head = f.io.head;
   let failing = true; let reads = 0;
   f.io.head = async () => {
@@ -255,7 +294,8 @@ test('#162 backoff prevents early RPC calls, grows exponentially to 60 seconds a
     if (failing) throw new TimeoutError({ body: {}, url: 'http://127.0.0.1:1' });
     return head();
   };
-  for (const delay of [2000, 4000, 8000, 16_000, 32_000, 60_000, 60_000]) {
+  assert.deepEqual(RETRY_DELAYS_MS, [5000, 15_000, 60_000, 90_000, 120_000]);
+  for (const delay of [5000, 15_000, 60_000, 90_000, 120_000, 120_000, 120_000]) {
     await f.keeper.round(); assert.equal(f.keeper.retryDelayMs, delay);
     const before = reads;
     f.state.now += delay - 1; await f.keeper.round(); assert.equal(reads, before);
@@ -265,23 +305,25 @@ test('#162 backoff prevents early RPC calls, grows exponentially to 60 seconds a
   f.state.head = { number: 101n, timestamp: BigInt(f.state.now / 1000) };
   await f.keeper.round(); assert.equal(f.keeper.retryDelayMs, 0); assert.equal(f.state.alerts.length, 0);
   failing = true;
-  f.state.now += 1_800_001; // A successful round starts a new outage even after the old deadline.
-  await f.keeper.round(); assert.equal(f.keeper.retryDelayMs, 2000); assert.equal(f.state.alerts.length, 0);
+  f.state.now += 1_800_001; // A successful round starts a new failure window even after the old threshold.
+  await f.keeper.round(); assert.equal(f.keeper.retryDelayMs, 5000); assert.equal(f.state.alerts.length, 0);
 });
 
 test('#162 partial market success and a skipped repeated head cannot reset the outage window', async () => {
-  const f = fixture();
+  const f = fixture(); f.state.balances.set(addr(1), 10n ** 30n);
   const failed = f.observations.find((o) => o.market.symbol === 'COHRB'); assert.ok(failed);
   f.io.balance = async (token) => {
     if (token === failed.market.token) throw new HttpRequestError({ url: 'http://127.0.0.1:1', status: 429 });
     return 10n ** 40n;
   };
   await f.keeper.round(); assert.equal(f.state.swaps.length, 104);
-  f.state.now += 2000; await f.keeper.round(); // Repeated head: no successful round.
-  f.state.now += 1_798_000;
+  f.state.now += 5000; await f.keeper.round(); // Repeated head: no successful round.
+  f.state.now += 1_795_000;
   f.state.head = { number: 101n, timestamp: BigInt(f.state.now / 1000) };
   await f.keeper.round(); assert.equal(f.state.swaps.length, 208); assert.equal(f.state.alerts.length, 0);
-  f.state.now++; await assert.rejects(f.keeper.round(), /halted/); assert.equal(f.state.alerts.length, 1);
+  f.state.now += 15_000; f.state.head = { number: 102n, timestamp: BigInt(f.state.now / 1000) };
+  await f.keeper.round(); assert.equal(f.state.swaps.length, 312, 'the other markets keep trading');
+  assert.equal(f.state.alerts.length, 1); assert.match(f.state.alerts[0] ?? '', /已連續失敗 30 分鐘：inventory COHRB: HttpRequestError status=429/);
 });
 
 test('#162 transient recovery retries fresh observations before the script step without duplicate swaps', async () => {
@@ -295,7 +337,7 @@ test('#162 transient recovery retries fresh observations before the script step 
   const swap = f.io.swap;
   f.io.swap = async (o, target, budget) => { await swap(o, target, budget); o.lastObservation = f.state.head.timestamp; };
   await f.keeper.round(); assert.deepEqual(f.state.swaps, [second.market.symbol]);
-  f.state.now += 2000; f.state.head = { number: 101n, timestamp: 1062n };
+  f.state.now += 5000; f.state.head = { number: 101n, timestamp: 1065n };
   await f.keeper.round(); assert.deepEqual(f.state.swaps, [second.market.symbol, first.market.symbol]);
   assert.equal(f.state.alerts.length, 0); assert.equal(f.state.pushes.length, 0);
 });
@@ -316,68 +358,127 @@ test('#162 transient faults across read stages resume from fresh inspection with
     };
     f.io.push = async (feed, answer) => { fail('push preflight'); await push(feed, answer); };
     await f.keeper.round(); assert.ok(failed, fault); assert.equal(f.state.alerts.length, 0, fault);
-    f.state.now += 2000; f.state.head = { number: 101n, timestamp: 1062n };
+    f.state.now += 5000; f.state.head = { number: 101n, timestamp: 1065n };
     await f.keeper.round(); assert.equal(f.keeper.retryDelayMs, 0, fault);
     assert.equal(f.state.swaps.length, 105, fault); assert.equal(new Set(f.state.swaps).size, 105, fault);
     assert.equal(f.state.alerts.length, 0, fault);
   }
 });
 
-test('#162 long partial rounds stop new writes once the first failure exceeds the deadline', async () => {
-  const f = fixture(1); const first = f.observations[0]; assert.ok(first);
+test('a dead RPC ends the round after three failed markets instead of waiting out all 105', async () => {
+  const f = fixture(); let reads = 0;
   f.io.balance = async (token) => {
-    if (token === first.market.token) throw new HttpRequestError({ url: 'http://127.0.0.1:1', status: 503 });
-    return 10n ** 40n;
+    if (token === addr(1)) return 10n ** 40n;
+    reads++; throw new HttpRequestError({ url: 'http://127.0.0.1:1', status: 403 });
   };
-  let swaps = 0;
-  f.io.swap = async () => { swaps++; f.state.now += 2000; };
-  await assert.rejects(f.keeper.round(), /halted/);
-  assert.equal(swaps, 1, 'no new swaps after the outage deadline');
-  assert.match(f.state.logs.join('\n'), /RPC failure timeout exceeded/); assert.equal(f.state.alerts.length, 1);
+  await retried(f, /inventory [A-Za-z]+: HttpRequestError status=403; class=network/);
+  assert.equal(reads, 3); assert.equal(f.state.swaps.length, 0); assert.equal(f.state.pushes.length, 0);
 });
 
-test('#162 a failed post-mint balance check halts instead of losing the exact target validation', async () => {
-  const f = fixture(); const first = f.observations[0]; assert.ok(first);
-  const balance = f.io.balance;
-  f.io.balance = async (token) => {
-    if (token === first.market.token && f.state.mints.includes(token)) throw new HttpRequestError({ url: 'https://private-token.invalid/key', status: 503 });
-    return balance(token);
+test('a write lost in transit ends the round; nothing is sent until no keeper transaction is pending', async () => {
+  const f = fixture(); const swap = f.io.swap; let lost = true;
+  f.io.swap = async (o, target, budget) => {
+    if (lost && f.state.swaps.length === 2) { lost = false; throw new Error(UNSETTLED, { cause: new HttpRequestError({ url: 'https://private-token.invalid/key', status: 403 }) }); }
+    await swap(o, target, budget); o.lastObservation = f.state.head.timestamp;
   };
-  await assert.rejects(f.keeper.round(), /halted/);
-  assert.equal(f.state.mints.length, 1); assert.equal(f.state.swaps.length, 0); assert.equal(f.state.alerts.length, 1);
-  await assert.rejects(f.keeper.round(), /stopped/);
-  assert.match(f.state.logs.join('\n'), /mint balance verification unavailable/);
+  await retried(f, /swap [A-Za-z]+: transaction outcome unknown; HttpRequestError status=403; class=network/);
+  assert.equal(f.state.swaps.length, 2, 'no further writes in the round of a lost write'); assert.equal(f.state.pushes.length, 0);
+  f.state.settled = false; f.state.now += 5000; f.state.head = { number: 101n, timestamp: 1065n };
+  await retried(f, /pending transactions: keeper transaction still pending; class=retry/);
+  assert.equal(f.state.inspections, 1); assert.equal(f.state.swaps.length, 2);
+  f.state.settled = true; f.state.now += 15_000; f.state.head = { number: 102n, timestamp: 1080n };
+  await f.keeper.round();
+  assert.equal(f.state.settledReads, 2); assert.equal(f.state.swaps.length, 105); assert.equal(new Set(f.state.swaps).size, 105);
+  assert.equal(f.keeper.retryDelayMs, 0); assert.equal(f.state.alerts.length, 0);
+  f.state.now += 60_000; f.state.head = { number: 103n, timestamp: 1140n };
+  await f.keeper.round(); assert.equal(f.state.settledReads, 2, 'settled is only read after a lost write');
   assert.doesNotMatch(f.state.logs.join('\n'), /private-token|https:/);
 });
 
-test('#162 classification retries only transport/node faults, traverses wrappers and never hides a permanent cause', async () => {
+test('two hours of HTTP 403 never stop the keeper; when the RPC returns it recovers the stale pools and feeds by itself', async () => {
+  const f = fixture(); f.state.balances.set(addr(1), 10n ** 30n); await f.keeper.round();
+  const swapsBefore = f.state.swaps.length; const pushesBefore = f.state.pushes.length;
+  const { head, inspect, swap } = f.io; let refused = true;
+  f.io.head = async () => { if (refused) throw new HttpRequestError({ url: 'https://private-token.invalid/key', status: 403 }); return head(); };
+  f.io.inspect = async (block) => { if (refused) throw new HttpRequestError({ url: 'https://private-token.invalid/key', status: 403 }); return inspect(block); };
+  f.io.swap = async (o, target, budget) => { await swap(o, target, budget); o.spotE18 = target; o.lastObservation = f.state.head.timestamp; };
+  const started = f.state.now;
+  while (f.state.now - started < 7_200_000) { await f.keeper.round(); f.state.now += f.keeper.retryDelayMs; }
+  assert.equal(f.state.swaps.length, swapsBefore); assert.equal(f.state.alerts.length, 1, 'critical once after 30 minutes, still running');
+  // The outage outlived the oracle window: every primary reverts TwapUnavailable and every feed is past its max age.
+  refused = false;
+  const at = BigInt(Math.floor(f.state.now / 1000)); f.state.head = { number: 9000n, timestamp: at };
+  for (const o of f.observations) o.twapE18 = null;
+  await f.keeper.round();
+  assert.equal(f.state.swaps.length - swapsBefore, 105, 'one recovery swap per pool'); assert.equal(f.state.pushes.length, pushesBefore);
+  assert.match(f.state.logs.join('\n'), /recovery round complete/); assert.equal(f.keeper.retryDelayMs, 0);
+  assert.equal(f.state.alerts.length, 2); assert.match(f.state.alerts[1] ?? '', /已恢復/);
+  for (const o of f.observations) o.twapE18 = o.spotE18;
+  f.state.now += 60_000; f.state.head = { number: 9001n, timestamp: at + 60n };
+  await f.keeper.round();
+  assert.equal(f.state.pushes.length - pushesBefore, 12, 'the stale feed set is pushed again'); assert.equal(f.state.alerts.length, 2);
+  assert.doesNotMatch(f.state.logs.join('\n') + f.state.alerts.join('\n'), /private-token|https:/);
+});
+
+test('a failed post-mint balance check skips that market; the next round re-reads the balance and never mints twice', async () => {
+  const f = fixture(); const first = f.observations[0]; assert.ok(first);
+  const balance = f.io.balance; let failed = false;
+  f.io.balance = async (token) => {
+    if (token === first.market.token && f.state.mints.includes(token) && !failed) { failed = true; throw new HttpRequestError({ url: 'https://private-token.invalid/key', status: 503 }); }
+    return balance(token);
+  };
+  const swap = f.io.swap;
+  f.io.swap = async (o, target, budget) => { await swap(o, target, budget); o.lastObservation = f.state.head.timestamp; };
+  await retried(f, /inventory [A-Za-z]+: mint balance verification unavailable; HttpRequestError status=503; class=network/);
+  assert.equal(f.state.swaps.length, 104); assert.ok(!f.state.swaps.includes(first.market.symbol));
+  f.state.now += 5000; f.state.head = { number: 101n, timestamp: 1065n };
+  await f.keeper.round();
+  assert.equal(f.state.mints.filter((token) => token === first.market.token).length, 1);
+  assert.equal(f.state.swaps.length, 105); assert.equal(f.keeper.retryDelayMs, 0); assert.equal(f.state.alerts.length, 0);
+  assert.doesNotMatch(f.state.logs.join('\n'), /private-token|https:/);
+});
+
+test('classification: every RPC/network fault is retried as network, only configuration/roles/funds stop the keeper', async () => {
   const rpc = (code: number, message: string, data?: string) => new RpcRequestError({ body: {}, url: 'https://private-token.invalid/key', error: { code, message, ...(data ? { data } : {}) } });
-  const transient = [new TimeoutError({ body: {}, url: 'http://127.0.0.1:1' }), new SocketClosedError(),
-    ...[undefined, 408, 429, 500, 599].map((status) => new HttpRequestError({ url: 'http://127.0.0.1:1', ...(status ? { status } : {}) })),
+  const network = [new TimeoutError({ body: {}, url: 'http://127.0.0.1:1' }), new SocketClosedError(),
+    ...[undefined, 400, 401, 403, 404, 408, 429, 500, 502, 503, 599].map((status) => new HttpRequestError({ url: 'http://127.0.0.1:1', ...(status ? { status } : {}) })),
+    // A 200 response whose body is not JSON reaches the keeper as an HttpRequestError around the parse error.
+    new HttpRequestError({ url: 'https://private-token.invalid/key', cause: new SyntaxError('Unexpected token < in JSON private-token') }),
     ...[-32603, -32002, -32005].map((code) => rpc(code, 'private-token')),
-    rpc(-32000, 'rate limit private-token'), rpc(-32000, 'node unavailable private-token'),
-    Object.assign(new Error('private-token'), { code: 'ECONNRESET' })];
-  for (const error of transient) {
-    assert.equal(isTransientRpcError(new Error('private-token wrapper', { cause: error })), true);
+    rpc(-32000, 'rate limit private-token'), rpc(-32000, 'node unavailable private-token'), rpc(-32000, 'Request exceeds defined limit'),
+    rpc(-32001, 'forbidden private-token'), Object.assign(new Error('private-token'), { code: 'ECONNRESET' }),
+    new HttpRequestError({ url: 'http://127.0.0.1:1', cause: new Error('swap result mismatch') }),
+    new Error('transaction not confirmed', { cause: new TimeoutError({ body: {}, url: 'http://127.0.0.1:1' }) })];
+  for (const error of network) {
+    assert.equal(classifyKeeperError(new Error('private-token wrapper', { cause: error })), 'network'); assert.ok(isNetworkError(error));
     const f = fixture(); f.io.head = async () => { throw error; };
-    await f.keeper.round(); assert.equal(f.state.alerts.length, 0); assert.equal(f.keeper.retryDelayMs, 2000);
+    await retried(f, /class=network/); assert.equal(f.keeper.retryDelayMs, 5000);
     assert.doesNotMatch(f.state.logs.join('\n'), /private-token|https:/);
   }
-  const permanent = [new Error('private-token'),
-    ...[400, 401, 403, 404].map((status) => new HttpRequestError({ url: 'http://127.0.0.1:1', status })),
-    rpc(-32000, 'invalid input'), rpc(-32602, 'invalid params'), rpc(3, 'execution reverted'),
-    rpc(-32603, 'execution reverted'), rpc(-32005, 'rate limit', '0x12345678'),
+  const retry = [new Error('private-token'), rpc(-32000, 'invalid input'), rpc(-32602, 'invalid params'), rpc(3, 'execution reverted'),
+    rpc(-32603, 'execution reverted'), rpc(-32005, 'rate limit', '0x12345678'), rpc(-32000, 'nonce too low'),
     new ContractFunctionRevertedError({ abi: parseAbi(['function fail()']), functionName: 'fail', data: '0x' }),
-    new Error('transaction not confirmed', { cause: transient[0] }),
-    ...['swap result mismatch', 'feed unavailable', 'market configuration mismatch', 'invalid timeline'].map((message) => new Error(message))];
-  for (const error of permanent) {
-    assert.equal(isTransientRpcError(error), false);
+    new HttpRequestError({ url: 'http://127.0.0.1:1', status: 503, cause: new ContractFunctionRevertedError({ abi: parseAbi(['function fail()']), functionName: 'fail', data: '0x' }) }),
+    ...['swap result mismatch', 'feed unavailable', 'pool changed since inspection', 'old block', 'incomplete market observations'].map((message) => new Error(message))];
+  for (const error of retry) {
+    assert.equal(classifyKeeperError(error), 'retry'); assert.equal(isNetworkError(error), false);
+    const f = fixture(); f.io.head = async () => { throw error; };
+    await retried(f, /class=retry/); assert.equal(f.keeper.retryDelayMs, 5000);
+    assert.doesNotMatch(f.state.logs.join('\n'), /private-token|https:/);
+  }
+  const fatal = [rpc(-32000, 'insufficient funds for gas * price + value: private-token'), rpc(-32003, 'insufficient funds for transfer'),
+    new HttpRequestError({ url: 'http://127.0.0.1:1', status: 503, cause: new Error('feed keeper mismatch') }),
+    ...['chain 97 only', 'market configuration mismatch', 'keeper role mismatch', 'invalid timeline', 'prefunded USDT inventory below minimum',
+      'invalid keeper RPC configuration', 'manifest must be chain 97'].map((message) => new Error(message))];
+  for (const error of fatal) {
+    assert.equal(classifyKeeperError(new Error('private-token wrapper', { cause: error })), 'fatal');
     const f = fixture(); f.io.head = async () => { throw error; };
     await assert.rejects(f.keeper.round(), /halted/); assert.equal(f.state.alerts.length, 1);
+    assert.match(f.state.alerts[0] ?? '', /已停止：head: .*請檢查後手動重啟/);
     await assert.rejects(f.keeper.round(), /stopped/); assert.equal(f.state.alerts.length, 1);
+    assert.doesNotMatch(f.state.logs.join('\n') + f.state.alerts.join('\n'), /private-token|https:/);
   }
-  const wrapped = new HttpRequestError({ url: 'http://127.0.0.1:1', cause: new Error('swap result mismatch') });
-  assert.equal(isTransientRpcError(wrapped), false);
+  assert.match(safeReason(fatal[0]), /insufficient funds/);
   assert.doesNotMatch(safeReason(new Error('private-token')), /private-token/);
 });
 
@@ -387,7 +488,7 @@ test('#162 RPC outage settings validate zero, exact limits and invalid input wit
   assert.equal(loadKeeperSettings(env)?.settings.rpcFailureTimeoutSeconds, 1800);
   for (const value of [1, 86_400]) {
     assert.equal(loadKeeperSettings({ ...env, PRICE_KEEPER_RPC_FAILURE_TIMEOUT_SECONDS: String(value) })?.settings.rpcFailureTimeoutSeconds, value);
-    const retry = new RpcRetry(value, () => 0); assert.equal(retry.fail(), 2000);
+    const retry = new RpcRetry(value, () => 0); assert.equal(retry.fail(), 5000);
   }
   for (const value of [0, -1, 86_401, 1.5, NaN, Infinity]) assert.throws(() => new RpcRetry(value));
   for (const value of ['', '0', '-1', '86401', '1.5', 'Infinity', '1e3', 'private-token']) {
@@ -433,23 +534,25 @@ test('keeper unconfirmed inventory top-up stops before swaps and alerts once', a
   assert.equal(state.swaps.length, 0); assert.equal(state.pushes.length, 0); assert.equal(state.alerts.length, 1);
 });
 
-test('keeper halts on old/future blocks, persistent reversed/stalled blocks, missing data and zero price', async () => {
-  const old = fixture(); old.state.now += 91_000; await assert.rejects(old.keeper.round(), /halted/);
-  const future = fixture(); future.state.head.timestamp += 91n; await assert.rejects(future.keeper.round(), /halted/);
-  const boundary = fixture(); boundary.state.now += 90_000; await boundary.keeper.round();
+test('keeper writes nothing on old/future blocks, persistent reversed/stalled blocks, missing data and zero price, and retries', async () => {
+  const old = fixture(); old.state.now += 91_000; await retried(old, /head: old block; class=retry/); assert.equal(old.state.inspections, 0);
+  const future = fixture(); future.state.head.timestamp += 91n; await retried(future, /head: invalid block time; class=retry/); assert.equal(future.state.inspections, 0);
+  const boundary = fixture(); boundary.state.now += 90_000; await boundary.keeper.round(); assert.equal(boundary.keeper.retryDelayMs, 0);
   for (const update of [
     (head: Head) => ({ ...head, number: head.number - 1n }),
     (head: Head) => ({ number: head.number + 1n, timestamp: head.timestamp - 1n }),
     (head: Head) => head,
   ]) {
-    const f = fixture(); await f.keeper.round(); f.state.now += 90_000; f.state.head = update(f.state.head);
+    const f = fixture(); await f.keeper.round(); const swaps = f.state.swaps.length; f.state.now += 90_000; f.state.head = update(f.state.head);
     for (let i = 1; i < 5; i++) await f.keeper.round();
-    await assert.rejects(f.keeper.round(), /halted/); assert.equal(f.state.alerts.length, 1);
-    assert.match(f.state.logs.join('\n'), /block progress unavailable/);
+    await retried(f, /head: block progress unavailable; class=retry/); assert.equal(f.state.swaps.length, swaps);
+    // The node catches up: the keeper continues without a restart.
+    f.state.now += 5000; f.state.head = { number: 200n, timestamp: BigInt(Math.floor(f.state.now / 1000)) };
+    await f.keeper.round(); assert.equal(f.keeper.retryDelayMs, 0); assert.equal(f.state.swaps.length, swaps + 105); assert.equal(f.state.alerts.length, 0);
   }
   for (const mutate of [(o: Observation[]) => { o.pop(); }, (o: Observation[]) => { const first = o[0]; assert.ok(first); o[1] = first; },
     (o: Observation[]) => { const first = o[0]; assert.ok(first); first.spotE18 = 0n; }]) {
-    const f = fixture(); mutate(f.observations); await assert.rejects(f.keeper.round(), /halted/);
+    const f = fixture(); mutate(f.observations); await retried(f, /inspect: (incomplete market observations|invalid market observation)/);
     assert.equal(f.state.swaps.length, 0); assert.equal(f.state.mints.length, 0);
   }
 });
@@ -477,9 +580,9 @@ test('#139 a regressed or repeated head skips all IO until progress resumes and 
   }
   f.state.head = { number: 101n, timestamp: 1061n }; await f.keeper.round(); // Progress also counts before the scenario step is due.
   for (let i = 1; i < 5; i++) await f.keeper.round();
-  assert.equal(f.state.alerts.length, 0);
-  await assert.rejects(f.keeper.round(), /halted/); assert.equal(f.state.alerts.length, 1);
-  await assert.rejects(f.keeper.round(), /stopped/); assert.equal(f.state.alerts.length, 1);
+  assert.equal(f.state.alerts.length, 0); assert.equal(f.keeper.retryDelayMs, 0);
+  await retried(f, /head: block progress unavailable/);
+  assert.equal(f.state.inspections, inspections); assert.equal(f.state.swaps.length, swaps);
 });
 
 test('#139 all 105 unavailable TWAPs receive only a 1 bp recovery swap, then normal validation and feed pushes resume', async () => {
@@ -510,7 +613,7 @@ test('#139 partial TWAP recovery leaves healthy markets alone and validates ever
     if (bad === 'zero twap') last.twapE18 = 0n;
     if (bad === 'future observation') last.lastObservation = 1061n;
     if (bad === 'missing feed') { const feed = f.observations.find((o) => o.market.feed); assert.ok(feed); feed.feedUpdatedAt = null; }
-    await assert.rejects(f.keeper.round(), /halted/);
+    await retried(f, /inspect: (incomplete market observations|invalid market observation|invalid observation time|invalid feed observation); class=retry/);
     assert.equal(f.state.mints.length, 0); assert.equal(f.state.swaps.length, 0); assert.equal(f.state.pushes.length, 0);
   }
 });
@@ -523,20 +626,26 @@ test('#139 recovery retains the observation interval, precision, inventory and f
     if (fault === 'swap') f.state.fail = 'swap';
     if (fault === 'cash') f.state.balances.set(addr(1), 0n);
     if (fault === 'dust') first.spotE18 = 1n;
-    await assert.rejects(f.keeper.round(), /halted/); assert.equal(f.state.pushes.length, 0); assert.equal(f.state.alerts.length, 1);
-    await assert.rejects(f.keeper.round(), /stopped/); assert.equal(f.state.swaps.length, 0);
+    if (fault === 'cash') {
+      // Only a person can refill the prefunded USDT: this one still stops.
+      await assert.rejects(f.keeper.round(), /halted/); assert.equal(f.state.alerts.length, 1);
+      await assert.rejects(f.keeper.round(), /stopped/);
+    } else await retried(f, fault === 'dust' ? /recovery price precision unavailable/ : /recover swap [A-Za-z]+: upstream error \(details redacted\); class=retry/);
+    assert.equal(f.state.pushes.length, 0); assert.equal(f.state.swaps.length, 0);
   }
 });
 
-test('#139 stopped logs explain the stage and safe local/RPC reason without upstream secrets', async () => {
+test('#139 retry and stopped logs explain the stage and safe local/RPC reason without upstream secrets', async () => {
   const local = fixture(); local.observations.pop();
-  await assert.rejects(local.keeper.round(), /halted/);
-  assert.match(local.state.logs.join('\n'), /inspect.*incomplete market observations/);
+  await retried(local, /inspect: incomplete market observations/);
+  const stopped = fixture(); stopped.io.head = async () => { throw new Error('chain 97 only', { cause: new Error('seed=private-token') }); };
+  await assert.rejects(stopped.keeper.round(), /halted/);
+  assert.match(stopped.state.logs.join('\n'), /已停止：head: chain 97 only；請檢查後手動重啟/); assert.doesNotMatch(stopped.state.logs.join('\n'), /private-token|seed=/);
   for (const error of [new Error('transaction not confirmed', { cause: new TimeoutError({ body: {}, url: 'https://private-token.invalid/key' }) }),
     new RpcRequestError({ body: {}, url: 'https://private-token.invalid/key', error: { code: -32000, message: 'seed=private-token' } }),
     new HttpRequestError({ url: 'https://private-token.invalid/key', status: 401, details: 'seed=private-token' })]) {
     const f = fixture(); f.io.head = async () => { throw error; };
-    await assert.rejects(f.keeper.round(), /halted/);
+    await retried(f);
     const output = f.state.logs.join('\n') + f.state.alerts.join('\n');
     assert.match(output, /head/);
     if (error instanceof HttpRequestError) assert.match(output, /HttpRequestError.*401/);
@@ -546,23 +655,22 @@ test('#139 stopped logs explain the stage and safe local/RPC reason without upst
   }
 });
 
-test('#139 TWAP unavailable during the post-swap refresh halts before publishing even the cash feed', async () => {
+test('#139 TWAP unavailable during the post-swap refresh publishes nothing, not even the cash feed, and is retried', async () => {
   const f = fixture(); const inspect = f.io.inspect;
   f.io.inspect = async (head) => {
     const observations = await inspect(head);
     return f.state.inspections > 1 ? observations.map((o) => ({ ...o, twapE18: null })) : observations;
   };
-  await assert.rejects(f.keeper.round(), /halted/);
+  await retried(f, /refresh inspect: TWAP unavailable after swaps/);
   assert.equal(f.state.swaps.length, 105); assert.equal(f.state.pushes.length, 0);
-  assert.match(f.state.logs.join('\n'), /refresh inspect.*TWAP unavailable after swaps/);
 });
 
 test('keeper rejects missing/future/stale feed metadata before mint, tolerates alert failure and prohibits concurrent rounds', async () => {
   for (const timestamp of [null, 0n, 1061n, -3000n]) {
     const f = fixture(); const feed = f.observations.find((o) => o.market.feed); assert.ok(feed);
-    feed.feedUpdatedAt = timestamp; await assert.rejects(f.keeper.round(), /halted/); assert.equal(f.state.mints.length, 0);
+    feed.feedUpdatedAt = timestamp; await retried(f, /inspect: invalid feed observation/); assert.equal(f.state.mints.length, 0); assert.equal(f.state.swaps.length, 0);
   }
-  const f = fixture(); f.io.head = async () => { throw new Error('secret RPC'); };
+  const f = fixture(); f.io.head = async () => { throw new Error('chain 97 only', { cause: new Error('secret RPC') }); };
   f.state.fail = 'alert'; await assert.rejects(f.keeper.round(), /halted/);
   assert.match(f.state.logs.join('\n'), /Telegram 通知失敗/); assert.doesNotMatch(f.state.logs.join('\n'), /secret/);
   const concurrent = fixture(); let release: (() => void) | undefined;
@@ -647,11 +755,12 @@ test('#87 held, paused and completed markets refresh at 30 minutes and retain re
   }
 });
 
-test('#87 maintenance swap failure halts, alerts once and never retries', async () => {
+test('#87 a failed maintenance swap is retried next round without an alert', async () => {
   const f = fixture(); f.scenario.timeline = [{ steps: 1, mode: 'closed', stepBps: 0 }];
   f.state.head = { number: 101n, timestamp: 2800n }; f.state.now = 2_800_000; f.state.fail = 'swap';
-  await assert.rejects(f.keeper.round(), /halted/); assert.equal(f.state.alerts.length, 1);
-  await assert.rejects(f.keeper.round(), /stopped/); assert.equal(f.state.alerts.length, 1);
+  await retried(f, /swap [A-Za-z]+: upstream error \(details redacted\); class=retry/); assert.equal(f.state.swaps.length, 0);
+  f.state.fail = ''; f.state.now += 5000; f.state.head = { number: 102n, timestamp: 2805n };
+  await f.keeper.round(); assert.equal(f.state.swaps.length, 105); assert.equal(f.state.alerts.length, 0);
   assert.doesNotMatch(f.state.logs.join(''), /secret|credential/);
 });
 

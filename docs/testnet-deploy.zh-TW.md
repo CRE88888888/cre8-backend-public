@@ -82,7 +82,7 @@ API 的 Railway pre-deploy command 另行執行 `bun src/migrate.ts`，只更新
 | app 建置 | `VITE_CHAIN_ID`、`VITE_RPC_URL`、`VITE_API_BASE`、`VITE_PRIVY_APP_ID`、`VITE_WALLETCONNECT_PROJECT_ID`、`VITE_LIVE_FUNDS` |
 | 唯讀 preflight／選配警示 | `DEPLOYER_ADDRESS`、`BUNDLER_EXECUTOR_ADDRESS`、`ATP_SAFE`、`EXECUTOR_DEPLOYMENT_BLOCK`、`TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID` |
 
-RPC 使用公開 BSC testnet HTTP 端點。現有 API 與 keeper 各收單一 URL，故障時停下並明確替換端點；不宣稱有自動多 RPC 備援。所有角色必須使用測試網專用金鑰，不把 deployer／owner key 放進任何服務。scheduler 不需要 operator key；relayer 監控設定公開 `OPERATOR_ADDRESS`（chain 97 profile 的 operator）及 `RPC_URL`，以唯讀 client 查餘額。points-sync 與 website 不持有任何簽名金鑰。Telegram 兩個變數必須成對設定或全部留空。
+RPC 使用公開 BSC testnet HTTP 端點。API／scheduler 與 keeper 各收單一 URL，另有公開節點備援（`src/rpc-transport.ts`；keeper 見 `src/keeper/README.md`「失敗時怎麼處理」）：RPC 故障時不停下，退避重試並暫時改走公開節點。所有角色必須使用測試網專用金鑰，不把 deployer／owner key 放進任何服務。scheduler 不需要 operator key；relayer 監控設定公開 `OPERATOR_ADDRESS`（chain 97 profile 的 operator）及 `RPC_URL`，以唯讀 client 查餘額。points-sync 與 website 不持有任何簽名金鑰。Telegram 兩個變數必須成對設定或全部留空。
 
 `SESSION_KEY_MASTER_SEED` 新建於 `~/.cre8-testnet/session-seed.txt`，權限 600；重部署沿用，不能無意輪替。角色金鑰只從 `~/.cre8-testnet/` 讀入程式記憶體，再經 stdin／GraphQL 變數送進服務設定；禁止貼在 CLI 參數、終端輸出或 PR。Privy 只放 app ID 與 verification public key，App Secret 不進 Railway。不要執行會印出 raw variables 的 CLI 查詢。
 

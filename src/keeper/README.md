@@ -18,7 +18,8 @@
 | `PRICE_KEEPER_INVENTORY_E18` | 補貨後庫存價值；預設 100,000 × 10^18，必須大於門檻 |
 | `PRICE_KEEPER_SWAP_BUDGET_E18` | 單筆 input 價值上限；預設 10,000 × 10^18，不能大於門檻 |
 | `PRICE_KEEPER_MAINTENANCE_SECONDS` | 休市／暫停／劇本結束時的維護成交間隔；預設 1,800，只接受 600–3,000 的整數（oracle `maxOracleAge` 為 3,600） |
-| `PRICE_KEEPER_RPC_FAILURE_TIMEOUT_SECONDS` | 連續 RPC 故障的停止門檻；預設 1,800 秒，只接受 1–86,400 的整數；超過門檻才發 critical 並停止 |
+| `PRICE_KEEPER_RPC_FAILURE_TIMEOUT_SECONDS` | 連續失敗多久後發一則 critical；預設 1,800 秒，只接受 1–86,400 的整數。**不會停止**，發完繼續重試 |
+| `PRICE_KEEPER_PUBLIC_FALLBACK` | `1`（預設）：主要 RPC 故障時改走公開節點；`0` 關閉。只接受 `0` 或 `1` |
 | `TELEGRAM_BOT_TOKEN`／`TELEGRAM_CHAT_ID` | 沿用 `src/notify.ts`；留空停用通知 |
 
 這次驗收只允許 `http://127.0.0.1:8562` anvil fork。金鑰只能在本機驗收時由
@@ -58,24 +59,38 @@ USDT 在連續買入間逐筆檢查；所有 mint／approve／swap／push 都記
 休市或暫停期間仍推 feed，避免過期。backend#187 起 feed 不再每一步都推（原本每小時約 720 筆，是 keeper gas 的大宗）：整組（USDT/USD＋11 個 asset feed）只在最舊的 feed 年齡達到 `min(maxFeedAge, 3600) / 2`（目前 1,800 秒），或某個 TWAP 與已發布值偏離 ≥ 100 bps（secondary 門檻 200 bps 的一半）且距上次推送已滿一步時才推送。所有寫入改用 legacy `gasPrice = eth_gasPrice`（chain 97 為 0.1 gwei），不用 viem 預估的 EIP-1559 小費；讀 gas price 失敗發生在簽名前，視為暫時性讀取故障。
 第一次啟動前，部署池必須已有完整 30 分鐘歷史，且 feed 尚未 stale。
 
-暫時性 RPC 讀取故障（連線中斷、timeout、HTTP 408／429／5xx，以及限流或節點暫不可用的 RPC 錯誤）
-先記 warning，以 2、4、8、16、32、60 秒退避，之後維持最多 60 秒。啟動時的鏈上核對也用同樣策略。
-市場庫存／成交前讀取失敗時跳過該市場，繼續其他市場；全體 inspection、回合開頭的 USDT 庫存或 feed 刷新讀取失敗則結束當輪。
-重試從新的 head 與全體 inspection 開始，仍由鏈上 observation 時間限制成交頻率，不重播原本的 swap 指令。
-單一市場持續失敗也算未完成回合；略過區塊與其他市場成功都不清除故障窗。
-只有完整成功的正常／TWAP 恢復回合才重設故障窗；從第一次故障起超過上述秒數才停止並發一則 critical。
-回合內跨市場與發起 mint／swap／push 前也會檢查門檻，避免長回合在故障逾時後持續發起寫入。
-`--once` 仍只嘗試一輪，暫時性故障記 warning 後退出；常駐模式才持續重試。
+### 失敗時怎麼處理（2026-11-25 之後）
 
-合約 revert、HTTP 權限／設定錯誤、劇本／manifest／鏈上權限錯誤、區塊停滯／時鐘異常、feed／oracle 異常、
-庫存／成交驗證失敗仍立即永久停止，透過既有 Telegram sender 發一則 critical。
-廣播或確認階段的失敗可能已改變鏈上狀態，包含 HTTP／timeout 也立即停止；不自動重送未知交易。
-mint／swap 確認後若餘額或池價核對讀取失敗，也立即停止，避免下一輪略過原交易的結果驗證。
-營運者檢查 receipt／nonce、來源與權限後手動重啟。本次未增加多 RPC 備援，仍只使用 `PRICE_KEEPER_RPC_URL`。
-無法確認為暫時性故障的 RPC 錯誤仍停止；例如帶有非空 `data` 的 RPC 回應可能包含 revert 資料，不自動重試。
-啟動與停止 log 記錄階段、白名單本機原因、HTTP status／RPC code 或檔案錯誤 code；
-上游原文、檔案內容／路徑、私鑰與 RPC URL 不進 log 或通知。
-這個獨立程序不新增 DB alert kind，也不提供 `/health` 的 DB alert 列。
+11/17、11/20、11/25 三次停擺都是一次暫時性錯誤就讓行程停掉（最後一次是 RPC 回 HTTP 403）；
+11/25 還看到另一個使用者的成交讓 keeper 以 `pool changed since inspection` 停止。keeper 一停，feed 過期，全站交易被擋。
+所以現在只有 `fatal` 會停；其餘一律重試（`network`／`retry` 的差別只是 log 上的類別）：
+
+| 類別 | 內容 | 處理 |
+| --- | --- | --- |
+| `fatal` | 設定錯、劇本／manifest 不一致、鏈上角色不對（keeper／minter／feed keeper）、RPC 不是 chain 97、預撥 USDT 低於門檻、gas 餘額不足 | 發 critical、停止、行程以非零結束；修好後重啟 |
+| `network` | RPC／網路層：任何 HTTP 狀態（403、429、5xx…）、回傳不是 JSON、timeout、連線錯誤、節點端的 JSON-RPC 錯誤（限流、額度、內部錯誤） | 退避重試，不停止 |
+| `retry` | 其他全部：合約 revert、與其他交易者的競態（`pool changed since inspection`、`swap result mismatch`）、舊區塊／區塊不前進、觀測值不合理、未知錯誤 | 同上，退避重試，不停止 |
+
+- 退避：5 秒 → 15 秒 → 60 秒 → 90 秒 → 之後每 120 秒。每次重試都從新的 head 與全體 inspection 開始，
+  成交頻率仍由鏈上 observation 時間限制，不重播原本的指令。
+- 啟動時的鏈上核對（verify）用同一套：RPC 拒絕或逾時就等，不讓行程結束（不會變成 CRASHED）。
+- 連續失敗超過 `PRICE_KEEPER_RPC_FAILURE_TIMEOUT_SECONDS`（預設 30 分鐘）發**一則** critical（寫明階段、原因、類別、已失敗多久），
+  之後照樣每 60–120 秒重試；恢復時 log `recovered after …`，發過 critical 的話再發一則「已恢復」。
+- 單一市場失敗只跳過那個市場，其他市場照常成交與推 feed；同一輪有 3 個市場都是 `network` 失敗就結束這一輪（RPC 整個不通時不逐一等逾時）。
+- 寫入：廣播或等 receipt 時出錯，交易可能已上鏈也可能沒有（`transaction outcome unknown`）。這一輪立刻結束、不再送任何交易；
+  下一輪先確認 keeper 帳戶沒有交易還在 pool 裡（mined nonce＝pending nonce）才繼續，而且是重新讀鏈上狀態再決定，**不重送原交易**。
+  已上鏈但失敗（receipt 為 revert）記為 `transaction not confirmed`，下一輪重來。
+  mint／swap 確認後的核對讀取失敗只記名（`… verification unavailable`），下一輪重讀餘額與池價，不會重複補貨。
+- 停擺超過 1 小時後（feed 過期、池子觀測過期）的自我恢復沿用 #139：RPC 回來後的第一輪對 TWAP 不可用的池子各做 1 bp 成交，
+  下一輪推完整組 feed，不需要人重啟。
+- 備用 RPC：主要 RPC 出現 `network` 類失敗時，該請求改送公開節點（`src/rpc-transport.ts` 的 `PUBLIC_RPC_97`，api／scheduler 已在用），
+  之後 60 秒都走公開節點，再回頭試主要 RPC。revert 與被拒的請求不會換節點。已簽名交易改送另一個節點是同一筆交易（同 nonce、同 hash），不會執行兩次。
+  主要 RPC 連續失敗超過上述門檻另發一則 critical（這時報價靠公開節點維持）。本機 fork（127.0.0.1）不啟用。
+- log 每行都有階段、白名單原因（本機原因、HTTP status／RPC code）、`class=`、`failing=…s`、`attempt=`、`retryMs=`；
+  上游原文、檔案內容／路徑、私鑰與 RPC URL 不進 log 或通知。
+- `--once` 仍只嘗試一輪，失敗記 warning 後退出；常駐模式才持續重試。
+- 這個獨立程序沒有 DB，不寫 `/health` 的 alert 列。`/api/health` 看得到的是 scheduler 的 `price_source_unavailable`
+  （feed 過期或 TWAP 不可用連續數輪後亮）。
 
 ## 驗收
 

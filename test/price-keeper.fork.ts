@@ -46,6 +46,7 @@ test('#70 local chain 97: two hours, 105 markets every ten minutes, both directi
     head: () => checked('head', chain.io.head), inspect: (head) => checked('inspect', () => chain.io.inspect(head)),
     balance: (token) => checked('balance', () => chain.io.balance(token)), mint: (token, amount) => checked('mint', () => chain.io.mint(token, amount)),
     swap: (o, target, budget) => checked(`swap-${o.market.symbol}`, () => chain.io.swap(o, target, budget)), push: (feed, answer) => checked('push', () => chain.io.push(feed, answer)),
+    settled: () => checked('settled', chain.io.settled),
   };
   const snapshot = await local('evm_snapshot'); assert.equal(typeof snapshot, 'string');
   let previews = 0; let swaps = 0; let pushes = 0; let mints = 0;

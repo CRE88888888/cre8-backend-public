@@ -1,10 +1,11 @@
 import { BaseError, ContractFunctionRevertedError, createPublicClient, createWalletClient, decodeErrorResult, getAddress, http, isAddress, isHex, parseAbi, size, zeroAddress } from 'viem';
-import type { Account, Address, Hex, Transport } from 'viem';
+import type { Account, Address, EIP1193RequestFn, Hex, Transport } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { bscTestnet } from 'viem/chains';
 import { TESTNET_ASSETS } from './assets.js';
 import type { Head, KeeperIO, Market, Observation } from './engine.js';
-import { isTransientRpcError } from './engine.js';
+import { classifyKeeperError, isNetworkError, isRevert, safeReason, UNSETTLED } from './engine.js';
+import { secondaryRpc } from '../rpc-transport.js';
 import { positiveAmount, record } from './scenario.js';
 
 // Official chain-97 periphery: https://developer.pancakeswap.finance/contracts/v3/addresses
@@ -116,8 +117,54 @@ function revertData(error: unknown) {
   } catch { return undefined; }
 }
 
-export function createKeeperChain(rpcUrl: string, account: Account, manifest: Manifest, log: (line: string) => void, transport?: Transport) {
-  const chainTransport = transport ?? http(rpcUrl, { timeout: 10_000, retryCount: 0 });
+/** How long requests stay on the public node after the primary RPC failed, before the primary is tried again. */
+export const FAILOVER_MS = 60_000;
+
+/**
+ * Primary RPC with a keyless public node behind it (chain 97 only; local forks get no fallback).
+ *
+ * A network-class failure of the primary (HTTP 403/429/5xx, timeout, connection error, node-side JSON-RPC error)
+ * sends that request to the public node and keeps later requests there for FAILOVER_MS; then the primary is tried
+ * again. Reverts and rejected requests are never failed over. Re-sending a signed transaction to the second node is
+ * safe: it is the same transaction (same nonce and hash), so it cannot execute twice.
+ * `downSeconds()` is how long the primary has been failing without one success in between.
+ */
+export function failoverTransport(primary: Transport, fallback: Transport, log: (line: string) => void, now: () => number = Date.now) {
+  let openUntil = 0;
+  let downSince: number | undefined;
+  let lastLog = -Infinity;
+  const transport: Transport = (args) => {
+    const p = primary(args);
+    const s = fallback(args);
+    const request = (async (req, opts) => {
+      if (now() >= openUntil) {
+        try {
+          const result = await p.request(req, opts);
+          if (downSince !== undefined) log(`[price-keeper] primary RPC recovered after ${Math.floor((now() - downSince) / 1000)}s`);
+          downSince = undefined;
+          return result;
+        } catch (error) {
+          if (!isNetworkError(error)) throw error;
+          downSince ??= now();
+          openUntil = now() + FAILOVER_MS;
+          if (now() - lastLog >= FAILOVER_MS) {
+            lastLog = now();
+            log(`[price-keeper][warning] primary RPC ${req.method}: ${safeReason(error)}; using the public node for ${FAILOVER_MS / 1000}s; primaryDown=${Math.floor((now() - downSince) / 1000)}s`);
+          }
+        }
+      }
+      return s.request(req, opts);
+    }) as EIP1193RequestFn;
+    return { ...p, request };
+  };
+  return { transport, downSeconds: () => downSince === undefined ? 0 : Math.floor((now() - downSince) / 1000) };
+}
+
+export function createKeeperChain(rpcUrl: string, account: Account, manifest: Manifest, log: (line: string) => void, transport?: Transport, publicFallback = true) {
+  const options = { timeout: 10_000, retryCount: 0 };
+  const fallbackUrl = transport === undefined && publicFallback ? secondaryRpc(rpcUrl, 97) : null;
+  const failover = fallbackUrl === null ? null : failoverTransport(http(rpcUrl, options), http(fallbackUrl, options), log);
+  const chainTransport = transport ?? failover?.transport ?? http(rpcUrl, options);
   const client = createPublicClient({ chain: bscTestnet, transport: chainTransport, cacheTime: 0 });
   const wallet = createWalletClient({ chain: bscTestnet, account, transport: chainTransport, cacheTime: 0 });
   const same = (a: Address, b: Address) => a.toLowerCase() === b.toLowerCase();
@@ -134,18 +181,32 @@ export function createKeeperChain(rpcUrl: string, account: Account, manifest: Ma
     await head();
     const gasPrice = await client.getGasPrice();
     if (gasPrice <= 0n) throw new Error('invalid gas price');
-    try {
-      const hash = await submit({ gasPrice });
-      log(`[price-keeper] submitted ${action} tx=${hash}`);
-      const receipt = await client.waitForTransactionReceipt({ hash, timeout: 30_000, pollingInterval: 250, retryCount: 0 });
-      if (receipt.transactionHash.toLowerCase() !== hash.toLowerCase() || receipt.status !== 'success' ||
-        (await client.getBlock({ blockNumber: receipt.blockNumber })).hash !== receipt.blockHash) throw new Error('transaction not confirmed');
-      log(`[price-keeper] confirmed ${action} block=${receipt.blockNumber}`);
-    } catch (error) {
-      // A lost broadcast/receipt response may already have changed the chain. Never retry it.
-      if (isTransientRpcError(error)) throw new Error('transaction not confirmed', { cause: error });
-      throw error;
+    // A lost broadcast or receipt may already have changed the chain. This transaction is never sent again:
+    // the keeper waits until nothing of its own is pending (`settled`), then starts over from a fresh inspection.
+    let hash: Hex;
+    try { hash = await submit({ gasPrice }); }
+    catch (error) {
+      // Only a revert during gas estimation or a missing gas balance proves that nothing was broadcast.
+      if (classifyKeeperError(error) === 'fatal' || isRevert(error)) throw error;
+      throw new Error(UNSETTLED, { cause: error });
     }
+    log(`[price-keeper] submitted ${action} tx=${hash}`);
+    let confirmed: boolean;
+    try {
+      const receipt = await client.waitForTransactionReceipt({ hash, timeout: 30_000, pollingInterval: 250, retryCount: 0 });
+      confirmed = receipt.transactionHash.toLowerCase() === hash.toLowerCase() && receipt.status === 'success' &&
+        (await client.getBlock({ blockNumber: receipt.blockNumber })).hash === receipt.blockHash;
+      if (confirmed) log(`[price-keeper] confirmed ${action} block=${receipt.blockNumber}`);
+    } catch (error) {
+      if (classifyKeeperError(error) === 'fatal') throw error;
+      throw new Error(UNSETTLED, { cause: error });
+    }
+    if (!confirmed) throw new Error('transaction not confirmed');
+  }
+
+  async function settled(): Promise<boolean> {
+    const mined = await client.getTransactionCount({ address: account.address, blockTag: 'latest' });
+    return await client.getTransactionCount({ address: account.address, blockTag: 'pending' }) <= mined;
   }
 
   async function verify(): Promise<void> {
@@ -185,6 +246,7 @@ export function createKeeperChain(rpcUrl: string, account: Account, manifest: Ma
 
   const io: KeeperIO = {
     head,
+    settled,
     async inspect(block) {
       const cash = await client.readContract({ address: manifest.cashFeed, abi: KEEPER_ABI, functionName: 'latestRoundData', blockNumber: block.number });
       // These are keeper-owned feeds: age makes them due for a push, not invalid input.
@@ -272,13 +334,13 @@ export function createKeeperChain(rpcUrl: string, account: Account, manifest: Ma
         if (after[0] !== limit || spent <= 0n || spent > amountIn) throw new Error('swap result mismatch');
         log(`[price-keeper] spent ${market.symbol} tokenIn=${tokenIn} amountRaw=${spent}`);
       } catch (error) {
-        // A later round cannot substitute for this transaction's result checks.
-        if (isTransientRpcError(error)) throw new Error('swap result verification unavailable', { cause: error });
+        // The swap is confirmed; name the lost check. The next round re-reads the pool before deciding anything.
+        if (isNetworkError(error)) throw new Error('swap result verification unavailable', { cause: error });
         throw error;
       }
     },
   };
-  return { io, verify };
+  return { io, verify, primaryDownSeconds: () => failover?.downSeconds() ?? 0 };
 }
 
 export function amountSetting(env: NodeJS.ProcessEnv, key: string, fallback: bigint): bigint {

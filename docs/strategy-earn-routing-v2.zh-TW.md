@@ -125,5 +125,5 @@ executor 自己不換幣。借 USDC／USD1／U 的路線，vault 長得比負債
 - **db**：`strategy_route_events.kind` 加 `top_up`、`cash_out`（或另開 `strategy_cash_swaps` 表：chain_id、portfolio_id、account、kind、token、usdt_raw、token_raw、need_raw、tx_hash、log_index、block_number，`(chain_id, tx_hash, log_index)` 唯一）。現在只有 log。
 - 健康度接近減倉線、策略盒不夠還時「先 `topUp` 讓第三方的 `executeDeleverage` 有錢可還」（規格 §17 第 5 點）還沒做：keeper 那一輪只有任何人可呼叫的交易，`topUp` 要 session key。
 - **補差額用不到組合現金與賣出所得**（見上「用哪些 USDT」）：帳戶裡沒有帳本以外的 USDT 時，非 USDT 路線有差額就還不清（定期重新評估與 owner 關閉會等；全部賣出會剩一小段負債與對應的抵押品）。要補上需要決定現金帳本的規則：補差額從哪一格扣（建議 `allocated_cash_raw`，賣出所得就在這格）、換回現金記到哪一格，並在同一個交易確認時寫帳。這是動到資金帳本的決定，這次沒有做。
-- routing v2 既有的 USDT 路線還款把帳戶的整筆 USDT 當 `maxCashIn`（策略盒不夠時合約會直接拿帳戶現金），同樣可能動到被認領的現金；目前沒有擋，建議跟上一條一起處理。
+- USDT 路線的還款同理：給合約的 `maxCashIn`（策略盒不夠時合約可以直接拿帳戶的 USDT）只給帳本沒認領的那一段（排程器、賣出前、owner 關閉都是）。策略盒差一點、帳戶又沒有帳本以外的 USDT 時，這筆還款會 `VaultShortfall`、下一輪再試；要用組合現金補，同樣要等上一條的帳本規則。
 - 主網：可抵押資產的價格來源（測試網用共用的借貸 oracle）；Lista USD1 vault 的單筆操作約 670 萬 gas，乘 2 之後貼近單筆上限；`shortfall` 的 eth_call 在主網約 560–590 萬 gas（已給 3,000 萬）。

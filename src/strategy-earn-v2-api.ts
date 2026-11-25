@@ -155,8 +155,12 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
      */
     async close(account: Address, input: { symbols: readonly string[]; exit?: boolean }) {
       const read = await reader.account(account);
-      const reserved = deps.reservedUsdt && Object.values(read.tokens).some(t => t.swap) ? await deps.reservedUsdt(account) : 0n;
+      // Account USDT the cash ledger claims is never the strategy's to spend: not for a top-up, and not as the `maxCashIn`
+      // of a repayment on a route that borrows USDT (src/withdrawable-cash.ts claimedCash).
+      const usdtToken = v2.loanTokens.USDT?.toLowerCase(), usdtCash = Object.values(read.tokens).find(t => t.token.toLowerCase() === usdtToken);
+      const reserved = deps.reservedUsdt && (Object.values(read.tokens).some(t => t.swap) || (usdtCash?.cashRaw ?? 0n) > 0n) ? await deps.reservedUsdt(account) : 0n;
       for (const t of Object.values(read.tokens)) if (t.swap) t.swap.usdtRaw = t.swap.usdtRaw > reserved ? t.swap.usdtRaw - reserved : 0n;
+      if (usdtCash) usdtCash.cashRaw = usdtCash.cashRaw > reserved ? usdtCash.cashRaw - reserved : 0n;
       const open = read.routes.filter(r => r.collateralRaw > 0n || r.routeDebtRaw > 0n);
       const chosen = open.filter(r => input.symbols.includes(r.route.symbol));
       const all = open.every(r => chosen.includes(r));

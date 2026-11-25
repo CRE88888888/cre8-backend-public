@@ -518,7 +518,7 @@ test('cash swapper, scheduler: the round that closes a short USDC route tops up,
   // The reservation cannot be read: no USDT is spent on a guess.
   const blind = await run({ reserved: new Error('db down') });
   assert.equal(blind.sent.length, 0);
-  assert.ok(blind.lines.some(l => /reserved cash unreadable/.test(l)));
+  assert.ok(blind.lines.some(l => /cash ledger is unreadable/.test(l)));
   // The owner has not approved the swapper (consented before it existed): waits, says so.
   const unapproved = await run({ approved: false });
   assert.equal(unapproved.sent.length, 0);
@@ -638,6 +638,40 @@ test('cash swapper, owner API: consent adds the swapper approvals an account lac
   const covered = await api2.close(W.account, { symbols: ['QQQB'] });
   if (covered.status !== 'ready') throw new Error('close not ready');
   assert.deepEqual(covered.calls.map(c => c.data.startsWith('0x095ea7b3') ? `approve:${c.to}` : swapFn(c)), [`approve:${USDC}`, 'executeReduce', 'cashOut', 'setStrategyPolicy']);
+});
+
+test('account USDT the cash ledger claims is never offered to a USDT-route repayment (maxCashIn): scheduler round, before a sale, owner close', async () => {
+  // Venus NVDAB/USDT, 441 owed, 440 in Aave: the executor would take the missing 1 from the account's own USDT. The account
+  // holds 7 USDT; 5 of it is claimed by the ledger (money waiting to be bought) -> only 2 may be offered.
+  const setup = () => { const w = world(), reader = createV2Reader(w.readerDeps); openVenus(w, { debt: 441n * E18, vault: 440n * E18 }); w.setBalance(USDT, W.account, 7n * E18); return { w, reader }; };
+  const cashIn = (c: Call) => argsOf(c)[5];
+  const round = async (o: { reserved?: bigint | Error; disabled?: boolean }) => {
+    const { w, reader } = setup(), sent: Call[][] = [], lines: string[] = [], led = ledger();
+    if (o.disabled !== false) w.state.policy.enabled = false; // the strategy was turned off: the engine closes
+    await v2AutoRound({ v2: W.v2, reader, account: W.account, portfolioId: 9, now: NOW, dryRun: false, ledger: led.l, log: l => lines.push(l), send: async calls => { sent.push(calls); return tx(sent.length); },
+      ...(o.reserved === undefined ? {} : { reservedUsdt: async () => { if (o.reserved instanceof Error) throw o.reserved; return o.reserved as bigint; } }) });
+    return { sent, lines };
+  };
+  assert.equal(cashIn((await round({ reserved: 5n * E18 })).sent[0]![0]!), 2n * E18);
+  assert.equal(cashIn((await round({ reserved: 9n * E18 })).sent[0]![0]!), 0n, 'everything is claimed: nothing is offered');
+  const blind = await round({ reserved: new Error('db down') });
+  assert.equal(cashIn(blind.sent[0]![0]!), 0n);
+  assert.ok(blind.lines.some(l => /cash ledger is unreadable/.test(l)));
+  // A caller without the ledger (tests, older wiring) behaves as before: the whole balance.
+  assert.equal(cashIn((await round({})).sent[0]![0]!), 7n * E18);
+  // Before a sale (session key): the same cut; the box (440) + 2 covers 441 -> a full close with at most 2 from the account.
+  const { reader } = setup(), sold: Call[][] = [], led = ledger();
+  await v2UnwindForSale({ v2: W.v2, reader, account: W.account, portfolioId: 9, now: NOW, dryRun: false, ledger: led.l, log: () => {}, steps: [{ tokenIn: W.NVDA, amountIn: 10n * E18 }],
+    send: async calls => { sold.push(calls); return tx(sold.length); }, reservedUsdt: async () => 5n * E18 });
+  assert.equal(cashIn(sold[0]![0]!), 2n * E18);
+  // Owner close: the same.
+  const owner = setup(), api = createStrategyEarnV2Api({ v2: W.v2, reader: owner.reader, now: () => NOW, reservedUsdt: async () => 5n * E18 });
+  const off = await api.close(W.account, { symbols: ['NVDAB'] });
+  if (off.status !== 'ready') throw new Error('close not ready');
+  assert.equal(cashIn(off.calls[0]!), 2n * E18);
+  const plain = createStrategyEarnV2Api({ v2: W.v2, reader: setup().reader, now: () => NOW });
+  const before = await plain.close(W.account, { symbols: ['NVDAB'] });
+  assert.equal(before.status === 'ready' && cashIn(before.calls[0]!), 7n * E18);
 });
 
 test('reads never use the paid RPC: the public node list is the default, replaceable for a fork', () => {

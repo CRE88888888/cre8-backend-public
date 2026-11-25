@@ -88,15 +88,27 @@ async function cashOutLeftovers(args: V2StepArgs, send: V2Send | null, leftovers
 }
 const deadlineOf = (now: Date) => BigInt(Math.floor(now.getTime() / 1000) + 30 * 60);
 /**
- * The USDT a top-up may spend is what no bucket of the cash ledger claims: the claimed part is taken off every quote of
- * this read (the quotes share the account's one USDT balance).
+ * Account USDT that some bucket of the cash ledger claims is not the strategy's to spend, whichever way it would leave:
+ * - a top-up (cash swapper): the claimed part is taken off every quote of this read (they share the one USDT balance);
+ * - a repayment on a route that borrows USDT: `maxCashIn` lets the executor take the account's own USDT when the box is
+ *   short, so the cash offered for USDT routes is cut to the unclaimed part as well.
+ * Only a transfer to the owner is ever reconciled as a withdrawal; anything else that takes claimed cash leaves the ledger
+ * above the chain balance and stops the portfolio's jobs ([CASH_DEFICIT]).
  */
-async function freeUsdtOnly(args: Pick<V2StepArgs, 'reservedUsdt' | 'log' | 'portfolioId'>, read: V2AccountRead): Promise<void> {
+async function freeUsdtOnly(args: Pick<V2StepArgs, 'v2' | 'reservedUsdt' | 'log' | 'portfolioId'>, read: V2AccountRead): Promise<void> {
+  if (!args.reservedUsdt) return;
+  const usdtToken = args.v2.loanTokens.USDT?.toLowerCase();
+  const usdt = Object.entries(read.tokens).find(([, t]) => t.token.toLowerCase() === usdtToken);
   const quotes = Object.values(read.tokens).flatMap(t => t.swap ? [t.swap] : []);
-  if (quotes.length === 0 || !args.reservedUsdt) return;
-  let reserved: bigint | null;
-  try { reserved = await args.reservedUsdt(); } catch { reserved = null; args.log(`[strategy-routing] portfolio ${args.portfolioId}: reserved cash unreadable, no USDT is used for top-ups this round`); }
-  for (const q of quotes) q.usdtRaw = reserved === null ? 0n : q.usdtRaw > reserved ? q.usdtRaw - reserved : 0n;
+  if (quotes.length === 0 && (!usdt || usdt[1].cashRaw === 0n)) return;
+  let claimed: bigint | null;
+  try { claimed = await args.reservedUsdt(); } catch { claimed = null; args.log(`[strategy-routing] portfolio ${args.portfolioId}: the cash ledger is unreadable, no account USDT is used for top-ups or USDT repayments this round`); }
+  const free = (raw: bigint) => claimed === null ? 0n : raw > claimed ? raw - claimed : 0n;
+  for (const q of quotes) q.usdtRaw = free(q.usdtRaw);
+  if (usdt) {
+    usdt[1].cashRaw = free(usdt[1].cashRaw);
+    for (const h of read.state.holdings) if (h.loan === usdt[0] && h.cashRaw !== undefined) h.cashRaw = usdt[1].cashRaw;
+  }
 }
 /** The account's own loan tokens other than USDT, from a full account read (the same shape `reader.leftovers` answers). */
 const leftoversOf = (read: V2AccountRead): Leftover[] => Object.entries(read.tokens).filter(([, t]) => t.swap !== undefined)

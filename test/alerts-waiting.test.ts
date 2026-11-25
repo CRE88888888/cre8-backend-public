@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { beforeEach, test } from 'node:test';
-import { detectPortfolioFailures, detectPortfolioStuck, noteRoundOutcome, resetRoundOutcomes, restoreRoundOutcomes, roundOutcomeSnapshot, ROUND_OUTCOME_TTL_MS, waitingReason } from '../src/alerts.js';
+import { detectPortfolioFailures, detectPortfolioStuck, noteRoundOutcome, resetRoundOutcomes, restoreRoundOutcomes, roundOutcomeSnapshot, ROUND_OUTCOME_TTL_MS, scheduledRebalanceAhead, waitingReason } from '../src/alerts.js';
 
 const NOW = new Date('2026-11-24T13:30:00Z');
 const stuckRows = (rows: { portfolio_id: number; hours_since: number; gross_drift_bps: number }[]) => async () => ({ rows });
@@ -13,12 +13,12 @@ test('drift alert: a portfolio the scheduler just looked at and is waiting on (m
   noteRoundOutcome(13, 'noop', 'Planner returned noop: 繼續原工作，後續期次不補扣', NOW); // a job that is not moving: not a known harmless wait
   noteRoundOutcome(14, 'blocked', '[STRATEGY_EXECUTION_UNAVAILABLE] 無法確認執行結果', NOW);
   noteRoundOutcome(15, 'failed', '[MARKET_CLOSED] but the round itself failed', NOW);
-  noteRoundOutcome(17, 'noop', '下一次再平衡為 2026-11-25T00:00:00.000Z。', NOW); // a private basket between its rebalance dates
+  noteRoundOutcome(17, 'noop', '下一次再平衡為 2026-11-24T00:00:00.000Z。', NOW); // a private basket whose rebalance date has passed: it should have rebalanced
   noteRoundOutcome(18, 'noop', 'Planner returned noop: [BELOW_MIN_BATCH] 待買入 8.62 USDT（1 個來源）湊不成每筆10 USDT的完整批次，已取消並留作可用現金', NOW);
   noteRoundOutcome(19, 'noop', '目前無法確認組合價值，停利停損暫不觸發。', NOW); // a basket that cannot be valued still needs someone
   const found = await detectPortfolioStuck(stuckRows([7, 8, 9, 13, 14, 15, 16, 17, 18, 19].map(id => ({ portfolio_id: id, hours_since: 72, gross_drift_bps: 2584 }))), 6, NOW);
   assert.deepEqual(found.map(f => [f.portfolioId, f.severity]), [[7, 'warn'], [8, 'warn'], [9, 'warn'], [13, 'critical'], [14, 'critical'], [15, 'critical'], [16, 'critical'], [17, 'warn'], [18, 'warn'], [19, 'critical']]);
-  assert.match(found[7]!.detail, /waiting, nothing to fix: 下一次再平衡為 2026-11-25T00:00:00\.000Z。$/);
+  assert.match(found[7]!.detail, /waiting, nothing to fix: 下一次再平衡為 2026-11-24T00:00:00\.000Z。$/);
   assert.equal(found[0]!.detail, 'portfolio 7: last observation showed 2584 bps drift (still above the threshold) 72.0 hours ago, with no successful execution since — waiting, nothing to fix: [MARKET_CLOSED] 股票部分等待下一個開盤時段');
   assert.match(found[3]!.detail, /or the scheduler is not running$/); // unchanged wording for the ones that need someone
   // Under 24h everything is a warn as before; the waiting ones still say why.
@@ -134,4 +134,48 @@ test('drift alert: scheduled principal that is not due yet is left out (portfoli
   assert.match(String(found[0]!.detail), /^portfolio 5: last observation showed 5020 bps drift \(8755 bps observed; 7500 bps of the portfolio is scheduled principal not due yet and is left out\) \(still above the threshold\) 25\.7 hours ago/);
   for (const f of found.slice(1)) assert.match(String(f.detail), /last observation showed 8755 bps drift \(still above the threshold\) 25\.7 hours ago/);
   assert.deepEqual(found.map(f => f.severity), ['critical', 'critical', 'critical']);
+});
+
+test('drift alert: a basket waiting for its own scheduled rebalance date reports nothing while the date is ahead; a passed date, a stale round or a failing one reports as before', async () => {
+  // Testnet portfolio 7: 1882 bps between its assets, next rebalance 2026-12-21. The weights are meant to drift until then.
+  const drift = (id: number, hours = 72) => ({ portfolio_id: id, hours_since: hours, gross_drift_bps: 1882 });
+  noteRoundOutcome(7, 'noop', '下一次再平衡為 2026-12-21T00:00:00.000Z。', NOW);
+  noteRoundOutcome(8, 'noop', '下一次再平衡為 2026-11-24T13:29:59.000Z。', NOW); // due a second ago and still drifting: reported
+  noteRoundOutcome(9, 'failed', '下一次再平衡為 2026-12-21T00:00:00.000Z。', NOW); // the round failed: reported, critical
+  noteRoundOutcome(10, 'noop', '下一次再平衡為 2026-12-21T00:00:00.000Z。；[STRATEGY_EARN_UNWINDING] something else is going on', NOW); // not exactly that wait
+  noteRoundOutcome(11, 'noop', '下一次再平衡為 not-a-date。', NOW);
+  assert.equal(scheduledRebalanceAhead(7, NOW)?.toISOString(), '2026-12-21T00:00:00.000Z');
+  assert.deepEqual([8, 9, 10, 11, 12].map(id => scheduledRebalanceAhead(id, NOW)), [null, null, null, null, null]);
+  const found = await detectPortfolioStuck(stuckRows([7, 8, 9, 10, 11, 12].map(id => drift(id))), 6, NOW);
+  assert.deepEqual(found.map(f => [f.portfolioId, f.severity]), [[8, 'warn'], [9, 'critical'], [10, 'warn'], [11, 'warn'], [12, 'critical']]);
+  // The same basket once the scheduler has not said so for longer than the TTL (it stopped running, or a restart lost it):
+  // the strict rule again — nothing is hidden on an old word.
+  const later = new Date(NOW.getTime() + ROUND_OUTCOME_TTL_MS + 1);
+  assert.equal(scheduledRebalanceAhead(7, later), null);
+  assert.deepEqual((await detectPortfolioStuck(stuckRows([drift(7)]), 6, later)).map(f => [f.portfolioId, f.severity]), [[7, 'critical']]);
+  // And once its date has come while the last word is still fresh: reported (a warn that says what it was waiting for).
+  const due = new Date('2026-12-21T00:00:01Z');
+  noteRoundOutcome(7, 'noop', '下一次再平衡為 2026-12-21T00:00:00.000Z。', new Date(due.getTime() - 60_000));
+  assert.deepEqual((await detectPortfolioStuck(stuckRows([drift(7)]), 6, due)).map(f => [f.portfolioId, f.severity]), [[7, 'warn']]);
+});
+
+test('PegExceeded on a top-up or a cash-out is a critical alert on that portfolio while it keeps happening; it joins a drift alert on the same portfolio and resolves once it has not been seen for two hours', async () => {
+  const { detectAlerts, noteStrategyPegExceeded, resetStrategyPegSightings, strategyPegFindings, STRATEGY_PEG_TTL_MS } = await import('../src/alerts.js');
+  resetStrategyPegSightings();
+  noteStrategyPegExceeded(31, 'PegExceeded(1003000000000000000, 1000000000000000000) via https://rpc.example/secret-key', NOW);
+  noteStrategyPegExceeded(31, 'PegExceeded(1003000000000000000, 1000000000000000000)', new Date(NOW.getTime() + 60_000));
+  noteStrategyPegExceeded(12, 'PegExceeded', NOW);
+  const later = new Date(NOW.getTime() + 120_000);
+  const found = strategyPegFindings(later);
+  assert.deepEqual(found.map(f => [f.kind, f.severity, f.portfolioId]), [['portfolio_stuck', 'critical', 12], ['portfolio_stuck', 'critical', 31]]);
+  assert.match(found[1]!.detail, /^\[STRATEGY_PEG_EXCEEDED\] .*（2 次，最近 2026-11-24T13:31:00\.000Z）；重送沒有用，需要人查看池子：PegExceeded\(1003000000000000000, 1000000000000000000\)$/);
+  assert.ok(!found.some(f => /rpc\.example/.test(f.detail)), 'a URL never reaches an alert');
+  // In the whole evaluation: its own row for portfolio 12, and appended to portfolio 31's drift row (one row per kind and portfolio).
+  const query = async (sql: string) => ({ rows: /from latest l/.test(sql) ? [{ portfolio_id: 31, hours_since: 3, gross_drift_bps: 900, threshold_bps: 100, total_usd_e8: '100000000000', pending_raw: '0', cash_raw: null }] : [] });
+  const all = (await detectAlerts(query, { now: later, env: { CHAIN_ID: '56', PAYMASTER_URL: '' }, readNativeBalance: async () => 10n ** 18n, readGasPrice: async () => 1n })).filter(f => f.kind === 'portfolio_stuck');
+  assert.deepEqual(all.map(f => [f.portfolioId, f.severity]), [[31, 'critical'], [12, 'critical']]);
+  assert.match(all[0]!.detail, /900 bps drift.*；\[STRATEGY_PEG_EXCEEDED\]/);
+  // Not seen for two hours: gone (the alert round then resolves the row).
+  assert.deepEqual(strategyPegFindings(new Date(NOW.getTime() + 60_000 + STRATEGY_PEG_TTL_MS + 1)), []);
+  resetStrategyPegSightings();
 });

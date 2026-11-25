@@ -344,6 +344,14 @@ export async function detectAlerts(
       else stuck.push({ kind: 'portfolio_stuck', severity: 'critical', portfolioId: null, detail });
     }
   }
+  // Routing v2 cash swapper: a top-up / cash-out refused with PegExceeded (the loan token's USDT pool is off 1:1 by more than
+  // the contract allows). Resending cannot fix it: someone has to look at the pool. Same (kind, portfolio) key as the
+  // drift alert, so it joins that row (as the exit and yield notes above do) instead of needing a kind of its own.
+  for (const finding of strategyPegFindings(now)) {
+    const prior = stuck.find(item => item.portfolioId === finding.portfolioId);
+    if (prior) { prior.severity = 'critical'; prior.detail += '；' + finding.detail; }
+    else stuck.push(finding);
+  }
   if(chainIdFromEnv(env)===97&&yieldProfile()!==null)for(const finding of await detectYieldAttention(query)){
     const prior=stuck.find(s=>s.portfolioId===finding.portfolioId);if(prior)prior.detail+='；'+finding.detail;else stuck.push(finding);
   }
@@ -451,6 +459,11 @@ export async function detectPortfolioStuck(query: QueryFn, stuckHours: number, n
     // The scheduler looked at it recently and is waiting for a known, harmless reason (market closed, below the minimum
     // trade, budget used up): nobody has to act, so it is a warn that says why, whatever its age.
     const waiting = waitingReason(portfolioId, now);
+    // A private basket between two of its own rebalance dates: the weights are meant to drift until that date, and the
+    // scheduler said in its latest round which date it is waiting for. Not a finding at all while that date is ahead
+    // (testnet portfolio 7: 1882 bps, a warn every round until 2026-12-21). Once the date has passed and the drift is
+    // still there, or the scheduler stops saying it (a failing or silent portfolio), the alert is back as before.
+    if (scheduledRebalanceAhead(portfolioId, now) !== null) return [];
     const severity: AlertSeverity = waiting === null && Number.isFinite(hours) && hours >= 24 ? 'critical' : 'warn';
     return [{
       kind: 'portfolio_stuck',
@@ -563,6 +576,44 @@ export function waitingReason(portfolioId: number, now: Date): string | null {
   const last = roundOutcomes.get(portfolioId);
   if (!last || now.getTime() - last.at > ROUND_OUTCOME_TTL_MS || !['noop', 'blocked'].includes(last.outcome)) return null;
   return WAITING.test(last.reason) ? truncate(last.reason.replace(/^Planner returned noop: /, ''), 160) : null;
+}
+
+/** How long one PegExceeded sighting keeps its alert open: the scheduler meets it again every round while the pool is off. */
+export const STRATEGY_PEG_TTL_MS = 2 * 60 * 60_000;
+const pegSightings = new Map<number, { at: number; count: number; detail: string }>();
+/**
+ * The scheduler (same process as the alert evaluation) met `PegExceeded` on this portfolio's top-up or cash-out
+ * (src/strategy-earn-v2-scheduler.ts). `detail`: the contract's own numbers when the error carried them; never a URL.
+ */
+export function noteStrategyPegExceeded(portfolioId: number, detail: string, now: Date): void {
+  const last = pegSightings.get(portfolioId);
+  pegSightings.set(portfolioId, { at: now.getTime(), count: last && now.getTime() - last.at <= STRATEGY_PEG_TTL_MS ? last.count + 1 : 1,
+    detail: truncate(detail.replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, '<url>'), 160) });
+}
+export const resetStrategyPegSightings = () => pegSightings.clear();
+/** One critical finding per portfolio that met PegExceeded within the TTL; older sightings are forgotten (the alert resolves). */
+export function strategyPegFindings(now: Date): AlertFinding[] {
+  const out: AlertFinding[] = [];
+  for (const [portfolioId, seen] of pegSightings) {
+    if (now.getTime() - seen.at > STRATEGY_PEG_TTL_MS) { pegSightings.delete(portfolioId); continue; }
+    out.push({ kind: 'portfolio_stuck', severity: 'critical', portfolioId,
+      detail: `[STRATEGY_PEG_EXCEEDED] 加息策略的借款幣對 USDT 池子偏離 1:1 超過合約上限，補差額／換回現金被擋下（${seen.count} 次，最近 ${new Date(seen.at).toISOString()}）；重送沒有用，需要人查看池子：${seen.detail}` });
+  }
+  return out.sort((a, b) => (a.portfolioId ?? 0) - (b.portfolioId ?? 0));
+}
+
+/**
+ * The date the portfolio's own schedule rebalances it next, when its latest round (recent, not failed) said it is waiting
+ * for exactly that (src/mix-runtime.ts decideMixTick: `下一次再平衡為 <ISO time>。`) and the date is still ahead of `now`.
+ * null otherwise: no recent round, a round that did or failed something, another reason, or a date that has passed.
+ */
+export function scheduledRebalanceAhead(portfolioId: number, now: Date): Date | null {
+  const last = roundOutcomes.get(portfolioId);
+  if (!last || now.getTime() - last.at > ROUND_OUTCOME_TTL_MS || !['noop', 'blocked'].includes(last.outcome)) return null;
+  const at = /^下一次再平衡為 (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)。$/.exec(last.reason)?.[1];
+  if (at === undefined) return null;
+  const date = new Date(at);
+  return Number.isFinite(date.getTime()) && date.getTime() > now.getTime() ? date : null;
 }
 
 /**

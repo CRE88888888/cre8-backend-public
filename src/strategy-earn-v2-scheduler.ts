@@ -3,8 +3,8 @@ import type { Address, Hex, Log } from 'viem';
 import type { Costs } from './strategy-earn-routing.js';
 import { V2_DEFAULT_COSTS } from './strategy-earn-v2-api.js';
 import type { V2AccountRead, V2Market, V2Reader } from './strategy-earn-v2-chain.js';
-import { boxRewardSignature, runV2Account, strandedSmallPosition, swapEventLine, swapperErrorOf, v2Batches, v2Calls, v2KeeperCall, v2PreSellPlan, v2RouteEvents, v2SwapEvents } from './strategy-earn-v2.js';
-import type { Call, PreSellPosition, RouteEvent, Step, StrategyEarnV2 } from './strategy-earn-v2.js';
+import { boxRewardSignature, runV2Account, strandedSmallPosition, swapEventLine, swapperErrorOf, v2Batches, v2CashEvents, v2Calls, v2KeeperCall, v2PreSellPlan, v2RouteEvents } from './strategy-earn-v2.js';
+import type { Call, PreSellPosition, RouteEvent, Step, StrategyEarnV2, SwapEvent } from './strategy-earn-v2.js';
 import { leftoverCashOuts } from './strategy-earn-v2-swap.js';
 import type { Leftover } from './strategy-earn-v2-swap.js';
 import { rewardEvents } from './strategy-rewards.js';
@@ -27,7 +27,16 @@ import type { RewardEvent, RewardSignature } from './strategy-rewards.js';
  */
 export type V2Tx = { hash: Hex; blockNumber: bigint; logs: readonly Log[] };
 export type V2Send = (calls: Call[]) => Promise<V2Tx>;
-export type V2Ledger = { routes(chainId: number, events: readonly RouteEvent[]): Promise<void>; rewards(chainId: number, events: readonly RewardEvent[]): Promise<void> };
+export type V2Ledger = { routes(chainId: number, events: readonly RouteEvent[]): Promise<void>; rewards(chainId: number, events: readonly RewardEvent[]): Promise<void>;
+  /** Cash ledger: a top-up is taken from the portfolio's own cash, a cash-out is added to it, once per event
+   * (src/strategy-cash-swaps.ts). Absent: the events are only logged (and then no top-up may spend the own cash). */
+  swaps?(portfolioId: number, account: Address, events: readonly SwapEvent[]): Promise<unknown> };
+/** The sale has to go ahead without some posted shares: they cannot be freed this round (see v2PreSellPlan `stuck`). */
+export type V2UnwindWait = { note: string;
+  /** Collateral tokens (lowercase) whose posted part stays posted for now. */
+  stuck: Address[];
+  /** USDT their top-ups are still short of (raw). 0: they wait for something else (the 24-hour window, the pool's peg). */
+  needUsdtRaw: bigint };
 export type V2StepArgs = { v2: StrategyEarnV2; reader: V2Reader; account: Address; portfolioId: number; now: Date; dryRun: boolean;
   /** null: the newest session key does not carry the routing v2 scope (the owner has not renewed) — the step only reports. */
   send: V2Send | null; ledger: V2Ledger; log: (line: string) => void; costs?: Costs;
@@ -36,10 +45,22 @@ export type V2StepArgs = { v2: StrategyEarnV2; reader: V2Reader; account: Addres
   /** Is yield strategy v1 still in use on this account (a position, debt or consent)? One account uses v1 or v2, never both:
    * while this answers true the round adds nothing on v2 (it only reports). */
   v1Active?: () => Promise<boolean>;
-  /** USDT in the account that some bucket of the cash ledger claims (src/withdrawable-cash.ts `claimedCash`: funding waiting
-   * to be bought, the portfolio's own cash, running jobs, reservations): a top-up never spends it — the ledger would end up
-   * above the chain balance ([CASH_DEFICIT]). Absent: nothing is claimed. A read that throws: no USDT is spent this round. */
-  reservedUsdt?: () => Promise<bigint> };
+  /**
+   * What the cash ledger says about the account's USDT (src/withdrawable-cash.ts): `claimedRaw` — every bucket that claims
+   * some of it (funding waiting to be bought, the portfolio's own cash, running jobs, reservations); `ownRaw` — the
+   * portfolio's own cash among them (`allocated_cash_raw`). A top-up may spend the own cash and what no bucket claims: it
+   * is booked against the own cash when it lands (`ledger.swaps`). A repayment on a route that borrows USDT (`maxCashIn`)
+   * has no such booking and only gets what no bucket claims. Absent: nothing is claimed. A read that throws: no USDT is
+   * spent this round.
+   */
+  cashClaims?: () => Promise<{ claimedRaw: bigint; ownRaw: bigint }>;
+  /** The ledger claims more USDT than the account holds: look for swapper events of this account that were never booked
+   * (an owner UserOp whose `confirm` never came, a crash between the receipt and the booking) and book them. Returns how many. */
+  recoverSwaps?: () => Promise<number>;
+  /** The round could not finish a repayment for lack of USDT: this much more of it is needed in the account (raw). */
+  onCashNeed?: (usdtRaw: bigint) => void;
+  /** A top-up or a cash-out was refused with PegExceeded (the alert: src/alerts.ts noteStrategyPegExceeded). */
+  onPegExceeded?: (detail: string) => void };
 
 const shortError = (error: unknown) => String((error as Error)?.message ?? error).split('\n')[0]!.slice(0, 160);
 type SwapWatch = { peg: boolean; window: boolean; other: boolean };
@@ -48,18 +69,19 @@ type SwapWatch = { peg: boolean; window: boolean; other: boolean };
  * has a table for them) and (b) names a cash swapper failure: `PegExceeded` -> a structured error line (alert) and a
  * tagged error; `WindowExceeded` -> the reason, once. Everything else passes through untouched.
  */
-function watchSwaps(args: Pick<V2StepArgs, 'v2' | 'portfolioId' | 'account' | 'log'>, send: V2Send, seen: SwapWatch): V2Send {
+function watchSwaps(args: Pick<V2StepArgs, 'v2' | 'portfolioId' | 'account' | 'log' | 'ledger' | 'reader' | 'onPegExceeded'>, send: V2Send, seen: SwapWatch): V2Send {
   return async calls => {
     const swaps = args.v2.swapper ? calls.some(c => isAddressEqual(c.to, args.v2.swapper!)) : false;
     try {
       const tx = await send(calls);
-      if (swaps) for (const e of v2SwapEvents(args.v2, tx, args.account)) args.log(swapEventLine(args.v2.chainId, args.portfolioId, e));
+      await bookSwaps(args, tx);
       return tx;
     } catch (error) {
       const name = swaps ? swapperErrorOf(error) : null;
       if (name === 'PegExceeded') {
         seen.peg = true;
         args.log(JSON.stringify({ level: 'error', msg: 'strategy_peg_exceeded', chainId: args.v2.chainId, portfolioId: args.portfolioId, account: args.account, detail: shortError(error) }));
+        args.onPegExceeded?.(shortError(error));
         throw new Error(`[STRATEGY_PEG_EXCEEDED] 借款幣與 USDT 的池子偏離 1:1 超過合約上限，補差額／換回現金被擋下（需要人處理，重送沒有用）：${shortError(error)}`);
       }
       if (name === 'WindowExceeded') {
@@ -71,6 +93,25 @@ function watchSwaps(args: Pick<V2StepArgs, 'v2' | 'portfolioId' | 'account' | 'l
       throw error;
     }
   };
+}
+/**
+ * What a landed UserOp did to the account's USDT through the strategy: `ToppedUp` / `CashedOut` (cash swapper), and on a
+ * route that borrows USDT the cash the executor took for a repayment and what the strategy paid back (`v2UsdtFlows`). One
+ * log line each, and the cash ledger (what was spent leaves the portfolio's own cash, what came back joins it). A ledger
+ * failure never undoes or repeats the chain action: it is logged as an error with the tx hash, and `recoverSwaps` books
+ * the event later (the marker makes a second booking impossible).
+ */
+async function bookSwaps(args: Pick<V2StepArgs, 'v2' | 'portfolioId' | 'account' | 'log' | 'ledger' | 'reader'>, tx: V2Tx): Promise<void> {
+  try {
+    const usdt = args.v2.loanTokens.USDT?.toLowerCase(), me = args.account.toLowerCase().slice(2);
+    // The strategy box is only read when the receipt moved USDT of this account at all.
+    const moved = usdt !== undefined && tx.logs.some(l => l.address.toLowerCase() === usdt && l.topics.length === 3 && (l.topics[1]!.toLowerCase().endsWith(me) || l.topics[2]!.toLowerCase().endsWith(me)));
+    const box = moved ? (await args.reader.box(args.account)).box : null;
+    const events = v2CashEvents(args.v2, tx, args.account, box);
+    for (const e of events) args.log(swapEventLine(args.v2.chainId, args.portfolioId, e));
+    if (events.length === 0 || !args.ledger.swaps) return;
+    await args.ledger.swaps(args.portfolioId, args.account, events);
+  } catch (error) { args.log(JSON.stringify({ level: 'error', msg: 'strategy_cash_swap_unbooked', chainId: args.v2.chainId, portfolioId: args.portfolioId, account: args.account, txHash: tx.hash, detail: shortError(error) })); }
 }
 /**
  * Loan token other than USDT left in the account with nothing owed in it (a vault's surplus, the unused part of a top-up
@@ -88,25 +129,35 @@ async function cashOutLeftovers(args: V2StepArgs, send: V2Send | null, leftovers
 }
 const deadlineOf = (now: Date) => BigInt(Math.floor(now.getTime() / 1000) + 30 * 60);
 /**
- * Account USDT that some bucket of the cash ledger claims is not the strategy's to spend, whichever way it would leave:
- * - a top-up (cash swapper): the claimed part is taken off every quote of this read (they share the one USDT balance);
- * - a repayment on a route that borrows USDT: `maxCashIn` lets the executor take the account's own USDT when the box is
- *   short, so the cash offered for USDT routes is cut to the unclaimed part as well.
- * Only a transfer to the owner is ever reconciled as a withdrawal; anything else that takes claimed cash leaves the ledger
- * above the chain balance and stops the portfolio's jobs ([CASH_DEFICIT]).
+ * Which of the account's USDT the strategy may spend, by the cash ledger: the portfolio's own cash (`allocated_cash_raw`)
+ * and what no bucket claims — for a top-up (cash swapper; taken off every quote of this read: they share the one USDT
+ * balance) and for a repayment on a route that borrows USDT (`maxCashIn` lets the executor take the account's own USDT when
+ * the box is short). What is spent is booked against the own cash when it lands (`bookSwaps`), so the ledger follows the
+ * chain balance down; without a ledger to book it in (`ledger.swaps`) only unclaimed USDT is offered.
+ * Funding waiting to be bought, a running job's money and the withdrawal / yield reservations are never offered: taking
+ * them leaves the ledger above the chain balance and stops the portfolio's jobs ([CASH_DEFICIT]).
+ * A ledger already above the chain balance: unbooked strategy cash movements are looked for first (`recoverSwaps`).
  */
-async function freeUsdtOnly(args: Pick<V2StepArgs, 'v2' | 'reservedUsdt' | 'log' | 'portfolioId'>, read: V2AccountRead): Promise<void> {
-  if (!args.reservedUsdt) return;
+async function spendableUsdtOnly(args: Pick<V2StepArgs, 'v2' | 'cashClaims' | 'recoverSwaps' | 'ledger' | 'log' | 'portfolioId'>, read: V2AccountRead): Promise<void> {
+  if (!args.cashClaims) return;
   const usdtToken = args.v2.loanTokens.USDT?.toLowerCase();
   const usdt = Object.entries(read.tokens).find(([, t]) => t.token.toLowerCase() === usdtToken);
   const quotes = Object.values(read.tokens).flatMap(t => t.swap ? [t.swap] : []);
   if (quotes.length === 0 && (!usdt || usdt[1].cashRaw === 0n)) return;
-  let claimed: bigint | null;
-  try { claimed = await args.reservedUsdt(); } catch { claimed = null; args.log(`[strategy-routing] portfolio ${args.portfolioId}: the cash ledger is unreadable, no account USDT is used for top-ups or USDT repayments this round`); }
-  const free = (raw: bigint) => claimed === null ? 0n : raw > claimed ? raw - claimed : 0n;
-  for (const q of quotes) q.usdtRaw = free(q.usdtRaw);
+  let claims: { claimedRaw: bigint; ownRaw: bigint } | null;
+  try {
+    claims = await args.cashClaims();
+    const held = quotes[0]?.usdtRaw ?? usdt?.[1].cashRaw ?? 0n;
+    if (claims.claimedRaw > held && args.recoverSwaps) {
+      const booked = await args.recoverSwaps();
+      if (booked > 0) { args.log(`[strategy-routing] portfolio ${args.portfolioId}: booked ${booked} cash swapper event(s) the cash ledger had missed`); claims = await args.cashClaims(); }
+    }
+  } catch { claims = null; args.log(`[strategy-routing] portfolio ${args.portfolioId}: the cash ledger is unreadable, no account USDT is used for top-ups or USDT repayments this round`); }
+  const free = (raw: bigint, kept: bigint | null) => kept === null ? 0n : raw > kept ? raw - kept : 0n;
+  const others = claims === null ? null : args.ledger.swaps ? claims.claimedRaw - (claims.ownRaw < claims.claimedRaw ? claims.ownRaw : claims.claimedRaw) : claims.claimedRaw;
+  for (const q of quotes) q.usdtRaw = free(q.usdtRaw, others);
   if (usdt) {
-    usdt[1].cashRaw = free(usdt[1].cashRaw);
+    usdt[1].cashRaw = free(usdt[1].cashRaw, others);
     for (const h of read.state.holdings) if (h.loan === usdt[0] && h.cashRaw !== undefined) h.cashRaw = usdt[1].cashRaw;
   }
 }
@@ -138,7 +189,7 @@ export async function v2AutoRound(args: V2StepArgs): Promise<string | null> {
   // path, so v2 never opens, tops up or moves anything while v1 still holds something on the account.
   if (args.v1Active && await args.v1Active()) return '[STRATEGY_ROUTING] 這個帳戶還有 v1 加息部位或同意，v2 不動作（一個帳戶只用其中一種）';
   const [m, read] = await Promise.all([reader.market(), reader.account(account, (args.held ?? []) as Address[])]);
-  await freeUsdtOnly(args, read);
+  await spendableUsdtOnly(args, read);
   const sent: Hex[] = [];
   const result = await runV2Account({ v2, portfolioId: args.portfolioId, account, snapshot: m.snapshot, state: read.state, costs: args.costs ?? V2_DEFAULT_COSTS, now: args.now.getTime(), deadline: deadlineOf(args.now),
     limits: m.limits, dryRun: args.dryRun || send === null, log: args.log,
@@ -152,6 +203,10 @@ export async function v2AutoRound(args: V2StepArgs): Promise<string | null> {
     try { cashed = await cashOutLeftovers(args, send, result.sent > 0 ? await reader.leftovers(account) : leftoversOf(read)); }
     catch (error) { args.log(`[strategy-routing] portfolio ${args.portfolioId}: leftover loan token not read this round: ${shortError(error)}`); }
   }
+  // A repayment that waits for USDT (or could only be made in part): the scheduler raises it by selling a little of what
+  // the portfolio holds, and the next round finishes the repayment.
+  const need = (result.plan?.steps ?? []).reduce((sum, s) => sum + (s.needUsdtRaw ?? 0n), 0n);
+  if (need > 0n && !args.dryRun && send !== null) args.onCashNeed?.(need);
   const acted = (result.plan?.steps ?? []).filter(s => s.calls.length > 0 && s.via === 'session');
   if (acted.length === 0) return cashed;
   const what = acted.map(s => `${s.symbol} ${s.action}(${s.reason})`).join('、');
@@ -171,7 +226,7 @@ export async function v2AutoRound(args: V2StepArgs): Promise<string | null> {
  * full exit: sell all / delete / take profit): reward tokens in the box and the account go to the owner's wallet with the
  * same session key (`executeSweepRewards`, spec §9). Returns a block reason, or null when the sale can go ahead.
  */
-export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tokenIn: string; amountIn: bigint }[]; exit?: boolean }): Promise<string | null> {
+export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tokenIn: string; amountIn: bigint }[]; exit?: boolean }): Promise<string | V2UnwindWait | null> {
   const { v2, reader, account } = args;
   const touched = await reader.touched(account);
   // A full exit also looks at an account with no route and no vault left: its strategy was simply turned off earlier (the
@@ -184,7 +239,7 @@ export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tok
   /** What this sale needs from one read of the account. `swapper: false`: plan as if there were no cash swapper (no top-up, no cash-out). */
   const build = async (swapper: boolean) => {
     const read = await reader.account(account);
-    await freeUsdtOnly(args, read);
+    await spendableUsdtOnly(args, read);
     const positions: PreSellPosition[] = [];
     for (const r of read.routes.filter(x => x.collateralRaw > 0n)) {
       const need = args.steps.filter(s => s.tokenIn.toLowerCase() === r.route.collateral).reduce((sum, s) => sum + s.amountIn, 0n);
@@ -212,10 +267,13 @@ export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tok
     }) : [];
     return { read, plan, cashOuts, sweeps, toOwner, calls: [...plan.calls, ...cashOuts, ...sweeps], blocking: plan.notes.length > 0 };
   };
+  /** Nothing of these positions can be repaid this round: the sale is not held back for them (it is what brings the USDT in). */
+  const waitOf = (x: Awaited<ReturnType<typeof build>>): V2UnwindWait => ({ note: `[STRATEGY_EARN_UNWINDING] ${x.plan.notes.join('；')}`, stuck: x.plan.stuck, needUsdtRaw: x.plan.needUsdtRaw });
+  const onlyWaits = (x: Awaited<ReturnType<typeof build>>) => x.plan.calls.length === 0 && x.plan.stuck.length > 0;
   let b = await build(true);
   if (b.plan.retryAt !== undefined) args.log(`[strategy-routing] portfolio ${args.portfolioId}: 補差額的 24 小時額度用完，${new Date(b.plan.retryAt * 1000).toISOString()} 之後再補；這一輪先還得起的部分`);
   if (b.plan.notes.length === 0 && b.sweeps.length === 0 && b.cashOuts.length === 0) return null;
-  if (b.calls.length === 0) return `[STRATEGY_EARN_UNWINDING] ${b.plan.notes.join('；')}`;
+  if (b.calls.length === 0) return onlyWaits(b) && !args.dryRun ? waitOf(b) : `[STRATEGY_EARN_UNWINDING] ${b.plan.notes.join('；')}`;
   if (args.dryRun || args.send === null) {
     if (!b.blocking) return null;
     return `[STRATEGY_EARN_UNWINDING] 賣出前需先還款取回：${b.plan.notes.join('；')}（${args.dryRun ? 'dry-run' : '沒有路由 v2 的 session 權限，等 owner 續期'}，未送出）`;
@@ -250,7 +308,7 @@ export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tok
     args.log(`[strategy-routing] portfolio ${args.portfolioId}: 補差額／換回現金這一輪做不了（${seen.peg ? 'PegExceeded' : seen.window ? 'WindowExceeded' : shortError(error)}），這次賣出改走不補差額的還款取回`);
     b = await build(false);
     if (b.calls.length === 0) {
-      if (b.blocking) return `[STRATEGY_EARN_UNWINDING] ${b.plan.notes.join('；')}`;
+      if (b.blocking) return onlyWaits(b) ? waitOf(b) : `[STRATEGY_EARN_UNWINDING] ${b.plan.notes.join('；')}`;
       return txs.length > 0 ? `[STRATEGY_EARN_UNWINDING] 賣出前已還款取回 tx=${txs.join(',')}；下一輪再賣` : null;
     }
     try { await sendAll(b.calls, b.read); }
@@ -263,6 +321,8 @@ export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tok
     args.log(`[strategy-routing] portfolio ${args.portfolioId} 退出：${b.sweeps.length > 0 ? `激勵代幣已送到 ${b.toOwner ? 'owner 錢包' : '投資組合帳戶'}` : ''}${b.cashOuts.length > 0 ? `${b.sweeps.length > 0 ? '、' : ''}剩餘借款幣已換回 USDT` : ''} tx=${txs.join(',')}`);
     return null;
   }
+  // Only reward tokens / leftover loan token went out while every position waits: the sale goes ahead with what is free.
+  if (onlyWaits(b)) return waitOf(b);
   return `[STRATEGY_EARN_UNWINDING] 賣出前已還款取回：${b.plan.notes.join('；')} tx=${txs.join(',')}${txs.length > 1 ? `（分 ${txs.length} 筆）` : ''}；下一輪再賣`;
 }
 

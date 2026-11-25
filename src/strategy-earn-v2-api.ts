@@ -4,8 +4,8 @@ import { planAccount } from './strategy-earn-routing.js';
 import type { Costs, Decision, Holding } from './strategy-earn-routing.js';
 import { marketIdOf } from './strategy-earn-v2-chain.js';
 import type { V2AccountRead, V2Market, V2Reader } from './strategy-earn-v2-chain.js';
-import { BORROW_BUFFER_BPS, V2_CASH_OUT_MIN_RAW, V2_SWAPPER_ABI, maxDebtFor, planExecution, swapEventLine, v2ConsentCalls, v2ExitBatches, v2ExitPlan, v2MissingSwapperApprovals, v2ReconsentCalls, v2RescueCall, v2RouteEvents, v2SwapEvents } from './strategy-earn-v2.js';
-import type { Call, ExitInput, ExitRoute, RouteEvent, StrategyEarnV2, SwapQuote } from './strategy-earn-v2.js';
+import { BORROW_BUFFER_BPS, V2_CASH_OUT_MIN_RAW, V2_SWAPPER_ABI, maxDebtFor, planExecution, strategyV2Addresses, swapEventLine, v2ConsentCalls, v2ExitBatches, v2ExitPlan, v2MissingSwapperApprovals, v2ReconsentCalls, v2RescueCall, v2CashEvents, v2RouteEvents } from './strategy-earn-v2.js';
+import type { Call, ExitInput, ExitRoute, RouteEvent, StrategyEarnV2, SwapEvent, SwapQuote } from './strategy-earn-v2.js';
 import { rewardEvents } from './strategy-rewards.js';
 import type { RewardEvent } from './strategy-rewards.js';
 
@@ -29,9 +29,13 @@ export type V2ApiDeps = { v2: StrategyEarnV2; reader: V2Reader; now: () => Date;
   recordRoutes?: (chainId: number, events: readonly RouteEvent[]) => Promise<void>;
   recordRewards?: (chainId: number, events: readonly RewardEvent[]) => Promise<void>;
   rewardSymbol?: (token: Address) => string | undefined;
-  /** USDT in the account that the cash ledger claims (src/withdrawable-cash.ts `claimedCash`): an owner-signed top-up never spends it. Absent: none. */
-  reservedUsdt?: (account: Address) => Promise<bigint>;
-  /** Where the cash swapper's events are written until the ledger has a table for them; default: stdout. */
+  /** What the cash ledger says about the account's USDT (src/withdrawable-cash.ts): every bucket's claim, and the portfolio's
+   * own cash among them. An owner-signed top-up may spend the own cash and unclaimed USDT (it is booked by `bookSwaps` at
+   * `confirm`, and by the scheduler's recovery scan if that call never comes); nothing else. Absent: nothing is claimed. */
+  cashClaims?: (account: Address) => Promise<{ claimedRaw: bigint; ownRaw: bigint }>;
+  /** Cash ledger booking of a receipt's `ToppedUp` / `CashedOut` (src/strategy-cash-swaps.ts). Absent: only unclaimed USDT is offered to a top-up. */
+  bookSwaps?: (portfolioId: number, account: Address, events: readonly SwapEvent[]) => Promise<unknown>;
+  /** One structured line per cash swapper event; default: stdout. */
   log?: (line: string) => void };
 
 /** What each eligible asset would be worth (USD) for the plan: what the account holds plus `extraUsd` (new money by weight). */
@@ -99,6 +103,9 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
             ratioBps, since: since > 0 ? new Date(since * 1000).toISOString() : null } };
       });
       return { portfolioId: id, account, status: 'ok' as const, reason: null, message: null, updatedAt: deps.now().toISOString(), version: 2 as const,
+        // The contracts this account's v2 position lives on, the same object the signing payload of a My mix weight change
+        // carries (`strategyV2Addresses`): the app has no v2 address of its own (position details, pre-signature checks).
+        strategyV2: strategyV2Addresses(v2)!,
         earnNetUsd: read.earnNetUsd.toString(), autoOpen: positions.length === 0 && read.consent, positions,
         rewards: read.rewards.map(r => ({ token: r.token, boxRaw: r.boxRaw.toString(), accountRaw: r.accountRaw.toString() })) };
     },
@@ -158,9 +165,12 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
       // Account USDT the cash ledger claims is never the strategy's to spend: not for a top-up, and not as the `maxCashIn`
       // of a repayment on a route that borrows USDT (src/withdrawable-cash.ts claimedCash).
       const usdtToken = v2.loanTokens.USDT?.toLowerCase(), usdtCash = Object.values(read.tokens).find(t => t.token.toLowerCase() === usdtToken);
-      const reserved = deps.reservedUsdt && (Object.values(read.tokens).some(t => t.swap) || (usdtCash?.cashRaw ?? 0n) > 0n) ? await deps.reservedUsdt(account) : 0n;
-      for (const t of Object.values(read.tokens)) if (t.swap) t.swap.usdtRaw = t.swap.usdtRaw > reserved ? t.swap.usdtRaw - reserved : 0n;
-      if (usdtCash) usdtCash.cashRaw = usdtCash.cashRaw > reserved ? usdtCash.cashRaw - reserved : 0n;
+      const claims = deps.cashClaims && (Object.values(read.tokens).some(t => t.swap) || (usdtCash?.cashRaw ?? 0n) > 0n) ? await deps.cashClaims(account) : { claimedRaw: 0n, ownRaw: 0n };
+      // A top-up, and the `maxCashIn` of a repayment on a USDT route, may spend the portfolio's own cash and unclaimed USDT:
+      // what is spent is booked against the own cash when the UserOp is confirmed. Every other bucket stays untouched.
+      const others = deps.bookSwaps ? claims.claimedRaw - (claims.ownRaw < claims.claimedRaw ? claims.ownRaw : claims.claimedRaw) : claims.claimedRaw;
+      for (const t of Object.values(read.tokens)) if (t.swap) t.swap.usdtRaw = t.swap.usdtRaw > others ? t.swap.usdtRaw - others : 0n;
+      if (usdtCash) usdtCash.cashRaw = usdtCash.cashRaw > others ? usdtCash.cashRaw - others : 0n;
       const open = read.routes.filter(r => r.collateralRaw > 0n || r.routeDebtRaw > 0n);
       const chosen = open.filter(r => input.symbols.includes(r.route.symbol));
       const all = open.every(r => chosen.includes(r));
@@ -168,6 +178,7 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
       const approved = (q: SwapQuote | undefined) => q ? { swap: { ...q, usdtAllowanceRaw: maxUint256, tokenAllowanceRaw: maxUint256 } } : {};
       const routes: ExitRoute[] = chosen.map(r => { const t = read.tokens[r.route.loanSymbol]!; return { routeId: r.route.routeId, vaultId: (r.vault?.vaultId ?? ('0x' + '00'.repeat(32))) as Hex, routeDebtRaw: r.routeDebtRaw, cashRaw: t.cashRaw,
         loan: r.route.loanSymbol, vaultAssetsRaw: read.vaults.find(v => v.vault.vaultId === r.vault?.vaultId)?.assetsRaw ?? 0n, idleRaw: t.idleRaw, ...approved(t.swap),
+        postedRaw: r.collateralRaw, minDebtRaw: r.limits.minDebtRaw,
         // No route of this token stays open after this exit (which of the chosen ones is the last is the exit plan's to say).
         lastOfToken: !open.some(x => x.route.loan === r.route.loan && !chosen.includes(x)) }; });
       // Loan token other than USDT already in the account with nothing owed in it and no route of it being closed now: sold too.
@@ -178,11 +189,15 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
       const leftoverVaults = all ? read.vaults.filter(v => v.assetsRaw > 0n && (!named.has(v.vault.vaultId) || !chosen.some(r => r.route.loan === v.vault.token))).map(v => v.vault.vaultId) : [];
       const rewards = input.exit && all ? read.rewards.filter(r => r.boxRaw > 0n || r.accountRaw > 0n && r.allowanceRaw >= r.accountRaw)
         .map(r => ({ token: r.token, accountAmountRaw: r.accountRaw > 0n && r.allowanceRaw >= r.accountRaw ? maxUint256 : 0n })) : [];
-      const base: ExitInput = { routes, leftoverVaults, rewards, cashOuts, deadline: deadline(), withdrawConsent: all && read.policy.enabled, rewardRecipient: read.policy.rewardRecipient, now: deps.now().getTime() };
+      const planned: ExitInput = { routes, leftoverVaults, rewards, cashOuts, deadline: deadline(), withdrawConsent: all && read.policy.enabled, rewardRecipient: read.policy.rewardRecipient, now: deps.now().getTime() };
+      // A route in USDC / USD1 / U whose box is short, and no way to top it up now (the portfolio has no USDT it may spend,
+      // or the token's 24-hour window is used up): its close would only revert, so it is not handed out. The owner's UserOp
+      // repays what the box holds and takes that share of the collateral back (v2ExitPlan); consent is still withdrawn, and
+      // the scheduler closes the rest with the session key (it raises the missing USDT from the portfolio's own holdings).
+      // A vault of a token that stays owed is not released: its money is that route's repayment.
+      const owed = new Set(v2ExitPlan(v2, account, planned).open.map(routeId => chosen.find(r => r.route.routeId === routeId)?.route.loan));
+      const base: ExitInput = owed.size === 0 ? planned : { ...planned, leftoverVaults: read.vaults.filter(v => leftoverVaults.includes(v.vault.vaultId) && !owed.has(v.vault.token)).map(v => v.vault.vaultId) };
       const first = v2ExitPlan(v2, account, base);
-      // A route in USDC / USD1 / U whose box is short, and no way to top it up now (no USDT in the account, or the token's
-      // 24-hour window is used up): a close that would only revert is not handed out.
-      if (first.blocked.length > 0) return { status: 'unavailable' as const, reason: 'top_up_unavailable', message: TEMPORARILY };
       // Approvals to the swapper this exit uses and the account lacks: USDT for a top-up, the token itself for a cash-out.
       const usdt = v2.loanTokens.USDT?.toLowerCase() as Address | undefined, uses = new Set<Address>();
       for (const c of first.calls) {
@@ -220,7 +235,10 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
       // account has not yet (the first consent covered only the venues of the assets it had then).
       const needed = [...new Set(m.routes.filter(r => tokens.includes(r.collateral)).map(r => r.venue))];
       const granted = needed.length === 0 ? { venus: true, lista: true } : await reader.delegations(account);
-      return v2ReconsentCalls(v2, { maxDebtUsdRaw, rewardRecipient: owner, newCollaterals: tokens, venues: needed.filter(venue => !granted[venue]) });
+      // Approvals to the cash swapper the account still lacks (it consented before the swapper existed): signed here too, so
+      // its repayments can be topped up and its leftover loan token sold without waiting for another consent.
+      return v2ReconsentCalls(v2, { maxDebtUsdRaw, rewardRecipient: owner, newCollaterals: tokens, venues: needed.filter(venue => !granted[venue]),
+        swapperApprovals: v2MissingSwapperApprovals(v2, token => read.swapperAllowances[token] ?? 0n) });
     },
 
     /** Owner only (spec §4): the box's receipts of a broken vault back to the account. Only sponsored in a root-signed UserOp. */
@@ -243,8 +261,11 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
       const rewards = rewardEvents(tx, { portfolioId: id, account, holders: [account, box], owner, tokens: v2.rewardTokens.map(address => ({ symbol: deps.rewardSymbol?.(address) ?? 'LISTA', address })) });
       if (rewards.length > 0 && deps.recordRewards) await deps.recordRewards(v2.chainId, rewards);
       // Top-ups and cash-outs have no table yet: one structured log line each.
-      const swaps = v2SwapEvents(v2, tx, account);
+      // Top-ups and cash-outs: one structured log line each, and the cash ledger (the portfolio's own cash pays a top-up and
+      // receives a cash-out; exactly once per event, so a second `confirm` of the same receipt changes nothing).
+      const swaps = v2CashEvents(v2, tx, account, box);
       for (const e of swaps) (deps.log ?? console.log)(swapEventLine(v2.chainId, id, e));
+      if (swaps.length > 0 && deps.bookSwaps) await deps.bookSwaps(id, account, swaps);
       return { routes: routes.length, rewards: rewards.length, kinds: [...routes.map(e => e.kind as string), ...rewards.map(e => `reward_${e.kind}`), ...swaps.map(e => e.kind as string)] };
     },
   };

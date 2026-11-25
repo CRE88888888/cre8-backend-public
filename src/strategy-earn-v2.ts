@@ -40,6 +40,9 @@ export type StrategyEarnV2 = {
   /** The swapper's USDT pools (manifest `cashSwapper.pools`): a top-up pays USDT into one, a cash-out is paid from one. Only
    * used to book those transfers as internal to the portfolio (My mix flow accounting); `poolOf` on chain decides the swaps. */
   swapperPools?: readonly Address[];
+  /** Manifest `cashSwapper.ledgerFromBlock`: swapper events before this block were never booked in the cash ledger (they
+   * spent USDT no bucket claimed) and are ignored by it (src/strategy-cash-swaps.ts). Absent: the recovery scan is off. */
+  swapLedgerFromBlock?: bigint;
 };
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 function parseDeployment(d: Record<string, unknown>, what: string): StrategyEarnV2 {
@@ -56,7 +59,9 @@ function parseDeployment(d: Record<string, unknown>, what: string): StrategyEarn
   // `cashSwapper`: the address, or the manifest's object form `{ address, pools }` (the pools are informational: `poolOf` on chain decides).
   const cs = d.cashSwapper, swapper = cs === undefined || cs === null ? null : a(typeof cs === 'object' ? (cs as Record<string, unknown>).address : cs, 'cashSwapper.address');
   const swapperPools = swapper !== null && typeof cs === 'object' ? Object.entries(((cs as Record<string, unknown>).pools ?? {}) as Record<string, unknown>).map(([k, v]) => a(v, 'cashSwapper.pools.' + k)) : [];
-  return { chainId, swapper, swapperPools, executor: a(d.executor, 'executor'), registry: a(d.registry, 'registry'), lens: a(d.lens, 'lens'), venusComptroller: a(d.venusComptroller, 'venusComptroller'), moolah: a(d.moolah, 'moolah'),
+  const from = swapper !== null && typeof cs === 'object' ? (cs as Record<string, unknown>).ledgerFromBlock : undefined;
+  if (from !== undefined && (typeof from !== 'number' || !Number.isSafeInteger(from) || from < 0)) throw new Error(`${what}.cashSwapper.ledgerFromBlock must be a block number`);
+  return { chainId, swapper, swapperPools, ...(from === undefined ? {} : { swapLedgerFromBlock: BigInt(from as number) }), executor: a(d.executor, 'executor'), registry: a(d.registry, 'registry'), lens: a(d.lens, 'lens'), venusComptroller: a(d.venusComptroller, 'venusComptroller'), moolah: a(d.moolah, 'moolah'),
     loanTokens, rewardTokens: list(d.rewardTokens, 'rewardTokens'), adapters: list(d.adapters, 'adapters'), canaryOwners: list(d.canaryOwners, 'canaryOwners') };
 }
 const parsed = new Map<string, StrategyEarnV2[]>();
@@ -115,6 +120,14 @@ export function v2Audience(chainId: number, owner: string | null | undefined, en
   return list.some(x => x.toLowerCase() === owner.toLowerCase());
 }
 /** The deployment this owner's accounts may use, or null (= this owner stays on v1 / has no yield strategy v2). */
+/**
+ * The v2 addresses the app is told about (it has none of its own): with the signing payload of a My mix weight change, and
+ * with a v2 position's status. One shape, one source (the deployment): `registry`, `executor`, and `cashSwapper` when the
+ * deployment has one. The field names are an API contract with cre8-app: do not rename them.
+ */
+export type StrategyV2Addresses = { registry: Address; executor: Address; cashSwapper?: Address };
+export const strategyV2Addresses = (v2: StrategyEarnV2 | null): StrategyV2Addresses | null =>
+  v2 === null ? null : { registry: v2.registry, executor: v2.executor, ...(v2.swapper ? { cashSwapper: v2.swapper } : {}) };
 export const strategyEarnV2For = (chainId: number, owner: string | null | undefined, env: NodeJS.ProcessEnv = process.env): StrategyEarnV2 | null => {
   const v2 = strategyEarnV2(chainId, env);
   return v2 !== null && v2Audience(chainId, owner, env) ? v2 : null;
@@ -345,8 +358,9 @@ export function v2MissingSwapperApprovals(v2: StrategyEarnV2, allowance: (token:
  * asset whose only route is on the other venue). Only missing ones: the real venues refuse a delegation that changes nothing.
  */
 export function v2ReconsentCalls(v2: StrategyEarnV2, input: { maxDebtUsdRaw: bigint; rewardRecipient: Address; newCollaterals?: readonly Address[]; venues?: readonly ('venus' | 'lista')[];
-  /** Missing approvals to the cash swapper (USDT / loan tokens). The paymaster and the mix check accept them; the app's
-   * pre-signature check (cre8-app `checkStrategyConsentV2`) does not know the swapper yet, so the API does not send any. */
+  /** Approvals to the cash swapper (USDT / loan tokens) the account still lacks: an account that consented before the
+   * swapper existed signs them with its next weight change. The paymaster's mix check accepts them (assertMixV2Reconsent),
+   * and the app checks them against the `cashSwapper` the signing payload declares. */
   swapperApprovals?: readonly Address[] }): Call[] {
   if (input.maxDebtUsdRaw <= 0n) throw new Error('consent needs a debt ceiling');
   const venues = input.venues ?? [];
@@ -417,7 +431,10 @@ export type TopUpBlocked = { blocked: string;
   /** There is no swapper for this token (USDT, or no swapper deployed): the gap can only come from the account's own loan token. */
   noSwap?: true;
   /** The 24-hour window is used up: retry at this unix time, not every round. */
-  retryAt?: number };
+  retryAt?: number;
+  /** Only USDT is missing: this much more of it in the account (raw) buys the whole top-up, buffer included. The portfolio
+   * raises it by selling a little of what it holds (src/scheduler.ts cash raise), or the sale under way brings it in. */
+  needUsdtRaw?: bigint };
 /**
  * What to buy before a repayment of `repayRaw` (spec §17 "how the backend uses it"): null when the box and the account
  * cover it as read (gap 0: nothing is bought and the repayment does not depend on the pool); otherwise
@@ -449,7 +466,8 @@ export function planTopUp(input: { repayRaw: bigint; haveRaw: bigint; swap: Swap
   if (topUpMaxUsdtIn(amount) > spendable) {
     // Not enough USDT for the buffer too: what it buys still serves when it covers the gap itself (or a partial repayment).
     const afford = spendable * 1_000n / 1_003n;
-    if (afford < gap && (!input.partial || afford < V2_CASH_OUT_MIN_RAW)) return { blocked: `needs ${topUpMaxUsdtIn(gap) - spendable} more USDT in the account to buy the ${gap} of the loan token it is short of` };
+    if (afford < gap && (!input.partial || afford < V2_CASH_OUT_MIN_RAW)) return { blocked: `needs ${topUpMaxUsdtIn(gap) - spendable} more USDT in the account to buy the ${gap} of the loan token it is short of`,
+      ...(swap.usdtAllowanceRaw >= topUpMaxUsdtIn(amount) ? { needUsdtRaw: topUpMaxUsdtIn(amount) - input.usdtRaw } : {}) };
     amount = afford;
   }
   return { amountRaw: amount, maxUsdtInRaw: topUpMaxUsdtIn(amount), covers: amount >= gap };
@@ -492,7 +510,9 @@ export function settleRepayment(v2: StrategyEarnV2, r: SettleRoute, budget: Sett
     // a debt nothing on chain can repay gets the reason back; when only a vault that could not be read is in doubt
     // (`shortfall` reverted) and the box does hold the debt as last read, the repayment goes out without a top-up, as it
     // always did (it fails the simulation if the vault really cannot pay, and is planned again next round).
-    if (first.noSwap || D > vault + idle + cash) return { before: [], after: [], maxCashInRaw: cash, blocked: first, toppedUpRaw: 0n };
+    // A route that borrows USDT needs no swap: what it is short of is USDT itself, taken from the account (`maxCashIn`).
+    const blocked: TopUpBlocked = first.noSwap && key === 'USDT' ? { ...first, needUsdtRaw: D + driftOf(D) - (vault + idle + cash) } : first;
+    if (first.noSwap || D > vault + idle + cash) return { before: [], after: [], maxCashInRaw: cash, blocked, toppedUpRaw: 0n };
     first = null;
   }
   const A = first?.amountRaw ?? 0n;
@@ -512,6 +532,23 @@ export function settleRepayment(v2: StrategyEarnV2, r: SettleRoute, budget: Sett
   budget.idle.set(key, take(idle + A)); budget.vault.set(key, take(vault)); budget.cash.set(key, take(cash));
   return { before, after, maxCashInRaw: cash, ...(vaultFails ? { vaultFails } : {}), toppedUpRaw: A };
 }
+/**
+ * The repayment the box and the account's own loan token can make when the debt cannot be cleared (no USDT for the top-up
+ * yet): pay what is there (one raw unit less; a Lista debt may not be left under `floorRaw`) and take back the same share
+ * of the collateral, 2% less (spec §5: collateral may leave when debt ÷ budget does not rise and health does not fall).
+ * null when that frees next to nothing — under 1% of the debt (an earlier round already paid what there was): sending it
+ * again every round would never end, the rest waits for USDT.
+ */
+export function partialRepayment(input: { debtRaw: bigint; postedRaw: bigint; haveRaw: bigint; floorRaw: bigint }): { payRaw: bigint; takeRaw: bigint } | null {
+  const { debtRaw: debt, postedRaw: posted, haveRaw: have, floorRaw: floor } = input;
+  if (debt <= 0n || posted <= 0n) return null;
+  let pay = have > 1n ? have - 1n : 0n;
+  if (pay > debt) pay = debt;
+  if (debt - pay < floor) pay = debt > floor ? debt - floor : 0n;
+  if (pay * 100n < debt) return null;
+  const take = posted * pay / debt * 9_800n / 10_000n;
+  return take === 0n ? null : { payRaw: pay, takeRaw: take };
+}
 /** Venue minimums of a route (lens `minLoan` / `minDebt`, loan raw). */
 export type RouteLimits = { minLoanRaw: bigint; minDebtRaw: bigint };
 export type StepReason = Decision['reason'] | 'small_position';
@@ -524,6 +561,8 @@ export type Step = {
   fallback?: Call[][];
   /** Why nothing was built. */
   skipped?: string;
+  /** The step (or the rest of it) waits for this much more USDT in the account for its top-up (raw). */
+  needUsdtRaw?: bigint;
   rationale: string;
 };
 export type ExecutionPlan = { steps: Step[];
@@ -565,7 +604,9 @@ export function planExecution(input: { v2: StrategyEarnV2; account: Address; dec
     idleRaw: p.idleRaw ?? 0n, cashRaw: p.cashRaw ?? 0n, ...(p.swap ? { swap: p.swap } : {}),
     lastOfToken: !input.positions.some(x => x !== p && !closed.has(x.symbol) && x.loan === loan && ((x.routeDebtRaw ?? 0n) > 0n || (x.postedRaw ?? 0n) > 0n)) }, budget, { repayRaw, deadline, now, close });
   /** A step that waits for the swapper (window used up, no USDT, not approved): logged with its reason, not sent to revert. */
-  const waits = (base: Omit<Step, 'via' | 'calls'>, s: Settlement): Step => ({ ...base, via: 'session', calls: [], skipped: s.blocked!.blocked });
+  const waits = (base: Omit<Step, 'via' | 'calls'>, s: Settlement): Step => ({ ...base, via: 'session', calls: [], skipped: s.blocked!.blocked, ...(s.blocked!.needUsdtRaw === undefined ? {} : { needUsdtRaw: s.blocked!.needUsdtRaw }) });
+  /** What the box and the account still hold of a loan token at this point of the plan. */
+  const left = (p: PositionState, loan: string) => (budget.vault.get(loan) ?? p.vaultAssetsRaw ?? 0n) + (budget.idle.get(loan) ?? p.idleRaw ?? 0n) + (budget.cash.get(loan) ?? p.cashRaw ?? 0n);
   for (const d of [...input.decisions].sort((a, b) => order[a.action] - order[b.action])) {
     const base = { symbol: d.symbol, action: d.action, reason: d.reason as StepReason, rationale: d.rationale };
     const p = state.get(d.symbol);
@@ -589,7 +630,21 @@ export function planExecution(input: { v2: StrategyEarnV2; account: Address; dec
         const from = idsOf(p, d.from!), debt = p.routeDebtRaw ?? 0n;
         if (debt === 0n) { closed.add(d.symbol); steps.push({ ...base, via: 'session', calls: [closeCall(v2, account, from, p, deadline)] }); continue; }
         const s = settle(p, d.from!.loan, debt, true);
-        if (s.blocked && !s.blocked.noSwap) { steps.push(waits(base, s)); continue; }
+        // (A caller that says nothing about the box — no vault holding, no idle amount — gets the plain close, as ever.)
+        if (s.blocked && (!s.blocked.noSwap || s.blocked.needUsdtRaw !== undefined && (p.vaultAssetsRaw !== undefined || p.idleRaw !== undefined))) {
+          // Only USDT is missing (for the top-up, or — on a route that borrows USDT — for the repayment itself): repay what
+          // the box and the account's own loan token can and take that share of the
+          // collateral back now. The rest closes once the portfolio has the USDT (its own cash, or a little of what it
+          // holds sold for it — `needUsdtRaw` tells the scheduler how much).
+          const loan = d.from!.loan, part = s.blocked.needUsdtRaw === undefined ? null : partialRepayment({ debtRaw: debt, postedRaw: p.postedRaw ?? 0n, haveRaw: left(p, loan), floorRaw: p.minDebtRaw ?? 0n });
+          if (part === null) { steps.push(waits(base, s)); continue; }
+          principal -= part.payRaw;
+          const cash = budget.cash.get(loan) ?? p.cashRaw ?? 0n;
+          budget.vault.set(loan, 0n); budget.idle.set(loan, 0n); budget.cash.set(loan, 0n);
+          steps.push({ ...base, action: 'reduce', via: 'session', needUsdtRaw: s.blocked.needUsdtRaw!, calls: [v2Calls.reduce(v2, account, from.routeId, from.vaultId, part.payRaw, part.takeRaw, cash, deadline)],
+            rationale: `${base.rationale} — short of USDT for the top-up: repay ${part.payRaw} ${loan}, take back ${part.takeRaw} of ${p.postedRaw ?? 0n}; the rest closes once the account has ${s.blocked.needUsdtRaw} more USDT` });
+          continue;
+        }
         principal -= debt; closed.add(d.symbol);
         const close = closeCall(v2, account, from, p, deadline);
         // First: [top-up,] close [, sell the leftover]. If that reverts as a whole: the plain close again, with the larger
@@ -680,7 +735,10 @@ export function v2Batches<T>(items: readonly T[], gasOf: (item: T) => bigint | n
 /** One open route as the exit planner needs it. */
 export type ExitRoute = { routeId: Hex; vaultId: Hex; routeDebtRaw?: bigint; cashRaw?: bigint;
   /** With `loan` (the loan token's symbol) the close is planned through the cash swapper where the box is short (settleRepayment). */
-  loan?: string; vaultAssetsRaw?: bigint; idleRaw?: bigint; swap?: SwapQuote; lastOfToken?: boolean };
+  loan?: string; vaultAssetsRaw?: bigint; idleRaw?: bigint; swap?: SwapQuote; lastOfToken?: boolean;
+  /** Collateral posted on the route and the venue's minimum debt (lens `minDebt`): for the partial repayment of a close that
+   * cannot be covered yet (see `partialRepayment`). */
+  postedRaw?: bigint; minDebtRaw?: bigint };
 /**
  * Turn the strategy off / sell everything / delete (owner-signed): close every route, release every vault the box still
  * holds, optionally send the reward tokens on (box + what the account holds, to the owner's `rewardRecipient`), withdraw
@@ -699,10 +757,15 @@ export type ExitInput = { routes: readonly ExitRoute[]; leftoverVaults?: readonl
   now?: number };
 /**
  * The exit, and the closes it cannot cover (`blocked`: a route in USDC / USD1 / U whose box is short while the account
- * has no USDT to top it up with, or whose 24-hour top-up window is used up). A blocked route still gets its plain close.
+ * has no USDT to top it up with, or whose 24-hour top-up window is used up). Such a route is not closed here (a close that
+ * would only revert is not handed out): the owner's UserOp repays what the box and the account's own loan token can and
+ * takes that share of the collateral back (`partialRepayment`), or leaves the route alone when that is next to nothing.
+ * What is left is the scheduler's: it closes it with the session key once the portfolio has the USDT, or the window reopens.
  */
-export function v2ExitPlan(v2: StrategyEarnV2, account: Address, input: ExitInput): { calls: Call[]; blocked: string[] } {
-  const budget = settleBudget(), blocked: string[] = [], now = input.now ?? Date.now();
+export function v2ExitPlan(v2: StrategyEarnV2, account: Address, input: ExitInput): { calls: Call[]; blocked: string[];
+  /** Routes this exit leaves open (still owed): the `blocked` ones. */
+  open: Hex[] } {
+  const budget = settleBudget(), blocked: string[] = [], open: Hex[] = [], now = input.now ?? Date.now();
   const closes = input.routes.flatMap((r, i) => {
     const close = closeCall(v2, account, r, r, input.deadline), debt = r.routeDebtRaw ?? 0n;
     if (r.loan === undefined || debt === 0n) return [close];
@@ -711,10 +774,18 @@ export function v2ExitPlan(v2: StrategyEarnV2, account: Address, input: ExitInpu
     const last = r.lastOfToken === true && !input.routes.slice(i + 1).some(x => x.loan === r.loan && (x.routeDebtRaw ?? 0n) > 0n);
     const s = settleRepayment(v2, { loan: r.loan, routeDebtRaw: debt, vaultAssetsRaw: r.vaultAssetsRaw ?? 0n, idleRaw: r.idleRaw ?? 0n, cashRaw: r.cashRaw ?? 0n, ...(r.swap ? { swap: r.swap } : {}), lastOfToken: last },
       budget, { repayRaw: debt, deadline: input.deadline, now, close: true });
-    if (s.blocked) { if (!s.blocked.noSwap) blocked.push(s.blocked.blocked); return [close]; }
+    if (s.blocked && (!s.blocked.noSwap || s.blocked.needUsdtRaw !== undefined)) {
+      blocked.push(s.blocked.blocked); open.push(r.routeId);
+      const vault = budget.vault.get(r.loan) ?? r.vaultAssetsRaw ?? 0n, idle = budget.idle.get(r.loan) ?? r.idleRaw ?? 0n, cash = budget.cash.get(r.loan) ?? r.cashRaw ?? 0n;
+      const part = partialRepayment({ debtRaw: debt, postedRaw: r.postedRaw ?? 0n, haveRaw: vault + idle + cash, floorRaw: r.minDebtRaw ?? 0n });
+      if (part === null) return [];
+      budget.vault.set(r.loan, 0n); budget.idle.set(r.loan, 0n); budget.cash.set(r.loan, 0n);
+      return [v2Calls.reduce(v2, account, r.routeId, r.vaultId, part.payRaw, part.takeRaw, cash, input.deadline)];
+    }
+    if (s.blocked) return [close];
     return [...s.before, close, ...s.after];
   });
-  return { blocked, calls: [
+  return { blocked, open, calls: [
     ...v2SwapperApprovalCalls(v2, input.swapperApprovals ?? []),
     ...closes,
     ...(input.leftoverVaults ?? []).map(vaultId => v2Calls.release(v2, account, vaultId, input.deadline)),
@@ -748,8 +819,14 @@ export type PreSellPosition = PositionState & { routeId: Hex; vaultId: Hex; venu
  */
 export function v2PreSellPlan(v2: StrategyEarnV2, account: Address, positions: readonly PreSellPosition[], deadline: bigint, now: number = Date.now()): { calls: Call[]; notes: string[];
   /** A top-up that has to wait (unix seconds): the 24-hour window of some token is used up. */
-  retryAt?: number } {
-  const calls: Call[] = [], notes: string[] = [];
+  retryAt?: number;
+  /** Collateral (lowercase) whose posted part cannot be freed this round: the box and the account's own loan token are used
+   * up and the top-up has nothing to buy with (or has to wait). The sale goes ahead with what the account holds free. */
+  stuck: Address[];
+  /** USDT the stuck positions still need for their top-ups (raw; 0 when the wait is not about USDT). */
+  needUsdtRaw: bigint } {
+  const calls: Call[] = [], notes: string[] = [], stuck: Address[] = [];
+  let needUsdtRaw = 0n;
   // Routes that share a loan token share the box's money for it (and the top-up cap, and the account's USDT): what an
   // earlier close in this plan uses is gone.
   const budget = settleBudget();
@@ -777,17 +854,17 @@ export function v2PreSellPlan(v2: StrategyEarnV2, account: Address, positions: r
     const part = full.blocked.noSwap ? null : settleRepayment(v2, route, budget, { repayRaw: debt, deadline, now, close: false, partial: true });
     const bought = part && !part.blocked ? part.toppedUpRaw : 0n;
     const have = before.vault + before.idle + before.cash + bought;
-    const floor = p.minDebtRaw ?? 0n;
-    let pay = have > 1n ? have - 1n : 0n;
-    if (pay > debt) pay = debt;
-    if (debt - pay < floor) pay = debt > floor ? debt - floor : 0n;
-    const take = pay === 0n ? 0n : posted * pay / debt * 9_800n / 10_000n;
-    if (pay === 0n || take === 0n) { notes.push(`${p.symbol} cannot be freed: the box and the account hold ${have} ${p.loan} against a debt of ${debt}${full.blocked.noSwap ? '' : ` (${full.blocked.blocked})`}`); continue; }
+    const some = partialRepayment({ debtRaw: debt, postedRaw: posted, haveRaw: have, floorRaw: p.minDebtRaw ?? 0n });
+    if (some === null) {
+      stuck.push(p.collateral.toLowerCase() as Address); needUsdtRaw += full.blocked.needUsdtRaw ?? 0n;
+      notes.push(`${p.symbol} cannot be freed yet: the box and the account hold ${have} ${p.loan} against a debt of ${debt}${full.blocked.noSwap ? '' : ` (${full.blocked.blocked})`}`); continue;
+    }
+    const pay = some.payRaw, take = some.takeRaw;
     calls.push(...(part && !part.blocked ? part.before : []), v2Calls.reduce(v2, account, p.routeId, p.vaultId, pay, take, before.cash, deadline));
     budget.vault.set(p.loan, 0n); budget.idle.set(p.loan, 0n); budget.cash.set(p.loan, 0n);
     notes.push(`${p.symbol} short of ${p.loan}: ${bought > 0n ? `top up ${bought} from USDT, ` : ''}repay ${pay}, take back ${take} of ${posted}; the sale pays the rest`);
   }
-  return { calls, notes, ...(retryAt === undefined ? {} : { retryAt }) };
+  return { calls, notes, stuck, needUsdtRaw, ...(retryAt === undefined ? {} : { retryAt }) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,7 +1175,10 @@ export async function runV2Account(a: V2RoundArgs): Promise<V2RoundResult> {
 // ---------------------------------------------------------------------------
 // Cash swapper: what happened (events) and why it did not (errors)
 // ---------------------------------------------------------------------------
-export type SwapEvent = { kind: 'top_up' | 'cash_out'; account: Address; token: Address; usdtRaw: bigint; tokenRaw: bigint;
+export type SwapEvent = {
+  /** `top_up` / `cash_out`: the cash swapper. `repay_cash` / `vault_cash`: a route that borrows USDT — the account's own USDT
+   * taken for a repayment (`maxCashIn`), and USDT the strategy paid back to the account (what a vault had left). */
+  kind: 'top_up' | 'cash_out' | 'repay_cash' | 'vault_cash'; account: Address; token: Address; usdtRaw: bigint; tokenRaw: bigint;
   /** top_up: the debt less the idle loan token in the box before the swap. */
   needRaw: bigint | null; txHash: Hex; logIndex: number; blockNumber: bigint };
 /**
@@ -1119,6 +1199,35 @@ export function v2SwapEvents(v2: StrategyEarnV2, tx: { hash: Hex; blockNumber: b
   }
   return out;
 }
+const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+/**
+ * USDT that moved between the account and its own strategy in a verified receipt, other than through the cash swapper:
+ * the account's USDT the executor took for a repayment on a route that borrows USDT (`repay_cash`: account -> executor,
+ * chain 97 fork: the `Reduced.fromCash` of that call), and USDT the strategy paid to the account (`vault_cash`: from the
+ * executor, a vault adapter or the account's strategy box — what a USDT vault had left once nothing is owed). The cash
+ * ledger books them like a top-up and a cash-out (src/strategy-cash-swaps.ts). `box`: the account's strategy box, when known.
+ * The swapper's pools are deliberately not counterparties here: their transfers are the `ToppedUp` / `CashedOut` events.
+ */
+export function v2UsdtFlows(v2: StrategyEarnV2, tx: { hash: Hex; blockNumber: bigint; logs: readonly Log[] }, account: Address, box?: Address | null): SwapEvent[] {
+  const usdt = v2.loanTokens.USDT?.toLowerCase();
+  if (!usdt) return [];
+  const me = account.toLowerCase(), inside = new Set([v2.executor, ...v2.adapters, ...(box ? [box] : [])].map(a => a.toLowerCase()));
+  const out: SwapEvent[] = [];
+  for (const log of tx.logs) {
+    if (log.address.toLowerCase() !== usdt || log.logIndex == null || log.topics.length !== 3 || log.topics[0] !== TRANSFER_TOPIC) continue;
+    const from = ('0x' + log.topics[1]!.slice(26)).toLowerCase(), to = ('0x' + log.topics[2]!.slice(26)).toLowerCase();
+    let value: bigint;
+    try { value = BigInt(log.data); } catch { continue; }
+    if (value === 0n) continue;
+    const kind = from === me && to === v2.executor.toLowerCase() ? 'repay_cash' as const : to === me && inside.has(from) ? 'vault_cash' as const : null;
+    if (kind === null) continue;
+    out.push({ kind, account: me as Address, token: usdt as Address, usdtRaw: value, tokenRaw: value, needRaw: null, txHash: tx.hash, logIndex: log.logIndex, blockNumber: tx.blockNumber });
+  }
+  return out;
+}
+/** Everything of a receipt the cash ledger books for this account: the swapper's events and the USDT flows of USDT routes. */
+export const v2CashEvents = (v2: StrategyEarnV2, tx: { hash: Hex; blockNumber: bigint; logs: readonly Log[] }, account: Address, box?: Address | null): SwapEvent[] =>
+  [...v2SwapEvents(v2, tx, account), ...v2UsdtFlows(v2, tx, account, box)].sort((a, b) => a.logIndex - b.logIndex);
 /** One structured log line per swap (JSON; amounts as decimal strings): the record until the ledger has a table for them. */
 export const swapEventLine = (chainId: number, portfolioId: number, e: SwapEvent): string => JSON.stringify({ level: 'info', msg: 'strategy_cash_swap', chainId, portfolioId, account: e.account, kind: e.kind, token: e.token,
   usdtRaw: e.usdtRaw.toString(), tokenRaw: e.tokenRaw.toString(), ...(e.needRaw === null ? {} : { needRaw: e.needRaw.toString() }), txHash: e.txHash, logIndex: e.logIndex, blockNumber: e.blockNumber.toString() });

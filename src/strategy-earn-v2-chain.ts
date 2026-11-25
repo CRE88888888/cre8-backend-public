@@ -1,5 +1,5 @@
 import { createPublicClient, decodeFunctionResult, encodeFunctionData, fallback, http, parseAbi, zeroAddress } from 'viem';
-import type { Abi, Address, Hex, PublicClient } from 'viem';
+import type { Abi, Address, Hex, Log, PublicClient } from 'viem';
 import { TESTNET_97 } from './testnet-profile.js';
 import { STRATEGY_EARN_97 } from './strategy-earn-guard.js';
 import { STABLES } from './strategy-earn-mainnet.js';
@@ -448,6 +448,14 @@ export function defaultV2Reader(v2: StrategyEarnV2, env: NodeJS.ProcessEnv = pro
     readers.set(key, r);
   }
   return r;
+}
+/** Logs and the head from the public nodes (never the paid RPC): the cash swapper's events for the cash ledger's recovery scan. */
+export function v2LogReader(v2: StrategyEarnV2, env: NodeJS.ProcessEnv = process.env) {
+  const urls = v2PublicRpcs(v2.chainId, env);
+  const client = createPublicClient({ transport: urls.length === 1 ? http(urls[0], { timeout: 12_000, retryCount: 1 }) : fallback(urls.map(u => http(u, { timeout: 12_000, retryCount: 0 })), { rank: false }) });
+  return { getBlockNumber: () => client.getBlockNumber({ cacheTime: 0 }),
+    getLogs: (filter: { address: Address; events: readonly unknown[]; args: Record<string, Address | readonly Address[]>; fromBlock: bigint; toBlock: bigint }) =>
+      client.getLogs({ address: filter.address, events: filter.events as never, args: filter.args as never, fromBlock: filter.fromBlock, toBlock: filter.toBlock, strict: true }) as Promise<readonly Log[]> };
 }
 /** Estimated gas of one executor call sent by the account itself (public node), or null when it cannot be estimated. */
 export async function v2EstimateGas(v2: StrategyEarnV2, account: Address, call: Call, env: NodeJS.ProcessEnv = process.env): Promise<bigint | null> {

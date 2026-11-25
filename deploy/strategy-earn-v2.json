@@ -1,5 +1,5 @@
 {
-  "note": "Strategy Earn routing v2 deployments (cre8-contracts deployments/*.json `borrowV2`). The backend reads every v2 address from here (or from STRATEGY_EARN_V2_DEPLOYMENT, which wins): executor, registry, lens, the cash swapper, the session-key scope and the paymaster allowlist all follow this file. After a redeploy, replace the entry (a new executor needs a new cash swapper); routes and vaults are discovered from the registry, they are not listed here. `cashSwapper`: AtpBorrowCashSwapper (docs/borrow-routing-v2 §17) bound to this executor — `address` is what the backend uses, `pools` are informational (`poolOf` on chain decides). `canaryOwners`: owners whose accounts use v2 while STRATEGY_EARN_V2_AUDIENCE is unset; empty = v2 is off for everyone (v1 for all). 2026-11-25: the draft6 set (executor 0xeddd…600F) replaced the draft5 one (executor 0x494C…6bB5, registry paused, no principal left on any of its 66 routes); the only canary owner is the e2e harness wallet.",
+  "note": "Strategy Earn routing v2 deployments (cre8-contracts deployments/*.json `borrowV2`). The backend reads every v2 address from here (or from STRATEGY_EARN_V2_DEPLOYMENT, which wins): executor, registry, lens, the cash swapper, the session-key scope and the paymaster allowlist all follow this file. After a redeploy, replace the entry (a new executor needs a new cash swapper); routes and vaults are discovered from the registry, they are not listed here. `cashSwapper`: AtpBorrowCashSwapper (docs/borrow-routing-v2 §17) bound to this executor — `address` is what the backend uses, `pools` are informational (`poolOf` on chain decides), `ledgerFromBlock` is the block from which the cash ledger books the swapper's top-ups and cash-outs (earlier ones spent USDT no bucket claimed and are never booked; without it the recovery scan is off). `canaryOwners`: owners whose accounts use v2 while STRATEGY_EARN_V2_AUDIENCE is unset; empty = v2 is off for everyone (v1 for all). 2026-11-25: the draft6 set (executor 0xeddd…600F) replaced the draft5 one (executor 0x494C…6bB5, registry paused, no principal left on any of its 66 routes); the only canary owner is the e2e harness wallet.",
   "deployments": [
     {
       "chainId": 97,
@@ -31,6 +31,7 @@
       ],
       "cashSwapper": {
         "address": "0x99811a1115B36F8310deaDAda818cAE685360798",
+        "ledgerFromBlock": 144783774,
         "gitCommit": "df96fcc222d53e6540d9566d72c9a754908beaac",
         "pools": {
           "USDC": "0xB880D719455D11627A37cAc49493bFb54C884A01",

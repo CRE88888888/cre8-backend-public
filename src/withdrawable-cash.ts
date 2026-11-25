@@ -37,3 +37,17 @@ export function withdrawableCash(observed: bigint, balances: Record<string, unkn
   const reserved = reservedCash(balances);
   return observed > reserved ? observed - reserved : 0n;
 }
+/**
+ * Account USDT a routing v2 cash swapper top-up may spend (src/strategy-cash-swaps.ts): what no bucket claims, plus the
+ * portfolio's own cash (`allocated_cash_raw`: its cash weight and what its sales brought in). The top-up is booked against
+ * that bucket when it lands and the cash-out is booked back into it, so the ledger never ends up above the chain balance.
+ * Never: funding waiting to be bought, a running job's money, the withdrawal and yield reservations. Wallet cash, Cash
+ * Earn and other portfolios live in other accounts and are never part of `observed`.
+ */
+export function strategySpendableCash(observed: bigint, balances: Record<string, unknown> | null | undefined): bigint {
+  if (!balances) return observed;
+  const own = balances.allocated_cash_raw;
+  if (typeof own !== 'string' || !/^\d+$/.test(own)) throw new Error('invalid cash bucket allocated_cash_raw');
+  const others = claimedCash(balances) - BigInt(own);
+  return observed > others ? observed - others : 0n;
+}

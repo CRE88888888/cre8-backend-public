@@ -3,7 +3,7 @@ import type { Address, Hex, Log, PublicClient } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { bscTestnet } from 'viem/chains';
 import { getConfig } from './config.js';
-import { query as dbQuery } from './db.js';
+import { query as dbQuery, withTransaction } from './db.js';
 import { AppError, ValidationError } from './errors.js';
 import { requireOwnedPortfolio } from './portfolios.js';
 import { TESTNET_97 } from './testnet-profile.js';
@@ -20,6 +20,7 @@ import { createStrategyEarnV2Api } from './strategy-earn-v2-api.js';
 import type { StrategyEarnV2Api } from './strategy-earn-v2-api.js';
 import { defaultV2Reader, v2EstimateGas } from './strategy-earn-v2-chain.js';
 import { claimedCash } from './withdrawable-cash.js';
+import { settleCashSwaps } from './strategy-cash-swaps.js';
 export { STRATEGY_EARN_97, assertNotStrategyVault, isStrategyVault } from './strategy-earn-guard.js';
 
 /**
@@ -383,10 +384,12 @@ export function defaultStrategyEarnV2Api(v2: StrategyEarnV2): StrategyEarnV2Api 
     const ledger = routeLedger((sql, params) => dbQuery(sql, params));
     api = createStrategyEarnV2Api({ v2, reader: defaultV2Reader(v2), now: () => new Date(), estimateGas: (account, call) => v2EstimateGas(v2, account, call),
       recordRoutes: (chainId, events) => ledger.record(chainId, events), recordRewards: (chainId, events) => rewardsStore().record(chainId, events),
-      // An owner-signed top-up spends only USDT no bucket of the cash ledger claims (src/withdrawable-cash.ts claimedCash).
-      reservedUsdt: async account => { const rows = (await dbQuery(`select b.unallocated_hold_raw::text,b.stack_prefund_raw::text,b.allocated_cash_raw::text,b.reserved_input_raw::text,b.reserved_fee_raw::text,b.withdrawal_raw::text,b.yield_raw::text
+      // An owner-signed top-up spends the portfolio's own cash and USDT no bucket of the cash ledger claims; `confirm` books it
+      // (src/strategy-cash-swaps.ts), and the scheduler's recovery scan does if that call never comes.
+      cashClaims: async account => { const rows = (await dbQuery(`select b.unallocated_hold_raw::text,b.stack_prefund_raw::text,b.allocated_cash_raw::text,b.reserved_input_raw::text,b.reserved_fee_raw::text,b.withdrawal_raw::text,b.yield_raw::text
         from strategy_cash_balances b join smart_accounts s on (s.chain_id,s.portfolio_id)=(b.chain_id,b.portfolio_id) where s.chain_id=$1 and s.address=$2 and s.retired_at is null`, [v2.chainId, account.toLowerCase()])).rows as Record<string, unknown>[];
-        return rows.reduce((sum, row) => sum + claimedCash(row), 0n); } });
+        return { claimedRaw: rows.reduce((sum, row) => sum + claimedCash(row), 0n), ownRaw: rows.reduce((sum, row) => sum + BigInt(String(row.allocated_cash_raw)), 0n) }; },
+      bookSwaps: (portfolioId, account, events) => settleCashSwaps(fn => withTransaction(client => fn({ query: (text, params) => client.query(text, params ? [...params] : []) })), v2, { chainId: v2.chainId, portfolioId, account }, events) });
     defaultV2Apis.set(key, api);
   }
   return api;
@@ -756,6 +759,9 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
       if (v2) {
         try {
           const more = await v2ApiOf(v2).confirm(id, account, wallet.toLowerCase() as Address, tx);
+          // An owner UserOp changed the v2 position: the scheduler looks at the portfolio in its next round instead of at the
+          // end of its idle back-off — what the owner's turn-off could not close (a little USDT missing) is finished then.
+          if (more.kinds.length > 0) { try { await deps.query('update portfolios set next_run_at=null where id=$1', [id]); } catch { /* the regular round comes anyway */ } }
           return { status: 'confirmed' as const, recorded: events.length + more.routes + more.rewards, kinds: [...events.map(e => e.kind as string), ...more.kinds] };
         } catch { return { status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY }; }
       }

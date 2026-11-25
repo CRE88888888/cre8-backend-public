@@ -177,7 +177,7 @@ test('routing v2 fork: consent -> open on the best route -> hold -> vault left o
   mark('pre-sell');
   // 8. Before a sale of the posted shares: repay first, take them back (session key); the sale waits a round.
   const selling = await v2UnwindForSale({ ...await step(), steps: [{ tokenIn: NVDAB, amountIn: held.freeCollateralRaw }] });
-  assert.match(selling ?? '', /\[STRATEGY_EARN_UNWINDING\] 賣出前已還款取回：NVDAB/);
+  assert.match(String(selling ?? ''), /\[STRATEGY_EARN_UNWINDING\] 賣出前已還款取回：NVDAB/);
   read = await reader.account(A, [NVDAB]);
   assert.equal(read.routes.filter(r => r.collateralRaw > 0n || r.routeDebtRaw > 0n).length, 0);
   assert.equal(read.state.holdings.find(h => h.collateral === NVDAB)!.freeCollateralRaw, held.freeCollateralRaw, 'every share is back in the account');
@@ -398,7 +398,7 @@ test('routing v2 fork, cash swapper: a USD1 route whose vault earned less than t
   const usdt0 = await bal(USDT);
   if (usdt0 > 0n) { const w = await s.from(A); await mined(client, await w.writeContract({ address: USDT, abi: ERC20, functionName: 'transfer', args: [OWNER, usdt0], gas: 200_000n })); }
   const dry = await v2UnwindForSale({ ...await step({ dryRun: true }), steps: [{ tokenIn: NVDAB, amountIn: pos.collateralRaw }] });
-  assert.match(dry ?? '', /short of USD1/);
+  assert.match(String(dry ?? ''), /short of USD1/);
 
   mark('swapper: USDT in the account -> topUp + close + cashOut');
   // 4. With USDT in the account (10 USDT: a little cash, far more than the gap): one "UserOp" tops up, closes and sells the leftover.
@@ -410,7 +410,7 @@ test('routing v2 fork, cash swapper: a USD1 route whose vault earned less than t
   const sentCalls: Call[][] = [];
   const txs: V2Tx[] = [];
   const selling = await v2UnwindForSale({ ...await step({ send: async (calls: Call[]) => { sentCalls.push(calls); const tx = await send(calls); txs.push(tx); return tx; } }), steps: [{ tokenIn: NVDAB, amountIn: pos.collateralRaw }] });
-  assert.match(selling ?? '', /賣出前已還款取回：NVDAB top up \d+ USD1 from USDT, repay \d+ USD1, take back, sell the USD1 left/);
+  assert.match(String(selling ?? ''), /賣出前已還款取回：NVDAB top up \d+ USD1 from USDT, repay \d+ USD1, take back, sell the USD1 left/);
   assert.deepEqual(sentCalls.map(c => names(c, v2)), [['topUp', 'executeReduce', 'cashOut']]);
   read = await reader.account(A, [NVDAB]);
   const swaps = txs.flatMap(tx => v2SwapEvents(v2, tx, A));
@@ -443,3 +443,179 @@ test('routing v2 fork, cash swapper: a USD1 route whose vault earned less than t
   console.log(JSON.stringify({ gap: q.gapRaw!.toString(), cap: q.capRaw.toString(), toppedUp: topped.tokenRaw.toString(), usdtIn: topped.usdtRaw.toString(), cashedOut: cashed.tokenRaw.toString(), usdtOut: cashed.usdtRaw.toString(),
     openGas: { estimate: gas.open.estimate.toString(), used: gas.open.used.toString() } }));
 });
+
+/**
+ * The portfolio has no USDT the cash ledger does not claim (what every real user's account looks like): a route in USD1
+ * whose box is a little short must still close cleanly — on a plain turn-off and on a sell-all with the strategy on — for
+ * both kinds of account. The scheduler's sale pipeline and Postgres are not part of a fork test: a sale is played by moving
+ * the sold shares out and its USDT proceeds in (booked as the portfolio's own cash, as settleAllocatedCash does), and the
+ * cash ledger by the two numbers the strategy reads from it. Everything on the v2 side is the real code on the real contracts.
+ */
+const FUND_ACCOUNT = '0x3a761e26ed26d417c7d59e259473f1b0ddcd04e5' as Address; // fund 40's account of the canary owner (testnet portfolio 12): enrolled in a public fund
+const MIX_ACCOUNT = '0xc1f64db181e29912dcf8ffd1d70f6e1821ef97c1' as Address; // My mix 16's account of the same owner (testnet portfolio 30): enrolled in its own private strategy
+const CANARY = '0xd3ab39b62e221bf9e8ba19fe19b2638767d3d6d9' as Address;
+for (const [kind, loan] of [['fund', 'USD1'], ['mix', 'USDT'], ['mix', 'USD1'], ['fund', 'USDT']] as const) {
+  test(`routing v2 fork, no USDT outside the cash ledger (${kind} account, ${loan} route): turn-off and sell-all with the strategy on both end with no debt, no posted collateral, no loan token left and a ledger equal to the chain balance`, { skip }, async () => {
+    const { cashRaiseUsdE8 } = await import('../src/scheduler.js');
+    const s = setup(), { v2, reader, client } = s;
+    const X = kind === 'fund' ? FUND_ACCOUNT : MIX_ACCOUNT, send = s.sender(X), lines: string[] = [];
+    const USDT = v2.loanTokens.USDT!, USD1 = v2.loanTokens.USD1!, swaps = loan !== 'USDT';
+    const bal = (token: Address, who: Address = X) => client.readContract({ address: token, abi: ERC20, functionName: 'balanceOf', args: [who] });
+    const move = async (token: Address, from: Address, to: Address, amount: bigint) => { if (amount === 0n) return; const w = await s.from(from); const r = await mined(client, await w.writeContract({ address: token, abi: ERC20, functionName: 'transfer', args: [to, amount], gas: 300_000n })); assert.equal(r.status, 'success'); };
+    const SINK = '0x000000000000000000000000000000000000dEaD' as Address;
+    // An asset of the account's own enrolled strategy that has a Lista route in this loan token and a pool to take test shares from.
+    const before = await reader.account(X);
+    assert.ok(before.enrollment !== null && before.routes.length === 0, 'the account is enrolled and holds nothing on v2');
+    // Earlier tests on this fork moved its clock by months: the rate reporter's numbers are refreshed first (as the API
+    // service does every 12 hours), so the vaults read as they do on the live chain.
+    const multicall = v2Multicall(client), operator = s.sender(OPERATOR), chainNow = (await s.now()).getTime();
+    await runRateReport({ v2, reader, multicall, now: () => chainNow, rates: book => fromTestnetMocks(v2, book, multicall), signer: { address: OPERATOR, send: async (to, data) => (await operator([{ to, data, value: '0' }])).hash } });
+    reader.invalidate();
+    const m = await reader.market();
+    const assets = await client.readContract({ address: T.contracts.registry as Address, abi: parseAbi(['function historicalAssets(uint256) view returns (address[])']), functionName: 'historicalAssets', args: [before.enrollment!.strategyId] });
+    const profile = Object.entries(T.assets as Record<string, { token: string; pool: string }>);
+    const picked = profile.find(([symbol, a]) => assets.some(x => x.toLowerCase() === a.token.toLowerCase()) && m.routes.some(r => r.symbol === symbol && r.venue === 'lista' && r.loanSymbol === loan));
+    assert.ok(picked, `the strategy has an asset with a Lista ${loan} route`);
+    const [SYMBOL, { token: C0, pool: POOL }] = picked!, C = C0.toLowerCase() as Address;
+    const route = m.routes.find(r => r.symbol === SYMBOL && r.venue === 'lista' && r.loanSymbol === loan)!;
+    // The cash ledger as the strategy sees it: the portfolio's own cash, and money other buckets claim (a fund here has 25
+    // USDT waiting for a running buy job — never the strategy's to spend; the mix has no USDT at all).
+    const cash = { own: 0n, others: kind === 'fund' ? 25n * 10n ** 18n : 0n };
+    const booked: { kind: string; usdtRaw: bigint }[] = [];
+    const ledger: V2Ledger = { ...s.ledger, swaps: async (_p, _a, events) => { for (const e of events) { booked.push({ kind: e.kind, usdtRaw: e.usdtRaw }); const out = e.kind === 'top_up' || e.kind === 'repay_cash'; cash.own = out ? (cash.own > e.usdtRaw ? cash.own - e.usdtRaw : 0n) : cash.own + e.usdtRaw; } } };
+    const cashClaims = async () => ({ claimedRaw: cash.own + cash.others, ownRaw: cash.own });
+    const needs: bigint[] = [];
+    const step = async (o: object = {}) => ({ v2, reader, account: X, portfolioId: 1, now: await s.now(), dryRun: false, send, ledger, log: (l: string) => lines.push(l), held: [C], cashClaims, onCashNeed: (n: bigint) => { needs.push(n); }, ...o });
+    const api = createStrategyEarnV2Api({ v2, reader, now: s.clock, cashClaims, bookSwaps: (id, account, events) => ledger.swaps!(id, account, events), log: () => {} });
+    /** The account's USDT is exactly what the ledger claims: nothing unclaimed, and never a deficit. */
+    const ledgerMatchesChain = async (when: string) => assert.equal(await bal(USDT), cash.own + cash.others, `${when}: chain USDT == ledger`);
+    const tag = `${kind}/${loan}`;
+
+    mark(`${tag}: fund the account`);
+    for (const token of [USDT, USD1, v2.loanTokens.USDC!, v2.loanTokens.U!, C]) await move(token, X, SINK, await bal(token));
+    await move(USDT, v2.swapperPools![0]!, X, cash.others);
+    await move(C, POOL as Address, X, await bal(C, POOL as Address) / 2_000n);
+    let read = await reader.account(X, [C]);
+    let held = read.state.holdings.find(h => h.collateral === C)!;
+    // About 400 USD of it, whatever the test token is priced at.
+    if (held.collateralUsd > 600 || held.collateralUsd < 300) {
+      const want = held.freeCollateralRaw * 400n / BigInt(Math.max(1, Math.round(held.collateralUsd)));
+      if (want < held.freeCollateralRaw) await move(C, X, SINK, held.freeCollateralRaw - want); else await move(C, POOL as Address, X, want - held.freeCollateralRaw);
+      read = await reader.account(X, [C]); held = read.state.holdings.find(h => h.collateral === C)!;
+    }
+    assert.ok(held.collateralUsd > 300 && held.collateralUsd < 600, `${SYMBOL} worth ${held.collateralUsd}`);
+    const total = held.freeCollateralRaw, usdPerUnitE18 = BigInt(Math.round(held.collateralUsd * 1e6)) * 10n ** 30n / total;
+    /** A sale through the portfolio's own pipeline, played: the shares leave, the USDT proceeds arrive and are booked as its own cash. */
+    const sell = async (amount: bigint) => { const proceeds = amount * usdPerUnitE18 / 10n ** 18n * 997n / 1_000n; await move(C, X, SINK, amount); await move(USDT, v2.swapperPools![0]!, X, proceeds); cash.own += proceeds; return proceeds; };
+    await ledgerMatchesChain('start');
+
+    mark(`${tag}: consent, open on Lista/${loan} into a vault that pays nothing, 60 days`);
+    const auto = await api.auto(X, CANARY, { budgetRaw: 0n, weights: [{ asset: C, weightBps: 10_000 }], keyReady: true });
+    if (auto.status !== 'ready') throw new Error('consent unavailable: ' + JSON.stringify(auto));
+    await send(auto.calls!);
+    // The session key's own call, on the route under test (which route is best today is the engine's business, not this test's).
+    // It borrows into the token's best open vault; then the money is moved to Venus (0% on chain 97), where it earns less
+    // than the loan costs (the contract refuses to open straight into a vault that pays less than the loan).
+    const zeroVault = m.vaults.find(v => v.venue === 'venus' && v.tokenSymbol === loan)!;
+    const goodVault = m.vaults.filter(v => v.tokenSymbol === loan && v.eligible && v.vaultId !== zeroVault.vaultId).sort((x, y) => (y.supplyBps + y.incentiveBps) - (x.supplyBps + x.incentiveBps))[0]!;
+    const borrow = BigInt(Math.round(held.collateralUsd * route.targetLtvBps / 10_000 * 0.9 * 1e6)) * 10n ** 12n;
+    const soon = async () => BigInt(Math.floor((await s.now()).getTime() / 1000) + 600);
+    await send([v2Calls.open(v2, X, route.routeId, goodVault.vaultId, total, borrow, await soon())]);
+    await send([v2Calls.switchVault(v2, X, goodVault.vaultId, zeroVault.vaultId, maxUint256, await soon())]);
+    read = await reader.account(X, [C]);
+    const pos = read.routes[0]!;
+    assert.deepEqual([pos.route.venue, pos.route.loanSymbol, pos.collateralRaw, read.vaults.filter(v => v.assetsRaw > 0n).map(v => v.vault.vaultId)], ['lista', loan, total, [zeroVault.vaultId]]);
+    await s.local.increaseTime({ seconds: 60 * 86_400 }); await s.local.mine({ blocks: 1 });
+    await s.now();
+    read = await reader.account(X, [C]);
+    const debt0 = read.tokens[loan]!.debtRaw, gap0 = debt0 - read.vaults.reduce((sum, v) => sum + v.assetsRaw, 0n) - read.tokens[loan]!.idleRaw;
+    assert.ok(gap0 > 0n && gap0 < debt0 / 50n, `the box holds a little less than the debt: gap ${gap0} of ${debt0}`);
+    if (swaps) assert.equal(read.tokens[loan]!.swap!.usdtRaw, cash.others, 'the account holds no USDT but what the ledger reserves');
+    assert.equal(await bal(USDT), cash.others);
+    const snapshot = await s.local.snapshot();
+    const clean = async (what: string, collateralLeft: bigint) => {
+      const r = await reader.account(X, [C]);
+      assert.deepEqual([r.routes.filter(x => x.collateralRaw > 0n || x.routeDebtRaw > 0n).length, r.tokens[loan]!.debtRaw, r.tokens[loan]!.idleRaw, r.vaults.reduce((sum, v) => sum + v.assetsRaw, 0n)], [0, 0n, 0n, 0n], `${what}: no debt, nothing posted, the box is empty`);
+      assert.deepEqual([await bal(USD1), await bal(v2.loanTokens.USDC!), await bal(v2.loanTokens.U!)], [0n, 0n, 0n], `${what}: no loan token other than USDT is left`);
+      assert.equal(await bal(C), collateralLeft, `${what}: shares in the account`);
+      await ledgerMatchesChain(what);
+      return r;
+    };
+    // What the finishing UserOp carries and what the ledger books from its receipt, per kind of route.
+    const closing = swaps ? ['topUp', 'executeReduce', 'cashOut'] : ['executeReduce'];
+    const bookedKinds = () => booked.map(b => b.kind);
+    const spent = () => booked.filter(b => b.kind === 'top_up' || b.kind === 'repay_cash').reduce((n, b) => n + b.usdtRaw, 0n), back = () => booked.filter(b => b.kind === 'cash_out' || b.kind === 'vault_cash').reduce((n, b) => n + b.usdtRaw, 0n);
+
+    // ---- A. Sell everything with the strategy on ----------------------------------------------------------------
+    mark(`${tag}: sell-all, round 1 — the box repays what it holds`);
+    const all = [{ tokenIn: C, amountIn: total }];
+    const sent: string[][] = [];
+    const tracked = async (calls: Call[]) => { sent.push(names(calls, v2) as string[]); return send(calls); };
+    const r1 = await v2UnwindForSale({ ...await step({ send: tracked }), steps: all, exit: true });
+    assert.match(String(r1), new RegExp(`short of ${loan}: repay \\d+, take back \\d+ of \\d+; the sale pays the rest`));
+    assert.deepEqual(sent, [['executeReduce']]);
+    read = await reader.account(X, [C]);
+    const free1 = await bal(C), left1 = read.routes[0]!;
+    assert.ok(free1 > total * 97n / 100n && free1 < total && left1.collateralRaw === total - free1 && left1.routeDebtRaw > 0n && left1.routeDebtRaw < debt0 / 50n, `freed ${free1} of ${total}, debt left ${left1.routeDebtRaw}`);
+    await ledgerMatchesChain('after round 1');
+    mark(`${tag}: sell-all, round 2 — nothing more can be repaid: the sale goes ahead with the free shares`);
+    const r2 = await v2UnwindForSale({ ...await step({ send: tracked }), steps: all, exit: true });
+    assert.ok(r2 !== null && typeof r2 === 'object', `round 2 answers "sell what is free": ${JSON.stringify(r2, (_k, v) => typeof v === 'bigint' ? v.toString() : v)}`);
+    const wait = r2 as { stuck: Address[]; needUsdtRaw: bigint; note: string };
+    assert.deepEqual([wait.stuck, sent.length], [[C], 1]);
+    assert.ok(wait.needUsdtRaw > left1.routeDebtRaw - 10n ** 12n && wait.needUsdtRaw < left1.routeDebtRaw * 2n + 10n ** 15n, `needs ${wait.needUsdtRaw} USDT for a debt of ${left1.routeDebtRaw}`);
+    const proceeds1 = await sell(free1);
+    await ledgerMatchesChain('after the first sale');
+    mark(`${tag}: sell-all, round 3 — the sale's USDT pays the rest, the route closes`);
+    const r3 = await v2UnwindForSale({ ...await step({ send: tracked }), steps: [{ tokenIn: C, amountIn: total - free1 }], exit: true });
+    assert.match(String(r3), swaps ? new RegExp(`${SYMBOL} top up \\d+ ${loan} from USDT, repay \\d+ ${loan}, take back, sell the ${loan} left`) : new RegExp(`${SYMBOL} repay \\d+ USDT, take back`));
+    assert.deepEqual(sent.slice(1), [closing]);
+    assert.deepEqual(bookedKinds().slice(0, swaps ? 2 : 1), swaps ? ['top_up', 'cash_out'] : ['repay_cash']);
+    await clean('after the close', total - free1);
+    mark(`${tag}: sell-all, round 4 — nothing is posted any more: the rest is sold`);
+    assert.equal(await v2UnwindForSale({ ...await step({ send: tracked }), steps: [{ tokenIn: C, amountIn: total - free1 }], exit: true }), null);
+    const proceeds2 = await sell(total - free1);
+    await clean('sell-all done', 0n);
+    // Everything is USDT the owner can take back: both sales' proceeds less what the strategy cost.
+    assert.equal(cash.own, proceeds1 + proceeds2 - spent() + back());
+    assert.ok(spent() - back() < left1.routeDebtRaw * 102n / 100n + 10n ** 15n, 'the strategy cost about the gap itself');
+    assert.equal(await bal(USDT) - cash.own, cash.others, 'the reserved USDT was never spent');
+    const sellAll = { reduced: sent[0], closed: sent[1], booked: booked.map(b => `${b.kind}:${b.usdtRaw}`), debtLeftAfterRound1: left1.routeDebtRaw.toString(), needUsdt: wait.needUsdtRaw.toString() };
+
+    // ---- B. A plain turn-off (nothing is being sold) ---------------------------------------------------------------
+    await s.local.revert({ id: snapshot });
+    cash.own = 0n; booked.length = 0; sent.length = 0; needs.length = 0;
+    await s.now();
+    await ledgerMatchesChain('turn-off start');
+    mark(`${tag}: turn-off — the owner repays what the box holds and withdraws consent`);
+    const off = await api.close(X, { symbols: [SYMBOL] });
+    if (off.status !== 'ready') throw new Error('close not ready: ' + JSON.stringify(off));
+    assert.deepEqual(names(off.calls, v2), ['executeReduce', v2.registry], 'a partial repayment, then consent off; no close that would revert');
+    for (const batch of off.batches) await send(batch);
+    read = await reader.account(X, [C]);
+    const freeB = await bal(C), leftB = read.routes[0]!;
+    assert.deepEqual([read.policy.enabled, leftB.collateralRaw], [false, total - freeB]);
+    assert.ok(freeB > total * 97n / 100n && leftB.routeDebtRaw > 0n && leftB.routeDebtRaw < debt0 / 50n);
+    mark(`${tag}: turn-off — the scheduler round reports the USDT it is short of`);
+    assert.equal(await v2AutoRound(await step({ send: tracked })), null);
+    assert.deepEqual([sent.length, needs.length], [0, 1]);
+    assert.ok(needs[0]! > leftB.routeDebtRaw - 10n ** 12n && needs[0]! < leftB.routeDebtRaw * 2n + 10n ** 15n, `needs ${needs[0]}`);
+    // The cash raise: twice the need, at least 1 USDT, from the shares that are free now (the scheduler's own small sale).
+    const need = needs[0]!, raise = cashRaiseUsdE8(need) * 10n ** 10n, sold = raise * 10n ** 18n / usdPerUnitE18 + 1n;
+    await sell(sold);
+    assert.ok(cash.own >= need && cash.own < 2n * 10n ** 18n + 4n * need, `raised ${cash.own}`);
+    mark(`${tag}: turn-off — the next round pays the rest and closes`);
+    assert.match(await v2AutoRound(await step({ send: tracked })) ?? '', new RegExp(`已執行：${SYMBOL} close\\(disabled\\)`));
+    assert.deepEqual(sent, [closing]);
+    assert.deepEqual(bookedKinds().slice(0, swaps ? 2 : 1), swaps ? ['top_up', 'cash_out'] : ['repay_cash']);
+    read = await clean('turn-off done', total - sold);
+    assert.equal(read.policy.enabled, false);
+    // A later round finds nothing to do and asks for nothing.
+    needs.length = 0;
+    assert.equal(await v2AutoRound(await step({ send: tracked })), null);
+    assert.deepEqual([sent.length, needs.length], [1, 0]);
+    await ledgerMatchesChain('the end');
+    console.log(JSON.stringify({ kind, loan, account: X, asset: SYMBOL, debt: debt0.toString(), gap: gap0.toString(), reservedUsdt: cash.others.toString(), sellAll,
+      turnOff: { debtLeftAfterOwner: leftB.routeDebtRaw.toString(), needUsdt: need.toString(), raised: raise.toString(), booked: booked.map(b => `${b.kind}:${b.usdtRaw}`) } }));
+  });
+}

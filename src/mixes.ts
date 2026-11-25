@@ -24,7 +24,8 @@ import { mixAnchor, mixValue, saveMixValuation } from './mix-valuation.js';
 import type { MixValuation } from './mix-valuation.js';
 import { MIX_EXIT_DUST_RAW } from './mix-runtime.js';
 import { mixStrategyConsent } from './strategy-earn.js';
-import { strategyEarnV2For } from './strategy-earn-v2.js';
+import { strategyEarnV2For, strategyV2Addresses } from './strategy-earn-v2.js';
+import type { StrategyV2Addresses } from './strategy-earn-v2.js';
 
 export type MixServiceDeps = {
   query: typeof query; transaction: typeof withTransaction; lock: typeof withMixLock; now: () => Date; chainId: () => number;
@@ -35,16 +36,17 @@ export type MixServiceDeps = {
   syncFlows: (m: MixRow, proof: import('./mix-store.js').MixEnrollmentProof) => Promise<void>;
   /** Yield strategy consent to re-sign with a weight change (src/strategy-earn.ts mixStrategyConsent: v1 or routing v2, whichever the account is on); [] when off. */
   strategyConsent: (input: Parameters<typeof mixStrategyConsent>[0]) => Promise<{ to: Address; data: Hex; value: '0' }[]>;
-  /** Routing v2 registry and executor for this owner, returned with the signing payload so the app can check a v2 re-consent
-   * against them before signing (cre8-app mix-chain.ts; it has no v2 address of its own). null outside the v2 audience. */
-  strategyV2: (owner: string) => { registry: Address; executor: Address } | null;
+  /** Routing v2 registry, executor and cash swapper for this owner, returned with the signing payload so the app can check a
+   * v2 re-consent against them before signing (cre8-app mix-chain.ts; it has no v2 address of its own). `cashSwapper` is
+   * there when the deployment has one: the re-consent may then carry approvals to it. null outside the v2 audience. */
+  strategyV2: (owner: string) => StrategyV2Addresses | null;
 };
 const defaults: MixServiceDeps = { query, transaction: withTransaction, lock: withMixLock, now: () => new Date(), chainId: configuredChainId,
   creationLock: withMixCreationLock, register: registerMixStrategy, prepareAccount: preparePortfolioEnrollment, enroll: enrollPortfolio, calls: prepareMixCalls,
   proof: readMixEnrollmentProof, plan: planPortfolio, anchor: mixAnchor, context: mixIntentContext, findEnrollment: findMixEnrollment, preview: createMixPreview(), syncFlows: async (m, proof) => {
     await syncMixEnrollmentFlows(getChain().publicClient, m, proof);
   }, strategyConsent: (input) => mixStrategyConsent(input),
-  strategyV2: owner => { const v2 = strategyEarnV2For(97, owner); return v2 ? { registry: v2.registry, executor: v2.executor } : null; }, maxAssets: async () => Number(await getChain().publicClient.readContract({ address: getChain().registryAddress, abi: (await import('./registry-abi.js')).REGISTRY_VERSION_ABI, functionName: 'MAX_STRATEGY_ASSETS' })) };
+  strategyV2: owner => strategyV2Addresses(strategyEarnV2For(97, owner)), maxAssets: async () => Number(await getChain().publicClient.readContract({ address: getChain().registryAddress, abi: (await import('./registry-abi.js')).REGISTRY_VERSION_ABI, functionName: 'MAX_STRATEGY_ASSETS' })) };
 const MIX_CASH = TESTNET_97.contracts.usdt.toLowerCase();
 const notFound = () => new AppError(404, 'MIX_NOT_FOUND', '找不到這個私人組合或分享連結。');
 export function createMixService(overrides: Partial<MixServiceDeps> = {}) {

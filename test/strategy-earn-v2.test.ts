@@ -553,3 +553,106 @@ test('POST confirm: the owner\'s own turn-on / turn-off is recorded from its ver
   await assert.rejects(earn.confirm(3, account, { txHash: '0x12' }), (e: unknown) => e instanceof AppError && e.status === 400);
   await assert.rejects(earn.confirm(3, account, { hash }), (e: unknown) => e instanceof AppError && e.status === 400);
 });
+
+// ---- routing v2: a repayment short of USDT (cash raise) and a full exit with shares that cannot be freed yet ------------
+
+test('routing v2 scheduler: a quiet round whose repayment is short of USDT sells a little of what is free (cash raise), once per 30 minutes; never on a dry run', async () => {
+  const { cashRaiseUsdE8, planCashRaise, resetCashRaises, withoutPosted } = await import('../src/scheduler.js');
+  resetCashRaises(); resetStrategyEarnOpenBackoff();
+  const at = new Date('2026-11-23T15:30:00Z'); // US market hours
+  const { plan } = mixRuntimeFixture();
+  const balanced = { ...plan, report: { ...plan.report!, needsRebalance: false } };
+  const NVDA = T.assets.NVDAB.token as Address, USDT = T.contracts.usdt as Address, need = 215_811_746_640_776_207n;
+  const a = legacyScheduler(balanced, null);
+  const raised: bigint[] = [];
+  a.deps.strategyEarn = { open: async (_d, dry, _held, onCashNeed) => { a.calls.push(`open:${dry}`); onCashNeed?.(need); return null; }, unwind: async () => { a.calls.push('unwind'); return null; } };
+  a.deps.planCashRaise = async (_input, n) => { raised.push(n); a.calls.push('raise'); return { kind: 'ready', deadline: 2_000_000_000n, rationale: 'fixture raise',
+    steps: [{ tokenIn: NVDA, tokenOut: USDT, amountIn: E18, amountOutMin: 1n, oracleFloor: 1n, venue: T.contracts.executor as Address, data: '0x' as Hex }] }; };
+  a.deps.refreshFloors = async () => { a.calls.push('floors'); return { ok: false, kind: 'quote-failed', reason: '[FIXTURE_STOP] before sending' }; };
+  // The quiet round asks for the need; the same pipeline then carries the small sale — past the between-assets minimums
+  // (not asked: a raise is deliberately small) up to the point where it would be sent.
+  const first = await runSchedulerOnce({ dryRun: false, now: at, skipAlerts: true }, a.deps);
+  assert.deepEqual([a.calls, raised, first.results[0]?.reason], [['open:false', 'raise', 'floors'], [need], '[FIXTURE_STOP] before sending']);
+  // The next rounds inside 30 minutes report the need again but do not sell again.
+  a.calls.length = 0;
+  const second = await runSchedulerOnce({ dryRun: false, now: new Date(at.getTime() + 10 * 60_000), skipAlerts: true }, a.deps);
+  assert.deepEqual([a.calls, second.results[0]?.outcome], [['open:false'], 'noop']);
+  a.calls.length = 0;
+  await runSchedulerOnce({ dryRun: false, now: new Date(at.getTime() + 31 * 60_000), skipAlerts: true }, a.deps);
+  assert.deepEqual(a.calls, ['open:false', 'raise', 'floors']);
+  // A dry run never raises.
+  resetCashRaises(); a.calls.length = 0;
+  await runSchedulerOnce({ dryRun: true, now: at, skipAlerts: true }, a.deps);
+  assert.deepEqual(a.calls, ['open:true']);
+  // Nothing could be planned (market closed, nothing free): that is not an attempt — the very next round tries again.
+  resetCashRaises(); a.calls.length = 0;
+  const ready = a.deps.planCashRaise!;
+  a.deps.planCashRaise = async () => { a.calls.push('raise'); return { kind: 'blocked', reason: '[STRATEGY_CASH_RAISE] nothing free' }; };
+  const none = await runSchedulerOnce({ dryRun: false, now: at, skipAlerts: true }, a.deps);
+  assert.deepEqual([a.calls, none.results[0]?.outcome], [['open:false', 'raise'], 'blocked']);
+  a.deps.planCashRaise = ready; a.calls.length = 0;
+  await runSchedulerOnce({ dryRun: false, now: new Date(at.getTime() + 60_000), skipAlerts: true }, a.deps);
+  assert.deepEqual(a.calls, ['open:false', 'raise', 'floors']);
+
+  // How much: twice the need, at least 1 USDT.
+  assert.deepEqual([cashRaiseUsdE8(need), cashRaiseUsdE8(3n * E18)], [100_000_000n, 600_000_000n]);
+  // What is sold: the asset with the most free (not posted) value whose market is open; posted shares are never offered.
+  const posted = { ...plan, snapshot: { ...plan.snapshot, strategyEarnCollateral: [{ asset: NVDA.toLowerCase() as Address, marketId: nvda.marketId, amount: 64n * E18 }] } };
+  const sold: { holdings: [string, bigint][]; usd: bigint }[] = [];
+  const sell = async (input: { plan: typeof plan }, usd: bigint): Promise<RebalancePlan> => { sold.push({ holdings: input.plan.snapshot.holdings.map(h => [h.asset.toLowerCase(), h.amountWei]), usd }); return { kind: 'ready', deadline: 1n, rationale: 'sold', purpose: 'exit', steps: [] }; };
+  const out = await planCashRaise({ portfolioId: 1, account: plan.account, plan: posted }, need, { chainId: 97, now: at, sell });
+  // WBNB (65 free) is chosen over NVDAB (1 free of 65); only it and the cash row are shown to the seller; never an "exit".
+  assert.deepEqual(sold, [{ holdings: [[USDT.toLowerCase(), 0n], [T.assets.WBNB.token.toLowerCase(), 65n * E18]], usd: 100_000_000n }]);
+  assert.ok(out.kind === 'ready' && out.purpose === undefined && /STRATEGY_CASH_RAISE/.test(out.rationale));
+  // Everything is posted (or the stock market is closed): nothing to sell this round.
+  const all = { ...plan, snapshot: { ...plan.snapshot, strategyEarnCollateral: [NVDA, T.assets.WBNB.token as Address].map(asset => ({ asset: asset.toLowerCase() as Address, marketId: nvda.marketId, amount: 65n * E18 })) } };
+  assert.match(((await planCashRaise({ portfolioId: 1, account: plan.account, plan: all }, need, { chainId: 97, now: at, sell })) as { reason: string }).reason, /STRATEGY_CASH_RAISE/);
+  const sunday = new Date('2026-11-22T15:30:00Z');
+  const stocksOnly = { ...plan, snapshot: { ...plan.snapshot, holdings: plan.snapshot.holdings.filter(h => h.asset !== T.assets.WBNB.token) } };
+  assert.equal((await planCashRaise({ portfolioId: 1, account: plan.account, plan: stocksOnly }, need, { chainId: 97, now: sunday, sell })).kind, 'blocked');
+
+  // withoutPosted: the plan a full exit sells from while some shares stay posted — only those assets, by the snapshot's own numbers.
+  const cut = withoutPosted(posted, [NVDA]);
+  assert.deepEqual(cut.snapshot.holdings.map(h => h.amountWei), [1n * E18, 65n * E18, 0n]);
+  assert.deepEqual([cut.snapshot.strategyEarnCollateral, cut.report!.totalUsdE8, posted.snapshot.holdings[0]!.amountWei], [undefined, 66n * 100_000_000n, 65n * E18]);
+  assert.deepEqual(withoutPosted(posted, []).snapshot.holdings.map(h => h.amountWei), [65n * E18, 65n * E18, 0n]);
+});
+
+test('routing v2 scheduler: a full exit whose posted shares cannot be freed yet sells what is free now; any other sale raises the missing USDT first', async () => {
+  const { resetCashRaises } = await import('../src/scheduler.js');
+  resetCashRaises();
+  const at = new Date('2026-11-23T15:30:00Z');
+  const { plan } = mixRuntimeFixture();
+  const NVDA = T.assets.NVDAB.token as Address, USDT = T.contracts.usdt as Address;
+  const drifted = { ...plan, report: { ...plan.report!, needsRebalance: true }, snapshot: { ...plan.snapshot, strategyEarnCollateral: [{ asset: NVDA.toLowerCase() as Address, marketId: nvda.marketId, amount: 2n * E18 }] } };
+  const wait = { note: '[STRATEGY_EARN_UNWINDING] NVDAB cannot be freed yet', stuck: [NVDA.toLowerCase() as Address], needUsdtRaw: 3n * 10n ** 17n };
+  const step = (amountIn: bigint) => ({ tokenIn: NVDA, tokenOut: USDT, amountIn, amountOutMin: 1n, oracleFloor: 1n, venue: T.contracts.executor as Address, data: '0x' as Hex });
+  // Full exit: the planner is asked again with the posted shares taken out, and the sale goes on with that plan.
+  const b = legacyScheduler(drifted, null);
+  const seen: bigint[] = [];
+  b.deps.planRebalance = async input => { const held = input.plan.snapshot.holdings.find(h => h.asset === NVDA)!.amountWei; seen.push(held); return { kind: 'ready', deadline: 2_000_000_000n, rationale: 'fixture exit', purpose: 'exit', steps: [step(held)] }; };
+  const unwinds: bigint[] = [];
+  b.deps.strategyEarn = { open: async () => null, unwind: async (_d, steps, _dry, exit) => { unwinds.push(steps[0]!.amountIn); assert.equal(exit, true); return wait; } };
+  b.deps.checkTradingMinimums = async (steps, purpose) => { b.calls.push(`minimums:${purpose}:${steps[0]!.amountIn}`); return '[FIXTURE_STOP] stop before quoting'; };
+  const exit = await runSchedulerOnce({ dryRun: false, now: at, skipAlerts: true }, b.deps);
+  assert.deepEqual([seen, unwinds, b.calls, exit.results[0]?.reason], [[65n * E18, 63n * E18], [65n * E18], [`minimums:exit:${63n * E18}`], '[FIXTURE_STOP] stop before quoting']);
+  // Nothing free to sell: the exit waits with the reason, nothing is sent.
+  seen.length = 0; b.calls.length = 0;
+  b.deps.planRebalance = async input => { const held = input.plan.snapshot.holdings.find(h => h.asset === NVDA)!.amountWei; seen.push(held); return seen.length === 1 ? { kind: 'ready', deadline: 2_000_000_000n, rationale: 'x', purpose: 'exit', steps: [step(held)] } : { kind: 'noop', reason: 'nothing to sell' }; };
+  const stuck = await runSchedulerOnce({ dryRun: false, now: at, skipAlerts: true }, b.deps);
+  assert.deepEqual([stuck.results[0]?.outcome, stuck.results[0]?.reason, b.calls], ['blocked', wait.note, []]);
+  // An ordinary sale (a rebalance): it is not cut down; the USDT the top-up is short of is raised first, by a small sale.
+  const c = legacyScheduler(drifted, [{ tokenIn: NVDA, amountIn: 65n * E18 }]);
+  const raises: bigint[] = [];
+  // (The hook answers as the real one does: only a sale that needs posted shares has to wait; the raise sells free ones.)
+  c.deps.strategyEarn = { open: async () => null, unwind: async (_d, steps) => steps[0]!.amountIn > 63n * E18 ? wait : null };
+  c.deps.planCashRaise = async (_i, n) => { raises.push(n); return { kind: 'ready', deadline: 2_000_000_000n, rationale: 'raise', steps: [step(E18)] }; };
+  c.deps.refreshFloors = async () => ({ ok: false, kind: 'quote-failed', reason: '[FIXTURE_STOP] before sending' });
+  const ordinary = await runSchedulerOnce({ dryRun: false, now: at, skipAlerts: true }, c.deps);
+  assert.deepEqual([raises, ordinary.results[0]?.reason], [[3n * 10n ** 17n], '[FIXTURE_STOP] before sending']);
+  // ...and when it waits for something that is not USDT (the 24-hour window), the sale just waits.
+  resetCashRaises(); raises.length = 0;
+  c.deps.strategyEarn = { open: async () => null, unwind: async (_d, steps) => steps[0]!.amountIn > 63n * E18 ? { ...wait, needUsdtRaw: 0n } : null };
+  const waiting = await runSchedulerOnce({ dryRun: false, now: at, skipAlerts: true }, c.deps);
+  assert.deepEqual([raises, waiting.results[0]?.outcome, waiting.results[0]?.reason], [[], 'blocked', wait.note]);
+});

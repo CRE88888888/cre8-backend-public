@@ -8,14 +8,16 @@ import { assetsMarketOpen } from './trading-calendar.js';
 import { runYieldRound } from './yield-service.js';
 import { runDcaRound } from './dca.js';
 import { STRATEGY_EARN_97 } from './strategy-earn-guard.js';
-import { noteRoundOutcome } from './alerts.js';
+import { noteRoundOutcome, noteStrategyPegExceeded } from './alerts.js';
 import { runStrategyRewardsRound } from './strategy-rewards.js';
 import { routeLedger, strategyEarnV2, strategyEarnV2For, v2Audience, v2InstalledScope } from './strategy-earn-v2.js';
 import type { StrategyEarnV2 } from './strategy-earn-v2.js';
-import { defaultV2Reader } from './strategy-earn-v2-chain.js';
+import { defaultV2Reader, v2LogReader } from './strategy-earn-v2-chain.js';
 import { claimedCash } from './withdrawable-cash.js';
+import { recoverCashSwaps, settleCashSwaps } from './strategy-cash-swaps.js';
+import { computeDrift } from './drift.js';
 import { runV2KeeperRound, v2AutoRound, v2RewardHolders, v2UnwindForSale } from './strategy-earn-v2-scheduler.js';
-import type { V2Ledger } from './strategy-earn-v2-scheduler.js';
+import type { V2Ledger, V2UnwindWait } from './strategy-earn-v2-scheduler.js';
 import { rewardsStore } from './strategy-rewards.js';
 import { dbStrategyEarnLedger, defaultStrategyEarnChain, runStrategyEarnRound, strategyEarnAutoOpen, strategyEarnUnwindForSale, strategyEarnV1Active, strategyKeeperWriter } from './strategy-earn.js';
 import type { Call as StrategyEarnCall, StrategyEarnSend, StrategyEarnTx } from './strategy-earn.js';
@@ -598,11 +600,15 @@ export type SchedulerDeps = {
   /** backend#204 (chain 97): auto-open after a buy, and repay + take shares back before a sale, with the session key. */
   strategyEarn?: {
     /** `held`: collateral the planner saw in the account (lowercase); only those markets are read. */
-    open(due: DuePortfolio, dryRun: boolean, held?: readonly string[]): Promise<string | null>;
+    /** `onCashNeed` (routing v2): a repayment waits for this much more USDT in the account (raw); see the cash raise in decideAndMaybeExecute. */
+    open(due: DuePortfolio, dryRun: boolean, held?: readonly string[], onCashNeed?: (usdtRaw: bigint) => void): Promise<string | null>;
     /** `exit`: the sale is a full exit (routing v2 then also sends the reward tokens to the owner's wallet). */
     /** `posted` false: nothing is posted, the sale is a full exit — only the reward tokens' way out is looked at (routing v2). */
-    unwind(due: DuePortfolio, steps: readonly PlannedStep[], dryRun: boolean, exit?: boolean, posted?: boolean): Promise<string | null>;
+    /** A `V2UnwindWait` answer: some posted shares cannot be freed this round and the sale must not wait for them. */
+    unwind(due: DuePortfolio, steps: readonly PlannedStep[], dryRun: boolean, exit?: boolean, posted?: boolean): Promise<string | V2UnwindWait | null>;
   };
+  /** The sale a cash raise sends (see planCashRaise). Default: one sale of the asset with the most free value, quoted like a redeem. */
+  planCashRaise?: (input: RebalancePlanningInput, needUsdtRaw: bigint, at: { chainId: number; now: Date }) => Promise<RebalancePlan>;
   /** Routing v2 keeper round (src/strategy-earn-v2-scheduler.ts). Default: runs for the accounts of owners in the v2 audience. */
   strategyV2Round?: (args: { dryRun: boolean; log: (line: string) => void }) => Promise<unknown>;
   clock?:()=>Date;
@@ -1676,16 +1682,21 @@ function defaultStrategyEarnSteps(deps: ResolvedDeps): NonNullable<SchedulerDeps
     const usable = key !== null && key.routingV2 !== undefined && isAddressEqual(key.routingV2.executor, v2.executor) &&
       (!v2.swapper || (key.routingV2.swapper !== undefined && isAddressEqual(key.routingV2.swapper, v2.swapper))) ? key : null;
     return { v2, reader: defaultV2Reader(v2), account: due.account, portfolioId: due.portfolioId, now: deps.clock(), dryRun, ...(held === undefined ? {} : { held }),
-      // A top-up (cash swapper) spends only USDT no bucket of the cash ledger claims (see claimedCash): taking claimed cash
-      // would leave the ledger above the chain balance and stop the portfolio's jobs with [CASH_DEFICIT].
-      reservedUsdt: async () => { const rows = (await deps.query(`select unallocated_hold_raw::text,stack_prefund_raw::text,allocated_cash_raw::text,reserved_input_raw::text,reserved_fee_raw::text,withdrawal_raw::text,yield_raw::text
-        from strategy_cash_balances where chain_id = $1 and portfolio_id = $2`, [deps.chainId, due.portfolioId])).rows as Record<string, unknown>[]; return rows.reduce((sum, row) => sum + claimedCash(row), 0n); },
-      send: usable === null ? null : (calls: StrategyEarnCall[]) => sendStrategyEarnWithSessionKey(due.account, usable, calls, v2.swapper ? [v2.executor, v2.swapper] : [v2.executor]), ledger: v2SchedulerLedger(deps.query), log: deps.log };
+      // A top-up (cash swapper) spends the portfolio's own cash (allocated_cash_raw) and USDT no bucket of the cash ledger
+      // claims; it is booked against the own cash when it lands (ledger.swaps -> src/strategy-cash-swaps.ts). Every other
+      // bucket stays untouched: taking it would leave the ledger above the chain balance ([CASH_DEFICIT]).
+      cashClaims: async () => { const rows = (await deps.query(`select unallocated_hold_raw::text,stack_prefund_raw::text,allocated_cash_raw::text,reserved_input_raw::text,reserved_fee_raw::text,withdrawal_raw::text,yield_raw::text
+        from strategy_cash_balances where chain_id = $1 and portfolio_id = $2`, [deps.chainId, due.portfolioId])).rows as Record<string, unknown>[];
+        return { claimedRaw: rows.reduce((sum, row) => sum + claimedCash(row), 0n), ownRaw: rows.reduce((sum, row) => sum + BigInt(String(row.allocated_cash_raw)), 0n) }; },
+      onPegExceeded: (detail: string) => noteStrategyPegExceeded(due.portfolioId, detail, deps.clock()),
+      recoverSwaps: () => recoverCashSwaps({ reader: v2LogReader(v2), run: deps.withTransaction, box: async () => (await defaultV2Reader(v2).box(due.account)).box }, v2, { chainId: deps.chainId, portfolioId: due.portfolioId, account: due.account }),
+      send: usable === null ? null : (calls: StrategyEarnCall[]) => sendStrategyEarnWithSessionKey(due.account, usable, calls, v2.swapper ? [v2.executor, v2.swapper] : [v2.executor]),
+      ledger: { ...v2SchedulerLedger(deps.query), swaps: (portfolioId: number, account: Address, events) => settleCashSwaps(deps.withTransaction, v2, { chainId: deps.chainId, portfolioId, account }, events) } satisfies V2Ledger, log: deps.log };
   };
   const both = (notes: (string | null)[]) => { const said = notes.filter((n): n is string => n !== null); return said.length === 0 ? null : said.join('；'); };
   return {
     // My mix: the same steps on the mix's own account (its session key moves with each weight change, mix-store).
-    open: async (due, dryRun, held) => {
+    open: async (due, dryRun, held, onCashNeed) => {
       if (deps.chainId !== 97) return null;
       const v2 = await v2Of(due);
       if (v2 === null) return strategyEarnAutoOpen(await args(due, dryRun, held));
@@ -1694,14 +1705,16 @@ function defaultStrategyEarnSteps(deps: ResolvedDeps): NonNullable<SchedulerDeps
       const touched = await defaultV2Reader(v2).touched(due.account);
       if (!touched.enabled && touched.routes.length === 0 && touched.vaults.length === 0) return strategyEarnAutoOpen(await args(due, dryRun, held));
       const chain = defaultStrategyEarnChain();
-      return v2AutoRound({ ...await v2Args(v2, due, dryRun, held), v1Active: async () => strategyEarnV1Active(chain, due.account, (await chain.head()).number) });
+      return v2AutoRound({ ...await v2Args(v2, due, dryRun, held), ...(onCashNeed ? { onCashNeed } : {}), v1Active: async () => strategyEarnV1Active(chain, due.account, (await chain.head()).number) });
     },
     unwind: async (due, steps, dryRun, exit, posted = true) => {
       if (deps.chainId !== 97) return null;
       // Nothing posted (a full exit after the strategy was simply turned off): v1 has nothing to take back, so it is not read.
       const v1 = posted ? await strategyEarnUnwindForSale({ ...await args(due, dryRun), steps }) : null;
       const v2 = await v2Of(due);
-      return both([v1, v2 === null ? null : await v2UnwindForSale({ ...await v2Args(v2, due, dryRun), steps, ...(exit ? { exit } : {}) })]);
+      const second = v2 === null ? null : await v2UnwindForSale({ ...await v2Args(v2, due, dryRun), steps, ...(exit ? { exit } : {}) });
+      // v1 holds the sale back -> it waits whatever v2 says; otherwise v2's answer stands (a note, or "sell what is free").
+      return second !== null && typeof second === 'object' ? (v1 === null ? second : both([v1, second.note])) : both([v1, second]);
     },
   };
 }
@@ -1897,6 +1910,7 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
     prepareNewMoney: provided.prepareNewMoney ?? prepareNewMoney,
     readBuyVersionWindow: provided.readBuyVersionWindow ?? (id => readBuyVersionWindow(defaultPublicClient(), registryAddress(), id)),
     strategyEarn: provided.strategyEarn ?? null,
+    planCashRaise: provided.planCashRaise ?? null,
     clock:provided.clock??(()=>new Date()),
     withDexLock: provided.withDexLock ?? withDexLock,
     dexGate: provided.dexGate ?? createDexGate(query, {
@@ -2557,22 +2571,77 @@ async function runOne(
  * `plan` narrows the reads to the collateral the account holds. My mix: never while the mix is exiting, exited or has a
  * weight change waiting for its signature (that change voids the consent it was given under).
  */
-async function strategyEarnOpen(due: DuePortfolio, ctx: { dryRun: boolean; deps: ResolvedDeps }, plan?: PortfolioPlan, mix?: MixRuntime | null) {
-  if (ctx.deps.chainId !== 97) return;
-  if (due.personalMix && (!mix || mix.triggered || mix.status !== 'active' || mix.pending)) return;
+async function strategyEarnOpen(due: DuePortfolio, ctx: { dryRun: boolean; deps: ResolvedDeps }, plan?: PortfolioPlan, mix?: MixRuntime | null): Promise<bigint | null> {
+  if (ctx.deps.chainId !== 97) return null;
+  if (due.personalMix && (!mix || mix.triggered || mix.status !== 'active' || mix.pending)) return null;
   const held = plan?.snapshot.holdings.filter(h => h.amountWei > 0n).map(h => h.asset.toLowerCase());
   // A failed auto-open backs off (5, 10, 20, 40, then 60 minutes) instead of failing again every round; any success clears it.
   const wait = strategyEarnOpenBackoff.get(due.portfolioId), nowMs = Date.now();
-  if (wait && nowMs < wait.until) return;
+  if (wait && nowMs < wait.until) return null;
+  // Routing v2: a repayment (a close the owner or the engine asked for) that waits for USDT says how much (raw).
+  let need = 0n;
   try {
-    const note = await strategyEarnSteps(ctx.deps).open(due, ctx.dryRun, held);
+    const note = await strategyEarnSteps(ctx.deps).open(due, ctx.dryRun, held, usdtRaw => { need += usdtRaw; });
     strategyEarnOpenBackoff.delete(due.portfolioId);
     if (note !== null) ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} ${note}`);
+    return need > 0n ? need : null;
   } catch (error) {
     const next = strategyEarnOpenDelay((wait?.fails ?? 0) + 1);
     strategyEarnOpenBackoff.set(due.portfolioId, { fails: (wait?.fails ?? 0) + 1, until: nowMs + next });
     ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} [STRATEGY_EARN_OPEN_FAILED] 自動開啟未完成，${Math.round(next / 60_000)} 分鐘後再試：${oneLine(error)}`);
+    return need > 0n ? need : null;
   }
+}
+/**
+ * Cash raise (routing v2, docs/strategy-earn-routing-v2 "補差額的錢從哪裡來"): a repayment is short of a little USDT for
+ * its top-up and the portfolio holds none it may spend. The portfolio sells just enough of what it holds free — through
+ * this same pipeline, so the sale is an ordinary recorded operation and its proceeds are booked as the portfolio's own
+ * cash — and the next round finishes the repayment. Twice the need, at least 1 USDT (below that the executor's floor and
+ * the fee leave nothing); from the free balance of the asset that has the most of it and whose market is open.
+ * Never wallet cash, Cash Earn or another portfolio: only this account's own holdings.
+ */
+export const CASH_RAISE_MIN_USD_E8 = 100_000_000n;
+/** At most one raise per portfolio in this long: a repayment that keeps failing for another reason must not keep selling. */
+export const CASH_RAISE_INTERVAL_MS = 30 * 60_000;
+const cashRaisedAt = new Map<number, number>();
+export const resetCashRaises = () => cashRaisedAt.clear();
+export const cashRaiseUsdE8 = (needUsdtRaw: bigint): bigint => {
+  const twice = (needUsdtRaw * 2n + 10n ** 10n - 1n) / 10n ** 10n;
+  return twice > CASH_RAISE_MIN_USD_E8 ? twice : CASH_RAISE_MIN_USD_E8;
+};
+/** The plan of a cash raise: one sale of `cashRaiseUsdE8(need)` from the asset with the largest free (not posted) value. */
+export async function planCashRaise(input: RebalancePlanningInput, needUsdtRaw: bigint, deps: { chainId: number; now: Date;
+  sell?: (input: RebalancePlanningInput, sellUsdE8: bigint) => Promise<RebalancePlan> }): Promise<RebalancePlan> {
+  const { snapshot } = input.plan, cash = (deps.chainId === 97 ? TESTNET_97.contracts.usdt : '0x55d398326f99059ff775485246999027b3197955').toLowerCase();
+  const posted = new Map<string, bigint>();
+  for (const c of snapshot.strategyEarnCollateral ?? []) posted.set(c.asset.toLowerCase(), (posted.get(c.asset.toLowerCase()) ?? 0n) + c.amount);
+  const sellUsdE8 = cashRaiseUsdE8(needUsdtRaw);
+  const free = snapshot.holdings.flatMap(h => {
+    const key = h.asset.toLowerCase(), amount = h.amountWei - (posted.get(key) ?? 0n);
+    if (key === cash || amount <= 0n || !assetsMarketOpen(deps.chainId, [h.asset], deps.now)) return [];
+    return [{ holding: { ...h, amountWei: amount }, usdE8: amount * h.usdPriceE8 / 10n ** BigInt(h.decimals) }];
+  }).sort((a, b) => (b.usdE8 > a.usdE8 ? 1 : b.usdE8 < a.usdE8 ? -1 : 0))[0];
+  if (!free || free.usdE8 < sellUsdE8) return { kind: 'blocked', reason: '[STRATEGY_CASH_RAISE] 加息還款還差一點 USDT，但帳戶裡目前沒有可賣的閒置資產（休市或都還抵押著），等下一輪' };
+  const only: RebalancePlanningInput = { ...input, plan: { ...input.plan, snapshot: { ...snapshot, holdings: [...snapshot.holdings.filter(h => h.asset.toLowerCase() === cash), free.holding] } } };
+  const sell = deps.sell ?? (async (i, usd) => (await (await import('./operator.js')).buildRedeemPlan(i, { sellUsdE8: usd })).plan);
+  const plan = await sell(only, sellUsdE8);
+  // Selling part of a holding is never an exit, whatever the redeem planner concluded from the narrowed view.
+  if (plan.kind !== 'ready') return plan;
+  const { purpose: _purpose, ...rest } = plan;
+  return { ...rest, rationale: `[STRATEGY_CASH_RAISE] 加息還款差 ${needUsdtRaw} USDT（raw），賣出一點閒置資產補上；${plan.rationale}` };
+}
+/**
+ * The plan as if the posted part of these assets were not there: what a full exit can sell now while their shares stay
+ * posted (routing v2 `V2UnwindWait`). Balances, posted amounts and prices are the snapshot's own.
+ */
+export function withoutPosted(plan: PortfolioPlan, stuck: readonly string[]): PortfolioPlan {
+  const keys = new Set(stuck.map(a => a.toLowerCase())), posted = new Map<string, bigint>();
+  for (const c of plan.snapshot.strategyEarnCollateral ?? []) if (keys.has(c.asset.toLowerCase())) posted.set(c.asset.toLowerCase(), (posted.get(c.asset.toLowerCase()) ?? 0n) + c.amount);
+  const holdings = plan.snapshot.holdings.map(h => { const p = posted.get(h.asset.toLowerCase()) ?? 0n; return p === 0n ? h : { ...h, amountWei: h.amountWei > p ? h.amountWei - p : 0n }; });
+  const left = (plan.snapshot.strategyEarnCollateral ?? []).filter(c => !keys.has(c.asset.toLowerCase()));
+  const { strategyEarnCollateral: _posted, ...snapshot } = plan.snapshot;
+  return { ...plan, snapshot: { ...snapshot, holdings, ...(left.length > 0 ? { strategyEarnCollateral: left } : {}) },
+    report: plan.report === null ? null : computeDrift(holdings, plan.targets, plan.thresholdBps) };
 }
 const strategyEarnOpenBackoff = new Map<number, { fails: number; until: number }>();
 /** 5 min after the first failure, doubling, capped at 60 min. */
@@ -2581,9 +2650,28 @@ export const resetStrategyEarnOpenBackoff = () => strategyEarnOpenBackoff.clear(
 
 async function decideAndMaybeExecute(
   due: DuePortfolio,
-  ctx: { dryRun: boolean; now: Date; thresholdBps: number; deps: ResolvedDeps; forcePlan?: boolean },
+  ctx: { dryRun: boolean; now: Date; thresholdBps: number; deps: ResolvedDeps; forcePlan?: boolean;
+    /** This pass is a cash raise for a routing v2 repayment (see planCashRaise): a small sale that is not a rebalance. */
+    cashRaise?: true },
   base: Omit<PortfolioRunResult, 'outcome' | 'reason'>,
 ): Promise<PortfolioRunResult> {
+  /**
+   * A quiet round whose strategy step is short of USDT: run this pipeline once more as a sale of just that much. null:
+   * not now (dry run, already a forced plan, or this portfolio raised cash within CASH_RAISE_INTERVAL_MS).
+   */
+  const raiseCash = async (needUsdtRaw: bigint | null): Promise<PortfolioRunResult | null> => {
+    if (needUsdtRaw === null || needUsdtRaw <= 0n || ctx.dryRun || ctx.forcePlan === true || ctx.cashRaise) return null;
+    const last = cashRaisedAt.get(due.portfolioId), nowMs = ctx.now.getTime();
+    if (last !== undefined && nowMs - last < CASH_RAISE_INTERVAL_MS) return null;
+    cashRaisedAt.set(due.portfolioId, nowMs);
+    ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} [STRATEGY_CASH_RAISE] 加息還款還差 ${needUsdtRaw} USDT（raw），賣出一點閒置資產補上`);
+    let planned = false;
+    const result = await decideAndMaybeExecute(due, { ...ctx, forcePlan: true, cashRaise: true,
+      deps: { ...ctx.deps, planRebalance: async input => { const plan = await (ctx.deps.planCashRaise ?? planCashRaise)(input, needUsdtRaw, { chainId: ctx.deps.chainId, now: ctx.now }); planned = plan.kind === 'ready'; return plan; } } }, base);
+    // Nothing could even be planned (market closed, nothing free): not an attempt — the next round may try again.
+    if (!planned) cashRaisedAt.delete(due.portfolioId);
+    return result;
+  };
 
   // 帳戶型別：只有 KERNEL 能被 session key 簽 UserOp。EOA（帳戶就是 owner 本人）身上沒有
   // permission validator、`session_keys` 也不會有它的列，所以它**永遠不可能**成功 —— 這種
@@ -2717,7 +2805,8 @@ async function decideAndMaybeExecute(
     }
     // A mix waits between rebalance dates: like a fund's quiet round, that is when consented shares get posted.
     if (ctx.forcePlan !== true && mixTick.mode === 'wait') {
-      if (plan.blocked.length === 0) await strategyEarnOpen(due, ctx, plan, mix);
+      const raised = plan.blocked.length === 0 ? await raiseCash(await strategyEarnOpen(due, ctx, plan, mix)) : null;
+      if (raised !== null) return raised;
       return { ...base, outcome: 'noop', reason: mixTick.reason };
     }
     if (ctx.forcePlan !== true) {
@@ -2736,7 +2825,8 @@ async function decideAndMaybeExecute(
   // `forcePlan`：呼叫端要用**同一條送出管線**做別的事（例如 redeem 按比例賣成 numeraire）。
   // 那種動作不會讓漂移變大，所以「不需要再平衡」不代表「什麼都不用做」。
   if (due.executionKind === undefined && !plan.report.needsRebalance && ctx.forcePlan !== true) {
-    await strategyEarnOpen(due, ctx, plan, mix);
+    const raised = await raiseCash(await strategyEarnOpen(due, ctx, plan, mix));
+    if (raised !== null) return raised;
     return {
       ...base,
       outcome: 'noop',
@@ -2763,13 +2853,14 @@ async function decideAndMaybeExecute(
   const yieldRebalance=money?.useTargetWeights===true&&plan.snapshot.yieldPositions?.some(p=>p.receipt===null||p.receipt>0n)===true;
   // This projection is only for quoting capped inputs. Actual balances remain authoritative for withdrawal and execution.
   const quotePlan=yieldRebalance?await ctx.deps.newMoney.yieldHoldings(plan):plan;
-  let rebalance = (waitingSourceTarget || money?.useTargetWeights?null:money?.rebalance) ?? await ctx.deps.planRebalance({ portfolioId: due.portfolioId, account: due.account, plan:quotePlan,
+  const planning: RebalancePlanningInput = { portfolioId: due.portfolioId, account: due.account, plan:quotePlan,
     ...(mixTick?.mode === 'exit' ? { purpose: 'exit' } : {}),
     ...(cashBudgetRaw === undefined ? {} : { cashBudgetRaw }),
     ...(mix ? { sellOnlyAssets: mix.exits, canTradeAsset: (asset: string) => assetsMarketOpen(ctx.deps.chainId, [asset], ctx.now) } : {}),
     // A basket's own rebalance buys its idle cash back under the buy minimum, like a fund's (see PlanRebalanceArgs).
-    ...(mix && mixTick?.mode !== 'exit' ? { idleCashBuys: true } : {}),
-    ...(money?.useTargetWeights?{inclusiveFeeReserveRaw:money.context.reserve}:{}) });
+    ...(mix && mixTick?.mode !== 'exit' && !ctx.cashRaise ? { idleCashBuys: true } : {}),
+    ...(money?.useTargetWeights?{inclusiveFeeReserveRaw:money.context.reserve}:{}) };
+  let rebalance = (waitingSourceTarget || money?.useTargetWeights?null:money?.rebalance) ?? await ctx.deps.planRebalance(planning);
   if (mix && mixTick?.mode === 'exit' && !ctx.dryRun && (rebalance.kind === 'noop' || rebalance.kind === 'blocked')) {
     let minimum = false;
     try { minimum = await ctx.deps.mixExitMinimum(plan); } catch { /* RPC failure never proves dust. */ }
@@ -2793,14 +2884,14 @@ async function decideAndMaybeExecute(
     if (mix && (mixTick?.mode === 'rebalance' || waitingSourceTarget) && rebalance.retryable !== true && !ctx.dryRun && !mixSwitchExitsPending(mix, plan)) {
       await ctx.deps.query('update mixes set last_rebalanced_at=$2 where id=$1 and triggered_at is null', [mix.id, ctx.now]);
     }
-    if (ctx.forcePlan !== true && mixTick?.mode !== 'exit') await strategyEarnOpen(due, ctx, plan, mix);
+    if (ctx.forcePlan !== true && mixTick?.mode !== 'exit') { const raised = await raiseCash(await strategyEarnOpen(due, ctx, plan, mix)); if (raised !== null) return raised; }
     return { ...base, outcome: 'noop', ...(money?.useTargetWeights&&plan.report.maxAbsDeltaBps<=plan.report.thresholdBps?{rebalanceComplete:true}:{}), reason: `Planner returned noop: ${rebalance.reason}` };
   }
   if (rebalance.kind === 'blocked') {
     // A leftover below one complete batch waits for more money; the filled assets can still turn Strategy Earn on.
     // 2026-11-23 portfolio 17: bought with "Earn extra", filled, but every round was [BASKET_WAITING], so the auto-open
     // (called only on noop) never ran.
-    if (ctx.forcePlan !== true && mixTick?.mode !== 'exit' && /\[BASKET_WAITING\]/.test(rebalance.reason)) await strategyEarnOpen(due, ctx, plan, mix);
+    if (ctx.forcePlan !== true && mixTick?.mode !== 'exit' && /\[BASKET_WAITING\]/.test(rebalance.reason)) { const raised = await raiseCash(await strategyEarnOpen(due, ctx, plan, mix)); if (raised !== null) return raised; }
     let nextRunAt = base.nextRunAt;
     let scheduleNote = '';
     const end = rebalance.buyWindowEndsAt;
@@ -2832,9 +2923,8 @@ async function decideAndMaybeExecute(
   }
   if (mixTick?.mode === 'exit') rebalance = { ...rebalance, purpose: 'exit' };
   const batchCash = ctx.deps.chainId === 97 ? TESTNET_97.contracts.usdt : '0x55d398326f99059ff775485246999027b3197955';
-  const buys = rebalance.steps.some(step => !isAddressEqual(step.tokenOut,batchCash));
   const heldCount = plan.snapshot.holdings.filter(h=>h.amountWei>0n&&!isAddressEqual(getAddress(h.asset),batchCash)&&plan.targets.some(t=>t.asset.toLowerCase()===h.asset.toLowerCase())).length;
-  const limit = executionBatchSize(heldCount,buys);
+  const limit = executionBatchSize(heldCount,rebalance.steps.some(step => !isAddressEqual(step.tokenOut,batchCash)));
   if(limit===0)return {...base,outcome:'blocked',reason:'[USER_OP_CAPACITY] 無可行的安全批次'};
   if(rebalance.steps.length>limit)rebalance={...rebalance,steps:rebalance.steps.slice(0,limit),
     partial:{...rebalance.partial,remainingDriftBps:null,shrunk:rebalance.partial?.shrunk??[],maxLegBatched:true},rationale:rebalance.rationale+'；交易容量分批，剩餘依下一輪持倉續作'};
@@ -2848,10 +2938,27 @@ async function decideAndMaybeExecute(
   // of an account whose strategy was simply turned off earlier still have to reach the owner's wallet.
   const sharesPosted = (plan.snapshot.strategyEarnCollateral?.length ?? 0) > 0, exitSale = (rebalance.purpose ?? 'ordinary') === 'exit';
   if (sharesPosted || exitSale && ctx.deps.chainId === 97) {
-    let pending: string | null;
+    let pending: string | V2UnwindWait | null;
     try { pending = await strategyEarnSteps(ctx.deps).unwind(due, rebalance.steps, ctx.dryRun, exitSale, sharesPosted); }
     catch (error) { return { ...base, outcome: 'blocked', reason: `[STRATEGY_EARN_UNWIND_FAILED] 賣出前還款取回未完成，下一輪重試：${oneLine(error)}` }; }
-    if (pending !== null) return { ...base, outcome: 'blocked', reason: pending };
+    if (pending !== null && typeof pending === 'object') {
+      // Routing v2: some posted shares cannot be freed this round (the box is used up and the top-up has no USDT, or has
+      // to wait for its 24-hour window or the pool's peg). The sale is what brings the USDT in, so it is not held back:
+      // - a full exit sells what the account holds free now; a later round frees and sells the rest;
+      // - any other sale first raises the USDT the top-up is short of (a small sale of a free holding), then goes on.
+      const wait = pending;
+      if (!exitSale) {
+        const raised = await raiseCash(wait.needUsdtRaw);
+        return raised ?? { ...base, outcome: 'blocked', reason: wait.note };
+      }
+      const again = await ctx.deps.planRebalance({ ...planning, plan: withoutPosted(planning.plan, wait.stuck) });
+      if (again.kind !== 'ready' || again.steps.length === 0) return { ...base, outcome: 'blocked', reason: wait.note };
+      if (again.steps.some(step => !isAddressEqual(step.tokenOut, batchCash))) return { ...base, outcome: 'blocked', reason: '[INVALID_EXIT] 退出計畫包含買入，不送交易' };
+      if (!assetsMarketOpen(ctx.deps.chainId, again.steps.flatMap(step => [step.tokenIn, step.tokenOut]), ctx.now)) return { ...base, outcome: 'blocked', reason: '[MARKET_CLOSED] 股票休市，等待交易時段' };
+      ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} ${wait.note}；先賣出帳戶裡閒置的部分，之後的輪次再還款取回其餘`);
+      rebalance = { ...again, purpose: 'exit', steps: again.steps.slice(0, limit),
+        partial: { ...again.partial, remainingDriftBps: null, shrunk: again.partial?.shrunk ?? [], maxLegBatched: true }, rationale: `${again.rationale}；加息抵押中的部分之後的輪次還款取回再賣` };
+    } else if (pending !== null) return { ...base, outcome: 'blocked', reason: pending };
   }
   const gasPurpose = rebalance.purpose ?? 'ordinary';
   const cash = ctx.deps.chainId === 97 ? TESTNET_97.contracts.usdt : '0x55d398326f99059ff775485246999027b3197955';
@@ -2875,7 +2982,9 @@ async function decideAndMaybeExecute(
   if(money?.job?.kind==='asset')inclusiveBudget=rebalance.steps.reduce((s,step)=>s+step.amountIn,0n)+money.context.reserve;
   // Idle cash bought back by a rebalance is a buy: the buy minimum (10 USDT with its fee), not the 50 between assets.
   else if(rebalance.idleCashBuy!==undefined)inclusiveBudget=rebalance.steps.reduce((s,step)=>s+step.amountIn,0n)+rebalance.idleCashBuy.feeReserveRaw;
-  const minimumReason = await ctx.deps.checkTradingMinimums(rebalance.steps, gasPurpose, plan.snapshot.block,inclusiveBudget,money?.context.finalAssets,
+  // A cash raise is deliberately small (twice a top-up's shortfall, at least 1 USDT): the between-assets minimums do not
+  // apply to it; the executor's own floor does (the planner drops a step whose oracle floor is 0).
+  const minimumReason = ctx.cashRaise ? null : await ctx.deps.checkTradingMinimums(rebalance.steps, gasPurpose, plan.snapshot.block,inclusiveBudget,money?.context.finalAssets,
     money?.useTargetWeights&&rebalance.idleCashBuy===undefined?money.context.reserve:undefined);
   // The part of an idle-cash buy that fits one transaction can itself be under the minimum: it stays as cash, quietly.
   if (minimumReason !== null && rebalance.idleCashBuy !== undefined && /^\[BELOW_MIN_(STEP|BATCH)\]/.test(minimumReason)) return { ...base, outcome: 'noop', reason: `${minimumReason}；可用現金留作現金` };
@@ -3051,7 +3160,8 @@ async function decideAndMaybeExecute(
     valuationAssets,
     idempotencyKey,
     trackAllocatedCash:due.executionKind==='per_asset',
-    ...(due.personalMix ? { personalMix: true, mixDue: due } : {}),
+    // A cash raise on a private basket is not one of its rebalances: its date and its "rebalanced" notice stay untouched.
+    ...(due.personalMix ? { personalMix: true, ...(ctx.cashRaise ? {} : { mixDue: due }) } : {}),
     ...(money?.job ? { strategy: { context: money.context, job: money.job, ...(money.batchBudget ? { budget: money.batchBudget } : {}) } } : {}),
   });
   if (execution.errorCode === 'PINNED_VERSION_CHANGED' || execution.errorCode === 'VERSION_ACTIVATION_IMMINENT' || execution.errorCode === 'VERSION_STATE_UNAVAILABLE') {

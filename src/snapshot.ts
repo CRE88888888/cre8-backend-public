@@ -211,6 +211,25 @@ export async function readStrategyEarnV2Collateral(client: PublicClient, account
   return [...out.values()];
 }
 
+/**
+ * A fund account's total: the executor's account value (wallet balances + yield receipts) plus the shares posted for
+ * Strategy Earn. The lending market holds those shares, so the executor's value does not see them, yet they are still
+ * this portfolio's holding and are already in `holdings` (My mix totals the same holdings). Valued at this snapshot's
+ * price, the one the holdings table shows. Without them a fully posted account read as worth 0 while its holdings
+ * listed the shares (2026-11-25, portfolio 12 / 15). A posted asset without a priced holding = total unknown (null).
+ */
+export function withPostedCollateral(accountValue: bigint | null, holdings: readonly Holding[], posted: readonly StrategyEarnCollateral[]): bigint | null {
+  if (accountValue === null) return null;
+  let total = accountValue;
+  for (const c of posted) {
+    if (c.amount === 0n) continue;
+    const held = holdings.find(h => h.asset.toLowerCase() === c.asset.toLowerCase());
+    if (held === undefined || held.usdPriceE8 <= 0n) return null;
+    total += c.amount * held.usdPriceE8 / 10n ** BigInt(held.decimals) * E8_TO_E18;
+  }
+  return total;
+}
+
 function shortAddress(address: string): string {
   return `${address.slice(0, 6)}…${address.slice(-4)}`;
 }
@@ -558,7 +577,7 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
     snapshot.accountValueRaw = null;
   } else if(yieldConfig!==null && lending!==null){
     snapshot.yieldPositions=lending.positions;
-    snapshot.accountValueRaw=snapshot.unpriced.some(a=>a.amountWei>0n)?null:lending.accountValue;
+    snapshot.accountValueRaw=snapshot.unpriced.some(a=>a.amountWei>0n)?null:withPostedCollateral(lending.accountValue,snapshot.holdings,strategyEarn);
     try{
       const history=await query('select distinct block_number::text,block_hash,state from yield_events where chain_id=$1 and portfolio_id=$2',[chainId,portfolioId]);
       const events=history.rows.map(row=>yieldObject(row));

@@ -1171,3 +1171,66 @@ test('status 的 observeOnly：不掃日誌、不二分搜尋部署塊、不寫 
   assert.deepEqual(plan.blocked, []);
   assert.ok(plan.report !== null);
 });
+
+// ---------------------------------------------------------------------------
+// chain 97 基金帳戶：抵押在加息策略的股票要算進總值（2026-11-25 portfolio 12 / 15）
+// ---------------------------------------------------------------------------
+
+/**
+ * 基金帳戶（非自建組合）：NVDAB 3 顆全部抵押在加息策略（錢包餘額 0），帳戶裡只剩 5 USDT。
+ * executor 的帳戶估值看不到市場保管的股票，只回 5。
+ */
+const NVDAB = TESTNET_97.assets.NVDAB.token.toLowerCase() as Address;
+function pledgedFundPlan(posted: { asset: Address; marketId: string; amount: bigint }[], priceToken = oneDollarPrice()) {
+  const chain = baseChain({ versions: new Map([[1, { assets: [NVDAB, TESTNET_USDT], weightsBps: [10000, 0] }]]) });
+  chain.balances.set(TESTNET_USDT.toLowerCase(), 5n * 10n ** 18n);
+  const db = baseDb({
+    versions: new Map<string, Map<number, unknown>>([['11', new Map<number, unknown>([[1, { assets: [
+      { address: NVDAB, symbol: 'NVDAB', weightBps: 10000 }, { address: TESTNET_USDT, symbol: 'USDT', weightBps: 0 }] }]])]]),
+  });
+  const base = fakeQuery(db);
+  const query: QueryFn = async (text, params) => text.includes('from yield_events') ? { rows: [] } : base(text, params);
+  return planPortfolio(9, {
+    ...planDeps(chain, db, priceToken), query, chainId: 97,
+    strategyEarnCollateral: async () => posted,
+    readYield: async (_c, profile, _a, { block }) => ({ profile, positions: [], risks: [], accountValue: 5n * 10n ** 18n,
+      observation: { block, blockHash: `0x${'11'.repeat(32)}`, at: new Date(), source: 'test' } }),
+    yieldOptional: true, observeOnly: true,
+  });
+}
+
+test('chain 97 基金帳戶：抵押中的股票算進帳戶總值，與持倉表、漂移報告同一個數字', async () => {
+  const plan = await pledgedFundPlan([{ asset: NVDAB, marketId: `0x${'01'.repeat(32)}`, amount: 3n * 10n ** 18n }]);
+  assert.equal(plan.snapshot.holdings.find((h) => h.asset === NVDAB)?.amountWei, 3n * 10n ** 18n, '抵押的 3 顆仍列在持倉');
+  assert.equal(plan.report?.totalUsdE8, 8n * ONE_USD);
+  // 修正前：5e18（只有現金）。全部抵押、沒有現金時就是 0，App 以為沒東西可賣。
+  assert.equal(plan.snapshot.accountValueRaw, 8n * 10n ** 18n);
+
+  const { createPortfolioStatusReader } = await import('../src/operator.js');
+  const reader = createPortfolioStatusReader({
+    planPortfolio: async () => plan,
+    requireOwnedPortfolio: async () => ({ version: 1 }) as never,
+    query: (async () => ({ rows: [] })) as never,
+    readPauseFlags: async () => 0, accountGasBalance: async () => 0n, gasPrice: async () => 1n, minGasWei: 0n,
+    executor: '0x00000000000000000000000000000000000000ee',
+  });
+  const status = await reader(9, '0x00000000000000000000000000000000000000aa');
+  assert.equal(status.totalUsdE8, (8n * ONE_USD).toString(), 'GET /portfolios/:id/status 的總值含抵押中的股票');
+  assert.equal(status.holdings.reduce((sum, h) => sum + BigInt(h.usdValueE8), 0n).toString(), status.totalUsdE8, '總值 = 持倉表加總');
+});
+
+test('chain 97 基金帳戶：沒有抵押時總值照舊是 executor 的帳戶估值', async () => {
+  const plan = await pledgedFundPlan([]);
+  assert.equal(plan.snapshot.accountValueRaw, 5n * 10n ** 18n);
+});
+
+test('withPostedCollateral：抵押品用持倉表的價格；估值未知或抵押品沒有價格 → 總值未知，不當成 0', async () => {
+  const { withPostedCollateral } = await import('../src/snapshot.js');
+  const xaut = { asset: AAA.toLowerCase(), amountWei: 2_500_000n, decimals: 6, usdPriceE8: 4_000n * ONE_USD };
+  const posted = [{ asset: AAA, marketId: '0x01', amount: 2_000_000n }];
+  // 6 位小數的資產（測試網 XAUt）：2 顆 × 4000 美元 = 8000，加上帳戶裡的 1.5。
+  assert.equal(withPostedCollateral(15n * 10n ** 17n, [xaut], posted), 80015n * 10n ** 17n);
+  assert.equal(withPostedCollateral(null, [xaut], posted), null);
+  assert.equal(withPostedCollateral(1n, [], posted), null);
+  assert.equal(withPostedCollateral(1n, [], [{ ...posted[0]!, amount: 0n }]), 1n);
+});

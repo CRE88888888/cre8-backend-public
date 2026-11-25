@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createPublicClient, custom, encodeFunctionData, erc20Abi, maxUint256 } from 'viem';
+import { createPublicClient, custom, decodeFunctionData, encodeFunctionData, erc20Abi, maxUint256 } from 'viem';
 import type { Address, Hex } from 'viem';
 import { bscTestnet } from 'viem/chains';
 import { encodeCallDataEpV07 } from '@zerodev/sdk';
@@ -8,7 +8,8 @@ import { AppError } from '../src/errors.js';
 import { createPaymasterService } from '../src/paymaster.js';
 import { EXECUTOR_ABI } from '../src/chain.js';
 import { buildSessionPermissions } from '../src/permissions.js';
-import { closeCalls, consentCalls, openCalls, STRATEGY_EARN_97 as S, STRATEGY_EARN_ABI, strategyMarkets } from '../src/strategy-earn.js';
+import { closeCalls, consentCalls, openCalls, STRATEGY_EARN_97 as S, STRATEGY_EARN_ABI, strategyEarnUnwindForSale, strategyMarkets } from '../src/strategy-earn.js';
+import type { StrategyEarnChain } from '../src/strategy-earn.js';
 import { dcaDepositCalls, dcaReceiptApproval, dcaReturnCalls, dcaVaults } from '../src/dca-calls.js';
 import { YIELD_EXECUTOR_ABI } from '../src/yield-abi.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
@@ -110,6 +111,8 @@ async function flows(kind: Kind): Promise<[string, Call[], { lock: boolean }][]>
   shared.push(['Strategy Earn open after buy', openCalls(markets[0]!, account, 10n ** 18n, 10n ** 17n, 10n ** 18n, deadline).map(asCall), { lock: false }]);
   shared.push(['Strategy Earn off', closeCalls(markets[0]!, account, deadline).map(asCall), { lock: false }]);
   shared.push(['fund sell', [rebalance(asset, usdt)], { lock: false }]);
+  // The scheduler's session-key steps on a fund account: the same shapes as a My mix (last two of strategyFlows).
+  shared.push(...strategyFlows(r, deadline).slice(-2).map(([name, calls, expect]): [string, Call[], { lock: boolean }] => [name.replace(/^mix/, 'fund'), calls, expect]));
   return shared;
 }
 
@@ -146,6 +149,53 @@ for (const kind of ['fund', 'mix'] as const) {
     }
   });
 }
+
+/**
+ * 2026-11-25 portfolio 12 / 15 (fund account, every share posted for the yield strategy): "sell all" has to go
+ * settle (repay + take the shares back) -> sell -> withdraw USDT in one press, exactly like a My mix. The UserOps are the
+ * ones the scheduler really sends (strategyEarnUnwindForSale's batches), then the sale, then the owner's withdrawal.
+ */
+test('sell all with the yield strategy on (fund and My mix): settle -> sell -> withdraw, every UserOp sponsored', async () => {
+  const E = 10n ** 18n, now = new Date(NOW * 1000);
+  const venus = markets.find(m => m.protocol === 'venus')!, lista = markets.find(m => m.protocol === 'lista' && m.decimals === 18)!;
+  const reading = (debt: bigint) => ({ gate: 0, shouldDeleverage: false, shouldUnwind: false, borrowRate: 0n, collateralRate: 0n, vaultRate: 0n, collateralIncentiveRate: 0n,
+    borrowIncentiveRate: 0n, vaultIncentiveRate: 0n, borrowUtilizationBps: 0n, vaultUtilizationBps: 0n, ltv: 2n * 10n ** 17n, targetLtv: 3n * 10n ** 17n, deleverageLtv: 5n * 10n ** 17n,
+    liquidationLtv: 75n * 10n ** 16n, debt, vaultAssets: debt + debt / 100n, health: { collateralValue: 1000n * E, liquidationValue: 750n * E, debtValue: debt, healthFactor: 5n * E } });
+  for (const kind of ['fund', 'mix'] as const) {
+    // Everything is posted: the account holds none of the two assets, only a little USDT.
+    const posted = new Map([[venus.marketId as string, 10n * E], [lista.marketId as string, 10n * E]]);
+    const chain: StrategyEarnChain = {
+      head: async () => ({ number: 1n, timestamp: BigInt(NOW) }),
+      status: async () => reading(200n * E),
+      accountMarkets: async () => [...posted.keys()] as Hex[],
+      collateral: async id => posted.get(id) ?? 0n,
+      balance: async token => token.toLowerCase() === usdt.toLowerCase() ? E : 0n,
+      price: async () => 100n * 10n ** 8n,
+      rewards: async () => ({ vault: 0n, collateral: 0n }),
+      policy: async () => ({ maxDebt: 1_000_000n * E, enabled: true }),
+      weights: async () => [],
+    };
+    const ops: Call[][] = [];
+    const sponsored = async (calls: Call[], nonce: bigint, name: string) => {
+      const h = harness(kind);
+      await assert.doesNotReject(h.sponsor(calls, nonce), `${kind}: ${name}`);
+      assert.equal(h.seen.reservations, 1, `${kind}: ${name}`);
+      ops.push(calls);
+    };
+    // 1. The sale wants the posted shares: the scheduler repays from the vault and takes them back (session key).
+    const reason = await strategyEarnUnwindForSale({ chain, account, portfolioId: 15, now, dryRun: false, log: () => {},
+      ledger: { record: async () => {} },
+      steps: [{ tokenIn: venus.collateral, amountIn: 10n * E }, { tokenIn: lista.collateral, amountIn: 10n * E }],
+      send: async calls => { await sponsored(calls.map(asCall), SESSION, 'repay and take the shares back'); return { hash: `0x${'0'.repeat(63)}1`, blockNumber: 1n, logs: [] }; } });
+    assert.match(reason ?? '', /^\[STRATEGY_EARN_UNWINDING\] 賣出前已還款取回：/);
+    const fns = ops.flat().map(c => decodeFunctionData({ abi: STRATEGY_EARN_ABI, data: c.data }).functionName);
+    assert.deepEqual([...new Set(fns)].sort(), ['executeRepay', 'executeWithdrawCollateral']);
+    assert.equal(fns.filter(f => f === 'executeWithdrawCollateral').length, 2, 'both posted assets come back');
+    // 2. The sale itself (session key), 3. the owner's USDT withdrawal (root).
+    await sponsored([rebalance(venus.collateral, usdt), rebalance(lista.collateral, usdt)], SESSION, 'sell');
+    await sponsored([transfer(usdt, owner, 1_999n * E)], ROOT, 'withdraw USDT to the wallet');
+  }
+});
 
 test('portfolio 10: DCA on a fresh My mix (renewal + approve + deposit + receipt approval) is sponsored without the mix lock', async () => {
   for (const v of vaults) {

@@ -473,7 +473,7 @@ export type Settlement = {
  * - `vaultFails`: what to buy instead when the first attempt reverts although the vault read as enough.
  * The budget is updated as if the repayment lands, so the next route of the same token sees what is left.
  */
-export function settleRepayment(v2: StrategyEarnV2, r: SettleRoute, budget: SettleBudget, opts: { repayRaw: bigint; deadline: bigint; now: number; close: boolean; partial?: boolean; strict?: boolean }): Settlement {
+export function settleRepayment(v2: StrategyEarnV2, r: SettleRoute, budget: SettleBudget, opts: { repayRaw: bigint; deadline: bigint; now: number; close: boolean; partial?: boolean }): Settlement {
   const key = r.loan, D = opts.repayRaw;
   const vault = budget.vault.get(key) ?? r.vaultAssetsRaw, idle = budget.idle.get(key) ?? r.idleRaw, cash = budget.cash.get(key) ?? r.cashRaw;
   if (D === 0n) return { before: [], after: [], maxCashInRaw: cash, toppedUpRaw: 0n };
@@ -484,9 +484,10 @@ export function settleRepayment(v2: StrategyEarnV2, r: SettleRoute, budget: Sett
   if (first !== null && 'blocked' in first) {
     // Nothing can be bought. Without a swapper for the token the caller decides, as before the swapper existed. With one:
     // when the box and the account do hold the debt as read (only the margin for the next minutes' interest, or a vault
-    // that could not be read, is missing) the repayment goes out without a top-up, as it always did; `strict` callers (a
-    // sale, which can free the collateral in parts instead) and a debt nothing on chain can repay get the reason back.
-    if (first.noSwap || opts.strict || D > vault + idle + cash) return { before: [], after: [], maxCashInRaw: cash, blocked: first, toppedUpRaw: 0n };
+    // that could not be read, is missing) the repayment goes out without a top-up, as it always did — a vault that earns
+    // more than the loan costs is ahead again by the time it lands, and one that is not fails the simulation and is
+    // planned again next round. A debt nothing on chain can repay gets the reason back.
+    if (first.noSwap || D > vault + idle + cash) return { before: [], after: [], maxCashInRaw: cash, blocked: first, toppedUpRaw: 0n };
     first = null;
   }
   const A = first?.amountRaw ?? 0n;
@@ -498,8 +499,10 @@ export function settleRepayment(v2: StrategyEarnV2, r: SettleRoute, budget: Sett
   let vaultFails: Call[] | undefined;
   if (swap && swap.gapRaw !== null && vault > 0n) { const alt = top(false); if (alt !== null && !('blocked' in alt) && alt.covers && alt.amountRaw > A) vaultFails = [v2Calls.topUp(v2, swap.token, alt.amountRaw, opts.deadline)]; }
   // The budget after this repayment: idle (with the purchase) pays first, then the vault, then the account's own loan token.
+  // What it takes is the debt itself: the 0.02% margin is this repayment's own caution, not money that leaves the box —
+  // charging it to the next route of the same token made a box that holds both debts look short for the second one.
   if (swap) { budget.usdt = usdt - (first?.maxUsdtInRaw ?? 0n); budget.cap.set(key, cap > A ? cap - A : 0n); }
-  let need = D + driftOf(D);
+  let need = D;
   const take = (from: bigint) => { const used = from < need ? from : need; need -= used; return from - used; };
   budget.idle.set(key, take(idle + A)); budget.vault.set(key, take(vault)); budget.cash.set(key, take(cash));
   return { before, after, maxCashInRaw: cash, ...(vaultFails ? { vaultFails } : {}), toppedUpRaw: A };
@@ -757,7 +760,7 @@ export function v2PreSellPlan(v2: StrategyEarnV2, account: Address, positions: r
       lastOfToken: !positions.slice(i + 1).some(x => x.loan === p.loan && (x.routeDebtRaw ?? 0n) > 0n && (x.postedRaw ?? 0n) > 0n) && p.lastOfToken !== false };
     // The box (with a top-up from the account's USDT where the token is not USDT) and the account's own loan token cover
     // the debt -> close, and sell what is left of the loan token.
-    const full = settleRepayment(v2, route, budget, { repayRaw: debt, deadline, now, close: true, strict: true });
+    const full = settleRepayment(v2, route, budget, { repayRaw: debt, deadline, now, close: true });
     if (!full.blocked) {
       calls.push(...full.before, v2Calls.close(v2, account, p.routeId, p.vaultId, full.maxCashInRaw, deadline), ...full.after);
       notes.push(`${p.symbol} ${full.toppedUpRaw > 0n ? `top up ${full.toppedUpRaw} ${p.loan} from USDT, ` : ''}repay ${debt} ${p.loan}, take back${full.after.length > 0 ? `, sell the ${p.loan} left` : ''}`);

@@ -716,8 +716,8 @@ test('cash swapper, two routes in one loan token (they share the box): the lefto
   // Owner exit: before the fix a cash-out followed the FIRST close too, where the account holds nothing yet (ZeroAmount -> the whole batch reverted).
   const exit = v2ExitPlan(VS, account, { routes: [route(a), route(b)], deadline: DEADLINE, withdrawConsent: true, rewardRecipient: owner, now: SWAP_NOW });
   assert.deepEqual([names(exit.calls), exit.blocked], [['executeReduce', 'topUp', 'executeReduce', 'cashOut', 'setStrategyPolicy'], []]);
-  // The second close finds what the first left (1,999 − 1,000.2) and buys only the difference.
-  const short = 1000n * E + (1000n * E / 5_000n + 1n) - (1999n * E - 1000n * E - (1000n * E / 5_000n + 1n));
+  // The second close finds what the first left (1,999 − 1,000: the first takes its debt, not its own safety margin) and buys only the difference.
+  const short = 1000n * E + (1000n * E / 5_000n + 1n) - (1999n * E - 1000n * E);
   assert.equal(swapCall(exit.calls[1]!).args[1], short + 1000n * E / 2_500n + 1n);
   // Another route of the token stays open after the exit: nothing is sold at all.
   assert.deepEqual(names(v2ExitPlan(VS, account, { routes: [{ ...route(a), lastOfToken: false }], deadline: DEADLINE, withdrawConsent: false, now: SWAP_NOW }).calls), ['executeReduce']);
@@ -734,4 +734,30 @@ test('cash swapper, two routes in one loan token (they share the box): the lefto
   const moved = planExecution({ v2: VS, account, decisions: [decision('QQQB', 'migrate', 'negative_carry', worse, listaUsdc, 1000), decision('NVDAB', 'migrate', 'negative_carry', { ...worse, marketId: LISTA_MARKET_2 }, { ...listaUsdc, marketId: LISTA_MARKET_2 }, 1000)],
     positions: [state('QQQB', QQQ, { routeDebtRaw: 1000n * E, loan: 'USDC' }), state('NVDAB', NVDA, { routeDebtRaw: 1000n * E, loan: 'USDC' })], deadline: DEADLINE, policyMaxDebtUsdRaw: 10_000n * E, principalUsdRaw: 2000n * E, now: SWAP_NOW }).steps;
   assert.deepEqual(moved.map(x => [x.symbol, names(x.calls), x.skipped]), [['QQQB', ['executeSwitchVault'], undefined], ['NVDAB', [], 'moved with QQQB: one vault holds this loan token for both']]);
+});
+
+test('cash swapper, two routes in one loan token and no USDT to top up with: a box that holds both debts closes both (owner, before a sale, scheduler); only a real gap waits', () => {
+  // The usual case right after opening: the vault holds a hair more than the two debts together, and the account has no
+  // USDT the cash ledger does not claim. Before the fix the second route looked short (the first one's 0.02% margin was
+  // charged to the box) and the owner's turn-off answered "unavailable"; before a sale it was only freed in part.
+  const a = routeIds(VS, QQQ, listaUsdc), b = routeIds(VS, NVDA, { ...listaUsdc, marketId: LISTA_MARKET_2 });
+  const broke = quote({ usdtRaw: 0n, capRaw: 2_020n * E });
+  const box = 2000n * E + 10n ** 12n; // 0.000001 above the two debts
+  const route = (ids: typeof a) => ({ ...ids, routeDebtRaw: 1000n * E, cashRaw: 0n, loan: 'USDC', vaultAssetsRaw: box, idleRaw: 0n, swap: broke, lastOfToken: true });
+  const exit = v2ExitPlan(VS, account, { routes: [route(a), route(b)], deadline: DEADLINE, withdrawConsent: true, rewardRecipient: owner, now: SWAP_NOW });
+  assert.deepEqual([names(exit.calls), exit.blocked], [['executeReduce', 'executeReduce', 'setStrategyPolicy'], []]);
+  const pos = (ids: typeof a, symbol: string, collateral: Address): PreSellPosition => ({ symbol, collateral, freeCollateralRaw: 0n, postedRaw: 10n * E, routeDebtRaw: 1000n * E, routeId: ids.routeId, vaultId: ids.vaultId, venue: 'lista', loan: 'USDC', vaultAssetsRaw: box, swap: broke });
+  const sale = v2PreSellPlan(VS, account, [pos(a, 'QQQB', QQQ), pos(b, 'NVDAB', NVDA)], DEADLINE, SWAP_NOW);
+  assert.deepEqual(sale.calls.map(c => decode(c.data).args.slice(3, 5)), [[maxUint256, maxUint256], [maxUint256, maxUint256]], 'two full closes, nothing freed in part');
+  const steps = planExecution({ v2: VS, account, decisions: [decision('QQQB', 'close', 'negative_carry', listaUsdc, null, 0), decision('NVDAB', 'close', 'negative_carry', { ...listaUsdc, marketId: LISTA_MARKET_2 }, null, 0)],
+    positions: [state('QQQB', QQQ, { routeDebtRaw: 1000n * E, postedRaw: E, vaultAssetsRaw: box, loan: 'USDC', swap: broke }), state('NVDAB', NVDA, { routeDebtRaw: 1000n * E, postedRaw: E, vaultAssetsRaw: box, loan: 'USDC', swap: broke })],
+    deadline: DEADLINE, policyMaxDebtUsdRaw: 10_000n * E, principalUsdRaw: 2000n * E, now: SWAP_NOW }).steps;
+  assert.deepEqual(steps.map(x => [names(x.calls), x.skipped]), [[['executeReduce'], undefined], [['executeReduce'], undefined]]);
+  // A real gap (the box holds less than the two debts) and nothing to buy it with: the owner's exit says so, the sale frees what the box can repay.
+  const gap = 2000n * E - 10n ** 15n;
+  const short = v2ExitPlan(VS, account, { routes: [{ ...route(a), vaultAssetsRaw: gap }, { ...route(b), vaultAssetsRaw: gap }], deadline: DEADLINE, withdrawConsent: true, now: SWAP_NOW });
+  assert.equal(short.blocked.length, 1);
+  const part = v2PreSellPlan(VS, account, [{ ...pos(a, 'QQQB', QQQ), vaultAssetsRaw: gap }, { ...pos(b, 'NVDAB', NVDA), vaultAssetsRaw: gap }], DEADLINE, SWAP_NOW);
+  assert.deepEqual(part.calls.map(c => decode(c.data).args.slice(3, 5)), [[maxUint256, maxUint256], [1000n * E - 10n ** 15n - 1n, 10n * E * (1000n * E - 10n ** 15n - 1n) / (1000n * E) * 9_800n / 10_000n]]);
+  assert.match(part.notes[1]!, /short of USDC/);
 });

@@ -1,5 +1,6 @@
 import { assetsMarketOpen } from './trading-calendar.js';
 import { MAX_USER_OP_STEPS } from './execution-batch.js';
+import { MIN_BATCH_USDT } from './strategy-execution.js';
 import { configuredChainId, TESTNET_97, testnetAssets } from './testnet-profile.js';
 import { cancelJob, lockCash, readJob, unresolvedSql } from './strategy-jobs.js';
 import { OWNER_DEX_WAIT_MS, withDexLock } from './dex-queue.js';
@@ -1333,9 +1334,22 @@ export type RedeemResult = {
   batched: boolean;
 };
 
+/**
+ * The smallest partial sale an owner can ask for (`usd`, E8): the buy minimum (10 USDT), not the 50 USDT a rebalance
+ * between assets needs. Below it the request is refused before anything is read or sent. A continuation (`sellUsdE8`)
+ * is the remainder of a sale that already passed this, so it is not held to it.
+ */
+export const MIN_SELL_USD_E8 = MIN_BATCH_USDT * 100_000_000n;
+/**
+ * The smallest single step of an owner's partial sale (E8): 1 USDT, the same floor a cash raise uses (below it the
+ * executor's floor and the fee leave nothing). A remainder smaller than this is never sold on its own.
+ */
+export const SELL_MIN_STEP_USD_E8 = 100_000_000n;
+
 export async function runOperatorRedeem(portfolioId: number, wallet: string, amount: RedeemAmount, deps: RebalanceDeps = {}): Promise<RedeemResult> {
   const value = typeof amount === 'bigint' ? amount : amount.sellUsdE8;
   if (value <= 0n) throw new AppError(400, 'INVALID_AMOUNT', 'redeem amount must be greater than zero');
+  if (typeof amount === 'bigint' && amount < MIN_SELL_USD_E8) throw new AppError(400, 'BELOW_MIN_SELL', `a partial sale must be at least ${MIN_BATCH_USDT} USDT; sell everything to close a smaller position`);
   return runOperatorSell(portfolioId, wallet, amount, deps);
 }
 
@@ -1447,6 +1461,46 @@ async function readNumeraireAddress(query: QueryFn, chainId: number): Promise<Ad
   return address as Address;
 }
 
+/**
+ * How an owner's partial sale of `budget` is taken from the holdings when the plain pro-rata split does not work
+ * (a share would be under `minStep`, or would need shares posted for Strategy Earn). All values are oracle nominal in
+ * numeraire raw units; `free[i]` is what the account holds itself, `posted[i]` what it posted as collateral.
+ *
+ *   1. Free balances first, pro rata to their free value. A share under `minStep` is dropped (smallest first) and the
+ *      others take it over, so the sale lands in fewer assets instead of failing.
+ *   2. Only what the free balances cannot cover comes from posted shares, from as few assets as possible (largest
+ *      posted first): each of those positions has to be repaid and taken back before it can be sold.
+ *
+ * Whatever cannot be placed in a step of at least `minStep` is left out (the caller reports it as not sold).
+ */
+export function allocateSale(budget: bigint, free: readonly bigint[], posted: readonly bigint[], minStep: bigint): bigint[] {
+  const out = free.map(() => 0n);
+  if (budget <= 0n) return out;
+  let active = free.map((_, index) => index).filter((index) => (free[index] ?? 0n) > 0n);
+  while (active.length > 0) {
+    const room = active.reduce((sum, index) => sum + (free[index] ?? 0n), 0n);
+    const take = budget < room ? budget : room;
+    const shares = active.map((index) => take === room ? free[index] ?? 0n : take * (free[index] ?? 0n) / room);
+    let smallest = 0;
+    for (let i = 1; i < shares.length; i++) if ((shares[i] ?? 0n) < (shares[smallest] ?? 0n)) smallest = i;
+    if ((shares[smallest] ?? 0n) >= minStep) { active.forEach((index, i) => { out[index] = shares[i] ?? 0n; }); break; }
+    active = active.filter((_, i) => i !== smallest);
+  }
+  let left = budget - out.reduce((sum, value) => sum + value, 0n);
+  if (left < minStep) return out;
+  const byPosted = posted.map((value, index) => ({ value, index })).filter((entry) => entry.value > 0n)
+    .sort((a, b) => (b.value > a.value ? 1 : b.value < a.value ? -1 : a.index - b.index));
+  for (const { index } of byPosted) {
+    if (left <= 0n) break;
+    const room = (free[index] ?? 0n) + (posted[index] ?? 0n) - (out[index] ?? 0n);
+    const add = left < room ? left : room;
+    if ((out[index] ?? 0n) + add < minStep) continue;
+    out[index] = (out[index] ?? 0n) + add;
+    left -= add;
+  }
+  return out;
+}
+
 export type RedeemPlanningResult = {
   plan: RebalancePlan;
   requestedSellUsdE8: bigint | null;
@@ -1522,11 +1576,41 @@ export async function buildRedeemPlan(input: RebalancePlanningInput, request: Se
     const deadline = (timestamp > wall ? timestamp : wall) + BigInt(DEFAULT_DEADLINE_SECONDS);
     const steps: PlannedStep[] = [];
     let soldRaw = 0n;
-    for (const holding of availableHoldings) {
+    const closing = typeof request === 'object' && 'close' in request;
+    // What each holding sells this batch. A close sells everything; a partial sale is pro rata, as before.
+    let amounts = availableHoldings.map((holding) => {
+      const amount = closing ? holding.amountWei : first ? holding.amountWei * request / totalE8 : holding.amountWei * budget * scale / (nonCashRaw * 100_000_000n);
+      return amount > holding.amountWei ? holding.amountWei : amount;
+    });
+    if (!closing) {
+      // A pro-rata share under one step (many assets, a small weight) used to fail the whole sale ([BELOW_MIN_STEP]), and a
+      // share larger than the free balance repays and takes back Strategy Earn collateral first. Then the same amount is
+      // taken from fewer assets and from free balances first (allocateSale); weights drift a little, the sale goes through.
+      const postedOf = new Map<string, bigint>();
+      for (const entry of snapshot.strategyEarnCollateral ?? []) postedOf.set(entry.asset.toLowerCase(), (postedOf.get(entry.asset.toLowerCase()) ?? 0n) + entry.amount);
+      const values = availableHoldings.map((holding) => nominal[holdings.indexOf(holding)] ?? 0n);
+      const freeAmounts = availableHoldings.map((holding) => { const kept = postedOf.get(holding.asset.toLowerCase()) ?? 0n; return holding.amountWei > kept ? holding.amountWei - kept : 0n; });
+      const minStepRaw = SELL_MIN_STEP_USD_E8 * scale / 100_000_000n;
+      const budgetRaw = budget * scale / 100_000_000n;
+      const fits = availableHoldings.every((holding, index) => {
+        const share = first ? (values[index] ?? 0n) * request / totalE8 : budgetRaw * (values[index] ?? 0n) / nonCashRaw;
+        return (amounts[index] ?? 0n) > 0n && (amounts[index] ?? 0n) <= (freeAmounts[index] ?? 0n) && share >= minStepRaw;
+      });
+      if (!fits) {
+        const freeValues = availableHoldings.map((holding, index) => (values[index] ?? 0n) * (freeAmounts[index] ?? 0n) / holding.amountWei);
+        const allocated = allocateSale(budgetRaw, freeValues, values.map((value, index) => value - (freeValues[index] ?? 0n)), minStepRaw);
+        // A hair under the allocation: token rounding must never push the batch's oracle nominal above the request.
+        amounts = availableHoldings.map((holding, index) => {
+          const value = allocated[index] ?? 0n;
+          const amount = value === 0n ? 0n : holding.amountWei * (value - value / 1_000_000n) / (values[index] ?? 1n);
+          return amount > holding.amountWei ? holding.amountWei : amount;
+        });
+        if (amounts.every((amount) => amount === 0n)) return reply({ kind: 'noop', reason: `[BELOW_MIN_STEP] 待賣量換算後為 0：待賣 ${wanted} E8 湊不成一步至少 ${SELL_MIN_STEP_USD_E8} E8 的賣單，不送交易` });
+      }
+    }
+    for (const [index, holding] of availableHoldings.entries()) {
       if (steps.length === MAX_USER_OP_STEPS) break;
-      let amountIn = first ? holding.amountWei * request / totalE8 : holding.amountWei * budget * scale / (nonCashRaw * 100_000_000n);
-      if (typeof request === 'object' && 'close' in request) amountIn = holding.amountWei;
-      if (amountIn > holding.amountWei) amountIn = holding.amountWei;
+      let amountIn = amounts[index] ?? 0n;
       if (amountIn === 0n) continue;
       const limit = limits.get(holding.asset.toLowerCase());
       if (limit === undefined) return reply({ kind: 'blocked', reason: '[MAX_LEG_UNAVAILABLE] 缺少單筆限額' });
@@ -1554,11 +1638,13 @@ export async function buildRedeemPlan(input: RebalancePlanningInput, request: Se
     if (steps.length === 0) return reply({ kind: 'blocked', reason: `沒有可執行的賣出步驟：${notes.join('；') || '待賣量換算後為 0'}` });
     // Subtract the ceiling of aggregate nominal sold, so repeated E8 continuation never oversells by truncation.
     const soldE8 = (soldRaw * 100_000_000n + scale - 1n) / scale;
-    const fullExit = (typeof request === 'object' && 'close' in request) || holdings.every((holding) =>
+    // What a partial sale leaves under one step is never sold on its own: the request is complete, nothing to continue.
+    const plannedE8 = !closing && wanted > soldE8 && wanted - soldE8 < SELL_MIN_STEP_USD_E8 ? wanted : soldE8;
+    const fullExit = closing || holdings.every((holding) =>
       steps.filter((step) => step.tokenIn.toLowerCase() === holding.asset.toLowerCase()).reduce((sum, step) => sum + step.amountIn, 0n) === holding.amountWei);
     return reply({ kind: 'ready', steps, deadline,
-      ...(fullExit ? { purpose: 'exit' } : {}),
-      rationale: `賣出 ${steps.length} 檔，非現金待賣 ${wanted} E8，本批名義額 ${soldE8} E8；剩餘由 API 呼叫者以 sellUsdE8 續作（依當下非現金價值重新分配）${notes.length === 0 ? '' : `；blocked：${notes.join('；')}`}` }, soldE8);
+      ...(fullExit ? { purpose: 'exit' } : { ownerSale: true }),
+      rationale: `賣出 ${steps.length} 檔，非現金待賣 ${wanted} E8，本批名義額 ${soldE8} E8；剩餘由 API 呼叫者以 sellUsdE8 續作（依當下非現金價值重新分配）${notes.length === 0 ? '' : `；blocked：${notes.join('；')}`}` }, plannedE8);
   } catch (error) {
     return reply({ kind: 'blocked', reason: decodePriceSourceError(error)?.detail ?? '[REDEEM_PLAN_UNAVAILABLE] 持倉、限額、oracle 或 DB 資料不可用，不送交易' });
   }

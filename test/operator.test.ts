@@ -20,6 +20,8 @@ import {
   previewOperatorRebalance,
   runOperatorRebalance,
   runOperatorRedeem,
+  allocateSale,
+  MIN_SELL_USD_E8,
   runOperatorClose,
   singlePortfolioClaim,
   listPortfolioActivity,
@@ -31,6 +33,7 @@ import { listPriceableAssets } from '../src/assets.js';
 import type { OperatorRebalanceResult, PortfolioStatus } from '../src/operator.js';
 import { NUMERAIRE_PRICE_SOURCE, TWAP_PRICE_SOURCE } from '../src/positions.js';
 import type { PortfolioRunResult, runSchedulerOnce } from '../src/scheduler.js';
+import { AppError } from '../src/errors.js';
 import { createServer } from '../src/server.js';
 import type { ServerDeps } from '../src/server.js';
 import type { PortfolioPlan } from '../src/snapshot.js';
@@ -462,6 +465,38 @@ test('#40 redeem 路由接受 E8 續作字串、忽略 usd，拒絕錯誤格式'
     }
     assert.equal(received.length, 1);
   }, { operatorRedeem: async (_id, _wallet, amount) => { received.push(amount); return { remainingUsdE8: '0', batched: false }; } });
+});
+
+test('redeem 帶 Idempotency-Key：同一把 key 重送（含還在跑的時候）只賣一次、回同一個結果；換 key、換金額或不帶 key 才會再賣', async () => {
+  const received: unknown[] = [];
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  await withServer(async (base) => {
+    const token = await loginToken(base);
+    const post = (body: unknown, key?: string) => fetch(`${base}/portfolios/${PORTFOLIO_ID}/redeem`, { method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}`, ...(key === undefined ? {} : { 'idempotency-key': key }) }, body: JSON.stringify(body) });
+    const key = `sell-${Date.now()}-a`;
+    // 第一個還在跑（代理 30 秒逾時、前端重送）：第二個等它，不另外賣一次。
+    const first = post({ usd: 20 }, key), again = post({ usd: 20 }, key);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(received.length, 1);
+    release();
+    const [a, b] = await Promise.all([first, again]);
+    assert.deepEqual([a.status, b.status], [200, 200]);
+    assert.deepEqual(await a.json(), await b.json());
+    // 跑完之後再送同一把 key：回同一個結果。
+    const later = await post({ usd: 20 }, key);
+    assert.deepEqual(await later.json(), { outcome: 'executed', reason: '', remainingUsdE8: '0', batched: false, n: 1 });
+    assert.equal(received.length, 1);
+    await post({ usd: 20 }, `sell-${Date.now()}-b`);
+    await post({ usd: 21 }, key);
+    await post({ sellUsdE8: '300000000' }, key);
+    await post({ usd: 20 });
+    await post({ usd: 20 });
+    assert.deepEqual(received, [2000000000n, 2000000000n, 2100000000n, { sellUsdE8: 300000000n }, 2000000000n, 2000000000n]);
+    assert.equal((await post({ usd: 20 }, 'short')).status, 400);
+    assert.equal(received.length, 6);
+  }, { operatorRedeem: async (_id, _wallet, amount) => { received.push(amount); const n = received.length; await gate; return { outcome: 'executed', reason: '', remainingUsdE8: '0', batched: false, n }; } });
 });
 
 test('#40 1800 USDT + 200 DOGE：首批賣 150，remaining 50 續作恰好賣完', async () => {
@@ -1507,7 +1542,7 @@ test('#59 rebalance, preview, redeem and close all explicitly skip global alerts
   const options = { requireOwnedPortfolio: OWNED, runSchedulerOnce: run };
   await runOperatorRebalance(PORTFOLIO_ID, WALLET.address, options);
   await previewOperatorRebalance(PORTFOLIO_ID, WALLET.address, options);
-  await runOperatorRedeem(PORTFOLIO_ID, WALLET.address, 1n, options);
+  await runOperatorRedeem(PORTFOLIO_ID, WALLET.address, MIN_SELL_USD_E8, options);
   await runOperatorClose(PORTFOLIO_ID, WALLET.address, options);
   assert.deepEqual(seen.map((args) => args.skipAlerts), [true, true, true, true]);
   assert.deepEqual(seen.map((args) => args.dryRun), [false, true, false, false]);
@@ -1535,6 +1570,117 @@ test('#92 close plans at most 16 sell steps and resumes remaining holdings, incl
     if(count<=16)assert.equal(next.plan.kind,'noop');
     else {assert.ok(next.plan.kind==='ready');assert.equal(next.plan.steps.length,Math.min(16,count-16));assert.ok(next.plan.steps.every(s=>!sold.has(s.tokenIn.toLowerCase())));}
   }
+});
+
+
+// ---- 部分賣出一定成交（2026-11-25：賣 20 USDT 回 [BELOW_MIN_BATCH]，一檔都沒賣） ---------------------------------------------
+
+/** 非現金持倉各 `usd[i]` 美元（18 位、1 美元一顆），帳戶沒有現金；`posted[i]` 是其中抵押在加息策略的美元數。 */
+function partialSalePlan(f: ReturnType<typeof sellFixture>, usd: readonly string[], posted: readonly string[] = []) {
+  const wei = (value: string) => BigInt(Math.round(Number(value) * 1e6)) * 10n ** 12n;
+  const plan = f.plan(samplePlan());
+  const holdings: PortfolioPlan['snapshot']['holdings'] = usd.map((value, i) => ({ asset: getAddress(`0x${(0x9300 + i).toString(16).padStart(40, '0')}`),
+    amountWei: wei(value), decimals: 18, usdPriceE8: 100000000n, priceSource: TWAP_PRICE_SOURCE }));
+  f.state.limit = null;
+  f.state.extraLimits = holdings.map((h) => ({ address: h.asset, max_leg_usdt: null }));
+  plan.snapshot.holdings = holdings;
+  const collateral = posted.flatMap((value, i) => Number(value) > 0 ? [{ asset: holdings[i]!.asset.toLowerCase() as `0x${string}`, marketId: `0x${'00'.repeat(31)}${(i + 1).toString(16).padStart(2, '0')}`, amount: wei(value) }] : []);
+  if (collateral.length > 0) plan.snapshot.strategyEarnCollateral = collateral;
+  plan.targets = holdings.map((h) => ({ asset: h.asset, weightBps: Math.floor(10000 / holdings.length), symbol: 'TEST' }));
+  plan.targets[0]!.weightBps += 10000 - plan.targets.reduce((sum, t) => sum + t.weightBps, 0);
+  plan.report = computeDrift(holdings, plan.targets, 100);
+  return { plan, holdings, wei, sold: (steps: readonly { tokenIn: string; amountIn: bigint }[]) => holdings.map((h) => steps.filter((s) => s.tokenIn.toLowerCase() === h.asset.toLowerCase()).reduce((sum, s) => sum + s.amountIn, 0n)) };
+}
+const usdE8 = (value: number) => BigInt(Math.round(value * 1e8));
+
+test('部分賣出：7 檔各 18.4、賣 20（前端送 21.276596）按比例 7 步成交，標成 owner 自己的賣單、沒有剩餘待賣', async () => {
+  const f = sellFixture();
+  const p = partialSalePlan(f, Array.from({ length: 7 }, () => '18.4'));
+  const built = await buildRedeemPlan({ portfolioId: PORTFOLIO_ID, account: ACCOUNT, plan: p.plan }, usdE8(21.276596), { ...f.deps, quoteAggregator: async () => null });
+  assert.ok(built.plan.kind === 'ready');
+  assert.equal(built.plan.steps.length, 7);
+  assert.equal(built.plan.ownerSale, true, '排程器據此不套資產間再平衡的 1／50 USDT 門檻');
+  assert.equal(built.plan.purpose, undefined);
+  const sold = p.sold(built.plan.steps);
+  assert.ok(sold.every((amount) => amount === sold[0] && amount > 3n * 10n ** 18n && amount < 31n * 10n ** 17n), '每檔約 3.04');
+  assert.equal(built.requestedSellUsdE8, built.plannedSellUsdE8);
+  assert.ok(built.plannedSellUsdE8 > usdE8(21.27) && built.plannedSellUsdE8 <= usdE8(21.276596));
+});
+
+test('部分賣出：賣 10（送 10.638298）按比例會有一檔不到 1 USDT，改成集中賣其餘幾檔，整筆照樣成交', async () => {
+  const f = sellFixture();
+  const p = partialSalePlan(f, ['63', '63', '63.1', '9.87']);
+  const built = await buildRedeemPlan({ portfolioId: PORTFOLIO_ID, account: ACCOUNT, plan: p.plan }, usdE8(10.638298), { ...f.deps, quoteAggregator: async () => null });
+  assert.ok(built.plan.kind === 'ready');
+  const sold = p.sold(built.plan.steps);
+  assert.equal(sold[3], 0n, '9.87 那一檔按比例只有 0.53，不賣');
+  assert.equal(built.plan.steps.length, 3);
+  assert.ok(sold.slice(0, 3).every((amount) => amount > 35n * 10n ** 17n && amount < 36n * 10n ** 17n), '其餘三檔各約 3.55');
+  const total = sold.reduce((sum, amount) => sum + amount, 0n);
+  assert.ok(total <= p.wei('10.638298') && total > p.wei('10.6382'), '合計就是要賣的金額，不多賣');
+  assert.equal(built.plan.ownerSale, true);
+  assert.equal(built.requestedSellUsdE8, built.plannedSellUsdE8, '差不到一步的零頭不再續作');
+  // 恰好 10 USDT 也一樣成交（最低賣出金額）。
+  const ten = await buildRedeemPlan({ portfolioId: PORTFOLIO_ID, account: ACCOUNT, plan: p.plan }, MIN_SELL_USD_E8, { ...f.deps, quoteAggregator: async () => null });
+  assert.ok(ten.plan.kind === 'ready');
+  assert.equal(ten.requestedSellUsdE8, ten.plannedSellUsdE8);
+  const tenTotal = p.sold(ten.plan.steps).reduce((sum, amount) => sum + amount, 0n);
+  assert.ok(tenTotal <= 10n * 10n ** 18n && tenTotal > p.wei('9.9999'));
+});
+
+test('部分賣出：開著加息時先賣沒抵押的，不動抵押品；不夠才從抵押最多的那一檔拿', async () => {
+  // portfolio 18 的樣子：三檔各一半抵押（約 31），一檔沒抵押。賣 20：每一步都不超過沒抵押的餘額 → 不用還款取回。
+  const f = sellFixture();
+  const p = partialSalePlan(f, ['63', '63', '63.1', '9.87'], ['31.13', '31.14', '31.2', '0']);
+  const built = await buildRedeemPlan({ portfolioId: PORTFOLIO_ID, account: ACCOUNT, plan: p.plan }, usdE8(21.276596), { ...f.deps, quoteAggregator: async () => null });
+  assert.ok(built.plan.kind === 'ready');
+  const sold = p.sold(built.plan.steps), free = [p.wei('31.87'), p.wei('31.86'), p.wei('31.9'), p.wei('9.87')];
+  assert.ok(sold.every((amount, i) => amount > 10n ** 18n && amount <= free[i]!), '每檔都只賣沒抵押的');
+  assert.equal(built.requestedSellUsdE8, built.plannedSellUsdE8);
+  assert.equal(built.plan.ownerSale, true);
+  // 幾乎都抵押著（每檔只剩 2 沒抵押）：先把沒抵押的 6 賣掉，差的 15.28 只從抵押最多的一檔拿（那一檔下一輪先還款取回）。
+  const g = sellFixture();
+  const q = partialSalePlan(g, ['63', '63', '63.1'], ['61', '61', '61.1']);
+  const tight = await buildRedeemPlan({ portfolioId: PORTFOLIO_ID, account: ACCOUNT, plan: q.plan }, usdE8(21.276596), { ...g.deps, quoteAggregator: async () => null });
+  assert.ok(tight.plan.kind === 'ready');
+  const out = q.sold(tight.plan.steps);
+  assert.ok(out[0]! <= q.wei('2') && out[0]! > q.wei('1.99') && out[1]! <= q.wei('2') && out[1]! > q.wei('1.99'), '另外兩檔只賣沒抵押的 2');
+  assert.ok(out[2]! > q.wei('17.2') && out[2]! <= q.wei('17.3'), '抵押最多的那一檔補上差額');
+  assert.equal(tight.requestedSellUsdE8, tight.plannedSellUsdE8);
+});
+
+test('部分賣出：低於 10 USDT 直接 400 BELOW_MIN_SELL，不碰 DB 也不跑排程；續作的零頭不受這條限制，但不到一步就不送', async () => {
+  let touched = 0;
+  const options = { requireOwnedPortfolio: async () => { touched += 1; return ownedPortfolio(); },
+    runSchedulerOnce: (async () => { touched += 1; return { claimed: 0, dryRun: false, results: [] }; }) as typeof runSchedulerOnce };
+  await assert.rejects(runOperatorRedeem(PORTFOLIO_ID, WALLET.address, usdE8(9.99), options),
+    (error: unknown) => error instanceof AppError && error.status === 400 && error.code === 'BELOW_MIN_SELL' && /at least 10 USDT/.test(error.message));
+  assert.equal(touched, 0);
+  await runOperatorRedeem(PORTFOLIO_ID, WALLET.address, { sellUsdE8: usdE8(3) }, options);
+  assert.equal(touched, 2, '續作 3 USDT 照常進排程');
+  const f = sellFixture();
+  const p = partialSalePlan(f, ['63', '63']);
+  const dust = await buildRedeemPlan({ portfolioId: PORTFOLIO_ID, account: ACCOUNT, plan: p.plan }, { sellUsdE8: usdE8(0.5) }, { ...f.deps, quoteAggregator: async () => null });
+  assert.ok(dust.plan.kind === 'noop');
+  assert.match(dust.plan.reason, /^\[BELOW_MIN_STEP\] 待賣量換算後為 0/);
+  assert.equal(dust.plannedSellUsdE8, 0n);
+});
+
+test('allocateSale：沒抵押的先按比例；太小的一份併給其他檔；不夠才動抵押最多的；湊不成一步就不賣', () => {
+  const U = 10n ** 18n;
+  assert.deepEqual(allocateSale(20n * U, [50n * U, 30n * U, 20n * U], [0n, 0n, 0n], U), [10n * U, 6n * U, 4n * U]);
+  // 第三檔按比例只有 0.5：不賣，20 由前兩檔照比例分。
+  assert.deepEqual(allocateSale(20n * U, [60n * U, 20n * U, 2n * U], [0n, 0n, 0n], U).map((v) => v / (U / 100n)), [1500n, 500n, 0n]);
+  // 沒抵押的夠：抵押品一顆都不動。
+  assert.deepEqual(allocateSale(20n * U, [30n * U, 10n * U], [100n * U, 100n * U], U), [15n * U, 5n * U]);
+  // 沒抵押的只有 8：全賣，差的 12 只從抵押最多的那一檔拿。
+  assert.deepEqual(allocateSale(20n * U, [4n * U, 4n * U], [50n * U, 80n * U], U), [4n * U, 16n * U]);
+  // 沒抵押的差不到一步：不為了零頭去還款取回。
+  assert.deepEqual(allocateSale(20n * U, [10n * U, 9n * U + U / 2n], [50n * U, 80n * U], U), [10n * U, 9n * U + U / 2n]);
+  // 沒抵押的每檔都不到一步：整筆從抵押最多的那一檔拿（含它自己沒抵押的零頭）。
+  assert.deepEqual(allocateSale(20n * U, [U / 2n, U / 2n], [50n * U, 80n * U], U), [0n, 20n * U]);
+  assert.deepEqual(allocateSale(U / 2n, [50n * U], [0n], U), [0n]);
+  assert.deepEqual(allocateSale(0n, [50n * U], [0n], U), [0n]);
 });
 
 

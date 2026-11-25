@@ -312,6 +312,12 @@ export type RebalancePlan =
        * the buy minimum (10 USDT with this fee reserve), not the 50 USDT minimum of a rebalance between assets.
        */
       idleCashBuy?: { feeReserveRaw: bigint };
+      /**
+       * An owner's own partial sale (`POST /portfolios/:id/redeem`). The redeem planner sizes it (the request at least the
+       * 10 USDT sell minimum, every step at least 1 USDT), so the 1/50 USDT minimums of a rebalance between assets do not
+       * apply: 2026-11-25 a 20 USDT sale was answered `[BELOW_MIN_BATCH]` and nothing was sold.
+       */
+      ownerSale?: true;
     };
 
 /** 一個被價格衝擊上限縮小的 step（`index` 對應 `steps` 的位置）。 */

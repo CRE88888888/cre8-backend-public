@@ -2647,7 +2647,9 @@ export async function planCashRaise(input: RebalancePlanningInput, needUsdtRaw: 
     return [{ holding: { ...h, amountWei: amount }, usdE8: amount * h.usdPriceE8 / 10n ** BigInt(h.decimals) }];
   }).sort((a, b) => (b.usdE8 > a.usdE8 ? 1 : b.usdE8 < a.usdE8 ? -1 : 0))[0];
   if (!free || free.usdE8 < sellUsdE8) return { kind: 'blocked', reason: '[STRATEGY_CASH_RAISE] 加息還款還差一點 USDT，但帳戶裡目前沒有可賣的閒置資產（休市或都還抵押著），等下一輪' };
-  const only: RebalancePlanningInput = { ...input, plan: { ...input.plan, snapshot: { ...snapshot, holdings: [...snapshot.holdings.filter(h => h.asset.toLowerCase() === cash), free.holding] } } };
+  // The narrowed holding is already net of what is posted, so the posted list does not go along (the redeem planner would take it off again).
+  const { strategyEarnCollateral: _posted, ...unposted } = snapshot;
+  const only: RebalancePlanningInput = { ...input, plan: { ...input.plan, snapshot: { ...unposted, holdings: [...snapshot.holdings.filter(h => h.asset.toLowerCase() === cash), free.holding] } } };
   const sell = deps.sell ?? (async (i, usd) => (await (await import('./operator.js')).buildRedeemPlan(i, { sellUsdE8: usd })).plan);
   const plan = await sell(only, sellUsdE8);
   // Selling part of a holding is never an exit, whatever the redeem planner concluded from the narrowed view.
@@ -3009,7 +3011,8 @@ async function decideAndMaybeExecute(
   else if(rebalance.idleCashBuy!==undefined)inclusiveBudget=rebalance.steps.reduce((s,step)=>s+step.amountIn,0n)+rebalance.idleCashBuy.feeReserveRaw;
   // A cash raise is deliberately small (twice a top-up's shortfall, at least 1 USDT): the between-assets minimums do not
   // apply to it; the executor's own floor does (the planner drops a step whose oracle floor is 0).
-  const minimumReason = ctx.cashRaise ? null : await ctx.deps.checkTradingMinimums(rebalance.steps, gasPurpose, plan.snapshot.block,inclusiveBudget,money?.context.finalAssets,
+  // An owner's partial sale is sized by the redeem planner (10 USDT a request, 1 USDT a step): see RebalancePlan.ownerSale.
+  const minimumReason = ctx.cashRaise || rebalance.ownerSale ? null : await ctx.deps.checkTradingMinimums(rebalance.steps, gasPurpose, plan.snapshot.block,inclusiveBudget,money?.context.finalAssets,
     money?.useTargetWeights&&rebalance.idleCashBuy===undefined?money.context.reserve:undefined);
   // The part of an idle-cash buy that fits one transaction can itself be under the minimum: it stays as cash, quietly.
   if (minimumReason !== null && rebalance.idleCashBuy !== undefined && /^\[BELOW_MIN_(STEP|BATCH)\]/.test(minimumReason)) return { ...base, outcome: 'noop', reason: `${minimumReason}；可用現金留作現金` };

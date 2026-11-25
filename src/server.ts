@@ -1328,7 +1328,34 @@ async function planPreviewRoute(
  * 首批 usd 保留 balance × usd / total；續作 sellUsdE8 是正整數字串（E8），忽略 usd，
  * 依當下非現金 oracle 名義額重新分配，不保留首批各資產原始待賣量。
  * remainingUsdE8 有值時可直接帶回 sellUsdE8；0 代表完成，null 代表尚未能規劃、只做對帳或送出結果未知。
+ *
+ * 首批 usd 最低 10 USDT（400 BELOW_MIN_SELL）；10 USDT 以上的部分賣出不套資產間再平衡的 50 USDT 門檻，
+ * 按比例有哪一檔不到 1 USDT 就集中賣其餘幾檔，開著加息時先賣沒抵押的（src/operator.ts allocateSale）。
  */
+/**
+ * `/redeem` with an `Idempotency-Key`: the same key from the same wallet for the same portfolio and amount runs ONE sale.
+ * A repeat while the first is still running waits for it; a later repeat (10 minutes) gets the first answer again.
+ *
+ * Why: a round with several stocks can outlast the site proxy's 30 s (the browser gets 504 while the sale goes on here).
+ * Unlike `/close`, sending a partial sale again would sell twice; with the key the browser can simply ask again.
+ * Kept in this process (one api instance); a request without the header behaves as before.
+ */
+const REDEEM_REPLAY_TTL_MS = 10 * 60_000;
+const REDEEM_REPLAY_MAX = 2_000;
+const redeemReplays = new Map<string, { at: number; result: Promise<unknown> }>();
+function redeemOnce(key: string | null, run: () => Promise<unknown>): Promise<unknown> {
+  if (key === null) return run();
+  const now = Date.now();
+  for (const [seenKey, entry] of redeemReplays) if (now - entry.at > REDEEM_REPLAY_TTL_MS || redeemReplays.size > REDEEM_REPLAY_MAX) redeemReplays.delete(seenKey);
+  const seen = redeemReplays.get(key);
+  if (seen !== undefined) return seen.result;
+  const result = run();
+  // A failure is replayed too (the sale may have gone out before it threw); the handler below still reports it.
+  result.catch(() => {});
+  redeemReplays.set(key, { at: now, result });
+  return result;
+}
+
 async function redeemRoute(
   req: IncomingMessage,
   res: ServerResponse,
@@ -1339,12 +1366,15 @@ async function redeemRoute(
   await deps.rateLimiter.wallet('redeem', wallet);
   const body = await readJsonBody(req);
   if (typeof body !== 'object' || body === null || Array.isArray(body)) throw new AppError(400, 'INVALID_AMOUNT', 'body must contain usd or sellUsdE8');
+  const header = req.headers['idempotency-key'];
+  if (header !== undefined && (typeof header !== 'string' || !/^[A-Za-z0-9_.:-]{8,128}$/.test(header))) throw new AppError(400, 'INVALID_IDEMPOTENCY_KEY', 'Idempotency-Key must be 8-128 characters of A-Z a-z 0-9 _ . : -');
+  const replay = (amount: string) => header === undefined ? null : `${wallet.toLowerCase()}|${id}|${header}|${amount}`;
   if ('sellUsdE8' in body) {
     const sell: unknown = body.sellUsdE8;
     if (typeof sell !== 'string' || !/^[0-9]+$/.test(sell) || sell.length > 78 || BigInt(sell) <= 0n || BigInt(sell) >= 2n ** 256n) {
       throw new AppError(400, 'INVALID_AMOUNT', 'body.sellUsdE8 must be a positive E8 integer string');
     }
-    const redeemed = await deps.operatorRedeem(id, wallet, { sellUsdE8: BigInt(sell) });
+    const redeemed = await redeemOnce(replay(`sell:${sell}`), () => deps.operatorRedeem(id, wallet, { sellUsdE8: BigInt(sell) }));
     await ownerActed(deps, id);
     sendJson(res, 200, redeemed);
     return;
@@ -1357,7 +1387,7 @@ async function redeemRoute(
   const scaled = Math.round(usd * 1e8);
   if (!Number.isSafeInteger(scaled) || scaled <= 0) throw new AppError(400, 'INVALID_AMOUNT', 'body.usd must fit a positive safe E8 integer');
   const usdE8 = BigInt(scaled);
-  const redeemed = await deps.operatorRedeem(id, wallet, usdE8);
+  const redeemed = await redeemOnce(replay(`usd:${usdE8}`), () => deps.operatorRedeem(id, wallet, usdE8));
   await ownerActed(deps, id);
   sendJson(res, 200, redeemed);
 }

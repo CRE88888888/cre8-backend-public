@@ -632,6 +632,22 @@ test('#75 first-buy history RPC failure blocks; exit never reads history or ordi
   assert.equal(chain.executeCalls[0]?.gasPurpose, 'exit');
 });
 
+test('owner 的部分賣出（ownerSale）不問資產間再平衡的 1／50 USDT 門檻就送出；一般再平衡同樣大小照舊被擋', async () => {
+  const sale = { db: stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] }), chain: stubChain({ rebalance: { ...readyPlan(), ownerSale: true } }) };
+  const sold = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(sale.db, sale.chain, {
+    checkTradingMinimums: async () => { assert.fail('an owner sale is sized by the redeem planner'); },
+  }));
+  assert.equal(sold.results[0]?.outcome, 'executed');
+  assert.equal(sale.chain.executeCalls.length, 1);
+  const ordinary = { db: stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] }), chain: stubChain({ rebalance: readyPlan() }) };
+  const held = await runSchedulerOnce({ dryRun: false, now: NOW }, deps(ordinary.db, ordinary.chain, {
+    checkTradingMinimums: async () => '[BELOW_MIN_BATCH] 批次不足交易門檻，等待累積',
+  }));
+  assert.equal(held.results[0]?.outcome, 'blocked');
+  assert.equal(held.results[0]?.reason, '[BELOW_MIN_BATCH] 批次不足交易門檻，等待累積');
+  assert.equal(ordinary.chain.executeCalls.length, 0);
+});
+
 test('#75 exhausted ordinary budget defers until the next UTC day without broadcasting', async () => {
   const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
   const chain = stubChain();

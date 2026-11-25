@@ -91,6 +91,7 @@ test('#189 previews a mix of former non-lineup assets: crypto open on a weekend,
   assert.deepEqual(result.markets.map(market => [market.symbol, market.open, market.nextOpenAt]),
     [['Cake', true, null], ['TONCOIN', true, null], ['GLDon', false, '2026-11-23T14:30:00.000Z']]);
   assert.equal(result.minimumDepositRaw, (50n * 10n ** 18n).toString());
+  assert.equal(result.message, '美股收盘中，开盘后完成买入。');
   const crypto = await preview({ assets: [{ assetId: T.assets.SHIB.token, weightBps: 5000 }, { assetId: T.assets.PEPE.token, weightBps: 5000 }] });
   assert.equal(crypto.message, '所有成分目前都在可交易時段。');
   await assert.rejects(preview({ assets: [{ assetId: T.assets.USDC.token, weightBps: 10000 }] }), /這個資產暫時無法加入私人組合/);

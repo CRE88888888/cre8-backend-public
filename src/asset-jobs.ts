@@ -123,7 +123,21 @@ export async function prepareAssetJob(run:WithTransactionFn,c:JobContext,config:
   const slot=due.reduce((a,b)=>a.slot<b.slot?a:b).slot;
   due=due.filter(s=>s.slot.getTime()===slot.getTime());
   // A private basket keeps closed source budgets intact while open legs proceed.
-  if(c.personalMix&&c.marketOpenFor)due=due.filter(s=>c.marketOpenFor?.([s.asset]));
+  if(c.personalMix&&c.marketOpenFor){
+    const open=due.filter(s=>c.marketOpenFor?.([s.asset])),closed=due.filter(s=>!open.includes(s));
+    // Buying the open legs now must not strand the rest. A closed part that could not form a batch by itself at the
+    // open (2026-11-24 portfolio 7: an 8.62 USDT stock leg under the 10 USDT batch minimum, handed back as cash at the
+    // open) keeps the whole deposit together: nothing is bought now and one job buys every leg once all markets are
+    // open. Same test as the release rule below (unlimited depth and allowance), so only amounts decide. One-time
+    // money only: it has no period that could end while it waits.
+    if(open.length>0&&closed.length>0&&closed.every(s=>s.mode.kind==='hold')){
+      let later:InputVector={};for(const s of closed)later=addInputs(later,{[s.asset]:s.budget.toString()});
+      if(assetBatchBudget(later,c.reserve,new Map(Object.keys(later).map(asset=>[asset,null])),UINT256_MAX,c.batchStepLimit,
+          new Set(closed.filter(s=>s.index===s.effective_slices-1).map(s=>s.asset)),c.chainId===97)===null)
+        return {job:null,reason:'[MARKET_CLOSED] 同一批等待所有資產交易時段'};
+    }
+    due=open;
+  }
   if(due.length===0)return {job:null,reason:'[MARKET_CLOSED] 股票部分等待下一個開盤時段'};
   if(!(c.marketOpenFor?.(due.map(s=>s.asset))??c.marketOpen))return {job:null,reason:'[MARKET_CLOSED] 同一批等待所有資產交易時段'};
   const balance=(await query(`select unallocated_hold_raw::text,stack_prefund_raw::text,(unallocated_hold_raw+stack_prefund_raw+allocated_cash_raw+reserved_input_raw+reserved_fee_raw+withdrawal_raw+yield_raw)::text as total from strategy_cash_balances where chain_id=$1 and portfolio_id=$2`,[c.chainId,c.portfolioId])).rows[0] as {total:string;unallocated_hold_raw:string;stack_prefund_raw:string}|undefined;

@@ -1348,15 +1348,18 @@ const sourceRows=async(f:Fixture)=>(await query<{asset:string;state:string;slice
   array(select s.state from strategy_asset_slices s where s.lot_id=a.lot_id and s.asset=a.asset order by s.slice_index) as slices
   from strategy_lot_assets a join strategy_funding_lots l on l.id=a.lot_id where l.portfolio_id=$1 and a.asset<>$2 order by a.lot_id,a.asset`,[f.id,cash])).rows;
 
-test('basket waiting DB: portfolio 7 — a private basket bought its open legs while the stock was closed; the stock leg left under 10 USDT is closed at the open and its cash left free, once',async()=>{
-  // 33.37 USDT, 74.16% crypto (a) and 25.84% stock (b): the stock leg alone is 8.62 USDT.
-  const f=await fixture('hold',0,4,'none',undefined,[7416,2584]);await f.fund(usdt('33.37'),new Date(+start-60000),{[a]:1,[b]:1},undefined,10n*U); // under the 50 USDT of a first buy, as on portfolio 7
+test('basket waiting DB: portfolio 7 — a stock leg under 10 USDT left pending by a split made before the keep-together rule is closed at the open and its cash left free, once',async()=>{
+  // 33.37 USDT, 74.16% crypto (a) and 25.84% stock (b). Before the keep-together rule the crypto leg was bought on the
+  // Saturday and the 8.62 USDT stock leg stayed pending by itself; baskets split that way are still out there. Two
+  // single-asset lots give exactly that state: a's bought, b's waiting for its market.
+  const f=await fixture('hold',0,4,'none',undefined,[7416,2584]);
   const stockBudget=usdt('33.37')*2584n/10000n;assert.ok(stockBudget<10n*U);
   const closed=(assets:readonly string[])=>assets.every(asset=>asset!==b),open=()=>true;
   const mix=(now:Date,marketOpenFor:(assets:readonly string[])=>boolean)=>f.reserve({...f.context,personalMix:true,now,marketOpen:marketOpenFor([a,b]),marketOpenFor});
-  // Saturday: only the crypto leg is bought.
+  await f.fund(usdt('33.37')-stockBudget,new Date(+start-60000),{[a]:1},{weights:{[a]:10000},capped:[b]},10n*U);
   const first=(await mix(start,closed))?.job;assert.ok(first);assert.deepEqual(Object.keys(first.remaining_input),[a]);
   await complete(f,first,first.remaining_input,R);
+  await f.fund(stockBudget,new Date(+start+60000),{[b]:1},{weights:{[b]:10000},capped:[a]},U);
   const waiting=await balances(f);assert.equal(waiting?.unallocated_hold_raw,stockBudget.toString());
   // Still closed: the stock leg waits for its market, nothing is recorded.
   for(const minutes of [5,600]){
@@ -1364,7 +1367,7 @@ test('basket waiting DB: portfolio 7 — a private basket bought its open legs w
     assert.equal(result?.job,null);assert.match(result?.reason??'',/\[MARKET_CLOSED\]/);
   }
   assert.deepEqual((await sourceRows(f)).find(r=>r.asset===b),{asset:b,state:'active',slices:[]});
-  // Monday's open. Before the fix every round from here on answered [BASKET_WAITING] with the same 8.62, for good.
+  // Monday's open. Before #275 every round from here on answered [BASKET_WAITING] with the same 8.62, for good.
   const monday=new Date(+start+2*86400000+5400000);
   const released=await mix(monday,open);
   assert.equal(released?.job,null);assert.match(released?.reason??'',/\[BELOW_MIN_BATCH\].*8\.62.*可用現金/);
@@ -1401,6 +1404,144 @@ test('basket waiting DB: an open part under 10 USDT keeps waiting while other le
   assert.deepEqual((await sourceRows(f)).map(r=>[r.state,r.slices.length]),[['active',0],['active',0]]);assert.deepEqual(await balances(f),before);
   const together=(await mix(new Date(+start+2*86400000),open))?.job;assert.ok(together);
   assert.deepEqual(Object.keys(together.remaining_input).sort(),[a,b].sort());assert.equal(BigInt(together.amount_raw)+BigInt(together.fee_reserve_raw),50n*U);
+});
+
+const pendingSources=async(f:Fixture)=>(await query(`select 1 from strategy_lot_assets a join strategy_funding_lots l on l.id=a.lot_id
+  where l.portfolio_id=$1 and a.state='active'`,[f.id])).rows.length;
+// ---- 2026-11-25 keep-together rule: a closed part that could not form a batch by itself is not split off ------------
+// A private basket bought while the US market is closed buys its crypto legs now and leaves the stock legs for the
+// open. When the part left for the open is under one batch (10 USDT per transaction), it used to be handed back as cash
+// at the open (#275). Now the whole deposit waits and one job buys every leg once all markets are open.
+const tokens=(n:number)=>Object.values(TESTNET_97.assets).slice(0,n).map(t=>t.token);
+const mixRound=(f:Fixture,closedAssets:readonly string[],extra:Partial<JobContext>={})=>(now:Date,marketClosed:boolean)=>{
+  const marketOpenFor=(assets:readonly string[])=>!marketClosed||assets.every(asset=>!closedAssets.includes(asset));
+  return f.reserve({...f.context,...extra,personalMix:true,now,marketOpen:!marketClosed,marketOpenFor});
+};
+const saturday=start,monday=new Date(+start+2*86400000+5400000);
+
+test('keep together DB: portfolio 7 numbers — the stock leg alone is 8.62 USDT, so nothing is bought while it is closed and one job buys the whole 33.37 at the open',async()=>{
+  // The minimum of 10 USDT is also what a DCA (定投) tranche is admitted with: a tranche that reaches its buy after the close follows the same rule.
+  const f=await fixture('hold',0,4,'none',undefined,[7416,2584]);await f.fund(usdt('33.37'),new Date(+start-60000),{[a]:1,[b]:1},undefined,10n*U);
+  assert.ok(usdt('33.37')*2584n/10000n<10n*U);
+  const round=mixRound(f,[b]),before=await balances(f);
+  assert.equal(before?.unallocated_hold_raw,usdt('33.37').toString());
+  // Saturday and Sunday: the same answer every round, and nothing is written. Before the rule the first round bought the crypto leg.
+  for(const minutes of [0,5,600,2000]){
+    const result=await round(new Date(+saturday+minutes*60000),true);
+    assert.equal(result?.job,null);assert.match(result?.reason??'',/^\[MARKET_CLOSED\]/);
+  }
+  assert.deepEqual((await sourceRows(f)).map(r=>[r.state,r.slices.length]),[['active',0],['active',0]]);
+  assert.deepEqual(await balances(f),before);assert.equal((await query('select 1 from strategy_jobs where portfolio_id=$1',[f.id])).rows.length,0);
+  assert.equal(await pendingSources(f),2,'both legs are still new money to buy');
+  // Monday's open: one job, both legs, the whole deposit.
+  const together=(await round(monday,false))?.job;assert.ok(together);
+  assert.deepEqual(Object.keys(together.remaining_input).sort(),[a,b].sort());
+  assert.equal(BigInt(together.amount_raw)+BigInt(together.fee_reserve_raw),usdt('33.37'));
+  await complete(f,together,together.remaining_input,R);
+  assert.ok((await sourceRows(f)).every(r=>r.state==='completed'&&r.slices.length===1&&r.slices[0]==='completed'));
+  assert.deepEqual(await balances(f),{unallocated_hold_raw:'0',stack_prefund_raw:'0',allocated_cash_raw:'0',reserved_input_raw:'0',reserved_fee_raw:'0'},'nothing is left behind as cash');
+  assert.match((await round(new Date(+monday+60000),false))?.reason??'',/\[NO_DUE_SLOT\]/);
+});
+
+test('keep together DB: a stock part of 10 USDT or more is still split — crypto now, stocks at the open; a second deposit that lifts the stock part over 10 USDT releases the crypto legs',async()=>{
+  // 50 USDT: crypto 37.08, stock 12.92. Unchanged behaviour.
+  const f=await fixture('hold',0,4,'none',undefined,[7416,2584]);await f.fund(50n*U);
+  const round=mixRound(f,[b]);
+  const crypto=(await round(saturday,true))?.job;assert.ok(crypto);assert.deepEqual(Object.keys(crypto.remaining_input),[a]);
+  await complete(f,crypto,crypto.remaining_input,R);
+  assert.equal((await balances(f))?.unallocated_hold_raw,(50n*U*2584n/10000n).toString());
+  assert.match((await round(new Date(+saturday+600*60000),true))?.reason??'',/^\[MARKET_CLOSED\]/);
+  const stock=(await round(monday,false))?.job;assert.ok(stock);assert.deepEqual(Object.keys(stock.remaining_input),[b]);
+  assert.equal(BigInt(stock.amount_raw)+BigInt(stock.fee_reserve_raw),50n*U*2584n/10000n);
+  await complete(f,stock,stock.remaining_input,R);
+  assert.ok((await sourceRows(f)).every(r=>r.state==='completed'));assert.equal((await balances(f))?.unallocated_hold_raw,'0');
+  // Two deposits of 33.37 on the same weekend: the first waits (8.62 of stock); with the second the stock part is 17.24, a batch by itself.
+  const g=await fixture('hold',0,4,'none',undefined,[7416,2584]);await g.fund(usdt('33.37'),new Date(+start-60000),{[a]:1,[b]:1},undefined,10n*U);
+  const again=mixRound(g,[b]);
+  assert.match((await again(saturday,true))?.reason??'',/^\[MARKET_CLOSED\]/);
+  await g.fund(usdt('33.37'),new Date(+saturday+30*60000),{[a]:1,[b]:1},undefined,10n*U);
+  const both=(await again(new Date(+saturday+40*60000),true))?.job;assert.ok(both);assert.deepEqual(Object.keys(both.remaining_input),[a]);
+  assert.equal(BigInt(both.amount_raw)+BigInt(both.fee_reserve_raw),2n*(usdt('33.37')-usdt('33.37')*2584n/10000n));
+  await complete(g,both,both.remaining_input,R);
+  const stocks=(await again(monday,false))?.job;assert.ok(stocks);assert.deepEqual(Object.keys(stocks.remaining_input),[b]);
+  assert.equal(BigInt(stocks.amount_raw)+BigInt(stocks.fee_reserve_raw),2n*(usdt('33.37')*2584n/10000n));
+});
+
+test('keep together DB: whichever side is under 10 USDT — crypto, stock or both — the deposit waits for the open and is then bought whole',async()=>{
+  // [crypto weight, stock weight, deposit]: stock part small; crypto part small (unchanged, [BASKET_WAITING]); both small.
+  for(const [weights,amount,reason] of [[[8500,1500],50n*U,/^\[MARKET_CLOSED\]/],[[1500,8500],50n*U,/^\[BASKET_WAITING\]/],[[5000,5000],15n*U,/^\[MARKET_CLOSED\]/]] as const){
+    const f=await fixture('hold',0,4,'none',undefined,weights);await f.fund(amount,new Date(+start-60000),{[a]:1,[b]:1},undefined,10n*U);
+    const round=mixRound(f,[b]),before=await balances(f);
+    for(const minutes of [0,5,600]){
+      const result=await round(new Date(+saturday+minutes*60000),true);
+      assert.equal(result?.job,null);assert.match(result?.reason??'',reason);
+    }
+    assert.deepEqual((await sourceRows(f)).map(r=>[r.state,r.slices.length]),[['active',0],['active',0]]);assert.deepEqual(await balances(f),before);
+    const together=(await round(monday,false))?.job;assert.ok(together);
+    assert.deepEqual(Object.keys(together.remaining_input).sort(),[a,b].sort());assert.equal(BigInt(together.amount_raw)+BigInt(together.fee_reserve_raw),amount);
+    await complete(f,together,together.remaining_input,R);
+    assert.equal((await balances(f))?.unallocated_hold_raw,'0');assert.ok((await sourceRows(f)).every(r=>r.state==='completed'));
+  }
+});
+
+test('keep together DB: more assets than one transaction carries — the stock part has to fill every transaction it needs, else the deposit stays whole',async()=>{
+  // Five assets, two per transaction: the three stocks need two transactions of 10 USDT each.
+  const weights=[3200,3200,1200,1200,1200],[c1,c2,s1,s2,s3]=tokens(5);assert.ok(c1&&c2&&s1&&s2&&s3);
+  // 50 USDT: stocks 18 in all. Over 10, but not two transactions' worth: keep together.
+  const f=await fixture('hold',0,4,'none',undefined,weights,5);await f.fund(50n*U);
+  const round=mixRound(f,[s1,s2,s3],{batchStepLimit:2}),before=await balances(f);
+  for(const minutes of [0,600]){
+    const result=await round(new Date(+saturday+minutes*60000),true);
+    assert.equal(result?.job,null);assert.match(result?.reason??'',/^\[MARKET_CLOSED\]/);
+  }
+  assert.ok((await sourceRows(f)).every(r=>r.state==='active'&&r.slices.length===0));assert.deepEqual(await balances(f),before);
+  const together=(await round(monday,false))?.job;assert.ok(together);
+  assert.equal(Object.keys(together.remaining_input).length,5);assert.equal(BigInt(together.amount_raw)+BigInt(together.fee_reserve_raw),50n*U);
+  // With sixteen per transaction the same 18 USDT of stocks is one transaction: split as before.
+  const g=await fixture('hold',0,4,'none',undefined,weights,5);await g.fund(50n*U);
+  const wide=(await mixRound(g,[s1,s2,s3])(saturday,true))?.job;assert.ok(wide);assert.deepEqual(Object.keys(wide.remaining_input).sort(),[c1,c2].sort());
+  // 100 USDT, two per transaction: stocks 36, enough for two transactions: split as before.
+  const h=await fixture('hold',0,4,'none',undefined,weights,5);await h.fund(100n*U);
+  const hround=mixRound(h,[s1,s2,s3],{batchStepLimit:2});
+  const crypto=(await hround(saturday,true))?.job;assert.ok(crypto);assert.deepEqual(Object.keys(crypto.remaining_input).sort(),[c1,c2].sort());
+  await complete(h,crypto,crypto.remaining_input,R);
+  const stocks=(await hround(monday,false))?.job;assert.ok(stocks);assert.deepEqual(Object.keys(stocks.remaining_input).sort(),[s1,s2,s3].sort());
+  assert.equal(BigInt(stocks.amount_raw)+BigInt(stocks.fee_reserve_raw),36n*U);
+});
+
+test('keep together DB: when the open comes and the batch still cannot form, #275 applies — the sources are closed once and the cash stays free in this portfolio',async()=>{
+  // Kept whole over the weekend; at the open one asset per transaction is all that fits (many assets held), so 8.62 cannot fill its own.
+  const f=await fixture('hold',0,4,'none',undefined,[7416,2584]);await f.fund(usdt('33.37'),new Date(+start-60000),{[a]:1,[b]:1},undefined,10n*U);
+  assert.match((await mixRound(f,[b])(saturday,true))?.reason??'',/^\[MARKET_CLOSED\]/);
+  const narrow=mixRound(f,[b],{batchStepLimit:1});
+  const released=await narrow(monday,false);
+  assert.equal(released?.job,null);assert.match(released?.reason??'',/\[BELOW_MIN_BATCH\].*33\.37 USDT.*2 個來源/);
+  assert.ok((await sourceRows(f)).every(r=>r.state==='completed'&&r.slices.length===1&&r.slices[0]==='skipped_window'));
+  const free=await balances(f);
+  assert.deepEqual(free,{unallocated_hold_raw:usdt('33.37').toString(),stack_prefund_raw:'0',allocated_cash_raw:'0',reserved_input_raw:'0',reserved_fee_raw:'0'},'the whole deposit is free cash of this portfolio');
+  assert.equal(await pendingSources(f),0,'the basket is back to its own rebalance, which uses this cash');
+  for(const minutes of [1,1500])assert.match((await narrow(new Date(+monday+minutes*60000),false))?.reason??'',/\[NO_DUE_SLOT\]/);
+  assert.deepEqual(await balances(f),free);
+  // Split on the weekend (stocks 15 USDT, a batch then); at the open two transactions are needed and 15 cannot fill both.
+  const [c1,s1,s2]=tokens(3);assert.ok(c1&&s1&&s2);
+  const g=await fixture('hold',0,4,'none',undefined,[7000,1500,1500],3);await g.fund(50n*U);
+  const crypto=(await mixRound(g,[s1,s2])(saturday,true))?.job;assert.ok(crypto);assert.deepEqual(Object.keys(crypto.remaining_input),[c1]);
+  await complete(g,crypto,crypto.remaining_input,R);
+  const gone=await mixRound(g,[s1,s2],{batchStepLimit:1})(monday,false);
+  assert.equal(gone?.job,null);assert.match(gone?.reason??'',/\[BELOW_MIN_BATCH\].*15 USDT.*2 個來源/);
+  assert.equal((await balances(g))?.unallocated_hold_raw,(15n*U).toString());assert.equal(await pendingSources(g),0);
+});
+
+test('keep together DB: a fund (not a private basket) never splits — the whole deposit waits for every market, whatever the sizes',async()=>{
+  for(const weights of [[7416,2584],[5000,5000]] as const){
+    const f=await fixture('hold',0,4,'none',undefined,weights);await f.fund(100n*U);
+    const marketOpenFor=(assets:readonly string[])=>assets.every(asset=>asset!==b),before=await balances(f);
+    const waiting=await f.reserve({...f.context,marketOpen:false,marketOpenFor});
+    assert.equal(waiting?.job,null);assert.match(waiting?.reason??'',/^\[MARKET_CLOSED\]/);
+    assert.deepEqual(await balances(f),before);assert.ok((await sourceRows(f)).every(r=>r.state==='active'&&r.slices.length===0));
+    const whole=(await f.reserve({...f.context,now:monday}))?.job;assert.ok(whole);
+    assert.deepEqual(Object.keys(whole.remaining_input).sort(),[a,b].sort());assert.equal(BigInt(whole.amount_raw)+BigInt(whole.fee_reserve_raw),100n*U);
+  }
 });
 
 test('basket waiting DB: one-time money that needs more transactions than it can fill is closed; depth or allowance limits keep waiting and buy later',async()=>{
@@ -1467,8 +1608,6 @@ test('basket waiting DB: a started job whose remainder needs two transactions bu
 // cancelJob marks the started job's periods 'cancelled'; completeAssetSchedules only closes sources whose periods were
 // all bought or skipped, so those sources stayed 'active' for good. A private basket reads "an active source" as new
 // money still to buy and never went back to its own rebalance, which is the only thing that uses the returned cash.
-const pendingSources=async(f:Fixture)=>(await query(`select 1 from strategy_lot_assets a join strategy_funding_lots l on l.id=a.lot_id
-  where l.portfolio_id=$1 and a.state='active'`,[f.id])).rows.length;
 
 test('cancelled source DB: a started one-time job that is released closes its sources; the returned cash stays in this portfolio as free cash',async()=>{
   // #273: 9.90 principal + 0.05 fee left is under one 10 USDT batch.

@@ -677,6 +677,64 @@ test('a mix whose started buy is released closes its sources: it leaves new-mone
   });
 });
 
+test('a mix bought while the US market is closed keeps the deposit whole when its stock leg is under 10 USDT, and buys every leg at the open', async () => {
+  await fixture(async (_service, db, deps) => {
+    const proof = deps.proof;
+    let carrying = false;
+    const service = createMixService({ ...deps, anchor: async () => ({ hash: zeroHash, at: new Date() }),
+      proof: async (...args) => ({ ...await proof(...args), cashRaw: carrying ? (50n * WAD).toString() : '0' }) });
+    const made = await service.create({ assets: [{ assetId: T.assets.NVDAB.token, weightBps: 5000 },
+      { assetId: T.assets.WBNB.token, weightBps: 5000 }] }, owner, randomUUID());
+    await service.confirm(made.mixId, owner, { txHash: toHex(90n, { size: 32 }) });
+    // 50 USDT, 16% stock: the stock leg is 8 USDT.
+    await service.patch(made.mixId, owner, { assets: [{ assetId: T.assets.TSLAB.token, weightBps: 1600 }, { assetId: T.assets.WBNB.token, weightBps: 8400 }] });
+    carrying = true;
+    const switched = await service.confirm(made.mixId, owner, { txHash: toHex(91n, { size: 32 }) }); assert.ok(switched.portfolioId);
+    const detail = await service.get(made.mixId, owner);
+    const find: import('../src/scheduler.js').SchedulerQueryFn = (sql, args) => db.query(sql, args ? [...args] : []);
+    const version = (await db.query<{ allocation: import('../src/strategies.js').Allocation; execution: import('../src/strategy-execution.js').AssetExecution }>(
+      'select allocation,execution from strategy_versions where strategy_id=$1 and version=1', [detail.strategyId])).rows[0]; assert.ok(version);
+    const { assetsMarketOpen } = await import('../src/trading-calendar.js');
+    const { fundingLots, prepareStrategyJob } = await import('../src/strategy-jobs.js');
+    const { mixAvailableCash } = await import('../src/mix-runtime.js');
+    const run: import('../src/scheduler.js').WithTransactionFn = work => work({ query: find });
+    // The scheduler's own market test (strategy-runtime prepareNewMoney): the real NYSE calendar on the admitted stock tokens.
+    const round = async (now: Date) => {
+      const marketOpenFor = (assets: readonly string[]) => assetsMarketOpen(97, assets, now);
+      const context: import('../src/strategy-jobs.js').JobContext = { personalMix: true, chainId: 97, portfolioId: switched.portfolioId ?? 0,
+        strategyId: detail.strategyId, version: 1, kind: 'asset', account: made.account, allocation: version.allocation, execution: version.execution,
+        cash: T.contracts.usdt, now, reserve: 27n * WAD / 100n, caps: new Map(version.allocation.assets.map(a => [a.address, null])), buyLimit: 100n * WAD, observedCash: 50n * WAD,
+        enabled: true, marketOpen: marketOpenFor(version.allocation.assets.map(a => a.address)), marketOpenFor };
+      return prepareStrategyJob(run, context, await fundingLots(find, context));
+    };
+    const cashRow = async () => (await db.query<Record<string, string>>(`select unallocated_hold_raw::text,allocated_cash_raw::text,stack_prefund_raw::text,
+      reserved_input_raw::text,reserved_fee_raw::text from strategy_cash_balances where chain_id=97 and portfolio_id=$1`, [switched.portfolioId])).rows[0];
+    const whole = { unallocated_hold_raw: (50n * WAD).toString(), allocated_cash_raw: '0', stack_prefund_raw: '0', reserved_input_raw: '0', reserved_fee_raw: '0' };
+    assert.deepEqual(await cashRow(), whole);
+    const due = { personalMix: true, portfolioId: switched.portfolioId, strategyId: detail.strategyId, account: made.account,
+      accountType: 'KERNEL', intervalSeconds: 60, unsupportedReason: null, nextRunAt: mixClock };
+    // Saturday 2026-11-21, Sunday, and Monday before the bell: closed. Before the rule the first round bought 42 USDT of WBNB.
+    for (const at of ['2026-11-21T13:00:00Z', '2026-11-22T20:00:00Z', '2026-11-23T14:29:00Z']) {
+      const waiting = await round(new Date(at));
+      assert.equal(waiting.job, null); assert.match(waiting.reason, /^\[MARKET_CLOSED\]/);
+    }
+    assert.deepEqual(await cashRow(), whole, 'the deposit is untouched while it waits');
+    assert.equal((await db.query('select 1 from strategy_asset_slices s join strategy_funding_lots l on l.id=s.lot_id where l.portfolio_id=$1', [switched.portfolioId])).rows.length, 0);
+    const state = await loadMixRuntime(due, find); assert.ok(state); assert.equal(state.newMoney, true, 'still new money to buy');
+    // A target pass that falls in the wait may only spend allocated cash: none of the waiting deposit.
+    const { plan } = mixRuntimeFixture();
+    plan.snapshot.holdings = [{ asset: T.contracts.usdt, amountWei: 50n * WAD, decimals: 18, usdPriceE8: 100000000n, priceSource: 'numeraire' as const }];
+    assert.equal(await mixAvailableCash(due, plan, find), 0n);
+    // Monday 2026-11-23 09:30 New York: one job with both legs and the whole 50 USDT.
+    const together = (await round(new Date('2026-11-23T14:30:00Z'))).job; assert.ok(together);
+    assert.deepEqual(Object.keys(together.remaining_input).sort(), [T.assets.TSLAB.token, T.assets.WBNB.token].sort());
+    assert.equal(BigInt(together.amount_raw) + BigInt(together.fee_reserve_raw), 50n * WAD);
+    assert.deepEqual(await cashRow(), { unallocated_hold_raw: '0', allocated_cash_raw: '0', stack_prefund_raw: '0',
+      reserved_input_raw: together.amount_raw, reserved_fee_raw: together.fee_reserve_raw });
+    await db.query('set constraints all immediate');
+  });
+});
+
 test('a switched mix keeps its forced pass after a crypto batch until its closed stock exits are resolved', async () => {
   await fixture(async (service, db) => {
     const made = await service.create({ assets: [{ assetId: T.assets.NVDAB.token, weightBps: 10000 }] }, owner, randomUUID());

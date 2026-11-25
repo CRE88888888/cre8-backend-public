@@ -77,7 +77,7 @@ export function createMixPreview(deps: MixPreviewDeps = {}) {
         estimatedRebalanceCost: { swapFeeBps: 10, gasWei: gasPrice !== null && gasPrice > 0n ? perOperationCostWei(gasPrice).toString() : null,
           gasSponsored: true, message: '交易費為成交金額的 0.1%；gas 依實際用量計算，測試網由平台支付。' },
         markets, message: closed.length ? (closed.every(market => market.nextOpenAt !== null)
-          ? '美股收盤中，股票部分會在下一個開盤時段交易。' : '目前無法確認美股的下次開盤時間，股票部分暫不交易。') : '所有成分目前都在可交易時段。' };
+          ? '美股收盘中，开盘后完成买入。' : '目前無法確認美股的下次開盤時間，股票部分暫不交易。') : '所有成分目前都在可交易時段。' };
     } catch (error) {
       if (error instanceof AppError) throw error;
       throw new AppError(503, 'MIX_PREVIEW_UNAVAILABLE', '目前無法取得試算資料，請稍後重試。');

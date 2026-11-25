@@ -4185,3 +4185,14 @@ test('pre-checks read every step in one go and still list the failures step by s
   assert.equal(widest, 4, 'both reads of both steps were in flight together');
   assert.equal(chain.executeCalls.length, 0);
 });
+
+test('receipt reconciliation asks the bundler for the receipt and the original UserOp together; the verdict is unchanged', async () => {
+  const f = receiptFixture();
+  let inFlight = 0, widest = 0;
+  const slow = <T>(value: T) => async (): Promise<T> => { inFlight += 1; widest = Math.max(widest, inFlight); await new Promise((resolve) => setTimeout(resolve, 5)); inFlight -= 1; return value; };
+  const plain = await readRebalanceReceipt(f.input, f.reader);
+  const together = await readRebalanceReceipt(f.input, { ...f.reader, getReceipt: slow(await f.reader.getReceipt()), getOperation: slow(await f.reader.getOperation()) });
+  assert.equal(widest, 2);
+  assert.deepEqual(together, plain);
+  assert.equal(together.kind, 'found');
+});

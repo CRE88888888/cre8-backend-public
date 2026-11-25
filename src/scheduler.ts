@@ -134,7 +134,7 @@ import { hdKeyToAccount } from 'viem/accounts';
 import { createBundlerClient, entryPoint07Abi, formatUserOperation, formatUserOperationReceipt, getUserOperationHash } from 'viem/account-abstraction';
 import type { GetUserOperationReturnType, UserOperationReceipt } from 'viem/account-abstraction';
 import { rpcBatch, rpcTransport } from './rpc-transport.js';
-import { activeChain, RECEIPT_POLLING_MS } from './chain-object.js';
+import { activeChain } from './chain-object.js';
 import { testnetAssets, TESTNET_97 } from './testnet-profile.js';
 import { signPreparedOperation } from './user-operation.js';
 import { KERNEL_V3_3_ADDRESSES, kernelAddressesForChain } from './addresses.js';
@@ -202,13 +202,6 @@ const ENTRY_POINT = { address: KERNEL_V3_3_ADDRESSES.entryPointV07, version: '0.
 
 /** 交易送出後等 receipt 的上限（毫秒）。超過仍在途，下一輪先對帳，不能重送。 */
 const USER_OP_RECEIPT_TIMEOUT_MS = 180_000;
-/**
- * How often the bundler is asked for the receipt of a UserOp we just sent. Without it viem uses the client's 4 s
- * default: the first question is asked the instant the op is submitted (never there yet), the next one 4 s later, on a
- * chain whose blocks take under a second. Every sale (and every repay-and-take-back before one) waited those 4 s.
- * Same interval as the other receipt waits (`RECEIPT_POLLING_MS`); the bundler is our own, the cost is a few lookups.
- */
-const USER_OP_RECEIPT_POLL_MS = RECEIPT_POLLING_MS;
 
 const RELEASE_MARGIN_SECONDS = 300n;
 const MAX_USER_OP_NONCE = (1n << 256n) - 1n;
@@ -1589,13 +1582,15 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
     // ---- ① gas：`callGasLimit` 明確覆寫，不讓 alto 的估算單獨決定 ---------------------------------
     // alto 對「一筆 op 跑完整條 DeFi 路徑」系統性低估（§8.16 實測 367,885 vs 需要 450–500k），
     // 而 gas 不足的後果不是 revert，是「success = false 但 tx.status = 1」—— 錢扣了、幣沒換。
+    // Read next to the estimate (it needs nothing from it); a failure is still reported after the estimate, as before.
+    const numeraireRead = publicClient.readContract({ address: args.executor, abi: EXECUTOR_BUY_ABI, functionName: 'numeraire' })
+      .then((value) => ({ value }), () => null);
     const estimate = await client.estimateUserOperationGas({ calls, nonce: args.nonce,
       ...(paymaster === undefined ? {} : { paymaster: estimationPaymaster(paymaster) }) });
     mark('send:estimate');
-    let numeraire: Address;
-    try {
-      numeraire = await publicClient.readContract({ address: args.executor, abi: EXECUTOR_BUY_ABI, functionName: 'numeraire' });
-    } catch { throw new Error('[NUMERAIRE_UNAVAILABLE] 送出前讀不到 executor.numeraire，不送交易'); }
+    const numeraireResult = await numeraireRead;
+    if (numeraireResult === null) throw new Error('[NUMERAIRE_UNAVAILABLE] 送出前讀不到 executor.numeraire，不送交易');
+    const numeraire: Address = numeraireResult.value;
     const hasBuy = args.steps.some((step) => !isAddressEqual(step.tokenOut, numeraire));
     const valuationAssetCount = hasBuy ? new Set(args.valuationAssets.filter((asset) => !isAddressEqual(asset, numeraire)).map((asset) => asset.toLowerCase())).size : 0;
     // On 97 the actual estimate already includes the valuation loop. Adding it a
@@ -1664,7 +1659,8 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
     await settleGasBudget(budgetKey, 'submitted');
     mark('send:submit');
 
-    const receipt = await client.waitForUserOperationReceipt({ hash: userOpHash, timeout: USER_OP_RECEIPT_TIMEOUT_MS, pollingInterval: USER_OP_RECEIPT_POLL_MS });
+    // Asked once a second: `createKernelAccountClient` sets that itself (measured on chain 97: 1.4–2.8 s until the receipt).
+    const receipt = await client.waitForUserOperationReceipt({ hash: userOpHash, timeout: USER_OP_RECEIPT_TIMEOUT_MS });
     mark('send:receipt');
     await settleGasBudget(budgetKey, receipt.success ? 'confirmed' : 'failed');
 
@@ -1825,7 +1821,7 @@ async function sendStrategyEarnWithSessionKey(accountAddress: Address, sessionKe
     const signed = await signPreparedOperation(prepared, op => account.signUserOperation(op));
     const hash = await client.sendUserOperation(signed);
     await settleGasBudget(budgetKey, 'submitted');
-    const receipt = await client.waitForUserOperationReceipt({ hash, timeout: USER_OP_RECEIPT_TIMEOUT_MS, pollingInterval: USER_OP_RECEIPT_POLL_MS });
+    const receipt = await client.waitForUserOperationReceipt({ hash, timeout: USER_OP_RECEIPT_TIMEOUT_MS });
     await settleGasBudget(budgetKey, receipt.success ? 'confirmed' : 'failed');
     if (receipt.receipt.status !== 'success' || receipt.success !== true) throw new Error(`strategy earn UserOp failed tx=${receipt.receipt.transactionHash}`);
     return { hash: receipt.receipt.transactionHash, blockNumber: receipt.receipt.blockNumber, logs: receipt.logs };
@@ -3410,8 +3406,8 @@ export async function readRebalanceReceipt(input: ReconcileInput, reader: {
   getOperation: (hash: Hex) => Promise<GetUserOperationReturnType | null>;
   getBlockHash: (number: bigint) => Promise<Hex | null>;
 }): Promise<ReconcileResult> {
-  const receipt = await reader.getReceipt(input.userOpHash);
-  const operation = await reader.getOperation(input.userOpHash);
+  // Two independent bundler lookups: asked together (each waited for the other before).
+  const [receipt, operation] = await Promise.all([reader.getReceipt(input.userOpHash), reader.getOperation(input.userOpHash)]);
   if (receipt === null && operation === null) return { kind: 'not_found' };
   if (receipt === null || operation === null) return { kind: 'incomplete', reason: 'receipt 或原 UserOp 缺漏' };
   const same = (left: string, right: string) => left.toLowerCase() === right.toLowerCase();

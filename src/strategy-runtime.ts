@@ -150,9 +150,11 @@ export async function prepareNewMoney(args:{due:DuePortfolio;plan:PortfolioPlan;
   const prepared=await prepareStrategyJob(run,context,lots),job=prepared.job;
   if(!job&&version.execution.kind==='per_asset'&&version.execution.rebalance!=='none'&&context.enabled&&context.marketOpen){
     const balance=(await query('select unallocated_hold_raw::text,stack_prefund_raw::text,reserved_input_raw::text,reserved_fee_raw::text from strategy_cash_balances where chain_id=$1 and portfolio_id=$2',[chainId,due.portfolioId])).rows[0] as Record<string,string>|undefined;
-    const waiting=balance&&Object.values(balance).some(n=>BigInt(n)>0n);
+    let waiting=balance&&Object.values(balance).some(n=>BigInt(n)>0n);
     const last=(await query("select coalesce(last_rebalance_at,(select min(created_at) from strategy_funding_lots where portfolio_id=$1 and state='confirmed')) as last_rebalance_at from portfolios where id=$1",[due.portfolioId])).rows[0] as {last_rebalance_at:Date|null}|undefined;
     const dueRebalance=yieldRebalanceDue(version.execution.rebalance,last?.last_rebalance_at??null,plan.report?.maxAbsDeltaBps??null,now);
+    // Cash left behind by sources that have ended is not new money waiting to be bought: it joins this rebalance.
+    if(waiting&&dueRebalance&&await freeEndedSourceCash(run,context))waiting=false;
     if(!waiting&&dueRebalance){
       context.reserve=await deps.rebalanceReserve(plan);
       return {job:null,context,useTargetWeights:true,rebalance:{kind:'noop',reason:'全hold基金設定再平衡'}};
@@ -226,6 +228,29 @@ export async function fitChildToFee(inputs:InputVector,feeLeft:bigint,due:(notio
   // Per-asset children keep 1 USDT per leg (a final installment may be smaller); whole-basket children keep 5 USDT.
   const reduced=reduceInputs(inputs,principal-fit.principal,asset=>finalAssets===undefined?5n*USDT_UNIT:finalAssets.has(asset)?1n:USDT_UNIT);
   return reduced===null?null:{inputs:reduced,fromPrincipal:principal-fit.principal};
+}
+/**
+ * A fund's configured rebalance stood still while any one-time cash sat outside allocated_cash_raw. Cash whose sources
+ * have all ended (bought, skipped, or released and handed back: #273 / #275 / #276) is tied to no pending buy and
+ * never leaves that bucket by itself, so such a fund kept the cash and never rebalanced again. When a rebalance is due
+ * and nothing is left to buy, that cash becomes the fund's own free cash and the rebalance buys it back by the target
+ * weights, as a private basket's own rebalance does (prepareMixTick). No source budget or period is rewritten and
+ * nothing leaves this portfolio. While a source is still pending, new money is bought first, as before.
+ */
+async function freeEndedSourceCash(run:WithTransactionFn,context:JobContext):Promise<boolean>{
+  return run(async({query})=>{
+    await lockCash(query,context);
+    if(await readJob(query,context))return false;
+    if((await query(`select id from operations where portfolio_id=$1 and ${unresolvedSql} limit 1`,[context.portfolioId])).rows.length)return false;
+    if((await query(`select 1 from strategy_funding_lots l where l.chain_id=$1 and l.portfolio_id=$2 and (l.state<>'confirmed'
+      or exists(select 1 from strategy_lot_assets a where a.lot_id=l.id and a.state='active')
+      or exists(select 1 from strategy_replan_assets a join strategy_replans r on r.id=a.replan_id where r.lot_id=l.id and a.state='active')) limit 1`,
+      [context.chainId,context.portfolioId])).rows.length)return false;
+    // Only the one-time bucket moves; a job's reservation or creator-scheduled prefunding left over means something is unsettled.
+    return (await query(`update strategy_cash_balances set allocated_cash_raw=allocated_cash_raw+unallocated_hold_raw,unallocated_hold_raw=0,updated_at=clock_timestamp()
+      where chain_id=$1 and portfolio_id=$2 and stack_prefund_raw=0 and reserved_input_raw=0 and reserved_fee_raw=0 returning portfolio_id`,
+      [context.chainId,context.portfolioId])).rows.length===1;
+  });
 }
 /** Cancel a job that can never send again and hand its remaining principal and fee back to the portfolio's free cash. */
 async function releaseJob(run:WithTransactionFn,context:JobContext,job:StrategyJob,reason:string):Promise<{job:StrategyJob|null;context:JobContext;rebalance:RebalancePlan}>{

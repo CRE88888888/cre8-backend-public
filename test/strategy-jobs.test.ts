@@ -3,7 +3,7 @@ import {readdir,readFile} from 'node:fs/promises';
 import {join} from 'node:path';
 import {randomBytes} from 'node:crypto';
 import {after,test} from 'node:test';
-import type {Address,Hex} from 'viem';
+import type {Address,Hex,PublicClient} from 'viem';
 import {query,withTransaction,withPortfolioLock,migrate,closePool,getPool,MIGRATIONS_DIR} from '../src/db.js';
 import {canonicalConfigHash,UINT256_MAX,validateAssetConfig} from '../src/strategy-execution.js';
 import type {AssetMode,AssetExecution} from '../src/strategy-execution.js';
@@ -20,6 +20,8 @@ import type {PortfolioPlan} from '../src/snapshot.js';
 import {TWAP_PRICE_SOURCE} from '../src/positions.js';
 import {TESTNET_97} from '../src/testnet-profile.js';
 import {withDexLock,assertDexLock,createDexGate} from '../src/dex-queue.js';
+import {withdrawableCash} from '../src/withdrawable-cash.js';
+import {checkTradeMinimums} from '../src/rebalance-plan.js';
 const address=():Address=>`0x${randomBytes(20).toString('hex')}`;
 const hash=():Hex=>`0x${randomBytes(32).toString('hex')}`;
 const cash=TESTNET_97.contracts.usdt,a=TESTNET_97.assets.WBNB.token,b=TESTNET_97.assets.ETH.token;
@@ -1673,4 +1675,226 @@ test('cancelled source DB: a creator-scheduled source keeps its later periods af
   const h=await fixture();await h.fund(100n*U);
   assert.equal((await feeScheduler(h).once(start)).results[0]?.outcome,'executed');
   assert.deepEqual(await sourceRows(h),[a,b].sort().map(asset=>({asset,state:'completed',slices:['completed']})));
+});
+
+// ---- 2026-11-25 a fund's own rebalance uses the cash that ended sources left behind -------------------------------
+// #273 / #275 hand a remainder that can never form a batch back to unallocated_hold_raw and end its sources (#276).
+// A fund's configured rebalance (drift / monthly / monthly_drift) refused to start while that bucket was not 0, so the
+// cash was never bought back and the fund never rebalanced again. Now a due rebalance takes that cash in as the fund's
+// own free cash, exactly when no source is left to buy; with new money still pending, new money goes first.
+// Buying that idle cash back is a buy: 10 USDT with its fee is enough (the planner marks the batch `idleCashBuy`), while
+// a rebalance between assets keeps its 50 USDT minimum. Under 10 USDT the planner answers noop and the cash stays cash.
+// The planner itself is pinned on a stub chain in test/rebalance-plan.test.ts ("returned cash: ..."); here its answers
+// are fed to the real scheduler, the real send-time minimum check and real Postgres.
+type Planned=Awaited<ReturnType<NonNullable<SchedulerDeps['planRebalance']>>>;
+const buy=(token:Address,amountIn:bigint)=>({tokenIn:cash,tokenOut:token,amountIn,amountOutMin:90n,oracleFloor:80n,venue:TESTNET_97.contracts.universalRouter,data:'0x' as Hex});
+/** A fund whose buy was released with 9.90 + 0.05 USDT handed back (#273), driven by a target-weight planner the test controls. */
+async function fundWithReturnedCash(rebalance:AssetExecution['rebalance']){
+  const f=await fixture('hold',0,4,rebalance);await f.fund(100n*U);
+  const before=await spendDownTo(f,usdt('9.9'),usdt('0.05'));
+  const state={delta:0,calls:0,cashDelta:0n,usdt:usdt('9.95'),planned:{kind:'noop',reason:'shared target weight planner'} as Planned,withdrawals:[] as {txHash:Hex;logIndex:number;blockNumber:bigint;blockHash:Hex;amount:bigint}[]};
+  const s=feeScheduler(f,feeWindowModel(),{
+    planPortfolio:async()=>{const p=plan(f);assert.ok(p.report);
+      return {...p,snapshot:{...p.snapshot,holdings:[{asset:cash,amountWei:state.usdt,decimals:18,usdPriceE8:100000000n,priceSource:TWAP_PRICE_SOURCE}]},report:{...p.report,maxAbsDeltaBps:state.delta,grossDriftBps:state.delta,needsRebalance:state.delta>100}};},
+    planRebalance:async()=>{state.calls++;return state.planned;}});
+  // A target-weight rebalance settles on the USDT the account actually gained or lost.
+  const execute=s.deps.executeRebalance,reconcile=s.deps.reconcileRebalance;assert.ok(execute&&reconcile&&s.deps.newMoney);
+  s.deps.executeRebalance=async args=>({...await execute(args),cashDeltaRaw:state.cashDelta.toString()});
+  s.deps.reconcileRebalance=async input=>{const result=await reconcile(input);if(result.kind==='found')Object.assign(result.outcome,{cashDeltaRaw:state.cashDelta.toString()});return result;};
+  s.deps.newMoney.withdrawals=async()=>state.withdrawals;
+  const released=await s.once(new Date(+start+60000));
+  assert.match(released.results[0]?.reason??'',/\[BELOW_MIN_BATCH\]/);
+  const cashRow=await balances(f);assert.equal(cashRow?.unallocated_hold_raw,usdt('9.95').toString());assert.equal(cashRow?.allocated_cash_raw,'0');
+  assert.equal(await pendingSources(f),0);assert.equal(state.calls,0);
+  return {f,s,state,spent:before.firstSpent+before.firstFee};
+}
+/** The scheduler's real send-time minimum check over a 1:1 oracle (the fixture's default accepts every batch). */
+const realMinimums=():NonNullable<SchedulerDeps['checkTradingMinimums']>=>{
+  const reads={readContract:async({functionName,args}:{functionName:string;args?:readonly unknown[]})=>{
+    if(functionName==='numeraire')return cash;if(functionName==='oracle')return TESTNET_97.contracts.router;if(functionName==='decimals')return 18;
+    if(functionName==='previewSwap'){const amount=args?.[2];assert.equal(typeof amount,'bigint');return [amount,amount];}
+    throw new Error(`unexpected read ${functionName}`);}};
+  return (steps,purpose,block,assetBudgetRaw,finalAssets,rebalanceReserveRaw)=>checkTradeMinimums(reads as unknown as PublicClient,TESTNET_97.contracts.executor,steps,purpose,block,assetBudgetRaw,finalAssets,rebalanceReserveRaw);
+};
+/** What the planner answers for idle cash under one buy batch (test/rebalance-plan.test.ts pins the real one). */
+const cashStays:Planned={kind:'noop',reason:'[BELOW_MIN_BATCH] 可用現金 9.950000 USDT 含費不足10 USDT，留作現金'};
+/** A second deposit whose buy is released with `left` + `feeLeft` handed back, on top of what is already there. */
+async function returnMore(r:Awaited<ReturnType<typeof fundWithReturnedCash>>,at:number,left:bigint,feeLeft:bigint){
+  // A new job needs its own time slot: the first one is recorded at `start`.
+  const now=new Date(+start+at*60000),context={...r.f.context,now};
+  const later:Fixture={...r.f,context,reserve:(c=context)=>r.f.reserve(c)};
+  await later.fund(100n*U,new Date(+now-60000));
+  await spendDownTo(later,left,feeLeft);
+  r.state.usdt+=left+feeLeft;
+  assert.match((await r.s.once(new Date(+start+(at+1)*60000))).results[0]?.reason??'',/\[BELOW_MIN_BATCH\]/);
+  assert.equal(await pendingSources(r.f),0);
+}
+const lotEvidence=async(f:Fixture)=>({sources:await sourceRows(f),lots:(await query('select id,amount_raw::text,state from strategy_funding_lots where portfolio_id=$1 order by id',[f.id])).rows,
+  budgets:(await query(`select a.lot_id,a.asset,a.budget_raw::text from strategy_lot_assets a join strategy_funding_lots l on l.id=a.lot_id where l.portfolio_id=$1 order by 1,2`,[f.id])).rows,
+  slices:(await query(`select s.lot_id,s.asset,s.slice_index,s.budget_raw::text,s.amount_raw::text,s.fee_reserve_raw::text,s.state from strategy_asset_slices s join strategy_funding_lots l on l.id=s.lot_id where l.portfolio_id=$1 order by 1,2,3`,[f.id])).rows});
+
+test('returned cash DB: 12 USDT handed back is bought back on the rebalance — one buy batch of 10 USDT with its fee is enough, the 50 between assets does not apply',async()=>{
+  const r=await fundWithReturnedCash('drift'),{f,s,state}=r;
+  s.deps.checkTradingMinimums=realMinimums();
+  // Not due (drift 500): nothing moves, the cash simply stays where it is.
+  state.delta=500;
+  for(const minutes of [2,3])assert.equal((await s.once(new Date(+start+minutes*60000))).results[0]?.outcome,'noop');
+  assert.equal(state.calls,0);assert.equal((await balances(f))?.unallocated_hold_raw,usdt('9.95').toString());
+  // A second released buy hands back 2.05 more: 12.00 USDT of this fund's cash, tied to no pending buy.
+  await returnMore(r,4,usdt('2'),usdt('0.05'));
+  assert.equal((await balances(f))?.unallocated_hold_raw,usdt('12').toString());assert.equal(state.calls,0);
+  const evidence=await lotEvidence(f);
+  // Due (drift 501). The planner's answer for 12 USDT of idle cash: buys only, 11.73 + the 0.27 fee, marked as an idle-cash buy.
+  state.delta=501;state.cashDelta=-usdt('12');
+  const steps=[buy(a,usdt('5.865')),buy(b,usdt('5.865'))],deadline=BigInt(start.getTime()/1000)+7200n;
+  // The same steps as an ordinary rebalance batch are refused before sending: 12 is under the 50 USDT between assets.
+  state.planned={kind:'ready',steps,deadline,rationale:'target weights'};
+  const refused=await s.once(new Date(+start+6*60000));
+  assert.equal(refused.results[0]?.outcome,'blocked');assert.match(refused.results[0]?.reason??'',/\[BELOW_MIN_BATCH\] 含費批次不足50 USDT/);assert.equal(s.sends.length,0);
+  // As the idle-cash buy the planner reports, the buy minimum applies and it is sent.
+  state.planned={kind:'ready',steps,deadline,rationale:'target weights',idleCashBuy:{feeReserveRaw:R}};
+  const result=await s.once(new Date(+start+7*60000));
+  assert.equal(result.results[0]?.outcome,'executed',result.results[0]?.reason);assert.equal(s.sends.length,1);
+  assert.deepEqual(s.sends.at(-1)?.steps.map(step=>[step.tokenIn,step.tokenOut,step.amountIn]),[[cash,a,usdt('5.865')],[cash,b,usdt('5.865')]]);
+  assert.deepEqual(await balances(f),{unallocated_hold_raw:'0',stack_prefund_raw:'0',allocated_cash_raw:'0',reserved_input_raw:'0',reserved_fee_raw:'0'},'every bucket is settled: 11.73 bought + 0.27 fee = the 12.00 handed back');
+  assert.deepEqual(await lotEvidence(f),evidence,'no lot, source budget or period was rewritten');
+  assert.ok((await query<{last_rebalance_at:Date|null}>('select last_rebalance_at from portfolios where id=$1',[f.id])).rows[0]?.last_rebalance_at,'the rebalance is recorded as done');
+  // Back in balance: quiet rounds, nothing changes.
+  state.delta=0;state.usdt=0n;
+  assert.equal((await s.once(new Date(+start+8*60000))).results[0]?.outcome,'noop');assert.equal(s.sends.length,1);
+});
+
+test('returned cash DB: 9.95 USDT is under one buy batch — it stays as the fund\'s cash and every round is a quiet noop, never blocked; it still joins a later rebalance between assets',async()=>{
+  const {f,s,state}=await fundWithReturnedCash('drift');
+  s.deps.checkTradingMinimums=realMinimums();
+  state.delta=501;state.planned=cashStays;
+  for(const [minutes,calls] of [[2,1],[3,2],[70,3]] as const){
+    const now=new Date(+start+minutes*60000),result=await s.once(now);
+    assert.equal(result.results[0]?.outcome,'noop',result.results[0]?.reason);assert.match(result.results[0]?.reason??'',/\[BELOW_MIN_BATCH\].*留作現金/);
+    assert.equal(state.calls,calls,'the rebalance is not stalled: the planner is asked when the fund comes up again');
+    // A noop waits out the idle backoff (15 minutes) instead of coming back every round.
+    assert.equal(result.results[0]?.nextRunAt.getTime(),now.getTime()+900_000);
+  }
+  assert.equal(s.sends.length,0);
+  assert.deepEqual(await balances(f),{unallocated_hold_raw:'0',stack_prefund_raw:'0',allocated_cash_raw:usdt('9.95').toString(),reserved_input_raw:'0',reserved_fee_raw:'0'},'kept as this fund\'s cash');
+  assert.equal(withdrawableCash(usdt('9.95'),(await query<Record<string,string>>(`select unallocated_hold_raw::text,stack_prefund_raw::text,allocated_cash_raw::text,reserved_input_raw::text,reserved_fee_raw::text,
+    withdrawal_raw::text,yield_raw::text from strategy_cash_balances where portfolio_id=$1`,[f.id])).rows[0]),usdt('9.95'),'all of it can be taken out');
+  // Prices move: the planner now sells A for B and adds the cash. 60 + 69.68 + 0.27 is an ordinary batch; it executes like any other rebalance.
+  state.planned={kind:'ready',steps:[{...buy(cash,60n*U),tokenIn:a},buy(b,usdt('69.68'))],deadline:BigInt(start.getTime()/1000)+7200n,rationale:'target weights'};
+  state.cashDelta=-usdt('9.95'); // +60 from the sale, -69.68 bought, -0.27 fee
+  assert.equal((await s.once(new Date(+start+71*60000))).results[0]?.outcome,'executed');assert.equal(s.sends.length,1);
+  assert.equal((await balances(f))?.allocated_cash_raw,'0');
+});
+
+test('returned cash DB: idle cash next to assets that are less than 50 USDT apart — only the cash is bought; a sale under 50 is never sent with it',async()=>{
+  const r=await fundWithReturnedCash('drift'),{f,s,state}=r;
+  s.deps.checkTradingMinimums=realMinimums();
+  await returnMore(r,2,usdt('2'),usdt('0.05'));
+  state.delta=501;state.cashDelta=-usdt('12');
+  const deadline=BigInt(start.getTime()/1000)+7200n;
+  // A batch that also swaps 4 USDT of A into B is a rebalance between assets: 4 + 15.69 + 0.27 is under 50, refused before sending.
+  state.planned={kind:'ready',steps:[{...buy(cash,4n*U),tokenIn:a},buy(b,usdt('15.69'))],deadline,rationale:'target weights'};
+  for(const minutes of [4,5]){
+    const swap=await s.once(new Date(+start+minutes*60000));
+    assert.equal(swap.results[0]?.outcome,'blocked');assert.match(swap.results[0]?.reason??'',/\[BELOW_MIN_BATCH\] 含費批次不足50 USDT/);
+  }
+  // Marking it as an idle-cash buy does not let a sale through either: that minimum is for buys paid in cash only.
+  state.planned={...state.planned,idleCashBuy:{feeReserveRaw:R}};
+  const marked=await s.once(new Date(+start+6*60000));
+  assert.equal(marked.results[0]?.outcome,'blocked');assert.match(marked.results[0]?.reason??'',/TRADE_MINIMUM_UNAVAILABLE/);
+  assert.equal(s.sends.length,0);assert.equal((await balances(f))?.allocated_cash_raw,usdt('12').toString());
+  // What the planner sends instead: the 12 USDT into the asset that is short, nothing sold. The assets are still apart
+  // (`partial`), so the rebalance is not recorded as complete and comes back when the drift is worth a batch.
+  state.planned={kind:'ready',steps:[buy(b,usdt('11.73'))],deadline,rationale:'target weights',idleCashBuy:{feeReserveRaw:R},partial:{remainingDriftBps:380,shrunk:[]}};
+  const before=(await query<{last_rebalance_at:Date|null}>('select last_rebalance_at from portfolios where id=$1',[f.id])).rows[0]?.last_rebalance_at;
+  const result=await s.once(new Date(+start+7*60000));
+  assert.equal(result.results[0]?.outcome,'executed',result.results[0]?.reason);
+  assert.deepEqual(s.sends.at(-1)?.steps.map(step=>[step.tokenIn,step.tokenOut,step.amountIn]),[[cash,b,usdt('11.73')]]);
+  assert.deepEqual(await balances(f),{unallocated_hold_raw:'0',stack_prefund_raw:'0',allocated_cash_raw:'0',reserved_input_raw:'0',reserved_fee_raw:'0'});
+  assert.deepEqual((await query<{last_rebalance_at:Date|null}>('select last_rebalance_at from portfolios where id=$1',[f.id])).rows[0]?.last_rebalance_at,before,'still due: the assets were not rebalanced');
+});
+
+test('returned cash DB: with new money still to buy, new money goes first — the returned cash is not touched until that buy is done',async()=>{
+  const {f,s,state}=await fundWithReturnedCash('drift');
+  state.delta=501;state.planned=cashStays;
+  // A 20 USDT deposit, the size of a DCA (定投) tranche, arrives while the buy allowance is used up: it waits.
+  await f.fund(20n*U,new Date(+start+2*60000),{[a]:1,[b]:1},undefined,10n*U);state.usdt+=20n*U;
+  assert.ok(s.deps.newMoney);const policy=s.deps.newMoney.policy;assert.ok(policy);
+  s.deps.newMoney.policy=async(...args)=>({...await policy(...args),buyLimit:0n});
+  for(const minutes of [3,4]){
+    const waiting=await s.once(new Date(+start+minutes*60000));
+    assert.match(waiting.results[0]?.reason??'',/\[BASKET_WAITING\]/);
+  }
+  assert.equal(state.calls,0,'no rebalance while a source is pending');
+  assert.equal((await balances(f))?.unallocated_hold_raw,usdt('29.95').toString());assert.equal((await balances(f))?.allocated_cash_raw,'0');
+  // Allowance is back: the tranche buys exactly its own 20 USDT.
+  s.deps.newMoney.policy=policy;
+  const bought=await s.once(new Date(+start+5*60000));assert.equal(bought.results[0]?.outcome,'executed',bought.results[0]?.reason);
+  const send=s.sends.at(-1);assert.ok(send);const paid=s.fees.get(send)??0n;
+  assert.equal(sumInputs(s.spent(send))+paid,20n*U-(BigInt((await balances(f))?.allocated_cash_raw??'0')),'only the tranche was spent');
+  assert.equal(await job(f),null);assert.equal(await pendingSources(f),0);
+  assert.equal((await balances(f))?.unallocated_hold_raw,usdt('9.95').toString(),'the returned cash was not part of that buy');
+  // Now nothing is pending: the due rebalance takes the returned cash in.
+  const kept=BigInt((await balances(f))?.allocated_cash_raw??'0');
+  assert.equal((await s.once(new Date(+start+6*60000))).results[0]?.outcome,'noop');assert.equal(state.calls,1);
+  assert.deepEqual(await balances(f),{unallocated_hold_raw:'0',stack_prefund_raw:'0',allocated_cash_raw:(usdt('9.95')+kept).toString(),reserved_input_raw:'0',reserved_fee_raw:'0'});
+});
+
+test('returned cash DB: a monthly fund takes the cash in on its date, not before; cash left by sources closed before any job (#275) counts the same',async()=>{
+  // Seven assets, 50 USDT, one asset per transaction: the sources are closed and the 50 USDT stays free (#275).
+  const f=await fixture('hold',0,4,'monthly',undefined,undefined,7);await f.fund(50n*U);
+  assert.match((await f.reserve({...f.context,batchStepLimit:1}))?.reason??'',/\[BELOW_MIN_BATCH\]/);
+  assert.equal((await balances(f))?.unallocated_hold_raw,(50n*U).toString());assert.equal(await pendingSources(f),0);
+  let calls=0;
+  const s=scheduler(f,{planRebalance:async()=>{calls++;return {kind:'blocked',reason:'quote unavailable'};}});
+  assert.equal((await s.once(new Date('2026-11-30T23:59:00Z'))).results[0]?.outcome,'noop');
+  assert.equal(calls,0);assert.equal((await balances(f))?.unallocated_hold_raw,(50n*U).toString(),'same month: not due, untouched');
+  // Before the fix December never came for this fund.
+  assert.equal((await s.once(new Date('2026-12-01T00:00:00Z'))).results[0]?.outcome,'blocked');assert.equal(calls,1);
+  assert.deepEqual(await balances(f),{unallocated_hold_raw:'0',stack_prefund_raw:'0',allocated_cash_raw:(50n*U).toString(),reserved_input_raw:'0',reserved_fee_raw:'0'});
+  assert.ok((await sourceRows(f)).every(r=>r.state==='completed'&&r.slices.length===1&&r.slices[0]==='skipped_window'));
+});
+
+test('returned cash DB: a fund with rebalance none keeps the cash as cash — never bought back, never in the way of a later deposit',async()=>{
+  const {f,s,state}=await fundWithReturnedCash('none');
+  state.delta=9000;
+  for(const minutes of [2,3,70,50000]){
+    const result=await s.once(new Date(+start+minutes*60000));assert.equal(result.results[0]?.outcome,'noop');
+  }
+  assert.equal(state.calls,0);assert.equal(s.sends.length,0);
+  assert.deepEqual(await balances(f),{unallocated_hold_raw:usdt('9.95').toString(),stack_prefund_raw:'0',allocated_cash_raw:'0',reserved_input_raw:'0',reserved_fee_raw:'0'});
+  await f.fund(50n*U,new Date(+start+50001*60000));state.usdt+=50n*U;
+  assert.equal((await s.once(new Date(+start+50002*60000))).results[0]?.outcome,'executed');
+  const send=s.sends.at(-1);assert.ok(send);assert.ok(sumInputs(s.spent(send))<=50n*U);
+  assert.equal((await balances(f))?.unallocated_hold_raw,usdt('9.95').toString(),'the later deposit bought only its own money');
+});
+
+test('returned cash DB: the owner can take the returned cash out at any point — before the rebalance, or after it joined the free cash',async()=>{
+  const row=async(f:Fixture)=>(await query<Record<string,string>>(`select unallocated_hold_raw::text,stack_prefund_raw::text,allocated_cash_raw::text,reserved_input_raw::text,reserved_fee_raw::text,
+    withdrawal_raw::text,yield_raw::text from strategy_cash_balances where portfolio_id=$1`,[f.id])).rows[0];
+  const withdrawal=()=>({txHash:hash(),logIndex:0,blockNumber:15n,blockHash:hash(),amount:usdt('9.95')});
+  // Still in the one-time bucket (rebalance not due): all of it is withdrawable; the withdrawal empties the bucket.
+  const early=await fundWithReturnedCash('drift');
+  assert.equal(withdrawableCash(usdt('9.95'),await row(early.f)),usdt('9.95'));
+  early.state.withdrawals=[withdrawal()];early.state.usdt=0n;early.state.delta=501;
+  assert.equal((await early.s.once(new Date(+start+2*60000))).results[0]?.outcome,'noop');
+  assert.deepEqual(await balances(early.f),{unallocated_hold_raw:'0',stack_prefund_raw:'0',allocated_cash_raw:'0',reserved_input_raw:'0',reserved_fee_raw:'0'});
+  // Already taken in by a rebalance that could not buy it: still all withdrawable; the withdrawal empties the free cash.
+  const late=await fundWithReturnedCash('drift');
+  late.state.delta=501;late.state.planned=cashStays;
+  assert.equal((await late.s.once(new Date(+start+2*60000))).results[0]?.outcome,'noop');
+  assert.equal((await balances(late.f))?.allocated_cash_raw,usdt('9.95').toString());
+  assert.equal(withdrawableCash(usdt('9.95'),await row(late.f)),usdt('9.95'));
+  late.state.withdrawals=[withdrawal()];late.state.usdt=0n;
+  await late.s.once(new Date(+start+3*60000));
+  assert.deepEqual(await balances(late.f),{unallocated_hold_raw:'0',stack_prefund_raw:'0',allocated_cash_raw:'0',reserved_input_raw:'0',reserved_fee_raw:'0'});
+  assert.equal((await query("select 1 from operations where portfolio_id=$1 and type='withdraw' and state='confirmed'",[late.f.id])).rows.length,1);
+});
+
+test('returned cash DB: a funding lot that needs reconciliation keeps the cash where it is and the rebalance waiting',async()=>{
+  const {f,s,state}=await fundWithReturnedCash('drift');
+  state.delta=501;
+  await query("update strategy_funding_lots set state='reorged' where portfolio_id=$1",[f.id]);
+  for(const minutes of [2,3])await s.once(new Date(+start+minutes*60000));
+  assert.equal(state.calls,0);assert.equal((await balances(f))?.unallocated_hold_raw,usdt('9.95').toString());assert.equal((await balances(f))?.allocated_cash_raw,'0');
 });

@@ -3339,6 +3339,89 @@ test('#96 all-hold 1-USDT policy is independent of a legacy 5-USDT override',asy
 });
 
 
+test('returned cash: a rebalance buys idle USDT back under the buy minimum (10 USDT with its fee); under it the cash stays as cash (noop); trades between assets keep 50', async () => {
+  const U = 10n ** 18n, reserve = 27n * 10n ** 16n, cents = (n: bigint) => n * U / 100n;
+  const fresh = () => { const chain = hubChain({ feeBps: 10 }); chain.rate = { rateE18: 10n ** 18n, slippageBps: 100 }; chain.minBatchFee = 3n * 10n ** 17n; return chain; };
+  const targets = [{ asset: WBNB, weightBps: 5000 }, { asset: TOKEN3, weightBps: 5000 }, { asset: USDT, weightBps: 0 }];
+  const run = async (wbnb: bigint, token3: bigint, usdt: bigint, extra: Partial<PlanRebalanceArgs> = { inclusiveFeeReserveRaw: reserve }, weights = targets, thresholdBps = 100) => {
+    const chain = fresh();
+    const plan = await planRebalance({ ...hubArgs(chain, { holdings: [holding(WBNB, wbnb, 18, PRICE_1_USD), holding(TOKEN3, token3, 18, PRICE_1_USD),
+      holding(USDT, usdt, 18, PRICE_1_USD)], targets: weights, thresholdBps, maxImpactBps: null, tradingConfig: loadTradingConfig({}) }), ...extra });
+    return { plan, quoted: chain.calls.some(call => call.functionName === 'previewSwap' || call.functionName === 'buyAllowance') };
+  };
+  const bought = (steps: readonly { tokenIn: string; tokenOut: string; amountIn: bigint }[], token: string) =>
+    steps.filter(step => step.tokenIn.toLowerCase() === USDT.toLowerCase() && step.tokenOut.toLowerCase() === token.toLowerCase()).reduce((sum, step) => sum + step.amountIn, 0n);
+  const sold = (steps: readonly { tokenIn: string; amountIn: bigint }[]) => steps.filter(step => step.tokenIn.toLowerCase() !== USDT.toLowerCase()).reduce((sum, step) => sum + step.amountIn, 0n);
+
+  // 60 USDT of idle cash next to a balanced 100/100: an ordinary batch (50 or more), both assets bought, the fee out of the same cash.
+  const even = expectReady((await run(100n * U, 100n * U, 60n * U)).plan);
+  assert.equal(even.steps.length, 2); assert.equal(even.idleCashBuy, undefined);
+  assert.deepEqual([bought(even.steps, WBNB), bought(even.steps, TOKEN3)].sort(), [30n * U - reserve, 30n * U].sort(), 'one leg carries the fee');
+
+  // 12 USDT handed back: under 50, but it is a buy from idle cash, so the buy minimum applies: 11.73 bought + 0.27 fee = 12.
+  const twelve = expectReady((await run(100n * U, 100n * U, 12n * U)).plan);
+  assert.deepEqual(twelve.idleCashBuy, { feeReserveRaw: reserve });
+  assert.equal(sold(twelve.steps), 0n);
+  assert.deepEqual([bought(twelve.steps, WBNB), bought(twelve.steps, TOKEN3)].sort(), [6n * U - reserve, 6n * U].sort());
+  // Exactly 10 USDT is one buy batch; 9.99 is not.
+  assert.equal(expectReady((await run(100n * U, 100n * U, 10n * U)).plan).idleCashBuy?.feeReserveRaw, reserve);
+
+  // 8.62 USDT (portfolio 7's leftover) next to 12/12, and 9.99 next to 100/100: under one buy batch. Not blocked: a noop,
+  // decided before any quote or allowance read, and the cash simply stays.
+  for (const [each, usdt] of [[12n * U, cents(862n)], [100n * U, cents(999n)]] as const) {
+    const small = await run(each, each, usdt);
+    assert.equal(small.plan.kind, 'noop');
+    if (small.plan.kind === 'noop') assert.equal(small.plan.reason, `[BELOW_MIN_BATCH] 可用現金 ${usdt === cents(862n) ? '8.620000' : '9.990000'} USDT 含費不足10 USDT，留作現金`);
+    assert.equal(small.quoted, false, 'no quotes for cash that cannot be bought');
+  }
+  // 9.5 USDT next to 105.5/95 (one asset 0.5 over, too small to sell): decided with quotes, still a noop.
+  const dust = await run(cents(10550n), 95n * U, cents(950n));
+  assert.equal(dust.plan.kind, 'noop'); if (dust.plan.kind === 'noop') assert.match(dust.plan.reason, /^\[BELOW_MIN_BATCH\] 含費批次不足10 USDT/);
+
+  // 12 USDT next to 110/90: the trade between the assets (sell 4, buy 16) is under 50 and is NOT sent with it.
+  // Only the idle cash is bought, into the asset that is short. Nothing is sold.
+  const drifted = expectReady((await run(110n * U, 90n * U, 12n * U)).plan);
+  assert.equal(sold(drifted.steps), 0n, 'a rebalance between assets under 50 is not triggered by the cash');
+  assert.equal(drifted.steps.length, 1); assert.equal(bought(drifted.steps, TOKEN3), 12n * U - reserve);
+  assert.deepEqual(drifted.idleCashBuy, { feeReserveRaw: reserve });
+  assert.ok(drifted.partial, 'the assets are still apart: this rebalance is not reported as complete');
+  // The same drift without idle cash, and with idle cash under one buy batch: the 50 minimum between assets, as before.
+  for (const usdt of [0n, cents(862n)]) {
+    const between = (await run(110n * U, 90n * U, usdt)).plan;
+    assert.equal(between.kind, 'blocked'); if (between.kind === 'blocked') assert.match(between.reason, /\[BELOW_MIN_BATCH\] 含費批次不足50 USDT/);
+  }
+  // 8.62 USDT when the assets have drifted to 140/60: one ordinary batch of 50 or more that sells WBNB and uses the cash too.
+  const wide = expectReady((await run(140n * U, 60n * U, cents(862n))).plan);
+  assert.equal(wide.idleCashBuy, undefined); assert.ok(sold(wide.steps) > 0n);
+  assert.ok(bought(wide.steps, TOKEN3) > sold(wide.steps), 'more is bought than the sale brings in: the idle cash is used');
+  assert.ok(bought(wide.steps, TOKEN3) <= sold(wide.steps) + cents(862n) - reserve);
+
+  // Cash at its own target weight is not idle: a 10 USDT buy out of it (the overweight asset cannot be sold now) keeps the 50 minimum.
+  const withCash = [{ asset: WBNB, weightBps: 4500 }, { asset: TOKEN3, weightBps: 4500 }, { asset: USDT, weightBps: 1000 }];
+  const atTarget = (await run(100n * U, 80n * U, 20n * U, { inclusiveFeeReserveRaw: reserve, canTradeAsset: asset => asset.toLowerCase() !== WBNB.toLowerCase() }, withCash)).plan;
+  assert.equal(atTarget.kind, 'blocked'); if (atTarget.kind === 'blocked') assert.match(atTarget.reason, /\[BELOW_MIN_BATCH\] 含費批次不足50 USDT/);
+  // 12 USDT above a 10% cash target (90/90/32 -> target cash 21.2): only the 10.8 above the target is spent.
+  const above = expectReady((await run(90n * U, 90n * U, 32n * U, { inclusiveFeeReserveRaw: reserve }, withCash)).plan);
+  assert.deepEqual(above.idleCashBuy, { feeReserveRaw: reserve });
+  assert.equal(bought(above.steps, WBNB) + bought(above.steps, TOKEN3) + reserve, cents(1080n));
+
+  // A private basket's own rebalance (threshold 0, no fee-inclusive budget) follows the same rule when the scheduler asks for it...
+  const basket = expectReady((await run(100n * U, 100n * U, 12n * U, { idleCashBuys: true }, targets, 0)).plan);
+  assert.deepEqual(basket.idleCashBuy, { feeReserveRaw: reserve }); assert.equal(sold(basket.steps), 0n);
+  assert.equal(bought(basket.steps, WBNB) + bought(basket.steps, TOKEN3), 12n * U - reserve);
+  const basketSmall = (await run(12n * U, 12n * U, cents(862n), { idleCashBuys: true }, targets, 0)).plan;
+  assert.deepEqual({ kind: basketSmall.kind, retryable: basketSmall.kind === 'noop' ? basketSmall.retryable : undefined }, { kind: 'noop', retryable: false });
+  // A basket whose pending sources hold the rest of the cash (cash ceiling 0): nothing is bought, and the pass stays
+  // retryable, so it does not use up the basket's rebalance date.
+  const ceiling = (await run(12n * U, 12n * U, cents(862n), { idleCashBuys: true, cashBudgetRaw: 0n }, targets, 0)).plan;
+  assert.deepEqual({ kind: ceiling.kind, retryable: ceiling.kind === 'ready' ? undefined : ceiling.retryable }, { kind: 'noop', retryable: true });
+  // ...and never for a caller that did not ask (legacy funds keep the 50 minimum).
+  const legacy = (await run(100n * U, 100n * U, 12n * U, {}, targets, 100)).plan;
+  assert.equal(legacy.kind, 'blocked'); if (legacy.kind === 'blocked') assert.match(legacy.reason, /\[BELOW_MIN_BATCH\] 批次不足交易門檻/);
+  const legacySmall = (await run(12n * U, 12n * U, cents(862n), {}, targets, 100)).plan;
+  assert.equal(legacySmall.kind, 'blocked'); if (legacySmall.kind === 'blocked') assert.match(legacySmall.reason, /\[BELOW_MIN_BATCH\] 批次不足交易門檻/);
+});
+
 test('My mix exit sells sub-dollar assets below ordinary minimums; the exemption rejects buy targets', async () => {
   for (const raw of [10n ** 10n, 5n * 10n ** 17n, 15n * 10n ** 18n]) {
     const holdings = [holding(TOKEN3, raw, 18, PRICE_1_USD), holding(USDT, 0n, 18, PRICE_1_USD)];

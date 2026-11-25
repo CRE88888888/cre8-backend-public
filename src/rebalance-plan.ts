@@ -307,6 +307,11 @@ export type RebalancePlan =
        * 排程器據此把 `next_run_at` 拉近（見 src/scheduler.ts 的 `PARTIAL_FOLLOW_UP_SECONDS`）。
        */
       partial?: PlanPartial | undefined;
+      /**
+       * A buys-only batch paid from idle cash (cash above its target, e.g. what a released buy handed back). It follows
+       * the buy minimum (10 USDT with this fee reserve), not the 50 USDT minimum of a rebalance between assets.
+       */
+      idleCashBuy?: { feeReserveRaw: bigint };
     };
 
 /** 一個被價格衝擊上限縮小的 step（`index` 對應 `steps` 的位置）。 */
@@ -348,6 +353,13 @@ export type PlanRebalanceArgs = {
   canTradeAsset?: (asset: string) => boolean;
   /** Only typed all-hold rebalances count the saved fee reserve in the 50 USDT batch. */
   inclusiveFeeReserveRaw?:bigint;
+  /**
+   * Private baskets (typed fund rebalances always do): cash above its target is bought back as a buys-only batch under
+   * the buy minimum (10 USDT with its fee). Under that it stays as cash (noop). Trades between assets keep 50 USDT.
+   */
+  idleCashBuys?: boolean;
+  /** Internal second pass: no sells, and buys spend at most this much cash (the idle cash). */
+  idleCashOnlyRaw?: bigint;
   tradingConfig?: TradingConfig;
   /** DB max_leg_usdt 轉成 E8；NULL 不限、0 阻擋。省略時規劃器讀 DB，CLI 也不能繞過限額。 */
   maxLegUsdE8?: ReadonlyMap<string, bigint | null>;
@@ -1919,6 +1931,26 @@ async function planHub(
     legs.push({ asset: getAddress(target.asset), row, deltaUsdE8: row.usdValueE8 - targetUsdE8 });
   }
 
+  // Idle cash = what the account holds above the cash target (all of it when the target has no cash). Exact in raw
+  // units, so "the whole balance" is not lost to a price round trip.
+  const idleCashBuys = args.purpose !== 'exit' && (args.inclusiveFeeReserveRaw !== undefined || args.idleCashBuys === true);
+  const hubRow = driftByAsset.get(hubKey);
+  let idleCashRaw: bigint | null = null;
+  if (idleCashBuys && hubRow !== undefined && hubHolding !== undefined && hubHolding.decimals === 18 && hubHolding.usdPriceE8 > 0n) {
+    const targetRaw = ceilDiv(ceilDiv(BigInt(hubRow.targetBps) * drift.totalUsdE8, BPS_BIG) * pow10(18), hubHolding.usdPriceE8);
+    idleCashRaw = hubHolding.amountWei > targetRaw ? hubHolding.amountWei - targetRaw : 0n;
+    if (args.cashBudgetRaw !== undefined && args.cashBudgetRaw >= 0n && args.cashBudgetRaw < idleCashRaw) idleCashRaw = args.cashBudgetRaw;
+  }
+  // Nothing to sell, and both the idle cash (fee included) and everything there is to buy are under one buy batch: the
+  // cash stays as this portfolio's cash. A pure decision before any chain read, so a small leftover (2026-11-25
+  // portfolio 7: 8.62 USDT) costs no quotes each round. Anything less clear-cut is decided below with real quotes,
+  // and so is a pass with a cash ceiling (a basket whose pending sources hold the rest: that one must stay retryable).
+  if (idleCashRaw !== null && args.cashBudgetRaw === undefined && idleCashRaw < MIN_ASSET_BATCH_RAW && legs.every((leg) => leg.deltaUsdE8 < policy.minStepUsdE8) &&
+      legs.reduce((sum, leg) => leg.deltaUsdE8 < 0n ? sum - leg.deltaUsdE8 : sum, 0n) < MIN_ASSET_BATCH_RAW / 10n ** 18n * USD_E8) {
+    return { kind: 'noop', ...(args.thresholdBps === 0 ? { retryable: false } : {}),
+      reason: `[BELOW_MIN_BATCH] 可用現金 ${formatUnits(idleCashRaw, 18)} USDT 含費不足${MIN_ASSET_BATCH_RAW / 10n ** 18n} USDT，留作現金` };
+  }
+
   const budgetResult = legs.some((leg) => leg.deltaUsdE8 < 0n) ? await readBuyBudget(args) : null;
   const buySourceBlock = budgetResult !== null && 'kind' in budgetResult && /StaleFeed|SourcesDisagree|InvalidAnswer/.test(budgetResult.reason) ? budgetResult.reason : null;
   if (budgetResult !== null && 'kind' in budgetResult && buySourceBlock === null) return budgetResult;
@@ -2068,7 +2100,7 @@ async function planHub(
 
   // ---- ① 先所有賣 ----
   for (const leg of legs) {
-    if (leg.deltaUsdE8 <= 0n) continue;
+    if (leg.deltaUsdE8 <= 0n || args.idleCashOnlyRaw !== undefined) continue;
     if (args.canTradeAsset?.(leg.asset) === false) { notes.push(`${short(leg.asset)} 收盤中，等待開盤賣出`); continue; }
     const holding = holdingsByAsset.get(leg.asset.toLowerCase());
     if (holding === undefined) {
@@ -2144,7 +2176,8 @@ async function planHub(
   if (args.cashBudgetRaw !== undefined && (args.cashBudgetRaw < 0n || args.cashBudgetRaw > (hubHolding?.amountWei ?? 0n))) {
     return { kind: 'blocked', reason: '[CASH_BUDGET_INVALID] 可用現金預算與持倉不一致。' };
   }
-  const availableCash = (args.cashBudgetRaw ?? hubHolding?.amountWei ?? 0n) + sellProceeds;
+  const cashCeiling = args.cashBudgetRaw ?? hubHolding?.amountWei ?? 0n;
+  const availableCash = (args.idleCashOnlyRaw !== undefined && args.idleCashOnlyRaw < cashCeiling ? args.idleCashOnlyRaw : cashCeiling) + sellProceeds;
   const spendable = availableCash > feeReserve ? availableCash - feeReserve : 0n;
   let spent = 0n;
 
@@ -2234,9 +2267,26 @@ async function planHub(
 
   const steps = priced.map((leg) => leg.routed);
   const nominal=priced.map((leg)=>sameAsset(leg.tokenIn,hub)?leg.amountIn:leg.oracleQuoted);
-  const minimumReason = args.inclusiveFeeReserveRaw===undefined?tradeMinimumReason(nominal,args.purpose ?? 'ordinary',policy,cashDecimals):
+  let minimumReason = args.inclusiveFeeReserveRaw===undefined?tradeMinimumReason(nominal,args.purpose ?? 'ordinary',policy,cashDecimals):
     cashDecimals!==18||args.inclusiveFeeReserveRaw<0n?'[TRADE_MINIMUM_UNAVAILABLE] 含費批次單位或預留無效':
     assetTradeMinimumReason(nominal,nominal.reduce((n,value)=>n+value,0n)+args.inclusiveFeeReserveRaw);
+  // Under the batch minimum of a rebalance. Idle cash still gets bought back under the buy minimum, by itself:
+  // the sells of a rebalance between assets that is too small are not sent with it.
+  let idleCashBuy: { feeReserveRaw: bigint } | undefined;
+  if (minimumReason !== null && minimumReason.startsWith('[BELOW_MIN_BATCH]') && idleCashRaw !== null && cashDecimals === 18) {
+    const reserve = args.inclusiveFeeReserveRaw ?? feeReserve;
+    const total = nominal.reduce((sum, value) => sum + value, 0n);
+    if (sellCount === 0 && total + reserve <= idleCashRaw) {
+      const buyReason = reserve < 0n ? '[TRADE_MINIMUM_UNAVAILABLE] 含費批次單位或預留無效' : assetTradeMinimumReason(nominal, total + reserve, new Set(), MIN_ASSET_BATCH_RAW);
+      if (buyReason !== null) return { kind: 'noop', reason: `${buyReason}；可用現金留作現金`,
+        ...(args.thresholdBps === 0 ? { retryable: notes.some(note => !note.startsWith('[BELOW_MIN_STEP]')) } : {}) };
+      minimumReason = null;
+      idleCashBuy = { feeReserveRaw: reserve };
+    } else if (args.idleCashOnlyRaw === undefined && idleCashRaw >= MIN_ASSET_BATCH_RAW) {
+      const cashOnly = await planHub({ ...args, idleCashOnlyRaw: idleCashRaw }, hub, deps, deadlineSeconds, maxImpactBps);
+      if (cashOnly.kind === 'ready') return cashOnly;
+    }
+  }
   if (minimumReason !== null) return { kind: 'blocked', reason: minimumReason,
     ...(args.thresholdBps === 0 ? { retryable: notes.some(note => !note.startsWith('[BELOW_MIN_STEP]')) } : {}) };
 
@@ -2304,7 +2354,8 @@ async function planHub(
     describePostDrift(drift, postDrift, partial),
   ].join('；');
 
-  return { kind: 'ready', steps, deadline, rationale, ...(args.purpose === undefined ? {} : { purpose: args.purpose }), ...(batchPartial === null ? {} : { partial: batchPartial }) };
+  return { kind: 'ready', steps, deadline, rationale, ...(args.purpose === undefined ? {} : { purpose: args.purpose }), ...(batchPartial === null ? {} : { partial: batchPartial }),
+    ...(idleCashBuy === undefined ? {} : { idleCashBuy }) };
 }
 
 /** pinned 路徑裡「已算好、只差問鏈」的那一筆：全部是純算術的結果，不含任何鏈上讀取。 */

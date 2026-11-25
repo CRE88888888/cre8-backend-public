@@ -27,6 +27,7 @@ function fixture() {
     planRebalance: async input => {
       quotes++;
       assert.equal(input.purpose, 'exit');
+      assert.equal(input.idleCashBuys, undefined, 'an exit only sells');
       assert.equal(input.canTradeAsset?.(T.assets.NVDAB.token), false);
       assert.equal(input.canTradeAsset?.(T.assets.WBNB.token), true);
       assert.equal(input.plan.targets.find(t => t.asset === T.contracts.usdt)?.weightBps, 10000);
@@ -137,6 +138,30 @@ test('monthly due pass below the batch minimum completes the period, while a def
   assert.equal(completed, 1, 'a closed/RPC-deferred leg cannot consume the occurrence');
 });
 
+
+test('a basket rebalance asks the planner to buy idle cash back, and such a batch is checked against the buy minimum (10 USDT with its fee), not the 50 between assets', async () => {
+  const f = fixture(); f.state.last = null; f.state.takeProfit = null; f.state.stopLoss = null;
+  const cash = f.plan.snapshot.holdings.find(h => h.asset === T.contracts.usdt); assert.ok(cash); cash.amountWei = 12n * 10n ** 18n;
+  const reserve = 27n * 10n ** 16n;
+  const steps = [{ tokenIn: T.contracts.usdt, tokenOut: T.assets.WBNB.token, amountIn: 12n * 10n ** 18n - reserve, amountOutMin: 1n, oracleFloor: 1n, venue: T.contracts.router, data: '0x' as const }];
+  let asked: boolean | undefined;
+  const checks: unknown[][] = [];
+  f.deps.planRebalance = async input => { asked = input.idleCashBuys; assert.equal(input.purpose, undefined);
+    return { kind: 'ready', steps, deadline: 2000000000n, rationale: 'fixture idle cash', idleCashBuy: { feeReserveRaw: reserve } }; };
+  f.deps.clock = () => mixClock;
+  f.deps.readBuyVersionWindow = async () => ({ activeVersion: 1, timestamp: BigInt(Math.floor(mixClock.getTime() / 1000)), pendingActiveAt: null });
+  f.deps.checkTradingMinimums = async (...args) => { checks.push(args); return '[FIXTURE_STOP] stop before sending'; };
+  const result = await runSchedulerOnce({ dryRun: false, now: mixClock, skipAlerts: true }, f.deps);
+  assert.equal(asked, true);
+  assert.match(result.results[0]?.reason ?? '', /FIXTURE_STOP/);
+  // Budget = what is bought + the fee reserve (12 USDT), and no 50-USDT rebalance reserve is passed.
+  assert.deepEqual(checks.map(([planned, purpose, , budget, , rebalanceReserve]) => [planned, purpose, budget, rebalanceReserve]), [[steps, 'ordinary', 12n * 10n ** 18n, undefined]]);
+  // A batch of that size under the minimum stays as cash: a quiet noop, not an error each round.
+  f.deps.checkTradingMinimums = async () => '[BELOW_MIN_BATCH] 含費批次不足10 USDT';
+  const small = await runSchedulerOnce({ dryRun: false, now: mixClock, skipAlerts: true }, f.deps);
+  assert.equal(small.results[0]?.outcome, 'noop'); assert.match(small.results[0]?.reason ?? '', /\[BELOW_MIN_BATCH\].*留作現金/);
+  assert.equal(f.counts().sends, 0);
+});
 
 test('keeper outage for five minutes does not exhaust exits and the next priced tick completes without restart', async () => {
   const f = fixture();

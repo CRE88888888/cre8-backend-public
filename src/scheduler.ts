@@ -568,7 +568,7 @@ export type ExecutionOutcome = {
 };
 
 /** 決策所需的輸入：portfolio 與它的 drift 計畫（`planPortfolio` 的產物）。 */
-export type RebalancePlanningInput = { cashBudgetRaw?: bigint; purpose?: 'exit'; sellOnlyAssets?: ReadonlySet<string>; canTradeAsset?: (asset: string) => boolean; portfolioId: number; account: Address; plan: PortfolioPlan; inclusiveFeeReserveRaw?:bigint };
+export type RebalancePlanningInput = { cashBudgetRaw?: bigint; purpose?: 'exit'; sellOnlyAssets?: ReadonlySet<string>; canTradeAsset?: (asset: string) => boolean; portfolioId: number; account: Address; plan: PortfolioPlan; inclusiveFeeReserveRaw?:bigint; idleCashBuys?: boolean };
 
 /** 送出前重問地板的輸入。`executor` 是 chain 上 `oracle()` 的讀取點，`strategyId` 是 `effectiveFeeBps` 的 key。 */
 export type FloorRefreshInput = {
@@ -1939,7 +1939,7 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
         })),
     planRebalance:
       provided.planRebalance ??
-      (async ({ account, plan, inclusiveFeeReserveRaw, sellOnlyAssets, canTradeAsset, purpose, cashBudgetRaw }: RebalancePlanningInput) => {
+      (async ({ account, plan, inclusiveFeeReserveRaw, sellOnlyAssets, canTradeAsset, purpose, cashBudgetRaw, idleCashBuys }: RebalancePlanningInput) => {
         const publicClient = defaultPublicClient();
         const executor = executorAddress();
         const oracle = await publicClient.readContract({
@@ -1955,6 +1955,7 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
           ...(cashBudgetRaw === undefined ? {} : { cashBudgetRaw }),
           ...(purpose === undefined ? {} : { purpose }),
           ...(inclusiveFeeReserveRaw===undefined?{}:{inclusiveFeeReserveRaw}),
+          ...(idleCashBuys === undefined ? {} : { idleCashBuys }),
           ...(sellOnlyAssets === undefined ? {} : { sellOnlyAssets }),
           ...(canTradeAsset === undefined ? {} : { canTradeAsset }),
           maxLegUsdE8: await readMaxLegUsdE8(plan.targets.map((target) => target.asset), query, chainId),
@@ -2752,6 +2753,8 @@ async function decideAndMaybeExecute(
     ...(mixTick?.mode === 'exit' ? { purpose: 'exit' } : {}),
     ...(cashBudgetRaw === undefined ? {} : { cashBudgetRaw }),
     ...(mix ? { sellOnlyAssets: mix.exits, canTradeAsset: (asset: string) => assetsMarketOpen(ctx.deps.chainId, [asset], ctx.now) } : {}),
+    // A basket's own rebalance buys its idle cash back under the buy minimum, like a fund's (see PlanRebalanceArgs).
+    ...(mix && mixTick?.mode !== 'exit' ? { idleCashBuys: true } : {}),
     ...(money?.useTargetWeights?{inclusiveFeeReserveRaw:money.context.reserve}:{}) });
   if (mix && mixTick?.mode === 'exit' && !ctx.dryRun && (rebalance.kind === 'noop' || rebalance.kind === 'blocked')) {
     let minimum = false;
@@ -2853,7 +2856,12 @@ async function decideAndMaybeExecute(
   }
   let inclusiveBudget:bigint|undefined;
   if(money?.job?.kind==='asset')inclusiveBudget=rebalance.steps.reduce((s,step)=>s+step.amountIn,0n)+money.context.reserve;
-  const minimumReason = await ctx.deps.checkTradingMinimums(rebalance.steps, gasPurpose, plan.snapshot.block,inclusiveBudget,money?.context.finalAssets,money?.useTargetWeights?money.context.reserve:undefined);
+  // Idle cash bought back by a rebalance is a buy: the buy minimum (10 USDT with its fee), not the 50 between assets.
+  else if(rebalance.idleCashBuy!==undefined)inclusiveBudget=rebalance.steps.reduce((s,step)=>s+step.amountIn,0n)+rebalance.idleCashBuy.feeReserveRaw;
+  const minimumReason = await ctx.deps.checkTradingMinimums(rebalance.steps, gasPurpose, plan.snapshot.block,inclusiveBudget,money?.context.finalAssets,
+    money?.useTargetWeights&&rebalance.idleCashBuy===undefined?money.context.reserve:undefined);
+  // The part of an idle-cash buy that fits one transaction can itself be under the minimum: it stays as cash, quietly.
+  if (minimumReason !== null && rebalance.idleCashBuy !== undefined && /^\[BELOW_MIN_(STEP|BATCH)\]/.test(minimumReason)) return { ...base, outcome: 'noop', reason: `${minimumReason}；可用現金留作現金` };
   if (minimumReason !== null) return { ...base, outcome: 'blocked', reason: minimumReason };
 
   // ---- ⑤ 送出前重問地板：`rebalance.steps` 的 `amountOutMin` 是**規劃當時**的地板 --------------

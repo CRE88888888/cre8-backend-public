@@ -1,4 +1,5 @@
-import { strategyEarnV2For } from './strategy-earn-v2.js';
+import { strategyEarnV2, v2Audience } from './strategy-earn-v2.js';
+import { defaultV2Reader, v2HasState } from './strategy-earn-v2-chain.js';
 import { withMixPortfolioLock, mixBusy } from './mix-store.js';
 import type { Address, Hex, PublicClient } from 'viem';
 import { KERNEL_V3_3_ADDRESSES, KERNEL_VERSION_STRING } from './addresses.js';
@@ -115,6 +116,8 @@ export type BuildRenewalKeyArgs = {
   publicClient: PublicClient;
   /** Unix 秒；未給 = `sessionValidUntil()`（now + 365 天）。 */
   validUntil?: number;
+  /** 這個帳戶在路由 v2 上有沒有東西（同意、部位、策略盒的錢、或用過 v2）。未給 = 走公開節點讀鏈（讀不到就丟錯，不猜）。只在 owner 不在 audience 時才問。 */
+  hasV2State?: (account: Address) => Promise<boolean>;
 };
 
 /**
@@ -129,8 +132,13 @@ export async function buildRenewalKey(args: BuildRenewalKeyArgs): Promise<Renewa
   const validUntil = args.validUntil ?? sessionValidUntil();
 
   const chainId = args.publicClient.chain?.id ?? await args.publicClient.getChainId();
-  // Routing v2 scope only for owners in its audience (a canary list today): everyone else renews exactly as before.
-  const v2 = strategyEarnV2For(chainId, args.owner);
+  // Routing v2 scope for owners in its audience (a canary list today; a pause on new opens does not take it away), and for
+  // any account that already has something on v2 whoever its owner is: without the scope the scheduler could no longer
+  // repay or close that position with the new key. Everyone else renews exactly as before, and costs one public-node read
+  // every ten minutes at most (`touchedOutside`). That read failing fails the renewal: the scope is never guessed.
+  const deployment = strategyEarnV2(chainId);
+  const v2 = deployment === null ? null : v2Audience(chainId, args.owner) ? deployment
+    : args.accountAddress !== undefined && await (args.hasV2State ?? (async account => v2HasState(await defaultV2Reader(deployment).touchedOutside(account))))(args.accountAddress) ? deployment : null;
   const session = await buildSessionPermissions({
     publicClient: args.publicClient,
     sessionKeyAddress: derived.address,

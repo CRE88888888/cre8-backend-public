@@ -32,8 +32,15 @@ export type StrategyEarnV2 = {
   rewardTokens: readonly Address[];
   /** The vault adapters (they pay a withdrawal straight to the account; My mix flow accounting treats them as internal). */
   adapters: readonly Address[];
-  /** Owners whose accounts use v2 while STRATEGY_EARN_V2_AUDIENCE is unset (a canary list). */
+  /** Owners who may START on v2 while the audience is `canary` (a canary list). */
   canaryOwners: readonly Address[];
+  /** Manifest `audience`: who may start on v2 when STRATEGY_EARN_V2_AUDIENCE is unset — `canary` (only `canaryOwners`; the
+   * default) or `all` (every owner). The api and the scheduler read the same file, so they always agree. */
+  audience?: 'canary' | 'all';
+  /** Manifest `newOpensPaused`: nobody (canary owners included) starts anything new on v2 — no new consent, no new
+   * position, no asset added — while every account that already has something on v2 is still looked after and can
+   * close. The switch to pull when something goes wrong. Default false. */
+  newOpensPaused?: boolean;
   /** AtpBorrowCashSwapper (spec §17), bound to this executor: USDT -> the loan token an account owes (`topUp`, into its
    * strategy box) and leftover loan token -> USDT (`cashOut`). Absent / null: this deployment has none (nothing is swapped). */
   swapper?: Address | null;
@@ -61,7 +68,9 @@ function parseDeployment(d: Record<string, unknown>, what: string): StrategyEarn
   const swapperPools = swapper !== null && typeof cs === 'object' ? Object.entries(((cs as Record<string, unknown>).pools ?? {}) as Record<string, unknown>).map(([k, v]) => a(v, 'cashSwapper.pools.' + k)) : [];
   const from = swapper !== null && typeof cs === 'object' ? (cs as Record<string, unknown>).ledgerFromBlock : undefined;
   if (from !== undefined && (typeof from !== 'number' || !Number.isSafeInteger(from) || from < 0)) throw new Error(`${what}.cashSwapper.ledgerFromBlock must be a block number`);
-  return { chainId, swapper, swapperPools, ...(from === undefined ? {} : { swapLedgerFromBlock: BigInt(from as number) }), executor: a(d.executor, 'executor'), registry: a(d.registry, 'registry'), lens: a(d.lens, 'lens'), venusComptroller: a(d.venusComptroller, 'venusComptroller'), moolah: a(d.moolah, 'moolah'),
+  if (d.audience !== undefined && d.audience !== 'canary' && d.audience !== 'all') throw new Error(`${what}.audience must be "canary" or "all"`);
+  if (d.newOpensPaused !== undefined && typeof d.newOpensPaused !== 'boolean') throw new Error(`${what}.newOpensPaused must be true or false`);
+  return { chainId, swapper, swapperPools, audience: d.audience === 'all' ? 'all' : 'canary', newOpensPaused: d.newOpensPaused === true, ...(from === undefined ? {} : { swapLedgerFromBlock: BigInt(from as number) }), executor: a(d.executor, 'executor'), registry: a(d.registry, 'registry'), lens: a(d.lens, 'lens'), venusComptroller: a(d.venusComptroller, 'venusComptroller'), moolah: a(d.moolah, 'moolah'),
     loanTokens, rewardTokens: list(d.rewardTokens, 'rewardTokens'), adapters: list(d.adapters, 'adapters'), canaryOwners: list(d.canaryOwners, 'canaryOwners') };
 }
 const parsed = new Map<string, StrategyEarnV2[]>();
@@ -85,7 +94,7 @@ function manifestDeployments(env: NodeJS.ProcessEnv): StrategyEarnV2[] {
  * The v2 deployment for this chain, or null (no v2 contracts on this chain). Every v2 address comes from deployment
  * configuration, none from code: STRATEGY_EARN_V2_DEPLOYMENT (one JSON object, wins when set) or the manifest file
  * deploy/strategy-earn-v2.json, both `{ chainId, executor, registry, lens, venusComptroller, moolah, adapters: [...],
- * loanTokens: { USDT: … }, rewardTokens: [...], canaryOwners: [...] }`. The session-key scope, the paymaster rules and the
+ * loanTokens: { USDT: … }, rewardTokens: [...], canaryOwners: [...], audience, newOpensPaused }`. The session-key scope, the paymaster rules and the
  * readers all take the executor / registry / lens from the object returned here, so a redeploy is a manifest change.
  * Routes and vaults are not configured at all: the registry enumerates them. A malformed manifest throws: a half-read
  * deployment must never be used to build calls. This says where v2 IS, not who may use it: see `strategyEarnV2For`.
@@ -103,23 +112,32 @@ export function strategyEarnV2(chainId: number, env: NodeJS.ProcessEnv = process
   return list[0]!.chainId === chainId ? list[0]! : null;
 }
 /**
- * Is routing v2 open to this owner's accounts? STRATEGY_EARN_V2_AUDIENCE: unset = the deployment's `canaryOwners`
- * (empty today: v2 is off for everyone until an owner is listed there); `all` = every owner; `off` = nobody; otherwise a
- * comma-separated list of owner addresses (malformed entries throw). Everyone outside the audience stays on v1: no v2
- * session scope is installed for them, the paymaster sponsors no v2 call of theirs, the API and the scheduler build none.
- * Opening v2 to everyone is a product decision (set the variable to `all`); nothing in the code changes.
+ * May this owner START something on routing v2 (a new consent, a new position, another asset)? This is all the audience
+ * decides: an account that already has anything on v2 is looked after whoever its owner is (src/strategy-earn-v2-chain.ts
+ * `v2TouchedOutside`, the scheduler, the keeper, the paymaster's settle calls, the API's reads and close).
+ * STRATEGY_EARN_V2_AUDIENCE wins when set: `all` = every owner; `off` = nobody; otherwise a comma-separated list of owner
+ * addresses (malformed entries throw). Unset: the deployment's own `audience` — `canary` (the default: only its
+ * `canaryOwners`) or `all`. The manifest is one file both services read, so they cannot disagree; the variable has to
+ * be set on both. Opening v2 to everyone is a product decision (`"audience": "all"`); nothing in the code changes.
  */
 export function v2Audience(chainId: number, owner: string | null | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
   if (typeof owner !== 'string' || !ADDRESS.test(owner)) return false;
   const raw = env.STRATEGY_EARN_V2_AUDIENCE?.trim();
-  if (!raw) return (strategyEarnV2(chainId, env)?.canaryOwners ?? []).some(o => o === owner.toLowerCase());
+  if (!raw) {
+    const v2 = strategyEarnV2(chainId, env);
+    return v2 !== null && (v2.audience === 'all' || v2.canaryOwners.some(o => o === owner.toLowerCase()));
+  }
   if (raw === 'all') return true;
   if (raw === 'off') return false;
   const list = raw.split(',').map(x => x.trim()).filter(Boolean);
   if (list.some(x => !ADDRESS.test(x))) throw new Error('STRATEGY_EARN_V2_AUDIENCE must be all, off or comma-separated 0x addresses');
   return list.some(x => x.toLowerCase() === owner.toLowerCase());
 }
-/** The deployment this owner's accounts may use, or null (= this owner stays on v1 / has no yield strategy v2). */
+/** Manifest `newOpensPaused`: nothing new starts on v2 for anybody (what is there is still looked after and can close). */
+export const v2NewOpensPaused = (chainId: number, env: NodeJS.ProcessEnv = process.env): boolean => strategyEarnV2(chainId, env)?.newOpensPaused === true;
+/** May this owner start something new on v2 right now: in the audience, and new opens are not paused. */
+export const v2MayOpen = (chainId: number, owner: string | null | undefined, env: NodeJS.ProcessEnv = process.env): boolean =>
+  v2Audience(chainId, owner, env) && !v2NewOpensPaused(chainId, env);
 /**
  * The v2 addresses the app is told about (it has none of its own): with the signing payload of a My mix weight change, and
  * with a v2 position's status. One shape, one source (the deployment): `registry`, `executor`, and `cashSwapper` when the
@@ -128,9 +146,11 @@ export function v2Audience(chainId: number, owner: string | null | undefined, en
 export type StrategyV2Addresses = { registry: Address; executor: Address; cashSwapper?: Address };
 export const strategyV2Addresses = (v2: StrategyEarnV2 | null): StrategyV2Addresses | null =>
   v2 === null ? null : { registry: v2.registry, executor: v2.executor, ...(v2.swapper ? { cashSwapper: v2.swapper } : {}) };
+/** The deployment this owner may START on (`v2MayOpen`), or null: new consent and new positions go to v1. It says nothing
+ * about an account that already has something on v2 — that one is managed whatever this answers. */
 export const strategyEarnV2For = (chainId: number, owner: string | null | undefined, env: NodeJS.ProcessEnv = process.env): StrategyEarnV2 | null => {
   const v2 = strategyEarnV2(chainId, env);
-  return v2 !== null && v2Audience(chainId, owner, env) ? v2 : null;
+  return v2 !== null && v2MayOpen(chainId, owner, env) ? v2 : null;
 };
 /**
  * Contracts that hand a portfolio its own tokens back for routing v2: the executor (collateral, surplus), the vault
@@ -1105,6 +1125,9 @@ export type V2AccountState = { enabled: boolean; policyMaxDebtUsdRaw: bigint; pr
 export type V2Tx = { hash: Hex };
 export type V2RoundArgs = { v2: StrategyEarnV2; portfolioId: number; account: Address; snapshot: RoutingSnapshot; state: V2AccountState; costs: Costs; now: number; deadline: bigint;
   liquidity?: Liquidity; dryRun: boolean; log: (line: string) => void;
+  /** The owner may not start anything new on v2 (outside the audience, or new opens paused — `v2MayOpen`): this round
+   * only looks after what is there. See `withoutNewRisk`. */
+  noNewRisk?: boolean;
   /** Each route's venue minimums (lens `minLoan` / `minDebt`). */
   limits?: (routeId: Hex) => RouteLimits | undefined;
   /** One UserOp through the account with its session key. */
@@ -1118,6 +1141,26 @@ export type V2RoundResult = { decisions: number; sent: number; failed: number; s
   plan?: ExecutionPlan };
 const firstLine = (error: unknown) => String((error as Error)?.message ?? error).split('\n')[0]!.slice(0, 140);
 /**
+ * The engine's decisions for an account whose owner may not start anything new on v2: nothing that adds risk is kept
+ * (the paymaster would refuse it anyway: `executeOpen` / `executeMigrate` / `executeSwitchVault` are 'risk'), everything
+ * that lowers it is.
+ * - open (a new position, or more borrowing on an open one) -> nothing happens: the position, if any, stays as it is;
+ * - a move the engine wants only because another route pays more -> the position stays where it is;
+ * - a move the engine wants because the route has to be left now (negative carry, the market or the vault paused,
+ *   removed or drained) -> close, which is what the engine itself does when there is no other route;
+ * - hold, reduce (the safety line included) and close are untouched.
+ */
+export function withoutNewRisk(decisions: readonly Decision[], holdings: readonly Pick<V2Holding, 'symbol' | 'position'>[]): Decision[] {
+  const debtOf = (symbol: string) => holdings.find(h => h.symbol === symbol)?.position?.debtUsd ?? 0;
+  return decisions.map((d): Decision => {
+    if (d.action === 'open' || d.action === 'migrate' && !d.urgent) return { ...d, action: 'hold', urgent: false, to: d.action === 'open' && d.from !== null ? d.to : null, targetDebtUsd: debtOf(d.symbol),
+      rationale: `${d.symbol} hold: nothing new starts on routing v2 for this account (outside the audience, or new opens are paused) — was: ${d.rationale}` };
+    if (d.action === 'migrate') return { ...d, action: 'close', to: null, targetDebtUsd: 0,
+      rationale: `${d.symbol} close ${d.from ? `${d.from.venue}/${d.from.loan}` : ''}: ${d.reason}, and nothing new starts on routing v2 for this account, so it is not moved — was: ${d.rationale}` };
+    return d;
+  });
+}
+/**
  * Decide (routing engine) and execute for one account. Every decision is logged as one line with its rationale, whether or
  * not it leads to a transaction. Plain steps (close, repay, open, vault switch) are sent up to V2_CALLS_PER_USER_OP per
  * UserOp; a UserOp that fails is retried one step at a time. A step that still fails is logged and left for the next round;
@@ -1130,11 +1173,12 @@ export async function runV2Account(a: V2RoundArgs): Promise<V2RoundResult> {
   const snapshot = a.state.hasV1Venus || foreign.length > 0 ? { ...a.snapshot, options: Object.fromEntries(Object.entries(a.snapshot.options).map(([k, v]) =>
     [k, v.filter(o => o.venue !== 'venus' || !a.state.hasV1Venus && !foreign.includes(o.loan))])) } : a.snapshot;
   const engine = planAccount({ snapshot, holdings, costs: a.costs, now: a.now, ...(a.liquidity ? { liquidity: a.liquidity } : {}) });
-  const execution = planExecution({ v2: a.v2, account: a.account, decisions: engine.decisions, positions: a.state.holdings, deadline: a.deadline,
+  const decisions = a.noNewRisk ? withoutNewRisk(engine.decisions, a.state.holdings) : engine.decisions;
+  const execution = planExecution({ v2: a.v2, account: a.account, decisions, positions: a.state.holdings, deadline: a.deadline,
     policyMaxDebtUsdRaw: a.state.policyMaxDebtUsdRaw, principalUsdRaw: a.state.principalUsdRaw, now: a.now, ...(a.limits ? { limits: a.limits } : {}) });
-  const result: V2RoundResult = { decisions: engine.decisions.length, sent: 0, failed: 0, skipped: 0, consentShort: execution.consentShort, plan: execution };
+  const result: V2RoundResult = { decisions: decisions.length, sent: 0, failed: 0, skipped: 0, consentShort: execution.consentShort, plan: execution };
   const tag = `[strategy-routing] portfolio ${a.portfolioId}:`;
-  for (const d of engine.decisions) if (d.action === 'hold' && !execution.steps.some(s => s.symbol === d.symbol)) a.log(`${tag} ${d.rationale}`);
+  for (const d of decisions) if (d.action === 'hold' && !execution.steps.some(s => s.symbol === d.symbol)) a.log(`${tag} ${d.rationale}`);
   const sendable: Step[] = [];
   for (const step of execution.steps) {
     if (step.calls.length === 0) { result.skipped++; a.log(`${tag} ${step.rationale} — not sent: ${step.skipped}`); continue; }

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { readFileSync } from 'node:fs';
 import { toFunctionSelector, createPublicClient, custom, decodeFunctionData, encodeFunctionData, erc20Abi, maxUint256 } from 'viem';
 import type { Address, Hex } from 'viem';
 import { bscTestnet } from 'viem/chains';
@@ -62,7 +63,7 @@ type Kind = 'fund' | 'mix';
 function harness(kind: Kind, opts: { pendingChange?: boolean; reservedRaw?: bigint; observedRaw?: bigint; exiting?: 'triggered' | 'exited' | 'deleting'; rewardTokens?: Address[]; v2?: StrategyEarnV2 | null;
   /** Which generation of the yield strategy the account already uses (the paymaster's exclusivity check). */
   inUse?: 'v1' | 'v2' | 'unreadable';
-  /** Leave the v2 deployment to production wiring (strategyEarnV2For: manifest + audience) instead of injecting it. */
+  /** Leave the v2 deployment to production wiring (strategyEarnV2 + v2MayOpen: manifest, audience, newOpensPaused) instead of injecting it. */
   wired?: boolean } = {}) {
   const seen = { locks: 0, reservations: 0, setups: 0, exits: 0 }, asked: string[] = [];
   const service = createPaymasterService({ config: c, now: () => NOW, ...(opts.rewardTokens ? { rewardTokens: opts.rewardTokens } : {}), ...(opts.wired ? {} : { strategyV2: opts.v2 ?? null }),
@@ -591,22 +592,51 @@ for (const kind of ['fund', 'mix'] as const) {
     assert.deepEqual(plain.asked, []);
   });
 
-  test(`routing v2, ${kind} account: production wiring — the deployment and the audience come from configuration; an owner outside the audience gets no v2 sponsorship`, async () => {
+  test(`routing v2, ${kind} account: production wiring — the deployment and the audience come from configuration; outside the audience nothing new starts on v2, and everything that settles is still sponsored`, async () => {
     const real = strategyEarnV2(97, {})!;
     const v2f = v2Flows(await renewalV2(real), real);
-    const before = process.env.STRATEGY_EARN_V2_AUDIENCE;
+    const risk = v2f.filter(f => f[2] === 'risk'), settle = v2f.filter(f => f[2] === 'settle');
+    assert.ok(risk.length > 0 && settle.length > 0);
+    const before = { audience: process.env.STRATEGY_EARN_V2_AUDIENCE, deployment: process.env.STRATEGY_EARN_V2_DEPLOYMENT };
+    const file = JSON.parse(readFileSync(new URL('../deploy/strategy-earn-v2.json', import.meta.url), 'utf8')).deployments[0];
+    /** Outside the audience / paused: consent, open, move are refused without a chain read; repay, close, top-up, cash-out, consent off, rewards go through. */
+    const closedToNew = async (why: string) => {
+      for (const [name, calls] of risk) { const h = harness(kind, { wired: true }); await assert.rejects(h.sponsor(calls), code('PAYMASTER_CALL_FORBIDDEN', 403), `${kind}: ${name} ${why}`); assert.deepEqual([h.asked, h.seen.reservations], [[], 0], name); }
+      for (const [name, calls] of settle) { const h = harness(kind, { wired: true }); await assert.doesNotReject(h.sponsor(calls), `${kind}: ${name} ${why}`); assert.deepEqual([h.asked, h.seen.reservations], [[], 1], name); }
+    };
     try {
-      // Nobody is listed in the shipped deployment's canary list: every v2 UserOp is refused, v1 is untouched.
-      delete process.env.STRATEGY_EARN_V2_AUDIENCE;
+      // This owner is not in the shipped deployment's canary list, and the shipped audience is the canary list.
+      delete process.env.STRATEGY_EARN_V2_AUDIENCE; delete process.env.STRATEGY_EARN_V2_DEPLOYMENT;
       assert.ok(!real.canaryOwners.includes(owner.toLowerCase() as Address));
-      for (const [name, calls] of v2f) await assert.rejects(harness(kind, { wired: true }).sponsor(calls), code('PAYMASTER_CALL_FORBIDDEN', 403), `${kind}: ${name} outside the audience`);
+      assert.deepEqual([real.audience, real.newOpensPaused], ['canary', false]);
+      await closedToNew('outside the audience');
       for (const [name, calls] of await flows(kind)) await assert.doesNotReject(harness(kind, { wired: true }).sponsor(calls), `${kind} outside the audience: ${name}`);
-      // In the audience: the same UserOps against the configured executor / registry are sponsored.
+      // v1 risk from an owner outside the audience is checked against v2 too: the account may still be on v2 from when its
+      // owner was in the audience (one account never uses both). Nothing on v2 -> sponsored as ever.
+      const v1Open = openCalls(markets[0]!, account, 10n ** 18n, 10n ** 18n, 2n * 10n ** 18n, BigInt(NOW + 600)).map(asCall);
+      const clean = harness(kind, { wired: true });
+      await assert.doesNotReject(clean.sponsor(v1Open));
+      assert.deepEqual(clean.asked, ['v2']);
+      await assert.rejects(harness(kind, { wired: true, inUse: 'v2' }).sponsor(v1Open), code('PAYMASTER_CALL_FORBIDDEN', 403));
+      // In the audience (the variable): the same UserOps against the configured executor / registry are sponsored.
       process.env.STRATEGY_EARN_V2_AUDIENCE = owner;
       for (const [name, calls] of v2f) { const h = harness(kind, { wired: true }); await assert.doesNotReject(h.sponsor(calls), `${kind}: ${name} in the audience`); assert.equal(h.seen.reservations, 1); }
       // A v2 call aimed at any other "executor" is not a v2 call: refused.
       await assert.rejects(harness(kind, { wired: true }).sponsor([asCall(v2Calls.release(V2, account, VA, BigInt(NOW + 600)))]), code('PAYMASTER_CALL_FORBIDDEN', 403));
-    } finally { if (before === undefined) delete process.env.STRATEGY_EARN_V2_AUDIENCE; else process.env.STRATEGY_EARN_V2_AUDIENCE = before; }
+      // The same from the configuration file alone: `"audience": "all"` opens v2 to every owner, no variable needed.
+      delete process.env.STRATEGY_EARN_V2_AUDIENCE;
+      process.env.STRATEGY_EARN_V2_DEPLOYMENT = JSON.stringify({ ...file, audience: 'all' });
+      for (const [name, calls] of v2f) await assert.doesNotReject(harness(kind, { wired: true }).sponsor(calls), `${kind}: ${name} with audience all in the file`);
+      // `newOpensPaused`: nobody starts anything new — not an owner on the canary list, not with the audience at `all`, not
+      // with the variable naming this owner — and everything that settles is sponsored all the same.
+      process.env.STRATEGY_EARN_V2_DEPLOYMENT = JSON.stringify({ ...file, audience: 'all', canaryOwners: [owner], newOpensPaused: true });
+      await closedToNew('while new opens are paused');
+      process.env.STRATEGY_EARN_V2_AUDIENCE = owner;
+      await closedToNew('while new opens are paused (variable set)');
+    } finally {
+      if (before.audience === undefined) delete process.env.STRATEGY_EARN_V2_AUDIENCE; else process.env.STRATEGY_EARN_V2_AUDIENCE = before.audience;
+      if (before.deployment === undefined) delete process.env.STRATEGY_EARN_V2_DEPLOYMENT; else process.env.STRATEGY_EARN_V2_DEPLOYMENT = before.deployment;
+    }
   });
 }
 
@@ -620,4 +650,37 @@ test('routing v2 session scope, golden: keys installed before the cash swapper r
   assert.deepEqual([v1.policySnapshot.call.permissions.length, v2Only.policySnapshot.call.permissions.length, withSwapper.policySnapshot.call.permissions.length], [7, 13, 15]);
   assert.deepEqual(withSwapper.policySnapshot.call.permissions.slice(13).map(p => [p.target, p.selector, p.rules.length, p.valueLimit]),
     [toFunctionSelector('topUp(address,uint256,uint256,uint256)'), toFunctionSelector('cashOut(address,uint256,uint256,uint256)')].map(selector => [V2.swapper, selector, 0, '0']));
+});
+
+test('renewal: the routing v2 scope is installed for an owner in the audience, and for any account that already has something on v2 whoever its owner is — never dropped from a key the scheduler needs to close a position', async () => {
+  const { buildRenewalKey } = await import('../src/renewal.js');
+  const { v2InstalledScope } = await import('../src/strategy-earn-v2.js');
+  const real = strategyEarnV2(97, {})!, asked: Address[] = [];
+  const key = async (who: Address, has: boolean | 'unreadable') => {
+    const k = await buildRenewalKey({ accountAddress: account, owner: who, strategyId: 1, existingKeyRefs: [], material: { masterSeed: ('0x' + '11'.repeat(32)) as Hex }, executorAddress: executor, publicClient: offline as never,
+      validUntil: NOW + 30 * 86400, hasV2State: async a => { asked.push(a); if (has === 'unreadable') throw new Error('public node down'); return has; } });
+    return v2InstalledScope(k.policySnapshot, account);
+  };
+  const before = { audience: process.env.STRATEGY_EARN_V2_AUDIENCE, deployment: process.env.STRATEGY_EARN_V2_DEPLOYMENT };
+  try {
+    delete process.env.STRATEGY_EARN_V2_AUDIENCE; delete process.env.STRATEGY_EARN_V2_DEPLOYMENT;
+    const scope = { executor: real.executor, account, swapper: real.swapper };
+    // Outside the audience, nothing on v2: the key is exactly what it was before v2 existed (one question about the account).
+    assert.deepEqual([await key(owner, false), asked], [null, [account]]);
+    // Outside the audience, the account is on v2 (or used it): the new key keeps the v2 scope, so the scheduler can still repay and close.
+    assert.deepEqual(await key(owner, true), scope);
+    // That cannot be read: the renewal fails rather than hand out a key that may be missing the scope.
+    await assert.rejects(key(owner, 'unreadable'), /public node down/);
+    // In the audience: always, without asking — also while new opens are paused (the pause must not strip the scope from renewals).
+    asked.length = 0;
+    process.env.STRATEGY_EARN_V2_AUDIENCE = owner;
+    assert.deepEqual([await key(owner, false), asked], [scope, []]);
+    delete process.env.STRATEGY_EARN_V2_AUDIENCE;
+    const file = JSON.parse(readFileSync(new URL('../deploy/strategy-earn-v2.json', import.meta.url), 'utf8')).deployments[0];
+    process.env.STRATEGY_EARN_V2_DEPLOYMENT = JSON.stringify({ ...file, canaryOwners: [owner], newOpensPaused: true });
+    assert.deepEqual([await key(owner, false), asked], [scope, []]);
+  } finally {
+    if (before.audience === undefined) delete process.env.STRATEGY_EARN_V2_AUDIENCE; else process.env.STRATEGY_EARN_V2_AUDIENCE = before.audience;
+    if (before.deployment === undefined) delete process.env.STRATEGY_EARN_V2_DEPLOYMENT; else process.env.STRATEGY_EARN_V2_DEPLOYMENT = before.deployment;
+  }
 });

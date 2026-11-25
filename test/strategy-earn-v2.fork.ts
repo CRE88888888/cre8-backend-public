@@ -12,9 +12,9 @@ import { bscTestnet } from 'viem/chains';
 import { createStrategyEarnV2Api } from '../src/strategy-earn-v2-api.js';
 import { createV2Reader, v2Multicall } from '../src/strategy-earn-v2-chain.js';
 import { fromTestnetMocks, reportCalldata, reportDue, runRateReport } from '../src/strategy-earn-v2-rates.js';
-import { runV2KeeperRound, v2AutoRound, v2UnwindForSale } from '../src/strategy-earn-v2-scheduler.js';
+import { runV2KeeperRound, v2AutoRound, v2QuietRound, v2UnwindForSale } from '../src/strategy-earn-v2-scheduler.js';
 import type { V2Ledger, V2Tx } from '../src/strategy-earn-v2-scheduler.js';
-import { strategyEarnV2, v2Calls, v2RescueCall, v2SessionPermissions, v2SwapEvents, V2_CASH_OUT_MIN_RAW, V2_EXECUTOR_ABI, V2_REGISTRY_ABI, V2_SWAPPER_ABI, V2_SWAPPER_SELECTORS } from '../src/strategy-earn-v2.js';
+import { strategyEarnV2, v2Calls, v2ConsentOffCall, v2RescueCall, v2SessionPermissions, v2SwapEvents, V2_CASH_OUT_ALONE_MIN_RAW, V2_CASH_OUT_MIN_RAW, V2_EXECUTOR_ABI, V2_REGISTRY_ABI, V2_SWAPPER_ABI, V2_SWAPPER_SELECTORS } from '../src/strategy-earn-v2.js';
 import type { Call, RouteEvent } from '../src/strategy-earn-v2.js';
 import { readStrategyEarnV2Collateral } from '../src/snapshot.js';
 import type { RewardEvent } from '../src/strategy-rewards.js';
@@ -318,6 +318,75 @@ test('routing v2 fork: consent -> open on the best route -> hold -> vault left o
   assert.equal(await api.active(A), false);
   assert.equal(await v2AutoRound(await step()), null, 'consent withdrawn: the scheduler leaves the account alone');
   console.log(JSON.stringify({ routes: s.routes.map(e => `${e.kind}:${e.reason ?? 'owner'}`), rewards: s.rewards.map(e => `${e.kind}:${e.amountRaw}`), lines: lines.length }));
+});
+
+/**
+ * 2026-11-26: the audience only decides who may START on v2. An account that opened while its owner was in it is, once the
+ * owner is outside it (or new opens are paused), still read, watched by the keeper and closed by the session key — it only
+ * adds nothing. And loan token left in an account whose strategy is off (no route, no vault) is sold by the quiet round.
+ */
+test('routing v2 fork, owner outside the audience: an existing position is held (no top-up), watched by the keeper, closed when consent is withdrawn; leftover USD1 after that is sold for USDT, a 0.005 leftover is not', { skip }, async () => {
+  const s = setup(), { v2, reader, client } = s;
+  const send = s.sender(A), lines: string[] = [], sent: Call[][] = [];
+  const tracked = async (calls: Call[]) => { sent.push(calls); return send(calls); };
+  const api = createStrategyEarnV2Api({ v2, reader, now: s.clock, recordRoutes: s.ledger.routes, recordRewards: s.ledger.rewards });
+  const step = async () => ({ v2, reader, account: A, portfolioId: 1, now: await s.now(), dryRun: false, send: tracked, ledger: s.ledger, log: (l: string) => lines.push(l), held: [NVDAB] });
+  let v1 = 0;
+  const round = async (mayOpen: boolean) => v2QuietRound({ v2, reader, account: A, mayOpen, log: l => lines.push(l), v1: async () => { v1++; return null; },
+    v2Round: async (touched, may) => v2AutoRound({ ...await step(), touched, mayOpen: may }) });
+  const balance = (token: Address) => client.readContract({ address: token, abi: ERC20, functionName: 'balanceOf', args: [A] });
+
+  // In the audience: consent, then the quiet round opens on the best route.
+  const auto = await api.auto(A, OWNER, { budgetRaw: 0n, weights: [{ asset: NVDAB, weightBps: 10_000 }], keyReady: true });
+  if (auto.status !== 'ready') throw new Error('consent not ready');
+  await send(auto.calls);
+  assert.match(await round(true) ?? '', /已執行：NVDAB open\(best_route\)/);
+  let read = await reader.account(A, [NVDAB]);
+  const pos = read.routes[0]!;
+  assert.ok(read.routes.length === 1 && pos.routeDebtRaw > 0n);
+
+  mark('outside the audience: hold');
+  // The owner is no longer in the audience. The position is read and left as it is: nothing sent, the v1 step is not run for it.
+  sent.length = 0; v1 = 0;
+  assert.equal(await round(false), null);
+  assert.deepEqual([sent.length, v1], [0, 0]);
+  // The keeper never asks who owns an account: the position is found by the bulk read and checked against its health line.
+  const kept = await runV2KeeperRound({ dryRun: true, log: l => lines.push(l) }, { v2, reader, send: null, ledger: s.ledger,
+    accounts: async () => [{ account: A, portfolioId: 1, owner: '0x00000000000000000000000000000000000000d1' as Address }, { account: KEEPER, portfolioId: 2, owner: KEEPER }] });
+  assert.deepEqual([kept.accounts, kept.managed, kept.checked, kept.failed], [2, 1, 1, 0]);
+
+  mark('consent withdrawn: the session key closes');
+  // The owner withdraws consent without closing (the recipient stays on the policy): the next quiet round closes the position
+  // with the session key — `executeReduce` and the cash swapper only, nothing the paymaster calls 'risk'.
+  await send([v2ConsentOffCall(v2, OWNER)]);
+  const closed = await round(false);
+  assert.match(closed ?? '', /已執行：NVDAB close\(disabled\)/);
+  assert.ok(sent.flat().every(c => ['executeReduce', 'topUp', 'cashOut', 'executeRelease'].includes(names([c], v2)[0] as string)), names(sent.flat(), v2).join(','));
+  read = await reader.account(A, [NVDAB]);
+  assert.deepEqual([read.routes.filter(r => r.collateralRaw > 0n || r.routeDebtRaw > 0n).length, read.consent], [0, false]);
+  assert.deepEqual(await readStrategyEarnV2Collateral(client as never, A, await client.getBlockNumber()), []);
+
+  mark('leftover loan token');
+  // Strategy off, no route: whatever a later round still has to release is released first; then the account is "nothing on
+  // v2 now" — exactly the state the scheduler used to send to the v1 step alone.
+  for (let i = 0; i < 3; i++) await round(false);
+  const touched = await reader.touched(A);
+  assert.deepEqual([touched.enabled, touched.routes.length, touched.vaults.length, touched.rewardRecipient], [false, 0, 0, OWNER]);
+  const usd1 = v2.loanTokens.USD1!, usdt = v2.loanTokens.USDT!;
+  const minter = await s.from(OWNER);
+  const have = await balance(usd1);
+  // 0.005 USD1 on top of the dust that is there: under 0.01, not worth a UserOp of its own.
+  await mined(client, await minter.writeContract({ address: usd1, abi: ERC20, functionName: 'mint', args: [A, V2_CASH_OUT_ALONE_MIN_RAW / 2n - have], gas: 500_000n }));
+  sent.length = 0; v1 = 0;
+  assert.equal(await round(false), null);
+  assert.deepEqual([sent.length, v1], [0, 1]);
+  // 3 USD1: sold for USDT by the same quiet round, next to the v1 step.
+  await mined(client, await minter.writeContract({ address: usd1, abi: ERC20, functionName: 'mint', args: [A, 3n * 10n ** 18n], gas: 500_000n }));
+  const usdtBefore = await balance(usdt);
+  assert.match(await round(false) ?? '', /USD1 已換回 USDT tx=0x/);
+  assert.deepEqual([names(sent.flat(), v2), v1], [['cashOut'], 2]);
+  assert.ok(await balance(usd1) < V2_CASH_OUT_MIN_RAW && await balance(usdt) - usdtBefore > 2_990_000_000_000_000_000n, 'USD1 became USDT');
+  console.log(JSON.stringify({ closed, usd1Left: String(await balance(usd1)), usdtGained: String(await balance(usdt) - usdtBefore) }));
 });
 
 test('routing v2 fork: an urgent move to another borrow market is one executeMigrate; executeRescue hands the box\'s receipts back only once the token is no longer owed', { skip }, async () => {

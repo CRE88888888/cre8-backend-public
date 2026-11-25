@@ -40,7 +40,7 @@ const owned = (async () => ({ id: 3, userId: account, strategyId: 1, version: 1,
 
 test('buy-time consent: Venus markets share one ceiling = the account\'s whole planned Venus debt; Lista stays per market', async () => {
   const f = { weights: [{ asset: nvda.collateral, weightBps: 4000 }, { asset: tsla.collateral, weightBps: 4000 }, { asset: wbnb.collateral, weightBps: 2000 }] };
-  const r = await createStrategyEarn({ chainId: 97, chain: () => chain(f), owned, query: (async () => ({ rows: [] })) as never }).auto(3, account, { budgetRaw: String(1000n * E18) });
+  const r = await createStrategyEarn({ v2: null, chainId: 97, chain: () => chain(f), owned, query: (async () => ({ rows: [] })) as never }).auto(3, account, { budgetRaw: String(1000n * E18) });
   assert.ok('calls' in r && r.calls);
   const ceilings = Object.fromEntries(r.calls.filter(c => c.to === S.registry).map(c => decode(c.data).args).map(a => [a[0] as string, a[1] as bigint]));
   // NVDAB 400 + TSLAB 400 USD at 30% x 98% = 235.2 USDT of Venus debt -> x 110% = 258.72 on BOTH; WBNB 200 -> 64.68.
@@ -50,7 +50,7 @@ test('buy-time consent: Venus markets share one ceiling = the account\'s whole p
   // Existing Venus debt (shared) is counted once, not per market.
   const withDebt = { ...f, statuses: { [nvda.marketId]: base({ debt: 9n * E18, health: { collateralValue: 100n * E18, liquidationValue: 0n, debtValue: 9n * E18, healthFactor: 0n } }),
     [tsla.marketId]: base({ debt: 9n * E18, health: { collateralValue: 100n * E18, liquidationValue: 0n, debtValue: 9n * E18, healthFactor: 0n } }) } };
-  const again = await createStrategyEarn({ chainId: 97, chain: () => chain(withDebt), owned, query: (async () => ({ rows: [] })) as never }).auto(3, account, { budgetRaw: String(1000n * E18) });
+  const again = await createStrategyEarn({ v2: null, chainId: 97, chain: () => chain(withDebt), owned, query: (async () => ({ rows: [] })) as never }).auto(3, account, { budgetRaw: String(1000n * E18) });
   assert.ok('calls' in again && again.calls);
   const c2 = again.calls.filter(c => c.to === S.registry).map(c => decode(c.data).args[1] as bigint);
   // (100 + 800) x 30% x 98% = 264.6 total -> 255.6 new + 9 existing = 264.6 x 110% = 291.06 for each Venus market.
@@ -200,7 +200,7 @@ test('POST close { assets }: Venus planned together, Lista per market, consent w
     statuses: { [nvda.marketId]: base({ ...shared, vaultAssets: 460n * E16 }), [tsla.marketId]: base({ ...shared, vaultAssets: 460n * E16 }),
       [wbnb.marketId]: base({ debt: 2n * E18, vaultAssets: 2n * E18 }) },
     collateral: { [nvda.marketId]: 20n * E18, [tsla.marketId]: 15n * E18, [wbnb.marketId]: 3n * E18 } };
-  const earn = createStrategyEarn({ chainId: 97, chain: () => chain(f), owned, now: () => new Date('2026-11-23T16:00:00Z') });
+  const earn = createStrategyEarn({ v2: null, chainId: 97, chain: () => chain(f), owned, now: () => new Date('2026-11-23T16:00:00Z') });
   const r = await earn.close(3, account, { assets: ['NVDAB', 'TSLAB', 'WBNB'] });
   assert.equal(r.status, 'ready'); assert.ok('calls' in r && r.calls);
   const shape = r.calls.map(c => { const d = decode(c.data); return [d.functionName, d.args[d.functionName === 'setBorrowPolicy' ? 0 : 1]]; });
@@ -223,7 +223,7 @@ test('ledger: XAUt is stored as XAUT (db 0063 asset check) and shown as XAUt aga
     amountRaw: 1n, collateralRaw: 1n, ltvBeforeBps: null, ltvAfterBps: null, txHash: ('0x' + '05'.repeat(32)) as Hex, logIndex: 1, blockNumber: 1n }]);
   assert.equal(seen[0]?.[4], 'XAUT');
   assert.match(String(seen[0]?.[4]), /^[A-Z0-9]{1,16}$/);
-  const r = await createStrategyEarn({ chainId: 97, chain: () => chain({}), owned, query: (async () => ({ rows: [{ kind: 'close', asset: 'XAUT', amount_raw: '1', collateral_raw: '1',
+  const r = await createStrategyEarn({ v2: null, chainId: 97, chain: () => chain({}), owned, query: (async () => ({ rows: [{ kind: 'close', asset: 'XAUT', amount_raw: '1', collateral_raw: '1',
     ltv_before_bps: null, ltv_after_bps: null, tx_hash: '0x' + '05'.repeat(32), block_number: '1', created_at: new Date('2026-11-24T00:00:00Z') }] })) as never }).activity(20, account);
   assert.equal(r.activity[0]?.asset, 'XAUt');
 });

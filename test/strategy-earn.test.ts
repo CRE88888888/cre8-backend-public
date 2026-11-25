@@ -150,7 +150,7 @@ test('#199 service: market quotes with gate reasons; outages are "temporarily un
   const f: Fake = { statuses: Object.fromEntries(markets.map(m => [m.marketId, status()])), ids: [], held: 0n, collateral: 0n, prices: {}, rewards: { vault: 0n, collateral: 0n } };
   f.statuses[qqq.marketId] = status({ gate: 3 });
   f.statuses[markets[4]?.marketId ?? ''] = null;
-  const earn = createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio() as never, marketsCacheMs: 0, mainnetRates: noMainnet });
+  const earn = createStrategyEarn({ v2: null, chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio() as never, marketsCacheMs: 0, mainnetRates: noMainnet });
   const list = await earn.markets();
   // Where the money goes: Venus -> collateral vToken + vUSDT; Lista -> Moolah + market id; every market -> the strategy vault.
   const nv = list.markets[0], qq = list.markets[3];
@@ -174,7 +174,7 @@ test('#199 portfolio view: net value = collateral + vault - debt per position, k
     health: { collateralValue: 1000n * E18, liquidationValue: 600n * E18, debtValue: 250n * E18, healthFactor: 24n * E17() } }),
     [qqq.marketId]: status({ gate: 4 }) }, ids: [nvda.marketId], held: 10n * E18, collateral: 10n * E18,
     prices: { [nvda.collateral]: 100n * 10n ** 8n }, rewards: { vault: 3n * E16, collateral: 1n * E16 } };
-  const earn = createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio() as never, now: () => new Date('2026-11-23T00:00:00Z') });
+  const earn = createStrategyEarn({ v2: null, chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio() as never, now: () => new Date('2026-11-23T00:00:00Z') });
   const view = await earn.portfolio(3, account);
   assert.equal(view.status, 'ok');
   assert.equal('autoOpen' in view && view.autoOpen, false, 'a position is on: not "waiting for the fill"');
@@ -194,16 +194,16 @@ test('#199 portfolio view: net value = collateral + vault - debt per position, k
   assert.equal((await earn.close(3, account, { asset: 'NVDAB' })).calls?.length, 3);
   // Close skips what is not there: collateral posted but nothing borrowed -> no repay (NothingToRepay would revert the UserOp).
   const unborrowed = { ...f, statuses: { ...f.statuses, [nvda.marketId]: status() } };
-  assert.deepEqual((await createStrategyEarn({ chainId: 97, chain: () => fakeChain(unborrowed), owned: ownedPortfolio() as never }).close(3, account, { asset: 'NVDAB' }))
+  assert.deepEqual((await createStrategyEarn({ v2: null, chainId: 97, chain: () => fakeChain(unborrowed), owned: ownedPortfolio() as never }).close(3, account, { asset: 'NVDAB' }))
     .calls?.map(c => decodeFunctionData({ abi: STRATEGY_EARN_ABI, data: c.data }).functionName), ['executeWithdrawCollateral', 'setBorrowPolicy']);
   // My mix: the mix's own account; an exiting / exited / deleting mix takes no new collateral or borrowing.
   const mixRow = (busy: boolean) => (async () => ({ rows: [{ busy }] })) as never;
-  const mixEarn = (busy: boolean) => createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio({ personalMix: true }) as never, query: mixRow(busy) });
+  const mixEarn = (busy: boolean) => createStrategyEarn({ v2: null, chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio({ personalMix: true }) as never, query: mixRow(busy) });
   assert.equal((await mixEarn(false).open(3, account, { asset: 'NVDAB', collateralRaw: String(2n * E18) })).status, 'ready');
   await assert.rejects(mixEarn(true).open(3, account, { asset: 'NVDAB', collateralRaw: '1' }), isError(409, 'MIX_EXITING'));
   assert.equal((await mixEarn(true).close(3, account, { asset: 'NVDAB' })).calls?.length, 3, 'a mix that is exiting can always settle');
   await assert.rejects(createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio({ chainId: 56 }) as never }).close(3, account, { asset: 'NVDAB' }), isError(403, 'FORBIDDEN'));
-  await assert.rejects(createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: (async () => { throw new ForbiddenError('not yours'); }) as never }).portfolio(3, account),
+  await assert.rejects(createStrategyEarn({ v2: null, chainId: 97, chain: () => fakeChain(f), owned: (async () => { throw new ForbiddenError('not yours'); }) as never }).portfolio(3, account),
     (e: unknown) => e instanceof AppError && e.status === 403);
   function E17() { return 10n ** 17n; }
 });
@@ -257,7 +257,7 @@ test('#207 keeper drill accounts: merged with DB accounts and de-duplicated; emp
 test('#199 HTTP: public markets with short cache; portfolio routes need login; 405 on wrong methods', async () => {
   const f: Fake = { statuses: Object.fromEntries(markets.map(m => [m.marketId, status()])), ids: [], held: 0n, collateral: 0n, prices: {}, rewards: { vault: 0n, collateral: 0n } };
   const server = createServer({
-    strategyEarn: createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio() as never, mainnetRates: noMainnet }),
+    strategyEarn: createStrategyEarn({ v2: null, chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio() as never, mainnetRates: noMainnet }),
     rateLimiter: new RequestRateLimiter(loadRateLimitConfig({}), new MemoryRateLimitStore()),
     auth: { authenticate: async (h) => { if (h !== 'Bearer ok') throw new UnauthorizedError('login required'); return account; },
       issueNonce: () => { throw new Error('unused'); }, login: async () => { throw new Error('unused'); }, logout: async () => {} },
@@ -280,7 +280,7 @@ test('#199 HTTP: public markets with short cache; portfolio routes need login; 4
 
 test('portfolio view: autoOpen = consented (policy enabled) but nothing posted yet, so the app keeps the switch on until the fill', async () => {
   const base: Fake = { statuses: Object.fromEntries(markets.map(m => [m.marketId, status()])), ids: [], held: 0n, collateral: 0n, prices: {}, rewards: { vault: 0n, collateral: 0n } };
-  const view = (f: Fake) => createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio() as never, query: (async () => ({ rows: [] })) as never }).portfolio(3, account);
+  const view = (f: Fake) => createStrategyEarn({ v2: null, chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio() as never, query: (async () => ({ rows: [] })) as never }).portfolio(3, account);
   const none = await view(base);
   assert.equal('autoOpen' in none && none.autoOpen, false);
   const armed = await view({ ...base, policies: { [nvda.marketId]: { maxDebt: 100n * E18, enabled: true } } });
@@ -294,7 +294,7 @@ test('GET /strategy-earn/markets is cached server-side: one chain read per windo
   const f: Fake = { statuses: Object.fromEntries(markets.map(m => [m.marketId, status()])), ids: [], held: 0n, collateral: 0n, prices: {}, rewards: { vault: 0n, collateral: 0n } };
   let reads = 0, t = 1_000_000;
   const chain = fakeChain(f), counted: StrategyEarnChain = { ...chain, status: async (...a) => { reads++; return chain.status(...a); } };
-  const earn = createStrategyEarn({ chainId: 97, chain: () => counted, owned: ownedPortfolio() as never, now: () => new Date(t), mainnetRates: noMainnet });
+  const earn = createStrategyEarn({ v2: null, chainId: 97, chain: () => counted, owned: ownedPortfolio() as never, now: () => new Date(t), mainnetRates: noMainnet });
   const first = await earn.markets();
   assert.equal(reads, markets.length);
   assert.deepEqual(await earn.markets(), first); assert.equal(reads, markets.length);
@@ -441,4 +441,73 @@ test('after "sell all" (v1 API): autoOpen reads off until Earn extra is chosen a
   const broken = createStrategyEarn({ chainId: 97, chain: () => fakeChain(same), owned: ownedPortfolio() as never, v2: null,
     query: (async (sql: string) => { if (sql.includes('insert into user_notifications')) throw new Error('db down'); return { rows: sql.includes('jsonb_agg') ? [{ requests: [] }] : [] }; }) as never });
   assert.equal((await broken.auto(3, account, { budgetRaw: String(1000n * E18) })).status, 'unavailable');
+});
+
+test('2026-11-26 the audience only decides who may START on v2: an account that is on v2 is answered by v2 whoever its owner is (view, close, receipt, rescue), and nothing may be added to it; a pause on new opens sends new starts to v1', async () => {
+  const { strategyEarnV2 } = await import('../src/strategy-earn-v2.js');
+  const v2 = strategyEarnV2(97, {})!;
+  const asked: string[] = [];
+  let active = false, broken = false;
+  const api = {
+    active: async (_a: Address, outside?: boolean) => { asked.push(`active:${outside === true}`); if (broken) throw new Error('public node down'); return active; },
+    portfolio: async (id: number, a: Address) => { asked.push('portfolio'); return { portfolioId: id, account: a, status: 'ok' as const, version: 2 as const, positions: [] }; },
+    auto: async () => { asked.push('auto'); return { status: 'ready' as const, version: 2 as const, calls: [], batches: [] }; },
+    open: async () => { asked.push('open'); return { status: 'ready' as const, version: 2 as const, calls: [] }; },
+    close: async (_a: Address, input: { symbols: readonly string[]; exit?: boolean }) => { asked.push(`close:${input.symbols.join(',')}:${input.exit === true}`); return { status: 'ready' as const, version: 2 as const, calls: [], batches: [] }; },
+    confirm: async () => { asked.push('confirm'); return { routes: 1, rewards: 0, kinds: ['close'] }; },
+    rescue: async () => { asked.push('rescue'); return { status: 'ready' as const, version: 2 as const, ownerOnly: true as const, calls: [], batches: [] }; },
+    reconsent: async () => [],
+  };
+  const f: Fake = { statuses: Object.fromEntries(markets.map(m => [m.marketId, status()])), ids: [], held: 10n * E18, collateral: 0n, prices: { [nvda.collateral]: 150n * 10n ** 8n }, rewards: { vault: 0n, collateral: 0n },
+    weights: [{ asset: nvda.collateral, weightBps: 10_000 }] };
+  const chain = { ...fakeChain(f), receipt: async () => ({ ...tx0, success: true }) };
+  const store = { view: async () => ({ tokens: [], signature: { needed: true, signedAt: null } }), saveSignature: async () => {} };
+  const earn = (who: { audience: boolean; mayOpen: boolean }) => createStrategyEarn({ chainId: 97, chain: () => chain, owned: ownedPortfolio() as never, v2, v2Open: () => who, v2Api: () => api as never,
+    mainnetRates: noMainnet, ledger: noLedger, rewards: store as never, rewardsEnabled: false, query: (async () => ({ rows: [] })) as never });
+  const vaultId = ('0x' + 'b1'.repeat(32)) as Hex;
+  const statuses = async (e: ReturnType<typeof earn>) => [(await e.portfolio(3, account) as { version?: number }).version ?? 1, (await e.auto(3, account, { budgetRaw: '1000' }) as { version?: number; status: string }).version ?? (await e.auto(3, account, { budgetRaw: '1000' })).status,
+    (await e.open(3, account, { asset: 'NVDAB', collateralRaw: String(E18) }) as { version?: number; status: string }).version ?? (await e.open(3, account, { asset: 'NVDAB', collateralRaw: String(E18) })).status];
+
+  // ---- An owner outside the audience (it was narrowed, or never included this owner).
+  const outside = earn({ audience: false, mayOpen: false });
+  // Nothing on v2: v1 answers everything exactly as before; the one question asked is "anything on v2?", from the ten-minute memory.
+  assert.deepEqual(await statuses(outside), [1, 'ready', 'ready']);
+  assert.equal((await outside.close(3, account, { asset: 'NVDAB' })).status, 'ready');
+  assert.deepEqual(await outside.confirm(3, account, { txHash: tx0.hash }), { status: 'confirmed', recorded: 0, kinds: [] });
+  await assert.rejects(outside.rescue(3, account, { vaultId }), isError(404, 'STRATEGY_EARN_NOT_CONFIGURED'));
+  await assert.rejects(outside.rewards(3, account), isError(404, 'STRATEGY_REWARDS_NOT_CONFIGURED'));
+  assert.deepEqual([...new Set(asked)], ['active:true']);
+  // The account IS on v2 (a position from when its owner was in the audience): v2 answers — the position is shown, it can
+  // be closed (also as a full exit), its receipt is recorded, its rewards are listed, the rescue is there...
+  asked.length = 0; active = true;
+  assert.equal((await outside.portfolio(3, account) as { version?: number }).version, 2);
+  assert.equal((await outside.close(3, account, { assets: ['NVDAB', 'QQQB'] }) as { version?: number }).version, 2);
+  await outside.close(3, account, { assets: ['NVDAB'], exit: true });
+  assert.deepEqual(await outside.confirm(3, account, { txHash: tx0.hash }), { status: 'confirmed', recorded: 1, kinds: ['close'] });
+  assert.equal((await outside.rescue(3, account, { vaultId })).status, 'ready');
+  assert.deepEqual((await outside.rewards(3, account)).signature, { needed: false, signedAt: null });
+  // ...and nothing can be added to it: not on v2 (its owner may not start there) and not on v1 (one account never uses both).
+  assert.deepEqual([await outside.auto(3, account, { budgetRaw: '1000' }), await outside.open(3, account, { asset: 'NVDAB', collateralRaw: String(E18) })],
+    [{ status: 'unavailable', reason: 'data_unavailable', message: 'Temporarily unavailable.' }, { status: 'unavailable', reason: 'data_unavailable', message: 'Temporarily unavailable.', asset: 'NVDAB' }]);
+  assert.deepEqual(asked.filter(x => !x.startsWith('active')), ['portfolio', 'close:NVDAB,QQQB:false', 'close:NVDAB:true', 'confirm', 'rescue']);
+  // Which generation holds the money is never guessed: v2 unreadable -> "temporarily unavailable", never v1's answer.
+  broken = true;
+  assert.deepEqual([(await outside.portfolio(3, account)).status, (await outside.close(3, account, { asset: 'NVDAB' })).status, (await outside.confirm(3, account, { txHash: tx0.hash })).status,
+    (await outside.rescue(3, account, { vaultId })).status], ['unavailable', 'unavailable', 'unavailable', 'unavailable']);
+  await assert.rejects(outside.rewards(3, account), isError(404, 'STRATEGY_REWARDS_NOT_CONFIGURED')); // as it always answered this owner
+  broken = false;
+
+  // ---- An owner in the audience while new opens are paused (`newOpensPaused`).
+  const paused = earn({ audience: true, mayOpen: false });
+  // On v2 already: looked after and closable, nothing added.
+  asked.length = 0;
+  assert.deepEqual([(await paused.portfolio(3, account) as { version?: number }).version, (await paused.close(3, account, { asset: 'NVDAB' }) as { version?: number }).version,
+    (await paused.auto(3, account, { budgetRaw: '1000' })).status, (await paused.open(3, account, { asset: 'NVDAB', collateralRaw: String(E18) })).status], [2, 2, 'unavailable', 'unavailable']);
+  assert.ok(asked.includes('active:false') && !asked.includes('active:true') && !asked.includes('auto') && !asked.includes('open')); // in the audience: read fresh, never from memory
+  // A clean account: a new start goes to v1 — the roll-back — and v2 builds nothing.
+  active = false; asked.length = 0;
+  assert.deepEqual(await statuses(paused), [1, 'ready', 'ready']);
+  assert.deepEqual([...new Set(asked)], ['active:false']);
+  // Pause lifted: the same clean account starts on v2 again.
+  assert.deepEqual(await statuses(earn({ audience: true, mayOpen: true })), [1, 2, 2]);
 });

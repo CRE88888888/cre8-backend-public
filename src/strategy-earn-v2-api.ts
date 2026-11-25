@@ -2,7 +2,7 @@ import { decodeFunctionData, maxUint256 } from 'viem';
 import type { Address, Hex, Log } from 'viem';
 import { planAccount } from './strategy-earn-routing.js';
 import type { Costs, Decision, Holding } from './strategy-earn-routing.js';
-import { marketIdOf } from './strategy-earn-v2-chain.js';
+import { marketIdOf, v2Active } from './strategy-earn-v2-chain.js';
 import type { V2AccountRead, V2Market, V2Reader } from './strategy-earn-v2-chain.js';
 import { BORROW_BUFFER_BPS, V2_CASH_OUT_ALONE_MIN_RAW, V2_CASH_OUT_MIN_RAW, V2_SWAPPER_ABI, V2_SWAPPER_SELECTORS, maxDebtFor, planExecution, strategyV2Addresses, swapEventLine, v2ConsentCalls, v2ExitBatches, v2ExitPlan, v2MissingSwapperApprovals, v2ReconsentCalls, v2RescueCall, v2CashEvents, v2RouteEvents } from './strategy-earn-v2.js';
 import type { Call, ExitInput, ExitRoute, RouteEvent, StrategyEarnV2, SwapEvent, SwapQuote } from './strategy-earn-v2.js';
@@ -94,8 +94,9 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
   };
 
   return {
-    /** Has this account anything on v2 (consent, a position, money in the box)? */
-    async active(account: Address): Promise<boolean> { const t = await reader.touched(account); return t.enabled || t.routes.length > 0 || t.vaults.length > 0; },
+    /** Has this account anything on v2 (consent, a position, money in the box)? `outside`: its owner may not start on v2,
+     * so "nothing" may come from the reader's ten-minute memory (`touchedOutside`) instead of a request. */
+    async active(account: Address, outside = false): Promise<boolean> { return v2Active(outside ? await reader.touchedOutside(account) : await reader.touched(account)); },
 
     /** Positions of this portfolio account. Net value of the strategy money = vault holdings + idle in the box − debt. */
     async portfolio(id: number, account: Address) {

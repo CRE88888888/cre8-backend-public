@@ -9,7 +9,7 @@ import type { Decision, PricedRoute, RouteKey } from '../src/strategy-earn-routi
 import { boxRewardSignature, maxDebtFor, planExecution, routeIdOf, routeIds, strategyEarnV2, V2_EVENTS_ABI, V2_EXECUTOR_ABI, V2_INTERFACE_VERSION, V2_REGISTRY_ABI, V2_SESSION_SELECTORS,
   routeMessage, runV2Account, v2Authorized, v2RouteEvents, v2Calls, v2ConsentCalls, v2ExitCalls, v2RateReport, v2SessionPermissions, vaultIdOf } from '../src/strategy-earn-v2.js';
 import type { Call, PositionState, PreSellPosition, StrategyEarnV2, V2Holding } from '../src/strategy-earn-v2.js';
-import { isRootSignedNonce, strandedSmallPosition, strategyEarnV2For, v2Audience, v2Batches, v2ExitBatches, v2InternalAddresses, v2KeeperCall, v2PreSellPlan, v2ReconsentCalls, v2RescueCall, v2SponsoredCall, V2_LENS_ABI } from '../src/strategy-earn-v2.js';
+import { isRootSignedNonce, strandedSmallPosition, strategyEarnV2For, v2Audience, v2MayOpen, v2NewOpensPaused, withoutNewRisk, v2Batches, v2ExitBatches, v2InternalAddresses, v2KeeperCall, v2PreSellPlan, v2ReconsentCalls, v2RescueCall, v2SponsoredCall, V2_LENS_ABI } from '../src/strategy-earn-v2.js';
 import { V2_CASH_OUT_MIN_RAW, V2_SWAPPER_ABI, V2_SWAPPER_SELECTORS, cashOutMinUsdt, partialRepayment, planTopUp, settleBudget, settleRepayment, swapEventLine, swapperErrorOf, topUpMaxUsdtIn, v2ExitPlan, v2InstalledScope,
   v2MissingSwapperApprovals, v2SwapEvents, v2SwapperApprovalCalls } from '../src/strategy-earn-v2.js';
 import type { SwapQuote } from '../src/strategy-earn-v2.js';
@@ -51,7 +51,7 @@ test('every v2 address comes from deployment configuration: the manifest file, o
   assert.equal(strategyEarnV2(97, { STRATEGY_EARN_V2_DEPLOYMENT: moved })!.executor, A(0xabc));
   assert.ok(v2InternalAddresses(97, { STRATEGY_EARN_V2_DEPLOYMENT: moved }).has(A(0xabc)) && !v2InternalAddresses(97, { STRATEGY_EARN_V2_DEPLOYMENT: moved }).has(testnet.executor));
   assert.equal(strategyEarnV2(97, { STRATEGY_EARN_V2_DEPLOYMENT: MANIFEST }), null); // the variable wins, and its deployment is for another chain
-  assert.deepEqual(strategyEarnV2(56, { STRATEGY_EARN_V2_DEPLOYMENT: MANIFEST }), { ...V2, swapper: null, swapperPools: [] });
+  assert.deepEqual(strategyEarnV2(56, { STRATEGY_EARN_V2_DEPLOYMENT: MANIFEST }), { ...V2, swapper: null, swapperPools: [], audience: 'canary', newOpensPaused: false });
   // The cash swapper (spec §17) is part of the deployment: its address is what the session scope and the paymaster follow,
   // its pools are booked as internal to the portfolio. A deployment without one has none (nothing is swapped).
   assert.deepEqual([testnet.swapper, testnet.swapperPools], [file.cashSwapper.address.toLowerCase(), Object.values(file.cashSwapper.pools as Record<string, string>).map(x => x.toLowerCase())]);
@@ -87,6 +87,69 @@ test('audience: v2 is for the deployment\'s canary owners only until STRATEGY_EA
   assert.equal(v2Audience(97, canary, { ...listed, STRATEGY_EARN_V2_AUDIENCE: 'off' }), false);
   assert.deepEqual([v2Audience(97, other, { STRATEGY_EARN_V2_AUDIENCE: `${A(1)}, ${other}` }), v2Audience(97, canary, { ...listed, STRATEGY_EARN_V2_AUDIENCE: A(1) })], [true, false]);
   assert.throws(() => v2Audience(97, other, { STRATEGY_EARN_V2_AUDIENCE: 'everyone' }));
+});
+
+test('audience in the configuration file: `"audience": "all"` is the same as STRATEGY_EARN_V2_AUDIENCE=all (the variable still wins); `newOpensPaused` stops every new start whoever is listed, and leaves the deployment in place', () => {
+  const file = JSON.parse(readFileSync(new URL('../deploy/strategy-earn-v2.json', import.meta.url), 'utf8')).deployments[0];
+  // What ships today: the canary list, nothing paused. Opening v2 to everyone is a later decision ("audience": "all").
+  assert.deepEqual([file.audience, file.newOpensPaused], ['canary', false]);
+  assert.deepEqual([strategyEarnV2(97, {})!.audience, strategyEarnV2(97, {})!.newOpensPaused], ['canary', false]);
+  const env = (o: object, extra: Record<string, string> = {}) => ({ STRATEGY_EARN_V2_DEPLOYMENT: JSON.stringify({ ...file, ...o }), ...extra });
+  const other = A(0x1234), canary = (file.canaryOwners[0] as string).toLowerCase();
+  // `canary` (also when the field is absent, as in a manifest written before it existed): the listed owners only.
+  const { audience: _a, newOpensPaused: _p, ...old } = file;
+  for (const e of [env({}), env({ audience: 'canary' }), { STRATEGY_EARN_V2_DEPLOYMENT: JSON.stringify(old) }]) assert.deepEqual([v2Audience(97, canary, e), v2Audience(97, other, e), v2MayOpen(97, canary, e), v2NewOpensPaused(97, e)], [true, false, true, false]);
+  // `all` in the file = every owner, exactly what the variable `all` answers — with no variable set on either service.
+  const all = env({ audience: 'all' }), byVariable = env({}, { STRATEGY_EARN_V2_AUDIENCE: 'all' });
+  for (const who of [other, canary, owner]) {
+    assert.deepEqual([v2Audience(97, who, all), v2MayOpen(97, who, all), strategyEarnV2For(97, who, all)?.executor], [true, true, file.executor.toLowerCase()]);
+    assert.deepEqual([v2Audience(97, who, all), v2MayOpen(97, who, all), strategyEarnV2For(97, who, all)?.executor], [v2Audience(97, who, byVariable), v2MayOpen(97, who, byVariable), strategyEarnV2For(97, who, byVariable)?.executor]);
+  }
+  for (const who of [null, undefined, 'not an address']) assert.equal(v2Audience(97, who, all), false);
+  assert.equal(strategyEarnV2For(56, other, all), null); // the deployment is for chain 97
+  // The variable, when set, still wins over the file (as before).
+  assert.equal(v2Audience(97, other, { ...all, STRATEGY_EARN_V2_AUDIENCE: 'off' }), false);
+  assert.deepEqual([v2Audience(97, other, { ...all, STRATEGY_EARN_V2_AUDIENCE: A(1) }), v2Audience(97, A(1), { ...env({}), STRATEGY_EARN_V2_AUDIENCE: A(1) }), v2Audience(97, canary, { ...env({}), STRATEGY_EARN_V2_AUDIENCE: A(1) })], [false, true, false]);
+  // A value that is not one of the two, or a pause that is not a boolean, is a broken manifest: it throws, it is never read as "all" or "not paused".
+  for (const bad of [{ audience: 'everyone' }, { audience: true }, { audience: 'ALL' }, { newOpensPaused: 'yes' }, { newOpensPaused: 1 }, { newOpensPaused: null }]) assert.throws(() => strategyEarnV2(97, env(bad)), /audience|newOpensPaused/);
+  // newOpensPaused: nobody may start — not a listed owner, not with the audience at `all`, not with the variable — while the
+  // deployment (what the scheduler, the keeper and the paymaster's settle rules work from) and the audience itself stay as they are.
+  for (const e of [env({ newOpensPaused: true }), env({ newOpensPaused: true, audience: 'all' }), env({ newOpensPaused: true }, { STRATEGY_EARN_V2_AUDIENCE: 'all' }), env({ newOpensPaused: true }, { STRATEGY_EARN_V2_AUDIENCE: canary })]) {
+    assert.equal(v2NewOpensPaused(97, e), true);
+    for (const who of [canary, other]) assert.deepEqual([v2MayOpen(97, who, e), strategyEarnV2For(97, who, e)], [false, null]);
+    assert.deepEqual([strategyEarnV2(97, e)!.executor, v2Audience(97, canary, e)], [file.executor.toLowerCase(), true]);
+  }
+  assert.equal(v2NewOpensPaused(56, env({ newOpensPaused: true })), false); // no deployment on that chain
+});
+
+test('an owner who may not start on v2: of the engine\'s decisions only what adds no risk is kept — open, top-up and a better route become hold; a route that has to be left is closed, not moved; hold, reduce and close stay', async () => {
+  const held = [{ symbol: 'QQQB', position: { route: listaUsdc, debtUsd: 2940, since: 0 } }, { symbol: 'NVDAB', position: null }];
+  const d = (action: Decision['action'], reason: Decision['reason'], urgent: boolean, from: RouteKey | null, to: RouteKey | null, symbol = 'QQQB'): Decision => ({ ...decision(symbol, action, reason, from, to, 3500), urgent });
+  const out = (x: Decision) => { const [y] = withoutNewRisk([x], held); return [y!.action, y!.reason, y!.to?.marketId ?? null, y!.targetDebtUsd]; };
+  assert.deepEqual(out(d('open', 'best_route', false, null, listaUsdc, 'NVDAB')), ['hold', 'best_route', null, 0]);          // a new position: not opened
+  assert.deepEqual(out(d('open', 'top_up', false, listaUsdc, listaUsdc)), ['hold', 'top_up', LISTA_MARKET, 2940]);            // more borrowing on an open one: stays at its debt
+  assert.deepEqual(out(d('migrate', 'better_route', false, listaUsdc, listaUsdt)), ['hold', 'better_route', null, 2940]);     // pays more elsewhere: stays
+  assert.deepEqual(out(d('migrate', 'negative_carry', true, listaUsdc, listaUsdt)), ['close', 'negative_carry', null, 0]);    // has to be left now: closed
+  assert.deepEqual(out(d('migrate', 'vault_liquidity', true, listaUsdc, listaUsdc)), ['close', 'vault_liquidity', null, 0]);  // a vault-only move is a move too
+  for (const same of [d('hold', 'best_route', false, listaUsdc, listaUsdc), d('reduce', 'safety_line', true, listaUsdc, listaUsdc), d('close', 'disabled', true, listaUsdc, null)]) assert.deepEqual(withoutNewRisk([same], held), [same]);
+  assert.match(withoutNewRisk([d('open', 'top_up', false, listaUsdc, listaUsdc)], held)[0]!.rationale, /^QQQB hold: nothing new starts on routing v2 for this account .* — was: QQQB open$/);
+  // Through the round: a filled buy is not opened, a healthy position is neither topped up nor moved; the turned-off strategy
+  // still closes and the safety line still goes to the keeper.
+  const options = [option('lista', 'USDC', LISTA_MARKET, 100), option('lista', 'USDT', LISTA_MARKET_2, 390)];
+  const pos = (o: object = {}, h: object = {}) => holding({ freeCollateralRaw: 0n, routeDebtRaw: 2940n * E, position: { route: listaUsdc, debtUsd: 2940, since: NOW_MS - 86_400_000, ...o }, ...h });
+  const fresh = await round({ options, holdings: [holding()], noNewRisk: true });
+  assert.deepEqual([fresh.sent, fresh.result.sent, fresh.lines.length], [[], 0, 1]);
+  assert.match(fresh.lines[0]!, /QQQB hold: nothing new starts on routing v2 for this account/);
+  assert.deepEqual((await round({ options, holdings: [holding()] })).sent, [['executeOpen']]);
+  const off = await round({ options, holdings: [pos()], enabled: false, noNewRisk: true });
+  assert.deepEqual([off.sent, off.recorded], [[['executeReduce']], ['close:disabled']]);
+  const risky = await round({ options, holdings: [pos({ ltvBps: 5000, deleverageLtvBps: 5000 })], noNewRisk: true });
+  assert.deepEqual([risky.sent, risky.kept, risky.recorded], [[], ['executeDeleverage'], ['reduce:safety_line']]);
+  // Its own vault stopped paying (a negative carry on USDC, USDT still pays): moved in the audience, closed outside it.
+  const sour = [option('lista', 'USDC', LISTA_MARKET, 900), option('lista', 'USDT', LISTA_MARKET_2, 100)];
+  assert.deepEqual((await round({ options: sour, holdings: [pos()] })).recorded.map(x => x.split(':')[0]), ['migrate']);
+  const left = await round({ options: sour, holdings: [pos()], noNewRisk: true });
+  assert.deepEqual([left.sent, left.recorded], [[['executeReduce']], ['close:negative_carry']]);
 });
 
 test('every function and event this module encodes exists in the contracts interface file, and the session scope is the spec list', () => {
@@ -258,10 +321,10 @@ const option = (venue: 'venus' | 'lista', loan: 'USDT' | 'USDC', marketId: strin
 const snapshot = (options: Record<string, RouteOption[]>): RoutingSnapshot => ({ at: NOW_MS, sourceAt: { venus: NOW_MS, lista: NOW_MS, aave: NOW_MS }, options,
   vaults: [vaultRow('USDC', 'lista', A(0xb1), 500), vaultRow('USDT', 'venus', A(0xb2), 400)] });
 const holding = (o: Partial<V2Holding> = {}): V2Holding => ({ symbol: 'QQQB', collateral: QQQ, freeCollateralRaw: 10n * E, collateralUsd: 10_000, position: null, ...o });
-function round(o: { options: RouteOption[]; holdings: V2Holding[]; dryRun?: boolean; fail?: (calls: Call[]) => boolean; keeper?: boolean; enabled?: boolean; ceiling?: bigint }) {
+function round(o: { options: RouteOption[]; holdings: V2Holding[]; dryRun?: boolean; fail?: (calls: Call[]) => boolean; keeper?: boolean; enabled?: boolean; ceiling?: bigint; noNewRisk?: boolean }) {
   const sent: string[][] = [], kept: string[] = [], lines: string[] = [], recorded: string[] = [];
   let n = 0;
-  const run = runV2Account({ v2: V2, portfolioId: 7, account, snapshot: snapshot({ QQQB: o.options }), costs: { gasUsdPerTx: 0.05 }, now: NOW_MS, deadline: DEADLINE, dryRun: o.dryRun ?? false, log: l => lines.push(l),
+  const run = runV2Account({ v2: V2, portfolioId: 7, account, snapshot: snapshot({ QQQB: o.options }), costs: { gasUsdPerTx: 0.05 }, now: NOW_MS, deadline: DEADLINE, dryRun: o.dryRun ?? false, log: l => lines.push(l), ...(o.noNewRisk ? { noNewRisk: true } : {}),
     state: { enabled: o.enabled ?? true, policyMaxDebtUsdRaw: o.ceiling ?? 100_000n * E, principalUsdRaw: 0n, holdings: o.holdings },
     send: async calls => { if (o.fail?.(calls)) throw new Error('VaultShortfall(5, 3)\n  at ...'); sent.push(calls.map(c => decode(c.data).functionName)); return { hash: ('0x' + String(++n).padStart(64, '0')) as Hex }; },
     ...(o.keeper === false ? {} : { keeper: async (c: Call) => { kept.push(decode(c.data).functionName); return { hash: ('0x' + 'ee'.repeat(32)) as Hex }; } }),

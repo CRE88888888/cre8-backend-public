@@ -1,5 +1,5 @@
 {
-  "note": "Strategy Earn routing v2 deployments (cre8-contracts deployments/*.json `borrowV2`). The backend reads every v2 address from here (or from STRATEGY_EARN_V2_DEPLOYMENT, which wins): executor, registry, lens, the cash swapper, the session-key scope and the paymaster allowlist all follow this file. After a redeploy, replace the entry (a new executor needs a new cash swapper); routes and vaults are discovered from the registry, they are not listed here. `cashSwapper`: AtpBorrowCashSwapper (docs/borrow-routing-v2 §17) bound to this executor — `address` is what the backend uses, `pools` are informational (`poolOf` on chain decides), `ledgerFromBlock` is the block from which the cash ledger books the swapper's top-ups and cash-outs (earlier ones spent USDT no bucket claimed and are never booked; without it the recovery scan is off). `canaryOwners`: owners whose accounts use v2 while STRATEGY_EARN_V2_AUDIENCE is unset; empty = v2 is off for everyone (v1 for all). 2026-11-25: the draft6 set (executor 0xeddd…600F) replaced the draft5 one (executor 0x494C…6bB5, registry paused, no principal left on any of its 66 routes); the only canary owner is the e2e harness wallet.",
+  "note": "Strategy Earn routing v2 deployments (cre8-contracts deployments/*.json `borrowV2`). The backend reads every v2 address from here (or from STRATEGY_EARN_V2_DEPLOYMENT, which wins): executor, registry, lens, the cash swapper, the session-key scope and the paymaster allowlist all follow this file. After a redeploy, replace the entry (a new executor needs a new cash swapper); routes and vaults are discovered from the registry, they are not listed here. `cashSwapper`: AtpBorrowCashSwapper (docs/borrow-routing-v2 §17) bound to this executor — `address` is what the backend uses, `pools` are informational (`poolOf` on chain decides), `ledgerFromBlock` is the block from which the cash ledger books the swapper's top-ups and cash-outs (earlier ones spent USDT no bucket claimed and are never booked; without it the recovery scan is off). Who may START on v2 (a new consent, a new position, another asset) — and only that: an account that already has anything on v2 is looked after and can close whatever these say. `audience`: `canary` = only `canaryOwners` (empty list = nobody starts on v2), `all` = every owner; the api and the scheduler read this same file, so they always agree (STRATEGY_EARN_V2_AUDIENCE, when set, still wins — and then has to be set on both services). `newOpensPaused`: true = nobody starts anything new on v2, canary owners included, while existing positions are still managed and can be closed — the switch to pull when something goes wrong. 2026-11-25: the draft6 set (executor 0xeddd…600F) replaced the draft5 one (executor 0x494C…6bB5, registry paused, no principal left on any of its 66 routes); the only canary owner is the e2e harness wallet.",
   "deployments": [
     {
       "chainId": 97,
@@ -39,6 +39,8 @@
           "U": "0x8A84c8EBe1c97Ab212600714DdCb53760F25Ba32"
         }
       },
+      "audience": "canary",
+      "newOpensPaused": false,
       "canaryOwners": [
         "0xD3Ab39B62E221bF9E8bA19fE19b2638767d3D6D9"
       ]

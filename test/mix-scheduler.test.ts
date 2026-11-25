@@ -18,7 +18,7 @@ function fixture() {
       execution: { kind: 'per_asset' }, version: 1, schedule_state: 'active' }] };
     return { rows: [] };
   };
-  const deps: SchedulerDeps = { query, chainId: 97, executor: T.contracts.executor,
+  const deps: SchedulerDeps = { query, chainId: 97, strategyEarnV2: null, executor: T.contracts.executor,
     withTransaction: work => work({ query }), withMixPortfolioLock: async (_id, work) => { held = true; try { return await work(); } finally { held = false; } },
     withDexLock: async (_chain, work) => work(), dexGate: async () => null, readGlobalPaused: async () => false, log: () => {},
     yieldRound: async () => ({ checked: 0, blocked: 0 }), planPortfolio: async () => plan,

@@ -2,7 +2,8 @@ import { encodeFunctionData, isAddressEqual, maxUint256, parseAbi, zeroAddress }
 import type { Address, Hex, Log } from 'viem';
 import type { Costs } from './strategy-earn-routing.js';
 import { V2_DEFAULT_COSTS } from './strategy-earn-v2-api.js';
-import type { V2AccountRead, V2Market, V2Reader } from './strategy-earn-v2-chain.js';
+import { v2Active, v2HasState } from './strategy-earn-v2-chain.js';
+import type { V2AccountRead, V2Market, V2Reader, V2Touched } from './strategy-earn-v2-chain.js';
 import { V2_CASH_OUT_ALONE_MIN_RAW, boxRewardSignature, runV2Account, strandedSmallPosition, swapEventLine, swapperErrorOf, v2Batches, v2CashEvents, v2Calls, v2KeeperCall, v2PreSellPlan, v2RouteEvents } from './strategy-earn-v2.js';
 import type { Call, PreSellPosition, RouteEvent, Step, StrategyEarnV2, SwapEvent } from './strategy-earn-v2.js';
 import { leftoverCashOuts } from './strategy-earn-v2-swap.js';
@@ -64,7 +65,13 @@ export type V2StepArgs = { v2: StrategyEarnV2; reader: V2Reader; account: Addres
   /** A top-up or a cash-out was refused with PegExceeded (the alert: src/alerts.ts noteStrategyPegExceeded). */
   onPegExceeded?: (detail: string) => void;
   /** The owner's consent requests since the account's last finished "sell all" (src/strategy-earn-after-sell-all.ts). Absent: every consent counts. */
-  consentSince?: () => Promise<ConsentSinceSellAll> };
+  consentSince?: () => Promise<ConsentSinceSellAll>;
+  /** What the caller already read of this account (`reader.touched`), so the step does not ask again. */
+  touched?: V2Touched;
+  /** false: this owner may not start anything new on v2 (outside the audience, or new opens paused — `v2MayOpen`). The
+   * account is still looked after in full — read, repaid, topped up for a repayment, closed, unwound before a sale, its
+   * leftovers sold — but nothing is opened, borrowed on top or moved (strategy-earn-v2 `withoutNewRisk`). Default true. */
+  mayOpen?: boolean };
 
 const shortError = (error: unknown) => String((error as Error)?.message ?? error).split('\n')[0]!.slice(0, 160);
 type SwapWatch = { peg: boolean; window: boolean; other: boolean };
@@ -181,7 +188,7 @@ async function recordRoutes(args: Pick<V2StepArgs, 'v2' | 'ledger' | 'portfolioI
  */
 export async function v2AutoRound(args: V2StepArgs): Promise<string | null> {
   const { v2, reader, account } = args;
-  const touched = await reader.touched(account);
+  const touched = args.touched ?? await reader.touched(account);
   const seen: SwapWatch = { peg: false, window: false, other: false };
   const send = args.send === null ? null : watchSwaps(args, args.send, seen);
   if (!touched.enabled && touched.routes.length === 0) {
@@ -204,7 +211,7 @@ export async function v2AutoRound(args: V2StepArgs): Promise<string | null> {
   }
   const sent: Hex[] = [];
   const result = await runV2Account({ v2, portfolioId: args.portfolioId, account, snapshot: m.snapshot, state: read.state, costs: args.costs ?? V2_DEFAULT_COSTS, now: args.now.getTime(), deadline: deadlineOf(args.now),
-    limits: m.limits, dryRun: args.dryRun || send === null, log: args.log,
+    limits: m.limits, dryRun: args.dryRun || send === null, log: args.log, ...(args.mayOpen === false ? { noNewRisk: true } : {}),
     send: async calls => { const tx = await send!(calls); sent.push(tx.hash); return tx; },
     // executeDeleverage is the keeper round's (runV2KeeperRound): no keeper here, the step is logged as left for it.
     record: async (step: Step, tx) => recordRoutes(args, m, tx as V2Tx, step.reason) });
@@ -233,6 +240,38 @@ export async function v2AutoRound(args: V2StepArgs): Promise<string | null> {
 }
 
 /**
+ * The quiet round of one account on a chain with a v2 deployment: which generation acts. One account is on v1 or on v2,
+ * never both (the API and the paymaster refuse the second consent).
+ * - Anything on v2 now (consent, a route, money in the box) -> the v2 round only, WHOEVER the owner is: the audience only
+ *   decides who may start on v2 (`mayOpen`), never who is looked after. Without `mayOpen` the round adds no risk.
+ * - Nothing on v2 now -> the v1 step, exactly as for everyone else. An account that used v2 before (the reward recipient
+ *   outlives a turn-off) also has the loan token a close left behind sold for USDT: the v2 round does only that for it.
+ *   (Until 2026-11-26 such an account went to the v1 step alone and its USDC / USD1 / U stayed where it was.)
+ * - An owner who may not start on v2 and whose account is known to have nothing there costs no read (`touchedOutside`);
+ *   when that read fails, only the v1 step runs this round (an owner in the audience still fails the round, as before:
+ *   his account may have just started on v2).
+ */
+export async function v2QuietRound(input: { v2: StrategyEarnV2; reader: Pick<V2Reader, 'touched' | 'touchedOutside'>; account: Address; mayOpen: boolean; log: (line: string) => void;
+  v1: () => Promise<string | null>; v2Round: (touched: V2Touched, mayOpen: boolean) => Promise<string | null> }): Promise<string | null> {
+  let touched: V2Touched;
+  if (input.mayOpen) touched = await input.reader.touched(input.account);
+  else {
+    // An owner who may not start on v2: when the public nodes do not answer, the v1 step still runs — it never depended on
+    // them, and for an account that is on v2 it is a no-op (no v1 consent: one account never uses both). What the account
+    // has on v2 is looked at again next round; the keeper round and the pre-sale step read for themselves.
+    try { touched = await input.reader.touchedOutside(input.account); }
+    catch (error) { input.log(`[strategy-routing] ${input.account}: routing v2 could not be read this round (${shortError(error)}); only the v1 step runs`); return input.v1(); }
+  }
+  if (v2Active(touched)) return input.v2Round(touched, input.mayOpen);
+  const first = await input.v1();
+  if (!input.v2.swapper || !v2HasState(touched)) return first;
+  let second: string | null = null;
+  // Never a reason to fail the round: the next one looks again.
+  try { second = await input.v2Round(touched, input.mayOpen); } catch (error) { input.log(`[strategy-routing] ${input.account}: leftover loan token not looked at this round: ${shortError(error)}`); }
+  return first !== null && second !== null ? `${first}；${second}` : first ?? second;
+}
+
+/**
  * Before a sale: posted shares count as holdings, so the plan may sell more than the account holds free. For each such
  * asset repay its route and take the shares back (v2PreSellPlan); the trade waits for the next round. `exit` (the sale is a
  * full exit: sell all / delete / take profit): reward tokens in the box and the account go to the owner's wallet with the
@@ -240,7 +279,7 @@ export async function v2AutoRound(args: V2StepArgs): Promise<string | null> {
  */
 export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tokenIn: string; amountIn: bigint }[]; exit?: boolean }): Promise<string | V2UnwindWait | null> {
   const { v2, reader, account } = args;
-  const touched = await reader.touched(account);
+  const touched = args.touched ?? await reader.touched(account);
   // A full exit also looks at an account with no route and no vault left: its strategy was simply turned off earlier (the
   // reward recipient outlives that), and reward tokens may still sit in the account or the box.
   const mayHoldRewards = args.exit === true && (touched.vaults.length > 0 || !isAddressEqual(touched.rewardRecipient, zeroAddress));
@@ -353,7 +392,7 @@ async function recordRewards(args: Pick<V2StepArgs, 'v2' | 'ledger' | 'portfolio
 // ---------------------------------------------------------------------------
 /** Sends a plain transaction with the keeper key and waits for its receipt. */
 export type V2KeeperSend = (to: Address, data: Hex) => Promise<V2Tx>;
-export type V2KeeperResult = { accounts: number; checked: number; deleveraged: number; collected: number; stranded: number; failed: number; writer: boolean };
+export type V2KeeperResult = { accounts: number; /** Accounts with a position or money in the box on v2 (the ones read in full). */ managed: number; checked: number; deleveraged: number; collected: number; stranded: number; failed: number; writer: boolean };
 /** Reward tokens under this (raw, 18 decimals) wait in the box: not worth a transaction. Chain 97's simulated tokens are
  * worth nothing and its positions are small, so the bar is ten times lower there (a test position shows a reward within the hour). */
 export const V2_MIN_COLLECT_RAW = 10n ** 16n;
@@ -361,7 +400,8 @@ export const v2MinCollectRaw = (chainId: number) => chainId === 97 ? V2_MIN_COLL
 const MOCK_VAULT_ABI = parseAbi(['function claimReward(address account) returns (uint256)', 'function claimReward(bytes32 id, address account) returns (uint256)']);
 
 /**
- * For every account of an owner in the v2 audience that has a v2 position: send `executeDeleverage` when the venue says the
+ * For every account that has a v2 position, whoever its owner is (the audience only decides who may START on v2; a position
+ * of an owner no longer in it is watched just the same): send `executeDeleverage` when the venue says the
  * health line is reached (from the vault of that loan token the box holds most in), report small positions nobody else can
  * repay (the session-key round closes them), and move reward tokens from the strategy box into the account. On chain 97
  * the simulated earn vaults pay their incentive on a call anyone may make (`claimReward(box)`); it is triggered here
@@ -371,15 +411,25 @@ const MOCK_VAULT_ABI = parseAbi(['function claimReward(address account) returns 
 export async function runV2KeeperRound(args: { dryRun: boolean; log: (line: string) => void }, deps: { v2: StrategyEarnV2; reader: V2Reader; send: V2KeeperSend | null; ledger: V2Ledger;
   accounts: () => Promise<{ account: Address; portfolioId: number; owner: Address }[]> }): Promise<V2KeeperResult> {
   const { v2, reader } = deps, minCollect = v2MinCollectRaw(v2.chainId);
-  const result: V2KeeperResult = { accounts: 0, checked: 0, deleveraged: 0, collected: 0, stranded: 0, failed: 0, writer: deps.send !== null };
+  const result: V2KeeperResult = { accounts: 0, managed: 0, checked: 0, deleveraged: 0, collected: 0, stranded: 0, failed: 0, writer: deps.send !== null };
   const accounts = await deps.accounts();
   if (accounts.length === 0) return result;
-  const m = await reader.market();
-  for (const a of accounts) {
-    result.accounts++;
+  // Which accounts have anything on v2: one bulk read (40 accounts per request) instead of one request per account.
+  const all = await reader.touchedMany(accounts.map(a => a.account));
+  result.accounts = accounts.length;
+  const held: typeof accounts = [];
+  for (const [i, a] of accounts.entries()) {
     try {
-      const touched = await reader.touched(a.account);
-      if (touched.routes.length === 0 && touched.vaults.length === 0) continue;
+      // An account the bulk read could not answer for is asked by itself; if that fails too it counts as failed, not as empty.
+      const touched = all[i] ?? await reader.touched(a.account);
+      if (touched.routes.length > 0 || touched.vaults.length > 0) held.push(a);
+    } catch (error) { result.failed++; args.log(`[strategy-routing] ${a.account} 讀值或送出失敗，下輪再試：${shortError(error)}`); }
+  }
+  result.managed = held.length;
+  if (held.length === 0) return result;
+  const m = await reader.market();
+  for (const a of held) {
+    try {
       let read = await reader.account(a.account);
       const ctx = { v2, ledger: deps.ledger, portfolioId: a.portfolioId, account: a.account, log: args.log };
       for (const r of read.routes) {

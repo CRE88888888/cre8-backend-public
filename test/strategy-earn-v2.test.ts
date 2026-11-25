@@ -137,7 +137,7 @@ const borrowSnap = describePolicies({ executorAddress: T.contracts.executor, val
 test('#204 POST auto: eligible assets from the enrolled version; ceiling = (new money share + held) x target, +10%; renewal flag', async () => {
   const f: Fake = { weights: [{ asset: nvda.collateral, weightBps: 6000 }, { asset: qqq.collateral, weightBps: 2000 }, { asset: T.assets.TQQQB.token.toLowerCase() as Address, weightBps: 2000 }],
     statuses: { [qqq.marketId]: status({ gate: 4 }) }, balances: { [nvda.collateral]: 2n * E18 }, prices: { [nvda.collateral]: 100n * 10n ** 8n } };
-  const earn = createStrategyEarn({ chainId: 97, chain: () => chainOf(f), owned: owned(), query: keyRows(borrowSnap) });
+  const earn = createStrategyEarn({ v2: null, chainId: 97, chain: () => chainOf(f), owned: owned(), query: keyRows(borrowSnap) });
   const r = await earn.auto(3, account, { budgetRaw: String(1000n * E18) });
   assert.equal(r.status, 'ready'); assert.ok('calls' in r && r.calls && 'authorization' in r);
   assert.equal(r.authorization, 'ready');
@@ -147,26 +147,26 @@ test('#204 POST auto: eligible assets from the enrolled version; ceiling = (new 
   assert.deepEqual(r.calls.map(c => decode(c.data).functionName), ['updateDelegate', 'setBorrowPolicy', 'approve', 'approve', 'approve']);
   // Older key without the #204 calls -> the frontend must also sign the renewal.
   for (const rows of [keyRows(describePolicies({ executorAddress: T.contracts.executor, validUntil: 2_000_000_000, chainId: 97, yieldAccount: account })), keyRows(null)]) {
-    const again = await createStrategyEarn({ chainId: 97, chain: () => chainOf(f), owned: owned(), query: rows }).auto(3, account, { budgetRaw: '5' });
+    const again = await createStrategyEarn({ v2: null, chainId: 97, chain: () => chainOf(f), owned: owned(), query: rows }).auto(3, account, { budgetRaw: '5' });
     assert.ok('authorization' in again); assert.equal(again.authorization, 'renewal_required');
   }
   // No strategy-earn asset in the portfolio, or every market closed.
-  assert.deepEqual(await createStrategyEarn({ chainId: 97, chain: () => chainOf({ weights: [] }), owned: owned(), query: keyRows(null) }).auto(3, account, { budgetRaw: '1' }),
+  assert.deepEqual(await createStrategyEarn({ v2: null, chainId: 97, chain: () => chainOf({ weights: [] }), owned: owned(), query: keyRows(null) }).auto(3, account, { budgetRaw: '1' }),
     { status: 'unavailable', reason: 'no_eligible_asset', message: 'Temporarily unavailable.', assets: [] });
-  const closed = await createStrategyEarn({ chainId: 97, chain: () => chainOf({ ...f, statuses: { [nvda.marketId]: status({ gate: 1 }), [qqq.marketId]: status({ gate: 2 }) } }), owned: owned(), query: keyRows(null) })
+  const closed = await createStrategyEarn({ v2: null, chainId: 97, chain: () => chainOf({ ...f, statuses: { [nvda.marketId]: status({ gate: 1 }), [qqq.marketId]: status({ gate: 2 }) } }), owned: owned(), query: keyRows(null) })
     .auto(3, account, { budgetRaw: '1' });
   assert.equal(closed.status, 'unavailable');
   // Nothing to borrow against (no new money and nothing held) is not a consent.
-  const empty = await createStrategyEarn({ chainId: 97, chain: () => chainOf({ ...f, balances: {} }), owned: owned(), query: keyRows(null) }).auto(3, account, { budgetRaw: '0' });
+  const empty = await createStrategyEarn({ v2: null, chainId: 97, chain: () => chainOf({ ...f, balances: {} }), owned: owned(), query: keyRows(null) }).auto(3, account, { budgetRaw: '0' });
   assert.equal(empty.status, 'unavailable');
   for (const bad of [{ budgetRaw: '-1' }, { budgetRaw: '1.5' }, { budgetRaw: 1 }, {}, { budgetRaw: '1', x: 1 }]) {
     await assert.rejects(earn.auto(3, account, bad), (e: unknown) => e instanceof AppError && e.status === 400);
   }
   // My mix: same consent on the mix's own account (one account per mix); refused while the mix is exiting or deleting.
   const mixQuery = (busy: boolean) => (async (sql: string) => sql.includes('from mixes') ? { rows: [{ busy }] } : { rows: [] }) as never;
-  const mix = await createStrategyEarn({ chainId: 97, chain: () => chainOf(f), owned: owned({ personalMix: true }), query: mixQuery(false) }).auto(3, account, { budgetRaw: String(1000n * E18) });
+  const mix = await createStrategyEarn({ v2: null, chainId: 97, chain: () => chainOf(f), owned: owned({ personalMix: true }), query: mixQuery(false) }).auto(3, account, { budgetRaw: String(1000n * E18) });
   assert.ok('calls' in mix && mix.calls); assert.deepEqual(mix.calls, r.calls);
-  await assert.rejects(createStrategyEarn({ chainId: 97, chain: () => chainOf(f), owned: owned({ personalMix: true }), query: mixQuery(true) }).auto(3, account, { budgetRaw: '1' }),
+  await assert.rejects(createStrategyEarn({ v2: null, chainId: 97, chain: () => chainOf(f), owned: owned({ personalMix: true }), query: mixQuery(true) }).auto(3, account, { budgetRaw: '1' }),
     (e: unknown) => e instanceof AppError && e.code === 'MIX_EXITING');
 });
 
@@ -238,13 +238,13 @@ test('#204 GET activity: newest first from the ledger, owner only', async () => 
   const query = (async (sql: string, params: unknown[]) => { sqls.push(sql); assert.deepEqual(params, [3, account]); return { rows: [
     { kind: 'deleverage', asset: 'NVDAB', amount_raw: String(6750n * E16), collateral_raw: '0', ltv_before_bps: 4174, ltv_after_bps: 3000, tx_hash: '0x' + '01'.repeat(32), block_number: '9', created_at: new Date('2026-11-23T01:00:00Z') },
   ] }; }) as never;
-  const r = await createStrategyEarn({ chainId: 97, chain: () => chainOf({}), owned: owned(), query }).activity(3, account);
+  const r = await createStrategyEarn({ v2: null, chainId: 97, chain: () => chainOf({}), owned: owned(), query }).activity(3, account);
   assert.deepEqual(r.activity, [{ kind: 'deleverage', asset: 'NVDAB', amountRaw: String(6750n * E16), collateralRaw: '0', ltvBeforeBps: 4174, ltvAfterBps: 3000,
     txHash: '0x' + '01'.repeat(32), blockNumber: '9', createdAt: '2026-11-23T01:00:00.000Z',
     message: 'NVDAB fell, so we automatically used 67.50 USDT from Earn to stay safe (safety level 41.7% → 30.0%).' }]);
   assert.match(sqls[0] ?? '', /from strategy_earn_events where chain_id = 97 and \(portfolio_id = \$1 or portfolio_id in \(select h\.portfolio_id from mix_portfolio_history h/);
   assert.match(sqls[0] ?? '', /m\.account = \$2\)\) order by block_number desc, log_index desc limit 50/);
-  await assert.rejects(createStrategyEarn({ chainId: 97, chain: () => chainOf({}), owned: (async () => { throw new AppError(403, 'FORBIDDEN', 'no'); }) as never, query }).activity(3, account),
+  await assert.rejects(createStrategyEarn({ v2: null, chainId: 97, chain: () => chainOf({}), owned: (async () => { throw new AppError(403, 'FORBIDDEN', 'no'); }) as never, query }).activity(3, account),
     (e: unknown) => e instanceof AppError && e.status === 403);
 });
 
@@ -552,7 +552,7 @@ test('#67 session keys: a renewal installs every market; a key renewed before #6
   assert.deepEqual(borrowKeyMarkets(a.policySnapshot, account), LEGACY);
   // POST auto with a pre-#67 key: renewal required.
   const f: Fake = { weights: [{ asset: bySymbol('AAPLB').collateral, weightBps: 10_000 }], prices: { [bySymbol('AAPLB').collateral]: 300n * 10n ** 8n } };
-  const r = await createStrategyEarn({ chainId: 97, chain: () => chainOf(f), owned: owned(), query: keyRows(legacy) }).auto(3, account, { budgetRaw: String(1000n * E18) });
+  const r = await createStrategyEarn({ v2: null, chainId: 97, chain: () => chainOf(f), owned: owned(), query: keyRows(legacy) }).auto(3, account, { budgetRaw: String(1000n * E18) });
   assert.ok('authorization' in r); assert.equal(r.authorization, 'renewal_required');
   assert.deepEqual(r.assets.map(x => x.asset), ['AAPLB']);
 });
@@ -600,7 +600,7 @@ test('#67 XAUt (6 decimals): values, auto-open plan and the vault-short take-bac
   await strategyEarnAutoOpen(stepArgs({ ...f, balances: { [xaut.collateral]: 2_587n } }, async calls => { sent = calls; return tx([]); }).args);
   assert.equal(sent.length, 2);
   // POST auto: 50% of 1,000 USDT new money + 1 XAUt held (3,866 USD) = 4,366 x 35% x 98% x 110% = 1,647.2918 USDT ceiling.
-  const r = await createStrategyEarn({ chainId: 97, chain: () => chainOf({ ...f, balances: { [xaut.collateral]: 1_000_000n }, weights: [{ asset: xaut.collateral, weightBps: 5000 }] }),
+  const r = await createStrategyEarn({ v2: null, chainId: 97, chain: () => chainOf({ ...f, balances: { [xaut.collateral]: 1_000_000n }, weights: [{ asset: xaut.collateral, weightBps: 5000 }] }),
     owned: owned(), query: keyRows(null) }).auto(3, account, { budgetRaw: String(1000n * E18) });
   assert.ok('assets' in r);
   assert.deepEqual(r.assets, [{ asset: 'XAUt', status: 'ready', maxDebtRaw: String(16472918n * 10n ** 14n), extraApyBps: 137 }]);
@@ -623,7 +623,7 @@ test('POST confirm: the owner\'s own turn-on / turn-off is recorded from its ver
     log('0x' + '66'.repeat(20), 'Borrowed', 5, { account, marketId: nvda.marketId, amount: 1n, vaultShares: 1n, ltv: 1n })]);
   const recorded: StrategyEarnEvent[] = [];
   let receipt: (StrategyEarnTx & { success: boolean }) | null = null;
-  const earn = createStrategyEarn({ chainId: 97, owned: owned(), chain: () => ({ ...chainOf({}), receipt: async () => receipt }),
+  const earn = createStrategyEarn({ v2: null, chainId: 97, owned: owned(), chain: () => ({ ...chainOf({}), receipt: async () => receipt }),
     ledger: { record: async (_c, e) => { recorded.push(...e); } } });
   const hash = '0x' + 'ab'.repeat(32);
   assert.deepEqual(await earn.confirm(3, account, { txHash: hash }), { status: 'pending', recorded: 0 });

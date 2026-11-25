@@ -264,7 +264,7 @@ function plan(f:Fixture):PortfolioPlan{return {portfolioId:f.id,strategyId:f.str
 function scheduler(f:Fixture,extra:SchedulerDeps={}){
   const sends:ExecuteArgs[]=[],userHash=hash(),txHash=hash();
   let status:ExecutionOutcome['status']='success',currentTime=start;
-  const deps:SchedulerDeps={clock:()=>currentTime,readBuyVersionWindow:async()=>({activeVersion:f.context.version,timestamp:BigInt(Math.floor(currentTime.getTime()/1000)),pendingActiveAt:null}),query,withTransaction:singlePortfolioClaim(f.id),chainId:97,executor:TESTNET_97.contracts.executor,
+  const deps:SchedulerDeps={clock:()=>currentTime,readBuyVersionWindow:async()=>({activeVersion:f.context.version,timestamp:BigInt(Math.floor(currentTime.getTime()/1000)),pendingActiveAt:null}),query,withTransaction:singlePortfolioClaim(f.id),chainId:97,strategyEarnV2:null,executor:TESTNET_97.contracts.executor,
     readGlobalPaused:async()=>false,withPortfolioLock,dexGate:async()=>null,log:()=>{},writeSnapshot:async()=>({headerInserted:true,inserted:0,updated:0}),
     planPortfolio:async()=>plan(f),planRebalance:async()=>{throw new Error('hold/stack must never enter drift planner');},
     readPermissionConfig:async()=>({signer:f.owner,policyCount:3}),deriveSessionKeyAddress:async()=>f.owner,readAllowance:async()=>UINT256_MAX,readBalance:async()=>UINT256_MAX,

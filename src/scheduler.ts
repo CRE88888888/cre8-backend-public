@@ -13,13 +13,13 @@ import { numeraireFor } from './strategy-execution.js';
 import { STRATEGY_EARN_97 } from './strategy-earn-guard.js';
 import { noteRoundOutcome, noteStrategyPegExceeded } from './alerts.js';
 import { runStrategyRewardsRound } from './strategy-rewards.js';
-import { routeLedger, strategyEarnV2, strategyEarnV2For, v2Audience, v2InstalledScope } from './strategy-earn-v2.js';
+import { routeLedger, strategyEarnV2, v2InstalledScope, v2MayOpen } from './strategy-earn-v2.js';
 import type { StrategyEarnV2 } from './strategy-earn-v2.js';
-import { defaultV2Reader, v2LogReader } from './strategy-earn-v2-chain.js';
+import { defaultV2Reader, v2HasState, v2LogReader } from './strategy-earn-v2-chain.js';
 import { claimedCash } from './withdrawable-cash.js';
 import { recoverCashSwaps, settleCashSwaps } from './strategy-cash-swaps.js';
 import { computeDrift } from './drift.js';
-import { runV2KeeperRound, v2AutoRound, v2RewardHolders, v2UnwindForSale } from './strategy-earn-v2-scheduler.js';
+import { runV2KeeperRound, v2AutoRound, v2QuietRound, v2RewardHolders, v2UnwindForSale } from './strategy-earn-v2-scheduler.js';
 import { SELL_ALL_OPEN_SQL, sellAllOver, sellAllRetryAt, settleSellAll } from './sell-all-intent.js';
 import type { V2Ledger, V2UnwindWait } from './strategy-earn-v2-scheduler.js';
 import { rewardsStore } from './strategy-rewards.js';
@@ -623,8 +623,11 @@ export type SchedulerDeps = {
   };
   /** The sale a cash raise sends (see planCashRaise). Default: one sale of the asset with the most free value, quoted like a redeem. */
   planCashRaise?: (input: RebalancePlanningInput, needUsdtRaw: bigint, at: { chainId: number; now: Date }) => Promise<RebalancePlan>;
-  /** Routing v2 keeper round (src/strategy-earn-v2-scheduler.ts). Default: runs for the accounts of owners in the v2 audience. */
+  /** Routing v2 keeper round (src/strategy-earn-v2-scheduler.ts). Default: every account of the chain that has anything on v2. */
   strategyV2Round?: (args: { dryRun: boolean; log: (line: string) => void }) => Promise<unknown>;
+  /** The routing v2 deployment of this chain. Default: strategyEarnV2(chainId) (the manifest). null = no v2 on this chain:
+   * the default strategy steps and the keeper round then read nothing about v2 (tests whose chain knows nothing of v2). */
+  strategyEarnV2?: StrategyEarnV2 | null;
   clock?:()=>Date;
   withDexLock?: typeof withDexLock;
   dexGate?: (chainId:number,portfolioId:number)=>Promise<string|null>;
@@ -1721,10 +1724,16 @@ function defaultStrategyEarnSteps(deps: ResolvedDeps): NonNullable<SchedulerDeps
       send: key?.send ?? null, ...(key?.markets === undefined ? {} : { sendable: key.markets }), ledger: dbStrategyEarnLedger, log: deps.log,
       consentSince: () => consentSinceSellAll(deps.query, deps.chainId, due.account) };
   };
-  // Routing v2 (src/strategy-earn-v2-scheduler.ts): only for accounts of an owner in the v2 audience (a canary list today).
-  // For everyone else `v2Of` is null after one cached owner lookup and nothing below runs. One account is on v1 or on v2,
-  // never both (the API refuses the second consent), so running the v1 step next to it is a no-op for a v2 account.
-  const v2Of = async (due: DuePortfolio): Promise<StrategyEarnV2 | null> => strategyEarnV2For(deps.chainId, await accountOwner(deps.query, deps.chainId, due.account));
+  // Routing v2 (src/strategy-earn-v2-scheduler.ts). The audience (`v2MayOpen`: the canary list / `audience`, and not
+  // `newOpensPaused`) only decides who may START on v2. An account that already has anything there is looked after
+  // whoever its owner is: read, repaid, closed, unwound before a sale, its leftovers sold — it just adds no risk.
+  // One account is on v1 or on v2, never both (the API refuses the second consent), so running the v1 step next to it is
+  // a no-op for a v2 account. An owner who may not start and whose account has nothing on v2 costs one read every ten
+  // minutes at most (`touchedOutside`; the keeper round refreshes it every round).
+  const v2Scope = async (due: DuePortfolio): Promise<{ v2: StrategyEarnV2; mayOpen: boolean } | null> => {
+    const v2 = deps.strategyEarnV2;
+    return v2 === null ? null : { v2, mayOpen: v2MayOpen(deps.chainId, await accountOwner(deps.query, deps.chainId, due.account)) };
+  };
   const v2Args = async (v2: StrategyEarnV2, due: DuePortfolio, dryRun: boolean, held?: readonly string[]) => {
     const key = dryRun ? null : await resolved(due);
     // Only a key whose installed policy carries the whole routing v2 scope for this account, this executor and (when the
@@ -1749,21 +1758,26 @@ function defaultStrategyEarnSteps(deps: ResolvedDeps): NonNullable<SchedulerDeps
     // My mix: the same steps on the mix's own account (its session key moves with each weight change, mix-store).
     open: async (due, dryRun, held, onCashNeed) => {
       if (deps.chainId !== 97) return null;
-      const v2 = await v2Of(due);
-      if (v2 === null) return strategyEarnAutoOpen(await args(due, dryRun, held));
-      // An audience owner's account: whichever generation it is on, never both. Anything on v2 -> the v2 round only (which
-      // itself refuses to add risk while v1 still holds something); nothing on v2 -> the v1 step exactly as for everyone else.
-      const touched = await defaultV2Reader(v2).touched(due.account);
-      if (!touched.enabled && touched.routes.length === 0 && touched.vaults.length === 0) return strategyEarnAutoOpen(await args(due, dryRun, held));
-      const chain = defaultStrategyEarnChain();
-      return v2AutoRound({ ...await v2Args(v2, due, dryRun, held), ...(onCashNeed ? { onCashNeed } : {}), v1Active: async () => strategyEarnV1Active(chain, due.account, (await chain.head()).number) });
+      const scope = await v2Scope(due);
+      if (scope === null) return strategyEarnAutoOpen(await args(due, dryRun, held));
+      const { v2 } = scope;
+      // Anything on v2 -> the v2 round only (which itself refuses to add risk while v1 still holds something, and adds none
+      // at all for an owner who may not start on v2); nothing on v2 -> the v1 step exactly as for everyone else, plus the
+      // leftover loan token of an account that used v2 before (v2QuietRound).
+      return v2QuietRound({ v2, reader: defaultV2Reader(v2), account: due.account, mayOpen: scope.mayOpen, log: deps.log,
+        v1: async () => strategyEarnAutoOpen(await args(due, dryRun, held)),
+        v2Round: async (touched, mayOpen) => v2AutoRound({ ...await v2Args(v2, due, dryRun, held), touched, mayOpen, ...(onCashNeed ? { onCashNeed } : {}),
+          v1Active: async () => { const chain = defaultStrategyEarnChain(); return strategyEarnV1Active(chain, due.account, (await chain.head()).number); } }) });
     },
     unwind: async (due, steps, dryRun, exit, posted = true) => {
       if (deps.chainId !== 97) return null;
       // Nothing posted (a full exit after the strategy was simply turned off): v1 has nothing to take back, so it is not read.
       const v1 = posted ? await strategyEarnUnwindForSale({ ...await args(due, dryRun), steps }) : null;
-      const v2 = await v2Of(due);
-      const second = v2 === null ? null : await v2UnwindForSale({ ...await v2Args(v2, due, dryRun), steps, ...(exit ? { exit } : {}) });
+      // Before a sale every account with something on v2 repays and takes its shares back, whoever its owner is.
+      const scope = await v2Scope(due);
+      const touched = scope === null ? null : scope.mayOpen ? await defaultV2Reader(scope.v2).touched(due.account) : await defaultV2Reader(scope.v2).touchedOutside(due.account);
+      const second = scope === null || touched === null || !v2HasState(touched) ? null
+        : await v2UnwindForSale({ ...await v2Args(scope.v2, due, dryRun), touched, mayOpen: scope.mayOpen, steps, ...(exit ? { exit } : {}) });
       // v1 holds the sale back -> it waits whatever v2 says; otherwise v2's answer stands (a note, or "sell what is free").
       return second !== null && typeof second === 'object' ? (v1 === null ? second : both([v1, second.note])) : both([v1, second]);
     },
@@ -1786,15 +1800,17 @@ const v2SchedulerLedger = (query: ResolvedDeps['query']): V2Ledger => ({
   rewards: (chainId, events) => rewardsStore((sql, params) => query(sql, params) as Promise<{ rows: any[] }>).record(chainId, events),
 });
 /**
- * Routing v2 keeper round: the accounts of owners in the v2 audience, with the same keeper key the v1 keeper uses
- * (STRATEGY_EARN_KEEPER_PRIVATE_KEY; absent = report only). Returns null when v2 is not on this chain or nobody is in the audience.
+ * Routing v2 keeper round: EVERY account of the chain, with the same keeper key the v1 keeper uses
+ * (STRATEGY_EARN_KEEPER_PRIVATE_KEY; absent = report only). The audience only decides who may start on v2: a position
+ * whose owner is no longer in it is watched (health line, deleverage, rewards) just the same. Which accounts have anything
+ * on v2 is one bulk read (40 accounts per request); only those are read in full. Returns null when v2 is not on this chain.
  */
-async function defaultStrategyV2Round(args: { dryRun: boolean; log: (line: string) => void }, deps: { chainId: number; query: ResolvedDeps['query'] }) {
-  const v2 = strategyEarnV2(deps.chainId);
+async function defaultStrategyV2Round(args: { dryRun: boolean; log: (line: string) => void }, deps: { chainId: number; query: ResolvedDeps['query']; v2: StrategyEarnV2 | null }) {
+  const { v2 } = deps;
   if (v2 === null) return null;
   const rows = (await deps.query(`select sa.address, sa.portfolio_id::text as portfolio_id, sa.owner from smart_accounts sa join portfolios p on p.id = sa.portfolio_id
     where sa.chain_id = $1 and sa.retired_at is null order by sa.address`, [deps.chainId])).rows as { address: string; portfolio_id: string; owner: string }[];
-  const accounts = rows.filter(r => v2Audience(deps.chainId, r.owner)).map(r => ({ account: r.address.toLowerCase() as Address, portfolioId: Number(r.portfolio_id), owner: r.owner.toLowerCase() as Address }));
+  const accounts = rows.map(r => ({ account: r.address.toLowerCase() as Address, portfolioId: Number(r.portfolio_id), owner: r.owner.toLowerCase() as Address }));
   if (accounts.length === 0) return null;
   const writer = strategyKeeperWriter();
   return runV2KeeperRound(args, { v2, reader: defaultV2Reader(v2), send: writer?.send ? (to, data) => writer.send!(to, data) : null, ledger: v2SchedulerLedger(deps.query), accounts: async () => accounts });
@@ -1962,6 +1978,7 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
     prepareNewMoney: provided.prepareNewMoney ?? prepareNewMoney,
     readBuyVersionWindow: provided.readBuyVersionWindow ?? (id => readBuyVersionWindow(defaultPublicClient(), registryAddress(), id)),
     strategyEarn: provided.strategyEarn ?? null,
+    strategyEarnV2: provided.strategyEarnV2 === undefined ? strategyEarnV2(chainId) : provided.strategyEarnV2,
     planCashRaise: provided.planCashRaise ?? null,
     clock:provided.clock??(()=>new Date()),
     withDexLock: provided.withDexLock ?? withDexLock,
@@ -2197,8 +2214,9 @@ export async function runSchedulerOnce(
   if (keepers) try { const result=await (deps.dcaRound??runDcaRound)({dryRun,limit,log:resolved.log}); if(result.checked||result.blocked)resolved.log('[dca] '+JSON.stringify(result)); } catch { resolved.log('[dca] 定投讀值／對帳未完成，下輪再試'); }
   // Strategy earn keeper (backend#199): anyone-callable deleverage/unwind and incentive claims for each account's own position.
   if (keepers) try { const result=await (deps.strategyEarnRound??runStrategyEarnRound)({dryRun,log:resolved.log}); if(result)resolved.log('[strategy-earn] '+JSON.stringify(result)); } catch { resolved.log('[strategy-earn] 健康度讀值未完成，下輪再試'); }
-  // Routing v2 keeper (anyone-callable executeDeleverage at the health line, reward tokens box -> account): only accounts of owners in the v2 audience.
-  if (keepers) try { const result=await (deps.strategyV2Round??((a)=>defaultStrategyV2Round(a,{chainId:resolved.chainId,query:resolved.query})))({dryRun,log:resolved.log}); if(result)resolved.log('[strategy-routing] '+JSON.stringify(result)); } catch (error) { resolved.log(`[strategy-routing] keeper 讀值未完成，下輪再試：${oneLine(error)}`); }
+  // Routing v2 keeper (anyone-callable executeDeleverage at the health line, reward tokens box -> account): every account that has anything on v2,
+  // whoever its owner is. Its bulk read also tells the strategy steps below which accounts have nothing on v2 (`touchedOutside`).
+  if (keepers) try { const result=await (deps.strategyV2Round??((a)=>defaultStrategyV2Round(a,{chainId:resolved.chainId,query:resolved.query,v2:resolved.strategyEarnV2})))({dryRun,log:resolved.log}); if(result)resolved.log('[strategy-routing] '+JSON.stringify(result)); } catch (error) { resolved.log(`[strategy-routing] keeper 讀值未完成，下輪再試：${oneLine(error)}`); }
   // Strategy rewards (LISTA / XVS, db 0068): mainnet only and off unless STRATEGY_REWARDS_ENABLED=1; returns null otherwise (no I/O).
   if (keepers) try { const result=await (deps.strategyRewardsRound??((a)=>{ const chainId=getConfig().chainId, v2=strategyEarnV2(chainId); return runStrategyRewardsRound(a,{chainId,...(v2===null?{}:{extraHolders:v2RewardHolders(account=>defaultV2Reader(v2).box(account))})}); }))({dryRun,log:resolved.log}); if(result)resolved.log('[strategy-rewards] '+JSON.stringify(result)); } catch { resolved.log('[strategy-rewards] 激勵領取未完成，下輪再試'); }
   // Paused strategy jobs (three failed attempts): retryable pauses resume after their cool-down; the rest wait for the

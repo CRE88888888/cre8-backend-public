@@ -15,16 +15,42 @@
 
 測試：`test/strategy-earn-routing-v2.test.ts`、`test/strategy-earn-v2-chain.test.ts`、`test/sponsor-flows.test.ts`（兩種帳戶的每一種 UserOp 過 `sponsor()`，含 swapper）、`test/strategy-earn.test.ts`（同一組 endpoint 由 v1 或 v2 回答）、`test/strategy-earn-v2.test.ts`（排程器：補現金的小額賣出、全部賣出時先賣閒置的部分）、`test/strategy-cash-swaps.db.test.ts`（真 SQL：現金帳本的規則）、`test/strategy-earn-v2.fork.ts`（chain 97 fork，真合約：含已部署的 CallPolicy 對 swapper 兩個 selector 的放行與其餘的拒絕、非 USDT 路線負利差 → `topUp` → 關閉 → `cashOut`；**帳戶沒有任何帳本外的 USDT** 時的關加息與全部賣出，基金帳戶／自建組合帳戶 × USD1／USDT 路線共四組；補現金的小額賣出另有一組用真的贖回規劃器報價、由真的 `AtpExecutor` 成交：要 1 USDT、賣出約 0.0000147 BTCB、到手 0.9895 USDT）。
 
-## 開關：誰用 v2
+## 開關：誰可以在 v2 新開（名單只管「新開」）
 
-兩層，都是設定，不是程式：
+三層，都是設定，不是程式：
 
 1. **v2 在哪裡**：`strategyEarnV2(chainId)` 讀 `STRATEGY_EARN_V2_DEPLOYMENT`（一個 JSON 物件，有設就以它為準），沒設就讀 `deploy/strategy-earn-v2.json`。chain 97 已部署（2026-11-25），chain 56 沒有。session key 範圍、paymaster 允許清單、讀取用的 lens 全部跟著這份設定走；重新部署 executor 只要換這個檔案（或設變數）。格式錯就 throw。
-2. **誰可以用**：`strategyEarnV2For(chainId, owner)`。`STRATEGY_EARN_V2_AUDIENCE` 沒設＝部署設定裡的 `canaryOwners`；`all`＝所有人；`off`＝沒有人；或逗號分隔的 owner 地址。
+2. **誰可以新開**（`v2Audience`）：部署設定裡的 `audience`——`"canary"`（預設）＝只有 `canaryOwners`；`"all"`＝所有人。api 與 scheduler 讀同一份檔，所以一定一致。`STRATEGY_EARN_V2_AUDIENCE` 有設的話仍然優先（`all`／`off`／逗號分隔的 owner 地址），但變數要兩個服務都設，只設一個會不一致。
+3. **暫停新開**（`newOpensPaused`，只在設定檔，沒有環境變數）：`true` 時所有人（名單內、`audience: "all"`、變數指名的都算）都不能在 v2 新開。這是出事時的回退手段。
+
+`v2MayOpen(chainId, owner)`＝在名單內而且沒有暫停；`strategyEarnV2For(chainId, owner)` 回的就是「這個 owner 現在可以新開的部署」。
+
+**名單與暫停只管「新開」**：新的 v2 同意、新開倉、補借、搬家（含只換 vault）、把新資產加進 v2、My mix 改比例後的重新同意。**任何在鏈上已經有 v2 狀態的帳戶（同意開著、有路線／負債、策略盒有錢，或用過 v2 而留有收款人），不論 owner 在不在名單、有沒有暫停，都照樣被完整管理**（2026-11-26）：
+
+| 哪裡 | 名單外／暫停時，有 v2 狀態的帳戶 |
+|---|---|
+| 排程器 `open`（`v2QuietRound`） | 照樣跑 v2 這一輪：讀狀態、還款、補差額、關閉、小額部位全還、把留下的 USDC／USD1／U 換回 USDT。**不加風險**（`withoutNewRisk`）：開倉／補借不做；只是「別的路線賺更多」的搬家不做；非離開不可的（負利差、市場或 vault 停掉／領不出來）改成關閉 |
+| 排程器 `unwind`（賣出前） | 照樣還款取回；全部退出時照樣把激勵送到 owner 錢包、把剩下的借款幣換回 |
+| keeper（`runV2KeeperRound`） | 不看 owner：每一輪把這條鏈的所有帳戶用一次大量讀取（每個請求 40 個帳戶）問「v2 上有沒有東西」，有的才讀完整狀態、到健康線就 `executeDeleverage`、收激勵 |
+| paymaster | 部署對所有 owner 都認得。關閉與減風險方向（`executeReduce`／`executeRelease`／`executeSweepRewards`／`executeRescue`、`topUp`／`cashOut`、對換幣合約的 approve、撤回同意、收回借款授權）一律放行，不讀鏈；加風險方向（給同意、`executeOpen`／`executeMigrate`／`executeSwitchVault`、借款授權、對 v2 executor 的 approve）對不能新開的 owner 直接 403 |
+| API | 帳戶在 v2 上有東西就由 v2 回答：部位照顯示、`close`（含 `exit`）、`confirm`、`rescue`、激勵清單都照常；`open`／`auto` 回「暫時無法使用」（不能加，也不會改開 v1——一個帳戶只用一種）。帳戶在 v2 上沒東西：名單外／暫停的 owner 新開一律走 v1 |
+| 續期 | 名單內（暫停也算）或帳戶有 v2 狀態 → 新的 session key 帶 v2 權限，排程器才關得掉部位 |
+| 持倉快照 | 每個帳戶都讀 v2 抵押品（沒有的帳戶多一次 `accountRoutes`）。漏讀會把抵押中的股票當成賣掉而重買 |
+| My mix 金流對帳 | 策略盒付回帳戶的錢一律算組合內部（不看 owner） |
+
+**「有沒有 v2 狀態」怎麼判斷、多貴**：`registry.policy／accountRoutes／accountVaults` 一個請求（`reader.touched`）。名單內的 owner 每次都讀（他可能剛開）；不能新開的 owner，帳戶讀到「什麼都沒有」會記住 10 分鐘（`touchedOutside`，`V2_UNTOUCHED_TTL_MS`）——這種帳戶在我們這邊開不了 v2，10 分鐘是留給「兩個服務設定不一致」或 owner 自己付 gas 上鏈的情況。排程器的 keeper 每一輪的大量讀取會順便更新這份記憶，所以排程器的 `open`／`unwind` 對沒有 v2 的名單外帳戶平常不多讀。有東西的帳戶每次都讀。
+
+**My mix 改比例**：重新同意是「新的同意」，不能新開的 owner 不會拿到 v2 的重新同意（v1 沒開所以也沒有 v1 的），改比例照常完成；合約上的 v2 同意隨著新的 enrollment 失效，排程器下一輪把部位關掉。
+
+### 全開與回退怎麼做
+
+- **全開**：`deploy/strategy-earn-v2.json` 的 `"audience"` 改成 `"all"`，確認 Railway 兩個服務都沒有設 `STRATEGY_EARN_V2_AUDIENCE`（有設會蓋過檔案），合併後部署 api 再部署 scheduler。
+- **回退（出事時）**：同一個檔把 `"newOpensPaused"` 改成 `true`，部署 api 再部署 scheduler。之後沒有人能在 v2 新開（新開的走 v1）；既有部位照管、照關、到健康線照樣減倉。要連名單一起收回就把 `"audience"` 改回 `"canary"`——既有部位一樣照管。
+- 解除：`"newOpensPaused"` 改回 `false` 再部署。
 
 **現況（2026-11-25）：`canaryOwners` 只有 e2e harness 的測試錢包（`0xD3Ab…D6D9`），其他人全部維持 v1。** 當天在測試網用兩種帳戶跑過的流程與交易見 PR #285–#289 的說明。 測試網已換成 draft6 的修正版（executor `0xeddd…600F`、registry `0x2461…CC0D`、lens `0x4fC6…a27A`）並部署了 `AtpBorrowCashSwapper`（`0x9981…0798`）。舊那套（executor `0x494C…6bB5`）的 registry 已暫停新開倉，66 條路線的本金都是 0（2026-11-25 用公開節點逐條讀 `totalPrincipal`），沒有部位要搬。
 
-不在對象裡的 owner 完全走 v1：續期不裝 v2 權限、paymaster 不贊助任何 v2 呼叫、API 與排程器不會組 v2 的交易，也不會多讀任何鏈上資料（排程器只多一次有快取的 owner 查詢；持倉快照與 My mix 金流對帳只對對象內的 owner 讀 v2）。**對所有人開啟＝把 `STRATEGY_EARN_V2_AUDIENCE` 設成 `all`，這是產品決定，這次沒有做。**
+不能新開、帳戶在 v2 上也沒有東西的 owner 完全走 v1：續期不裝 v2 權限、API 與排程器不會組 v2 的交易。多出來的讀取：持倉快照每次一個 `accountRoutes`；其餘每個帳戶每 10 分鐘最多一次「v2 上有沒有東西」（見上）；這種 owner 送 v1 加風險的 UserOp 時 paymaster 也問同一題（一個帳戶只用一種）。**對所有人開啟＝把設定檔的 `audience` 改成 `all`，這是產品決定，還沒有做。**
 
 ## 一個帳戶只用 v1 或 v2（後端硬擋）
 
@@ -38,6 +64,7 @@
 ## 讀鏈
 
 - 路線與 vault：`registry.routeCount／routeIds／route`（vault 同理），10 分鐘重讀。owner 新增路線不用改程式。
+- 公開節點（`v2RpcTransport`）：照清單順序問，每個節點 3.5 秒沒回就換下一個（以前 12 秒，第一個節點不回時一次讀取就超過 paymaster 的 10 秒上限 → 503）；剛失敗的節點 60 秒內排到最後，所以只有它剛不回的那一次請求要多等。節點明確回「execution reverted」算是答案，不換節點。只用免金鑰的公開節點，不用付費 RPC。
 - 市場快照（每輪一次，60 秒快取）：每條路線的 `routeStatus(routeId, 0)`、`minLoan`、`minDebt`；每個 vault 的 `vaultStatus`。另外讀：ERC4626 vault 的 `maxDeposit`（0＝存不進去，不當目的地）、Venus 抵押市場的 `supplyCaps` 與已供應量（剩餘額度不夠放這筆抵押就不選）、Venus／Aave vault 的可領現金。轉成跟主網顯示同一個形狀的 `RoutingSnapshot` 給引擎。
 - 帳戶：`policy`、`accountRoutes`、`accountVaults`、`boxOf`、每條路線的 `routeStatus(routeId, account)`、每個 vault 的 `vaultStatus`、每種借款幣的 `idleOf`／帳戶餘額／allowance、激勵代幣餘額、可抵押資產的餘額與價格。
 - **淨值**＝策略盒各 vault 的 `assets`＋`idleOf`－負債（抵押品算在持倉裡）。
@@ -115,7 +142,7 @@ executor 自己不換幣。借 USDC／USD1／U 的路線，vault 長得比負債
 
 **何時 `cashOut`**：
 - 跟關閉放同一個 UserOp：關掉的是這個幣的最後一條路線，而且「關完帳戶裡一定有剩」（帳戶原有的借款幣＋策略盒＋補進去的 − 負債 − 0.02% ≥ 0.000001）才帶。`cashOut(token, MAX, minUsdtOut = 這個下限 × 0.997)`；合約自己的錨定上限（0.25%）管其餘的部分。
-- 之後補做：每一輪（含加息已經關掉、帳戶沒有任何路線的帳戶）看到帳戶裡有 USDC／USD1／U、而且這個幣已經沒有負債，就用 session key 換回（`leftoverCashOuts`，`minUsdtOut = 餘額 × 0.997`）。全部賣出／刪除／停利停損的那一輪也會做，owner 領回的就只有 USDT。
+- 之後補做：每一輪（含加息已經關掉、帳戶沒有任何路線的帳戶）看到帳戶裡有 USDC／USD1／U、而且這個幣已經沒有負債，就用 session key 換回（`leftoverCashOuts`，`minUsdtOut = 餘額 × 0.997`）。單獨一筆才換得了的時候，低於 0.01 的零頭不換（`V2_CASH_OUT_ALONE_MIN_RAW`），等之後有別的 UserOp 順便帶。「同意已撤、沒有路線、策略盒也沒有錢」的帳戶在 2026-11-26 以前其實到不了這一步（排程器把它當成「v2 上什麼都沒有」只跑 v1 步驟）；現在 `v2QuietRound` 對用過 v2 的帳戶（收款人還在）在 v1 步驟之外另外做這件事。全部賣出／刪除／停利停損的那一輪也會做，owner 領回的就只有 USDT。
 - 換回之前，`earnNetUsd` 把帳戶裡的這些幣當 1 美元算（USDT 本來就是投資組合的現金，不算在這裡）。
 
 **記帳**：每一筆 `ToppedUp`／`CashedOut`（與 USDT 路線的 `repay_cash`／`vault_cash`）在 `strategy_route_events` 留一列（見上「記帳」），同時寫一行結構化 log：`{"msg":"strategy_cash_swap","kind":"top_up"|"cash_out"|"repay_cash"|"vault_cash","portfolioId",…,"usdtRaw","tokenRaw","needRaw","txHash","logIndex"}`（排程器與 `confirm` 都寫）。記帳失敗（鏈上已完成）寫 `{"level":"error","msg":"strategy_cash_swap_unbooked",…,"txHash"}`，之後由補記接手。My mix 的金流對帳把 swapper 的池子當成內部地址（USDT 付進池子、池子付回 USDT 都不算入金／出金）。

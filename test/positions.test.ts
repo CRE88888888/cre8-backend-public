@@ -1105,7 +1105,7 @@ function testnetPlan(readYield: NonNullable<PlanDeps['readYield']>, yieldOptiona
     publicClient: wrap(stubClient(chain)),
     query,
     chainId: 97,
-    strategyEarnCollateral: async () => [],
+    strategyEarnCollateral: async () => [], strategyEarnV2Collateral: async () => [],
     readYield,
     ...(yieldOptional === undefined ? {} : { yieldOptional }),
   });
@@ -1158,7 +1158,7 @@ test('status 的 observeOnly：不掃日誌、不二分搜尋部署塊、不寫 
   let getCode = 0;
   const client = Object.assign(stubClient(chain), { getCode: async () => { getCode += 1; return undefined; } }) as PublicClient;
   const plan = await planPortfolio(9, {
-    ...planDeps(chain, db), publicClient: client, query, chainId: 97, strategyEarnCollateral: async () => [],
+    ...planDeps(chain, db), publicClient: client, query, chainId: 97, strategyEarnCollateral: async () => [], strategyEarnV2Collateral: async () => [],
     readYield: async (_c, profile, _a, { block }) => ({ profile, positions: [], risks: [], accountValue: 500n * 10n ** 18n,
       observation: { block, blockHash: `0x${'11'.repeat(32)}`, at: new Date(), source: 'test' } }),
     yieldOptional: true, observeOnly: true,
@@ -1181,7 +1181,7 @@ test('status 的 observeOnly：不掃日誌、不二分搜尋部署塊、不寫 
  * executor 的帳戶估值看不到市場保管的股票，只回 5。
  */
 const NVDAB = TESTNET_97.assets.NVDAB.token.toLowerCase() as Address;
-function pledgedFundPlan(posted: { asset: Address; marketId: string; amount: bigint }[], priceToken = oneDollarPrice()) {
+function pledgedFundPlan(posted: { asset: Address; marketId: string; amount: bigint }[], priceToken = oneDollarPrice(), postedV2: { asset: Address; marketId: string; amount: bigint }[] = []) {
   const chain = baseChain({ versions: new Map([[1, { assets: [NVDAB, TESTNET_USDT], weightsBps: [10000, 0] }]]) });
   chain.balances.set(TESTNET_USDT.toLowerCase(), 5n * 10n ** 18n);
   const db = baseDb({
@@ -1192,12 +1192,31 @@ function pledgedFundPlan(posted: { asset: Address; marketId: string; amount: big
   const query: QueryFn = async (text, params) => text.includes('from yield_events') ? { rows: [] } : base(text, params);
   return planPortfolio(9, {
     ...planDeps(chain, db, priceToken), query, chainId: 97,
-    strategyEarnCollateral: async () => posted,
+    strategyEarnCollateral: async () => posted, strategyEarnV2Collateral: async () => postedV2,
     readYield: async (_c, profile, _a, { block }) => ({ profile, positions: [], risks: [], accountValue: 5n * 10n ** 18n,
       observation: { block, blockHash: `0x${'11'.repeat(32)}`, at: new Date(), source: 'test' } }),
     yieldOptional: true, observeOnly: true,
   });
 }
+
+test('chain 97：路由 v2 抵押中的股票，不論 owner 在不在 v2 名單都算進持倉（名單只管能不能新開）——漏算會被當成賣掉而重買', async () => {
+  // 這個帳戶的 owner 不在 canaryOwners，也沒有設 STRATEGY_EARN_V2_AUDIENCE：2026-11-26 以前這種帳戶完全不讀 v2，
+  // 3 顆抵押在 v2 的 NVDAB 會從持倉消失（總值只剩 5 USDT 現金）。
+  const { v2Audience } = await import('../src/strategy-earn-v2.js');
+  assert.equal(v2Audience(97, null), false); // 測試資料庫的帳戶沒有名單內的 owner
+  const plan = await pledgedFundPlan([], oneDollarPrice(), [{ asset: NVDAB, marketId: `0x${'02'.repeat(32)}`, amount: 3n * 10n ** 18n }]);
+  assert.equal(plan.snapshot.holdings.find((h) => h.asset === NVDAB)?.amountWei, 3n * 10n ** 18n);
+  assert.deepEqual(plan.snapshot.strategyEarnCollateral, [{ asset: NVDAB, marketId: `0x${'02'.repeat(32)}`, amount: 3n * 10n ** 18n }]);
+  assert.equal(plan.report?.totalUsdE8, 8n * ONE_USD);
+  assert.equal(plan.snapshot.accountValueRaw, 8n * 10n ** 18n);
+  // 讀不到 v2 就整份拒算（不把抵押品當 0）：對名單外的帳戶也一樣。
+  const chain = baseChain({ versions: new Map([[1, { assets: [NVDAB, TESTNET_USDT], weightsBps: [10000, 0] }]]) });
+  const db = baseDb({ versions: new Map<string, Map<number, unknown>>([['11', new Map<number, unknown>([[1, { assets: [
+    { address: NVDAB, symbol: 'NVDAB', weightBps: 10000 }, { address: TESTNET_USDT, symbol: 'USDT', weightBps: 0 }] }]])]]) });
+  await assert.rejects(planPortfolio(9, { ...planDeps(chain, db), chainId: 97, strategyEarnCollateral: async () => [], strategyEarnV2Collateral: async () => { throw new Error('rpc down'); },
+    readYield: async (_c, profile, _a, { block }) => ({ profile, positions: [], risks: [], accountValue: 0n, observation: { block, blockHash: `0x${'11'.repeat(32)}`, at: new Date(), source: 'test' } }),
+    yieldOptional: true, observeOnly: true }), /strategy earn collateral unavailable/);
+});
 
 test('chain 97 基金帳戶：抵押中的股票算進帳戶總值，與持倉表、漂移報告同一個數字', async () => {
   const plan = await pledgedFundPlan([{ asset: NVDAB, marketId: `0x${'01'.repeat(32)}`, amount: 3n * 10n ** 18n }]);

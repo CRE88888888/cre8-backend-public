@@ -32,7 +32,7 @@ test('#204 real SQL: ledger is idempotent per (tx, log), separate per portfolio,
     await client.query('savepoint s');
     await assert.rejects(ledger.record(97, [{ ...events[0]!, portfolioId: portfolio + 1_000_000, logIndex: 9 }]));
     await client.query('rollback to savepoint s');
-    const earn = createStrategyEarn({ chainId: 97, owned: (async () => ({ chainId: 97, ownerAddress: account, accountAddress: account })) as never, query: ((sql: string, params?: unknown[]) => client.query(sql, params)) as never });
+    const earn = createStrategyEarn({ v2: null, chainId: 97, owned: (async () => ({ chainId: 97, ownerAddress: account, accountAddress: account })) as never, query: ((sql: string, params?: unknown[]) => client.query(sql, params)) as never });
     const view = await earn.activity(portfolio, account);
     assert.deepEqual(view.activity.map(a => [a.kind, a.amountRaw, a.message]), [
       ['claim', '10000000000000000', 'Received 0.01 USDT in Earn rewards.'],

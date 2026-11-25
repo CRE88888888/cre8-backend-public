@@ -152,7 +152,7 @@ test('API: GET rewards and POST reward-signature are 404 while the feature is of
     saveSignature: async (...a: unknown[]) => { saved.push(a); } } as unknown as RewardsStore;
   const owned = (chainId: number) => (async () => ({ chainId, ownerAddress: owner, accountAddress: account })) as never;
   const base = { chain: () => { throw new Error('down'); }, now: () => NOW, rewards: store };
-  const off = createStrategyEarn({ ...base, chainId: 97, owned: owned(97) });
+  const off = createStrategyEarn({ v2: null, ...base, chainId: 97, owned: owned(97) });
   assert.equal('rewards' in await off.portfolio(7, owner), false);
   await assert.rejects(off.rewards(7, owner), (e: unknown) => e instanceof AppError && e.status === 404);
   await assert.rejects(off.rewardSignature(7, owner, { signedAt: NOW.toISOString(), signature: sig.signature }), (e: unknown) => e instanceof AppError && e.status === 404);

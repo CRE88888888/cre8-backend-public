@@ -127,7 +127,7 @@ test('a failed auto-open backs off: 5, 10, 20, 40, then 60 minutes', () => {
 test('owner turn-off (API close): up to three markets is one UserOp as before; ten markets come as batches that each finish what they touch', async () => {
   const w = world();
   await strategyEarnAutoOpen(step(w).args);
-  const earn = createStrategyEarn({ chainId: 97, chain: () => w.chain, owned: (async () => ({ chainId: 97, ownerAddress: account, accountAddress: account })) as never, now: () => now });
+  const earn = createStrategyEarn({ v2: null, chainId: 97, chain: () => w.chain, owned: (async () => ({ chainId: 97, ownerAddress: account, accountAddress: account })) as never, now: () => now });
   const isOff = (c: Call) => c.to.toLowerCase() === STRATEGY_EARN_97.registry && decode(c).functionName === 'setBorrowPolicy';
   const marketsOf = (batch: Call[]) => [...new Set(batch.map(c => isOff(c) ? String((decode(c).args as readonly unknown[])[0]).toLowerCase() : marketOf(c)))];
   const small = await earn.close(8, account, { assets: lista.slice(0, 3).map(m => m.symbol) });
@@ -155,7 +155,7 @@ test('owner turn-off (API close): up to three markets is one UserOp as before; t
 
 test('consent and single-asset open also carry batches (one batch in practice)', async () => {
   const w = world();
-  const earn = createStrategyEarn({ chainId: 97, chain: () => ({ ...w.chain, weights: async () => ten.map(m => ({ asset: m.collateral, weightBps: 1000 })) }),
+  const earn = createStrategyEarn({ v2: null, chainId: 97, chain: () => ({ ...w.chain, weights: async () => ten.map(m => ({ asset: m.collateral, weightBps: 1000 })) }),
     owned: (async () => ({ chainId: 97, ownerAddress: account, accountAddress: account, personalMix: false })) as never, now: () => now,
     query: (async () => ({ rows: [] })) as never });
   const open = await earn.open(8, account, { asset: lista[0]!.symbol, collateralRaw: (10n * E18).toString() });

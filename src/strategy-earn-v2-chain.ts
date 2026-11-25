@@ -1,5 +1,5 @@
-import { createPublicClient, decodeFunctionResult, encodeFunctionData, fallback, http, parseAbi, zeroAddress } from 'viem';
-import type { Abi, Address, Hex, Log, PublicClient } from 'viem';
+import { createPublicClient, custom, decodeFunctionResult, encodeFunctionData, http, isAddressEqual, parseAbi, zeroAddress } from 'viem';
+import type { Abi, Address, Hex, Log, PublicClient, Transport } from 'viem';
 import { TESTNET_97 } from './testnet-profile.js';
 import { STRATEGY_EARN_97 } from './strategy-earn-guard.js';
 import { STABLES } from './strategy-earn-mainnet.js';
@@ -16,7 +16,7 @@ import type { Call, RouteLimits, RouteLookup, StrategyEarnV2, SwapQuote, V2Accou
  *   registry is read for the allowlist, consent and accounting only. Nothing about a route or a vault is hard-coded: the
  *   registry enumerates them (`routeCount` / `routeIds` / `route`, same for vaults), so a route the owner adds shows up
  *   without a release.
- * - Keyless public nodes only, with fallback between them. The paid RPC_URL is never used here: a market snapshot is ~80
+ * - Keyless public nodes only, one after another (`v2RpcTransport`: a short timeout each, a quiet node is asked last for a minute). The paid RPC_URL is never used here: a market snapshot is ~80
  *   lens calls and an account another ~20, per round. When no public node answers, the caller skips that round.
  * - Bulk: Multicall3 `aggregate3` through eth_call (the status functions accrue first, which an eth_call may do).
  */
@@ -30,6 +30,50 @@ export function v2PublicRpcs(chainId: number, env: NodeJS.ProcessEnv = process.e
   const list = raw ? raw.split(',').map(x => x.trim()).filter(Boolean) : [...(V2_PUBLIC_RPCS[chainId] ?? [])];
   if (list.length === 0) throw new Error('no public RPC for routing v2 on chain ' + chainId);
   return list;
+}
+/** One public node gets this long to answer before the next one is asked. 2026-11-26: the first node of the list sometimes
+ * does not answer at all; at 12 s each such request outlasted the paymaster's 10 s bound (a 503) before the second node was tried. */
+export const V2_RPC_TIMEOUT_MS = 3_500;
+/** A node that just failed is asked last for this long: the requests that follow go straight to one that answers. */
+export const V2_RPC_COOLDOWN_MS = 60_000;
+/** A node's own answer about the call (it ran and reverted): another node would say the same, so it is not a reason to move on. */
+const deterministic = (error: unknown): boolean => {
+  for (let e: unknown = error, i = 0; e && typeof e === 'object' && i < 6; e = (e as { cause?: unknown }).cause, i++) {
+    const code = (e as { code?: unknown }).code, text = String((e as { details?: unknown }).details ?? (e as { message?: unknown }).message ?? '');
+    if (code === 3 || /execution reverted/i.test(text)) return true;
+  }
+  return false;
+};
+/**
+ * The public nodes as one transport: asked in list order, each with its own short timeout and no retry; a node that
+ * failed (no answer in time, a transport error, an HTTP error) is asked last for `cooldownMs`, so only the first request
+ * after a node goes quiet pays for it. Keyless public nodes only — no paid RPC (see the header).
+ */
+export function v2RpcTransport(urls: readonly string[], opts: { timeoutMs?: number; cooldownMs?: number; now?: () => number } = {}): Transport {
+  if (urls.length === 0) throw new Error('no public RPC for routing v2');
+  const timeout = opts.timeoutMs ?? V2_RPC_TIMEOUT_MS, cooldown = opts.cooldownMs ?? V2_RPC_COOLDOWN_MS, now = opts.now ?? Date.now;
+  const nodes = urls.map(url => ({ request: http(url, { timeout, retryCount: 0 })({ retryCount: 0, timeout }).request, badUntil: 0 }));
+  return custom({
+    async request(args: { method: string; params?: unknown }) {
+      const at = now();
+      // Healthy nodes in list order; the ones cooling down after them, the one that failed longest ago first.
+      const order = [...nodes.filter(n => n.badUntil <= at), ...nodes.filter(n => n.badUntil > at).sort((x, y) => x.badUntil - y.badUntil)];
+      let last: unknown;
+      for (const node of order) {
+        try { const result = await node.request(args as never); node.badUntil = 0; return result; }
+        catch (error) { if (deterministic(error)) throw error; node.badUntil = now() + cooldown; last = error; }
+      }
+      throw last;
+    },
+  }, { retryCount: 0 });
+}
+const transports = new Map<string, Transport>();
+/** The process-wide transport for a chain's public nodes: every v2 read shares its memory of which node answers. */
+export function v2PublicTransport(chainId: number, env: NodeJS.ProcessEnv = process.env): Transport {
+  const urls = v2PublicRpcs(chainId, env), key = urls.join(',');
+  let t = transports.get(key);
+  if (!t) { t = v2RpcTransport(urls); transports.set(key, t); }
+  return t;
 }
 export const MULTICALL3 = '0xca11bde05977b3631167028862be2a173976ca11' as Address;
 const MULTICALL_ABI = parseAbi([
@@ -61,7 +105,7 @@ const bpsOf = (rate: bigint) => Number(rate / 10n ** 14n);
 
 type Read = { target: Address; abi: Abi; functionName: string; args?: readonly unknown[] };
 /** A decoded multicall result: the value, or null when that one call failed (missing function on a mock, a revert). */
-export type V2Multicall = (reads: readonly Read[], opts?: { gas?: bigint }) => Promise<(unknown | null)[]>;
+export type V2Multicall = (reads: readonly Read[], opts?: { gas?: bigint; /** Reads per request for this call (default: the multicall's own). */ chunk?: number }) => Promise<(unknown | null)[]>;
 /**
  * Gas given to the eth_call that reads the cash swapper's `shortfall` (spec §17: it walks the box's vaults, 5.6–5.9M with
  * a Lista vault on mainnet; short of gas it reverts, it never answers a wrong number). Never under 10M.
@@ -70,9 +114,9 @@ export const V2_SHORTFALL_CALL_GAS = 30_000_000n;
 /** Multicall3 over eth_call, `chunk` reads per request. Throws only when the node itself fails. */
 export function v2Multicall(client: Pick<PublicClient, 'call'>, chunk = 40): V2Multicall {
   return async (reads, opts) => {
-    const out: (unknown | null)[] = [];
-    for (let i = 0; i < reads.length; i += chunk) {
-      const part = reads.slice(i, i + chunk);
+    const out: (unknown | null)[] = [], size = opts?.chunk ?? chunk;
+    for (let i = 0; i < reads.length; i += size) {
+      const part = reads.slice(i, i + size);
       const data = encodeFunctionData({ abi: MULTICALL_ABI, functionName: 'aggregate3',
         args: [part.map(r => ({ target: r.target, allowFailure: true, callData: encodeFunctionData({ abi: r.abi, functionName: r.functionName, args: r.args ?? [] } as never) }))] });
       const res = await client.call({ to: MULTICALL3, data, ...(opts?.gas === undefined ? {} : { gas: opts.gas }) });
@@ -107,7 +151,23 @@ export type V2ReaderDeps = { v2: StrategyEarnV2; multicall: V2Multicall; now?: (
   priceOracle?: Address;
   /** AtpRegistry (enrollment the consent is pinned to). */
   atpRegistry?: Address;
-  bookTtlMs?: number; marketTtlMs?: number };
+  bookTtlMs?: number; marketTtlMs?: number;
+  /** How long "this account has nothing on v2" is remembered for an owner who may not start there (`touchedOutside`). */
+  untouchedTtlMs?: number };
+/** What the registry says an account has on v2, in one request (`reader.touched`). */
+export type V2Touched = { enabled: boolean; routes: Hex[]; vaults: Hex[]; rewardRecipient: Address };
+/** Consent, a position (collateral or debt) or money in the strategy box: the account is on v2 now. */
+export const v2Active = (t: V2Touched): boolean => t.enabled || t.routes.length > 0 || t.vaults.length > 0;
+/**
+ * Anything of this account's is, or may still be, on v2: it is on v2 now (`v2Active`), or it was (the reward recipient
+ * outlives a turn-off: loan token a close left in the account, reward tokens). Such an account is looked after whoever
+ * its owner is — the audience only decides who may START on v2 (src/strategy-earn-v2.ts `v2MayOpen`).
+ */
+export const v2HasState = (t: V2Touched): boolean => v2Active(t) || !isAddressEqual(t.rewardRecipient, zeroAddress);
+/** `touchedOutside`: an account seen with nothing on v2 is not read again for this long. Its owner may not start there, so
+ * nothing this backend sponsors or sends can change the answer; the limit is for what happens outside it. */
+export const V2_UNTOUCHED_TTL_MS = 10 * 60_000;
+const NOTHING_ON_V2: V2Touched = { enabled: false, routes: [], vaults: [], rewardRecipient: zeroAddress };
 
 const profileAssets = new Map(Object.entries(TESTNET_97.assets as Record<string, { token: string; decimals: number }>).map(([symbol, a]) => [a.token.toLowerCase(), { symbol, decimals: a.decimals }]));
 
@@ -274,12 +334,41 @@ export function createV2Reader(deps: V2ReaderDeps) {
     return marketInflight;
   }
 
-  /** Does this account have anything on v2: consent given, a position, or money in the box? One request. */
-  async function touched(account: Address): Promise<{ enabled: boolean; routes: Hex[]; vaults: Hex[]; rewardRecipient: Address }> {
-    const [p, routes, vaults] = await multicall([reg('policy', [account]), reg('accountRoutes', [account]), reg('accountVaults', [account])]);
+  const untouchedUntil = new Map<string, number>();
+  const remember = (account: Address, t: V2Touched): V2Touched => {
+    if (v2HasState(t)) untouchedUntil.delete(lower(account)); else untouchedUntil.set(lower(account), now() + (deps.untouchedTtlMs ?? V2_UNTOUCHED_TTL_MS));
+    return t;
+  };
+  const touchedReads = (account: Address): Read[] => [reg('policy', [account]), reg('accountRoutes', [account]), reg('accountVaults', [account])];
+  const touchedOf = (p: unknown | null, routes: unknown | null, vaults: unknown | null): V2Touched => {
     const policy = must<{ enabled: boolean; rewardRecipient?: Address }>(p, 'policy');
     // `rewardRecipient` outlives consent (a plain turn-off keeps it): non-zero = this account has used v2 and may still hold reward tokens.
     return { enabled: policy.enabled, rewardRecipient: lower(policy.rewardRecipient ?? zeroAddress), routes: must<Hex[]>(routes, 'accountRoutes').map(x => lower(x) as Hex), vaults: must<Hex[]>(vaults, 'accountVaults').map(x => lower(x) as Hex) };
+  };
+  /** Does this account have anything on v2: consent given, a position, or money in the box? One request. */
+  async function touched(account: Address): Promise<V2Touched> {
+    const [p, routes, vaults] = await multicall(touchedReads(account));
+    return remember(account, touchedOf(p, routes, vaults));
+  }
+  /**
+   * `touched` for an account whose owner may NOT start on v2 (outside the audience, or new opens paused): such an account
+   * can only have what it already had, so "nothing" is remembered for `untouchedTtlMs` and costs no request until then.
+   * An account with anything on v2 is read every time.
+   */
+  async function touchedOutside(account: Address): Promise<V2Touched> {
+    const until = untouchedUntil.get(lower(account));
+    if (until !== undefined && until > now()) return NOTHING_ON_V2;
+    return touched(account);
+  }
+  /** `touched` for many accounts, 40 accounts per request (the keeper round asks every account of the chain each round).
+   * null for an account whose own reads did not come back: the caller asks about that one by itself, it is never guessed. */
+  async function touchedMany(accounts: readonly Address[]): Promise<(V2Touched | null)[]> {
+    const res = await multicall(accounts.flatMap(touchedReads), { chunk: 120 });
+    return accounts.map((account, i) => {
+      const [p, routes, vaults] = [res[i * 3] ?? null, res[i * 3 + 1] ?? null, res[i * 3 + 2] ?? null];
+      if (p === null || routes === null || vaults === null) { untouchedUntil.delete(lower(account)); return null; }
+      return remember(account, touchedOf(p, routes, vaults));
+    });
   }
   /** Has the account delegated borrowing to the v2 executor on each lending venue (Venus `approvedDelegates`, Moolah `isAuthorized`)? One request. */
   async function delegations(account: Address): Promise<{ venus: boolean; lista: boolean }> {
@@ -399,7 +488,7 @@ export function createV2Reader(deps: V2ReaderDeps) {
       state: { enabled, policyMaxDebtUsdRaw: policy.maxDebt, principalUsdRaw: principalUsd, holdings, ...(foreignVenusLoans.length > 0 ? { foreignVenusLoans } : {}) } };
   }
 
-  return { v2, book: getBook, market: getMarket, touched, delegations, account: readAccount,
+  return { v2, book: getBook, market: getMarket, touched, touchedOutside, touchedMany, delegations, account: readAccount,
     /** Pending incentive a chain-97 mock earn vault owes the box (`rewardOf`); null where the vault has no such read. */
     async vaultReward(vault: Address, box: Address): Promise<bigint | null> { const [r] = await multicall([venue(vault, 'rewardOf', [box])]); return typeof r === 'bigint' ? r : null; },
     /**
@@ -442,8 +531,7 @@ export function defaultV2Reader(v2: StrategyEarnV2, env: NodeJS.ProcessEnv = pro
   const key = `${v2.chainId}:${v2.executor}`;
   let r = readers.get(key);
   if (!r) {
-    const urls = v2PublicRpcs(v2.chainId, env);
-    const client = createPublicClient({ transport: urls.length === 1 ? http(urls[0], { timeout: 12_000, retryCount: 1 }) : fallback(urls.map(u => http(u, { timeout: 12_000, retryCount: 0 })), { rank: false }) });
+    const client = createPublicClient({ transport: v2PublicTransport(v2.chainId, env) });
     r = createV2Reader({ v2, multicall: v2Multicall(client) });
     readers.set(key, r);
   }
@@ -451,8 +539,7 @@ export function defaultV2Reader(v2: StrategyEarnV2, env: NodeJS.ProcessEnv = pro
 }
 /** Logs and the head from the public nodes (never the paid RPC): the cash swapper's events for the cash ledger's recovery scan. */
 export function v2LogReader(v2: StrategyEarnV2, env: NodeJS.ProcessEnv = process.env) {
-  const urls = v2PublicRpcs(v2.chainId, env);
-  const client = createPublicClient({ transport: urls.length === 1 ? http(urls[0], { timeout: 12_000, retryCount: 1 }) : fallback(urls.map(u => http(u, { timeout: 12_000, retryCount: 0 })), { rank: false }) });
+  const client = createPublicClient({ transport: v2PublicTransport(v2.chainId, env) });
   return { getBlockNumber: () => client.getBlockNumber({ cacheTime: 0 }),
     getLogs: (filter: { address: Address; events: readonly unknown[]; args: Record<string, Address | readonly Address[]>; fromBlock: bigint; toBlock: bigint }) =>
       client.getLogs({ address: filter.address, events: filter.events as never, args: filter.args as never, fromBlock: filter.fromBlock, toBlock: filter.toBlock, strict: true }) as Promise<readonly Log[]> };
@@ -460,7 +547,7 @@ export function v2LogReader(v2: StrategyEarnV2, env: NodeJS.ProcessEnv = process
 /** Estimated gas of one executor call sent by the account itself (public node), or null when it cannot be estimated. */
 export async function v2EstimateGas(v2: StrategyEarnV2, account: Address, call: Call, env: NodeJS.ProcessEnv = process.env): Promise<bigint | null> {
   try {
-    const client = createPublicClient({ transport: http(v2PublicRpcs(v2.chainId, env)[0], { timeout: 8_000, retryCount: 0 }) });
+    const client = createPublicClient({ transport: v2PublicTransport(v2.chainId, env) });
     return await client.estimateGas({ account, to: call.to, data: call.data });
   } catch { return null; }
 }

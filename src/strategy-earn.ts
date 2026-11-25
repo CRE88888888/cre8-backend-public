@@ -14,7 +14,7 @@ import { createMainnetRates, mainnetQuote } from './strategy-earn-mainnet.js';
 import type { MainnetRates } from './strategy-earn-mainnet.js';
 import { parseRewardSignature, rewardsStore, strategyRewardsEnabled } from './strategy-rewards.js';
 import type { RewardsStore, RewardsView } from './strategy-rewards.js';
-import { routeLedger, routeMessage, strategyEarnV2For, v2Authorized } from './strategy-earn-v2.js';
+import { routeLedger, routeMessage, strategyEarnV2, strategyEarnV2For, v2Audience, v2Authorized, v2MayOpen } from './strategy-earn-v2.js';
 import type { RouteEventKind, StrategyEarnV2 } from './strategy-earn-v2.js';
 import { createStrategyEarnV2Api } from './strategy-earn-v2-api.js';
 import type { StrategyEarnV2Api } from './strategy-earn-v2-api.js';
@@ -336,8 +336,13 @@ const TEMPORARILY = 'Temporarily unavailable.';
 /** Server-side cache for the public GET /strategy-earn/markets (31 status reads): one chain read per minute at most. */
 export const MARKETS_CACHE_MS = 60_000;
 export type StrategyEarnDeps = { chainId: number; chain: () => StrategyEarnChain; owned: typeof requireOwnedPortfolio; now: () => Date; rewards?: RewardsStore; rewardsEnabled?: boolean; ledger?: StrategyEarnLedger;
-  /** Routing v2 for this owner; default `strategyEarnV2For(chainId, owner)` (the canary list). Tests pass a fixed deployment or null. */
+  /** The routing v2 deployment for this owner; default `strategyEarnV2(chainId)` — the chain's deployment, for everyone
+   * (who may start on it is `v2Open`). Tests pass a fixed deployment or null. */
   v2?: StrategyEarnV2 | null | ((owner: string) => StrategyEarnV2 | null);
+  /** Who this owner is to v2: `audience` — in the audience (the canary list / `audience`); `mayOpen` — may start something
+   * new now (in the audience and new opens not paused). Default: both true when `v2` is passed (tests), else
+   * v2Audience / v2MayOpen. Neither decides whether an account that already has something on v2 is answered by v2: it always is. */
+  v2Open?: (owner: string) => { audience: boolean; mayOpen: boolean };
   /** The v2 side of these endpoints (src/strategy-earn-v2-api.ts); default reads the chain through the public-node reader. */
   v2Api?: (v2: StrategyEarnV2) => StrategyEarnV2Api;
   /** 0 = no cache (tests). Default MARKETS_CACHE_MS. */
@@ -377,8 +382,8 @@ export async function strategyEarnV1Active(chain: StrategyEarnChain, account: Ad
  * The paymaster's and the scheduler's question before sponsoring / sending anything that adds risk on one generation: is
  * the OTHER generation still in use on this account? Reads the chain; a failed read throws (never answered by a guess).
  */
-export async function strategyGenerationActive(generation: 'v1' | 'v2', account: Address, v2: StrategyEarnV2): Promise<boolean> {
-  if (generation === 'v2') return defaultStrategyEarnV2Api(v2).active(account);
+export async function strategyGenerationActive(generation: 'v1' | 'v2', account: Address, v2: StrategyEarnV2, outside = false): Promise<boolean> {
+  if (generation === 'v2') return defaultStrategyEarnV2Api(v2).active(account, outside);
   const chain = defaultStrategyEarnChain();
   return strategyEarnV1Active(chain, account, (await chain.head()).number);
 }
@@ -407,7 +412,10 @@ export function defaultStrategyEarnV2Api(v2: StrategyEarnV2): StrategyEarnV2Api 
 /**
  * My mix weight change, either generation (one account uses v1 or v2, never both): an account that has anything on
  * routing v2 re-consents there (`setStrategyPolicy` right after the enroll, in the same owner UserOp); every other account
- * gets the v1 calls exactly as before. Only an owner in the v2 audience can reach the v2 branch.
+ * gets the v1 calls exactly as before. Only an owner who may START on v2 (`strategyEarnV2For`: in the audience, new opens
+ * not paused) can reach the v2 branch: a re-consent is a new consent. For any other owner whose account is on v2 the
+ * weight change carries no consent at all (v1 is not on, so the v1 calls are []): the enrollment voids the v2 consent
+ * and the scheduler closes the position — it is never left unmanaged.
  */
 export async function mixStrategyConsent(input: Parameters<typeof mixStrategyConsentCalls>[0] & { owner?: string }, deps: { chain?: StrategyEarnChain; v2?: (owner: string) => StrategyEarnV2 | null;
   v2Api?: (v2: StrategyEarnV2) => StrategyEarnV2Api } = {}): Promise<Call[]> {
@@ -440,25 +448,36 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
   };
   const ready = () => { if (deps.chainId !== 97) throw new AppError(404, 'STRATEGY_EARN_NOT_CONFIGURED', '策略加息目前僅開放測試網。'); };
   // ---- Routing v2 (src/strategy-earn-v2*.ts): one account uses v1 or v2, never both (cre8-contracts borrow-routing-v2 §12).
-  // v2 answers only for an owner in the audience (strategyEarnV2For: a canary list today). For such an owner an account is
-  // on v2 when it already has anything there; a clean account starts on v2; an account with a v1 position or v1 consent stays
-  // on v1 until that is closed. Every other owner never reaches any of this.
-  const v2Of = (owner: string): StrategyEarnV2 | null => typeof deps.v2 === 'function' ? deps.v2(owner) : deps.v2 === undefined ? strategyEarnV2For(deps.chainId, owner) : deps.v2;
+  // An account that already has anything on v2 is answered by v2 WHOEVER its owner is: its position is read, and it can
+  // always be closed. The audience (`v2Open`) only decides who may START there: a clean account of an owner who may open
+  // starts on v2; an account with a v1 position or v1 consent stays on v1 until that is closed; an owner who may not open
+  // (outside the audience, or new opens paused) starts on v1, and can add nothing to what an account already has on v2.
+  const v2Of = (owner: string): StrategyEarnV2 | null => typeof deps.v2 === 'function' ? deps.v2(owner) : deps.v2 === undefined ? strategyEarnV2(deps.chainId) : deps.v2;
+  const v2Open = (owner: string): { audience: boolean; mayOpen: boolean } => deps.v2Open ? deps.v2Open(owner)
+    : deps.v2 !== undefined ? { audience: true, mayOpen: true } : { audience: v2Audience(deps.chainId, owner), mayOpen: v2MayOpen(deps.chainId, owner) };
   const v2ApiOf = (v2: StrategyEarnV2): StrategyEarnV2Api => deps.v2Api ? deps.v2Api(v2) : defaultStrategyEarnV2Api(v2);
   const v1Active = (chain: StrategyEarnChain, account: Address, block: bigint) => strategyEarnV1Active(chain, account, block);
   /**
    * The v2 side for this account, or null (= v1 answers). `forNew`: the request wants to turn the strategy on, so a clean
-   * account of an audience owner starts on v2; otherwise only an account that already has something on v2 is v2.
+   * account of an owner who may open starts on v2; otherwise only an account that already has something on v2 is v2.
+   * `mayOpen` false on the answer: the account is on v2 but nothing may be added to it (`open` / `auto` say unavailable).
+   * An owner outside the audience whose account has nothing on v2 costs one public-node read every ten minutes at most.
    * A read that fails throws: which generation holds the money is never guessed.
    */
-  async function v2Side(account: Address, wallet: string, forNew: boolean): Promise<{ api: StrategyEarnV2Api; v2: StrategyEarnV2 } | null> {
+  async function v2Side(account: Address, wallet: string, forNew: boolean): Promise<{ api: StrategyEarnV2Api; v2: StrategyEarnV2; mayOpen: boolean } | null> {
     const v2 = v2Of(wallet);
     if (!v2) return null;
-    const api = v2ApiOf(v2);
-    if (await api.active(account)) return { api, v2 };
-    if (!forNew) return null;
+    const api = v2ApiOf(v2), open = v2Open(wallet);
+    if (await api.active(account, !open.audience)) return { api, v2, mayOpen: open.mayOpen };
+    if (!forNew || !open.mayOpen) return null;
     const chain = deps.chain(), head = await chain.head();
-    return await v1Active(chain, account, head.number) ? null : { api, v2 };
+    return await v1Active(chain, account, head.number) ? null : { api, v2, mayOpen: true };
+  }
+  /** The deployment, when v2 has anything to say about this account: its owner is in the audience, or the account is on v2. Throws when that cannot be read. */
+  async function v2About(account: Address, wallet: string): Promise<StrategyEarnV2 | null> {
+    const v2 = v2Of(wallet);
+    if (!v2) return null;
+    return v2Open(wallet).audience || await v2ApiOf(v2).active(account, true) ? v2 : null;
   }
   const v2Unavailable = () => ({ status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY });
   /** Newest active session key carries the whole routing v2 scope for this account (and the not-for-signatures flag). */
@@ -633,9 +652,13 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
       // Routing v2 where there is no proof API (chain 97: the simulated vaults pay the box directly): the same ledger view,
       // and no owner signature is ever asked for.
       if (!rewardsOn() && v2Of(wallet)) {
-        const account = await owned(id, wallet);
-        const view = await (deps.rewards ?? rewardsStore()).view(deps.chainId, id, deps.now());
-        return { portfolioId: id, account, ...view, signature: { needed: false, signedAt: null } };
+        // An owner in the audience, or (whoever the owner is) an account that is on v2. Anyone else gets the answer they
+        // always got below; so does an account whose v2 state cannot be read right now.
+        const mine = v2Open(wallet).audience ? await owned(id, wallet) : await owned(id, wallet).then(async a => await v2About(a, wallet) ? a : null).catch(() => null);
+        if (mine !== null) {
+          const view = await (deps.rewards ?? rewardsStore()).view(deps.chainId, id, deps.now());
+          return { portfolioId: id, account: mine, ...view, signature: { needed: false, signedAt: null } };
+        }
       }
       const account = await rewardsAccount(id, wallet);
       return { portfolioId: id, account, ...await (deps.rewards ?? rewardsStore()).view(deps.chainId, id, deps.now()) };
@@ -649,6 +672,9 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
       const collateralRaw = BigInt(b.collateralRaw);
       let side: Awaited<ReturnType<typeof v2Side>>;
       try { side = await v2Side(account, wallet, true); } catch { return { ...v2Unavailable(), asset: String(b.asset) }; }
+      // The account is on v2 and nothing may be added there (its owner is outside the audience, or new opens are paused): it
+      // can only close. It is not offered v1 either — one account never uses both.
+      if (side && !side.mayOpen) return { ...v2Unavailable(), asset: String(b.asset) };
       if (side) {
         if (typeof b.asset !== 'string' || !/^[A-Za-z0-9]{1,16}$/.test(b.asset)) throw new ValidationError('INVALID_ASSET', '這個資產沒有開放策略加息。');
         try {
@@ -693,6 +719,7 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
       const budget = BigInt(b.budgetRaw);
       let side: Awaited<ReturnType<typeof v2Side>>;
       try { side = await v2Side(account, wallet, true); } catch { return v2Unavailable(); }
+      if (side && !side.mayOpen) return v2Unavailable(); // on v2, nothing may be added (see `open`)
       if (side) {
         try {
           const chain = deps.chain(), head = await chain.head();
@@ -748,7 +775,8 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
         return { kind: r.kind as StrategyEarnKind | RouteEventKind, asset: r.asset, amountRaw: r.amount_raw, collateralRaw: r.collateral_raw, ltvBeforeBps: r.ltv_before_bps, ltvAfterBps: r.ltv_after_bps,
           txHash: r.tx_hash, blockNumber: r.block_number, createdAt: new Date(r.created_at).toISOString(), message: strategyEarnMessage(e) };
       });
-      // Routing v2 (db 0069): route changes and the other v2 events, only when a v2 deployment is configured for this chain.
+      // Routing v2 (db 0069): route changes and the other v2 events, only when a v2 deployment is configured for this chain
+      // (a ledger read, for every owner: an account keeps its v2 history whether or not its owner is in the audience).
       const v2 = v2Of(wallet);
       if (!v2) return { portfolioId: id, activity: v1 };
       const moved = (await deps.query<{ kind: RouteEventKind; asset: string | null; reason: string | null; venue: string | null; loan: string | null; vault_venue: string | null;
@@ -782,8 +810,10 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
       if (!tx.success) return { status: 'reverted' as const, recorded: 0 };
       const events = strategyEarnEvents(tx, id, account);
       await (deps.ledger ?? dbStrategyEarnLedger).record(97, events);
-      // Routing v2: the same receipt may carry AtpBorrowExecutorV2 events of this account (db 0069) and reward movements (db 0068).
-      const v2 = v2Of(wallet);
+      // Routing v2: the same receipt may carry AtpBorrowExecutorV2 events of this account (db 0069) and reward movements (db 0068)
+      // — for an owner in the audience, and for any account that is on v2 (its close must be recorded whoever the owner is).
+      let v2: StrategyEarnV2 | null;
+      try { v2 = await v2About(account, wallet); } catch { return { status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY }; }
       if (v2) {
         try {
           const more = await v2ApiOf(v2).confirm(id, account, wallet.toLowerCase() as Address, tx);
@@ -804,7 +834,8 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
       const account = await owned(id, wallet);
       const b = body(input, ['vaultId']);
       if (typeof b.vaultId !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(b.vaultId)) throw new ValidationError('INVALID_STRATEGY_EARN_REQUEST', 'vaultId 須為 0x 開頭的 32 位元組。');
-      const v2 = v2Of(wallet);
+      let v2: StrategyEarnV2 | null;
+      try { v2 = await v2About(account, wallet); } catch { return v2Unavailable(); }
       if (!v2) throw new AppError(404, 'STRATEGY_EARN_NOT_CONFIGURED', '這個帳戶沒有可救援的部位。');
       try { return await v2ApiOf(v2).rescue(account, b.vaultId.toLowerCase() as Hex); } catch { return v2Unavailable(); }
     },

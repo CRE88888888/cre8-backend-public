@@ -8,7 +8,7 @@ import { mixUnavailable } from './mix-store.js';
 import { TESTNET_97 as T } from './testnet-profile.js';
 import { findDeploymentBlock } from './holdings-scan.js';
 import { STRATEGY_EARN_INTERNAL } from './strategy-earn-guard.js';
-import { strategyEarnV2, v2Audience, v2InternalAddresses, V2_EXECUTOR_ABI } from './strategy-earn-v2.js';
+import { strategyEarnV2, v2InternalAddresses, V2_EXECUTOR_ABI } from './strategy-earn-v2.js';
 export type MixFlow = { kind: 'deposit' | 'withdrawal'; amountRaw: string; txHash: Hex; logIndex: number;
   blockNumber: bigint; blockHash: Hex; at: Date; asset: Address; quantityRaw: string; quote: MixFlowQuote };
 export type MixFlowQuote = { decimals: number; priceUsdE8: bigint; source: string; at: Date };
@@ -73,11 +73,12 @@ export async function readMixFlows(client: PublicClient, m: MixFlowAccount, from
       const event = decodeEventLog({ abi: erc20Abi, eventName: 'Transfer', data: log.data, topics: log.topics });
       const kind = mixFlowDirection(event.args.from, event.args.to, m);
       if (kind === null || event.args.value === 0n) continue;
-      // Routing v2: the account's own strategy box pays idle strategy money back to it. Only an owner in the v2 audience can
-      // have a box, and the box is never the owner: an ordinary deposit and every other owner's mix cost no read. One `boxOf`
-      // read per call, only when some other address sent such an account tokens.
+      // Routing v2: the account's own strategy box pays idle strategy money back to it — for any account that has one,
+      // whoever its owner is (the audience only decides who may START on v2; a box keeps paying back after its owner left
+      // it). The box is never the owner: an ordinary deposit costs no read. One `boxOf` read per call (a pure CREATE2
+      // address), only when some other address sent the account tokens; none without a v2 deployment.
       const sender = event.args.from.toLowerCase();
-      if (kind === 'deposit' && sender !== m.owner.toLowerCase() && v2Audience(97, m.owner)) { box ??= strategyBoxOf(client, m.account); if (sender === await box) continue; }
+      if (kind === 'deposit' && sender !== m.owner.toLowerCase()) { box ??= strategyBoxOf(client, m.account); if (sender === await box) continue; }
       const asset = log.address.toLowerCase() as Address;
       if (!assets.includes(asset)) throw mixUnavailable();
       const [receipt, block] = await Promise.all([client.getTransactionReceipt({ hash: log.transactionHash }), client.getBlock({ blockNumber: log.blockNumber })]);

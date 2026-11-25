@@ -1,5 +1,5 @@
 import { sponsoredRewardTokens } from './strategy-rewards.js';
-import { isRootSignedNonce, strategyEarnV2For, v2SponsoredCall } from './strategy-earn-v2.js';
+import { isRootSignedNonce, strategyEarnV2, v2Audience, v2MayOpen, v2SponsoredCall } from './strategy-earn-v2.js';
 import type { StrategyEarnV2 } from './strategy-earn-v2.js';
 import { verifyEnrollmentSponsorship } from './enrollment-sponsorship.js';
 import { verifyMixOwnerCalls } from './mix-chain.js';
@@ -85,11 +85,17 @@ type Query = (sql: string, params?: readonly unknown[]) => Promise<{ rows: unkno
 export type PaymasterDeps = {
   /** Reward tokens an owner may send to their wallet. Default: sponsoredRewardTokens(chainId) (mainnet, behind STRATEGY_REWARDS_ENABLED). */
   rewardTokens?: readonly Address[];
-  /** Routing v2 deployment whose calls may be sponsored. Default: strategyEarnV2For(chainId, owner) — null for every owner outside the v2 audience (a canary list today). */
+  /** Routing v2 deployment whose calls may be sponsored. Default: strategyEarnV2(chainId) — the chain's deployment, for
+   * every owner: what settles (repay, close, top-up, cash-out, consent off, rewards) is sponsored for anyone, so an
+   * account that has something on v2 can always get out. What adds risk needs `strategyV2MayOpen`. */
   strategyV2?: StrategyEarnV2 | null;
+  /** May this owner START something on v2 (in the audience, and new opens not paused)? Default: v2MayOpen(chainId, owner);
+   * true when a test passes `strategyV2` itself. false: every v2 call that adds risk is refused. */
+  strategyV2MayOpen?: boolean;
   /** Is this generation of the yield strategy in use on the account (a position, debt or consent)? Default reads the chain
-   * (src/strategy-earn.ts strategyGenerationActive). Only asked for owners in the v2 audience. */
-  strategyGenerationActive?: (generation: 'v1' | 'v2', account: Address, v2: StrategyEarnV2) => Promise<boolean>;
+   * (src/strategy-earn.ts strategyGenerationActive). `outside`: the owner is outside the v2 audience, so "nothing on v2" may
+   * be answered from the reader's ten-minute memory (such an account cannot start there). */
+  strategyGenerationActive?: (generation: 'v1' | 'v2', account: Address, v2: StrategyEarnV2, outside?: boolean) => Promise<boolean>;
   mixSetup?: typeof verifyMixOwnerCalls;
   mixLock?: typeof withMixLock;
   config?: PaymasterConfig | null;
@@ -1042,8 +1048,14 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
           owner.owner.toLowerCase() !== wallet.toLowerCase() || owner.user_id.toLowerCase() !== wallet.toLowerCase()) throw rejected('PAYMASTER_SENDER_FORBIDDEN', 403);
       const isMix = owner.mix_id !== null && owner.mix_id !== undefined;
       const mixDca = (call: { target: Address; callData: Hex }) => mixDcaCall(call, op.sender, hex(owner.owner, 20), c);
-      // Routing v2 is decided per owner (strategyEarnV2For): outside its audience no v2 call, v2 renewal scope or v2 reward payout is sponsored.
-      const strategyV2 = deps.strategyV2 === undefined ? strategyEarnV2For(c.chainId, owner.owner) : deps.strategyV2;
+      // Routing v2: the chain's deployment, for every owner. The audience (v2MayOpen) only decides who may START on v2 —
+      // what adds risk (consent, open, move, a delegation or an approval to the v2 executor) is refused outside it, below.
+      // What settles is sponsored for anyone: an account that has something on v2 must always be able to repay, close and
+      // turn the strategy off, whether or not its owner is (still) in the audience and whether or not new opens are paused.
+      const strategyV2 = deps.strategyV2 === undefined ? strategyEarnV2(c.chainId) : deps.strategyV2;
+      const v2MayStart = strategyV2 !== null && (deps.strategyV2MayOpen ?? (deps.strategyV2 === undefined ? v2MayOpen(c.chainId, owner.owner) : true));
+      // In the audience (whether or not new opens are paused): the account may have started on v2 moments ago, so its state is read fresh.
+      const v2InAudience = strategyV2 !== null && (deps.strategyV2 === undefined ? v2Audience(c.chainId, owner.owner) : deps.strategyV2MayOpen !== false);
       const rewardTokens = deps.rewardTokens ?? [...sponsoredRewardTokens(c.chainId), ...(strategyV2?.rewardTokens ?? [])];
       const isRewardToken = (target: Address) => rewardTokens.some(token => isAddressEqual(target, token));
       // USDT and reward tokens (LISTA / XVS) going to the owner's wallet; the recipient is checked in validateSponsoredCalls.
@@ -1128,17 +1140,21 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
       }
       validateSponsoredCalls(op, c, { owner: hex(owner.owner, 20), assets, rewardTokens, v2: strategyV2 });
       // One account uses yield strategy v1 or routing v2, never both (cre8-contracts borrow-routing-v2 §12: the contract's
-      // ForeignDebt check can be walked around, so the rule is enforced here). Owners outside the v2 audience can only ever
-      // reach v1, so only an audience owner's UserOp that ADDS risk on one generation is checked against the other.
+      // ForeignDebt check can be walked around, so the rule is enforced here): a UserOp that ADDS risk on one generation is
+      // checked against the other. That includes v1 risk from an owner outside the v2 audience — the account may still hold
+      // a v2 position from when its owner was in it; "nothing on v2" is then remembered for ten minutes, so it costs such
+      // an owner one public-node read at most.
       if (strategyV2) {
         const v2Ctx = { sender: op.sender, owner: hex(owner.owner, 20), assets: testnetAssets().map(a => a.address), rootSigned: isRootSignedNonce(op.nonce) };
         const adds = (generation: 'v1' | 'v2') => calls.some(call => {
           try { return generation === 'v2' ? v2SponsoredCall(strategyV2, call, v2Ctx) === 'risk' : v2SponsoredCall(strategyV2, call, v2Ctx) === null && mixStrategyCall(call, c) === 'risk'; } catch { return false; }
         });
+        // Nothing new starts on v2 for this owner (outside the audience, or `newOpensPaused`): no chain read, no exception.
+        if (!v2MayStart && adds('v2')) throw rejected('PAYMASTER_CALL_FORBIDDEN', 403, 'routing v2: nothing new starts for this owner (outside the audience, or new opens are paused)');
         for (const [wants, other] of [['v2', 'v1'], ['v1', 'v2']] as const) {
           if (!adds(wants)) continue;
           let busy: boolean;
-          try { busy = await bounded((deps.strategyGenerationActive ?? (async (g, account, v2) => (await import('./strategy-earn.js')).strategyGenerationActive(g, account, v2)))(other, op.sender, strategyV2), c.timeoutMs * 2); }
+          try { busy = await bounded((deps.strategyGenerationActive ?? (async (g, account, v2, outside) => (await import('./strategy-earn.js')).strategyGenerationActive(g, account, v2, outside)))(other, op.sender, strategyV2, !v2InAudience), c.timeoutMs * 2); }
           catch { throw rejected('PAYMASTER_DEPENDENCY_UNAVAILABLE', 503); }
           if (busy) throw rejected('PAYMASTER_CALL_FORBIDDEN', 403, `yield strategy ${other} is still in use on this account`);
         }

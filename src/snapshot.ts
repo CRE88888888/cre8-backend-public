@@ -144,7 +144,7 @@ export type PlanDeps = {
   block?: bigint;
   /** Chain 97 Strategy Earn shares posted as collateral at `block` (backend#204). Default reads AtpBorrowRegistry. */
   strategyEarnCollateral?: (account: Address, block: bigint) => Promise<StrategyEarnCollateral[]>;
-  /** The same for routing v2 (AtpBorrowLensV2), read only for accounts of an owner in the v2 audience. */
+  /** The same for routing v2 (AtpBorrowLensV2), read for every account when the chain has a v2 deployment. */
   strategyEarnV2Collateral?: (account: Address, block: bigint) => Promise<StrategyEarnCollateral[]>;
   /** Chain 97 per-account yield read; default `readYieldAccount`. */
   readYield?: (client: PublicClient, profile: YieldProfile, account: Address, options: { block: bigint; ignore?: readonly Hex[] }) => Promise<YieldRead>;
@@ -187,8 +187,9 @@ export async function readStrategyEarnCollateral(client: PublicClient, account: 
 /**
  * Shares posted through routing v2 at `block`: the account's routes from the v2 registry, each route's collateral from
  * the lens. Venus routes of one collateral (they differ only in the loan token) share the same vTokens: counted once.
- * One read (`accountRoutes`) for an account with nothing on v2. No v2 deployment on this chain = []. Only called for
- * accounts of an owner in the v2 audience (planPortfolio): nobody else can have a v2 position, and they cost no read.
+ * One read (`accountRoutes`) for an account with nothing on v2. No v2 deployment on this chain = []. Called for every
+ * account (planPortfolio): the audience only decides who may START on v2, and an account whose owner is no longer in it
+ * (the audience was narrowed, the two services disagreed for a while) still has its shares posted there.
  */
 export async function readStrategyEarnV2Collateral(client: PublicClient, account: Address, block: bigint): Promise<StrategyEarnCollateral[]> {
   const { strategyEarnV2, V2_LENS_ABI, V2_REGISTRY_ABI } = await import('./strategy-earn-v2.js');
@@ -405,9 +406,12 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
   // My mix too: without them a posted asset would read as sold, the planner would buy it again and the return would jump.
   const strategyEarnRead = chainId !== 97 ? null
     : early((deps.strategyEarnCollateral ?? ((a: Address, b: bigint) => readStrategyEarnCollateral(client, a, b)))(account, block));
-  // Routing v2 (one account is on v1 or v2, never both; only owners in the v2 audience can be on v2): the shares it posted
-  // are this portfolio's holding just the same. Unknown -> throw, as above.
-  const v2Read = chainId !== 97 ? null : early((async () => (await import('./strategy-earn-v2.js')).v2Audience(chainId, owner)
+  // Routing v2 (one account is on v1 or v2, never both): the shares it posted are this portfolio's holding just the same.
+  // Read for EVERY account, whoever its owner is — the audience only decides who may start on v2; skipping an account that
+  // is on v2 while its owner is outside it would read its posted shares as sold, and the planner would buy them again.
+  // One read at this block (`accountRoutes`) for an account with nothing there; no deployment on this chain = no read.
+  // Unknown -> throw, as above.
+  const v2Read = chainId !== 97 ? null : early((async () => (await import('./strategy-earn-v2.js')).strategyEarnV2(chainId) !== null
     ? (deps.strategyEarnV2Collateral ?? ((a: Address, b: bigint) => readStrategyEarnV2Collateral(client, a, b)))(account, block)
         .catch(() => { throw new Error('strategy earn collateral unavailable'); })
     : null)());

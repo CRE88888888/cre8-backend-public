@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { decodeFunctionData, encodeAbiParameters, encodeEventTopics, maxUint256 } from 'viem';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { decodeFunctionData, encodeAbiParameters, encodeEventTopics, maxUint256, parseAbi } from 'viem';
 import type { Address, Hex, Log } from 'viem';
 import { planAccount } from '../src/strategy-earn-routing.js';
 import { createStrategyEarnV2Api } from '../src/strategy-earn-v2-api.js';
-import { createV2Reader, v2PublicRpcs } from '../src/strategy-earn-v2-chain.js';
+import { createV2Reader, v2HasState, v2Multicall, v2PublicRpcs, v2RpcTransport, V2_RPC_COOLDOWN_MS, V2_RPC_TIMEOUT_MS, V2_UNTOUCHED_TTL_MS } from '../src/strategy-earn-v2-chain.js';
 import { fromMainnetRates, fromTestnetMocks, reportCalldata, reportDue, runRateReport } from '../src/strategy-earn-v2-rates.js';
-import { runV2KeeperRound, v2AutoRound, v2MinCollectRaw, v2RewardHolders, v2UnwindForSale } from '../src/strategy-earn-v2-scheduler.js';
+import { runV2KeeperRound, v2AutoRound, v2MinCollectRaw, v2QuietRound, v2RewardHolders, v2UnwindForSale } from '../src/strategy-earn-v2-scheduler.js';
 import type { V2Ledger, V2Tx } from '../src/strategy-earn-v2-scheduler.js';
 import { boxRewardSignature, cashOutMinUsdt, topUpMaxUsdtIn, v2ConsentCalls, V2_CASH_OUT_ALONE_MIN_RAW, V2_EXECUTOR_ABI, V2_REGISTRY_ABI, V2_SWAPPER_ABI } from '../src/strategy-earn-v2.js';
 import type { Call, RouteEvent, SwapEvent } from '../src/strategy-earn-v2.js';
@@ -383,7 +385,7 @@ test('keeper round: executeDeleverage only when the venue says the health line i
   const sent: { to: Address; name: string }[] = [], lines: string[] = [], led = ledger();
   const run = (send: boolean, dryRun = false) => runV2KeeperRound({ dryRun, log: l => lines.push(l) }, { v2: W.v2, reader, ledger: led.l, accounts: async () => [{ account: W.account, portfolioId: 9, owner: W.owner }],
     send: send ? async (to, data) => { sent.push({ to, name: to === W.v2.executor ? decodeFunctionData({ abi: V2_EXECUTOR_ABI, data }).functionName : 'claimReward' }); return tx(sent.length); } : null });
-  assert.deepEqual(await run(true), { accounts: 1, checked: 0, deleveraged: 0, collected: 0, stranded: 0, failed: 0, writer: true });
+  assert.deepEqual(await run(true), { accounts: 1, managed: 0, checked: 0, deleveraged: 0, collected: 0, stranded: 0, failed: 0, writer: true });
   openVenus(w);
   assert.deepEqual([(await run(true)).checked, sent.length], [1, 0]); // healthy: nothing is sent
   w.state.positions.get(w.ids.nvdaVenusUsdt)!.shouldDeleverage = true;
@@ -909,4 +911,215 @@ test('after "sell all" (routing v2 API): autoOpen reads off until Earn extra is 
   w.state.policy = { ...w.state.policy, maxDebt: 0n, enabled: false };
   assert.ok(await ceiling([]) > 0n);
   assert.deepEqual(notes[1], [W.account, { [V2_CONSENT_KEY]: '0' }]);
+});
+
+// ---------------------------------------------------------------------------
+// 2026-11-26: the audience only decides who may START on v2; an account that has anything there is always looked after
+// ---------------------------------------------------------------------------
+/** The scheduler's quiet round for one account (src/scheduler.ts `open`), with the v1 step counted. */
+function quiet(w: ReturnType<typeof world>, v2 = W.v2, readerDeps: Parameters<typeof createV2Reader>[0] = w.readerDeps) {
+  const reader = createV2Reader(readerDeps), sent: Call[][] = [], lines: string[] = [], led = ledger();
+  const state = { v1: 0, v1Note: null as string | null };
+  const step = { v2, reader, account: W.account, portfolioId: 9, now: NOW, dryRun: false, ledger: led.l, log: (l: string) => lines.push(l), held: [W.NVDA], send: async (calls: Call[]) => { sent.push(calls); return tx(sent.length); } };
+  const round = (mayOpen: boolean) => v2QuietRound({ v2, reader, account: W.account, mayOpen, log: l => lines.push(l), v1: async () => { state.v1++; return state.v1Note; },
+    v2Round: (touched, may) => v2AutoRound({ ...step, touched, mayOpen: may }) });
+  return { reader, sent, lines, led, state, step, round };
+}
+
+test('2026-11-26 leftover loan token: consent withdrawn, no route, no vault — the quiet round still runs the v1 step AND sells the USDC / USD1 / U a close left behind; under 0.01 it is not worth a UserOp of its own', async () => {
+  const w = world(WS), q = quiet(w, WS);
+  // Turned off earlier: nothing on v2 any more except the recipient the turn-off kept, and 3 USDC the close left in the account.
+  w.state.policy = { maxDebt: 0n, rewardRecipient: W.owner, strategyId: 57n, enabled: false };
+  w.setBalance(USDC, W.account, 3n * E18); w.setAllowance(USDC, W.account, SWAPPER, maxUint256);
+  // Until this fix the scheduler sent such an account to the v1 step alone ("nothing on v2") and the USDC stayed where it was.
+  assert.match((await q.round(true))!, /USDC 已換回 USDT tx=0x0+1$/);
+  assert.deepEqual([q.state.v1, q.sent.map(c => c.map(swapFn)), swapArgs(q.sent[0]![0]!).slice(0, 3)], [1, [['cashOut']], [USDC, maxUint256, 3n * E18 * 997n / 1_000n]]);
+  // The v1 step's own note is kept next to it.
+  q.state.v1Note = '[STRATEGY_EARN] v1 note';
+  assert.match((await q.round(true))!, /^\[STRATEGY_EARN\] v1 note；\[STRATEGY_ROUTING\] 關閉後留在帳戶的 USDC 已換回 USDT/);
+  q.state.v1Note = null;
+  // The same for an owner who may no longer start on v2 (outside the audience, or new opens paused).
+  q.sent.length = 0;
+  assert.match((await q.round(false))!, /USDC 已換回 USDT/);
+  assert.equal(q.sent.length, 1);
+  // A leftover under V2_CASH_OUT_ALONE_MIN_RAW (0.01) is not sold on its own; at 0.01 it is.
+  q.sent.length = 0; w.setBalance(USDC, W.account, V2_CASH_OUT_ALONE_MIN_RAW - 1n);
+  assert.equal(await q.round(true), null);
+  assert.equal(q.sent.length, 0);
+  w.setBalance(USDC, W.account, V2_CASH_OUT_ALONE_MIN_RAW);
+  assert.match((await q.round(true))!, /USDC 已換回 USDT/);
+  // A failed leftover read never fails the round: the v1 step's answer stands and the next round looks again.
+  const broken = quiet(w, WS, { ...w.readerDeps, v2: WS });
+  const real = broken.reader.leftovers; broken.reader.leftovers = async () => { throw new Error('public node down'); };
+  assert.equal(await broken.round(true), null);
+  assert.ok(broken.lines.some(l => /leftover loan token not looked at this round/.test(l)));
+  broken.reader.leftovers = real;
+  // An account that never used v2: the v1 step alone, one request; on a deployment without a swapper nothing is looked for either.
+  w.state.policy.rewardRecipient = '0x0000000000000000000000000000000000000000';
+  const v1Before = q.state.v1, before = w.state.requests; q.sent.length = 0;
+  assert.equal(await q.round(true), null);
+  assert.deepEqual([q.state.v1 - v1Before, q.sent.length, w.state.requests - before], [1, 0, 1]);
+});
+
+test('an owner who may not start on v2 and whose account has nothing there costs one request every ten minutes, not one per round; anything on v2 is read every time', async () => {
+  const w = world();
+  let now = WORLD_START;
+  const reader = createV2Reader({ ...w.readerDeps, now: () => now });
+  const requests = async (work: () => Promise<unknown>) => { const before = w.state.requests; await work(); return w.state.requests - before; };
+  assert.equal(V2_UNTOUCHED_TTL_MS, 10 * 60_000);
+  assert.deepEqual([await requests(() => reader.touchedOutside(W.account)), await requests(() => reader.touchedOutside(W.account)), v2HasState(await reader.touchedOutside(W.account))], [1, 0, false]);
+  // An owner in the audience is always read fresh (the account may have started on v2 a moment ago).
+  assert.equal(await requests(() => reader.touched(W.account)), 1);
+  now += V2_UNTOUCHED_TTL_MS + 1;
+  assert.equal(await requests(() => reader.touchedOutside(W.account)), 1);
+  // Something appears on v2 (the owner acted outside this backend, or the two services disagreed about the audience for
+  // a while): seen at the next read, and from then on read every time.
+  consenting(w, 0n);
+  assert.equal(v2HasState(await reader.touchedOutside(W.account)), false); // still remembered as nothing...
+  now += V2_UNTOUCHED_TTL_MS + 1;
+  assert.deepEqual([v2HasState(await reader.touchedOutside(W.account)), await requests(() => reader.touchedOutside(W.account)), await requests(() => reader.touchedOutside(W.account))], [true, 1, 1]);
+  // ...unless the keeper round's bulk read (every round) has seen it first: that refreshes the memory both ways.
+  const w2 = world(), r2 = createV2Reader({ ...w2.readerDeps, now: () => WORLD_START });
+  assert.deepEqual((await r2.touchedMany([W.account, W.owner])).map(t => t && v2HasState(t)), [false, false]);
+  const before = w2.state.requests;
+  await r2.touchedOutside(W.account); await r2.touchedOutside(W.owner);
+  assert.equal(w2.state.requests - before, 0); // the bulk read answered for both
+  consenting(w2, 0n);
+  assert.equal(v2HasState(await r2.touchedOutside(W.account)), false);
+  assert.deepEqual((await r2.touchedMany([W.account])).map(t => t && v2HasState(t)), [true]);
+  assert.equal(v2HasState(await r2.touchedOutside(W.account)), true);
+});
+
+test('an account on v2 whose owner may no longer start there is still looked after in full — repaid, closed, unwound before a sale — and adds no risk: no top-up, no move; what has to be left is closed', async () => {
+  const w = world(), q = quiet(w);
+  const old = 1_795_000_000 - 30 * 86_400;
+  openVenus(w, { since: old });
+  // A fill since the position was opened: 5 more NVDAB free in the account. In the audience the round tops the position up.
+  w.setBalance(W.NVDA, W.account, 5n * E18);
+  assert.match((await q.round(true))!, /NVDAB open\(top_up\)/);
+  assert.deepEqual(q.sent.map(c => c.map(fn)), [['executeOpen']]);
+  // Outside the audience (or new opens paused): the position is read and held, nothing is borrowed on top; the v1 step is not run for it.
+  q.sent.length = 0; q.state.v1 = 0;
+  assert.equal(await q.round(false), null);
+  assert.deepEqual([q.sent.length, q.state.v1], [0, 0]);
+  assert.ok(q.lines.some(l => /NVDAB hold: nothing new starts on routing v2 for this account/.test(l)));
+  // Its vault stopped paying (negative carry). In the audience: moved to the better vault. Outside: closed — never moved.
+  w.setBalance(W.NVDA, W.account, 0n);
+  w.state.holdings.clear(); w.state.holdings.set(w.ids.venusUsdt, { assets: 442n * E18, since: old });
+  assert.match((await q.round(true))!, /NVDAB migrate\(negative_carry\)/);
+  assert.deepEqual(q.sent.map(c => c.map(fn)), [['executeSwitchVault']]);
+  q.sent.length = 0;
+  assert.match((await q.round(false))!, /^\[STRATEGY_ROUTING\] 已執行：NVDAB close\(negative_carry\) tx=/);
+  assert.deepEqual([q.sent.map(c => c.map(fn)), argsOf(q.sent[0]![0]!).slice(1, 5)], [[['executeReduce']], [w.ids.nvdaVenusUsdt, w.ids.venusUsdt, maxUint256, maxUint256]]);
+  // The owner turns the strategy off (consent withdrawn): closed, exactly as in the audience.
+  w.state.holdings.clear(); w.state.holdings.set(w.ids.aaveUsdt, { assets: 442n * E18, since: old });
+  w.state.policy.enabled = false; q.sent.length = 0;
+  assert.match((await q.round(false))!, /NVDAB close\(disabled\)/);
+  assert.deepEqual(q.sent.map(c => c.map(fn)), [['executeReduce']]);
+  // Before a sale: repay and take the shares back, whoever the owner is (the scheduler passes what it read and `mayOpen`).
+  w.state.policy.enabled = true; q.sent.length = 0;
+  const touched = await q.reader.touchedOutside(W.account);
+  assert.equal(v2HasState(touched), true);
+  assert.match(String(await v2UnwindForSale({ ...q.step, touched, mayOpen: false, steps: [{ tokenIn: W.NVDA, amountIn: 5n * E18 }] })), /^\[STRATEGY_EARN_UNWINDING\] 賣出前已還款取回/);
+  assert.deepEqual(q.sent.map(c => c.map(fn)), [['executeReduce']]);
+  // A clean account of such an owner: the v1 step only, and after the first look not even a request.
+  const clean = world(), c = quiet(clean);
+  clean.setBalance(W.NVDA, W.account, 10n * E18);
+  assert.equal(await c.round(false), null);
+  const before = clean.state.requests;
+  assert.equal(await c.round(false), null);
+  assert.deepEqual([c.state.v1, c.sent.length, clean.state.requests - before], [2, 0, 0]);
+  // The public nodes do not answer: for such an owner the v1 step still runs (it never depended on them); for an owner in
+  // the audience the round fails as it always did — his account may have just started on v2.
+  const down = quiet(clean, W.v2, { ...clean.readerDeps, multicall: async () => { throw new Error('public node down'); } });
+  assert.equal(await down.round(false), null);
+  assert.deepEqual([down.state.v1, down.sent.length, down.lines.some(l => /routing v2 could not be read this round .*only the v1 step runs/.test(l))], [1, 0, true]);
+  await assert.rejects(down.round(true), /public node down/);
+  assert.equal(down.state.v1, 1);
+  // Consent alone (given while the owner was in the audience, nothing opened yet): nothing is opened for it either.
+  consenting(clean);
+  const fresh = quiet(clean);
+  assert.equal(await fresh.round(false), null);
+  assert.deepEqual([fresh.sent.length, fresh.state.v1], [0, 0]);
+  assert.match((await fresh.round(true))!, /NVDAB open\(best_route\)/);
+});
+
+test('keeper round: every account of the chain is asked in one bulk read (not one request each), and a position is watched whoever its owner is; accounts with nothing on v2 are not read further', async () => {
+  const w = world(), chunks: (number | undefined)[] = [], lines: string[] = [], led = ledger(), sent: string[] = [];
+  const reader = createV2Reader({ ...w.readerDeps, multicall: (reads, opts) => { if (reads.length > 100) chunks.push(opts?.chunk); return w.multicall(reads, opts); } });
+  const stranger = '0x00000000000000000000000000000000000000d1' as Address; // an owner on nobody's canary list: the keeper never asks who owns what
+  const others = Array.from({ length: 60 }, (_, i) => ('0x' + (0x5000 + i).toString(16).padStart(40, '0')) as Address);
+  const mine = { account: W.account, portfolioId: 9, owner: stranger };
+  const run = (accounts = [...others.map((account, i) => ({ account, portfolioId: 100 + i, owner: stranger })), mine]) => runV2KeeperRound({ dryRun: false, log: l => lines.push(l) }, { v2: W.v2, reader, ledger: led.l, accounts: async () => accounts,
+    send: async (to, data) => { sent.push(to === W.v2.executor ? decodeFunctionData({ abi: V2_EXECUTOR_ABI, data }).functionName : 'claimReward'); return tx(sent.length); } });
+  // Nobody has anything on v2: 61 accounts are one bulk read of 183 calls, cut 120 to a request (2 requests instead of
+  // 61), and neither the market nor any account is read further.
+  const before = { requests: w.state.requests, calls: w.state.calls };
+  assert.deepEqual(await run(), { accounts: 61, managed: 0, checked: 0, deleveraged: 0, collected: 0, stranded: 0, failed: 0, writer: true });
+  assert.deepEqual([w.state.requests - before.requests, w.state.calls - before.calls, chunks], [1, 183, [120]]);
+  // The multicall itself: 183 reads at 120 per request are 2 eth_calls.
+  let ethCalls = 0;
+  const counting = v2Multicall({ call: async ({ data }: { data?: Hex }) => { ethCalls++;
+    const n = (decodeFunctionData({ abi: parseAbi(['struct Call3 { address target; bool allowFailure; bytes callData; }', 'function aggregate3(Call3[] calls)']), data: data! }).args[0] as readonly unknown[]).length;
+    return { data: encodeAbiParameters([{ type: 'tuple[]', components: [{ type: 'bool' }, { type: 'bytes' }] }], [Array.from({ length: n }, () => [false, '0x'] as const)]) }; } } as never);
+  const read = { target: W.v2.registry, abi: V2_REGISTRY_ABI, functionName: 'accountRoutes', args: [W.account] };
+  assert.deepEqual([(await counting(Array.from({ length: 183 }, () => read), { chunk: 120 })).length, ethCalls], [183, 2]);
+  ethCalls = 0;
+  assert.deepEqual([(await counting(Array.from({ length: 183 }, () => read))).length, ethCalls], [183, 5]); // 40 per request by default
+  // An account with a position at its health line: deleveraged, although its owner is in no audience (the fixture's chain
+  // answers the same for every account, so this round has the one account).
+  openVenus(w);
+  w.state.positions.get(w.ids.nvdaVenusUsdt)!.shouldDeleverage = true;
+  const r = await run([mine]);
+  assert.deepEqual([r.accounts, r.managed, r.checked, r.deleveraged, sent], [1, 1, 1, 1, ['executeDeleverage']]);
+  // An account the bulk read cannot answer for is asked by itself (never taken for empty); when that fails too it is counted as failed.
+  const partial = createV2Reader({ ...w.readerDeps, multicall: async (reads, opts) => { const out = await w.multicall(reads, opts); return opts?.chunk === 120 ? out.map((x, i) => i === 1 ? null : x) : out; } });
+  const again = (reader2: typeof partial) => runV2KeeperRound({ dryRun: true, log: l => lines.push(l) }, { v2: W.v2, reader: reader2, ledger: led.l, accounts: async () => [mine], send: null });
+  assert.deepEqual([(await again(partial)).managed, (await again(partial)).failed], [1, 0]);
+  const blind = createV2Reader({ ...w.readerDeps, multicall: async (reads, opts) => { const out = await w.multicall(reads, opts); return reads.length === 3 ? out.map((x, i) => i === 1 ? null : x) : out; } });
+  assert.deepEqual([(await again(blind)).managed, (await again(blind)).failed], [0, 1]);
+});
+
+const WORLD_START = NOW.getTime();
+
+test('public nodes: one that does not answer costs a single short timeout, the next requests go straight to one that answers, and it is asked again after the cool-down; a revert is the answer, not a reason to ask elsewhere', async () => {
+  const hits = { quiet: 0, good: 0, reverting: 0 };
+  const answer = (name: 'good' | 'reverting') => createServer((req, res) => {
+    let body = ''; req.on('data', c => { body += c; }); req.on('end', () => { hits[name]++; const id = (JSON.parse(body) as { id: number }).id; res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify(name === 'good' ? { jsonrpc: '2.0', id, result: '0x61' } : { jsonrpc: '2.0', id, error: { code: 3, message: 'execution reverted' } })); });
+  });
+  const quietNode = createServer(req => { hits.quiet++; req.resume(); /* accepts the request and never answers */ }), good = answer('good'), reverting = answer('reverting');
+  const urlOf = async (s: ReturnType<typeof createServer>) => { await new Promise<void>(r => s.listen(0, '127.0.0.1', r)); return `http://127.0.0.1:${(s.address() as AddressInfo).port}`; };
+  const [quietUrl, goodUrl, revertingUrl] = [await urlOf(quietNode), await urlOf(good), await urlOf(reverting)];
+  try {
+    let now = 1_000_000;
+    const ask = (t: ReturnType<typeof v2RpcTransport>) => t({ retryCount: 0 }).request({ method: 'eth_chainId' });
+    const timed = async (work: () => Promise<unknown>) => { const at = performance.now(); const value = await work(); return { value, ms: performance.now() - at }; };
+    const t = v2RpcTransport([quietUrl, goodUrl], { timeoutMs: 250, now: () => now });
+    // The first request pays the quiet node's timeout once (250 ms here; 3.5 s in production, 12 s before) and is answered by the second node.
+    const first = await timed(() => ask(t));
+    assert.deepEqual([first.value, hits.quiet, hits.good], ['0x61', 1, 1]);
+    assert.ok(first.ms >= 200 && first.ms < 2_000, `first request took ${first.ms} ms`);
+    // The requests that follow do not wait for the quiet node at all.
+    const second = await timed(() => ask(t));
+    assert.deepEqual([second.value, hits.quiet, hits.good], ['0x61', 1, 2]);
+    assert.ok(second.ms < 200, `second request took ${second.ms} ms`);
+    now += V2_RPC_COOLDOWN_MS - 1; await ask(t);
+    assert.deepEqual([hits.quiet, hits.good], [1, 3]);
+    // After the cool-down the list order is back: the first node is asked again (and, still quiet, costs one timeout again).
+    now += 2; await ask(t);
+    assert.deepEqual([hits.quiet, hits.good], [2, 4]);
+    // A node that answers "the call reverted" has answered: the error is the caller's, the next node is not asked, the node is not set aside.
+    const r = v2RpcTransport([revertingUrl, goodUrl], { timeoutMs: 250, now: () => now });
+    await assert.rejects(ask(r), /execution reverted/);
+    await assert.rejects(ask(r), /execution reverted/);
+    assert.deepEqual([hits.reverting, hits.good], [2, 4]);
+    // Every node quiet: the request fails after one timeout each (the caller skips the round), it does not hang.
+    const none = await timed(() => ask(v2RpcTransport([quietUrl, quietUrl], { timeoutMs: 100, now: () => now })).then(() => 'answered', () => 'failed'));
+    assert.equal(none.value, 'failed');
+    assert.ok(none.ms < 2_000, `two quiet nodes took ${none.ms} ms`);
+    // Production numbers: 3.5 s per node (the paymaster's v1 / v2 check has 10 s), a minute of cool-down. Public nodes only.
+    assert.deepEqual([V2_RPC_TIMEOUT_MS, V2_RPC_COOLDOWN_MS], [3_500, 60_000]);
+    assert.throws(() => v2RpcTransport([]));
+  } finally { for (const s of [quietNode, good, reverting]) { s.closeAllConnections(); s.close(); } }
 });

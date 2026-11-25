@@ -113,7 +113,7 @@ test('mainnet rates are cached; a failed source keeps its last good value', asyn
 
 test('GET /strategy-earn/markets carries mainnetRates and a mainnet quote per routed asset, even with the chain-97 reads down', async () => {
   const rates = createMainnetRates({ fetch: fakeFetch() as never, markets });
-  const earn = createStrategyEarn({ chainId: 97, chain: () => { throw new Error('down'); }, mainnetRates: rates, marketsCacheMs: 0 });
+  const earn = createStrategyEarn({ v2: null, chainId: 97, chain: () => { throw new Error('down'); }, mainnetRates: rates, marketsCacheMs: 0 });
   const view = await earn.markets();
   assert.equal(view.mainnetRates?.vaults.USDC?.venue, 'lista');
   const byAsset = Object.fromEntries(view.markets.map(m => [m.asset, 'mainnet' in m ? m.mainnet : undefined]));
@@ -150,7 +150,7 @@ test('portfolio view: each open position carries its route (v1 chain-97 = the si
   const owned = (async () => ({ chainId: 97, ownerAddress: account, accountAddress: account })) as never;
   const calls: string[] = [];
   const rates = createMainnetRates({ fetch: fakeFetch({ calls }) as never, markets });
-  const earn = createStrategyEarn({ chainId: 97, chain: () => chain as never, owned, mainnetRates: rates });
+  const earn = createStrategyEarn({ v2: null, chainId: 97, chain: () => chain as never, owned, mainnetRates: rates });
   // Cold cache: the portfolio request does not wait for (or start) the mainnet read; routes are simply absent.
   const cold = await earn.portfolio(3, account);
   assert.equal(calls.length, 0);

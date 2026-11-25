@@ -281,17 +281,27 @@ export function v2ConsentCalls(v2: StrategyEarnV2, input: { maxDebtUsdRaw: bigin
  * My mix weight change (spec §4 "consent is pinned to the strategy id"): the change enrolls the account into a new private
  * strategy, which voids the policy. The same owner UserOp re-consents right after `enroll`: only `setStrategyPolicy` is
  * needed again (delegations and approvals are not tied to the enrollment), plus approvals for collateral the new weights add.
+ * `venues`: lending venues the new weights route through that this account has NOT delegated to the executor yet (an added
+ * asset whose only route is on the other venue). Only missing ones: the real venues refuse a delegation that changes nothing.
  */
-export function v2ReconsentCalls(v2: StrategyEarnV2, input: { maxDebtUsdRaw: bigint; rewardRecipient: Address; newCollaterals?: readonly Address[] }): Call[] {
+export function v2ReconsentCalls(v2: StrategyEarnV2, input: { maxDebtUsdRaw: bigint; rewardRecipient: Address; newCollaterals?: readonly Address[]; venues?: readonly ('venus' | 'lista')[] }): Call[] {
   if (input.maxDebtUsdRaw <= 0n) throw new Error('consent needs a debt ceiling');
+  const venues = input.venues ?? [];
   return [
+    ...(venues.includes('venus') ? [{ to: v2.venusComptroller, value: '0' as const, data: encodeFunctionData({ abi: LENDING_ABI, functionName: 'updateDelegate', args: [v2.executor, true] }) }] : []),
+    ...(venues.includes('lista') ? [{ to: v2.moolah, value: '0' as const, data: encodeFunctionData({ abi: LENDING_ABI, functionName: 'setAuthorization', args: [v2.executor, true] }) }] : []),
     { to: v2.registry, value: '0', data: encodeFunctionData({ abi: V2_REGISTRY_ABI, functionName: 'setStrategyPolicy', args: [input.maxDebtUsdRaw, input.rewardRecipient, true] }) },
     ...[...new Set((input.newCollaterals ?? []).map(c => c.toLowerCase() as Address))].map((token): Call => ({ to: token, value: '0', data: encodeFunctionData({ abi: TOKEN_ABI, functionName: 'approve', args: [v2.executor, maxUint256] }) })),
   ];
 }
-/** Turn the strategy off for the account: withdraw consent (after the positions are closed in the same UserOp). */
-export const v2ConsentOffCall = (v2: StrategyEarnV2): Call =>
-  ({ to: v2.registry, value: '0', data: encodeFunctionData({ abi: V2_REGISTRY_ABI, functionName: 'setStrategyPolicy', args: [0n, zeroAddress, false] }) });
+/**
+ * Turn the strategy off for the account: withdraw consent (after the positions are closed in the same UserOp).
+ * `rewardRecipient`: the recipient the owner set at consent stays on the (disabled) policy. `executeSweepRewards` sends to
+ * that recipient and never checks consent; with it erased, reward tokens left in the account after a plain turn-off could
+ * only move box -> account, never to the owner's wallet on a later sell-all / delete.
+ */
+export const v2ConsentOffCall = (v2: StrategyEarnV2, rewardRecipient: Address = zeroAddress): Call =>
+  ({ to: v2.registry, value: '0', data: encodeFunctionData({ abi: V2_REGISTRY_ABI, functionName: 'setStrategyPolicy', args: [0n, rewardRecipient, false] }) });
 /** The ceiling to consent to for a plan: total planned debt over every loan token + 10%. */
 export const maxDebtFor = (plannedDebtUsd: number): bigint => usdRaw(plannedDebtUsd) * MAX_DEBT_BUFFER_BPS / 10_000n;
 
@@ -460,12 +470,14 @@ export type ExitRoute = { routeId: Hex; vaultId: Hex; routeDebtRaw?: bigint; cas
  * portfolio account, so `rewards` is empty then.
  */
 export function v2ExitCalls(v2: StrategyEarnV2, account: Address, input: { routes: readonly ExitRoute[]; leftoverVaults?: readonly Hex[];
-  rewards?: readonly { token: Address; accountAmountRaw: bigint }[]; deadline: bigint; withdrawConsent: boolean }): Call[] {
+  rewards?: readonly { token: Address; accountAmountRaw: bigint }[]; deadline: bigint; withdrawConsent: boolean;
+  /** Kept on the policy when consent is withdrawn (see v2ConsentOffCall). */
+  rewardRecipient?: Address }): Call[] {
   return [
     ...input.routes.map(r => closeCall(v2, account, r, r, input.deadline)),
     ...(input.leftoverVaults ?? []).map(vaultId => v2Calls.release(v2, account, vaultId, input.deadline)),
     ...(input.rewards ?? []).map(r => v2Calls.sweepRewards(v2, account, r.token, r.accountAmountRaw, input.deadline)),
-    ...(input.withdrawConsent ? [v2ConsentOffCall(v2)] : []),
+    ...(input.withdrawConsent ? [v2ConsentOffCall(v2, input.rewardRecipient)] : []),
   ];
 }
 /**
@@ -475,7 +487,7 @@ export function v2ExitCalls(v2: StrategyEarnV2, account: Address, input: { route
  */
 export function v2ExitBatches(v2: StrategyEarnV2, account: Address, input: Parameters<typeof v2ExitCalls>[2], gasOf?: (call: Call) => bigint | null): Call[][] {
   const batches = v2Batches(v2ExitCalls(v2, account, { ...input, withdrawConsent: false }), gasOf);
-  if (input.withdrawConsent) { if (batches.length === 0) batches.push([]); batches[batches.length - 1]!.push(v2ConsentOffCall(v2)); }
+  if (input.withdrawConsent) { if (batches.length === 0) batches.push([]); batches[batches.length - 1]!.push(v2ConsentOffCall(v2, input.rewardRecipient)); }
   return batches;
 }
 

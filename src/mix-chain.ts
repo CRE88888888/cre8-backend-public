@@ -16,6 +16,7 @@ import { TESTNET_97 as T } from './testnet-profile.js';
 import { publishMixStrategy } from './mix-publication.js';
 import { AppError } from './errors.js';
 import { validateAssetConfig } from './strategy-execution.js';
+import { strategyEarnV2For } from './strategy-earn-v2.js';
 
 /** Private, first-version hold. No performance-fee service or yield calls are installed.
  * The existing registry's 500-bps legacy commitment is inert without the optional fee ledger.
@@ -82,7 +83,7 @@ export async function verifyMixOwnerCalls(m: MixRow, intent: MixIntent, calls: r
     join strategy_versions v on (v.strategy_id,v.version)=(h.strategy_id,h.version) where h.id=$1 and h.mix_id=$2 and h.ended_at is null`, [intent.from_history_id, m.id])).rows[0]?.allocation.assets.map(a => a.address) ?? null;
   if (previous === null) throw mixUnavailable();
   assertMixOwnerCalls({ account: m.account, onchainId: BigInt(settings.onchain_id), previousAssets: previous,
-    selectedAssets: Object.keys(settings.user_allocation), stored: intent.owner_calls, calls, nonce });
+    selectedAssets: Object.keys(settings.user_allocation), stored: intent.owner_calls, calls, nonce, v2: strategyEarnV2For(97, m.owner), owner: m.owner });
   const block = await client.getBlock({ blockTag: 'latest' });
   // Kernel's sudo nonce occupies a distinct key. The SDK packs validator mode in
   // the upper 192 bits, so compare that complete key instead of assuming key=0.

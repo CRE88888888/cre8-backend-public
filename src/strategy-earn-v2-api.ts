@@ -43,13 +43,18 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
   const tokenOf = (m: V2Market, symbol: string) => m.routes.find(r => r.symbol === symbol)?.collateral;
   /** Collateral tokens of these symbols that have a route. */
   const eligibleTokens = (m: V2Market, tokens: readonly string[]) => [...new Set(m.routes.filter(r => tokens.some(t => t.toLowerCase() === r.collateral)).map(r => r.collateral))];
-  /** The consent an owner signs: one ceiling for everything planned (+10%), both venues the routes may use, approvals. */
-  const consent = (m: V2Market, owner: Address, collaterals: readonly Address[], plannedDebtUsd: number, read: V2AccountRead) => {
+  /**
+   * The consent an owner signs: one ceiling for everything planned (+10%), the lending venues the routes may use that the
+   * account has not delegated to the executor yet (`granted`: reader.delegations), approvals. A venue already delegated
+   * is never sent again: Venus (`Delegation status unchanged`) and Moolah (`already set`) revert on a delegation that
+   * changes nothing, which would take the whole UserOp with it — a second consent, or any `open` after the first one.
+   */
+  const consent = (m: V2Market, owner: Address, collaterals: readonly Address[], plannedDebtUsd: number, read: V2AccountRead, granted: { venus: boolean; lista: boolean }) => {
     const planned = maxDebtFor(plannedDebtUsd), current = read.consent ? read.policy.maxDebt : 0n;
     // Never lower a ceiling that still covers open principal.
     const floor = read.state.principalUsdRaw * 11_000n / 10_000n;
     const maxDebtUsdRaw = [planned, current, floor].reduce((a, b) => (a > b ? a : b));
-    const venues = [...new Set(m.routes.filter(r => collaterals.includes(r.collateral)).map(r => r.venue))];
+    const venues = [...new Set(m.routes.filter(r => collaterals.includes(r.collateral)).map(r => r.venue))].filter(venue => !granted[venue]);
     return { maxDebtUsdRaw, calls: v2ConsentCalls(v2, { maxDebtUsdRaw, rewardRecipient: owner, venues, collaterals, loanTokens: Object.values(v2.loanTokens) as Address[], rewardTokens: v2.rewardTokens }) };
   };
   const gasOf = async (account: Address, calls: readonly Call[]) => {
@@ -107,7 +112,7 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
         ? { asset: d.symbol, status: 'ready' as const, maxDebtRaw: maxDebtFor(d.targetDebtUsd).toString(), extraApyBps: d.to.extraBps }
         : { asset: d.symbol, status: 'unavailable' as const, reason: d.reason, message: TEMPORARILY });
       if (!assets.some(a => a.status === 'ready')) return { status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY, assets };
-      const c = consent(m, owner, tokens, targetOf(plan.decisions), read);
+      const c = consent(m, owner, tokens, targetOf(plan.decisions), read, await reader.delegations(account));
       return { status: 'ready' as const, version: 2 as const, authorization: input.keyReady ? 'ready' as const : 'renewal_required' as const, assets, calls: c.calls, batches: [c.calls] };
     },
 
@@ -124,7 +129,7 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
       const plan = planAccount({ snapshot: m.snapshot, holdings: holdingsFor(read, () => 0, true), costs, now: deps.now().getTime() });
       const d = plan.decisions.find(x => x.symbol === input.symbol);
       if (!d || d.action !== 'open' || !d.to) return unavailable(d?.reason ?? 'no_route');
-      const c = consent(m, owner, tokens, targetOf(plan.decisions), read);
+      const c = consent(m, owner, tokens, targetOf(plan.decisions), read, await reader.delegations(account));
       // Only this asset is opened here (the app sends one asset per UserOp); with exactly the amount asked for.
       const exec = planExecution({ v2, account, decisions: [d], positions: read.state.holdings.map(h => h.collateral === token ? { ...h, freeCollateralRaw: input.collateralRaw } : h), deadline: deadline(),
         policyMaxDebtUsdRaw: c.maxDebtUsdRaw, principalUsdRaw: read.state.principalUsdRaw, limits: m.limits });
@@ -152,7 +157,7 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
       const leftoverVaults = all ? read.vaults.filter(v => v.assetsRaw > 0n && (!named.has(v.vault.vaultId) || !chosen.some(r => r.route.loan === v.vault.token))).map(v => v.vault.vaultId) : [];
       const rewards = input.exit && all ? read.rewards.filter(r => r.boxRaw > 0n || r.accountRaw > 0n && r.allowanceRaw >= r.accountRaw)
         .map(r => ({ token: r.token, accountAmountRaw: r.accountRaw > 0n && r.allowanceRaw >= r.accountRaw ? maxUint256 : 0n })) : [];
-      const args = { routes, leftoverVaults, rewards, deadline: deadline(), withdrawConsent: all && read.policy.enabled };
+      const args = { routes, leftoverVaults, rewards, deadline: deadline(), withdrawConsent: all && read.policy.enabled, rewardRecipient: read.policy.rewardRecipient };
       const calls = v2ExitCalls(v2, account, args);
       if (calls.length === 0) return { status: 'ready' as const, version: 2 as const, asset: input.symbols[0] ?? null, assets: [], calls: [], batches: [] };
       const batches = v2ExitBatches(v2, account, args, await gasOf(account, calls));
@@ -178,7 +183,11 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
       const plan = planAccount({ snapshot: m.snapshot, holdings, costs, now: deps.now().getTime() });
       const planned = maxDebtFor(targetOf(plan.decisions)), floor = read.state.principalUsdRaw * 11_000n / 10_000n;
       const maxDebtUsdRaw = [planned, read.policy.maxDebt, floor].reduce((a, b) => (a > b ? a : b));
-      return v2ReconsentCalls(v2, { maxDebtUsdRaw, rewardRecipient: owner, newCollaterals: tokens });
+      // An asset the new weights add may route only through the other lending venue: delegate that venue too, when the
+      // account has not yet (the first consent covered only the venues of the assets it had then).
+      const needed = [...new Set(m.routes.filter(r => tokens.includes(r.collateral)).map(r => r.venue))];
+      const granted = needed.length === 0 ? { venus: true, lista: true } : await reader.delegations(account);
+      return v2ReconsentCalls(v2, { maxDebtUsdRaw, rewardRecipient: owner, newCollaterals: tokens, venues: needed.filter(venue => !granted[venue]) });
     },
 
     /** Owner only (spec §4): the box's receipts of a broken vault back to the account. Only sponsored in a root-signed UserOp. */

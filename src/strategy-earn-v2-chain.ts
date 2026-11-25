@@ -42,6 +42,8 @@ const VENUE_ABI = parseAbi([
   'function decimals() view returns (uint8)',
   'function balanceOf(address account) view returns (uint256)',
   'function allowance(address owner, address spender) view returns (uint256)',
+  'function approvedDelegates(address borrower, address delegate) view returns (bool)',
+  'function isAuthorized(address authorizer, address authorized) view returns (bool)',
   'function maxDeposit(address receiver) view returns (uint256)',
   'function supplyCaps(address vToken) view returns (uint256)',
   'function totalSupply() view returns (uint256)',
@@ -262,9 +264,16 @@ export function createV2Reader(deps: V2ReaderDeps) {
   }
 
   /** Does this account have anything on v2: consent given, a position, or money in the box? One request. */
-  async function touched(account: Address): Promise<{ enabled: boolean; routes: Hex[]; vaults: Hex[] }> {
+  async function touched(account: Address): Promise<{ enabled: boolean; routes: Hex[]; vaults: Hex[]; rewardRecipient: Address }> {
     const [p, routes, vaults] = await multicall([reg('policy', [account]), reg('accountRoutes', [account]), reg('accountVaults', [account])]);
-    return { enabled: must<{ enabled: boolean }>(p, 'policy').enabled, routes: must<Hex[]>(routes, 'accountRoutes').map(x => lower(x) as Hex), vaults: must<Hex[]>(vaults, 'accountVaults').map(x => lower(x) as Hex) };
+    const policy = must<{ enabled: boolean; rewardRecipient?: Address }>(p, 'policy');
+    // `rewardRecipient` outlives consent (a plain turn-off keeps it): non-zero = this account has used v2 and may still hold reward tokens.
+    return { enabled: policy.enabled, rewardRecipient: lower(policy.rewardRecipient ?? zeroAddress), routes: must<Hex[]>(routes, 'accountRoutes').map(x => lower(x) as Hex), vaults: must<Hex[]>(vaults, 'accountVaults').map(x => lower(x) as Hex) };
+  }
+  /** Has the account delegated borrowing to the v2 executor on each lending venue (Venus `approvedDelegates`, Moolah `isAuthorized`)? One request. */
+  async function delegations(account: Address): Promise<{ venus: boolean; lista: boolean }> {
+    const [venus, lista] = await multicall([venue(v2.venusComptroller, 'approvedDelegates', [account, v2.executor]), venue(v2.moolah, 'isAuthorized', [account, v2.executor])]);
+    return { venus: must<boolean>(venus, 'approvedDelegates'), lista: must<boolean>(lista, 'isAuthorized') };
   }
 
   /**
@@ -355,7 +364,7 @@ export function createV2Reader(deps: V2ReaderDeps) {
       state: { enabled, policyMaxDebtUsdRaw: policy.maxDebt, principalUsdRaw: principalUsd, holdings, ...(foreignVenusLoans.length > 0 ? { foreignVenusLoans } : {}) } };
   }
 
-  return { v2, book: getBook, market: getMarket, touched, account: readAccount,
+  return { v2, book: getBook, market: getMarket, touched, delegations, account: readAccount,
     /** Pending incentive a chain-97 mock earn vault owes the box (`rewardOf`); null where the vault has no such read. */
     async vaultReward(vault: Address, box: Address): Promise<bigint | null> { const [r] = await multicall([venue(vault, 'rewardOf', [box])]); return typeof r === 'bigint' ? r : null; },
     /**

@@ -215,3 +215,62 @@ test('scheduler: a failed auto-open backs off instead of failing again every rou
   for (let round = 0; round < 2; round++) await runSchedulerOnce({ dryRun: false, now: mixClock, skipAlerts: true }, s.deps);
   assert.equal(attempts, 3);
 });
+
+// ---- routing v2 (flag off): the weight-change tail and the exit sweep ---------------------------------------------
+
+test('mix owner calls on routing v2: approval+enroll, then the v2 re-consent (missing venue delegation, one policy for the owner, approvals) — only for an owner in the v2 audience', async () => {
+  const { strategyEarnV2, v2ReconsentCalls, v2ConsentOffCall, v2Calls, maxDebtFor } = await import('../src/strategy-earn-v2.js');
+  const v2 = strategyEarnV2(97, {})!, owner = '0x00000000000000000000000000000000000000aa' as Address, stranger = '0x00000000000000000000000000000000000000bb' as Address;
+  const selected = [nvda.collateral, aapl.collateral];
+  const reconsent = (o: Partial<Parameters<typeof v2ReconsentCalls>[1]> = {}) => v2ReconsentCalls(v2, { maxDebtUsdRaw: maxDebtFor(800), rewardRecipient: owner, newCollaterals: [aapl.collateral], ...o });
+  const run = (stored: readonly { to: string; data: string; value: '0' }[], ctx: { v2?: typeof v2 | null; owner?: Address } = { v2, owner }) => assertMixOwnerCalls({
+    account, onchainId: 13n, previousAssets: [nvda.collateral, T.contracts.usdt], selectedAssets: selected, stored: stored as never, calls: asActual(stored), nonce: MIX_SUDO_NONCE_KEY << 64n, ...ctx });
+  // Before: any v2 tail was refused (the check only knew the v1 consent), so a weight change on a v2 account could not be sponsored.
+  run([...enrollCalls, ...reconsent()]);
+  run([...enrollCalls, ...reconsent({ venues: ['lista'] })]);
+  run([...enrollCalls, ...reconsent({ venues: ['venus', 'lista'], newCollaterals: selected })]);
+  run([...enrollCalls, ...reconsent({ newCollaterals: [] })]);
+  // The v1 tail is judged exactly as before, with or without a v2 deployment for the owner.
+  run([...enrollCalls, ...tail]);
+  run(enrollCalls);
+  // An owner outside the v2 audience (no deployment for them): a v2 tail is refused.
+  assert.throws(() => run([...enrollCalls, ...reconsent()], {}), /待確認/);
+  assert.throws(() => run([...enrollCalls, ...reconsent()], { v2: null, owner }), /待確認/);
+  const approveTo = (token: string, spender: string) => ({ to: token as Address, value: '0' as const, data: encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [spender as Address, maxUint256] }) });
+  const policy = reconsent({ newCollaterals: [] })[0]!;
+  const bad: [string, { to: string; data: string; value: '0' }[]][] = [
+    ['reward recipient is not the owner', reconsent({ rewardRecipient: stranger })],
+    ['reward recipient is the account itself', reconsent({ rewardRecipient: account })],
+    ['no policy at all (delegation + approval only)', reconsent({ venues: ['lista'] }).filter(c => c.to !== v2.registry)],
+    ['two policies', [policy, policy]],
+    ['consent withdrawn instead of given', [v2ConsentOffCall(v2, owner)]],
+    ['the same venue delegated twice', [...reconsent({ venues: ['lista'] }), reconsent({ venues: ['lista'] })[0]!]],
+    ['an asset outside the new weights approved to the v2 executor', [policy, approveTo(T.assets.TSLAB.token, v2.executor)]],
+    ['a loan token approved to the v2 executor', [policy, approveTo(T.contracts.usdt, v2.executor)]],
+    ['an approval to a stranger next to the policy', [policy, approveTo(aapl.collateral, stranger)]],
+    ['a v1 consent call mixed in', [policy, ...consentCalls([{ market: aapl, maxDebtRaw: 1n }])]],
+    ['an executor call (open) in the owner tail', [policy, v2Calls.open(v2, account, ('0x' + 'a1'.repeat(32)) as Hex, ('0x' + 'b1'.repeat(32)) as Hex, E18, E18, 2_000_000_000n)]],
+  ];
+  for (const [name, calls] of bad) assert.throws(() => run([...enrollCalls, ...calls]), /待確認/, name);
+});
+
+test('scheduler: a full exit with nothing posted still goes through the yield strategy step (routing v2 reward tokens); an ordinary sale with nothing posted never does', async () => {
+  const nvdaToken = T.assets.NVDAB.token as Address, at = new Date('2026-11-23T15:30:00Z'); // US market hours
+  const sale = (patch: Parameters<typeof mixScheduler>[0]) => {
+    const f = mixScheduler(patch), seen: unknown[][] = [];
+    f.deps.strategyEarn = { open: async () => null, unwind: async (_d, s, dry, exit, posted) => { seen.push([s.length, dry, exit, posted]); return '[FIXTURE] exit step reached'; } };
+    f.deps.planRebalance = async () => ({ kind: 'ready', deadline: 2_000_000_000n, rationale: 'fixture', steps: [{ tokenIn: nvdaToken, tokenOut: T.contracts.usdt as Address,
+      amountIn: E18, amountOutMin: 1n, oracleFloor: 1n, venue: T.contracts.executor as Address, data: '0x' as Hex }] });
+    return { f, seen };
+  };
+  // Take-profit exit, the strategy was simply turned off earlier: nothing is posted any more.
+  const exit = sale(s => { s.takeProfit = 1000; });
+  assert.equal(exit.f.plan.snapshot.strategyEarnCollateral, undefined);
+  const e = await runSchedulerOnce({ dryRun: true, now: at, skipAlerts: true }, exit.f.deps);
+  assert.deepEqual(exit.seen, [[1, true, true, false]], 'exit = true, posted = false');
+  assert.equal(e.results[0]?.reason, '[FIXTURE] exit step reached');
+  // A rebalance sale with nothing posted: the step is not called at all (no extra reads for anyone).
+  const ordinary = sale(s => { s.last = null; });
+  await runSchedulerOnce({ dryRun: true, now: at, skipAlerts: true }, ordinary.f.deps).catch(() => undefined);
+  assert.deepEqual(ordinary.seen, []);
+});

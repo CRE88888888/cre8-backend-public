@@ -70,14 +70,14 @@ UserOp：一筆最多 3 個 executor 呼叫，估計 gas 合計 ≤ 600 萬（�
 
 | Endpoint | v2 的內容 |
 | --- | --- |
-| `POST /portfolios/:id/strategy-earn/auto` `{ budgetRaw }` | 同意（`v2ConsentCalls`）：兩個場所的授權、一次 `setStrategyPolicy(maxDebt, owner, true)`、抵押品／借款幣／激勵代幣 approve 給 v2 executor。`authorization: 'renewal_required'` 時連 `GET /renewal-params` 的續期一起簽（會裝上 v2 權限） |
+| `POST /portfolios/:id/strategy-earn/auto` `{ budgetRaw }` | 同意（`v2ConsentCalls`）：路線會用到、而且帳戶**還沒委託**的借貸場所的授權（讀 `approvedDelegates`／`isAuthorized`；已委託的不重送，主網的 Venus／Moolah 對沒有改變的委託會 revert）、一次 `setStrategyPolicy(maxDebt, owner, true)`、抵押品／借款幣／激勵代幣 approve 給 v2 executor。`authorization: 'renewal_required'` 時連 `GET /renewal-params` 的續期一起簽（會裝上 v2 權限） |
 | `POST …/open` `{ asset, collateralRaw }` | 同意＋一筆 `executeOpen`（當下最好的路線）。也會回 `authorization` |
 | `POST …/close` `{ assets }` 或 `{ asset }`，可加 `exit: true` | `v2ExitCalls` 切成 `batches`：關閉、放回剩餘、（`exit` 時）激勵送到 owner 錢包；全部關掉時最後一筆撤回同意 |
 | `POST …/rescue` `{ vaultId }` | owner 專用。該幣別還有負債時回 `debt_outstanding` |
 | `POST …/confirm` `{ txHash }` | 把 v2 事件寫進帳本（db 0069）與激勵帳本（db 0068） |
 | `GET …/strategy-earn` | 每個部位的 `route.source` 是 `onchain`（實際所在的路線與 vault）；`earnNetUsd` 含策略盒閒置的錢；`rewards` 是策略盒與帳戶裡的激勵代幣 |
 | `GET …/strategy-earn/rewards` | 測試網沒有 proof API：直接回帳本，`signature.needed` 永遠是 false |
-| My mix 改比例 | 後端組 owner calls 時，帳戶在 v2 就在 enroll 後面接 `setStrategyPolicy`＋新增資產的 approve（`mixStrategyConsent`）。簽名資料（`GET /me/mixes/:id/enrollment-params`、PATCH 的回應）對 v2 對象內的 owner 多 `strategyV2: { registry, executor }`：App 沒有自己的 v2 地址，簽名前用這兩個地址核對 v2 的呼叫（cre8-app `mix-chain.ts`），並在鏈上確認 `registry.executor()` 就是它 |
+| My mix 改比例 | 後端組 owner calls 時，帳戶在 v2 就在 enroll 後面接 `setStrategyPolicy`＋新增資產的 approve（`mixStrategyConsent`）；新比例的路線用到、但帳戶還沒委託給 v2 executor 的借貸場所（新增的資產只走另一個場所），前面再加該場所的委託（Venus `updateDelegate`／Moolah `setAuthorization`，只補缺的：讀 `approvedDelegates`／`isAuthorized`）。paymaster 的改比例檢查（`assertMixOwnerCalls`）對 v2 對象內的 owner 認得這段尾巴（`assertMixV2Reconsent`）。簽名資料（`GET /me/mixes/:id/enrollment-params`、PATCH 的回應）對 v2 對象內的 owner 多 `strategyV2: { registry, executor }`：App 沒有自己的 v2 地址，簽名前用這兩個地址核對 v2 的呼叫（cre8-app `mix-chain.ts`），並在鏈上確認 `registry.executor()` 就是它 |
 
 ## reportRates
 
@@ -94,7 +94,7 @@ UserOp：一筆最多 3 個 executor 呼叫，估計 gas 合計 ≤ 600 萬（�
 ## 激勵
 
 - 策略盒的簽名：`abi.encode(bytes message, bytes accountSignature)`，Lista 只呼叫 `isValidSignature(bytes32,bytes)`＋EIP-191（主網實測）。激勵工作把策略盒當成另一個領取對象（`v2RewardHolders`），回應碼照實測處理（`000000000`／`1005`／401／沒帶 `type=safe` 的 500）。
-- 領到策略盒之後由 keeper `collectRewards` 搬進帳戶；全部退出時 `executeSweepRewards` 送到 owner 錢包（同意時已 approve 激勵代幣，所以帳戶裡的也一起送）。單純關掉加息不送，留在投資組合帳戶。
+- 領到策略盒之後由 keeper `collectRewards` 搬進帳戶；全部退出時 `executeSweepRewards` 送到 owner 錢包（同意時已 approve 激勵代幣，所以帳戶裡的也一起送）。單純關掉加息不送，留在投資組合帳戶；撤回同意時**保留收款人**（`setStrategyPolicy(0, 原收款人, false)`），之後全部賣出／刪除／停利停損時，就算已經沒有路線也沒有 vault，排程器仍會用 session key 把策略盒與帳戶裡的激勵送到 owner 錢包（只送激勵這一步失敗不擋賣出，下一輪再試）。收款人是 0 的帳戶只會做「策略盒 → 帳戶」。
 - 測試網沒有 Lista proof API：模擬 earn vault 的 `claimReward(box)` 任何人可呼叫，keeper 代觸發後再 `collectRewards`。
 
 ## 還沒做／要注意

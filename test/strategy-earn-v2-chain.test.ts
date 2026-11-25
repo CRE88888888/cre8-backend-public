@@ -9,7 +9,7 @@ import { fromMainnetRates, fromTestnetMocks, reportCalldata, reportDue, runRateR
 import { runV2KeeperRound, v2AutoRound, v2MinCollectRaw, v2RewardHolders, v2UnwindForSale } from '../src/strategy-earn-v2-scheduler.js';
 import type { V2Ledger, V2Tx } from '../src/strategy-earn-v2-scheduler.js';
 import { loanTokenNeeds, planLoanTokenSwaps } from '../src/strategy-earn-v2-swap.js';
-import { boxRewardSignature, V2_EXECUTOR_ABI, V2_REGISTRY_ABI } from '../src/strategy-earn-v2.js';
+import { boxRewardSignature, v2ConsentCalls, V2_EXECUTOR_ABI, V2_REGISTRY_ABI } from '../src/strategy-earn-v2.js';
 import type { Call, RouteEvent } from '../src/strategy-earn-v2.js';
 import type { RewardEvent } from '../src/strategy-rewards.js';
 import { E18, W, WORLD_NOW as NOW, world } from './fixtures/v2-world.js';
@@ -207,11 +207,117 @@ test('My mix weight change: an account on v2 re-consents (policy + approvals for
   const api = createStrategyEarnV2Api({ v2: W.v2, reader, now: () => NOW });
   assert.deepEqual(await api.reconsent(W.account, W.owner, { assets: [{ address: W.NVDA, weightBps: 10_000 }], totalValueUsd: 2_000n * E18 }), []);
   openVenus(w);
+  w.state.delegated = { venus: true, lista: true }; // the first consent delegated both venues
   const calls = await api.reconsent(W.account, W.owner, { assets: [{ address: W.NVDA, weightBps: 5000 }, { address: W.QQQ, weightBps: 5000 }], totalValueUsd: 2_000n * E18 });
   assert.deepEqual(calls.map(c => c.to), [W.v2.registry, W.QQQ, W.NVDA]);
   const [maxDebt, recipient, enabled] = decodeFunctionData({ abi: V2_REGISTRY_ABI, data: calls[0]!.data }).args as readonly [bigint, Address, boolean];
   // Never below the ceiling already consented to (10,000) nor below what is open.
   assert.deepEqual([maxDebt, recipient, enabled], [10_000n * E18, W.owner, true]);
+});
+
+test('consent (auto / open) delegates only the venues the account has not delegated yet: both, one, none — a venue already delegated is never sent again', async () => {
+  const w = world(), reader = createV2Reader(w.readerDeps);
+  const api = createStrategyEarnV2Api({ v2: W.v2, reader, now: () => NOW, estimateGas: async () => 700_000n });
+  w.setBalance(W.NVDA, W.account, 10n * E18);
+  const weights = [{ asset: W.NVDA, weightBps: 6000 }, { asset: W.QQQ, weightBps: 4000 }];
+  const rest = [W.v2.registry, W.QQQ, W.NVDA, USDT, USDC, W.v2.rewardTokens[0]];
+  const auto = async () => { const r = await api.auto(W.account, W.owner, { budgetRaw: 1_000n * E18, weights, keyReady: true }); assert.equal(r.status, 'ready'); return r.status === 'ready' ? r.calls.map(c => c.to) : []; };
+  const open = async () => { const r = await api.open(W.account, W.owner, { symbol: 'NVDAB', collateralRaw: 10n * E18, weights, keyReady: true }); assert.equal(r.status, 'ready');
+    return r.status === 'ready' ? r.calls.slice(0, -1).map(c => c.to) : []; }; // the last call is the executeOpen
+  const cases: [string, { venus: boolean; lista: boolean }, Address[]][] = [
+    ['neither delegated (a first consent)', { venus: false, lista: false }, [W.v2.venusComptroller, W.v2.moolah]],
+    ['only Lista missing', { venus: true, lista: false }, [W.v2.moolah]],
+    ['only Venus missing', { venus: false, lista: true }, [W.v2.venusComptroller]],
+    // Before: both were sent every time; on mainnet either one reverts the whole UserOp once it is already set
+    // (Venus "Delegation status unchanged", Moolah "already set"): a second consent, or every open after the first.
+    ['both already delegated', { venus: true, lista: true }, []],
+  ];
+  for (const [name, delegated, expected] of cases) {
+    w.state.delegated = delegated;
+    assert.deepEqual(await auto(), [...expected, ...rest], `auto: ${name}`);
+    // `open` lists the asset being opened first among the approvals; everything else is the same consent.
+    const opened = await open();
+    assert.deepEqual([opened.slice(0, expected.length + 1), [...opened.slice(expected.length + 1)].sort()], [[...expected, W.v2.registry], [...rest.slice(1)].sort()], `open: ${name}`);
+  }
+  // The delegation that is sent is exactly the grant to the v2 executor.
+  w.state.delegated = { venus: false, lista: false };
+  const r = await api.auto(W.account, W.owner, { budgetRaw: 1_000n * E18, weights, keyReady: true });
+  assert.ok(r.status === 'ready');
+  const grants = v2ConsentCalls(W.v2, { maxDebtUsdRaw: 1n, rewardRecipient: W.owner, venues: ['venus', 'lista'], collaterals: [] });
+  assert.deepEqual(r.calls.slice(0, 2).map(c => c.data), grants.slice(0, 2).map(c => c.data));
+  // A portfolio whose assets only route through Lista never asks for the Venus delegation, delegated or not.
+  w.setBalance(W.QQQ, W.account, 4n * E18);
+  const lista = await api.auto(W.account, W.owner, { budgetRaw: 1_000n * E18, weights: [{ asset: W.QQQ, weightBps: 10_000 }], keyReady: true });
+  assert.ok(lista.status === 'ready');
+  assert.deepEqual(lista.calls.map(c => c.to).slice(0, 2), [W.v2.moolah, W.v2.registry]);
+});
+
+test('My mix weight change adds an asset whose only route is on the other venue: the re-consent also delegates that venue — only when the account has not yet', async () => {
+  const w = world(), reader = createV2Reader(w.readerDeps);
+  const api = createStrategyEarnV2Api({ v2: W.v2, reader, now: () => NOW });
+  openVenus(w);
+  // The first consent covered Venus only (the account's assets had no Lista route then). QQQB borrows on Lista only.
+  w.state.delegated = { venus: true, lista: false };
+  const added = [{ address: W.NVDA, weightBps: 5000 }, { address: W.QQQ, weightBps: 5000 }];
+  const calls = await api.reconsent(W.account, W.owner, { assets: added, totalValueUsd: 2_000n * E18 });
+  // Before: [registry, QQQ, NVDA] — QQQB could never open (Moolah refuses the executor).
+  assert.deepEqual(calls.map(c => c.to), [W.v2.moolah, W.v2.registry, W.QQQ, W.NVDA]);
+  assert.equal(calls[0]!.data, v2ConsentCalls(W.v2, { maxDebtUsdRaw: 1n, rewardRecipient: W.owner, venues: ['lista'], collaterals: [] })[0]!.data, 'setAuthorization(v2 executor, true)');
+  // The other way round, and both at once: exactly the missing ones, in the first consent's order (Venus, Lista, policy, approvals).
+  w.state.delegated = { venus: false, lista: true };
+  assert.deepEqual((await api.reconsent(W.account, W.owner, { assets: added, totalValueUsd: 2_000n * E18 })).map(c => c.to), [W.v2.venusComptroller, W.v2.registry, W.QQQ, W.NVDA]);
+  w.state.delegated = { venus: false, lista: false };
+  assert.deepEqual((await api.reconsent(W.account, W.owner, { assets: added, totalValueUsd: 2_000n * E18 })).map(c => c.to), [W.v2.venusComptroller, W.v2.moolah, W.v2.registry, W.QQQ, W.NVDA]);
+  // A venue none of the new weights' routes use is left alone even when it is not delegated: QQQB alone needs only Lista.
+  w.state.delegated = { venus: false, lista: true };
+  assert.deepEqual((await api.reconsent(W.account, W.owner, { assets: [{ address: W.QQQ, weightBps: 10_000 }], totalValueUsd: 2_000n * E18 })).map(c => c.to), [W.v2.registry, W.QQQ]);
+  // Already delegated on both: nothing is sent twice (the real venues refuse a delegation that changes nothing).
+  w.state.delegated = { venus: true, lista: true };
+  assert.deepEqual((await api.reconsent(W.account, W.owner, { assets: added, totalValueUsd: 2_000n * E18 })).map(c => c.to), [W.v2.registry, W.QQQ, W.NVDA]);
+});
+
+test('turn off keeps the reward recipient on the withdrawn consent; a later full exit with no route and no vault left still sends the reward tokens to the owner', async () => {
+  const w = world(), reader = createV2Reader(w.readerDeps);
+  const api = createStrategyEarnV2Api({ v2: W.v2, reader, now: () => NOW });
+  const LISTA = W.v2.rewardTokens[0]!;
+  // 1. A plain turn-off (not an exit): close, withdraw consent — the recipient the owner set stays; rewards stay in the account.
+  openVenus(w);
+  const off = await api.close(W.account, { symbols: ['NVDAB'] });
+  const last = off.calls.at(-1)!;
+  assert.deepEqual([last.to, decodeFunctionData({ abi: V2_REGISTRY_ABI, data: last.data }).args], [W.v2.registry, [0n, W.owner, false]]);
+  assert.ok(!off.calls.some(c => c.to === W.v2.executor && fn(c) === 'executeSweepRewards'));
+  // 2. The chain after it: nothing open, nothing in a vault, consent off with the recipient kept; LISTA in the box and the account.
+  w.state.positions.clear(); w.state.holdings.clear(); w.state.principalUsd = 0n;
+  w.state.policy = { maxDebt: 0n, rewardRecipient: W.owner, strategyId: 57n, enabled: false };
+  w.setBalance(LISTA, W.box, 5n * E18); w.setBalance(LISTA, W.account, 3n * E18);
+  w.state.allowances.set(`${LISTA}:${W.account}`.toLowerCase(), maxUint256);
+  const sent: Call[][] = [], lines: string[] = [], led = ledger();
+  const args = <T extends object>(o: T) => ({ v2: W.v2, reader, account: W.account, portfolioId: 9, now: NOW, dryRun: false, send: async (calls: Call[]) => { sent.push(calls); return tx(sent.length); }, ledger: led.l, log: (l: string) => lines.push(l), steps: [{ tokenIn: W.NVDA, amountIn: E18 }], ...o });
+  // An ordinary sale never moves rewards.
+  assert.equal(await v2UnwindForSale(args({})), null);
+  assert.equal(sent.length, 0);
+  // 3. Sell all / delete: before the fix this returned at once (no route, no vault) and the tokens never left the account.
+  assert.equal(await v2UnwindForSale(args({ exit: true })), null, 'the sale itself is not held back');
+  assert.deepEqual([sent.map(b => b.map(fn)), argsOf(sent[0]![0]!).slice(1, 3)], [[['executeSweepRewards']], [LISTA, maxUint256]]);
+  assert.ok(lines.some(l => /激勵代幣已送到 owner 錢包/.test(l)));
+  // A sweep that fails never blocks the sale: logged, tried again at the next exit round.
+  assert.equal(await v2UnwindForSale(args({ exit: true, send: async () => { throw new Error('PAYMASTER_QUOTA_EXCEEDED'); } })), null);
+  assert.ok(lines.some(l => /激勵代幣這一輪沒送出（不擋賣出）：PAYMASTER_QUOTA_EXCEEDED/.test(l)));
+  // dry-run and a key without the v2 scope: nothing sent, sale not blocked.
+  sent.length = 0;
+  assert.deepEqual([await v2UnwindForSale(args({ exit: true, dryRun: true })), await v2UnwindForSale(args({ exit: true, send: null })), sent.length], [null, null, 0]);
+  // No recipient on the policy (never set): the contract only moves box -> account, and a sweep of the account's own tokens
+  // alone would revert — so only the box is swept, with nothing asked from the account.
+  w.state.policy = { maxDebt: 0n, rewardRecipient: ('0x' + '00'.repeat(20)) as Address, strategyId: 57n, enabled: false };
+  w.state.holdings.set(w.ids.aaveUsdt, { assets: E18, since: 1 }); // something left in a vault keeps the account "touched"
+  await v2UnwindForSale(args({ exit: true }));
+  assert.deepEqual([sent.map(b => b.map(fn)), argsOf(sent[0]![0]!).slice(1, 3)], [[['executeSweepRewards']], [LISTA, 0n]]);
+  sent.length = 0; w.setBalance(LISTA, W.box, 0n);
+  assert.deepEqual([await v2UnwindForSale(args({ exit: true })), sent.length], [null, 0]);
+  // An account that never used v2 (no recipient, nothing held) costs one read and nothing else.
+  const fresh = world(), before = fresh.state.requests;
+  assert.equal(await v2UnwindForSale({ ...args({ exit: true }), reader: createV2Reader(fresh.readerDeps) }), null);
+  assert.equal(fresh.state.requests - before, 1);
 });
 
 test('scheduler round: nothing on v2 -> silent; consent + a filled buy -> one executeOpen; v1 still in use -> nothing is added; no v2 session scope -> reported, not sent', async () => {

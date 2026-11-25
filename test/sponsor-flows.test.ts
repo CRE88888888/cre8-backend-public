@@ -317,6 +317,19 @@ test('My mix weight change with the yield strategy on: approval + enroll + conse
   assert.deepEqual([h.seen.setups, h.seen.locks, h.seen.reservations], [1, 1, 1]);
 });
 
+test('My mix weight change on routing v2: approval + enroll + v2 re-consent (with the missing venue delegation) goes through the pending-change check under the mix lock', async () => {
+  const enroll = { to: T.contracts.registry as Address, value: 0n,
+    data: encodeFunctionData({ abi: [{ type: 'function', name: 'enroll', inputs: [{ type: 'address' }, { type: 'uint256' }, { type: 'uint16' }], outputs: [], stateMutability: 'nonpayable' }],
+      functionName: 'enroll', args: [account, 12n, 1] }) };
+  const calls = [approve(asset, executor), enroll, ...v2ReconsentCalls(V2, { maxDebtUsdRaw: maxDebtFor(800), rewardRecipient: owner, newCollaterals: [asset], venues: ['venus', 'lista'] }).map(asCall)];
+  // No pending change: an owner change is refused; outside the v2 audience the v2 calls are unknown targets.
+  await assert.rejects(harness('mix', { v2: V2 }).sponsor(calls), code('PAYMASTER_CALL_FORBIDDEN', 403));
+  await assert.rejects(harness('mix', { pendingChange: true }).sponsor(calls), code('PAYMASTER_CALL_FORBIDDEN', 403));
+  const h = harness('mix', { pendingChange: true, v2: V2 });
+  await h.sponsor(calls);
+  assert.deepEqual([h.seen.setups, h.seen.locks, h.seen.reservations], [1, 1, 1]);
+});
+
 test('reward tokens (LISTA / XVS): only a plain transfer to the owner wallet, on a fund and a My mix; nothing while the feature is off', async () => {
   const LISTA = '0xfceb31a79f71ac9cbdcf853519c1b12d379edc46' as Address, XVS = '0xcf6bb5389c92bdda8a3747ddb454cb7a64626c63' as Address;
   const { rewardExitCalls } = await import('../src/strategy-rewards.js');
@@ -402,6 +415,10 @@ function v2Flows(r: Call[], V2x: StrategyEarnV2 = V2): [string, Call[], 'risk' |
     ['yield strategy off / sell all / delete: close all + release + sweep + consent off', v2ExitCalls(V2, account, { routes: [{ routeId: R1, vaultId: VA }, { routeId: R2, vaultId: VB }],
       leftoverVaults: [VA], rewards: V2.rewardTokens.map(token => ({ token, accountAmountRaw: 0n })), deadline, withdrawConsent: true }).map(asCall), 'settle'],
     ['consent off alone', [asCall(v2ConsentOffCall(V2))], 'settle'],
+    ['plain turn-off: close + release, consent withdrawn with the owner kept as reward recipient', v2ExitCalls(V2, account, { routes: [{ routeId: R1, vaultId: VA }], leftoverVaults: [VA], deadline, withdrawConsent: true, rewardRecipient: owner }).map(asCall), 'settle'],
+    ['My mix weight change tail adding an asset that only routes through the other venue: delegation + re-consent + approval',
+      v2ReconsentCalls(V2, { maxDebtUsdRaw: maxDebtFor(800), rewardRecipient: owner, newCollaterals: [asset], venues: ['lista'] }).map(asCall), 'risk'],
+    ['full exit after a plain turn-off: only the reward sweep (scheduler session key)', [asCall(v2Calls.sweepRewards(V2, account, V2.rewardTokens[0]!, maxUint256, deadline))], 'settle'],
   ];
 }
 

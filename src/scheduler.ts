@@ -599,7 +599,8 @@ export type SchedulerDeps = {
     /** `held`: collateral the planner saw in the account (lowercase); only those markets are read. */
     open(due: DuePortfolio, dryRun: boolean, held?: readonly string[]): Promise<string | null>;
     /** `exit`: the sale is a full exit (routing v2 then also sends the reward tokens to the owner's wallet). */
-    unwind(due: DuePortfolio, steps: readonly PlannedStep[], dryRun: boolean, exit?: boolean): Promise<string | null>;
+    /** `posted` false: nothing is posted, the sale is a full exit — only the reward tokens' way out is looked at (routing v2). */
+    unwind(due: DuePortfolio, steps: readonly PlannedStep[], dryRun: boolean, exit?: boolean, posted?: boolean): Promise<string | null>;
   };
   /** Routing v2 keeper round (src/strategy-earn-v2-scheduler.ts). Default: runs for the accounts of owners in the v2 audience. */
   strategyV2Round?: (args: { dryRun: boolean; log: (line: string) => void }) => Promise<unknown>;
@@ -1683,9 +1684,10 @@ function defaultStrategyEarnSteps(deps: ResolvedDeps): NonNullable<SchedulerDeps
       const chain = defaultStrategyEarnChain();
       return v2AutoRound({ ...await v2Args(v2, due, dryRun, held), v1Active: async () => strategyEarnV1Active(chain, due.account, (await chain.head()).number) });
     },
-    unwind: async (due, steps, dryRun, exit) => {
+    unwind: async (due, steps, dryRun, exit, posted = true) => {
       if (deps.chainId !== 97) return null;
-      const v1 = await strategyEarnUnwindForSale({ ...await args(due, dryRun), steps });
+      // Nothing posted (a full exit after the strategy was simply turned off): v1 has nothing to take back, so it is not read.
+      const v1 = posted ? await strategyEarnUnwindForSale({ ...await args(due, dryRun), steps }) : null;
       const v2 = await v2Of(due);
       return both([v1, v2 === null ? null : await v2UnwindForSale({ ...await v2Args(v2, due, dryRun), steps, ...(exit ? { exit } : {}) })]);
     },
@@ -2830,9 +2832,12 @@ async function decideAndMaybeExecute(
     if(pending!==null)return {...base,outcome:'blocked',reason:`[YIELD_REBALANCE_PENDING] ${pending}`};
   }
   // backend#204 / EARN_UX B.5: shares posted for Strategy Earn are counted as holdings; selling them repays first.
-  if ((plan.snapshot.strategyEarnCollateral?.length ?? 0) > 0) {
+  // A full exit (sell all / delete / take profit) also goes through it with nothing posted: on routing v2 the reward tokens
+  // of an account whose strategy was simply turned off earlier still have to reach the owner's wallet.
+  const sharesPosted = (plan.snapshot.strategyEarnCollateral?.length ?? 0) > 0, exitSale = (rebalance.purpose ?? 'ordinary') === 'exit';
+  if (sharesPosted || exitSale && ctx.deps.chainId === 97) {
     let pending: string | null;
-    try { pending = await strategyEarnSteps(ctx.deps).unwind(due, rebalance.steps, ctx.dryRun, (rebalance.purpose ?? 'ordinary') === 'exit'); }
+    try { pending = await strategyEarnSteps(ctx.deps).unwind(due, rebalance.steps, ctx.dryRun, exitSale, sharesPosted); }
     catch (error) { return { ...base, outcome: 'blocked', reason: `[STRATEGY_EARN_UNWIND_FAILED] 賣出前還款取回未完成，下一輪重試：${oneLine(error)}` }; }
     if (pending !== null) return { ...base, outcome: 'blocked', reason: pending };
   }

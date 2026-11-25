@@ -5,6 +5,8 @@ import { TESTNET_97 as T } from './testnet-profile.js';
 import type { MixOwnerCall } from './mix-approval.js';
 import { AppError } from './errors.js';
 import { BORROW_CALL_ABI, STRATEGY_EARN_97 } from './strategy-earn-guard.js';
+import { v2SponsoredCall } from './strategy-earn-v2.js';
+import type { StrategyEarnV2 } from './strategy-earn-v2.js';
 
 const denied = () => new AppError(403, 'MIX_CALL_FORBIDDEN', '這筆授權與待確認的組合變更不符，請重新讀取組合設定。');
 export const MIX_SUDO_NONCE_KEY = BigInt(T.contracts.ecdsaValidatorV31) << 16n;
@@ -23,6 +25,8 @@ export function assertMixSudoNonce(nonce: bigint): void {
 export function assertMixOwnerCalls(input: {
   account: Address; onchainId: bigint; previousAssets: readonly string[]; selectedAssets: readonly string[];
   stored: readonly MixOwnerCall[]; calls: readonly { target: Address; value: bigint; callData: Hex }[]; nonce: bigint;
+  /** Routing v2 for this mix's owner (null / absent = not in the v2 audience) and that owner: the tail may then be the v2 re-consent. */
+  v2?: StrategyEarnV2 | null; owner?: Address;
 }): void {
   assertMixSudoNonce(input.nonce);
   const { calls, stored } = input;
@@ -43,8 +47,41 @@ export function assertMixOwnerCalls(input: {
     if (call.callData.toLowerCase() !== expected.toLowerCase() || !added.has(target) || seen.has(target)) throw denied();
     seen.add(target);
   }
-  assertMixStrategyConsent(calls.slice(at + 1), input.selectedAssets);
+  const tail = calls.slice(at + 1), v2 = input.v2 ?? null;
+  // One account is on v1 or on v2, never both: a tail that touches the v2 registry is judged by the v2 rules alone.
+  if (v2 && input.owner && tail.some(call => call.target.toLowerCase() === v2.registry.toLowerCase())) assertMixV2Reconsent(tail, v2, { account: input.account, owner: input.owner, selectedAssets: input.selectedAssets });
+  else assertMixStrategyConsent(tail, input.selectedAssets);
 }
+
+/**
+ * The re-consent tail after a mix enroll for an account on routing v2 (src/strategy-earn-v2.ts v2ReconsentCalls): at most
+ * one delegation per lending venue to the v2 executor, exactly one `setStrategyPolicy(ceiling > 0, the mix's owner, true)`,
+ * and approvals of selected assets to the v2 executor. Each call at most once, canonical encoding (v2SponsoredCall).
+ */
+export function assertMixV2Reconsent(tail: readonly { target: Address; value: bigint; callData: Hex }[], v2: StrategyEarnV2,
+  ctx: { account: Address; owner: Address; selectedAssets: readonly string[] }): void {
+  const selected = ctx.selectedAssets.map(a => a.toLowerCase() as Address);
+  const seen = new Set<string>();
+  let policies = 0;
+  for (const call of tail) {
+    const target = call.target.toLowerCase();
+    if (call.value !== 0n || seen.has(target)) throw denied();
+    seen.add(target);
+    let kind;
+    try { kind = v2SponsoredCall(v2, call, { sender: ctx.account, owner: ctx.owner, assets: selected, rootSigned: true }); } catch { throw denied(); }
+    if (kind !== 'risk') throw denied(); // a delegation granted, consent given, an approval to the v2 executor — nothing else
+    if (target === v2.registry.toLowerCase()) {
+      // The recipient is the mix's owner: v2SponsoredCall would also let the account itself or nobody through.
+      let recipient: string;
+      try { recipient = (decodeFunctionData({ abi: V2_POLICY_ABI, data: call.callData }).args[1]).toLowerCase(); } catch { throw denied(); }
+      if (recipient !== ctx.owner.toLowerCase()) throw denied();
+      policies++;
+    } else if (target !== v2.venusComptroller.toLowerCase() && target !== v2.moolah.toLowerCase() && !selected.includes(target as Address)) throw denied();
+  }
+  if (policies !== 1) throw denied();
+}
+const V2_POLICY_ABI = [{ type: 'function', name: 'setStrategyPolicy', stateMutability: 'nonpayable', outputs: [],
+  inputs: [{ name: 'maxDebt', type: 'uint256' }, { name: 'rewardRecipient', type: 'address' }, { name: 'enabled', type: 'bool' }] }] as const;
 
 /** 12 approval+enroll calls, plus a full consent: two lending delegates, ceiling + approval per selected asset, two approvals. */
 export const MAX_MIX_OWNER_CALLS = 12 + 2 + 2 * 10 + 2;

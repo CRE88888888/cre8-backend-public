@@ -1,4 +1,4 @@
-import { encodeFunctionData, maxUint256, parseAbi } from 'viem';
+import { encodeFunctionData, isAddressEqual, maxUint256, parseAbi, zeroAddress } from 'viem';
 import type { Address, Hex, Log } from 'viem';
 import type { Costs } from './strategy-earn-routing.js';
 import { V2_DEFAULT_COSTS } from './strategy-earn-v2-api.js';
@@ -79,7 +79,10 @@ export async function v2AutoRound(args: V2StepArgs): Promise<string | null> {
 export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tokenIn: string; amountIn: bigint }[]; exit?: boolean }): Promise<string | null> {
   const { v2, reader, account } = args;
   const touched = await reader.touched(account);
-  if (touched.routes.length === 0 && !(args.exit && touched.vaults.length > 0)) return null;
+  // A full exit also looks at an account with no route and no vault left: its strategy was simply turned off earlier (the
+  // reward recipient outlives that), and reward tokens may still sit in the account or the box.
+  const mayHoldRewards = args.exit === true && (touched.vaults.length > 0 || !isAddressEqual(touched.rewardRecipient, zeroAddress));
+  if (touched.routes.length === 0 && !mayHoldRewards) return null;
   const [m, read] = await Promise.all([reader.market(), reader.account(account)]);
   const deadline = deadlineOf(args.now);
   const positions: PreSellPosition[] = [];
@@ -93,9 +96,14 @@ export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tok
       routeId: r.route.routeId, vaultId: (r.vault?.vaultId ?? ('0x' + '00'.repeat(32))) as Hex, venue: r.route.venue, loan: r.route.loanSymbol });
   }
   const plan = v2PreSellPlan(v2, account, positions, deadline);
-  // A full exit also sends the reward tokens on (the account's own only when the owner approved them at consent).
-  const sweeps = args.exit ? read.rewards.filter(r => r.boxRaw > 0n || r.accountRaw > 0n && r.allowanceRaw >= r.accountRaw)
-    .map(r => v2Calls.sweepRewards(v2, account, r.token, r.accountRaw > 0n && r.allowanceRaw >= r.accountRaw ? maxUint256 : 0n, deadline)) : [];
+  // A full exit also sends the reward tokens on (the account's own only when the owner approved them at consent). The
+  // contract sends to the policy's recipient; without one it only moves box -> account, and a sweep of the account's own
+  // tokens alone would revert (nothing moves), so that part is only asked for when there is a recipient.
+  const recipient = read.policy.rewardRecipient, toOwner = !isAddressEqual(recipient, zeroAddress) && !isAddressEqual(recipient, account);
+  const sweeps = args.exit ? read.rewards.flatMap(r => {
+    const fromAccount = toOwner && r.accountRaw > 0n && r.allowanceRaw >= r.accountRaw;
+    return r.boxRaw > 0n || fromAccount ? [v2Calls.sweepRewards(v2, account, r.token, fromAccount ? maxUint256 : 0n, deadline)] : [];
+  }) : [];
   if (plan.notes.length === 0 && sweeps.length === 0) return null;
   const calls = [...plan.calls, ...sweeps];
   const blocking = plan.notes.length > 0;
@@ -104,19 +112,26 @@ export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tok
     if (!blocking) return null;
     return `[STRATEGY_EARN_UNWINDING] 賣出前需先還款取回：${plan.notes.join('；')}（${args.dryRun ? 'dry-run' : '沒有路由 v2 的 session 權限，等 owner 續期'}，未送出）`;
   }
-  const txs: Hex[] = [];
-  for (const batch of v2Batches(calls)) {
-    let landed: V2Tx[];
-    try { landed = [await args.send(batch)]; }
-    catch (error) {
-      // A UserOp that does not fit (or reverts as a whole) is retried one call at a time; what landed stays.
-      if (batch.length === 1) throw new Error(`${txs.length > 0 ? `已完成 ${txs.length} 筆（tx=${txs.join(',')}），其餘未完成：` : ''}${shortError(error)}`);
-      landed = [];
-      for (const call of batch) landed.push(await args.send([call]));
+  const send = args.send, txs: Hex[] = [];
+  const sendAll = async () => {
+    for (const batch of v2Batches(calls)) {
+      let landed: V2Tx[];
+      try { landed = [await send(batch)]; }
+      catch (error) {
+        // A UserOp that does not fit (or reverts as a whole) is retried one call at a time; what landed stays.
+        if (batch.length === 1) throw new Error(`${txs.length > 0 ? `已完成 ${txs.length} 筆（tx=${txs.join(',')}），其餘未完成：` : ''}${shortError(error)}`);
+        landed = [];
+        for (const call of batch) landed.push(await send([call]));
+      }
+      for (const tx of landed) { txs.push(tx.hash); await recordRoutes(args, m, tx, 'sale'); await recordRewards(args, read, tx); }
     }
-    for (const tx of landed) { txs.push(tx.hash); await recordRoutes(args, m, tx, 'sale'); await recordRewards(args, read, tx); }
+  };
+  if (!blocking) {
+    // Only reward tokens to send: never a reason to hold the sale back. A failure is logged and the next exit round tries again.
+    try { await sendAll(); } catch (error) { args.log(`[strategy-routing] portfolio ${args.portfolioId} 退出：激勵代幣這一輪沒送出（不擋賣出）：${shortError(error)}`); return null; }
+    args.log(`[strategy-routing] portfolio ${args.portfolioId} 退出：激勵代幣已送到 ${toOwner ? 'owner 錢包' : '投資組合帳戶'} tx=${txs.join(',')}`); return null;
   }
-  if (!blocking) { args.log(`[strategy-routing] portfolio ${args.portfolioId} 退出：激勵代幣已送到 owner 錢包 tx=${txs.join(',')}`); return null; }
+  await sendAll();
   return `[STRATEGY_EARN_UNWINDING] 賣出前已還款取回：${plan.notes.join('；')} tx=${txs.join(',')}${txs.length > 1 ? `（分 ${txs.length} 筆）` : ''}；下一輪再賣`;
 }
 

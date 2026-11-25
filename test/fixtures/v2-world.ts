@@ -53,6 +53,8 @@ export function world() {
     venusOwed: new Map<Address, bigint>(), supplyCaps: new Map<Address, { cap: bigint; supply: bigint; rate: bigint }>(), rateReporter: A(0xd8), reports: new Map<Hex, [bigint, bigint, bigint]>(),
     mock: { moolahBorrowIncentive: 50, moolahCollateralIncentive: 100, vTokenBorrowIncentive: 0, vTokenSupplyIncentive: 50, vaultApr: 400, vaultIncentive: 50 },
     vaultReward: 0n, calls: 0, requests: 0,
+    /** Has the account delegated borrowing to the v2 executor on each venue (Venus approvedDelegates / Moolah isAuthorized)? */
+    delegated: { venus: false, lista: false },
   };
   const bal = (token: Address, who: Address) => state.balances.get(`${token}:${who}`.toLowerCase()) ?? 0n;
   const routeIds = () => [...routes.keys()], vaultIds = () => [...vaults.keys()];
@@ -92,6 +94,8 @@ export function world() {
     if (t === W.atpRegistry && fn === 'enrollments') return state.enrollment;
     if (t === W.oracle && fn === 'peek') return state.prices.get(args[0] as Address) ?? null;
     if (t === v2.venusComptroller && fn === 'supplyCaps') return state.supplyCaps.get(args[0] as Address)?.cap ?? null;
+    if (t === v2.venusComptroller && fn === 'approvedDelegates') return args[1] === v2.executor && state.delegated.venus;
+    if (t === v2.moolah && fn === 'isAuthorized') return args[1] === v2.executor && state.delegated.lista;
     if (t === v2.moolah) return fn === 'borrowIncentiveAprBps' ? state.mock.moolahBorrowIncentive : fn === 'collateralIncentiveAprBps' ? state.mock.moolahCollateralIncentive : null;
     if (fn === 'totalSupply') return state.supplyCaps.get(target)?.supply ?? null;
     if (fn === 'exchangeRateStored') return state.supplyCaps.get(target)?.rate ?? null;

@@ -27,13 +27,13 @@
 
 | 方法與路徑 | body | 回應重點 |
 | --- | --- | --- |
-| `GET /portfolios/:id/dca` | — | `{portfolioId, account, status:"none"\|"awaiting_deposit"\|"active"\|"paused"\|"completed"\|"closed", minimumPerPeriodRaw, frequencies, minPeriods:2, maxPeriods:365, offer:{vaultId,name,apyBps}\|null, plan, updatedAt}`；`plan`＝`{id, state, vaultId, vaultName, apyBps, frequency, periods, periodsDone, totalRaw, trancheRaw, startAt, nextRunAt, waitingForMarket, buying, depositedRaw, investedRaw, returnedRaw, remainingRaw, maxWithdrawRaw, earnedRaw, authorization:"ready"\|"renewal_required", createdAt, closedAt, closeReason}` |
+| `GET /portfolios/:id/dca` | — | `{portfolioId, account, status:"none"\|"awaiting_deposit"\|"active"\|"paused"\|"completed"\|"closed", minimumPerPeriodRaw, frequencies, minPeriods:2, maxPeriods:365, offer:{vaultId,name,apyBps}\|null, plan, updatedAt}`；`plan`＝`{id, state, vaultId, vaultName, apyBps, frequency, periods, periodsDone, totalRaw, trancheRaw, startAt, nextRunAt, waitingForMarket, waitingReason, buying, depositedRaw, investedRaw, returnedRaw, remainingRaw, maxWithdrawRaw, earnedRaw, authorization:"ready"\|"renewal_required", createdAt, closedAt, closeReason}` |
 | `POST /portfolios/:id/dca` | `{totalRaw, periods, frequency, startAt?, vaultId?}`；`startAt`＝第一期日期（ISO），可選今天（不早於現在 24 小時，容許各時區的「今天」；早於現在視為現在）到一年內，省略＝現在；之後各期沿用它的時刻 | `{status:"ready", planId, authorization, vaultId, vaultName, apyBps, totalRaw, periods, frequency, trancheRaw, startAt, calls}`；vault 不收新錢回 `{status:"unavailable", reason, message}`（200） |
 | `POST /portfolios/:id/dca/confirm` | `{txHash}` | 存入：`{status:"confirmed", state:"active"}`；領回：`{status:"confirmed", state:"closed", returnedRaw}`；還沒上鏈／非 canonical／份額還在：`{status:"pending", state}` |
 | `POST /portfolios/:id/dca/pause`、`/resume` | `{}` | `{status:"ok", state}` |
 | `POST /portfolios/:id/dca/withdraw` | `{}` | `{status:"ready", amountRaw, calls}`；流動性不足 `{status:"limited", maxWithdrawRaw, message}`；vault 已空或還沒存入 `{status:"closed", calls:[]}` |
 
-`calls` 的格式同 Cash Earn：`{to, data, value:"0", gas}`，由組合帳戶（Kernel）送出，不是錢包。`vaultId` 省略時用目前合計 APY 最高、可存入的那個（Venus／Lista／Aave）。`earnedRaw`＝剩餘＋已投入＋已領回−存入，負數（帳本不完整）回 `null`。`waitingForMarket:true`＝這期到了、在等美股開盤。
+`calls` 的格式同 Cash Earn：`{to, data, value:"0", gas}`，由組合帳戶（Kernel）送出，不是錢包。`vaultId` 省略時用目前合計 APY 最高、可存入的那個（Venus／Lista／Aave）。`earnedRaw`＝剩餘＋已投入＋已領回−存入，負數（帳本不完整）回 `null`。`waitingForMarket:true`＝這期到了、在等美股開盤。`waitingReason`＝這期到了但沒在買的原因，順序同排程器：`"portfolio_paused"`（組合暫停，或「全部賣出」還沒賣完）→ `"market_closed"`（等美股開盤）→ `"authorization_required"`（要 owner 更新授權）；`null`＝沒有在等（還沒到期、正在買，或下一輪排程器就會買）。
 
 錯誤：`INVALID_AMOUNT`、`INVALID_PERIODS`（2–365）、`INVALID_FREQUENCY`、`INVALID_START`（早於今天或超過一年）、`INVALID_VAULT`、`DCA_PERIOD_TOO_SMALL`（每期低於 `minimumPerPeriodRaw`，首發基金與 My mix 是 10 USDT）、`INVALID_DCA_REQUEST`（400）；`DCA_FUNDS_NOT_IN_ACCOUNT`（帳戶裡沒被其他用途占用的 USDT 不夠總額）、`DCA_ALREADY_ACTIVE`、`DCA_BUSY`（這期正在領出）、`DCA_DEPOSIT_MISMATCH`、`NO_DCA_DEPOSIT`、`NO_DCA_RETURN`、`TX_FAILED`（409）；`DCA_NOT_FOUND`（404）。
 

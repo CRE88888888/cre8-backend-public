@@ -7,7 +7,7 @@ import { DCA_VAULT_ABI, dcaDepositCalls, dcaReceiptApproval, dcaReturnCalls, dca
 import type { DcaVault } from './dca-calls.js';
 import { getConfig } from './config.js';
 import { query as dbQuery, withTransaction } from './db.js';
-import { AppError, ValidationError } from './errors.js';
+import { AppError, errorChain, ValidationError } from './errors.js';
 import type { FaucetFundingEvidence } from './faucet.js';
 import { withMixPortfolioLock } from './mix-store.js';
 import { yieldAuthorization } from './permissions.js';
@@ -77,6 +77,11 @@ type ActionRow = { id: string; plan_id: string; through_period: number; shares_r
 const PLAN_COLUMNS = `id::text,chain_id::text,portfolio_id::text,account,owner,vault_id,market_id,total_raw::text,periods,frequency,tranche_raw::text,
   start_at,state,periods_done,deposited_raw::text,deposit_tx_hash,deposited_at,invested_raw::text,returned_raw::text,close_reason,closed_at,created_at`;
 const OPEN = "('awaiting_deposit','active','paused')";
+/** `$1` portfolio id. An unfinished "sell all" (src/sell-all-intent.ts) counts as paused. */
+const PORTFOLIO_STATE_SQL = `select schedule_state,strategy_id::text,version,${SELL_ALL_OF_PORTFOLIO_SQL} as selling from portfolios p where p.id=$1`;
+type PortfolioState = { schedule_state: string; strategy_id: string; version: number; selling?: boolean };
+/** Why a period whose time has come is not being bought (the scheduler's own skip order, src/dca.ts step). */
+export type DcaWaitingReason = 'portfolio_paused' | 'market_closed' | 'authorization_required';
 const INFLIGHT = "('prepared','sending','submitted','unknown')";
 
 export type DcaChain = {
@@ -254,13 +259,22 @@ export function createDca(overrides: Partial<DcaDeps> = {}) {
     } else if (plan.state === 'closed') { remaining = 0n; maxWithdraw = 0n; }
     const done = plan.periods_done, next = plan.state === 'active' && done < plan.periods ? periodAt(plan.start_at, plan.frequency, done) : null;
     const inflight = (await deps.query<{ id: string }>(`select id::text from dca_actions where plan_id=$1 and state in ${INFLIGHT} limit 1`, [plan.id])).rows.length > 0;
+    const due = next !== null && next <= deps.now(), waitingForMarket = due && !await marketOpen(p, plan.owner);
+    const authorization = await keyReady(p.id, plan.account) ? 'ready' as const : 'renewal_required' as const;
+    // A due period that is not being bought says why, in the order the scheduler skips it. null while due = the next round buys it.
+    let waitingReason: DcaWaitingReason | null = null;
+    if (due && !inflight) {
+      const state = (await deps.query<PortfolioState>(PORTFOLIO_STATE_SQL, [p.id])).rows[0];
+      waitingReason = !state || state.schedule_state !== 'active' || state.selling === true ? 'portfolio_paused'
+        : waitingForMarket ? 'market_closed' : authorization !== 'ready' ? 'authorization_required' : null;
+    }
     return { id: plan.id, state: plan.state, vaultId: vault.id, vaultName: vault.name, apyBps: v?.apyBps ?? null, frequency: plan.frequency,
       periods: plan.periods, periodsDone: done, totalRaw: plan.total_raw, trancheRaw: plan.tranche_raw, startAt: plan.start_at.toISOString(),
-      nextRunAt: next?.toISOString() ?? null, waitingForMarket: next !== null && next <= deps.now() && !await marketOpen(p, plan.owner),
+      nextRunAt: next?.toISOString() ?? null, waitingForMarket, waitingReason,
       buying: inflight, depositedRaw: plan.deposited_raw, investedRaw: plan.invested_raw, returnedRaw: plan.returned_raw,
       remainingRaw: remaining?.toString() ?? null, maxWithdrawRaw: maxWithdraw?.toString() ?? null,
       earnedRaw: dcaEarned(big(plan.deposited_raw), BigInt(plan.invested_raw), BigInt(plan.returned_raw), remaining)?.toString() ?? null,
-      authorization: await keyReady(p.id, plan.account) ? 'ready' as const : 'renewal_required' as const,
+      authorization,
       createdAt: plan.created_at.toISOString(), closedAt: plan.closed_at?.toISOString() ?? null, closeReason: plan.close_reason };
   }
   const offer = (views: VaultView[] | null) => {
@@ -489,7 +503,7 @@ async function step(d: RoundDeps, plan: PlanRow, portfolioId: number): Promise<s
   }
   if (plan.state !== 'active') return '[DCA_NOT_ACTIVE]';
   // An unfinished "sell all" (src/sell-all-intent.ts) counts as paused: no tranche is bought while everything is being sold.
-  const portfolio = (await d.query<{ schedule_state: string; strategy_id: string; version: number; selling?: boolean }>(`select schedule_state,strategy_id::text,version,${SELL_ALL_OF_PORTFOLIO_SQL} as selling from portfolios p where p.id=$1`, [portfolioId])).rows[0];
+  const portfolio = (await d.query<PortfolioState>(PORTFOLIO_STATE_SQL, [portfolioId])).rows[0];
   if (!portfolio || portfolio.schedule_state !== 'active' || portfolio.selling === true) return '[DCA_PORTFOLIO_PAUSED] 組合暫停中，餘額留在 vault';
   if ((await d.query(`select id from operations where portfolio_id=$1 and (state in ('pending','submitted') or (state='failed' and (tx_hash is not null or user_op_hash is not null))) limit 1`, [portfolioId])).rows.length) {
     return '[PREVIOUS_INFLIGHT] 帳戶其他操作待對帳';
@@ -518,7 +532,10 @@ async function step(d: RoundDeps, plan: PlanRow, portfolioId: number): Promise<s
   if (shares === 0n) return '[DCA_ZERO_SHARES]';
   if (await chain.earn.allowance(vault.receipt, account, d.executor, head.number) < shares) return '[DCA_APPROVAL_REQUIRED] 帳戶尚未授權 executor 領出';
   if (d.dryRun) return `[DCA_DUE] dry-run：第 ${through}/${plan.periods} 期，贖回 ${shares} shares`;
-  const key = await d.sessionKey(portfolioId, account, now);
+  // The key check compares the chain head's time with this clock (yieldSessionAvailable: a head newer than `now` is
+  // refused as not fresh), so it gets the clock of this moment, not the one read before the vault reads above.
+  // 2026-11-25 plan 7: two of three rounds stopped here with YIELD_UNAVAILABLE.
+  const key = await d.sessionKey(portfolioId, account, d.now());
   if (key) {
     const evidence = await d.submit({ publicClient: d.publicClient(), bundlerUrl: resolveBundlerUrl(), account, sessionKey: key.sessionKey, policies: key.policies,
       action: { marketId: vault.marketId, kind: 'withdraw', amount: shares }, journal: journal(d, plan, portfolioId, through, shares) });
@@ -562,7 +579,8 @@ export async function runDcaRound(options: { dryRun: boolean; limit: number; log
     } catch (error) {
       blocked++;
       const code = error instanceof AppError ? error.code : 'DCA_UNAVAILABLE';
-      d.log(`[dca] plan ${plan.id}: blocked ${code}`);
+      // The code alone never said why (2026-11-25 plan 7: three rounds of "blocked YIELD_…" and no cause anywhere).
+      d.log(`[dca] plan ${plan.id}: blocked ${code}：${errorChain(error)}`);
     }
   }
   return { checked, credited, blocked };

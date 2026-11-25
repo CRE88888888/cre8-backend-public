@@ -1211,6 +1211,16 @@ function borrowMarketsOf(permissions: unknown, account: Address): Pick<SessionKe
 }
 
 /**
+ * Everything beyond the base call policy that a key's own snapshot says it was installed with: the #204 borrow grant, the
+ * routing v2 scope and the permission flag. `sessionKernelAccount` rebuilds the policy from these and refuses to sign when
+ * the rebuilt permissionId differs, so every sender must pass all three (2026-11-25, DCA plan 7: the yield/DCA sender
+ * passed none of the last two and a key installed after #272 never rebuilt — no period was ever redeemed).
+ */
+export function installedKeyScope(permissions: unknown, account: Address, chainId: number): Pick<SessionKeyRef, 'borrowAccount' | 'borrowMarkets' | 'routingV2' | 'permissionFlag'> {
+  return { ...(chainId === 97 ? borrowMarketsOf(permissions, account) : {}), ...routingV2Of(permissions, account, chainId), permissionFlag: sessionPermissionFlagOf(permissions) };
+}
+
+/**
  * 前置檢查 a：挑一把**鏈上真的裝好了**的 session key。
  *
  * ⚠ `permissionConfig` 要讀的是 **smart account**（`planPortfolio` 的 `account`），不是 `owner`
@@ -1281,9 +1291,7 @@ async function resolveSessionKey(
         validUntil,
         owner,
         ...(args.chainId === 97 && yieldAuthorization(row.permissions, args.account, TESTNET_97.contracts.executor).status === 'ready' ? { yieldAccount: args.account } : {}),
-        ...(args.chainId === 97 ? borrowMarketsOf(row.permissions, args.account) : {}),
-        ...routingV2Of(row.permissions, args.account, args.chainId),
-        permissionFlag: sessionPermissionFlagOf(row.permissions),
+        ...installedKeyScope(row.permissions, args.account, args.chainId),
       },
     };
   }

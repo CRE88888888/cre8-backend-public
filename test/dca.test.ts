@@ -457,3 +457,113 @@ test('DCA tranche floor: one 10 USDT fee-inclusive batch forms even with 5% sate
   assert.equal(planFundingContribution(10n * E18, config, at, 97), null, 'a one-time 10 USDT buy is still below the 50 minimum');
   assert.equal(planFundingContribution(9n * E18, config, at, 97, 9n * E18), null, 'below one complete batch never plans');
 });
+
+// ---------------------------------------------------------------- 2026-11-25 testnet plan 7: the first period was never bought
+const dcaPlanRow = (patch: Row = {}): Row => ({ id: '1', chain_id: '97', portfolio_id: '7', account, owner, vault_id: 'lista_usdt', market_id: lista.marketId, total_raw: (20n * E18).toString(),
+  periods: 2, frequency: 'daily', tranche_raw: (10n * E18).toString(), start_at: new Date('2026-11-23T14:59:00Z'), state: 'active', periods_done: 0,
+  deposited_raw: (20n * E18).toString(), deposit_tx_hash: '0x' + 'd1'.repeat(32), deposited_at: new Date(), invested_raw: '0', returned_raw: '0',
+  close_reason: null, closed_at: null, created_at: new Date(), ...patch });
+const testKey = { sessionKey: { keyRef: "m/44'/60'/0'/0/1" as const, permissionId: '0x01020304' as Hex, sessionKeyAddress: owner, validUntil: 1, owner }, policies: {} };
+
+test('2026-11-25 plan 7: a key installed with the current permission flag, the Strategy Earn calls and the routing v2 scope is rebuilt to its own permissionId by the yield / DCA sender', async () => {
+  const { createPublicClient, custom } = await import('viem');
+  const { bscTestnet } = await import('viem/chains');
+  const { mnemonicToAccount } = await import('viem/accounts');
+  const { buildSessionPermissions, SESSION_PERMISSION_FLAG, SESSION_PERMISSION_FLAG_LEGACY } = await import('../src/permissions.js');
+  const { yieldSessionKey } = await import('../src/yield-execution.js');
+  const { strategyEarnV2 } = await import('../src/strategy-earn-v2.js');
+  type Ref = ReturnType<typeof yieldSessionKey>;
+  const client = createPublicClient({ chain: bscTestnet, transport: custom({ request: async () => { throw new Error('no RPC'); } }) });
+  const sessionKeyAddress = mnemonicToAccount('test test test test test test test test test test test junk', { addressIndex: 3 }).address;
+  const kernel = '0x1000000000000000000000000000000000000005' as Address, validUntil = 1_900_000_000;
+  const base = { publicClient: client, sessionKeyAddress, executorAddress: executor, validUntil };
+  // What sessionKernelAccount (src/scheduler.ts) rebuilds from a key reference before it signs; a different id = it refuses.
+  const rebuilt = async (ref: Ref) => (await buildSessionPermissions({ ...base,
+    ...(ref.yieldAccount === undefined ? {} : { yieldAccount: ref.yieldAccount }), ...(ref.borrowAccount === undefined ? {} : { borrowAccount: ref.borrowAccount }),
+    ...(ref.borrowMarkets === undefined ? {} : { borrowMarkets: ref.borrowMarkets }), ...(ref.routingV2 === undefined ? {} : { routingV2: ref.routingV2 }),
+    permissionFlag: ref.permissionFlag ?? SESSION_PERMISSION_FLAG_LEGACY })).permissionId;
+  const stored = (id: Hex): Ref => ({ keyRef: "m/44'/60'/0'/0/3", permissionId: id, sessionKeyAddress, validUntil, owner });
+  const v2 = strategyEarnV2(97);
+  const installs = [
+    { name: 'yield only, current flag (every enrollment since #272)', args: { ...base, yieldAccount: kernel } },
+    { name: 'yield + Strategy Earn, current flag', args: { ...base, yieldAccount: kernel, borrowAccount: kernel } },
+    ...(v2 === null ? [] : [{ name: 'yield + Strategy Earn + routing v2, current flag', args: { ...base, yieldAccount: kernel, borrowAccount: kernel,
+      routingV2: { executor: v2.executor, account: kernel, ...(v2.swapper ? { swapper: v2.swapper } : {}) } } }]),
+    { name: 'installed before #272 (no flag in the snapshot)', args: { ...base, yieldAccount: kernel, permissionFlag: SESSION_PERMISSION_FLAG_LEGACY }, legacy: true },
+  ];
+  for (const install of installs) {
+    const installed = await buildSessionPermissions(install.args);
+    const { permissionFlag: _flag, ...withoutFlag } = installed.policySnapshot;
+    const snapshot = 'legacy' in install ? withoutFlag : installed.policySnapshot;
+    const ref = yieldSessionKey(stored(installed.permissionId), snapshot, kernel);
+    assert.equal(ref.permissionFlag, 'legacy' in install ? SESSION_PERMISSION_FLAG_LEGACY : SESSION_PERMISSION_FLAG, install.name);
+    assert.equal(await rebuilt(ref), installed.permissionId, install.name);
+    // The reference the sender built before the fix (no flag, no v2 scope): a current key rebuilt to another id and was refused.
+    const { permissionFlag: _f, routingV2: _r, ...before } = ref;
+    if (!('legacy' in install)) assert.notEqual(await rebuilt(before), installed.permissionId, `${install.name}: the old reference did not rebuild`);
+  }
+});
+
+test('2026-11-25 plan 7: the key check runs on the clock of that moment (a chain head newer than a clock read before the vault reads is refused as not fresh)', async () => {
+  const h = harness({ allocation: ['0x' + '11'.repeat(20)] });
+  h.plans.push(dcaPlanRow());
+  h.state.shares = 20n * E18; h.state.value = 20n * E18;
+  // Every chain read takes 400 ms of wall clock; the head's own time is the clock when it was read.
+  let clock = new Date('2026-11-23T15:00:00Z').getTime(), newestHead = 0;
+  h.deps.now = () => new Date(clock);
+  const base = (h.deps.chain as () => DcaChain)(), tick = <A extends unknown[], R>(fn: (...a: A) => Promise<R>) => async (...a: A): Promise<R> => { clock += 400; newestHead = clock; return fn(...a); };
+  const chain: DcaChain = { ...base, sharesFor: tick(base.sharesFor), earn: { ...base.earn, head: tick(base.earn.head), vault: tick(base.earn.vault), position: tick(base.earn.position),
+    allowance: tick(async () => maxUint256) } };
+  h.deps.chain = () => chain;
+  const seen: number[] = [];
+  // yieldSessionAvailable: `fresh(head, now)` needs 0 <= now - head <= 60 s, otherwise YIELD_UNAVAILABLE.
+  h.deps.sessionKey = async (_id, _account, now) => { seen.push(now.getTime()); if (now.getTime() < newestHead) throw new AppError(503, 'YIELD_UNAVAILABLE', 'x'); return testKey; };
+  const logs: string[] = [];
+  const result = await runDcaRound({ dryRun: false, limit: 10, log: l => logs.push(l) }, h.deps);
+  assert.deepEqual(seen, [newestHead], 'the key check got the clock after the vault reads');
+  assert.deepEqual(result, { checked: 1, credited: 1, blocked: 0 });
+  assert.match(logs.join('\n'), /DCA_REDEEMED\] 第 1\/2 期/);
+  assert.equal(h.plans[0]?.periods_done, 1);
+});
+
+test('2026-11-25 plan 7: a blocked round logs the cause chain, not only the public code', async () => {
+  const h = harness({ allocation: ['0x' + '11'.repeat(20)] });
+  h.plans.push(dcaPlanRow());
+  h.state.shares = 20n * E18; h.state.value = 20n * E18;
+  const base = (h.deps.chain as () => DcaChain)(), allowed = { ...base, earn: { ...base.earn, allowance: async () => maxUint256 } };
+  h.deps.chain = () => allowed;
+  h.deps.sessionKey = async () => testKey;
+  h.deps.submit = async () => { throw new AppError(503, 'YIELD_DEPENDENCY_UNAVAILABLE', '生息依賴讀取或授權重建失敗，未自動重送', { cause: new Error('permissionId 不符：重建 0x11111111 != DB 0x22222222') }); };
+  const logs: string[] = [];
+  assert.deepEqual(await runDcaRound({ dryRun: false, limit: 10, log: l => logs.push(l) }, h.deps), { checked: 0, credited: 0, blocked: 1 });
+  assert.match(logs.join('\n'), /plan 1: blocked YIELD_DEPENDENCY_UNAVAILABLE：.*permissionId 不符：重建 0x11111111 != DB 0x22222222/);
+  // submitYieldAction keeps a non-AppError as the cause of its generic code.
+  const { submitYieldAction } = await import('../src/yield-execution.js');
+  const thrown = await submitYieldAction({ get policies(): unknown { throw new Error('boom'); } } as never).then(() => null, (e: unknown) => e);
+  assert.ok(thrown instanceof AppError && thrown.code === 'YIELD_DEPENDENCY_UNAVAILABLE' && (thrown.cause as Error).message === 'boom');
+});
+
+test('DCA view: a due period that is not being bought says why (portfolio paused or selling > market closed > renewal needed); null = the next round buys it', async () => {
+  const stock = T.assets.NVDAB?.token ?? Object.values(T.assets)[0]?.token;
+  assert.ok(stock);
+  const view = async (o: { now?: Date; keyReady?: boolean; schedule?: string; selling?: boolean; planOwner?: string; startAt?: Date; inflight?: boolean }) => {
+    const h = harness({ allocation: [stock], keyReady: o.keyReady ?? true, ...(o.now ? { now: o.now } : {}) });
+    h.plans.push(dcaPlanRow({ ...(o.planOwner ? { owner: o.planOwner } : {}), ...(o.startAt ? { start_at: o.startAt } : {}) }));
+    if (o.inflight) h.actions.push({ id: '1', plan_id: '1', through_period: 1, shares_raw: '1', state: 'submitted', lot_id: null });
+    const base = h.deps.query as unknown as (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }>;
+    h.deps.query = (async (sql: string, params: unknown[] = []) => sql.replace(/\s+/g, ' ').startsWith('select schedule_state,strategy_id')
+      ? { rows: [{ schedule_state: o.schedule ?? 'active', strategy_id: '3', version: 1, selling: o.selling ?? false }] } : base(sql, params)) as unknown as DcaDeps['query'];
+    const plan = (await createDca(h.deps).get(7, owner)).plan;
+    assert.ok(plan);
+    return [plan.waitingReason, plan.waitingForMarket];
+  };
+  const sunday = new Date('2026-11-22T15:00:00Z');
+  assert.deepEqual(await view({}), [null, false], 'due, market open, key ready: bought by the next round');
+  assert.deepEqual(await view({ schedule: 'paused' }), ['portfolio_paused', false]);
+  assert.deepEqual(await view({ selling: true }), ['portfolio_paused', false], 'an unfinished "sell all" counts as paused');
+  assert.deepEqual(await view({ now: sunday, startAt: new Date('2026-11-21T15:00:00Z') }), ['market_closed', true]);
+  assert.deepEqual(await view({ now: sunday, startAt: new Date('2026-11-21T15:00:00Z'), schedule: 'paused' }), ['portfolio_paused', true], 'the scheduler stops at the pause first');
+  assert.deepEqual(await view({ keyReady: false }), ['authorization_required', false]);
+  assert.deepEqual(await view({ startAt: new Date('2026-11-24T15:00:00Z'), schedule: 'paused' }), [null, false], 'not due yet: nothing is waiting');
+  assert.deepEqual(await view({ inflight: true, schedule: 'paused' }), [null, false], 'this period is being bought');
+});

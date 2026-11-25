@@ -10,16 +10,19 @@ import { assertNotStrategyVault } from './strategy-earn-guard.js';
 import { assertUserOpCapacity, MAX_USER_OP_GAS, userOpGasOverhead } from './execution-batch.js';
 import { canonicalKernelCalls, estimationPaymaster, schedulerPaymaster, gasExecutionKey, settleGasBudget, paymasterExecutionError } from './paymaster.js';
 import type { PaymasterDeps } from './paymaster.js';
-import { borrowKeyMarkets, yieldAuthorization } from './permissions.js';
-import { sessionKernelAccount } from './scheduler.js';
+import { yieldAuthorization } from './permissions.js';
+import { installedKeyScope, sessionKernelAccount } from './scheduler.js';
 import { yieldSessionAvailable } from './yield-session.js';
 import type { SessionKeyRef } from './scheduler.js';
 import { signPreparedOperation } from './user-operation.js';
 
-/** Keys renewed after #204 also carry the Strategy Earn calls; the policy must be rebuilt exactly as installed (market list included). */
-function borrowGrant(policies: unknown, account: Address): { borrowAccount?: Address; borrowMarkets?: Hex[] } {
-  const markets = borrowKeyMarkets(policies, account);
-  return markets === null ? {} : { borrowAccount: account, borrowMarkets: markets };
+/**
+ * The key reference the yield / DCA sender signs with: the policy must be rebuilt exactly as installed — the #204 Strategy
+ * Earn calls (market list included), the routing v2 scope and the permission flag, all read off the key's own snapshot
+ * (the same reading as the rebalance sender, `installedKeyScope`).
+ */
+export function yieldSessionKey(sessionKey: SessionKeyRef, policies: unknown, account: Address): SessionKeyRef {
+  return { ...sessionKey, yieldAccount: account, ...installedKeyScope(policies, account, 97) };
 }
 
 export type YieldAction = Readonly<{ kind: 'supply' | 'withdraw'; marketId: Hex; amount: bigint }>;
@@ -279,7 +282,8 @@ export type YieldSubmitArgs = {
  */
 export async function submitYieldAction(args: YieldSubmitArgs): Promise<YieldEvidence> {
   try { return await submitYieldWithSession(args); }
-  catch (error) { throw error instanceof AppError ? error : fail('YIELD_DEPENDENCY_UNAVAILABLE', '生息依賴讀取或授權重建失敗，未自動重送'); }
+  // The public code and message stay generic; the original error rides along as `cause` for the scheduler's log (errorChain).
+  catch (error) { throw error instanceof AppError ? error : new AppError(503, 'YIELD_DEPENDENCY_UNAVAILABLE', '生息依賴讀取或授權重建失敗，未自動重送', { cause: error }); }
 }
 
 async function submitYieldWithSession(args: YieldSubmitArgs): Promise<YieldEvidence> {
@@ -291,8 +295,7 @@ async function submitYieldWithSession(args: YieldSubmitArgs): Promise<YieldEvide
   if (!await yieldSessionAvailable(publicClient, args.policies, args.account, TESTNET_97.contracts.executor, new Date()))
     throw fail('SESSION_AUTHORIZATION_REQUIRED', '需要更新授權：生息 permission 未安裝或已過期', 409);
   const account = await sessionKernelAccount({ account: args.account, executor: TESTNET_97.contracts.executor,
-    // Keys renewed after #204 also carry the Strategy Earn calls; the policy must be rebuilt exactly as installed.
-    sessionKey: { ...args.sessionKey, yieldAccount: args.account, ...borrowGrant(args.policies, args.account) } }, publicClient);
+    sessionKey: yieldSessionKey(args.sessionKey, args.policies, args.account) }, publicClient);
   const paymaster = schedulerPaymaster(args.account, args.paymaster);
   if (!paymaster) throw fail('PAYMASTER_DISABLED', 'chain 97 生息需要指定 paymaster');
   const client = createKernelAccountClient({ account, client: publicClient, chain: publicClient.chain,

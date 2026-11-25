@@ -11,9 +11,12 @@ import type { Address } from 'viem';
  *
  * The rule now: once a "sell all" has finished for an account, a consent counts only if the owner asked for it again
  * afterwards and that consent landed.
- *   - finished "sell all": the request row of src/sell-all-intent.ts in state `delivered` (the scheduler's
- *     [SELL_ALL_DONE], a `/close` that found nothing left, or the owner's new money arriving in an account that holds
- *     nothing but cash while the request was still open);
+ *   - "sell all": the request row of src/sell-all-intent.ts, from the moment `/close` writes it (`pending`) and for good
+ *     once it is finished (`delivered`: the scheduler's [SELL_ALL_DONE], a `/close` that found nothing left, or the
+ *     owner's new money arriving in an account that holds nothing but cash while the request was still open). The app's
+ *     last `/close` call sells the last batch and the scheduler closes the request a round later; counting the open
+ *     request too means `autoOpen` reads off as soon as the shares are back, not minutes after. A request that ends
+ *     `failed` (taken back because nothing was done, or ended by new money while assets were still held) never counted;
  *   - asked again: `POST /portfolios/:id/strategy-earn/auto` (the buy confirmation with Earn extra on, or the switch
  *     before a fill) answered `ready`. The app sends nothing when Earn extra is off, so no request = not chosen. The
  *     request is a row (kind `strategy_earn_consent`) whose payload is what the consent was about to replace: the
@@ -34,7 +37,7 @@ export const SOLD_KIND = 'sell_all_requested';
 export const V2_CONSENT_KEY = 'v2';
 /** Debt ceilings on chain when the owner asked for consent, as decimal strings; `0` = no usable consent there. */
 export type ConsentBefore = Record<string, string>;
-/** null: no "sell all" has finished for this account — every consent counts, as before. Otherwise the requests made since. */
+/** null: no "sell all" is open or has finished for this account — every consent counts, as before. Otherwise the requests made since. */
 export type ConsentSinceSellAll = readonly ConsentBefore[] | null;
 
 type Run = (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }>;
@@ -44,7 +47,7 @@ const OF_ACCOUNT = (n: string) => `${n}.chain_id = $1 and ${n}.owner in (select 
 const SINCE_SQL = `with acct as (select a.portfolio_id, a.owner from smart_accounts a where a.chain_id = $1 and a.address = $2)
   select coalesce((select jsonb_agg(r.payload order by r.id) from user_notifications r
       where ${OF_ACCOUNT('r')} and r.kind = '${CONSENT_REQUEST_KIND}' and r.id > s.id), '[]'::jsonb) as requests
-  from (select max(n.id) as id from user_notifications n where ${OF_ACCOUNT('n')} and n.kind = '${SOLD_KIND}' and n.state = 'delivered') s
+  from (select max(n.id) as id from user_notifications n where ${OF_ACCOUNT('n')} and n.kind = '${SOLD_KIND}' and n.state in ('pending', 'delivered')) s
  where s.id is not null`;
 /** `$1` chain id, `$2` account (lowercase), `$3` payload. The account's current portfolio; nothing without a cash ledger row. */
 const REQUEST_SQL = `insert into user_notifications (chain_id, portfolio_id, owner, kind, dedup_key, payload)
@@ -57,7 +60,7 @@ const REQUEST_SQL = `insert into user_notifications (chain_id, portfolio_id, own
    order by c.portfolio_id desc limit 1
   on conflict (chain_id, kind, dedup_key) do nothing`;
 
-/** The owner's consent requests since this account's last finished "sell all"; null when there was none. */
+/** The owner's consent requests since this account's last "sell all" (open or finished); null when there was none. */
 export async function consentSinceSellAll(run: Run, chainId: number, account: Address): Promise<ConsentSinceSellAll> {
   const row = (await run(SINCE_SQL, [chainId, account.toLowerCase()])).rows[0] as { requests?: unknown } | undefined;
   if (row === undefined) return null;

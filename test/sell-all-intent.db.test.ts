@@ -290,9 +290,14 @@ test('Earn extra after "sell all" (real Postgres): a finished sale is found by a
   // Never sold: every consent counts (null). A request written now is older than any later sale.
   assert.equal(await since(), null);
   await noteConsentRequest(query, 97, account, { v2: '7' });
-  // A request the owner cancelled by buying again while assets were still held is not a finished sale.
+  // While the sale is going on the consent already does not count; a request the owner cancelled by buying again while
+  // assets were still held (or one taken back because nothing was done) never was a sale.
   await requestSellAll(run, 97, id);
+  assert.deepEqual(await since(), []);
   await query(CANCEL_SELL_ALL_SQL, [id]);
+  assert.equal(await since(), null);
+  const taken = await requestSellAll(run, 97, id);
+  await withdrawSellAll(run, taken.created!);
   assert.equal(await since(), null);
   // Finished by the scheduler / `/close`: sold, and nothing asked for since.
   await requestSellAll(run, 97, id);
@@ -313,7 +318,7 @@ test('Earn extra after "sell all" (real Postgres): a finished sale is found by a
   await query(FINISH_SELL_ALL_SQL, [id]);
   await query(RESUME_AFTER_SELL_ALL_SQL, [id]);
   await query(NEW_MONEY_ENDS_SELL_ALL_SQL, [id]);
-  assert.deepEqual((await requests(id)).slice(-1), ['#3 delivered']);
+  assert.deepEqual((await requests(id)).slice(-1), ['#4 delivered']);
   assert.equal((await state(id)).schedule_state, 'active');
   assert.deepEqual(await since(), []);
   // Another account's rows are never read.

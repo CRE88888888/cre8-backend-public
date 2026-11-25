@@ -5,7 +5,7 @@ import { bscTestnet } from 'viem/chains';
 import { TESTNET_ASSETS } from './assets.js';
 import type { Head, KeeperIO, Market, Observation } from './engine.js';
 import { classifyKeeperError, isNetworkError, isRevert, safeReason, UNSETTLED } from './engine.js';
-import { secondaryRpc } from '../rpc-transport.js';
+import { publicRpcs } from '../rpc-transport.js';
 import { positiveAmount, record } from './scenario.js';
 
 // Official chain-97 periphery: https://developer.pancakeswap.finance/contracts/v3/addresses
@@ -121,21 +121,23 @@ function revertData(error: unknown) {
 export const FAILOVER_MS = 60_000;
 
 /**
- * Primary RPC with a keyless public node behind it (chain 97 only; local forks get no fallback).
+ * Primary RPC with the keyless public nodes behind it (chain 97 only; local forks get no fallback).
  *
  * A network-class failure of the primary (HTTP 403/429/5xx, timeout, connection error, node-side JSON-RPC error)
- * sends that request to the public node and keeps later requests there for FAILOVER_MS; then the primary is tried
- * again. Reverts and rejected requests are never failed over. Re-sending a signed transaction to the second node is
- * safe: it is the same transaction (same nonce and hash), so it cannot execute twice.
+ * sends that request to the public nodes and keeps later requests there for FAILOVER_MS; then the primary is tried
+ * again. The public nodes are tried in order; one that fails goes to the back of that order. Reverts and rejected
+ * requests are never failed over. Re-sending a signed transaction to another node is safe: it is the same
+ * transaction (same nonce and hash), so it cannot execute twice.
  * `downSeconds()` is how long the primary has been failing without one success in between.
  */
-export function failoverTransport(primary: Transport, fallback: Transport, log: (line: string) => void, now: () => number = Date.now) {
+export function failoverTransport(primary: Transport, fallbacks: readonly Transport[], log: (line: string) => void, now: () => number = Date.now) {
   let openUntil = 0;
   let downSince: number | undefined;
   let lastLog = -Infinity;
+  const order = fallbacks.map((_, index) => index);
   const transport: Transport = (args) => {
     const p = primary(args);
-    const s = fallback(args);
+    const s = fallbacks.map((fallback) => fallback(args));
     const request = (async (req, opts) => {
       if (now() >= openUntil) {
         try {
@@ -149,11 +151,22 @@ export function failoverTransport(primary: Transport, fallback: Transport, log: 
           openUntil = now() + FAILOVER_MS;
           if (now() - lastLog >= FAILOVER_MS) {
             lastLog = now();
-            log(`[price-keeper][warning] primary RPC ${req.method}: ${safeReason(error)}; using the public node for ${FAILOVER_MS / 1000}s; primaryDown=${Math.floor((now() - downSince) / 1000)}s`);
+            log(`[price-keeper][warning] primary RPC ${req.method}: ${safeReason(error)}; using the public nodes for ${FAILOVER_MS / 1000}s; primaryDown=${Math.floor((now() - downSince) / 1000)}s`);
           }
         }
       }
-      return s.request(req, opts);
+      let failure: unknown;
+      for (const index of [...order]) {
+        const node = s[index];
+        if (node === undefined) continue;
+        try { return await node.request(req, opts); }
+        catch (error) {
+          if (!isNetworkError(error)) throw error;
+          failure ??= error;
+          order.splice(order.indexOf(index), 1); order.push(index);
+        }
+      }
+      throw failure;
     }) as EIP1193RequestFn;
     return { ...p, request };
   };
@@ -162,8 +175,8 @@ export function failoverTransport(primary: Transport, fallback: Transport, log: 
 
 export function createKeeperChain(rpcUrl: string, account: Account, manifest: Manifest, log: (line: string) => void, transport?: Transport, publicFallback = true) {
   const options = { timeout: 10_000, retryCount: 0 };
-  const fallbackUrl = transport === undefined && publicFallback ? secondaryRpc(rpcUrl, 97) : null;
-  const failover = fallbackUrl === null ? null : failoverTransport(http(rpcUrl, options), http(fallbackUrl, options), log);
+  const fallbackUrls = transport === undefined && publicFallback ? publicRpcs(rpcUrl, 97) : [];
+  const failover = fallbackUrls.length === 0 ? null : failoverTransport(http(rpcUrl, options), fallbackUrls.map((url) => http(url, options)), log);
   const chainTransport = transport ?? failover?.transport ?? http(rpcUrl, options);
   const client = createPublicClient({ chain: bscTestnet, transport: chainTransport, cacheTime: 0 });
   const wallet = createWalletClient({ chain: bscTestnet, account, transport: chainTransport, cacheTime: 0 });

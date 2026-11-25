@@ -19,7 +19,7 @@
 | `PRICE_KEEPER_SWAP_BUDGET_E18` | 單筆 input 價值上限；預設 10,000 × 10^18，不能大於門檻 |
 | `PRICE_KEEPER_MAINTENANCE_SECONDS` | 休市／暫停／劇本結束時的維護成交間隔；預設 1,800，只接受 600–3,000 的整數（oracle `maxOracleAge` 為 3,600） |
 | `PRICE_KEEPER_RPC_FAILURE_TIMEOUT_SECONDS` | 連續失敗多久後發一則 critical；預設 1,800 秒，只接受 1–86,400 的整數。**不會停止**，發完繼續重試 |
-| `PRICE_KEEPER_PUBLIC_FALLBACK` | `1`（預設）：主要 RPC 故障時改走公開節點；`0` 關閉。只接受 `0` 或 `1` |
+| `PRICE_KEEPER_PUBLIC_FALLBACK` | `1`（預設）：主要 RPC 故障時改走公開節點清單；`0` 關閉。只接受 `0` 或 `1` |
 | `TELEGRAM_BOT_TOKEN`／`TELEGRAM_CHAT_ID` | 沿用 `src/notify.ts`；留空停用通知 |
 
 這次驗收只允許 `http://127.0.0.1:8562` anvil fork。金鑰只能在本機驗收時由
@@ -83,8 +83,9 @@ USDT 在連續買入間逐筆檢查；所有 mint／approve／swap／push 都記
   mint／swap 確認後的核對讀取失敗只記名（`… verification unavailable`），下一輪重讀餘額與池價，不會重複補貨。
 - 停擺超過 1 小時後（feed 過期、池子觀測過期）的自我恢復沿用 #139：RPC 回來後的第一輪對 TWAP 不可用的池子各做 1 bp 成交，
   下一輪推完整組 feed，不需要人重啟。
-- 備用 RPC：主要 RPC 出現 `network` 類失敗時，該請求改送公開節點（`src/rpc-transport.ts` 的 `PUBLIC_RPC_97`，api／scheduler 已在用），
-  之後 60 秒都走公開節點，再回頭試主要 RPC。revert 與被拒的請求不會換節點。已簽名交易改送另一個節點是同一筆交易（同 nonce、同 hash），不會執行兩次。
+- 備用 RPC：主要 RPC 出現 `network` 類失敗時，該請求改送公開節點清單（`src/rpc-transport.ts` 的 `PUBLIC_RPCS_97`，api／scheduler 共用同一份；
+  keeper 自己的 URL 若就在清單裡會被排除），之後 60 秒都走公開節點，再回頭試主要 RPC。公開節點依序嘗試，失敗的那個排到最後。
+  revert 與被拒的請求不會換節點。已簽名交易改送另一個節點是同一筆交易（同 nonce、同 hash），不會執行兩次。
   主要 RPC 連續失敗超過上述門檻另發一則 critical（這時報價靠公開節點維持）。本機 fork（127.0.0.1）不啟用。
 - log 每行都有階段、白名單原因（本機原因、HTTP status／RPC code）、`class=`、`failing=…s`、`attempt=`、`retryMs=`；
   上游原文、檔案內容／路徑、私鑰與 RPC URL 不進 log 或通知。

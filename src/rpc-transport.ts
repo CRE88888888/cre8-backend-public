@@ -2,20 +2,37 @@ import { http } from 'viem';
 import type { EIP1193RequestFn, HttpTransportConfig, Transport } from 'viem';
 
 /**
- * Chain-97 RPC with a keyless public fallback (2026-11-23: the RPC_URL provider answered "Request exceeds defined
- * limit" and every chain read of the API failed, including the pre-deploy check).
+ * Chain-97 RPC: RPC_URL plus a short list of keyless public nodes, tried one after another.
  *
- * - The primary (RPC_URL) serves every request while it is healthy.
- * - A quota / rate-limit / connection / timeout error trips a 60 s breaker: the request is retried on the public node and
- *   later requests go straight there until the breaker closes, then the primary is tried again.
- * - Every other error (a revert, a lagging node's "header not found", bad params) is thrown as before. Callers keep
- *   their own bounded re-reads (src/node-lag.ts); both nodes can lag, and those helpers wait for the head either way.
- * - One `rpc_failover` line per minute at most, and an `rpc_usage` line every 10 minutes with calls per source/method,
- *   so the provider's quota can be traced to its callers.
+ * History: 2026-11-23 the RPC_URL provider answered "Request exceeds defined limit" and every chain read of the API
+ * failed; 2026-11-25 17:35–17:44 UTC the one public node answered HTTP 403 and three scheduler rounds failed whole
+ * (403 was not counted as a node failure, and scheduler bulk reads had no second node to go to).
  *
- * Local forks (127.0.0.1 / localhost) and other chains never get a secondary: tests and mainnet keep plain http().
+ * - Every request walks its candidate nodes in order. A node failure (any HTTP error status such as 403/429/5xx, a
+ *   body that is not JSON, a timeout, a connection error, a quota / rate-limit answer) moves on to the next node and
+ *   puts the failed one at the back of the order for 60 s. After that it is tried in its normal place again.
+ * - A node that simply does not have the data (pruned state, a block it has not seen yet) also passes the request
+ *   on, but keeps its place: it is healthy for everything else.
+ * - Every other error (a revert, bad params) is the request's fault and is thrown at once. Callers keep their own
+ *   bounded re-reads (src/node-lag.ts).
+ * - A request fails only when every candidate failed. Nothing is remembered beyond the 60 s, so the next round
+ *   starts from the healthy nodes again.
+ * - One `rpc_failover` line per node per minute at most, one `rpc_all_failed` / `rpc_failover_skipped` line per
+ *   minute when every candidate failed, and an `rpc_usage` line every 10 minutes with calls per source/method, so
+ *   the provider's quota can be traced to its callers.
+ *
+ * Local forks (127.0.0.1 / localhost) and other chains never get public nodes: tests and mainnet keep plain http().
  */
 export const PUBLIC_RPC_97 = 'https://bsc-testnet-rpc.publicnode.com';
+/**
+ * Keyless chain-97 nodes in order of preference. Probed 2026-11-25:
+ * - publicnode: logs and older state (what the services ran on alone until now);
+ * - bsc-prebsc-dataseed.bnbchain.org: eth_getLogs up to 5,000 blocks, state of the latest blocks only;
+ * - data-seed-prebsc-{1,2}-s1.bnbchain.org: no eth_getLogs ("limit exceeded"), state of the latest blocks only.
+ * The last three are run by BNB Chain. None of them needs a key, so no URL here is a secret.
+ */
+export const PUBLIC_RPCS_97: readonly string[] = [PUBLIC_RPC_97, 'https://bsc-prebsc-dataseed.bnbchain.org',
+  'https://data-seed-prebsc-1-s1.bnbchain.org:8545', 'https://data-seed-prebsc-2-s1.bnbchain.org:8545'];
 export const RPC_BREAKER_MS = 60_000;
 /**
  * In the scheduler, bulk reads (≈670 calls/min on 2026-11-23) never fall back to the paid RPC: when the public node
@@ -35,7 +52,6 @@ export const PAID_FIRST_SOURCES: ReadonlySet<string> = new Set(['paymaster', 'pa
 const LOG_EVERY_MS = 60_000;
 const USAGE_EVERY_MS = 10 * 60_000;
 
-type Breaker = { openUntil: number; lastLog: number; lastSkipLog: number };
 /**
  * Call-volume cuts shared by every client on the same URL (new clients are created per request in many routes):
  * eth_chainId never changes, and eth_blockNumber is reused for 250 ms (under one 0.45 s chain-97 block), so the head-wait
@@ -44,12 +60,17 @@ type Breaker = { openUntil: number; lastLog: number; lastSkipLog: number };
 const chainIds = new Map<string, Promise<unknown>>();
 const heads = new Map<string, { at: number; value: Promise<unknown> }>();
 export const HEAD_CACHE_MS = 250;
-const breakers = new Map<string, Breaker>();
+/** Node URL -> until when it stays at the back of the order. Shared by every client: a node is down for all of them. */
+const demotedUntil = new Map<string, number>();
+const lastFailoverLog = new Map<string, number>();
 const usage = new Map<string, number>();
 let usageSince = Date.now();
 let usageTimer: ReturnType<typeof setInterval> | undefined;
 
-/** Quota, rate limit, HTTP 429/5xx, timeouts and connection failures: the node, not the request, is the problem. */
+/**
+ * The node, not the request, is the problem: any HTTP error status (403, 429, 5xx…), a body that is not JSON, a timeout,
+ * a connection failure, or a quota / rate-limit / access answer.
+ */
 export function isProviderFailure(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   const chain: unknown[] = [];
@@ -59,10 +80,20 @@ export function isProviderFailure(error: unknown): boolean {
   return chain.some((e) => {
     const x = e as { name?: string; status?: number; code?: number; message?: string; details?: string; shortMessage?: string };
     const text = `${x.message ?? ''} ${x.details ?? ''} ${x.shortMessage ?? ''}`;
-    return x.status === 429 || (typeof x.status === 'number' && x.status >= 500) || x.code === -32005 || x.code === 429 ||
+    // viem raises HttpRequestError for every non-2xx answer, for a 2xx body that is not JSON and for a failed fetch.
+    return x.name === 'HttpRequestError' || (typeof x.status === 'number' && x.status >= 400) || x.code === -32005 || x.code === 429 ||
       x.name === 'TimeoutError' || x.name === 'LimitExceededRpcError' ||
-      /exceeds defined limit|limit exceeded|rate.?limit|too many requests|quota|capacity|fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|socket hang up|network error/i.test(text);
+      /exceeds defined limit|limit exceeded|rate.?limit|too many requests|quota|capacity|forbidden|unauthori[sz]ed|access denied|fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|socket hang up|network error/i.test(text);
   });
+}
+
+/** This node cannot answer this request (pruned state, a block it has not seen yet, a log range over its own cap); another node may. */
+export function isNodeGap(error: unknown): boolean {
+  for (let e: unknown = error, depth = 0; e && depth < 8; e = (e as { cause?: unknown }).cause, depth++) {
+    const x = e as { message?: string; details?: string };
+    if (/missing trie node|historical state|state (?:is )?not available|header not found|unknown block|block not found|block range|response size exceeded/i.test(`${x.details ?? ''} ${x.message ?? ''}`)) return true;
+  }
+  return false;
 }
 
 function reasonOf(error: unknown): string {
@@ -86,14 +117,20 @@ function count(source: string, method: string): void {
   }
 }
 
-export function secondaryRpc(url: string | null | undefined, chainId = Number(process.env.CHAIN_ID ?? '')): string | null {
-  if (chainId !== 97 || !url) return null;
+/** The keyless public nodes behind `url`: none for local forks and other chains, and never `url` itself. */
+export function publicRpcs(url: string | null | undefined, chainId = Number(process.env.CHAIN_ID ?? '')): string[] {
+  if (chainId !== 97 || !url) return [];
   try {
     const host = new URL(url).hostname;
-    if (host === '127.0.0.1' || host === 'localhost' || host === '::1' || host.endsWith('.internal')) return null;
-    if (url.replace(/\/+$/, '') === PUBLIC_RPC_97) return null;
-  } catch { return null; }
-  return PUBLIC_RPC_97;
+    if (host === '127.0.0.1' || host === 'localhost' || host === '::1' || host.endsWith('.internal')) return [];
+  } catch { return []; }
+  return PUBLIC_RPCS_97.filter((node) => node !== url.replace(/\/+$/, ''));
+}
+
+/** The first public node behind `url`, or null when it has none (local fork, other chain). */
+export function secondaryRpc(url: string | null | undefined, chainId = Number(process.env.CHAIN_ID ?? '')): string | null {
+  if (url && url.replace(/\/+$/, '') === PUBLIC_RPC_97) return null;
+  return publicRpcs(url, chainId)[0] ?? null;
 }
 
 function withCache(key: string, transport: Transport, now: () => number): Transport {
@@ -120,68 +157,79 @@ function withCache(key: string, transport: Transport, now: () => number): Transp
   };
 }
 
-/** Drop-in for `http(rpcUrl, options)` on chain reads/writes. `source` names the caller in `rpc_usage`. */
+type RpcNode = { name: string; key: string; request: EIP1193RequestFn };
+
+/** Healthy nodes in their configured order, then the ones that failed in the last minute (longest ago first). */
+function inOrder(nodes: readonly RpcNode[], now: number): RpcNode[] {
+  const until = (node: RpcNode) => demotedUntil.get(node.key) ?? 0;
+  return [...nodes.filter((node) => until(node) <= now), ...nodes.filter((node) => until(node) > now).sort((a, b) => until(a) - until(b))];
+}
+
+/**
+ * Drop-in for `http(rpcUrl, options)` on chain reads/writes. `source` names the caller in `rpc_usage`.
+ * `deps.secondary` replaces the public node list (one URL, a list, or null for none); tests use it.
+ */
 export function rpcTransport(source: string, url: string | null | undefined, options: HttpTransportConfig = {},
-  deps: { now?: () => number; log?: (line: string) => void; secondary?: string | null; preferPublic?: boolean; schedulerRole?: boolean } = {}): Transport {
-  const fallbackUrl = deps.secondary !== undefined ? deps.secondary : secondaryRpc(url);
-  // Caches only on the real chain-97 provider (never on local test nodes, which change chain/head between tests).
-  const plain = http(url ?? undefined, options);
-  const primary = fallbackUrl === null ? plain : withCache(url ?? '', plain, deps.now ?? Date.now);
+  deps: { now?: () => number; log?: (line: string) => void; secondary?: string | readonly string[] | null; preferPublic?: boolean; schedulerRole?: boolean } = {}): Transport {
+  const publicUrls = deps.secondary === undefined ? publicRpcs(url) : deps.secondary === null ? [] : typeof deps.secondary === 'string' ? [deps.secondary] : [...deps.secondary];
   const now = deps.now ?? Date.now, log = deps.log ?? ((line: string) => console.warn(line));
-  if (fallbackUrl === null) {
+  if (publicUrls.length === 0) {
+    const plain = http(url ?? undefined, options);
     return (args) => {
-      const t = primary(args);
+      const t = plain(args);
       return { ...t, request: (async (req, opts) => { count(source, req.method); return t.request(req, opts); }) as EIP1193RequestFn };
     };
   }
-  const publicNode = withCache(fallbackUrl, http(fallbackUrl, options), now);
-  // The scheduler's reads are bulk and latency-tolerant (drift, scans, monitoring): they go to the keyless public node
-  // first and use the paid RPC_URL only when the public node fails. The API keeps RPC_URL first.
+  // Going to the next node is the retry: a node is asked once per request, so a dead one costs one attempt, not four.
+  // Caches only on the real chain-97 nodes (never on local test nodes, which change chain/head between tests).
+  const node = (nodeUrl: string) => withCache(nodeUrl, http(nodeUrl, { ...options, retryCount: 0 }), now);
+  const primary = node(url ?? ''), publics = publicUrls.map(node);
+  // The scheduler's reads are bulk and latency-tolerant (drift, scans, monitoring): they go to the keyless public nodes
+  // first and use the paid RPC_URL only when every public node fails. The API keeps RPC_URL first.
   const preferPublic = deps.preferPublic ?? (process.env.SERVICE_ROLE === 'scheduler' || !PAID_FIRST_SOURCES.has(source));
-  const [first, second] = preferPublic ? [publicNode, primary] : [primary, publicNode];
-  const [firstName, secondName] = preferPublic ? ['public', 'primary'] : ['primary', 'public'];
-  const key = `${preferPublic ? 'public-first' : 'primary-first'}:${url ?? ''}`;
   const schedulerRole = deps.schedulerRole ?? process.env.SERVICE_ROLE === 'scheduler';
-  // Paid fallback after a public-node failure: always for the API; in the scheduler only for transaction methods.
+  // Paid RPC after the public nodes: always for the API; in the scheduler only for transaction methods.
   const paidFallback = (method: string) => !preferPublic || !schedulerRole || SCHEDULER_PAID_METHODS.has(method);
   return (args) => {
-    const p = first(args), s = second(args);
-    const breaker = breakers.get(key) ?? { openUntil: 0, lastLog: 0, lastSkipLog: 0 };
-    breakers.set(key, breaker);
+    const base = primary(args);
+    const p: RpcNode = { name: 'primary', key: url ?? '', request: base.request };
+    const s: RpcNode[] = publics.map((transport, index) => ({ name: index === 0 ? 'public' : `public${index + 1}`, key: publicUrls[index] ?? '', request: transport(args).request }));
     const request = (async (req, opts) => {
-      if (!paidFallback(req.method)) {
-        // Scheduler bulk read: public node only. A failure skips this round's work for the portfolio (retried next round).
-        count(`${source}:${firstName}`, req.method);
-        try { return await p.request(req, opts); }
+      // Scheduler bulk read: public nodes only. When all of them fail, this round's work for the portfolio is skipped.
+      const paid = paidFallback(req.method);
+      const candidates = inOrder(!paid ? s : preferPublic ? [...s, p] : [p, ...s], now());
+      let failure: unknown, gap: unknown;
+      for (const [index, candidate] of candidates.entries()) {
+        count(`${source}:${candidate.name}`, req.method);
+        try { return await candidate.request(req, opts); }
         catch (error) {
-          if (isProviderFailure(error) && now() - breaker.lastSkipLog >= LOG_EVERY_MS) {
-            breaker.lastSkipLog = now();
-            log(JSON.stringify({ msg: 'rpc_failover_skipped', from: firstName, source, method: req.method, reason: reasonOf(error) }));
-          }
-          throw error;
-        }
-      }
-      if (now() >= breaker.openUntil) {
-        count(`${source}:${firstName}`, req.method);
-        try { return await p.request(req, opts); }
-        catch (error) {
-          if (!isProviderFailure(error)) throw error;
-          breaker.openUntil = now() + RPC_BREAKER_MS;
-          if (now() - breaker.lastLog >= LOG_EVERY_MS) {
-            breaker.lastLog = now();
-            log(JSON.stringify({ msg: 'rpc_failover', from: firstName, to: secondName, source, method: req.method, reason: reasonOf(error) }));
+          const down = isProviderFailure(error);
+          if (!down && !isNodeGap(error)) throw error;
+          if (!down) { gap ??= error; continue; }
+          failure ??= error;
+          demotedUntil.set(candidate.key, now() + RPC_BREAKER_MS);
+          const next = candidates[index + 1]?.name;
+          if (next !== undefined && now() - (lastFailoverLog.get(candidate.key) ?? -Infinity) >= LOG_EVERY_MS) {
+            lastFailoverLog.set(candidate.key, now());
+            log(JSON.stringify({ msg: 'rpc_failover', from: candidate.name, to: next, source, method: req.method, reason: reasonOf(error) }));
           }
         }
       }
-      count(`${source}:${secondName}`, req.method);
-      return s.request(req, opts);
+      // Every candidate failed. `rpc_failover_skipped`: a scheduler bulk read that deliberately did not use the paid RPC.
+      const kind = paid ? 'rpc_all_failed' : 'rpc_failover_skipped';
+      if (failure !== undefined && now() - (lastFailoverLog.get(kind) ?? -Infinity) >= LOG_EVERY_MS) {
+        lastFailoverLog.set(kind, now());
+        log(JSON.stringify({ msg: kind, from: candidates[0]?.name, nodes: candidates.length, source, method: req.method, reason: reasonOf(failure) }));
+      }
+      // A node that only lacked the data says more to the caller's own re-read (src/node-lag.ts) than a dead node does.
+      throw gap ?? failure;
     }) as EIP1193RequestFn;
-    return { ...p, request };
+    return { ...base, request };
   };
 }
 
 /** Test hook. */
-export function resetRpcTransport(): void { breakers.clear(); usage.clear(); chainIds.clear(); heads.clear(); }
+export function resetRpcTransport(): void { demotedUntil.clear(); lastFailoverLog.clear(); usage.clear(); chainIds.clear(); heads.clear(); }
 
 /**
  * Multicall batching for the bulk readers (scheduler, snapshot, status, Strategy Earn): concurrent readContract calls

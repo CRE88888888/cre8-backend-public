@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { readFile } from 'node:fs/promises';
 import { ContractFunctionRevertedError, custom, decodeFunctionData, encodeErrorResult, encodeFunctionResult, HttpRequestError, http, isHex, parseAbi, RpcRequestError, TimeoutError } from 'viem';
 import { createKeeperChain, FAILOVER_MS, failoverTransport, KEEPER_ABI, parseManifest, signingAccount, spotPrice, sqrtPriceFor } from '../src/keeper/chain.js';
-import { PUBLIC_RPC_97, secondaryRpc } from '../src/rpc-transport.js';
+import { PUBLIC_RPC_97, PUBLIC_RPCS_97, publicRpcs } from '../src/rpc-transport.js';
 import { TESTNET_ASSETS } from '../src/keeper/assets.js';
 import { keeperChainFixture, manifestInput } from './fixtures/price-keeper.js';
 import { runScript, assertNoSecretSlices } from './fixtures/secret-output.js';
@@ -328,7 +328,7 @@ test('startup waits out RPC failures (403/503) without exiting, reports a long o
   }
 });
 
-test('2026-11-25: a primary RPC that answers 403 is failed over to the public node for 60 s, then tried again', async () => {
+test('2026-11-25: a primary RPC that answers 403 is failed over to the public nodes for 60 s, then tried again', async () => {
   let now = 1_000_000; const logs: string[] = [];
   const calls = { primary: [] as string[], fallback: [] as string[] };
   let primaryFault: (() => Error) | null = () => new HttpRequestError({ url: 'https://private-token.invalid/key', status: 403 });
@@ -338,19 +338,23 @@ test('2026-11-25: a primary RPC that answers 403 is failed over to the public no
     return '0x61';
   } }, { retryCount: 0 });
   const fallback = custom({ request: async ({ method }) => { calls.fallback.push(method); return method === 'eth_sendRawTransaction' ? `0x${'ab'.repeat(32)}` : '0x61'; } }, { retryCount: 0 });
-  const failover = failoverTransport(primary, fallback, (line) => logs.push(line), () => now);
+  // The first public node refuses as well: the next one answers, and the refusing one goes to the back.
+  let firstPublic = 0; let firstPublicRefuses = true;
+  const refusing = custom({ request: async () => { firstPublic++; if (firstPublicRefuses) throw new HttpRequestError({ url: 'https://private-token.invalid/key', status: 403 }); return '0x61'; } }, { retryCount: 0 });
+  const failover = failoverTransport(primary, [refusing, fallback], (line) => logs.push(line), () => now);
   const { request } = failover.transport({});
   assert.equal(await request({ method: 'eth_chainId' }), '0x61');
-  assert.deepEqual(calls, { primary: ['eth_chainId'], fallback: ['eth_chainId'] });
+  assert.deepEqual(calls, { primary: ['eth_chainId'], fallback: ['eth_chainId'] }); assert.equal(firstPublic, 1);
   // While the breaker is open the primary is not touched, reads and the signed transaction go to the public node.
   now += FAILOVER_MS - 1;
   await request({ method: 'eth_blockNumber' });
   assert.equal(await request({ method: 'eth_sendRawTransaction', params: ['0x01'] }), `0x${'ab'.repeat(32)}`);
   assert.equal(calls.primary.length, 1); assert.equal(calls.fallback.length, 3);
+  assert.equal(firstPublic, 1, 'the refusing public node is asked last from now on');
   assert.equal(failover.downSeconds(), 59);
   now += 1; await request({ method: 'eth_chainId' }); // Still refused: the window restarts, the outage clock does not.
   assert.equal(calls.primary.length, 2); assert.equal(failover.downSeconds(), 60);
-  assert.equal(logs.length, 2); assert.match(logs[1] ?? '', /primary RPC eth_chainId: HttpRequestError status=403; using the public node for 60s; primaryDown=60s/);
+  assert.equal(logs.length, 2); assert.match(logs[1] ?? '', /primary RPC eth_chainId: HttpRequestError status=403; using the public nodes for 60s; primaryDown=60s/);
   primaryFault = null; now += FAILOVER_MS;
   await request({ method: 'eth_chainId' });
   assert.equal(calls.primary.length, 3); assert.equal(calls.fallback.length, 4); assert.equal(failover.downSeconds(), 0);
@@ -369,10 +373,15 @@ test('2026-11-25: a primary RPC that answers 403 is failed over to the public no
     primaryFault = () => fault; now += FAILOVER_MS; const before: number = calls.fallback.length;
     assert.equal(await request({ method: 'eth_chainId' }), '0x61'); assert.equal(calls.fallback.length, before + 1);
   }
+  // Every node refusing is a network fault of the request (the round is retried), never a different error.
+  primaryFault = () => new HttpRequestError({ url: 'https://private-token.invalid/key', status: 403 }); now += FAILOVER_MS;
+  const all = failoverTransport(primary, [refusing, refusing], () => {}, () => now).transport({});
+  await assert.rejects(all.request({ method: 'eth_chainId' }), (error: unknown) => classifyKeeperError(error) === 'network');
   assert.doesNotMatch(logs.join('\n'), /private-token|https:/);
-  // Local forks and the public node itself get no fallback; any other chain-97 RPC does.
-  assert.equal(secondaryRpc('http://127.0.0.1:8562', 97), null); assert.equal(secondaryRpc(PUBLIC_RPC_97, 97), null);
-  assert.equal(secondaryRpc('https://rpc.example.invalid/key', 97), PUBLIC_RPC_97);
+  // Local forks get no fallback; any chain-97 RPC gets the public nodes, never itself.
+  assert.deepEqual(publicRpcs('http://127.0.0.1:8562', 97), []);
+  assert.deepEqual(publicRpcs('https://rpc.example.invalid/key', 97), [...PUBLIC_RPCS_97]);
+  assert.deepEqual(publicRpcs(PUBLIC_RPC_97, 97), PUBLIC_RPCS_97.slice(1)); assert.equal(PUBLIC_RPCS_97.length, 4);
 });
 
 test('real HTTP: 403, 429, 502 and a 200 whose body is not JSON all reach the keeper as network faults, without the URL', async () => {

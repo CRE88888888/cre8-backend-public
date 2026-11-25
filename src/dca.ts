@@ -559,13 +559,21 @@ async function creditPending(d: RoundDeps, plan: PlanRow, portfolioId: number): 
   return credited;
 }
 
-export async function runDcaRound(options: { dryRun: boolean; limit: number; log: (line: string) => void }, overrides: Partial<DcaDeps> = {}): Promise<{ checked: number; credited: number; blocked: number }> {
+/**
+ * `portfolioId`: only the plan(s) of that portfolio's account (an owner's own buy round runs this instead of the
+ * site-wide pass: the same step, the same crediting, for one portfolio). Without it: every plan, as the scheduler runs it.
+ */
+export async function runDcaRound(options: { dryRun: boolean; limit: number; log: (line: string) => void; portfolioId?: number }, overrides: Partial<DcaDeps> = {}): Promise<{ checked: number; credited: number; blocked: number }> {
   const d: RoundDeps = { ...defaults(), ...overrides, log: options.log, dryRun: options.dryRun };
   if (d.chainId !== 97 || d.vaults.length === 0) return { checked: 0, credited: 0, blocked: 0 };
-  const plans = (await d.query<PlanRow & { current_portfolio: string | null }>(`select ${PLAN_COLUMNS},
+  const due = `select ${PLAN_COLUMNS},
       (select a.portfolio_id::text from smart_accounts a where a.chain_id=97 and a.address=p.account and a.retired_at is null order by a.portfolio_id desc limit 1) as current_portfolio
     from dca_plans p where p.chain_id=97 and (p.state='active' or exists(select 1 from dca_actions a where a.plan_id=p.id
-      and (a.state in ${INFLIGHT} or (a.state='confirmed' and a.lot_id is null)))) order by p.id limit $1`, [options.limit])).rows;
+      and (a.state in ${INFLIGHT} or (a.state='confirmed' and a.lot_id is null))))`;
+  const plans = (options.portfolioId === undefined
+    ? await d.query<PlanRow & { current_portfolio: string | null }>(`${due} order by p.id limit $1`, [options.limit])
+    : await d.query<PlanRow & { current_portfolio: string | null }>(`select q.* from (${due}) q where q.current_portfolio=$2::text order by q.id::bigint limit $1`,
+      [options.limit, String(options.portfolioId)])).rows;
   let checked = 0, credited = 0, blocked = 0;
   for (const plan of plans) {
     const portfolioId = Number(plan.current_portfolio);

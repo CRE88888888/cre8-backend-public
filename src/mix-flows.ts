@@ -129,6 +129,43 @@ export async function syncMixFlowRange(client: PublicClient, portfolioId: number
   if (!m) return;
   return syncMixAccountFlows(client, m, range, deps, portfolioId);
 }
+/**
+ * Hashes of blocks the node has reported as finalized, by block number: such a block cannot be replaced, so its header
+ * is read once per client. 2026-11-25: every plan of a private basket re-read the header of every saved cash flow, one
+ * request after the other (portfolios 6, 7, 11 and 13: 27–86 s per plan, with the shared DEX lane held meanwhile).
+ * Kept per client object and only for a client bound to a chain (the long-lived production clients): a test's fixture
+ * transport, which may rewrite any block, never fills it.
+ */
+const finalizedHeaders = new WeakMap<PublicClient, Map<string, Hex>>();
+const FINALIZED_HEADERS_MAX = 20_000;
+const HEADER_READS_AT_ONCE = 12;
+/**
+ * The canonical hash of every saved flow's block (the reorg check). The same answers as reading them one by one:
+ * - a block at or below the node's `finalized` block is read once and remembered (nothing can change it any more);
+ * - every other block is read on every call, as before, a few at a time instead of one after the other;
+ * - a node that cannot say what is finalized remembers nothing (every block is read); a failed header read fails the
+ *   call, as before.
+ */
+export async function savedFlowHeaders(client: PublicClient, blocks: readonly string[]): Promise<Map<string, Hex | null>> {
+  const remembered = client.chain === undefined ? null : finalizedHeaders.get(client) ?? new Map<string, Hex>();
+  if (remembered !== null) finalizedHeaders.set(client, remembered);
+  const headers = new Map<string, Hex | null>(), missing: string[] = [];
+  for (const n of blocks) { const known = remembered?.get(n); if (known === undefined) missing.push(n); else headers.set(n, known); }
+  if (missing.length === 0) return headers;
+  const finalizedRead: Promise<bigint | null> = remembered === null ? Promise.resolve(null)
+    : client.getBlock({ blockTag: 'finalized' }).then(b => b.number, () => null);
+  for (let at = 0; at < missing.length; at += HEADER_READS_AT_ONCE) {
+    const part = missing.slice(at, at + HEADER_READS_AT_ONCE);
+    const hashes = await Promise.all(part.map(async n => (await client.getBlock({ blockNumber: BigInt(n) })).hash));
+    part.forEach((n, i) => headers.set(n, hashes[i] ?? null));
+  }
+  const finalized = await finalizedRead;
+  if (remembered !== null && finalized !== null) {
+    if (remembered.size + missing.length > FINALIZED_HEADERS_MAX) remembered.clear();
+    for (const n of missing) { const hash = headers.get(n); if (hash && BigInt(n) <= finalized) remembered.set(n, hash); }
+  }
+  return headers;
+}
 export async function syncMixAccountFlows(client: PublicClient, m: MixFlowAccount, range: { fromBlock: bigint; toBlock: bigint },
   deps = { query, transaction: withTransaction }, portfolioId?: number): Promise<void> {
   if (range.toBlock < 0n || range.fromBlock < 0n || range.fromBlock > range.toBlock + 1n) throw mixUnavailable();
@@ -143,11 +180,8 @@ export async function syncMixAccountFlows(client: PublicClient, m: MixFlowAccoun
   const originalQuotes = new Map(saved.map(s => [`${s.tx_hash}:${s.log_index}:${s.block_hash}`, {
     decimals: s.asset_decimals, priceUsdE8: BigInt(s.price_usd_e8), source: s.price_source, at: s.priced_at }]));
   const changed: string[] = [];
-  const headers = new Map<string, Hex | null>();
-  for (const s of saved) {
-    if (!headers.has(s.block_number)) headers.set(s.block_number, (await client.getBlock({ blockNumber: BigInt(s.block_number) })).hash);
-    if (headers.get(s.block_number) !== s.block_hash) changed.push(s.id);
-  }
+  const headers = await savedFlowHeaders(client, [...new Set(saved.map(s => s.block_number))]);
+  for (const s of saved) if (headers.get(s.block_number) !== s.block_hash) changed.push(s.id);
   const flows = changed.length || range.fromBlock > range.toBlock ? [] : await readMixFlows(client, m, range.fromBlock, range.toBlock, { assets,
     savedQuote: (hash, index, block) => originalQuotes.get(`${hash}:${index}:${block}`) });
   if (!anchor.hash || (await client.getBlock({ blockNumber: range.toBlock })).hash !== anchor.hash) throw mixUnavailable();

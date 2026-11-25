@@ -1842,24 +1842,40 @@ export async function quoteNewMoney(args: Pick<PlanRebalanceArgs,'publicClient'|
     const feeBps=Number(await publicClient.readContract({address:args.registry,abi:REGISTRY_ABI,functionName:'effectiveFeeBps',args:[args.strategyId],blockNumber}));
     if(!Number.isInteger(feeBps)||feeBps<0||feeBps>=10000)throw new Error('invalid fee');
     const steps:PlannedStep[]=[];
-    for(const [asset,raw] of Object.entries(args.inputs)) {
+    type Leg={blocked:Extract<RebalancePlan,{kind:'blocked'}>}|{step:PlannedStep};
+    const blocked=(reason:string):Leg=>({blocked:{kind:'blocked',reason}});
+    /**
+     * One component's quote. A component reads nothing of the others and every read is pinned to `blockNumber`, so all
+     * of them are asked at once (they were asked one after the other, about ten round trips each). The results are taken
+     * in the basket's order below, so the first component that blocks or fails is still the one that decides, as before.
+     */
+    const quoteLeg=async(asset:string,raw:string):Promise<Leg>=>{
       const tokenOut=getAddress(asset),amountIn=BigInt(raw);
+      // The pool lookup and the oracle quote do not depend on each other; the lookup's answer is still checked first.
+      const quoteRead=quoteHub(publicClient,{router:oracle,tokenIn:args.cash,tokenOut,amountIn,blockNumber});
+      quoteRead.catch(()=>{});
       const pair=await resolveHubPair(publicClient,{router:oracle,asset:tokenOut,blockNumber});
-      if('skip' in pair)return {kind:'blocked',reason:'[BASKET_QUOTE_UNAVAILABLE] 整籃子等待池子資料'};
-      const quote=await quoteHub(publicClient,{router:oracle,tokenIn:args.cash,tokenOut,amountIn,blockNumber});
-      if('skip' in quote)return {kind:'blocked',reason:'[BASKET_QUOTE_UNAVAILABLE] 任一成分缺價，整籃子等待'};
+      if('skip' in pair)return blocked('[BASKET_QUOTE_UNAVAILABLE] 整籃子等待池子資料');
+      const quote=await quoteRead;
+      if('skip' in quote)return blocked('[BASKET_QUOTE_UNAVAILABLE] 任一成分缺價，整籃子等待');
       const deviation=await twapSpotDeviationBps({client:publicClient,pool:pair.pool,tokenIn:args.cash,amountIn,quoted:quote.quoted,blockNumber});
-      if(deviation===null||deviation>Number(MAX_TWAP_SPOT_DEVIATION_BPS))return {kind:'blocked',reason:'[BASKET_DEPTH] TWAP 與現價無法確認，整籃子等待'};
+      if(deviation===null||deviation>Number(MAX_TWAP_SPOT_DEVIATION_BPS))return blocked('[BASKET_DEPTH] TWAP 與現價無法確認，整籃子等待');
       const step=await buildRoutedStep({publicClient,executor,tokenIn:args.cash,tokenOut,amountIn,oracleFloor:quote.floor,oracleQuoted:quote.quoted,
         minGross:minGrossFor(quote.floor,feeBps),poolFee:pair.poolFee,blockNumber,feeBps,deadline:args.deadline},deps);
-      if(step===null)return {kind:'blocked',reason:'[BASKET_DEPTH] 整籃子沒有符合成交下限的路徑，等待縮量'};
+      if(step===null)return blocked('[BASKET_DEPTH] 整籃子沒有符合成交下限的路徑，等待縮量');
       if(isAddressEqual(step.venue,pancakeRouterForChain(publicClient.chain?.id))) {
         const identity=decodeStepIdentity(step);
-        if('problem' in identity||identity.path===null)return {kind:'blocked',reason:'[BASKET_DEPTH] 無法確認路徑深度'};
+        if('problem' in identity||identity.path===null)return blocked('[BASKET_DEPTH] 無法確認路徑深度');
         const impact=await routeImpactBps(publicClient,{path:identity.path,amountIn,blockNumber});
-        if(impact===null||impact>DEFAULT_MAX_IMPACT_BPS)return {kind:'blocked',reason:'[BASKET_DEPTH] 整籃子等待可用深度'};
+        if(impact===null||impact>DEFAULT_MAX_IMPACT_BPS)return blocked('[BASKET_DEPTH] 整籃子等待可用深度');
       }
-      steps.push(step);
+      return {step};
+    };
+    const legs=await Promise.allSettled(Object.entries(args.inputs).map(([asset,raw])=>quoteLeg(asset,raw)));
+    for(const leg of legs){
+      if(leg.status==='rejected')throw leg.reason;
+      if('blocked' in leg.value)return leg.value.blocked;
+      steps.push(leg.value.step);
     }
     if(steps.length===0)return {kind:'noop',reason:'沒有新買單'};
     return {kind:'ready',steps,deadline:args.deadline,rationale:'僅配置已授權新錢；各成分 exact-input，不賣舊倉'};
@@ -1871,9 +1887,12 @@ export async function quoteNewMoney(args: Pick<PlanRebalanceArgs,'publicClient'|
  */
 export async function newMoneyDepthCap(client:PublicClient,oracle:Address,cash:Address,asset:Address,upper:bigint,blockNumber:bigint,feeBps=0):Promise<bigint>{
   if(upper<=0n)return 0n;
+  // The oracle quote does not depend on the pool lookup: both are asked at once, and the lookup's answer is still checked first.
+  const quoteRead=quoteHub(client,{router:oracle,tokenIn:cash,tokenOut:asset,amountIn:upper,blockNumber});
+  quoteRead.catch(()=>{});
   const pair=await resolveHubPair(client,{router:oracle,asset,blockNumber});
   if('skip' in pair)throw new Error('new money pool unavailable');
-  const quote=await quoteHub(client,{router:oracle,tokenIn:cash,tokenOut:asset,amountIn:upper,blockNumber});
+  const quote=await quoteRead;
   if('skip' in quote)throw new Error('new money oracle unavailable');
   const state=await readPoolImpactState(client,pair.pool,cash,blockNumber);
   if(state===null)throw new Error('new money depth unavailable');

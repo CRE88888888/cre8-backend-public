@@ -64,22 +64,32 @@ export function defaultNewMoneyDeps(client:()=>PublicClient,executor:()=>Address
     },
     policy:async(due,plan,assets)=>{
       const publicClient=client(),blockNumber=plan.snapshot.block;
-      const oracle=await publicClient.readContract({address:executor(),abi:EXECUTOR_ABI,functionName:'oracle',blockNumber});
-      const buy=await readBuyBudget({publicClient,executor:executor(),oracle,account:due.account,blockNumber,targets:plan.targets});
+      // Every read is pinned to the plan's block and none changes what another one returns, so they are started together
+      // (they were ~30 round trips one after the other). Each result is still taken in the original order, so the first
+      // failure in that order is the one reported, as before.
+      const early=<T>(read:Promise<T>):Promise<T>=>{read.catch(()=>{});return read;};
+      const oracleRead=early(publicClient.readContract({address:executor(),abi:EXECUTOR_ABI,functionName:'oracle',blockNumber}));
+      const buyRead=early(oracleRead.then(oracle=>readBuyBudget({publicClient,executor:executor(),oracle,account:due.account,blockNumber,targets:plan.targets})));
+      const limitsRead=early(readMaxLegUsdE8(assets,query,chainId));
+      const reserveRead=early(minimumFeeReserve(publicClient,executor(),BigInt(plan.pinnedVersion.onchainStrategyId),blockNumber,due.account,chainId===97));
+      const feeRead=early(publicClient.readContract({address:registry(),abi:[{type:'function',name:'effectiveFeeBps',stateMutability:'view',inputs:[{type:'uint256'}],outputs:[{type:'uint16'}]}],functionName:'effectiveFeeBps',args:[BigInt(plan.pinnedVersion.onchainStrategyId)],blockNumber}));
+      const oracle=await oracleRead;
+      const buy=await buyRead;
       if('kind' in buy && buy.reason.includes('UNAVAILABLE'))throw new Error('[BUY_ALLOWANCE_UNAVAILABLE] 買入額度無法確認');
-      const limits=await readMaxLegUsdE8(assets,query,chainId);
+      const limits=await limitsRead;
       const holding=plan.snapshot.holdings.find(h=>h.asset.toLowerCase()===numeraireFor(chainId));
-      const reserve=await minimumFeeReserve(publicClient,executor(),BigInt(plan.pinnedVersion.onchainStrategyId),blockNumber,due.account,chainId===97);
+      const reserve=await reserveRead;
       // Executor buyAllowance is already in numeraire raw units (18 decimals).
       const buyLimit='kind' in buy?0n:buy.remaining;
-      const fee=Number(await publicClient.readContract({address:registry(),abi:[{type:'function',name:'effectiveFeeBps',stateMutability:'view',inputs:[{type:'uint256'}],outputs:[{type:'uint16'}]}],functionName:'effectiveFeeBps',args:[BigInt(plan.pinnedVersion.onchainStrategyId)],blockNumber}));
-      const caps=new Map<string,bigint|null>();
-      for(const asset of assets){
+      const fee=Number(await feeRead);
+      const capReads=assets.map(asset=>{
         const limit=limits.get(asset.toLowerCase());
-        if(limit===undefined)throw new Error('asset capacity missing');
+        if(limit===undefined)return early(Promise.reject<bigint>(new Error('asset capacity missing')));
         const upper=limit===null?buyLimit:limit*10n**10n;
-        caps.set(asset.toLowerCase(),await newMoneyDepthCap(publicClient,oracle,numeraireFor(chainId) as Address,asset as Address,upper,blockNumber,fee));
-      }
+        return early(newMoneyDepthCap(publicClient,oracle,numeraireFor(chainId) as Address,asset as Address,upper,blockNumber,fee));
+      });
+      const caps=new Map<string,bigint|null>();
+      for(const [index,asset] of assets.entries())caps.set(asset.toLowerCase(),await (capReads[index] as Promise<bigint>));
       return {reserve,caps,buyLimit,
         cash:holding?.amountWei??0n};
     },
@@ -92,9 +102,12 @@ export function defaultNewMoneyDeps(client:()=>PublicClient,executor:()=>Address
     },
     quote:async(due,plan,inputs,deadline)=>{
       const publicClient=client();
+      // The block header and the oracle address are asked together; the header's answer is still taken first.
+      const oracleRead=publicClient.readContract({address:executor(),abi:EXECUTOR_ABI,functionName:'oracle',blockNumber:plan.snapshot.block});
+      oracleRead.catch(()=>{});
       const block=await publicClient.getBlock({blockNumber:plan.snapshot.block});
       if(block.timestamp+1800n>deadline)deadline=block.timestamp+1800n;
-      const oracle=await publicClient.readContract({address:executor(),abi:EXECUTOR_ABI,functionName:'oracle',blockNumber:plan.snapshot.block});
+      const oracle=await oracleRead;
       return quoteNewMoney({publicClient,executor:executor(),registry:registry(),oracle,strategyId:BigInt(plan.pinnedVersion.onchainStrategyId),
         blockNumber:plan.snapshot.block,cash:numeraireFor(chainId) as Address,inputs,deadline});
     },

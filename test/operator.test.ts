@@ -1776,3 +1776,33 @@ test('#124 authenticated fund status serializes buying pause independently from 
     assert.equal(result.complete, true); assert.deepEqual(result.blocked, []); assert.equal(result.totalUsdE8, '60000000000');
   }, { portfolioStatus: reader });
 });
+
+test("the owner's own buy round leaves the site-wide keepers to the scheduler, keeps this portfolio's DCA step, does not wait for the after snapshot, and logs how long the owner waited; the operator's round is unchanged", async () => {
+  const run = async (owner: boolean) => {
+    const seen: { args?: Record<string, unknown>; deps?: Record<string, unknown> } = {}, lines: string[] = [];
+    const outcome = await runOperatorRebalance(PORTFOLIO_ID, WALLET.address, {
+      requireOwnedPortfolio: OWNED,
+      ...(owner ? { resumeIfPaused: true, query: (async () => ({ rows: [] })) as never } : {}),
+      runSchedulerOnce: (async (args: Record<string, unknown>, deps: Record<string, unknown>) => {
+        seen.args = args; seen.deps = deps;
+        return { claimed: 1, dryRun: false, results: [runResult()] };
+      }) as unknown as typeof runSchedulerOnce,
+      publicClient: receiptClient(2) as never,
+      executor: EXECUTOR,
+      log: (line) => lines.push(line),
+    });
+    return { seen, lines, outcome };
+  };
+  const owner = await run(true);
+  assert.deepEqual(owner.seen.args, { dryRun: false, limit: 1, skipAlerts: true, skipKeepers: true, dcaPortfolioId: PORTFOLIO_ID });
+  assert.equal(owner.seen.deps?.afterSnapshotInBackground, true);
+  const timing = owner.lines.map((line) => { try { return JSON.parse(line) as Record<string, unknown>; } catch { return null; } }).find((line) => line?.msg === 'owner_buy_round');
+  assert.ok(timing, owner.lines.join('\n'));
+  assert.deepEqual([timing.portfolioId, timing.outcome, typeof timing.totalMs], [PORTFOLIO_ID, 'executed', 'number']);
+  assert.equal(owner.outcome.swapExecuted, 2, 'the result the owner gets is the same');
+  const operator = await run(false);
+  assert.deepEqual(operator.seen.args, { dryRun: false, limit: 1, skipAlerts: true });
+  assert.equal(operator.seen.deps?.afterSnapshotInBackground, undefined);
+  assert.equal(operator.lines.some((line) => line.includes('owner_buy_round')), false);
+  assert.deepEqual(operator.outcome, owner.outcome);
+});

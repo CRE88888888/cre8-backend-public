@@ -719,6 +719,12 @@ export type RunSchedulerArgs = {
    * before the sale even started. The executor's global pause is still read: that is this round's own gate.
    */
   skipKeepers?: boolean;
+  /**
+   * With `skipKeepers`, an owner's own buy of one portfolio: the DCA pass still runs, for this portfolio only (its due
+   * tranche is redeemed and credited before the buy, exactly as the site-wide pass did for it). Every other portfolio's
+   * DCA and the other keeper passes stay with the background scheduler.
+   */
+  dcaPortfolioId?: number;
   /** **預設 true**（省略即 dry run）。要送交易必須明確給 false。 */
   dryRun?: boolean;
   limit?: number;
@@ -2224,7 +2230,7 @@ export async function runSchedulerOnce(
   // Yield exits/recovery have their own account lock and precede DEX queues, buy throttles and price gates.
   if (keepers) try { const result=await (deps.yieldRound??runYieldRound)({dryRun,limit}); resolved.log('[yield] '+JSON.stringify(result)); } catch (error) { resolved.log(`[yield] 生息讀值／對帳未完成，保留原部位與預留：${errorChain(error)}`); }
   // DCA (定投, db 0064): redeem due tranches from each plan's vault and credit them as funding lots before the buy round.
-  if (keepers) try { const result=await (deps.dcaRound??runDcaRound)({dryRun,limit,log:resolved.log}); if(result.checked||result.blocked)resolved.log('[dca] '+JSON.stringify(result)); } catch { resolved.log('[dca] 定投讀值／對帳未完成，下輪再試'); }
+  if (keepers || args.dcaPortfolioId !== undefined) try { const result=await (deps.dcaRound??runDcaRound)({dryRun,limit,log:resolved.log,...(keepers||args.dcaPortfolioId===undefined?{}:{portfolioId:args.dcaPortfolioId})}); if(result.checked||result.blocked)resolved.log('[dca] '+JSON.stringify(result)); } catch { resolved.log('[dca] 定投讀值／對帳未完成，下輪再試'); }
   // Strategy earn keeper (backend#199): anyone-callable deleverage/unwind and incentive claims for each account's own position.
   if (keepers) try { const result=await (deps.strategyEarnRound??runStrategyEarnRound)({dryRun,log:resolved.log}); if(result)resolved.log('[strategy-earn] '+JSON.stringify(result)); } catch { resolved.log('[strategy-earn] 健康度讀值未完成，下輪再試'); }
   // Routing v2 keeper (anyone-callable executeDeleverage at the health line, reward tokens box -> account): every account that has anything on v2,

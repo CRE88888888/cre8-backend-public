@@ -3175,6 +3175,34 @@ test('#83 new-money quote preserves every exact-input component; missing price/d
   await assert.rejects(newMoneyDepthCap(params.publicClient,ROUTER,USDT,WBNB,50n*U,chain.block.number));
 });
 
+test('new-money quote: components are quoted together, and the first component in basket order still decides what the basket reports', async () => {
+  const U=10n**18n;
+  const amount=(25n*U).toString();
+  const quote=async(order:readonly Address[],setup:(chain:StubChain)=>void)=>{
+    const chain=hubChain();
+    chain.routeQuotes=true;
+    chain.poolState={sqrtPriceX96:1n<<96n,liquidity:10n**30n,token0:USDT};
+    setup(chain);
+    return quoteNewMoney({publicClient:stubClient(chain),executor:EXECUTOR_MULTI,oracle:ROUTER,registry:REGISTRY,strategyId:1n,
+      blockNumber:chain.block.number,cash:USDT,inputs:Object.fromEntries(order.map(a=>[a.toLowerCase(),amount])),deadline:1900000000n},{quoteAggregator:async()=>null});
+  };
+  // TOKEN3 has no pool (blocked: pool data); TOKEN6's oracle cannot quote (blocked: no price). Whichever comes first in the basket is reported.
+  const noPoolNoPrice=(chain:StubChain)=>{
+    chain.oracle.pairs={[WBNB.toLowerCase()]:{oracle:ORACLE_WBNB_USDT,pool:WBNB_USDT_POOL,fee:500},[TOKEN6.toLowerCase()]:{oracle:ORACLE_TOKEN6_USDT,pool:TOKEN6_USDT_POOL,fee:100}};
+    chain.oracle.errors={[`${USDT.toLowerCase()}:${TOKEN6.toLowerCase()}`]:new Error('execution reverted: UnsupportedRoute()')};
+  };
+  assert.deepEqual(await quote([TOKEN3,TOKEN6],noPoolNoPrice),{kind:'blocked',reason:'[BASKET_QUOTE_UNAVAILABLE] 整籃子等待池子資料'});
+  assert.deepEqual(await quote([TOKEN6,TOKEN3],noPoolNoPrice),{kind:'blocked',reason:'[BASKET_QUOTE_UNAVAILABLE] 任一成分缺價，整籃子等待'});
+  // WBNB's oracle reports TwapUnavailable (the quote throws); TOKEN3 has no pool (blocked). A throw that comes first aborts
+  // the basket with the generic reason; a blocked component that comes first is reported even though a later one throws.
+  const throwsAndNoPool=(chain:StubChain)=>{
+    chain.oracle.pairs={[WBNB.toLowerCase()]:{oracle:ORACLE_WBNB_USDT,pool:WBNB_USDT_POOL,fee:500}};
+    chain.oracle.errors={[`${USDT.toLowerCase()}:${WBNB.toLowerCase()}`]:twapRevert()};
+  };
+  assert.deepEqual(await quote([WBNB,TOKEN3],throwsAndNoPool),{kind:'blocked',reason:'[BASKET_QUOTE_UNAVAILABLE] RPC／報價資料不可用，整籃子等待'});
+  assert.deepEqual(await quote([TOKEN3,WBNB],throwsAndNoPool),{kind:'blocked',reason:'[BASKET_QUOTE_UNAVAILABLE] 整籃子等待池子資料'});
+});
+
 test('#83 new-money fee upper bound includes conservative depth capacity and zero cap',async()=>{
   const U=10n**18n,chain=hubChain();chain.rate={rateE18:U,slippageBps:100};
   chain.poolState={sqrtPriceX96:1n<<96n,liquidity:100000n*U,token0:USDT};

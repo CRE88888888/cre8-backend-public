@@ -916,8 +916,11 @@ export async function runOperatorRebalance(
   wallet: string,
   deps: RebalanceDeps = {},
 ): Promise<OperatorRebalanceResult> {
+  const started = performance.now();
   const find = deps.requireOwnedPortfolio ?? requireOwnedPortfolio;
   await find(portfolioId, wallet);
+  // The owner's own round (`/portfolios/:id/rebalance`, the buy the App waits for), not the operator's "Run round".
+  const ownerRound = deps.resumeIfPaused === true;
 
   // 使用者主動要求跑一輪 = 「請幫我管理這個投組」→ 若之前因為清倉被暫停，這裡接回來。
   // 排程器只認領 `schedule_state = 'active'`，不接回來的話「入金後再也不會自動再平衡」。
@@ -934,8 +937,13 @@ export async function runOperatorRebalance(
   const run = deps.runSchedulerOnce ?? runSchedulerOnce;
   const round = await run(
     // `dryRun: false` 是這支端點存在的理由，所以逐字寫出來（排程器的預設是 dry-run）。
-    { dryRun: false, limit: 1, skipAlerts: true },
+    // The owner waits for this one buy (2026-11-25: 34 s and 48 s, behind a 30 s proxy): the site-wide keeper passes took
+    // about 10 s before the round even started and none of them is about this portfolio. Only this portfolio's own DCA
+    // step still runs first (a due tranche is redeemed and credited before the buy, as before). The operator's round is unchanged.
+    { dryRun: false, limit: 1, skipAlerts: true, ...(ownerRound ? { skipKeepers: true, dcaPortfolioId: portfolioId } : {}) },
     {
+      // The after snapshot is still written; the owner does not wait for its full re-read of the account (as for a sale).
+      ...(ownerRound ? { afterSnapshotInBackground: true } : {}),
       withTransaction: singlePortfolioClaim(portfolioId, deps.withTransaction),
       // The owner's own round waits for the shared DEX lane (src/dex-queue.ts) instead of failing at once.
       ...(deps.withTransaction === undefined ? { withDexLock: <T>(chainId: number, fn: () => Promise<T>) => withDexLock(chainId, fn, { waitMs: OWNER_DEX_WAIT_MS }) } : {}),
@@ -965,13 +973,16 @@ export async function runOperatorRebalance(
 
   const outcome = operatorOutcome(result);
   const execution = result.execution;
+  const swapExecuted = await swapExecutedFor(deps, execution);
+  // One line per owner buy: the whole call as the owner waited for it (the round's own phases are in the scheduler line).
+  if (ownerRound) (deps.log ?? console.info)(JSON.stringify({ msg: 'owner_buy_round', portfolioId, outcome, totalMs: Math.round(performance.now() - started) }));
   return {
     portfolioId,
     outcome,
     reason: result.reason,
     txHash: execution?.txHash ?? null,
     userOpHash: execution?.userOpHash ?? null,
-    swapExecuted: await swapExecutedFor(deps, execution),
+    swapExecuted,
     expectedSwaps: result.plan?.steps.length ?? 0,
     gasUsed: execution?.gasUsed ?? null,
     steps: (result.plan?.steps ?? []).map((step) => ({

@@ -4180,6 +4180,26 @@ test('each portfolio logs how long it took and where the time went (slow phases 
   assert.match(timing, /planPortfolio \d+/);
 });
 
+test("an owner's own buy runs only its own portfolio's DCA step before the round; a background round runs the pass for every plan", async () => {
+  for (const owner of [false, true]) {
+    const db = stubDb({ portfolios: [portfolio()], sessionKeys: [sessionKey()] });
+    const chain = stubChain({ rebalance: readyPlan([step()]) });
+    const ran: string[] = [];
+    // A background round ignores dcaPortfolioId: the pass covers every plan.
+    const round = await runSchedulerOnce({ dryRun: false, now: NOW, skipAlerts: true, dcaPortfolioId: 305, ...(owner ? { skipKeepers: true } : {}) }, deps(db, chain, {
+      yieldRound: async () => { ran.push('yield'); return { checked: 0, blocked: 0 }; },
+      dcaRound: async (options) => { ran.push(`dca:${options.portfolioId ?? 'all'}:${options.dryRun ? 'dry' : 'live'}`); return { checked: 1, credited: 0, blocked: 0 }; },
+      strategyEarnRound: async () => { ran.push('strategy-earn'); return null; },
+      strategyV2Round: async () => { ran.push('strategy-v2'); return null; },
+      strategyRewardsRound: async () => { ran.push('rewards'); return null; },
+      resumePausedJobs: async () => { ran.push('paused-jobs'); return []; },
+    }));
+    assert.deepEqual(ran, owner ? ['dca:305:live'] : ['yield', 'dca:all:live', 'strategy-earn', 'strategy-v2', 'rewards', 'paused-jobs']);
+    assert.deepEqual(outcomes(round), ['executed'], 'the round itself is unchanged');
+    assert.equal(chain.executeCalls.length, 1);
+  }
+});
+
 test("an owner's own sale skips the account-wide keeper passes; the executor pause still gates it and background rounds keep them", async () => {
   for (const skipKeepers of [undefined, true]) {
     for (const paused of [false, true]) {

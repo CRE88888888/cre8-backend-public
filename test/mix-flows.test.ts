@@ -91,3 +91,67 @@ test('mix flow reader rejects missing, failed, reorged and timed-out RPC proof; 
   state.fail = true;
   await assert.rejects(readMixFlows(client, m, 16n, 16n), e => e instanceof Error && !e.message.includes('SECRET_RPC_CREDENTIAL'));
 });
+
+test('saved cash-flow headers: a finalized block is read once per client, every other block on every call; same hashes as reading one by one', async () => {
+  const { savedFlowHeaders } = await import('../src/mix-flows.js');
+  const { bscTestnet } = await import('viem/chains');
+  const hashOf = (n: bigint, salt = 0n) => toHex(n * 1000n + salt, { size: 32 });
+  const node = (bound: boolean) => {
+    const state = { finalized: 20n as bigint | null, salt: new Map<bigint, bigint>(), reads: [] as string[], inFlight: 0, most: 0, fail: null as bigint | null };
+    const client = createPublicClient({ ...(bound ? { chain: bscTestnet } : {}), transport: custom({ request: async ({ method, params }) => {
+      assert.equal(method, 'eth_getBlockByNumber');
+      const tag = String((params as unknown[])[0]);
+      state.reads.push(tag === 'finalized' ? tag : BigInt(tag).toString());
+      state.inFlight += 1; state.most = Math.max(state.most, state.inFlight);
+      try { await new Promise(resolve => setTimeout(resolve, 2)); } finally { state.inFlight -= 1; }
+      if (tag === 'finalized') { if (state.finalized === null) throw new Error('finalized tag not supported'); return { number: toHex(state.finalized), hash: hashOf(state.finalized), timestamp: '0x64', transactions: [] }; }
+      const n = BigInt(tag);
+      if (state.fail === n) throw new Error('fixture RPC unavailable');
+      return { number: toHex(n), hash: hashOf(n, state.salt.get(n) ?? 0n), timestamp: '0x64', transactions: [] };
+    } }, { retryCount: 0 }) });
+    return { state, client };
+  };
+  const blocks = ['10', '20', '30'];
+  const expected = (salt: Record<string, bigint> = {}) => new Map(blocks.map(n => [n, hashOf(BigInt(n), salt[n] ?? 0n)]));
+
+  // A client bound to a chain (production): 10 and 20 are finalized, 30 is not.
+  let { state, client } = node(true);
+  assert.deepEqual(await savedFlowHeaders(client, blocks), expected());
+  assert.deepEqual([...state.reads].sort(), ['10', '20', '30', 'finalized']);
+  state.reads = [];
+  state.salt.set(30n, 7n); // the block above the finalized one was replaced: seen on the next call
+  assert.deepEqual(await savedFlowHeaders(client, blocks), expected({ '30': 7n }));
+  assert.deepEqual([...state.reads].sort(), ['30', 'finalized'], 'finalized headers are not read again');
+  state.finalized = 40n; state.reads = [];
+  await savedFlowHeaders(client, blocks);
+  state.reads = [];
+  assert.deepEqual(await savedFlowHeaders(client, blocks), expected({ '30': 7n }));
+  assert.deepEqual(state.reads, [], 'everything is finalized now: no request at all');
+  // A header that cannot be read fails the call, as before (a remembered one needs no read).
+  state.fail = 50n;
+  await assert.rejects(savedFlowHeaders(client, ['10', '50']), /fixture RPC unavailable/);
+
+  // Another client never sees what the first one remembered.
+  ({ state, client } = node(true));
+  state.salt.set(10n, 3n);
+  assert.equal((await savedFlowHeaders(client, ['10'])).get('10'), hashOf(10n, 3n));
+
+  // A node that cannot say what is finalized: nothing is remembered, every block is read on every call.
+  ({ state, client } = node(true));
+  state.finalized = null;
+  await savedFlowHeaders(client, blocks); state.reads = []; state.salt.set(10n, 5n);
+  assert.deepEqual(await savedFlowHeaders(client, blocks), expected({ '10': 5n }));
+  assert.deepEqual([...state.reads].sort(), ['10', '20', '30', 'finalized']);
+
+  // A client without a chain (a test fixture, which may rewrite any block): never remembered, never asked for `finalized`.
+  ({ state, client } = node(false));
+  await savedFlowHeaders(client, blocks); state.reads = []; state.salt.set(10n, 9n);
+  assert.deepEqual(await savedFlowHeaders(client, blocks), expected({ '10': 9n }));
+  assert.deepEqual([...state.reads].sort(), ['10', '20', '30']);
+
+  // Many flows: a few headers at a time (12 plus the `finalized` read), not all at once and not one by one.
+  ({ state, client } = node(true));
+  const many = Array.from({ length: 40 }, (_, i) => String(100 + i));
+  assert.equal((await savedFlowHeaders(client, many)).size, 40);
+  assert.ok(state.most > 1 && state.most <= 13, `in flight at once: ${state.most}`);
+});

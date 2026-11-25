@@ -69,6 +69,76 @@ test('#92 policy preserves buyAllowance raw units and converts only USD-E8 leg l
   }
 });
 
+test('policy reads are started together and their results are taken in the original order: the first failure in that order is the one reported', async () => {
+  const U=10n**18n,cash=P.contracts.usdt,account=P.roles.operator;
+  const tokens=[P.assets.WBNB,P.assets.BTCB,P.assets.NVDAB];
+  const assets=tokens.map(t=>t.token);
+  const abi=parseAbi(['function oracle() view returns(address)','function buyAllowance(address) view returns(uint256,uint256,uint64)',
+    'function minBatchFee() view returns(uint256)','function minFeeTopUp(uint256,uint256) view returns(uint256)','function minFeeDue(address,uint256) view returns(uint256)',
+    'function minFeeWindowOf(address) view returns(uint64,uint192,uint256)','function effectiveFeeBps(uint256) view returns(uint16)',
+    'function oracleOf(address) view returns(address)','function pool() view returns(address)','function fee() view returns(uint24)',
+    'function previewSwap(address,address,uint256) view returns(uint256,uint256)','function token0() view returns(address)',
+    'function slot0() view returns(uint160,int24,uint16,uint16,uint16,uint32,bool)','function liquidity() view returns(uint128)']);
+  // `fail`: `${functionName}` for an account-wide read, `${functionName}:${asset index}` for one asset's read.
+  const state={fail:new Set<string>(),busy:new Map<number,number>(),most:0};
+  const same=(a:string,b:string)=>a.toLowerCase()===b.toLowerCase();
+  const client=createPublicClient({chain:bscTestnet,transport:custom({request:async({method,params})=>{
+    if(method==='eth_getBlockByNumber')return {number:'0x14',timestamp:'0x2710',transactions:[]};
+    assert.equal(method,'eth_call');assert.ok(Array.isArray(params));const raw:unknown=params[0];
+    assert.ok(typeof raw==='object'&&raw!==null);const data:unknown=Reflect.get(raw,'data'),to=String(Reflect.get(raw,'to'));assert.ok(typeof data==='string'&&isHex(data));
+    const call=decodeFunctionData({abi,data});assert.equal(params[1],'0x14','every read is pinned to the plan block');
+    const byOracle=tokens.findIndex(t=>same(t.oracle,to)),byPool=tokens.findIndex(t=>same(t.pool,to));
+    const index=call.functionName==='oracleOf'?tokens.findIndex(t=>same(t.token,call.args[0])):call.functionName==='previewSwap'?tokens.findIndex(t=>same(t.token,call.args[1])):byOracle>=0?byOracle:byPool;
+    const key=index>=0?`${call.functionName}:${index}`:call.functionName;
+    // How many different assets have a read in flight at this moment.
+    if(index>=0){state.busy.set(index,(state.busy.get(index)??0)+1);state.most=Math.max(state.most,[...state.busy.values()].filter(n=>n>0).length);}
+    // The later an asset is in the list, the sooner its reads answer: a later asset's failure is known first.
+    try{await new Promise(resolve=>setTimeout(resolve,index>=0?(tokens.length-index)*4:2));}finally{if(index>=0)state.busy.set(index,(state.busy.get(index)??0)-1);}
+    if(state.fail.has(key))throw new Error('private upstream credential');
+    const result=(value:bigint|number|Address|readonly [bigint,bigint]|readonly [bigint,bigint,bigint]|readonly [bigint,number,number,number,number,number,boolean])=>encodeFunctionResult({abi,functionName:call.functionName,result:value});
+    switch(call.functionName){
+      case 'oracle':return result(P.contracts.router);
+      case 'buyAllowance':return result([1100n*U,0n,0n]);
+      case 'minBatchFee':return result(3n*U/10n);
+      case 'minFeeTopUp':return result(27n*U/100n);
+      case 'minFeeWindowOf':return result([10000n,100n*U,2n*U/10n]);
+      case 'minFeeDue':return result(0n);
+      case 'effectiveFeeBps':return result(10);
+      case 'oracleOf':return result(tokens[index]?.oracle??P.contracts.router);
+      case 'pool':return result(tokens[index]?.pool??P.contracts.router);
+      case 'fee':return result(500);
+      case 'token0':return result(cash);
+      case 'slot0':return result([1n<<96n,0,0,10,10,0,true]);
+      case 'liquidity':return result(10n**30n);
+      case 'previewSwap':return result([call.args[2],call.args[2]*99n/100n]);
+    }
+  }},{retryCount:0})});
+  const due:DuePortfolio={portfolioId:1,strategyId:1,version:1,account,accountType:'KERNEL',intervalSeconds:60,unsupportedReason:null,nextRunAt:new Date(0)};
+  const plan:PortfolioPlan={portfolioId:1,strategyId:1,account,chainId:97,
+    snapshot:{portfolioId:1,block:20n,nativeBalanceWei:0n,holdings:[{asset:cash,amountWei:1100n*U,decimals:18,usdPriceE8:100000000n,priceSource:TWAP_PRICE_SOURCE}],unpriced:[]},
+    scan:{portfolioId:1,block:20n,cursor:{portfolioId:1,startBlock:1n,lastScannedBlock:20n},scannedRange:null,candidateCount:0,unknownHoldings:[],zeroBalanceCount:0,unreadableCandidates:[],deployment:{block:1n,reason:'resolved',detail:'test'},universeComplete:true,incompleteReasons:[]},
+    targets:assets.map((asset,i)=>({asset,weightBps:i===0?3400:3300,symbol:`T${i}`})),report:null,blocked:[],pinnedVersion:{version:1,onchainStrategyId:1,paused:false},allocationCheck:{consistent:true,chain:[],mismatches:[]},thresholdBps:100};
+  let rows=assets.map(address=>({address,max_leg_usdt:'5000'}));
+  const deps=defaultNewMoneyDeps(()=>client,()=>P.contracts.executor,()=>P.contracts.registry,async()=>({rows}),56);
+  const run=async(...fail:string[])=>{state.fail=new Set(fail);state.most=0;
+    try{return await deps.policy(due,plan,assets);}catch(error){return (error as Error).message;}};
+  // All healthy: one cap per asset in the given order, and the three assets are read at the same time (they were read one asset after the other).
+  const healthy=await run();
+  assert.ok(typeof healthy==='object');
+  assert.deepEqual([...healthy.caps.keys()],assets.map(a=>a.toLowerCase()));
+  assert.equal(state.most,3,'assets with a read in flight at once');
+  // Two assets fail in different ways; the one that comes first in the list is reported although the later one answered first.
+  assert.equal(await run('slot0:0','oracleOf:2'),'new money depth unavailable');
+  assert.equal(await run('oracleOf:1','slot0:2'),'new money pool unavailable');
+  // An account-wide read that the old code made before the per-asset ones is still reported before them.
+  assert.equal(await run('buyAllowance','oracleOf:0'),'[BUY_ALLOWANCE_UNAVAILABLE] 買入額度無法確認');
+  assert.equal(await run('minBatchFee','oracleOf:0'),'[MIN_FEE_UNAVAILABLE] 無法確認最低費預留，不買入');
+  // A missing capacity row for the second asset is reported after the first asset's own failure, before the third's.
+  rows=rows.filter((_,i)=>i!==1);
+  assert.equal(await run('slot0:0'),'[MAX_LEG_UNAVAILABLE] 資產單筆限額讀取失敗或資料缺漏，不送交易');
+  assert.equal(await run('buyAllowance'),'[BUY_ALLOWANCE_UNAVAILABLE] 買入額度無法確認');
+});
+
 test('#104 yield planning projects claim units once, prices missing direct assets and never changes the spendable snapshot',async()=>{
   const U=10n**18n;
   const {yieldFixture,yieldRebalancePlan}=await import('./fixtures/yield.js');

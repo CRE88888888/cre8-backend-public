@@ -567,3 +567,32 @@ test('DCA view: a due period that is not being bought says why (portfolio paused
   assert.deepEqual(await view({ startAt: new Date('2026-11-24T15:00:00Z'), schedule: 'paused' }), [null, false], 'not due yet: nothing is waiting');
   assert.deepEqual(await view({ inflight: true, schedule: 'paused' }), [null, false], 'this period is being bought');
 });
+
+test("DCA round for one portfolio (an owner's own buy): only the plan of that portfolio's account is stepped and credited", async () => {
+  const h = harness({ allocation: ['0x' + '11'.repeat(20)] });
+  h.plans.push(dcaPlanRow());
+  h.state.shares = 20n * E18; h.state.value = 20n * E18;
+  const base = (h.deps.chain as () => DcaChain)(), allowed = { ...base, earn: { ...base.earn, allowance: async () => maxUint256 } };
+  h.deps.chain = () => allowed;
+  h.deps.sessionKey = async () => testKey;
+  const inner = h.deps.query as unknown as (sql: string, params?: unknown[]) => Promise<{ rows: Row[] }>;
+  const asked: unknown[][] = [];
+  h.deps.query = (async (sql: string, params: unknown[] = []) => {
+    const s = sql.replace(/\s+/g, ' ');
+    if (!s.includes('from dca_plans p where p.chain_id=97')) return inner(sql, params);
+    asked.push([s.startsWith('select q.* from (') && s.endsWith(') q where q.current_portfolio=$2::text order by q.id::bigint limit $1'), ...params]);
+    const rows = (await inner(sql, params)).rows;
+    return { rows: params.length === 2 ? rows.filter(r => r.current_portfolio === params[1]) : rows };
+  }) as unknown as DcaDeps['query'];
+  const run = (portfolioId?: number) => runDcaRound({ dryRun: false, limit: 10, log: () => undefined, ...(portfolioId === undefined ? {} : { portfolioId }) }, h.deps);
+  // Another portfolio's own round: this plan (portfolio 7) is not touched.
+  assert.deepEqual(await run(8), { checked: 0, credited: 0, blocked: 0 });
+  assert.equal(h.submitted.length, 0);
+  // Its own portfolio's round: the due period is redeemed and credited, exactly as the site-wide pass does.
+  assert.deepEqual(await run(7), { checked: 1, credited: 1, blocked: 0 });
+  assert.equal(h.plans[0]?.periods_done, 1);
+  assert.deepEqual(asked, [[true, 10, '8'], [true, 10, '7']]);
+  // The site-wide pass keeps its own statement and parameters.
+  asked.length = 0; await run();
+  assert.deepEqual(asked, [[false, 10]]);
+});

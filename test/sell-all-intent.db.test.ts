@@ -5,6 +5,7 @@ import type { Address } from 'viem';
 import { detectSellAllOverdue, resetRoundOutcomes } from '../src/alerts.js';
 import { closePool, getPool, migrate, query } from '../src/db.js';
 import { claimDuePortfolios } from '../src/scheduler.js';
+import { singlePortfolioClaim } from '../src/operator.js';
 import { CANCEL_SELL_ALL_SQL, NEW_MONEY_ENDS_SELL_ALL_SQL, SELL_ALL_KIND, SELL_ALL_OF_PORTFOLIO_SQL, requestSellAll, sellAllRetryAt, settleSellAll } from '../src/sell-all-intent.js';
 import { canonicalConfigHash, validateAssetConfig } from '../src/strategy-execution.js';
 import type { Allocation } from '../src/strategies.js';
@@ -119,6 +120,32 @@ test('sell all request (real Postgres): the owner\'s new money or buy ends it an
   assert.deepEqual([await selling(bought), await selling(id)], [false, false]);
   await requestSellAll(run, 97, bought);
   assert.equal(await selling(bought), true);
+}));
+
+test('sell all request (real Postgres): the single-portfolio claims of /close, /redeem, /rebalance and /plan run as written and carry the request', { skip: !DB }, tidy(async () => {
+  await migrate();
+  const id = await portfolio(), other = await portfolio();
+  // What the owner's own calls claim: the scheduler's claim narrowed to one portfolio (operator.ts singlePortfolioClaim).
+  const own = async (options: { allowPaused?: boolean; preserveNextRunAt?: boolean } = {}, advance = false) =>
+    (await claimDuePortfolios(1, new Date(), { chainId: 97, advance, withTransaction: singlePortfolioClaim(id, undefined, options) })).map(due => [due.portfolioId, due.sellAll ?? false]);
+  const close = { allowPaused: true, preserveNextRunAt: true };
+  assert.deepEqual(await own(close), [[id, false]]);
+  await requestSellAll(run, 97, id);
+  await requestSellAll(run, 97, other);
+  // The request does not hide the portfolio from its owner's calls (the scheduler itself waits 90 seconds), and never brings another portfolio along.
+  assert.deepEqual(await own(close), [[id, true]]);
+  assert.deepEqual(await own(), [[id, true]], '/redeem and /plan on an active portfolio');
+  // A `/close` claim advances next_run_at only forwards (the full interval is later than the caller's 90 seconds).
+  const before = (await state(id)).next_run_at!;
+  assert.deepEqual(await own(close, true), [[id, true]]);
+  assert.ok((await state(id)).next_run_at!.getTime() >= before.getTime());
+  // Paused by the first batch: `/close` still claims it; calls that need an active portfolio do not (as before).
+  await settleSellAll(run, id, { outcome: 'executed', over: false, tracked: true });
+  assert.deepEqual(await own(close), [[id, true]]);
+  assert.deepEqual(await own(), []);
+  // Done: `/close` again finds a paused portfolio without a request.
+  await settleSellAll(run, id, { outcome: 'noop', over: true, tracked: true });
+  assert.deepEqual(await own(close), [[id, false]]);
 }));
 
 test('sell all request (real Postgres): a portfolio without a cash ledger row holds no request and /close works as before (untracked pause)', { skip: !DB }, tidy(async () => {

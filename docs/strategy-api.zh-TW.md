@@ -81,6 +81,13 @@ enroll、投入及執行均核對 pinned 版本、chain、allocation、scheduleH
 
 「全部賣出」的要求會留在後端（`src/sell-all-intent.ts`，2026-11-25 testnet portfolio 33）：`/close` 在第一輪之前把要求記成一列（`user_notifications`，kind `sell_all_requested`，`pending`＝還在賣、`delivered`＝賣完、`failed`＝本人中途又放錢進來）。呼叫端還在一批一批呼叫 `/close` 時排程器不插手（每次呼叫把下一輪排到 90 秒後，免得鎖住組合讓下一批回 `[PORTFOLIO_LOCK_BUSY]`）；呼叫端斷線、逾時、沒有再呼叫滿 90 秒後，排程器每一輪看到這一列就只做賣出（與 `/close` 同一份計畫與管線），不做再平衡、不買新入金或定投、不重新開加息；`/close` 第一批成交後組合就是暫停的，有這一列的暫停組合照樣會被認領。某一輪看到帳戶只剩現金（其他資產合計不到 0.01 USDT，或剩下的不到 1 USDT 且執行器地板為 0）就結束這一列，組合維持暫停，等本人把 USDT 領回。要求只有在已經動過手之後才算數：寫下這一列的那一次呼叫，如果它自己那一輪在鏈上什麼都沒做成（休市、沒有報價、代付被拒、鎖或佇列擋住、賣出 revert；沒有還款取回、也沒有任何一筆賣出成交或結果未明），那一輪結束時就把這一列撤回（`failed`），這次沒賣、之後也不會自己賣，`sellAllPending` 回 false。判斷在後端那一輪結束時做，與呼叫端還在不在等回應無關；先前的呼叫留下的要求不會因為後來某一次呼叫被擋而撤回。再呼叫 `/close` 只是接續，不會重複賣；回應多一個 `sellAllPending`（true＝後端會自己做完）。本人再買（`/rebalance`）、新的入金 lot、定投存入確認、`execution-state` 都會結束這一列並照常管理。送出連續失敗 5 次後依 5 分鐘、15 分鐘、1 小時、6 小時拉長間隔（從 `operations` 算，重啟不歸零）；沒送出的輪次（休市、沒有報價、抵押品還取不回）每輪重試不計次；超過 `ALERT_STUCK_HOURS`（預設 6 小時）還沒賣完進 `portfolio_stuck` 告警（休市等待是 warn，其餘 critical）。沒有現金帳列的舊式組合、自己在退出／刪除的自建組合不記這一列，行為同以前。
 
+「全部賣出」什麼時候算賣完、什麼時候可以領回（2026-11-25 testnet portfolio 37）：開著加息時 `/close` 要好幾輪——還款取回大部分、賣掉取回的、用賣出所得補差額並取回剩下的抵押、再賣掉。`/close` 的回應：
+- `remainingUsdE8`：這一輪之後帳戶還剩的非現金名義額，**含還抵押在加息裡的部分**（以前只賣得動閒置的那一輪會回 `"0"`，其實還有約 2% 抵押著）。
+- `sellAllDone`：`true`＝真的賣完（沒有抵押、沒有負債、沒有可賣的，或只剩賣不動的零頭）。呼叫端**只在這時領回 USDT**；`false` 就繼續呼叫 `/close`，或在 `sellAllPending` 為 `true` 時交給排程器做完、之後再呼叫一次（那時回 `noop`、`sellAllDone: true`）。不要只看 `remainingUsdE8 === "0"`。
+- 這一輪發現「抵押品取不回、帳戶裡也沒有閒置的可賣」（賣出所得被領走的帳戶）：不用還款就取回負債用不到的抵押品（`[STRATEGY_EARN_UNWINDING] 賣出前已還款取回：… take back … tx=…；下一輪再賣`），下一輪賣掉它、用所得補差額結清（路由 v2 `spareCollateral`；v1 在還款那一輪本來就只留負債需要的抵押）。
+
+可領金額的保留（`src/sell-all-hold.ts`）：全部賣出還開著（`sell_all_requested` 是 `pending`）而且帳戶的加息負債比策略盒裡的錢多（v1、路由 v2 都算）時，補差額要用的 USDT 不能領：`GET /portfolios/:id/execution` 的 `cash.withdrawableRaw` 會扣掉它（`cash.reservedRaw` 加上它），代付（領回錢包那筆 UserOp）用同一個數字，超過就回 409 `PAYMASTER_WITHDRAW_RESERVED`。保留量＝還款計畫現在要從帳戶 USDT 補的金額 × 2、至少 1 USDT（與排程器自己賣一點資產補現金的規則相同）；沒有全部賣出、沒有負債、或策略盒付得起時是 0，負債還清或要求結束就解除。補差額被 24 小時額度（`WindowExceeded`）擋住期間保留一直在。鏈上讀不到時不猜：`withdrawableRaw` 回 0、代付回 503（可重試）。
+
 `stack-instructions`／`stack-instruction-state` HTTP 路由已移除（404）；持有人不能覆寫創作者排程。舊 revision 仍供歷史稽核。
 
 cash 讀同一區塊的 USDT，顯示未分類與短缺，不憑 balance 差造 lot。所有 raw 為 USDT 原生 18 decimals 字串；token received／fee 向量用該 token 自己 decimals。ID／block 等大整數用字串。

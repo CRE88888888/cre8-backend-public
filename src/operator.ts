@@ -1342,7 +1342,11 @@ export type RedeemResult = {
   steps: { tokenIn: string; tokenOut: string; amountIn: string; amountOutMin: string; venue: string }[];
   /** 保留既有欄位：首批仍為請求的 usd，close 為投組總值；續作為請求的 sellUsdE8。 */
   redeemedUsdE8: string;
-  /** 非現金待賣名義額；尚未規劃、只對帳或送出結果未知時為 null，不能當成可重送量。 */
+  /**
+   * 非現金待賣名義額；尚未規劃、只對帳或送出結果未知時為 null，不能當成可重送量。
+   * Sell all: everything the account still holds after this round, shares still posted for Strategy Earn included — a
+   * round that could only sell what was free (the posted rest waits for its repayment) does not answer 0.
+   */
   remainingUsdE8: string | null;
   batched: boolean;
   /**
@@ -1352,6 +1356,13 @@ export type RedeemResult = {
    * request (then only further calls sell).
    */
   sellAllPending?: boolean;
+  /**
+   * Sell all only: the sale is over — nothing is posted for Strategy Earn, nothing is owed, nothing is left to sell (or
+   * only a residue that cannot be sold). Only then should the caller withdraw the USDT. False while another call still
+   * has something to do (repay and take back, sell the rest): keep calling, or leave it to the scheduler when
+   * `sellAllPending` is true. A caller must not read `remainingUsdE8: "0"` alone as "done".
+   */
+  sellAllDone?: boolean;
 };
 
 /**
@@ -1397,7 +1408,9 @@ async function runOperatorSell(portfolioId: number, wallet: string, request: Sel
     try { ({ open: tracked, created } = await requestSellAll(query, configuredChainId(), portfolioId)); }
     catch (error) { (deps.log ?? console.warn)(`[close] portfolio ${portfolioId}: sell-all request not recorded, this call sells on its own (${errorChain(error)})`); }
   }
-  const planning: { result: RedeemPlanningResult | null } = { result: null };
+  // `first`: the round's first plan, made from everything the account holds (shares posted for Strategy Earn included).
+  // A full exit may plan a second time without the shares that stay posted for now (scheduler.ts, V2UnwindWait).
+  const planning: { result: RedeemPlanningResult | null; first: RedeemPlanningResult | null } = { result: null, first: null };
   // From the first plan of the round only: a second one leaves out shares that stay posted for now (V2UnwindWait).
   let over: boolean | null = null;
   const round = await (deps.runSchedulerOnce ?? runSchedulerOnce)(
@@ -1410,7 +1423,7 @@ async function runOperatorSell(portfolioId: number, wallet: string, request: Sel
       ...(deps.query === undefined ? {} : { query: deps.query }),
       planRebalance: async (input) => {
         const built = await buildRedeemPlan(input, request, deps);
-        planning.result = built;
+        planning.result = built; planning.first ??= built;
         if (closing) { posted ??= input.plan.snapshot.strategyEarnCollateral ?? []; over ??= await sellAllOver(input.plan, built.plan, deps.belowExecutorMinimum); }
         return built.plan;
       },
@@ -1423,11 +1436,15 @@ async function runOperatorSell(portfolioId: number, wallet: string, request: Sel
   const details = planning.result;
   const requested = typeof request === 'bigint' ? request : 'sellUsdE8' in request ? request.sellUsdE8 : details?.portfolioTotalUsdE8 ?? 0n;
   const outcome = result === undefined || result.portfolioId !== portfolioId ? 'blocked' : operatorOutcome(result);
-  const wanted = details?.requestedSellUsdE8 ?? null;
+  // Sell all: what is left is counted from the whole account (the first plan), less what this round sold. Counting from
+  // the second plan answered "0 left" while about 2% of the position was still posted (2026-11-25, portfolio 37), and the
+  // app withdrew the USDT the repayment of that rest needed.
+  const whole = closing ? planning.first : details;
+  const wanted = whole?.requestedSellUsdE8 ?? null;
   const remaining = wanted === null || details === null || result?.execution?.status === 'unknown'
     ? null : wanted - (outcome === 'executed' ? details.plannedSellUsdE8 : 0n);
   let reason = result?.reason ?? `排程器沒有認領 portfolio ${portfolioId}（排程狀態或 smart account 不允許）`;
-  const nothingToSell = details?.plan.kind === 'noop' && details.plan.reason === 'nothing to sell';
+  const nothingToSell = whole?.plan.kind === 'noop' && whole.plan.reason === 'nothing to sell';
   if (nothingToSell) reason = 'nothing to sell';
   if (outcome === 'executed' || closing && over === true) {
     try {
@@ -1477,7 +1494,9 @@ async function runOperatorSell(portfolioId: number, wallet: string, request: Sel
     steps: (result?.plan?.steps ?? []).map((step) => ({ tokenIn: step.tokenIn, tokenOut: step.tokenOut, amountIn: step.amountIn, amountOutMin: step.amountOutMin, venue: step.venue })),
     redeemedUsdE8: requested.toString(), remainingUsdE8: remaining?.toString() ?? null,
     batched: details !== null && details.requestedSellUsdE8 !== null && details.plannedSellUsdE8 < details.requestedSellUsdE8,
-    ...(closing ? { sellAllPending: tracked && over !== true } : {}),
+    // Done: the round found nothing left (`over`), or it sold everything the account held and nothing was posted.
+    ...(closing ? { sellAllPending: tracked && over !== true,
+      sellAllDone: over === true || outcome === 'executed' && remaining === 0n && posted !== null && (posted as readonly unknown[]).length === 0 } : {}),
   };
 }
 

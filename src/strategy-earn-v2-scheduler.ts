@@ -277,7 +277,10 @@ export async function v2QuietRound(input: { v2: StrategyEarnV2; reader: Pick<V2R
  * full exit: sell all / delete / take profit): reward tokens in the box and the account go to the owner's wallet with the
  * same session key (`executeSweepRewards`, spec §9). Returns a block reason, or null when the sale can go ahead.
  */
-export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tokenIn: string; amountIn: bigint }[]; exit?: boolean }): Promise<string | V2UnwindWait | null> {
+export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tokenIn: string; amountIn: bigint }[]; exit?: boolean;
+  /** The sale has nothing free to sell (the caller planned it without the stuck shares and found nothing): a position
+   * with nothing to repay takes back the shares its debt does not need, so there is something to sell next round. */
+  spare?: boolean }): Promise<string | V2UnwindWait | null> {
   const { v2, reader, account } = args;
   const touched = args.touched ?? await reader.touched(account);
   // A full exit also looks at an account with no route and no vault left: its strategy was simply turned off earlier (the
@@ -292,6 +295,8 @@ export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tok
     const read = await reader.account(account);
     await spendableUsdtOnly(args, read);
     const positions: PreSellPosition[] = [];
+    // The debt a venue checks a route's budget against: Lista — that market's; Venus — the account's whole Venus debt.
+    const venusDebt = [...new Map(read.routes.filter(x => x.route.venue === 'venus').map(x => [x.route.loanSymbol, x.debtRaw])).values()].reduce((sum, d) => sum + d, 0n);
     for (const r of read.routes.filter(x => x.collateralRaw > 0n)) {
       const need = args.steps.filter(s => s.tokenIn.toLowerCase() === r.route.collateral).reduce((sum, s) => sum + s.amountIn, 0n);
       const h = read.state.holdings.find(x => x.collateral === r.route.collateral);
@@ -299,11 +304,12 @@ export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tok
       const t = read.tokens[r.route.loanSymbol]!;
       positions.push({ symbol: r.route.symbol, collateral: r.route.collateral, freeCollateralRaw: h.freeCollateralRaw, postedRaw: r.collateralRaw, routeDebtRaw: r.routeDebtRaw,
         vaultAssetsRaw: read.vaults.filter(v => v.vault.token === r.route.loan).reduce((s, v) => s + v.assetsRaw, 0n), idleRaw: t.idleRaw, cashRaw: t.cashRaw, minDebtRaw: r.limits.minDebtRaw,
-        routeId: r.route.routeId, vaultId: (r.vault?.vaultId ?? ('0x' + '00'.repeat(32))) as Hex, venue: r.route.venue, loan: r.route.loanSymbol, ...(swapper && t.swap ? { swap: t.swap } : {}) });
+        routeId: r.route.routeId, vaultId: (r.vault?.vaultId ?? ('0x' + '00'.repeat(32))) as Hex, venue: r.route.venue, loan: r.route.loanSymbol, ...(swapper && t.swap ? { swap: t.swap } : {}),
+        collateralValueUsd: r.collateralValueUsd, targetLtvBps: r.targetLtvBps, budgetDebtRaw: r.route.venue === 'venus' ? venusDebt : r.debtRaw });
     }
     // A route of the same token that this sale does not close keeps the token's leftover as its repayment fallback.
     for (const p of positions) if (read.routes.some(r => r.route.loanSymbol === p.loan && r.routeDebtRaw > 0n && !positions.some(x => x.routeId === r.route.routeId))) p.lastOfToken = false;
-    const plan = v2PreSellPlan(v2, account, positions, deadline, args.now.getTime());
+    const plan = v2PreSellPlan(v2, account, positions, deadline, args.now.getTime(), args.spare ? { spare: true } : {});
     // A full exit also sells loan token already sitting in the account with nothing owed in it (left by an earlier close),
     // so the owner takes back USDT only. Tokens this plan closes are sold in the same UserOp as their close (v2PreSellPlan).
     const closing = new Set(positions.map(p => p.loan));

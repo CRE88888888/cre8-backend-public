@@ -6,6 +6,8 @@ import { detectSellAllOverdue, resetRoundOutcomes } from '../src/alerts.js';
 import { closePool, getPool, migrate, query } from '../src/db.js';
 import { claimDuePortfolios } from '../src/scheduler.js';
 import { singlePortfolioClaim } from '../src/operator.js';
+import { FREE_CASH_SQL } from '../src/paymaster.js';
+import { sellAllCashHold } from '../src/sell-all-hold.js';
 import { CANCEL_SELL_ALL_SQL, NEW_MONEY_ENDS_SELL_ALL_SQL, SELL_ALL_KIND, SELL_ALL_OF_PORTFOLIO_SQL, requestSellAll, sellAllRetryAt, settleSellAll, sharesTakenBack, withdrawSellAll } from '../src/sell-all-intent.js';
 import { FINISH_SELL_ALL_SQL } from '../src/sell-all-intent.js';
 import { RESUME_AFTER_SELL_ALL_SQL } from '../src/sell-all-resume.js';
@@ -330,4 +332,36 @@ test('Earn extra after "sell all" (real Postgres): a finished sale is found by a
   const bareAccount = (await query<{ address: string }>('select address from smart_accounts where portfolio_id=$1', [bare])).rows[0]!.address as Address;
   await noteConsentRequest(query, 97, bareAccount, { v2: '1' });
   assert.equal((await query('select 1 from user_notifications where portfolio_id=$1', [bare])).rows.length, 0);
+}));
+
+test('sell-all hold (real Postgres): held only while the request is open — the paymaster\'s cash row names the portfolio', { skip: !DB }, tidy(async () => {
+  await migrate();
+  const id = await portfolio();
+  const row = (await query<{ address: string }>('select address from smart_accounts where portfolio_id=$1', [id])).rows[0]!;
+  const account = row.address as Address;
+  // What the paymaster reads before a withdraw-to-wallet: the cash buckets and the portfolio id of this account.
+  const cashRows = (await query<{ portfolio_id: string; reserved_input_raw: string }>(FREE_CASH_SQL, [97, account])).rows;
+  assert.deepEqual(cashRows.map(r => [Number(r.portfolio_id), r.reserved_input_raw]), [[id, '0']]);
+  // The chain says 0.0000004 USD1 is owed beyond an empty strategy box (the portfolio 37 state).
+  const USD1 = address(), chainReads: string[] = [];
+  const deps = { query: run,
+    v2: () => ({ v2: { loanTokens: { USDT: cash, USD1 } } as never, reader: {
+      touched: async () => { chainReads.push('touched'); return { enabled: true, routes: ['0x01' as const], vaults: [], rewardRecipient: account }; },
+      account: async () => ({ tokens: { USD1: { token: USD1, debtRaw: 407_371_640_080n, idleRaw: 0n, cashRaw: 0n, allowanceRaw: 0n } }, vaults: [] }) as never } }),
+    v1: () => null };
+  const hold = () => sellAllCashHold({ chainId: 97, portfolioId: id, account }, deps);
+  assert.equal(await hold(), 0n, 'no "sell all": nothing is held');
+  assert.deepEqual(chainReads, [], 'and the chain is not read at all');
+  await requestSellAll(run, 97, id);
+  assert.equal(await hold(), 10n ** 18n, 'open request, debt beyond the box: 1 USDT stays');
+  // Another portfolio's request holds nothing here.
+  const other = await portfolio();
+  assert.equal(await sellAllCashHold({ chainId: 97, portfolioId: other, account: address() }, deps), 0n);
+  // Sold (`delivered`), or the owner put money back in (`failed`): the hold is gone, everything is withdrawable.
+  await run(FINISH_SELL_ALL_SQL, [id]);
+  assert.equal(await hold(), 0n);
+  await requestSellAll(run, 97, id);
+  assert.equal(await hold(), 10n ** 18n);
+  await run(CANCEL_SELL_ALL_SQL, [id]);
+  assert.equal(await hold(), 0n);
 }));

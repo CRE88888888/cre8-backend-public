@@ -327,6 +327,82 @@ test('#204 unwind before a sale (Lista, its own debt): repay first then take sha
   assert.ok(all.length > 0 && all.every(c => c.to === S.executor));
 });
 
+test('sell all with the vault short and no USDT (v1): once nothing can be repaid or taken back the exit sells what is free; any other sale still waits', async () => {
+  // After the first round: the vault is empty, the account has no USDT, and what stays posted is just what the rest of the
+  // debt needs (0.34 of 10 shares); 9.66 shares are back in the account. Before, the sale waited for USDT only it could bring.
+  const sliver: Fake = { ids: [qqq.marketId], collateral: { [qqq.marketId]: 34n * E16 }, balances: { [qqq.collateral]: 966n * E16 }, prices: { [qqq.collateral]: 100n * 10n ** 8n },
+    statuses: { [qqq.marketId]: status({ debt: 10n * E18, vaultAssets: 0n, health: { collateralValue: 34n * E18, liquidationValue: 0n, debtValue: 10n * E18, healthFactor: 0n } }) } };
+  const steps = [{ tokenIn: qqq.collateral, amountIn: 10n * E18 }];
+  const sent: unknown[] = [];
+  const send = async (calls: { to: Address; data: Hex }[]) => { sent.push(calls); return tx([]); };
+  const exit = await strategyEarnUnwindForSale({ ...stepArgs(sliver, send).args, steps, exit: true });
+  assert.ok(exit !== null && typeof exit === 'object', String(exit));
+  assert.deepEqual([exit.stuck, exit.needUsdtRaw], [[qqq.collateral], 10n * E18 + 10n * E18 / 1_000n]);
+  assert.match(exit.note, /^\[STRATEGY_EARN_UNWINDING\] QQQB vault 不足/);
+  // A partial sale (not an exit) and a dry run keep the old answer: a note, the sale waits.
+  assert.match(await strategyEarnUnwindForSale({ ...stepArgs(sliver, send).args, steps }) ?? '', /^\[STRATEGY_EARN_UNWINDING\] QQQB vault 不足/);
+  assert.equal(typeof await strategyEarnUnwindForSale({ ...stepArgs(sliver, send, true).args, steps, exit: true }), 'string');
+  assert.deepEqual(sent, [], 'nothing is sent while nothing can be repaid or taken back');
+  // A price tick that frees under 1% of what is posted is not worth a UserOp every round: still "sell what is free".
+  const tick = { ...sliver, statuses: { [qqq.marketId]: status({ debt: 10n * E18, vaultAssets: 0n, health: { collateralValue: 3402n * E16, liquidationValue: 0n, debtValue: 10n * E18, healthFactor: 0n } }) } };
+  assert.equal(typeof await strategyEarnUnwindForSale({ ...stepArgs(tick, send).args, steps, exit: true }), 'object');
+  assert.deepEqual(sent, []);
+  // The sale brought USDT in: the next round repays everything and takes the last shares back, as before.
+  const paid = { ...sliver, balances: { [qqq.collateral]: 0n, [usdt]: 900n * E18 } };
+  assert.match(await strategyEarnUnwindForSale({ ...stepArgs(paid, send).args, steps: [{ tokenIn: qqq.collateral, amountIn: 34n * E16 }], exit: true }) as string, /賣出前已還款取回：QQQB 先還清再取回/);
+  assert.equal(sent.length, 1);
+  // A market the session key cannot call still holds the sale back (the owner has to renew): never "sell what is free".
+  const noKey = await strategyEarnUnwindForSale({ ...stepArgs(sliver, send).args, sendable: [], steps, exit: true });
+  assert.match(noKey as string, /需要 owner 續期/);
+});
+
+test('sell-all hold: USDT an open "sell all" still needs for its repayment — twice the shortfall, at least 1 USDT; nothing without a request, a debt or a shortfall', async () => {
+  const { holdForShortfall, v1ShortfallUsdt, v2ShortfallUsdt, sellAllCashHold, SELL_ALL_HOLD_MIN_RAW } = await import('../src/sell-all-hold.js');
+  assert.deepEqual([holdForShortfall(0n), holdForShortfall(-5n), holdForShortfall(1n), holdForShortfall(E18), holdForShortfall(3n * E18)], [0n, 0n, E18, 2n * E18, 6n * E18]);
+  assert.equal(SELL_ALL_HOLD_MIN_RAW, E18);
+  // Routing v2, the portfolio 37 state: 0.0000004 USD1 owed beyond an empty box, no USD1 in the account.
+  const USD1 = '0x00000000000000000000000000000000000000d1' as Address, v2 = { loanTokens: { USDT: usdt, USD1 } };
+  const token = (t: Address, debtRaw: bigint, idleRaw = 0n, cashRaw = 0n) => ({ token: t, debtRaw, idleRaw, cashRaw, allowanceRaw: 0n });
+  const vault = (t: Address, assetsRaw: bigint) => ({ vault: { token: t } as never, assetsRaw, since: 0, shouldExit: false });
+  const sliver = v2ShortfallUsdt(v2, { tokens: { USD1: token(USD1, 407_371_640_080n) }, vaults: [] });
+  assert.ok(sliver > 407_371_640_080n && sliver < 2n * 407_371_640_080n + 10n ** 9n, String(sliver));
+  assert.equal(holdForShortfall(sliver), E18, 'a sliver of debt holds 1 USDT');
+  // The box (vault + idle) or the account's own loan token covers the debt as read: nothing is held.
+  assert.equal(v2ShortfallUsdt(v2, { tokens: { USD1: token(USD1, 19n * E18) }, vaults: [vault(USD1, 19n * E18)] }), 0n);
+  assert.equal(v2ShortfallUsdt(v2, { tokens: { USD1: token(USD1, 19n * E18, 10n * E18, 9n * E18) }, vaults: [] }), 0n);
+  assert.equal(v2ShortfallUsdt(v2, { tokens: { USD1: token(USD1, 0n) }, vaults: [] }), 0n);
+  // A real gap: 19 owed, 14 in the box -> 5 short; bought with interest, buffer and the pool's 0.3% -> a little over 5, held twice.
+  const five = v2ShortfallUsdt(v2, { tokens: { USD1: token(USD1, 19n * E18) }, vaults: [vault(USD1, 14n * E18)] });
+  assert.ok(five > 5n * E18 && five < 51n * E18 / 10n, String(five));
+  assert.equal(holdForShortfall(five), five * 2n);
+  // A USDT debt is paid from the account's USDT directly: its own USDT is never counted as cover.
+  const direct = v2ShortfallUsdt(v2, { tokens: { USDT: token(usdt, 10n * E18, 0n, 500n * E18) }, vaults: [vault(usdt, 4n * E18)] });
+  assert.ok(direct > 6n * E18 && direct < 601n * E16, String(direct));
+  // v1: its own bar is vault >= debt x 1.001. Lista per market; Venus one debt against all of its vaults.
+  const st = (debt: bigint, vaultAssets: bigint) => ({ debt, vaultAssets });
+  assert.equal(v1ShortfallUsdt([]), 0n);
+  assert.equal(v1ShortfallUsdt([{ protocol: 'lista', st: st(100n * E18, 101n * E18) }]), 0n);
+  assert.equal(v1ShortfallUsdt([{ protocol: 'lista', st: st(100n * E18, 100n * E18) }]), E18 / 10n);
+  assert.equal(v1ShortfallUsdt([{ protocol: 'lista', st: st(100n * E18, 0n) }, { protocol: 'lista', st: st(0n, 0n) }]), 1001n * E18 / 10n);
+  assert.equal(v1ShortfallUsdt([{ protocol: 'venus', st: st(100n * E18, 60n * E18) }, { protocol: 'venus', st: st(100n * E18, 30n * E18) }]), 101n * E18 / 10n);
+  // The whole read: no open request -> one query and no chain read at all; an open one -> the shortfall of both generations.
+  const reads: string[] = [];
+  const deps = (open: boolean, debt = 407_371_640_080n, deployed = true) => ({
+    query: async (sql: string, params: readonly unknown[]) => { reads.push(`sql ${params.join(',')}`); assert.match(sql, /sell_all_requested/); assert.match(sql, /state = 'pending'/); return { rows: open ? [{}] : [] }; },
+    v2: () => deployed ? { v2: v2 as never, reader: {
+      touched: async () => { reads.push('touched'); return { enabled: true, routes: debt > 0n ? ['0x01' as Hex] : [], vaults: [], rewardRecipient: account }; },
+      account: async () => { reads.push('account'); return { tokens: { USD1: token(USD1, debt) }, vaults: [] } as never; } } } : null,
+    v1: () => ({ chain: { head: async () => ({ number: 1n, timestamp: 1n }), accountMarkets: async () => { reads.push('v1'); return [] as Hex[]; }, status: async () => status() }, markets: [] }) });
+  const input = { chainId: 97, portfolioId: 37, account };
+  assert.equal(await sellAllCashHold(input, deps(false)), 0n);
+  assert.deepEqual(reads, ['sql 97,37'], 'no open sell all: nothing else is read');
+  assert.equal(await sellAllCashHold(input, deps(true)), E18);
+  assert.equal(await sellAllCashHold(input, deps(true, 0n)), 0n, 'sold and repaid: nothing is held, everything is withdrawable');
+  assert.equal(await sellAllCashHold(input, deps(true, 407_371_640_080n, false)), 0n, 'a chain without routing v2 and nothing on v1');
+  // Unreadable chain while a request is open: the caller is told (it must not answer with a guess).
+  await assert.rejects(sellAllCashHold(input, { ...deps(true), v2: () => ({ v2: v2 as never, reader: { touched: async () => { throw new Error('rpc down'); }, account: async () => { throw new Error('unused'); } } }) }), /rpc down/);
+});
+
 // ---- keeper: Lista claim and ledger ------------------------------------------------------------------------------
 
 test('#204 keeper: Lista incentives claimed per market id; deleverage and claims written to the portfolio ledger; drill accounts are not', async () => {

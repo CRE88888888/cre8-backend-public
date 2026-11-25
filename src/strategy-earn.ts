@@ -23,6 +23,7 @@ import { claimedCash } from './withdrawable-cash.js';
 import { settleCashSwaps } from './strategy-cash-swaps.js';
 import { consentIsStale, consentSinceSellAll, distinctCeiling, noteConsentRequest } from './strategy-earn-after-sell-all.js';
 import type { ConsentBefore, ConsentSinceSellAll } from './strategy-earn-after-sell-all.js';
+import type { V2UnwindWait } from './strategy-earn-v2-scheduler.js';
 export { STRATEGY_EARN_97, assertNotStrategyVault, isStrategyVault } from './strategy-earn-guard.js';
 
 /**
@@ -1263,9 +1264,18 @@ export async function strategyEarnAutoOpen(args: StrategyEarnStepArgs): Promise<
  * trade waits for the next round. If vault + cash cannot clear the debt, repay what they can and take back only what
  * keeps the position at its target ratio; the sale of that part pays the rest next round.
  * Returns a block reason, or null when every sell step is covered by free balance.
+ * `exit` (sell all / delete / take profit): when nothing at all can be repaid or taken back this round — the vault and the
+ * account's USDT are used up and what stays posted is just what the rest of the debt needs — the answer is "sell what is
+ * free" (the same shape routing v2 answers, V2UnwindWait): that sale is what brings the USDT in. Before, the sale waited
+ * for USDT that only the sale itself could bring, round after round.
  */
-export async function strategyEarnUnwindForSale(args: StrategyEarnStepArgs & { steps: readonly { tokenIn: string; amountIn: bigint }[] }): Promise<string | null> {
+type UnwindSteps = { steps: readonly { tokenIn: string; amountIn: bigint }[] };
+export async function strategyEarnUnwindForSale(args: StrategyEarnStepArgs & UnwindSteps & { exit?: false }): Promise<string | null>;
+export async function strategyEarnUnwindForSale(args: StrategyEarnStepArgs & UnwindSteps & { exit?: boolean }): Promise<string | V2UnwindWait | null>;
+export async function strategyEarnUnwindForSale(args: StrategyEarnStepArgs & UnwindSteps & { exit?: boolean }): Promise<string | V2UnwindWait | null> {
   const { chain, account } = args;
+  /** Collateral (lowercase) that stays posted for now, the USDT its repayment is short of, and whether anything else held the sale back. */
+  const stuck: Address[] = []; let needUsdtRaw = 0n, other = false;
   const head = await chain.head();
   const ids = await chain.accountMarkets(account, head.number);
   const calls: Call[] = [];
@@ -1277,7 +1287,7 @@ export async function strategyEarnUnwindForSale(args: StrategyEarnStepArgs & { s
     if (need === 0n) continue;
     const [posted, free] = await Promise.all([chain.collateral(m.marketId, account, head.number), chain.balance(m.collateral, account, head.number)]);
     if (posted === 0n || need <= free) continue;
-    if (!keyCovers(args, m)) { notes.push(`${m.symbol} 需要 owner 續期策略加息授權才能先還款取回`); continue; }
+    if (!keyCovers(args, m)) { other = true; notes.push(`${m.symbol} 需要 owner 續期策略加息授權才能先還款取回`); continue; }
     // Venus: one debt for the whole account; planned together below.
     if (m.protocol === 'venus') { venusRelease.push(m); continue; }
     const st = await chain.status(m.marketId, account, head.number);
@@ -1303,8 +1313,12 @@ export async function strategyEarnUnwindForSale(args: StrategyEarnStepArgs & { s
     const perUnit = usdValue(unit, price, m.decimals);
     let take = perUnit === 0n ? 0n : freeValue * unit / perUnit;
     if (take > posted) take = posted;
+    // Nothing to repay with and under 1% of the posted shares to take back (an earlier round already took what the debt
+    // does not need; a price tick frees a sliver): not worth a UserOp every round — the position waits for USDT.
+    if (pay === 0n && take * 100n < posted) take = 0n;
     if (pay > 0n) calls.push(call(STRATEGY_EARN_97.executor, 'executeRepay', [account, m.marketId, pay, true, deadline]));
     if (take > 0n) calls.push(call(STRATEGY_EARN_97.executor, 'executeWithdrawCollateral', [account, m.marketId, take, deadline]));
+    if (pay === 0n && take === 0n) { stuck.push(m.collateral.toLowerCase() as Address); needUsdtRaw += st.debt + st.debt / 1_000n - st.vaultAssets - cash; }
     notes.push(`${m.symbol} vault 不足：先還 ${usdt2(pay)} USDT、取回 ${shares(take)}，賣出後再還剩下的`);
   }
   if (venusRelease.length > 0) {
@@ -1314,11 +1328,18 @@ export async function strategyEarnUnwindForSale(args: StrategyEarnStepArgs & { s
     const positions = read.map(p => keyCovers(args, p.market) ? p : { ...p, st: { ...p.st, vaultAssets: 0n } });
     const plan = venusReleaseCalls({ account, positions, release: venusRelease.map(m => m.marketId), cash, usdtPriceE8: usdtPrice, deadline });
     calls.push(...plan.calls);
+    if (plan.calls.length === 0 && !plan.full) {
+      const debt = read[0]?.st.debt ?? 0n, have = positions.reduce((sum, p) => sum + p.st.vaultAssets, 0n) + cash;
+      stuck.push(...venusRelease.map(m => m.collateral.toLowerCase() as Address)); needUsdtRaw += debt + debt / 1_000n > have ? debt + debt / 1_000n - have : 0n;
+    }
     const names = venusRelease.map(m => m.symbol).join('、');
     notes.push(plan.full ? `${names} 先還 ${usdt2(plan.repaidRaw)} USDT 再取回（Venus 共用負債）` : `${names} vault＋現金不足：先還 ${usdt2(plan.repaidRaw)} USDT、取回部分，賣出後再還剩下的`);
   }
   if (notes.length === 0) return null;
-  if (calls.length === 0) return `[STRATEGY_EARN_UNWINDING] ${notes.join('；')}`;
+  if (calls.length === 0) {
+    const note = `[STRATEGY_EARN_UNWINDING] ${notes.join('；')}`;
+    return args.exit && !args.dryRun && !other && stuck.length > 0 ? { note, stuck, needUsdtRaw } : note;
+  }
   if (args.dryRun || !args.send) return `[STRATEGY_EARN_UNWINDING] 賣出前需先還款取回：${notes.join('；')}（${args.dryRun ? 'dry-run' : '沒有策略加息 session 權限，等 owner 續期'}，未送出）`;
   const txs = await sendBatched(args, calls);
   return `[STRATEGY_EARN_UNWINDING] 賣出前已還款取回：${notes.join('；')} ${txList(txs)}；下一輪再賣`;

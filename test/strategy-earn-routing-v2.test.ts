@@ -9,7 +9,7 @@ import type { Decision, PricedRoute, RouteKey } from '../src/strategy-earn-routi
 import { boxRewardSignature, maxDebtFor, planExecution, routeIdOf, routeIds, strategyEarnV2, V2_EVENTS_ABI, V2_EXECUTOR_ABI, V2_INTERFACE_VERSION, V2_REGISTRY_ABI, V2_SESSION_SELECTORS,
   routeMessage, runV2Account, v2Authorized, v2RouteEvents, v2Calls, v2ConsentCalls, v2ExitCalls, v2RateReport, v2SessionPermissions, vaultIdOf } from '../src/strategy-earn-v2.js';
 import type { Call, PositionState, PreSellPosition, StrategyEarnV2, V2Holding } from '../src/strategy-earn-v2.js';
-import { isRootSignedNonce, strandedSmallPosition, strategyEarnV2For, v2Audience, v2MayOpen, v2NewOpensPaused, withoutNewRisk, v2Batches, v2ExitBatches, v2InternalAddresses, v2KeeperCall, v2PreSellPlan, v2ReconsentCalls, v2RescueCall, v2SponsoredCall, V2_LENS_ABI } from '../src/strategy-earn-v2.js';
+import { isRootSignedNonce, spareCollateral, strandedSmallPosition, strategyEarnV2For, v2Audience, v2MayOpen, v2NewOpensPaused, withoutNewRisk, v2Batches, v2ExitBatches, v2InternalAddresses, v2KeeperCall, v2PreSellPlan, v2ReconsentCalls, v2RescueCall, v2SponsoredCall, V2_LENS_ABI } from '../src/strategy-earn-v2.js';
 import { V2_CASH_OUT_MIN_RAW, V2_SWAPPER_ABI, V2_SWAPPER_SELECTORS, cashOutMinUsdt, partialRepayment, planTopUp, settleBudget, settleRepayment, swapEventLine, swapperErrorOf, topUpMaxUsdtIn, v2ExitPlan, v2InstalledScope,
   v2MissingSwapperApprovals, v2SwapEvents, v2SwapperApprovalCalls } from '../src/strategy-earn-v2.js';
 import type { SwapQuote } from '../src/strategy-earn-v2.js';
@@ -894,4 +894,37 @@ test('cash swapper, before a sale with no USDT at all: first what the box can re
   // The window (not USDT) is in the way: stuck, but no USDT is asked for.
   const waits = v2PreSellPlan(VS, account, [pos({ ...left, swap: quote({ usdtRaw: 50n * E, gapRaw: E / 10n, capRaw: 0n, windowEndsAt: SWAP_NOW / 1000 + 900 }) })], DEADLINE, SWAP_NOW);
   assert.deepEqual([waits.calls.length, waits.stuck, waits.needUsdtRaw, waits.retryAt], [0, [QQQ.toLowerCase()], 0n, SWAP_NOW / 1000 + 900]);
+});
+
+test('2026-11-25 portfolio 37: nothing to repay with and nothing free to sell — the shares the debt does not need come back without a repayment, once', () => {
+  // The sale's USDT was withdrawn before the last repayment: 0.2 shares (20 USD) posted against 0.0000004 owed, the box
+  // and the account empty. Kept: twice what the debt needs at the route's 50% target; the rest comes back to be sold.
+  assert.equal(spareCollateral({ postedRaw: E / 5n, collateralValueUsd: 20n * E, budgetDebtRaw: 4n * 10n ** 11n, targetLtvBps: 5_000 }), E / 5n - 16n * 10n ** 9n - 1n);
+  // A position that really carries its debt (or one this already ran on) frees less than half: never sent.
+  assert.equal(spareCollateral({ postedRaw: 10n * E, collateralValueUsd: 1000n * E, budgetDebtRaw: 130n * E, targetLtvBps: 5_000 }), null);
+  assert.equal(spareCollateral({ postedRaw: 16n * 10n ** 9n, collateralValueUsd: 16n * 10n ** 11n, budgetDebtRaw: 4n * 10n ** 11n, targetLtvBps: 5_000 }), null);
+  // 100 owed against 1,000 posted at a 50% target: 400 stays (LTV 25% afterwards), 600 comes back.
+  assert.equal(spareCollateral({ postedRaw: 10n * E, collateralValueUsd: 1000n * E, budgetDebtRaw: 100n * E, targetLtvBps: 5_000 }), 6n * E - 1n);
+  for (const bad of [{ postedRaw: 0n }, { collateralValueUsd: 0n }, { budgetDebtRaw: 0n }, { targetLtvBps: 0 }]) {
+    assert.equal(spareCollateral({ postedRaw: E, collateralValueUsd: 100n * E, budgetDebtRaw: E, targetLtvBps: 5_000, ...bad }), null, JSON.stringify(Object.keys(bad)));
+  }
+  const b = routeIds(VS, QQQ, listaUsdc);
+  const stuck: PreSellPosition = { symbol: 'QQQB', collateral: QQQ, freeCollateralRaw: 0n, postedRaw: E / 5n, routeDebtRaw: 4n * 10n ** 11n, vaultAssetsRaw: 0n, routeId: b.routeId, vaultId: b.vaultId, venue: 'lista', loan: 'USDC',
+    swap: quote({ usdtRaw: 0n, gapRaw: 4n * 10n ** 11n }), collateralValueUsd: 20n * E, targetLtvBps: 5_000, budgetDebtRaw: 4n * 10n ** 11n };
+  // The sale can still sell something (the default): the position just waits, as before.
+  const waits = v2PreSellPlan(VS, account, [stuck], DEADLINE, SWAP_NOW);
+  assert.deepEqual([waits.calls.length, waits.stuck], [0, [QQQ.toLowerCase()]]);
+  // Nothing free to sell either (`spare`): one executeReduce — repay 0, take back the spare shares, no USDT, no vault release.
+  const spared = v2PreSellPlan(VS, account, [stuck], DEADLINE, SWAP_NOW, { spare: true });
+  assert.deepEqual([names(spared.calls), spared.stuck, spared.needUsdtRaw], [['executeReduce'], [], 0n]);
+  assert.deepEqual((decode(spared.calls[0]!.data).args as readonly unknown[]).slice(1, 6), [b.routeId, `0x${'00'.repeat(32)}`, 0n, E / 5n - 16n * 10n ** 9n - 1n, 0n]);
+  assert.match(spared.notes[0]!, /take back 199999983999999999 of 200000000000000000/);
+  // What is left posted afterwards is what the debt needs: asking again sends nothing (it waits for the sale's USDT).
+  const after = v2PreSellPlan(VS, account, [{ ...stuck, postedRaw: 16n * 10n ** 9n, collateralValueUsd: 16n * 10n ** 11n }], DEADLINE, SWAP_NOW, { spare: true });
+  assert.deepEqual([after.calls.length, after.stuck], [0, [QQQ.toLowerCase()]]);
+  // Venus: the budget is the account's whole Venus debt, not this route's share of it.
+  const venus = v2PreSellPlan(VS, account, [{ ...stuck, venue: 'venus', budgetDebtRaw: 6n * E }], DEADLINE, SWAP_NOW, { spare: true });
+  assert.deepEqual([venus.calls.length, venus.stuck], [0, [QQQ.toLowerCase()]], '6 owed account-wide needs 24 of the 20 posted: nothing to spare');
+  // With USDT in the account the ordinary path wins even when `spare` is asked: top up and close.
+  assert.deepEqual(names(v2PreSellPlan(VS, account, [{ ...stuck, swap: quote({ usdtRaw: 50n * E, gapRaw: 4n * 10n ** 11n }) }], DEADLINE, SWAP_NOW, { spare: true }).calls).slice(0, 2), ['topUp', 'executeReduce']);
 });

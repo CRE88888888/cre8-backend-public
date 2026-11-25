@@ -18,6 +18,7 @@ import { strategyEarnV2, v2Calls, v2ConsentOffCall, v2RescueCall, v2SessionPermi
 import type { Call, RouteEvent } from '../src/strategy-earn-v2.js';
 import { readStrategyEarnV2Collateral } from '../src/snapshot.js';
 import type { RewardEvent } from '../src/strategy-rewards.js';
+import { holdForShortfall, v2ShortfallUsdt } from '../src/sell-all-hold.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
 
 const rpc = process.env.FORK_RPC_URL;
@@ -741,23 +742,64 @@ for (const [kind, loan] of [['fund', 'USD1'], ['mix', 'USDT'], ['mix', 'USD1'], 
     const wait = r2 as { stuck: Address[]; needUsdtRaw: bigint; note: string };
     assert.deepEqual([wait.stuck, sent.length], [[C], 1]);
     assert.ok(wait.needUsdtRaw > left1.routeDebtRaw - 10n ** 12n && wait.needUsdtRaw < left1.routeDebtRaw * 2n + 10n ** 15n, `needs ${wait.needUsdtRaw} USDT for a debt of ${left1.routeDebtRaw}`);
+    const afterRound2 = await s.local.snapshot();
     const proceeds1 = await sell(free1);
     await ledgerMatchesChain('after the first sale');
+    // 2026-11-25 portfolio 37: here the app withdrew the sale's USDT. While the "sell all" is open the hold keeps what the
+    // repayment still needs (src/sell-all-hold.ts): the app (and the paymaster) only let the rest go — and round 3 still closes.
+    mark(`${tag}: sell-all, a withdrawal attempted mid-way — the hold stays, the rest leaves`);
+    const hold = holdForShortfall(v2ShortfallUsdt(v2, await reader.account(X, [C])));
+    assert.ok(hold >= 10n ** 18n && hold >= wait.needUsdtRaw && hold < proceeds1, `hold ${hold} for a need of ${wait.needUsdtRaw}`);
+    const withdrawn = cash.own - hold;
+    await move(USDT, X, SINK, withdrawn); cash.own -= withdrawn;
+    await ledgerMatchesChain('after the mid-way withdrawal');
     mark(`${tag}: sell-all, round 3 — the sale's USDT pays the rest, the route closes`);
     const r3 = await v2UnwindForSale({ ...await step({ send: tracked }), steps: [{ tokenIn: C, amountIn: total - free1 }], exit: true });
     assert.match(String(r3), swaps ? new RegExp(`${SYMBOL} top up \\d+ ${loan} from USDT, repay \\d+ ${loan}, take back, sell the ${loan} left`) : new RegExp(`${SYMBOL} repay \\d+ USDT, take back`));
     assert.deepEqual(sent.slice(1), [closing]);
     assert.deepEqual(bookedKinds().slice(0, swaps ? 2 : 1), swaps ? ['top_up', 'cash_out'] : ['repay_cash']);
     await clean('after the close', total - free1);
+    assert.equal(holdForShortfall(v2ShortfallUsdt(v2, await reader.account(X, [C]))), 0n, 'repaid: nothing is held any more, everything is withdrawable');
     mark(`${tag}: sell-all, round 4 — nothing is posted any more: the rest is sold`);
     assert.equal(await v2UnwindForSale({ ...await step({ send: tracked }), steps: [{ tokenIn: C, amountIn: total - free1 }], exit: true }), null);
     const proceeds2 = await sell(total - free1);
     await clean('sell-all done', 0n);
     // Everything is USDT the owner can take back: both sales' proceeds less what the strategy cost.
-    assert.equal(cash.own, proceeds1 + proceeds2 - spent() + back());
+    assert.equal(cash.own, proceeds1 + proceeds2 - withdrawn - spent() + back());
     assert.ok(spent() - back() < left1.routeDebtRaw * 102n / 100n + 10n ** 15n, 'the strategy cost about the gap itself');
     assert.equal(await bal(USDT) - cash.own, cash.others, 'the reserved USDT was never spent');
-    const sellAll = { reduced: sent[0], closed: sent[1], booked: booked.map(b => `${b.kind}:${b.usdtRaw}`), debtLeftAfterRound1: left1.routeDebtRaw.toString(), needUsdt: wait.needUsdtRaw.toString() };
+    const sellAll = { reduced: sent[0], closed: sent[1], booked: booked.map(b => `${b.kind}:${b.usdtRaw}`), debtLeftAfterRound1: left1.routeDebtRaw.toString(), needUsdt: wait.needUsdtRaw.toString(), heldUsdt: hold.toString() };
+
+    // ---- A2. The account portfolio 37 was left in: the sale's USDT was withdrawn in full before the last repayment ----
+    // Shares still posted, a sliver of debt, no USDT the strategy may spend, nothing free to sell. The way out needs no one:
+    // the shares the debt does not need come back without a repayment, their sale brings the USDT, the route closes.
+    await s.local.revert({ id: afterRound2 });
+    booked.length = 0; sent.length = 0; cash.own = 0n;
+    await s.now();
+    await move(C, X, SINK, free1); // the free shares were sold and their USDT left for the owner's wallet
+    await ledgerMatchesChain('stuck: start');
+    mark(`${tag}: stuck account — nothing to repay with, nothing free to sell`);
+    const rest = [{ tokenIn: C, amountIn: total - free1 }];
+    const stuck = await v2UnwindForSale({ ...await step({ send: tracked }), steps: rest, exit: true });
+    assert.ok(stuck !== null && typeof stuck === 'object' && sent.length === 0, `still "sell what is free", nothing sent: ${String(stuck)}`);
+    mark(`${tag}: stuck account — the shares the debt does not need come back without a repayment`);
+    const spared = await v2UnwindForSale({ ...await step({ send: tracked }), steps: rest, exit: true, spare: true });
+    assert.match(String(spared), /^\[STRATEGY_EARN_UNWINDING\] 賣出前已還款取回：.*nothing free to sell: take back \d+ of \d+.*tx=0x[0-9a-f]{64}/);
+    assert.deepEqual(sent, [['executeReduce']]);
+    read = await reader.account(X, [C]);
+    const freeS = await bal(C), leftS = read.routes[0]!;
+    assert.ok(freeS > (total - free1) / 2n && leftS.collateralRaw === total - free1 - freeS && leftS.collateralRaw > 0n && leftS.routeDebtRaw >= left1.routeDebtRaw, `freed ${freeS} of ${total - free1}, ${leftS.collateralRaw} stays posted for a debt of ${leftS.routeDebtRaw}`);
+    // Asked again, nothing more is spared (what stays posted is what the debt needs): it waits, and sends nothing.
+    assert.equal(typeof await v2UnwindForSale({ ...await step({ send: tracked }), steps: rest, exit: true, spare: true }), 'object');
+    assert.equal(sent.length, 1);
+    mark(`${tag}: stuck account — the freed shares are sold, their USDT pays the rest and the route closes`);
+    const proceedsS = await sell(freeS);
+    const closedS = await v2UnwindForSale({ ...await step({ send: tracked }), steps: [{ tokenIn: C, amountIn: leftS.collateralRaw }], exit: true });
+    assert.match(String(closedS), /賣出前已還款取回/);
+    assert.deepEqual(sent.slice(1), [closing]);
+    await clean('stuck account: closed', leftS.collateralRaw);
+    assert.ok(cash.own > proceedsS * 9n / 10n, `the owner gets the sale back: ${cash.own} of ${proceedsS}`);
+    const wayOut = { takenBack: freeS.toString(), keptPosted: leftS.collateralRaw.toString(), debt: leftS.routeDebtRaw.toString(), proceeds: proceedsS.toString(), cashAfterClose: cash.own.toString() };
 
     // ---- B. A plain turn-off (nothing is being sold) ---------------------------------------------------------------
     await s.local.revert({ id: snapshot });
@@ -792,7 +834,7 @@ for (const [kind, loan] of [['fund', 'USD1'], ['mix', 'USDT'], ['mix', 'USD1'], 
     assert.equal(await v2AutoRound(await step({ send: tracked })), null);
     assert.deepEqual([sent.length, needs.length], [1, 0]);
     await ledgerMatchesChain('the end');
-    console.log(JSON.stringify({ kind, loan, account: X, asset: SYMBOL, debt: debt0.toString(), gap: gap0.toString(), reservedUsdt: cash.others.toString(), sellAll,
+    console.log(JSON.stringify({ kind, loan, account: X, asset: SYMBOL, debt: debt0.toString(), gap: gap0.toString(), reservedUsdt: cash.others.toString(), sellAll, wayOut,
       turnOff: { debtLeftAfterOwner: leftB.routeDebtRaw.toString(), needUsdt: need.toString(), raised: raise.toString(), booked: booked.map(b => `${b.kind}:${b.usdtRaw}`) } }));
   });
 }

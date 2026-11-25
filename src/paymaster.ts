@@ -35,6 +35,7 @@ export { reconcileExpiredExitAuthorizations } from './paymaster-exit-reconciliat
 import { fresh } from './yield-domain.js';
 import { dcaVaultCall, dcaVaults, isDcaSpender } from './dca-calls.js';
 import { writeYieldState } from './yield-runtime-state.js';
+import { defaultSellAllCashHold } from './sell-all-hold.js';
 import { reservedCash } from './withdrawable-cash.js';
 import { NODE_LAG_BUDGET_MS } from './node-lag.js';
 import { rpcTransport } from './rpc-transport.js';
@@ -116,6 +117,8 @@ export type PaymasterDeps = {
   enrollmentLagMs?: number;
   /** Tests: the account's USDT balance (withdraw-to-wallet free cash check). */
   readCash?: (account: Address, config: PaymasterConfig) => Promise<bigint>;
+  /** USDT an open "sell all" still needs in the account for its repayment (src/sell-all-hold.ts). Default reads the database and the chain. */
+  sellAllHold?: (input: { chainId: number; portfolioId: number; account: Address }) => Promise<bigint>;
   /** Tests: owner-withdrawal reset of paused strategy jobs. */
   resumePausedJobsForAccount?: (chainId: number, account: string) => Promise<number>;
 };
@@ -991,9 +994,15 @@ export function packedOperationHash(op:PackedSponsorOperation,chainId:number):He
 async function readAccountCash(account: Address, c: PaymasterConfig): Promise<bigint> {
   return rpc(c).readContract({ address: TESTNET_97.contracts.usdt, abi: ENTRY_POINT_ABI, functionName: 'balanceOf', args: [account] });
 }
+/** `$1` chain id, `$2` account: the cash ledger rows of a portfolio account, with the portfolio they belong to. */
+export const FREE_CASH_SQL = `select b.portfolio_id,b.reserved_input_raw::text,b.reserved_fee_raw::text,b.withdrawal_raw::text,b.yield_raw::text
+    from strategy_cash_balances b join smart_accounts s on (s.chain_id,s.portfolio_id)=(b.chain_id,b.portfolio_id)
+    where s.chain_id=$1 and s.address=$2 and s.retired_at is null`;
 /**
  * Withdraw to wallet (USDT transfer to the owner) never takes cash a running buy job or the withdrawal/yield
  * reservations hold (src/withdrawable-cash.ts). Taking it left portfolio 12 stuck in [CASH_DEFICIT] on 2026-11-23.
+ * Nor the USDT an open "sell all" still needs to repay its Earn extra debt (src/sell-all-hold.ts): taking that left
+ * portfolio 37 with shares posted and nothing to repay with on 2026-11-25.
  */
 async function checkFreeCash(op: PackedSponsorOperation, calls: ReturnType<typeof sponsoredCalls>, c: PaymasterConfig, owner: Address, deps: PaymasterDeps): Promise<void> {
   if (c.chainId !== 97) return;
@@ -1006,12 +1015,18 @@ async function checkFreeCash(op: PackedSponsorOperation, calls: ReturnType<typeo
   if (out === 0n) return;
   // A DCA Venus return redeems into the account in the same UserOp; that forward is bounded by dcaVaultCall instead.
   if (calls.some(call => { try { return dcaVaultCall(call, op.sender, owner); } catch { return false; } })) return;
-  const rows = (await (deps.query ?? query)(`select b.reserved_input_raw::text,b.reserved_fee_raw::text,b.withdrawal_raw::text,b.yield_raw::text
-    from strategy_cash_balances b join smart_accounts s on (s.chain_id,s.portfolio_id)=(b.chain_id,b.portfolio_id)
-    where s.chain_id=$1 and s.address=$2 and s.retired_at is null`, [c.chainId, op.sender])).rows;
+  const rows = (await (deps.query ?? query)(FREE_CASH_SQL, [c.chainId, op.sender])).rows;
   let reserved = 0n;
   try { for (const row of rows) { const r = object(row); if ('reserved_input_raw' in r) reserved += reservedCash(r); } }
   catch { throw rejected('PAYMASTER_DEPENDENCY_UNAVAILABLE', 503, 'free cash: unreadable cash buckets'); }
+  // An open "sell all" that still owes more than its strategy box holds: the USDT its repayment needs stays too
+  // (src/sell-all-hold.ts). Unreadable -> refused for now, never answered with a guess.
+  for (const row of rows) {
+    const r = object(row), portfolioId = Number(r.portfolio_id);
+    if (!Number.isSafeInteger(portfolioId)) continue;
+    try { reserved += await (deps.sellAllHold ?? defaultSellAllCashHold)({ chainId: c.chainId, portfolioId, account: op.sender }); }
+    catch { throw rejected('PAYMASTER_DEPENDENCY_UNAVAILABLE', 503, 'free cash: sell-all hold unreadable'); }
+  }
   if (reserved === 0n) return;
   const observed = await (deps.readCash ?? readAccountCash)(op.sender, c);
   const free = observed > reserved ? observed - reserved : 0n;
@@ -1159,7 +1174,8 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
           if (busy) throw rejected('PAYMASTER_CALL_FORBIDDEN', 403, `yield strategy ${other} is still in use on this account`);
         }
       }
-      await bounded(checkFreeCash(op, calls, c, hex(owner.owner, 20), deps), c.timeoutMs);
+      // Twice the usual bound: with a "sell all" open it reads the account's strategy position from the chain.
+      await bounded(checkFreeCash(op, calls, c, hex(owner.owner, 20), deps), c.timeoutMs * 2);
       const cost = gasCost(op, c);
       if (cost.gasLimit > MAX_USER_OP_GAS) throw rejected('PAYMASTER_USER_OP_CAPACITY', 400);
       await bounded((deps.checkChain ?? checkChain)(op, c), c.timeoutMs);

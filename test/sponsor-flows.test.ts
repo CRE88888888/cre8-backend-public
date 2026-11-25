@@ -60,7 +60,9 @@ async function renewal(): Promise<Call[]> {
 }
 
 type Kind = 'fund' | 'mix';
-function harness(kind: Kind, opts: { pendingChange?: boolean; reservedRaw?: bigint; observedRaw?: bigint; exiting?: 'triggered' | 'exited' | 'deleting'; rewardTokens?: Address[]; v2?: StrategyEarnV2 | null;
+function harness(kind: Kind, opts: { pendingChange?: boolean; reservedRaw?: bigint; observedRaw?: bigint;
+  /** USDT an open "sell all" still needs for its repayment (src/sell-all-hold.ts); 'unreadable': the chain cannot say. */
+  sellAllHoldRaw?: bigint | 'unreadable'; exiting?: 'triggered' | 'exited' | 'deleting'; rewardTokens?: Address[]; v2?: StrategyEarnV2 | null;
   /** Which generation of the yield strategy the account already uses (the paymaster's exclusivity check). */
   inUse?: 'v1' | 'v2' | 'unreadable';
   /** Leave the v2 deployment to production wiring (strategyEarnV2 + v2MayOpen: manifest, audience, newOpensPaused) instead of injecting it. */
@@ -75,8 +77,13 @@ function harness(kind: Kind, opts: { pendingChange?: boolean; reservedRaw?: bigi
       : sql.includes('mix_switch_intents') ? opts.pendingChange ? [{ id: '1', strategy_id: '12', owner_calls: [], nonce: '0', user_op_hash: null }] : []
       : sql.includes('select ms.exit_assets') ? [{ exit_assets: [] }]
       : sql.includes('from strategy_cash_balances b') && opts.reservedRaw !== undefined
-        ? [{ reserved_input_raw: opts.reservedRaw.toString(), reserved_fee_raw: '0', withdrawal_raw: '0', yield_raw: '0' }] : [] }),
+        ? [{ portfolio_id: 37, reserved_input_raw: opts.reservedRaw.toString(), reserved_fee_raw: '0', withdrawal_raw: '0', yield_raw: '0' }] : [] }),
     readCash: async () => opts.observedRaw ?? 0n,
+    sellAllHold: async (input) => {
+      assert.deepEqual(input, { chainId: 97, portfolioId: 37, account });
+      if (opts.sellAllHoldRaw === 'unreadable') throw new Error('rpc down');
+      return opts.sellAllHoldRaw ?? 0n;
+    },
     mixSetup: async () => { seen.setups++; },
     checkChain: async () => {},
     readBudgetContext: async () => ({ purpose: 'ordinary', nativePrice: 60000000000n, priceSource: 'fixture:oracle' }),
@@ -244,6 +251,32 @@ test('My mix: DCA keeps every DCA safety rule, and per-asset yield stays off', a
   await assert.rejects(pending.sponsor(dcaDepositCalls(lista, account, 1n, maxUint256).map(asCall)), code('MIX_BUSY', 409));
   await pending.sponsor([transfer(usdt, owner, 1n)]);
   assert.equal(pending.seen.reservations, 1);
+});
+
+test('portfolio 37: while a "sell all" still owes more than its strategy box holds, withdraw to wallet leaves the USDT its repayment needs (fund and My mix)', async () => {
+  const E = 10n ** 18n;
+  for (const kind of ['fund', 'mix'] as const) {
+    // 97.44 USDT from the sale in the account, 1 USDT held for the top-up of the debt that is left.
+    const held = { reservedRaw: 0n, observedRaw: 9_744n * E / 100n, sellAllHoldRaw: E };
+    // The old app sweeps the whole balance: refused, nothing is sponsored — the repayment's USDT stays.
+    const sweep = harness(kind, held);
+    await assert.rejects(sweep.sponsor([transfer(usdt, owner, 9_744n * E / 100n)]), code('PAYMASTER_WITHDRAW_RESERVED', 409), kind);
+    assert.equal(sweep.seen.reservations, 0);
+    // What is free (the balance less the hold) may go, to the wei.
+    await harness(kind, held).sponsor([transfer(usdt, owner, 9_644n * E / 100n)]);
+    await assert.rejects(harness(kind, held).sponsor([transfer(usdt, owner, 9_644n * E / 100n + 1n)]), code('PAYMASTER_WITHDRAW_RESERVED', 409), kind);
+    // It adds to what a running buy reserved.
+    await assert.rejects(harness(kind, { reservedRaw: 50n * E, observedRaw: 100n * E, sellAllHoldRaw: E }).sponsor([transfer(usdt, owner, 50n * E)]), code('PAYMASTER_WITHDRAW_RESERVED', 409), kind);
+    await harness(kind, { reservedRaw: 50n * E, observedRaw: 100n * E, sellAllHoldRaw: E }).sponsor([transfer(usdt, owner, 49n * E)]);
+    // The hold is larger than the balance (the 24-hour top-up window keeps the repayment waiting, the sale is not in yet): nothing is free.
+    await assert.rejects(harness(kind, { reservedRaw: 0n, observedRaw: E / 2n, sellAllHoldRaw: E }).sponsor([transfer(usdt, owner, 1n)]), code('PAYMASTER_WITHDRAW_RESERVED', 409), kind);
+    // Sold and repaid (or no "sell all" open): no hold, the whole balance may go.
+    await harness(kind, { reservedRaw: 0n, observedRaw: 9_944n * E / 100n, sellAllHoldRaw: 0n }).sponsor([transfer(usdt, owner, 9_944n * E / 100n)]);
+    // The chain cannot say whether something is still owed: refused for now (retryable), never sponsored on a guess.
+    const blind = harness(kind, { reservedRaw: 0n, observedRaw: 100n * E, sellAllHoldRaw: 'unreadable' });
+    await assert.rejects(blind.sponsor([transfer(usdt, owner, E)]), code('PAYMASTER_DEPENDENCY_UNAVAILABLE', 503), kind);
+    assert.equal(blind.seen.reservations, 0);
+  }
 });
 
 test('portfolio 12: withdraw to wallet never takes cash a running buy reserved (fund and My mix)', async () => {

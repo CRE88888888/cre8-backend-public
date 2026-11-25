@@ -3696,6 +3696,9 @@ test('sell all, routing v2 (shares that cannot be freed yet): /close sells the f
   assert.equal(c.chain.executeCalls[0]?.steps[0]?.amountIn, 80n * 10n ** 8n, 'only what the account holds free');
   assert.equal(c.db.portfolios[0]?.state, 'paused');
   assert.ok(c.db.sellAll.has(PORTFOLIO_ID), 'posted shares are still there: not done');
+  // 2026-11-25 portfolio 37: this answer used to say "0 left" (counted from the plan without the posted shares) and the
+  // app withdrew the USDT their repayment needed. What is left is the posted 120 USD, and the sale is not done.
+  assert.deepEqual([first.remainingUsdE8, first.sellAllDone, first.sellAllPending], ['12000000000', false, true]);
   // Client gone. The posted part stays stuck for one more round, then is freed and sold by the scheduler.
   c.chain.plan = c.f.plan(stubPlan(), 120n, 1880n);
   c.chain.plan.snapshot.strategyEarnCollateral = [{ asset: DOGE_HELD(c).asset as Address, marketId: MARKET, amount: 120n * 10n ** 8n }];
@@ -3709,6 +3712,67 @@ test('sell all, routing v2 (shares that cannot be freed yet): /close sells the f
   c.chain.plan = c.f.plan(stubPlan(), 0n, 2000n);
   assert.match((await s.round()).results[0]?.reason ?? '', /SELL_ALL_DONE/);
   assert.equal(c.db.sellAll.size, 0); assert.equal(c.db.portfolios[0]?.state, 'paused');
+});
+
+test('2026-11-25 portfolio 37 (the sale\'s USDT was withdrawn; shares still posted, nothing free to sell): /close says so and asks for the shares the debt does not need', async () => {
+  const asked: boolean[] = [];
+  let spare: string | null = `[STRATEGY_EARN_UNWINDING] 賣出前已還款取回：DOGE owes 407371640080 USD1 with nothing to repay it and nothing free to sell: take back 118 of 120 tx=0x${'cd'.repeat(32)}；下一輪再賣`;
+  const strategyEarn: NonNullable<SchedulerDeps['strategyEarn']> = {
+    open: async () => { throw new Error('Strategy Earn must not be opened while everything is being sold'); },
+    unwind: async (_due, _steps, _dry, exit, _posted, sparing) => {
+      assert.equal(exit, true); asked.push(sparing === true);
+      const wait = { note: '[STRATEGY_EARN_UNWINDING] DOGE cannot be freed yet: needs 1070639355899 more USDT in the account', stuck: [DOGE_HELD(c).asset.toLowerCase() as Address], needUsdtRaw: 1_070_639_355_899n };
+      return sparing ? spare ?? wait : wait;
+    },
+  };
+  const c = sellAllCase('active', { strategyEarn }); c.f.state.limit = null;
+  // 200 USD of DOGE, all of it posted: nothing is free.
+  const all = DOGE_HELD(c).amountWei;
+  c.chain.plan.snapshot.strategyEarnCollateral = [{ asset: DOGE_HELD(c).asset as Address, marketId: MARKET, amount: all }];
+  const first = await runOperatorClose(PORTFOLIO_ID, OWNER, c.options);
+  assert.deepEqual(asked, [false, true], 'asked again for the spare shares once the sale found nothing free');
+  assert.equal(first.outcome, 'blocked'); assert.match(first.reason, /賣出前已還款取回.*tx=0x(cd){32}/);
+  assert.equal(c.chain.executeCalls.length, 0, 'nothing is sold this round');
+  // Not "nothing to sell" and not "0 left": the whole position is still there, and the sale is not done.
+  assert.deepEqual([first.remainingUsdE8, first.sellAllDone, first.sellAllPending], ['20000000000', false, true]);
+  assert.ok(c.db.sellAll.has(PORTFOLIO_ID), 'a take-back landed: the request stays and the scheduler goes on');
+  // The scheduler's own round does the same when the caller is gone (nothing to spare this time: it just waits).
+  spare = null; asked.length = 0;
+  const s = sellAllRounds(c, { strategyEarn });
+  const waiting = await s.round();
+  assert.deepEqual(outcomes(waiting), ['blocked']); assert.match(waiting.results[0]?.reason ?? '', /cannot be freed yet/);
+  assert.deepEqual(asked, [false, true]);
+  assert.ok(c.db.sellAll.has(PORTFOLIO_ID), 'shares are still posted: the request is not closed');
+  // A dry run never asks for the spare shares (it would send).
+  asked.length = 0;
+  await runSchedulerOnce({ dryRun: true, now: new Date(s.now().getTime() + (ONE_DAY_SECONDS + 1) * 1000), skipAlerts: true }, deps(c.db, c.chain, { strategyEarn,
+    planSellAll: async (input) => (await buildRedeemPlan(input, { close: true }, c.options)).plan }));
+  assert.ok(asked.every((sparing) => !sparing), JSON.stringify(asked));
+});
+
+test('/close tells "done" from "more to do": done only when nothing was posted and everything was sold, or nothing is left', async () => {
+  // One capped batch of two: sold, more left, not done.
+  const c = sellAllCase();
+  const first = await runOperatorClose(PORTFOLIO_ID, OWNER, c.options);
+  assert.equal(first.outcome, 'executed');
+  assert.ok(BigInt(first.remainingUsdE8 ?? '0') > 0n);
+  assert.deepEqual([first.sellAllDone, first.sellAllPending], [false, true]);
+  // The last batch, nothing posted: everything the account held is sold — done, even though the request is closed by the next round.
+  c.chain.plan = c.f.plan(stubPlan(), 50n, 1950n);
+  const last = await runOperatorClose(PORTFOLIO_ID, OWNER, c.options);
+  assert.deepEqual([last.outcome, last.remainingUsdE8, last.sellAllDone, last.sellAllPending], ['executed', '0', true, true]);
+  // Only cash left (the owner presses "sell all" again to withdraw): done, nothing sent.
+  c.chain.plan = c.f.plan(stubPlan(), 0n, 2000n);
+  const again = await runOperatorClose(PORTFOLIO_ID, OWNER, c.options);
+  assert.deepEqual([again.outcome, again.reason, again.remainingUsdE8, again.sellAllDone, again.sellAllPending], ['noop', 'nothing to sell', '0', true, false]);
+  // Everything sold in the round, but shares had been posted when it planned: one more call has to confirm (never done on "0 left" alone).
+  const p = sellAllCase('active', { strategyEarn: { open: async () => null, unwind: async () => null } }); p.f.state.limit = null;
+  p.chain.plan.snapshot.strategyEarnCollateral = [{ asset: DOGE_HELD(p).asset as Address, marketId: MARKET, amount: 1n }];
+  const posted = await runOperatorClose(PORTFOLIO_ID, OWNER, p.options);
+  assert.deepEqual([posted.outcome, posted.remainingUsdE8, posted.sellAllDone], ['executed', '0', false]);
+  // A partial sale never carries the field.
+  const r = exitCase();
+  assert.equal('sellAllDone' in await runOperatorRedeem(PORTFOLIO_ID, OWNER, 100n * 10n ** 8n, r.options), false);
 });
 
 test('sell all is idempotent: calling /close again mid-way continues with the next batch and keeps one request', async () => {

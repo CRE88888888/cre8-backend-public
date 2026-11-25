@@ -619,7 +619,9 @@ export type SchedulerDeps = {
     /** `exit`: the sale is a full exit (routing v2 then also sends the reward tokens to the owner's wallet). */
     /** `posted` false: nothing is posted, the sale is a full exit — only the reward tokens' way out is looked at (routing v2). */
     /** A `V2UnwindWait` answer: some posted shares cannot be freed this round and the sale must not wait for them. */
-    unwind(due: DuePortfolio, steps: readonly PlannedStep[], dryRun: boolean, exit?: boolean, posted?: boolean): Promise<string | V2UnwindWait | null>;
+    /** `spare`: asked again after such an answer when the sale found nothing free to sell either — take back the shares the
+     * debt that is left does not need (routing v2 spareCollateral), so the next round has something to sell. */
+    unwind(due: DuePortfolio, steps: readonly PlannedStep[], dryRun: boolean, exit?: boolean, posted?: boolean, spare?: boolean): Promise<string | V2UnwindWait | null>;
   };
   /** The sale a cash raise sends (see planCashRaise). Default: one sale of the asset with the most free value, quoted like a redeem. */
   planCashRaise?: (input: RebalancePlanningInput, needUsdtRaw: bigint, at: { chainId: number; now: Date }) => Promise<RebalancePlan>;
@@ -1777,17 +1779,20 @@ function defaultStrategyEarnSteps(deps: ResolvedDeps): NonNullable<SchedulerDeps
         v2Round: async (touched, mayOpen) => v2AutoRound({ ...await v2Args(v2, due, dryRun, held), touched, mayOpen, ...(onCashNeed ? { onCashNeed } : {}),
           v1Active: async () => { const chain = defaultStrategyEarnChain(); return strategyEarnV1Active(chain, due.account, (await chain.head()).number); } }) });
     },
-    unwind: async (due, steps, dryRun, exit, posted = true) => {
+    unwind: async (due, steps, dryRun, exit, posted = true, spare = false) => {
       if (deps.chainId !== 97) return null;
       // Nothing posted (a full exit after the strategy was simply turned off): v1 has nothing to take back, so it is not read.
-      const v1 = posted ? await strategyEarnUnwindForSale({ ...await args(due, dryRun), steps }) : null;
+      const v1 = posted ? await strategyEarnUnwindForSale({ ...await args(due, dryRun), steps, ...(exit ? { exit } : {}) }) : null;
       // Before a sale every account with something on v2 repays and takes its shares back, whoever its owner is.
       const scope = await v2Scope(due);
       const touched = scope === null ? null : scope.mayOpen ? await defaultV2Reader(scope.v2).touched(due.account) : await defaultV2Reader(scope.v2).touchedOutside(due.account);
       const second = scope === null || touched === null || !v2HasState(touched) ? null
-        : await v2UnwindForSale({ ...await v2Args(scope.v2, due, dryRun), touched, mayOpen: scope.mayOpen, steps, ...(exit ? { exit } : {}) });
-      // v1 holds the sale back -> it waits whatever v2 says; otherwise v2's answer stands (a note, or "sell what is free").
-      return second !== null && typeof second === 'object' ? (v1 === null ? second : both([v1, second.note])) : both([v1, second]);
+        : await v2UnwindForSale({ ...await v2Args(scope.v2, due, dryRun), touched, mayOpen: scope.mayOpen, steps, ...(exit ? { exit } : {}), ...(spare ? { spare } : {}) });
+      // A note from either generation holds the sale back, whatever the other says. Otherwise "sell what is free" stands
+      // (one account is on v1 or on v2, never both; two such answers are simply joined).
+      const answers = [v1, second], waits = answers.filter((x): x is V2UnwindWait => x !== null && typeof x === 'object');
+      if (waits.length === 0 || answers.some(x => typeof x === 'string')) return both(answers.map(x => x !== null && typeof x === 'object' ? x.note : x));
+      return { note: waits.map(w => w.note).join('；'), stuck: waits.flatMap(w => w.stuck), needUsdtRaw: waits.reduce((sum, w) => sum + w.needUsdtRaw, 0n) };
     },
   };
 }
@@ -3106,7 +3111,16 @@ async function decideAndMaybeExecute(
         return raised ?? { ...base, outcome: 'blocked', reason: wait.note };
       }
       const again = await ctx.deps.planRebalance({ ...planning, plan: withoutPosted(planning.plan, wait.stuck) });
-      if (again.kind !== 'ready' || again.steps.length === 0) return { ...base, outcome: 'blocked', reason: wait.note };
+      if (again.kind !== 'ready' || again.steps.length === 0) {
+        // Nothing free to sell either, so no USDT will ever come in for that repayment (2026-11-25, portfolio 37: the sale's
+        // USDT had been withdrawn). Ask once more for the shares the debt that is left does not need; the next round sells
+        // them and their USDT pays the rest. Nothing to spare -> the wait stands.
+        if (ctx.dryRun) return { ...base, outcome: 'blocked', reason: wait.note };
+        let spared: string | V2UnwindWait | null;
+        try { spared = await strategyEarnSteps(ctx.deps).unwind(due, rebalance.steps, ctx.dryRun, exitSale, sharesPosted, true); }
+        catch (error) { return { ...base, outcome: 'blocked', reason: `[STRATEGY_EARN_UNWIND_FAILED] 賣出前還款取回未完成，下一輪重試：${oneLine(error)}` }; }
+        return { ...base, outcome: 'blocked', reason: typeof spared === 'string' ? spared : wait.note };
+      }
       if (again.steps.some(step => !isAddressEqual(step.tokenOut, batchCash))) return { ...base, outcome: 'blocked', reason: '[INVALID_EXIT] 退出計畫包含買入，不送交易' };
       if (!assetsMarketOpen(ctx.deps.chainId, again.steps.flatMap(step => [step.tokenIn, step.tokenOut]), ctx.now, owner)) return { ...base, outcome: 'blocked', reason: '[MARKET_CLOSED] 股票休市，等待交易時段' };
       ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} ${wait.note}；先賣出帳戶裡閒置的部分，之後的輪次再還款取回其餘`);

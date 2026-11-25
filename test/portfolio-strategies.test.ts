@@ -712,6 +712,28 @@ test('#82 DB paused typed enrollment returns the original account and stays paus
   assert.equal((await query('select id from portfolios where strategy_id=$1 and user_id=$2', [f.strategyId, f.owner])).rows.length, 1);
 });
 
+test('portfolio 37: the withdraw sheet leaves out the USDT an open "sell all" still needs for its repayment, and offers everything again once it is over', async () => {
+  const f = await fixture('hold');
+  // Default wiring, no "sell all" open: one query, nothing held — the whole balance is withdrawable, as before.
+  const free = await f.service.read(f.id, f.owner);
+  assert.deepEqual([free.cash.withdrawableRaw, free.cash.reservedRaw], [TEST_AMOUNT.toString(), '0']);
+  const E = 10n ** 18n, asked: unknown[] = [];
+  const withHold = (hold: () => Promise<bigint>) => createPortfolioStrategyService({ ...f.deps, sellAllHold: async (input) => { asked.push(input); return hold(); } });
+  // An open "sell all" that still owes a sliver beyond its strategy box: 1 USDT stays, the rest is offered.
+  const held = await withHold(async () => E).read(f.id, f.owner);
+  assert.deepEqual([held.cash.withdrawableRaw, held.cash.reservedRaw], [(TEST_AMOUNT - E).toString(), E.toString()]);
+  assert.deepEqual(asked, [{ chainId: 97, portfolioId: f.id, account: f.account }]);
+  // The hold is more than the account has: nothing is offered (and "reserved" never exceeds the balance).
+  const all = await withHold(async () => TEST_AMOUNT + E).read(f.id, f.owner);
+  assert.deepEqual([all.cash.withdrawableRaw, all.cash.reservedRaw], ['0', TEST_AMOUNT.toString()]);
+  // The chain cannot say whether something is still owed: nothing is offered until it reads again (never a guess).
+  const blind = await withHold(async () => { throw new Error('rpc down'); }).read(f.id, f.owner);
+  assert.deepEqual([blind.cash.withdrawableRaw, blind.cash.reservedRaw], ['0', TEST_AMOUNT.toString()]);
+  // Sold and repaid: the hold is 0 and everything is withdrawable.
+  const done = await withHold(async () => 0n).read(f.id, f.owner);
+  assert.deepEqual([done.cash.withdrawableRaw, done.cash.reservedRaw], [TEST_AMOUNT.toString(), '0']);
+});
+
 test('#82 DB unclassified transfers and cash deficits remain separate from product lots', async () => {
   const f = await fixture('hold');
   const before = await f.service.read(f.id, f.owner);

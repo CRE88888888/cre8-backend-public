@@ -22,6 +22,7 @@ import type { WelcomeGrant } from './welcome-grants.js';
 import { readAccountCash } from './chain.js';
 import { defaultAmountUsdt, exactKeys, minimumAllocationRaw, record, usdtRaw, utcDate, CONTRIBUTION_FEE_RESERVE_RAW, minimumAssetContribution, minimumDcaTranche, numeraireFor } from './strategy-execution.js';
 import type { AssetExecution } from './strategy-execution.js';
+import { defaultSellAllCashHold } from './sell-all-hold.js';
 import { reservedCash, withdrawableCash } from './withdrawable-cash.js';
 import { rpcTransport } from './rpc-transport.js';
 import { accountHoldsOnlyCash, pausedBySellAll, RESUME_AFTER_SELL_ALL_SQL } from './sell-all-resume.js';
@@ -99,6 +100,8 @@ export type PortfolioStrategyDeps = {
   exposure: typeof readAssetExposure;
   /** The account holds nothing but cash right now (src/sell-all-resume.ts). Read only for a paused portfolio. */
   holdsOnlyCash: (portfolioId: number) => Promise<boolean>;
+  /** USDT an open "sell all" still needs in the account for its repayment (src/sell-all-hold.ts). Default: the database (`query`) and the chain. */
+  sellAllHold?: (input: { chainId: number; portfolioId: number; account: Address }) => Promise<bigint>;
 };
 
 function positiveId(value: unknown, zero = false): string {
@@ -376,12 +379,17 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
       const jobs = await deps.query(`select id::text,kind,lot_id::text,instruction_revision::text,slot_index::text,through_slot_index::text,
         slot_at,window_end_at,amount_raw::text,fee_reserve_raw::text,allocated_cash_raw::text,original_input,remaining_input,
         remaining_fee_raw::text,state,failure_count,next_check_at from strategy_jobs where chain_id=$1 and portfolio_id=$2 order by id desc limit 100`,[p.chainId,id]);
+      const free = withdrawableCash(BigInt(observed.amountRaw), balances);
+      // Unreadable while a "sell all" is open: nothing is offered for withdrawal until it reads again (never a guess).
+      const hold = free === 0n ? 0n : await (deps.sellAllHold ?? (input => defaultSellAllCashHold(input, (sql, params) => deps.query(sql, [...params]))))(
+        { chainId: p.chainId, portfolioId: id, account: p.accountAddress as Address }).catch(() => free);
       return { portfolioId: id, chainId: p.chainId, version: p.version, execution: version.execution, configHash: version.configHash,
         lotAssets: lotAssets.rows, slices:slices.rows, enabled: p.scheduleState === 'active', automation: p.chainId===97?'enabled':'testnet_only', jobs:jobs.rows,
         defaultAmountUsdt: version.execution.kind==='per_asset'?formatUnits(minimumAssetContribution(version.execution),18):defaultAmountUsdt(version.allocation, p.chainId),
-        // The owner's withdraw sheet caps at this (never cash a running buy has reserved).
-        cash: { ...observed, ...cashDifference(difference,yieldPending), withdrawableRaw: withdrawableCash(BigInt(observed.amountRaw), balances).toString(),
-          reservedRaw: reservedCash(balances).toString() },
+        // The owner's withdraw sheet caps at this (never cash a running buy has reserved, nor what an open "sell all"
+        // still needs to repay its Earn extra debt: src/sell-all-hold.ts — the paymaster refuses the same amount).
+        cash: { ...observed, ...cashDifference(difference,yieldPending), withdrawableRaw: (free > hold ? free - hold : 0n).toString(),
+          reservedRaw: (reservedCash(balances) + (hold < free ? hold : free)).toString() },
         balances, instructions: instructions.rows.map(mapInstruction), lots: lots.rows.map(mapLot) };
       });
     }),

@@ -573,6 +573,23 @@ export function partialRepayment(input: { debtRaw: bigint; postedRaw: bigint; ha
   const take = posted * pay / debt * 9_800n / 10_000n;
   return take === 0n ? null : { payRaw: pay, takeRaw: take };
 }
+/**
+ * Posted shares the debt that is left does not need (2026-11-25, testnet portfolio 37: the sale's USDT was withdrawn before
+ * the last repayment, leaving about 2 USDT of shares posted against a debt of 0.0000004 USD1, no USDT and nothing free to
+ * sell). The executor lets collateral leave without a repayment as long as the debt stays inside the budget afterwards
+ * (lens `requireBudget`: debtValue <= collateralValue x target passes outright). Kept posted: what the venue's debt needs
+ * at the route's target ratio, twice over (loan tokens counted at 1 USD; prices and interest move before inclusion).
+ * `budgetDebtRaw`: the debt that budget is checked against — the market's on Lista, the account's whole Venus debt on
+ * Venus. null when that frees less than half of what is posted (a position that really carries its debt, or one this
+ * already ran on: it is never sent round after round).
+ */
+export function spareCollateral(input: { postedRaw: bigint; collateralValueUsd: bigint; budgetDebtRaw: bigint; targetLtvBps: number }): bigint | null {
+  const { postedRaw: posted, collateralValueUsd: value, budgetDebtRaw: debt, targetLtvBps: target } = input;
+  if (posted <= 0n || value <= 0n || debt <= 0n || !Number.isInteger(target) || target <= 0) return null;
+  const keepValue = debt * 2n * 10_000n / BigInt(target) + 1n;
+  const keep = (posted * keepValue + value - 1n) / value;
+  return keep * 2n > posted ? null : posted - keep;
+}
 /** Venue minimums of a route (lens `minLoan` / `minDebt`, loan raw). */
 export type RouteLimits = { minLoanRaw: bigint; minDebtRaw: bigint };
 export type StepReason = Decision['reason'] | 'small_position';
@@ -833,15 +850,20 @@ export function v2ExitBatches(v2: StrategyEarnV2, account: Address, input: ExitI
 /** One posted asset the sale needs back. */
 export type PreSellPosition = PositionState & { routeId: Hex; vaultId: Hex; venue: 'venus' | 'lista'; loan: string;
   /** false: another open route of the account (not in this sale) borrows the same token — its leftover is not sold. */
-  lastOfToken?: boolean };
+  lastOfToken?: boolean;
+  /** For `spare` (spareCollateral): the posted shares' value (lens `collateralValue`, USD 1e18), the route's target ratio,
+   * and the debt the venue checks the budget against (Lista: this market's; Venus: the account's whole Venus debt). */
+  collateralValueUsd?: bigint; targetLtvBps?: number; budgetDebtRaw?: bigint };
 /**
  * Before a sale (session key): for each asset being sold whose free balance is short, repay its route and take the shares
  * back. Box money for the loan token (vault + idle) plus the account's own loan token covers the debt -> close. Short ->
  * repay what the box and the cash can, and take back only the same share of the collateral, 2% less (spec §5: collateral
  * may leave when debt ÷ budget does not rise and health does not fall); the sale of that part pays the rest next round.
  * A Lista partial repayment is cut so that `minDebt` stays (the contract would cut it the same way).
+ * `spare` (the sale has nothing free to sell either, so no USDT will come in): a position with nothing to repay takes back
+ * the shares its debt does not need (spareCollateral) — selling them pays the rest next round.
  */
-export function v2PreSellPlan(v2: StrategyEarnV2, account: Address, positions: readonly PreSellPosition[], deadline: bigint, now: number = Date.now()): { calls: Call[]; notes: string[];
+export function v2PreSellPlan(v2: StrategyEarnV2, account: Address, positions: readonly PreSellPosition[], deadline: bigint, now: number = Date.now(), options: { spare?: boolean } = {}): { calls: Call[]; notes: string[];
   /** A top-up that has to wait (unix seconds): the 24-hour window of some token is used up. */
   retryAt?: number;
   /** Collateral (lowercase) whose posted part cannot be freed this round: the box and the account's own loan token are used
@@ -880,6 +902,13 @@ export function v2PreSellPlan(v2: StrategyEarnV2, account: Address, positions: r
     const have = before.vault + before.idle + before.cash + bought;
     const some = partialRepayment({ debtRaw: debt, postedRaw: posted, haveRaw: have, floorRaw: p.minDebtRaw ?? 0n });
     if (some === null) {
+      const spare = options.spare && p.collateralValueUsd !== undefined && p.targetLtvBps !== undefined
+        ? spareCollateral({ postedRaw: posted, collateralValueUsd: p.collateralValueUsd, budgetDebtRaw: p.budgetDebtRaw ?? debt, targetLtvBps: p.targetLtvBps }) : null;
+      if (spare !== null) {
+        // No vault id: nothing is repaid, so nothing is released either.
+        calls.push(v2Calls.reduce(v2, account, p.routeId, ZERO32, 0n, spare, 0n, deadline));
+        notes.push(`${p.symbol} owes ${debt} ${p.loan} with nothing to repay it and nothing free to sell: take back ${spare} of ${posted} (the debt does not need them); their sale pays the rest`); continue;
+      }
       stuck.push(p.collateral.toLowerCase() as Address); needUsdtRaw += full.blocked.needUsdtRaw ?? 0n;
       notes.push(`${p.symbol} cannot be freed yet: the box and the account hold ${have} ${p.loan} against a debt of ${debt}${full.blocked.noSwap ? '' : ` (${full.blocked.blocked})`}`); continue;
     }

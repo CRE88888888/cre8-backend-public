@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
-import { decodeFunctionData, encodeAbiParameters, encodeEventTopics, keccak256, stringToHex, maxUint256, toFunctionSelector, zeroAddress } from 'viem';
+import { decodeFunctionData, encodeAbiParameters, encodeEventTopics, encodeFunctionData, keccak256, stringToHex, maxUint256, toFunctionSelector, zeroAddress } from 'viem';
 import type { Abi, AbiEvent, AbiFunction, Address, Hex, Log } from 'viem';
 import { formatAbiItem } from 'viem/utils';
 import { describePolicies, sessionCallPermissions } from '../src/permissions.js';
@@ -10,9 +10,17 @@ import { boxRewardSignature, maxDebtFor, planExecution, routeIdOf, routeIds, str
   routeMessage, runV2Account, v2Authorized, v2RouteEvents, v2Calls, v2ConsentCalls, v2ExitCalls, v2RateReport, v2SessionPermissions, vaultIdOf } from '../src/strategy-earn-v2.js';
 import type { Call, PositionState, PreSellPosition, StrategyEarnV2, V2Holding } from '../src/strategy-earn-v2.js';
 import { isRootSignedNonce, strandedSmallPosition, strategyEarnV2For, v2Audience, v2Batches, v2ExitBatches, v2InternalAddresses, v2KeeperCall, v2PreSellPlan, v2ReconsentCalls, v2RescueCall, v2SponsoredCall, V2_LENS_ABI } from '../src/strategy-earn-v2.js';
+import { V2_CASH_OUT_MIN_RAW, V2_SWAPPER_ABI, V2_SWAPPER_SELECTORS, cashOutMinUsdt, planTopUp, settleBudget, settleRepayment, swapEventLine, swapperErrorOf, topUpMaxUsdtIn, v2ExitPlan, v2InstalledScope,
+  v2MissingSwapperApprovals, v2SwapEvents, v2SwapperApprovalCalls } from '../src/strategy-earn-v2.js';
+import type { SwapQuote } from '../src/strategy-earn-v2.js';
+import { leftoverCashOuts } from '../src/strategy-earn-v2-swap.js';
 import type { RouteOption, RoutingSnapshot, RoutingVault } from '../src/strategy-earn-mainnet.js';
 
 const A = (n: number) => ('0x' + n.toString(16).padStart(40, '0')) as Address;
+const APPROVE = [{ type: 'function', name: 'approve', inputs: [{ type: 'address' }, { type: 'uint256' }], outputs: [], stateMutability: 'nonpayable' }] as const;
+const OWNER_ABI = [{ type: 'function', name: 'setPool', inputs: [{ type: 'address' }, { type: 'address' }], outputs: [], stateMutability: 'nonpayable' },
+  { type: 'function', name: 'setLimits', inputs: [{ type: 'uint16' }, { type: 'uint16' }], outputs: [], stateMutability: 'nonpayable' }] as const;
+const encodeFunctionDataLoose = (abi: readonly unknown[], functionName: string, args: readonly unknown[]): Hex => encodeFunctionData({ abi, functionName, args } as never);
 const account = A(0x55), owner = A(0x66), QQQ = A(0x71), NVDA = A(0x72), LISTA = A(0x91), XVS = A(0x92);
 const V2: StrategyEarnV2 = { chainId: 56, executor: A(0xe2), registry: A(0xe3), lens: A(0xe6), venusComptroller: A(0xe4), moolah: A(0xe5), loanTokens: { USDT: A(0xa1), USDC: A(0xa2) }, rewardTokens: [LISTA, XVS],
   adapters: [A(0xe7)], canaryOwners: [owner] };
@@ -43,7 +51,14 @@ test('every v2 address comes from deployment configuration: the manifest file, o
   assert.equal(strategyEarnV2(97, { STRATEGY_EARN_V2_DEPLOYMENT: moved })!.executor, A(0xabc));
   assert.ok(v2InternalAddresses(97, { STRATEGY_EARN_V2_DEPLOYMENT: moved }).has(A(0xabc)) && !v2InternalAddresses(97, { STRATEGY_EARN_V2_DEPLOYMENT: moved }).has(testnet.executor));
   assert.equal(strategyEarnV2(97, { STRATEGY_EARN_V2_DEPLOYMENT: MANIFEST }), null); // the variable wins, and its deployment is for another chain
-  assert.deepEqual(strategyEarnV2(56, { STRATEGY_EARN_V2_DEPLOYMENT: MANIFEST }), V2);
+  assert.deepEqual(strategyEarnV2(56, { STRATEGY_EARN_V2_DEPLOYMENT: MANIFEST }), { ...V2, swapper: null, swapperPools: [] });
+  // The cash swapper (spec §17) is part of the deployment: its address is what the session scope and the paymaster follow,
+  // its pools are booked as internal to the portfolio. A deployment without one has none (nothing is swapped).
+  assert.deepEqual([testnet.swapper, testnet.swapperPools], [file.cashSwapper.address.toLowerCase(), Object.values(file.cashSwapper.pools as Record<string, string>).map(x => x.toLowerCase())]);
+  assert.ok(testnet.swapperPools!.every(pool => v2InternalAddresses(97, {}).has(pool)) && !v2InternalAddresses(97, {}).has(testnet.swapper!));
+  const withSwapper = (cashSwapper: unknown) => strategyEarnV2(56, { STRATEGY_EARN_V2_DEPLOYMENT: JSON.stringify({ ...JSON.parse(MANIFEST), cashSwapper }) });
+  assert.deepEqual([withSwapper(A(0xe8))!.swapper, withSwapper({ address: A(0xe8), pools: { USDC: A(0xe9) } })!.swapperPools], [A(0xe8), [A(0xe9)]]);
+  for (const bad of ['0x12', { address: zeroAddress }, { pools: {} }, { address: A(0xe8), pools: { USDC: 'x' } }]) assert.throws(() => withSwapper(bad));
   for (const bad of ['{', JSON.stringify({ ...JSON.parse(MANIFEST), executor: '0x12' }), JSON.stringify({ ...JSON.parse(MANIFEST), registry: zeroAddress }), JSON.stringify({ ...JSON.parse(MANIFEST), lens: undefined }),
     JSON.stringify({ ...JSON.parse(MANIFEST), loanTokens: {} }), JSON.stringify({ ...JSON.parse(MANIFEST), loanTokens: { DAI: A(1) } })]) {
     assert.throws(() => strategyEarnV2(56, { STRATEGY_EARN_V2_DEPLOYMENT: bad }));
@@ -55,8 +70,10 @@ test('every v2 address comes from deployment configuration: the manifest file, o
 });
 
 test('audience: v2 is for the deployment\'s canary owners only until STRATEGY_EARN_V2_AUDIENCE says otherwise; everyone else stays on v1', () => {
-  // The manifest shipped today lists nobody: v2 is deployed on chain 97 but off for every owner (v1 for all).
-  assert.deepEqual(strategyEarnV2(97, {})!.canaryOwners, []);
+  // The manifest shipped today lists one owner, the e2e harness wallet: v2 is on for that owner's accounts and off (v1) for everyone else.
+  const harnessOwner = '0xd3ab39b62e221bf9e8ba19fe19b2638767d3d6d9' as Address;
+  assert.deepEqual(strategyEarnV2(97, {})!.canaryOwners, [harnessOwner]);
+  assert.equal(strategyEarnV2For(97, harnessOwner, {})!.chainId, 97);
   const other = A(0x1234), canary = A(0xd3ab);
   for (const who of [other, canary, owner, null, undefined, 'not an address']) assert.equal(strategyEarnV2For(97, who, {}), null);
   // A deployment that lists a canary owner: that owner only, whatever the letter case.
@@ -466,4 +483,227 @@ test('My mix weight change: after the enroll only the policy is set again, plus 
   assert.throws(() => v2ReconsentCalls(V2, { maxDebtUsdRaw: 0n, rewardRecipient: owner }));
   // Consent also approves the reward tokens, so a full exit can send the account's own on with the box's.
   assert.deepEqual(v2ConsentCalls(V2, { maxDebtUsdRaw: 1n, rewardRecipient: owner, venues: [], collaterals: [], loanTokens: [V2.loanTokens.USDT!], rewardTokens: [LISTA] }).map(c => c.to), [V2.registry, V2.loanTokens.USDT, LISTA]);
+});
+
+// ---------------------------------------------------------------------------
+// Cash swapper (AtpBorrowCashSwapper, cre8-contracts docs/borrow-routing-v2 §17)
+// ---------------------------------------------------------------------------
+const SWAPPER = A(0xe8), VS: StrategyEarnV2 = { ...V2, swapper: SWAPPER, swapperPools: [A(0xe9)] };
+const USDC = V2.loanTokens.USDC!, USDT = V2.loanTokens.USDT!;
+const SWAP_NOW = 1_800_000_000_000;
+const quote = (o: Partial<SwapQuote> = {}): SwapQuote => ({ token: USDC, gapRaw: 0n, capRaw: 1_010n * E, windowEndsAt: 0, usdtRaw: 500n * E, usdtAllowanceRaw: maxUint256, tokenAllowanceRaw: maxUint256, ...o });
+const lowerArgs = (args: readonly unknown[]) => args.map(x => typeof x === 'string' ? x.toLowerCase() : x);
+const swapCall = (c: Call) => { const d = decodeFunctionData({ abi: V2_SWAPPER_ABI, data: c.data }); return { functionName: d.functionName, args: lowerArgs(d.args as readonly unknown[]) }; };
+const names = (calls: readonly Call[], v2 = VS) => calls.map(c => c.to === v2.swapper ? swapCall(c).functionName : c.to === v2.registry ? 'setStrategyPolicy' : c.to === v2.executor ? decode(c.data).functionName : `approve:${c.to}`);
+
+test('cash swapper, what to buy: nothing when the box covers the debt; the gap + 1% (never under 0.04% of the debt) up to the cap, maxUsdtIn 0.3% over; why not, otherwise', () => {
+  const top = (o: Partial<Parameters<typeof planTopUp>[0]>) => planTopUp({ repayRaw: 1000n * E, haveRaw: 990n * E, swap: quote(), usdtRaw: 500n * E, capRaw: 1_010n * E, now: SWAP_NOW, ...o });
+  // Covered with the 0.02% drift margin to spare: nothing is bought. Just under it: a top-up.
+  assert.equal(top({ haveRaw: 1000n * E + 1000n * E / 5_000n + 1n }), null);
+  assert.ok(top({ haveRaw: 1000n * E }) !== null);
+  // 990 against 1,000: short 10.2 (+0.02% drift) -> buy that + max(1% of it, 0.04% of the debt) + 1 wei; pay at most 0.3% over.
+  const short = 1000n * E + 1000n * E / 5_000n + 1n - 990n * E, want = short + 1000n * E / 2_500n + 1n;
+  assert.deepEqual(top({}), { amountRaw: want, maxUsdtInRaw: (want * 1_003n + 999n) / 1_000n, covers: true });
+  assert.equal(topUpMaxUsdtIn(1_000n), 1_003n);
+  assert.equal(topUpMaxUsdtIn(1n), 2n); // rounded up
+  // A large gap: its own 1% is the buffer.
+  const big = top({ haveRaw: 0n, usdtRaw: 5_000n * E }) as { amountRaw: bigint };
+  const bigShort = 1000n * E + 1000n * E / 5_000n + 1n;
+  assert.equal(big.amountRaw, 1_010n * E < bigShort + bigShort / 100n + 1n ? 1_010n * E : bigShort + bigShort / 100n + 1n); // capped by topUpCap
+  // USDT (or no swapper): nothing to buy with — the caller falls back to the account's own loan token.
+  assert.deepEqual(top({ swap: undefined }), { blocked: `short of ${short} of the loan token`, noSwap: true });
+  // The owner never approved USDT to the swapper: not sent to revert.
+  assert.match((top({ swap: quote({ usdtAllowanceRaw: 0n }) }) as { blocked: string }).blocked, /not approved USDT/);
+  // The 24-hour window is used up (cap below the gap): wait for it, with the time it resets.
+  const waits = top({ capRaw: E, swap: quote({ windowEndsAt: SWAP_NOW / 1000 + 3600 }) }) as { blocked: string; retryAt?: number };
+  assert.deepEqual([/24-hour top-up window is used up/.test(waits.blocked), waits.retryAt], [true, SWAP_NOW / 1000 + 3600]);
+  assert.equal((top({ capRaw: 0n }) as { retryAt?: number }).retryAt, undefined); // no window open: just the cap
+  // Not enough USDT in the account: blocked for a close...
+  assert.match((top({ usdtRaw: 5n * E }) as { blocked: string }).blocked, /more USDT in the account/);
+  // ...and for a sale that frees collateral step by step, what the USDT buys (5 / 1.003).
+  assert.deepEqual(top({ usdtRaw: 5n * E, partial: true }), { amountRaw: 5n * E * 1_000n / 1_003n, maxUsdtInRaw: topUpMaxUsdtIn(5n * E * 1_000n / 1_003n), covers: false });
+});
+
+test('cash swapper, planner: a close of a USDC route the box cannot cover tops up first and sells what is left, in one UserOp; USDT routes are untouched', () => {
+  const ids = routeIds(VS, QQQ, listaUsdc);
+  const run = (o: Partial<PositionState>, v2 = VS) => planExecution({ v2, account, decisions: [decision('QQQB', 'close', 'negative_carry', listaUsdc, null, 0)],
+    positions: [state('QQQB', QQQ, { routeDebtRaw: 1000n * E, postedRaw: 10n * E, vaultAssetsRaw: 990n * E, idleRaw: 0n, cashRaw: 0n, loan: 'USDC', swap: quote(), ...o })], deadline: DEADLINE,
+    policyMaxDebtUsdRaw: 10_000n * E, principalUsdRaw: 1000n * E, now: SWAP_NOW }).steps[0]!;
+  const step = run({});
+  assert.deepEqual(names(step.calls), ['topUp', 'executeReduce', 'cashOut']);
+  const short = 1000n * E + 1000n * E / 5_000n + 1n - 990n * E, bought = short + 1000n * E / 2_500n + 1n;
+  assert.deepEqual(swapCall(step.calls[0]!).args, [USDC, bought, topUpMaxUsdtIn(bought), DEADLINE]);
+  assert.deepEqual(decode(step.calls[1]!.data).args, [account, ids.routeId, ids.vaultId, maxUint256, maxUint256, 0n, DEADLINE]);
+  // What is certainly left: box + purchase − debt − 0.02% drift = the 0.04% buffer less the drift already counted.
+  const left = 990n * E + bought - 1000n * E - (1000n * E / 5_000n + 1n);
+  assert.deepEqual(swapCall(step.calls[2]!).args, [USDC, maxUint256, cashOutMinUsdt(left), DEADLINE]);
+  // If that reverts as a whole: the same without the cash-out (500 USDT cannot buy the whole debt)...
+  assert.deepEqual([names(step.fallback![0]!), swapCall(step.fallback![0]![0]!).args[1]], [['topUp', 'executeReduce'], bought]);
+  // ...and with the USDT for it, the larger top-up for a vault that read 990 but does not pay (the idle loan token alone repays).
+  const richer = run({ swap: quote({ usdtRaw: 5_000n * E }) });
+  assert.deepEqual(names(richer.fallback![0]!), ['topUp', 'executeReduce']);
+  assert.ok((swapCall(richer.fallback![0]![0]!).args[1] as bigint) > 1000n * E);
+  // The box covers the debt with room: no top-up; the vault's surplus and the account's own USDC are sold after the close.
+  const rich = run({ vaultAssetsRaw: 1005n * E, cashRaw: 2n * E });
+  assert.deepEqual(names(rich.calls), ['executeReduce', 'cashOut']);
+  assert.equal(swapCall(rich.calls[1]!).args[2], cashOutMinUsdt(1005n * E + 2n * E - 1000n * E - (1000n * E / 5_000n + 1n)));
+  // Barely covered and nothing of its own: a leftover that is not certain is not sold here (the next round does it).
+  assert.deepEqual(names(run({ vaultAssetsRaw: 1000n * E + 1000n * E / 5_000n + 2n }).calls), ['executeReduce']);
+  // `shortfall` reverted (a vault cannot be read): the vault is not counted on — buy the whole debt less the idle, up to the cap.
+  const blind = run({ swap: quote({ gapRaw: null, usdtRaw: 5_000n * E }), idleRaw: 100n * E });
+  assert.deepEqual(names(blind.calls), ['topUp', 'executeReduce', 'cashOut']);
+  assert.ok((swapCall(blind.calls[0]!).args[1] as bigint) > 900n * E);
+  // Another open route still borrows USDC: its leftover is that route's repayment fallback, not sold.
+  const two = planExecution({ v2: VS, account, decisions: [decision('QQQB', 'close', 'negative_carry', listaUsdc, null, 0)], deadline: DEADLINE, policyMaxDebtUsdRaw: 10_000n * E, principalUsdRaw: 2000n * E, now: SWAP_NOW,
+    positions: [state('QQQB', QQQ, { routeDebtRaw: 1000n * E, postedRaw: 10n * E, vaultAssetsRaw: 1005n * E, cashRaw: 2n * E, loan: 'USDC', swap: quote() }), state('NVDAB', NVDA, { routeDebtRaw: 500n * E, postedRaw: E, loan: 'USDC', swap: quote() })] }).steps[0]!;
+  assert.deepEqual(names(two.calls), ['executeReduce']);
+  // Waiting, never sent to revert: the window is used up / no USDT / not approved — one skipped step with the reason.
+  assert.match(run({ swap: quote({ capRaw: E, windowEndsAt: SWAP_NOW / 1000 + 600 }) }).skipped!, /24-hour top-up window is used up/);
+  assert.match(run({ swap: quote({ usdtRaw: 0n }) }).skipped!, /more USDT in the account/);
+  assert.match(run({ swap: quote({ usdtAllowanceRaw: 0n }) }).skipped!, /not approved USDT/);
+  assert.equal(run({ swap: quote({ usdtRaw: 0n }) }).calls.length, 0);
+  // No swapper on the deployment, or a USDT route: exactly the old call (the venue decides), whatever the box holds.
+  assert.deepEqual(names(run({}, V2).calls, V2), ['executeReduce']);
+  const usdtStep = planExecution({ v2: VS, account, decisions: [decision('NVDAB', 'close', 'negative_carry', venusUsdt, null, 0)], positions: [state('NVDAB', NVDA, { routeDebtRaw: 1000n * E, vaultAssetsRaw: 10n * E, loan: 'USDT' })],
+    deadline: DEADLINE, policyMaxDebtUsdRaw: 10_000n * E, principalUsdRaw: 1000n * E, now: SWAP_NOW }).steps[0]!;
+  assert.deepEqual([names(usdtStep.calls), usdtStep.fallback], [['executeReduce'], undefined]);
+});
+
+test('cash swapper, planner: a partial repayment and a move off a short USDC route top up first; routes of one token share the box, the cap and the USDT', () => {
+  const p = (decisions: Decision[], positions: PositionState[]) => planExecution({ v2: VS, account, decisions, positions, deadline: DEADLINE, policyMaxDebtUsdRaw: 100_000n * E, principalUsdRaw: 1000n * E, now: SWAP_NOW }).steps;
+  // Repay 600 of 1,000 with 500 in the box: buy the 100 (+buffer) first.
+  const reduce = p([decision('QQQB', 'reduce', 'negative_carry', listaUsdc, listaUsdc, 400)], [state('QQQB', QQQ, { routeDebtRaw: 1000n * E, vaultAssetsRaw: 500n * E, loan: 'USDC', swap: quote() })])[0]!;
+  assert.deepEqual(names(reduce.calls), ['topUp', 'executeReduce']);
+  assert.ok((swapCall(reduce.calls[0]!).args[1] as bigint) > 100n * E && (swapCall(reduce.calls[0]!).args[1] as bigint) < 102n * E);
+  // Move to another route: the top-up rides with the atomic move, and with the close of the two-step path.
+  const move = p([decision('QQQB', 'migrate', 'better_route', listaUsdc, listaUsdt, 1000)], [state('QQQB', QQQ, { routeDebtRaw: 1000n * E, vaultAssetsRaw: 990n * E, loan: 'USDC', swap: quote() })])[0]!;
+  assert.deepEqual([names(move.calls), move.fallback!.map(b => names(b))], [['topUp', 'executeMigrate'], [['topUp', 'executeReduce'], ['executeOpen']]]);
+  // Covered: the move is exactly as before.
+  assert.deepEqual(names(p([decision('QQQB', 'migrate', 'better_route', listaUsdc, listaUsdt, 1000)], [state('QQQB', QQQ, { routeDebtRaw: 1000n * E, vaultAssetsRaw: 1010n * E, loan: 'USDC', swap: quote() })])[0]!.calls), ['executeMigrate']);
+  // Two USDC routes closed in one plan, 1,500 in the shared box, 60 USDT in the account: the first is covered by the box;
+  // the second finds 500 left and needs ~500 more, which 60 USDT cannot buy -> it waits.
+  const q = quote({ usdtRaw: 60n * E, capRaw: 600n * E });
+  const both = p([decision('QQQB', 'close', 'negative_carry', listaUsdc, null, 0), decision('NVDAB', 'close', 'negative_carry', { ...listaUsdc, marketId: LISTA_MARKET_2 }, null, 0)],
+    [state('QQQB', QQQ, { routeDebtRaw: 1000n * E, postedRaw: E, vaultAssetsRaw: 1500n * E, loan: 'USDC', swap: q }), state('NVDAB', NVDA, { routeDebtRaw: 1000n * E, postedRaw: E, vaultAssetsRaw: 1500n * E, loan: 'USDC', swap: q })]);
+  assert.deepEqual([names(both[0]!.calls), both[1]!.calls.length], [['executeReduce'], 0]);
+  assert.match(both[1]!.skipped!, /more USDT in the account/);
+});
+
+test('cash swapper, before a sale: top up and close when the USDT is there; otherwise buy what it can, repay that much and free the same share of the collateral', () => {
+  const b = routeIds(VS, QQQ, listaUsdc);
+  const pos = (o: Partial<PreSellPosition>): PreSellPosition => ({ symbol: 'QQQB', collateral: QQQ, freeCollateralRaw: 0n, postedRaw: 10n * E, routeDebtRaw: 1000n * E, routeId: b.routeId, vaultId: b.vaultId, venue: 'lista', loan: 'USDC', swap: quote(), ...o });
+  let p = v2PreSellPlan(VS, account, [pos({ vaultAssetsRaw: 600n * E })], DEADLINE, SWAP_NOW);
+  assert.deepEqual(names(p.calls), ['topUp', 'executeReduce', 'cashOut']);
+  assert.match(p.notes[0]!, /top up \d+ USDC from USDT, repay \d+ USDC, take back, sell the USDC left/);
+  // Only 100 USDT free: buy 99.7 USDC, repay 699.7 (less 1 wei), take back that share of the 10 shares less 2%.
+  p = v2PreSellPlan(VS, account, [pos({ vaultAssetsRaw: 600n * E, swap: quote({ usdtRaw: 100n * E }) })], DEADLINE, SWAP_NOW);
+  const bought = 100n * E * 1_000n / 1_003n, pay = 600n * E + bought - 1n;
+  assert.deepEqual(names(p.calls), ['topUp', 'executeReduce']);
+  assert.equal(swapCall(p.calls[0]!).args[1], bought);
+  assert.deepEqual((decode(p.calls[1]!.data).args as readonly unknown[]).slice(3, 5), [pay, 10n * E * pay / (1000n * E) * 9_800n / 10_000n]);
+  assert.match(p.notes[0]!, /short of USDC: top up \d+ from USDT/);
+  // The window is used up: repay what the box holds (as before the swapper), and say when the top-up can be retried.
+  p = v2PreSellPlan(VS, account, [pos({ vaultAssetsRaw: 600n * E, swap: quote({ capRaw: 0n, windowEndsAt: SWAP_NOW / 1000 + 900 }) })], DEADLINE, SWAP_NOW);
+  assert.deepEqual([names(p.calls), p.retryAt, (decode(p.calls[0]!.data).args as readonly unknown[])[3]], [['executeReduce'], SWAP_NOW / 1000 + 900, 600n * E - 1n]);
+  // Covered by the box: close and sell the surplus; a USDT route next to it is closed exactly as before.
+  p = v2PreSellPlan(VS, account, [pos({ vaultAssetsRaw: 1010n * E }), pos({ symbol: 'NVDAB', collateral: NVDA, loan: 'USDT', swap: undefined, vaultAssetsRaw: 1100n * E, routeId: routeIds(VS, NVDA, venusUsdt).routeId })], DEADLINE, SWAP_NOW);
+  assert.deepEqual(names(p.calls), ['executeReduce', 'cashOut', 'executeReduce']);
+});
+
+test('cash swapper, owner exit: approvals it lacks first, top-up + close + cash-out, leftovers of closed tokens sold; a close that cannot be covered is reported, not hidden', () => {
+  const b = routeIds(VS, QQQ, listaUsdc);
+  const route = { ...b, routeDebtRaw: 1000n * E, cashRaw: 0n, loan: 'USDC', vaultAssetsRaw: 990n * E, idleRaw: 0n, swap: quote(), lastOfToken: true };
+  const plan = v2ExitPlan(VS, account, { routes: [route], swapperApprovals: [USDT, USDC], cashOuts: [{ token: USDC, amountRaw: 0n }], deadline: DEADLINE, withdrawConsent: true, rewardRecipient: owner, now: SWAP_NOW });
+  assert.deepEqual([names(plan.calls), plan.blocked], [[`approve:${USDT}`, `approve:${USDC}`, 'topUp', 'executeReduce', 'cashOut', 'setStrategyPolicy'], []]);
+  assert.deepEqual(decodeFunctionData({ abi: [{ type: 'function', name: 'approve', inputs: [{ type: 'address' }, { type: 'uint256' }], outputs: [], stateMutability: 'nonpayable' }], data: plan.calls[0]!.data }).args.map(x => typeof x === 'string' ? x.toLowerCase() : x), [SWAPPER, maxUint256]);
+  // No USDT to top up with: the plain close is still listed (old shape) and the reason is returned.
+  const stuck = v2ExitPlan(VS, account, { routes: [{ ...route, swap: quote({ usdtRaw: 0n }) }], deadline: DEADLINE, withdrawConsent: false, now: SWAP_NOW });
+  assert.deepEqual([names(stuck.calls), stuck.blocked.length], [['executeReduce'], 1]);
+  // A token with nothing owed and a balance worth selling is sold at the end; dust under 0.000001 is not.
+  const dust = v2ExitPlan(VS, account, { routes: [], cashOuts: [{ token: USDC, amountRaw: 3n * E }, { token: USDC, amountRaw: V2_CASH_OUT_MIN_RAW - 1n }], deadline: DEADLINE, withdrawConsent: false });
+  assert.deepEqual([names(dust.calls), swapCall(dust.calls[0]!).args], [['cashOut'], [USDC, maxUint256, 3n * E * 997n / 1_000n, DEADLINE]]);
+  // Without the settle fields (older callers) and without a swapper: byte for byte the old exit.
+  assert.deepEqual(v2ExitCalls(VS, account, { routes: [b], deadline: DEADLINE, withdrawConsent: false }), v2ExitCalls(V2, account, { routes: [b], deadline: DEADLINE, withdrawConsent: false }));
+  // Approvals: only USDT and loan tokens, each once; none without a swapper.
+  assert.deepEqual(v2SwapperApprovalCalls(VS, [USDT, USDC, USDT]).map(c => c.to), [USDT, USDC]);
+  assert.throws(() => v2SwapperApprovalCalls(VS, [QQQ]), /only USDT and loan tokens/);
+  assert.deepEqual(v2SwapperApprovalCalls(V2, [USDT]), []);
+  assert.deepEqual([v2MissingSwapperApprovals(VS, t => t === USDT ? maxUint256 : 0n), v2MissingSwapperApprovals(V2, () => 0n)], [[USDC], []]);
+  // Consent carries the missing ones first; the rest of it is unchanged.
+  const consent = v2ConsentCalls(VS, { maxDebtUsdRaw: E, rewardRecipient: owner, venues: ['lista'], collaterals: [QQQ], swapperApprovals: [USDT, USDC] });
+  assert.deepEqual(consent.map(c => c.to), [USDT, USDC, VS.moolah, VS.registry, QQQ]);
+  assert.deepEqual(consent.slice(2), v2ConsentCalls(VS, { maxDebtUsdRaw: E, rewardRecipient: owner, venues: ['lista'], collaterals: [QQQ] }));
+});
+
+test('cash swapper, leftovers: a loan token other than USDT with nothing owed in it is sold (min 0.3% under 1:1); owed, dust or unapproved ones are not', () => {
+  const l = (o: Partial<Parameters<typeof leftoverCashOuts>[1][number]>) => ({ symbol: 'USDC', token: USDC, cashRaw: 3n * E, debtRaw: 0n, allowanceRaw: maxUint256, ...o });
+  const out = leftoverCashOuts(VS, [l({}), l({ symbol: 'USD1', token: A(0xa3), debtRaw: 1n }), l({ symbol: 'U', token: A(0xa4), cashRaw: V2_CASH_OUT_MIN_RAW - 1n }), l({ symbol: 'X', token: A(0xa5), allowanceRaw: E })], DEADLINE);
+  assert.deepEqual([out.calls.map(c => swapCall(c).args), out.sold.map(x => x.symbol), out.unapproved.map(x => x.symbol)], [[[USDC, maxUint256, 3n * E * 997n / 1_000n, DEADLINE]], ['USDC'], ['X']]);
+  assert.deepEqual(leftoverCashOuts(V2, [l({})], DEADLINE).calls, []);
+});
+
+test('cash swapper, session scope: topUp and cashOut only on the swapper, after the six executor functions; a key from before the swapper waits for a renewal and still rebuilds as installed', () => {
+  const executor = A(0xe1);
+  const plain = sessionCallPermissions(executor, account, account, undefined, { executor: V2.executor, account });
+  const withSwapper = sessionCallPermissions(executor, account, account, undefined, { executor: V2.executor, account, swapper: SWAPPER });
+  assert.deepEqual(withSwapper.slice(0, plain.length), plain);
+  assert.deepEqual(withSwapper.slice(plain.length), V2_SWAPPER_SELECTORS.map(selector => ({ target: SWAPPER, selector, rules: [] })));
+  assert.deepEqual(V2_SWAPPER_SELECTORS, [toFunctionSelector('topUp(address,uint256,uint256,uint256)'), toFunctionSelector('cashOut(address,uint256,uint256,uint256)')]);
+  // Never the owner functions of the swapper, never anything else on it.
+  for (const owned of ['setPool(address,address)', 'setLimits(uint16,uint16)']) assert.ok(!withSwapper.some(p => p.selector === toFunctionSelector(owned)));
+  assert.equal(withSwapper.filter(p => p.target === SWAPPER).length, 2);
+  const snap = (routingV2: { executor: Address; account: Address; swapper?: Address }) => describePolicies({ executorAddress: executor, chainId: 97, validUntil: 1_900_000_000, yieldAccount: account, borrowAccount: account, routingV2 });
+  const withKey = snap({ executor: V2.executor, account, swapper: SWAPPER }), oldKey = snap({ executor: V2.executor, account });
+  // Today's deployment has a swapper: only a key that carries both scopes is ready; without one the old rule stands.
+  assert.deepEqual([v2Authorized(withKey, account, V2.executor, SWAPPER), v2Authorized(oldKey, account, V2.executor, SWAPPER), v2Authorized(oldKey, account, V2.executor), v2Authorized(withKey, account, V2.executor, A(0xee))], [true, false, true, false]);
+  // The scope a key was installed with is read off the key, not off today's deployment: an older key rebuilds to its own permissionId.
+  assert.deepEqual([v2InstalledScope(withKey, account), v2InstalledScope(oldKey, account), v2InstalledScope(snap({ executor: A(0xabc), account }), account)],
+    [{ executor: V2.executor, account, swapper: SWAPPER }, { executor: V2.executor, account }, { executor: A(0xabc), account }]);
+  assert.deepEqual([v2InstalledScope(withKey, A(0x77)), v2InstalledScope(describePolicies({ executorAddress: executor, chainId: 97, validUntil: 1_900_000_000, yieldAccount: account, borrowAccount: account }), account), v2InstalledScope(null, account)], [null, null, null]);
+  for (const scope of [{ executor: V2.executor, account, swapper: SWAPPER }, { executor: V2.executor, account }]) assert.deepEqual(snap(v2InstalledScope(snap(scope), account)!), snap(scope));
+});
+
+test('cash swapper, paymaster rules: topUp / cashOut of a loan token other than USDT settle; approvals to it only on USDT and loan tokens; everything else on it is refused', () => {
+  const ctx = { sender: account, owner, assets: [QQQ, NVDA] };
+  const kind = (c: Call) => v2SponsoredCall(VS, { target: c.to, callData: c.data }, ctx);
+  assert.deepEqual([kind(v2Calls.topUp(VS, USDC, E, DEADLINE)), kind(v2Calls.cashOut(VS, USDC, maxUint256, 0n, DEADLINE)), kind(v2Calls.cashOut(VS, USDC, E, E, DEADLINE))], ['settle', 'settle', 'settle']);
+  assert.deepEqual(v2SwapperApprovalCalls(VS, [USDT, USDC]).map(kind), ['settle', 'settle']);
+  const raw = (functionName: string, args: readonly unknown[], abi: readonly unknown[] = V2_SWAPPER_ABI): Call => ({ to: SWAPPER, value: '0', data: encodeFunctionDataLoose(abi, functionName, args) });
+  const approve = (token: Address, spender: Address): Call => ({ to: token, value: '0', data: encodeFunctionDataLoose(APPROVE, 'approve', [spender, maxUint256]) });
+  const refused: [string, Call][] = [
+    ['top-up of USDT', raw('topUp', [USDT, E, E, DEADLINE])],
+    ['top-up of a portfolio asset', raw('topUp', [QQQ, E, E, DEADLINE])],
+    ['top-up of nothing', raw('topUp', [USDC, 0n, 0n, DEADLINE])],
+    ['top-up of "everything"', raw('topUp', [USDC, maxUint256, maxUint256, DEADLINE])],
+    ['top-up without a deadline', raw('topUp', [USDC, E, E, 0n])],
+    ['cash-out of USDT', raw('cashOut', [USDT, E, 0n, DEADLINE])],
+    ['cash-out of a reward token', raw('cashOut', [LISTA, E, 0n, DEADLINE])],
+    ['cash-out without a deadline', raw('cashOut', [USDC, E, 0n, 0n])],
+    ['setPool', raw('setPool', [USDC, A(1)], OWNER_ABI)], ['setLimits', raw('setLimits', [100, 500], OWNER_ABI)],
+    ['shortfall as a transaction', raw('shortfall', [account, USDC])],
+    ['trailing bytes', { ...v2Calls.topUp(VS, USDC, E, DEADLINE), data: (v2Calls.topUp(VS, USDC, E, DEADLINE).data + '00') as Hex }],
+    ['a portfolio asset approved to the swapper', approve(QQQ, SWAPPER)],
+    ['a reward token approved to the swapper', approve(LISTA, SWAPPER)],
+  ];
+  for (const [name, call] of refused) assert.throws(() => kind(call), Error, name);
+  // Without a swapper on the deployment its address is nobody: an approval to it is not a v2 call (the ordinary token rules refuse it).
+  assert.equal(v2SponsoredCall(V2, { target: USDT, callData: approve(USDT, SWAPPER).data }, ctx), null);
+  assert.equal(v2SponsoredCall(V2, { target: SWAPPER, callData: v2Calls.topUp(VS, USDC, E, DEADLINE).data }, ctx), null);
+});
+
+test('cash swapper, records and failures: ToppedUp / CashedOut of this account become log lines; PegExceeded and WindowExceeded are recognised by selector or name', () => {
+  const topped = V2_SWAPPER_ABI.find(x => x.type === 'event' && x.name === 'ToppedUp')!, cashed = V2_SWAPPER_ABI.find(x => x.type === 'event' && x.name === 'CashedOut')!;
+  const u = [{ type: 'uint256' }] as const;
+  const log = (address: Address, event: AbiEvent, who: Address, values: bigint[], logIndex: number): Log => ({ address, topics: encodeEventTopics({ abi: [event], args: { account: who, token: USDC } } as never) as never,
+    data: encodeAbiParameters(values.map(() => u[0]), values), logIndex, blockNumber: 7n, blockHash: '0x', transactionHash: '0x', transactionIndex: 0, removed: false } as never);
+  const tx = { hash: ('0x' + 'cd'.repeat(32)) as Hex, blockNumber: 7n, logs: [log(SWAPPER, topped, account, [1003n, 1000n, 990n], 1), log(SWAPPER, cashed, account, [50n, 49n], 4), log(SWAPPER, topped, A(0x77), [1n, 1n, 1n], 5), log(A(0x99), topped, account, [1n, 1n, 1n], 6)] };
+  const events = v2SwapEvents(VS, tx, account);
+  assert.deepEqual(events.map(e => [e.kind, e.token, e.usdtRaw, e.tokenRaw, e.needRaw, e.logIndex]), [['top_up', USDC, 1003n, 1000n, 990n, 1], ['cash_out', USDC, 49n, 50n, null, 4]]);
+  assert.deepEqual(JSON.parse(swapEventLine(97, 9, events[0]!)), { level: 'info', msg: 'strategy_cash_swap', chainId: 97, portfolioId: 9, account, kind: 'top_up', token: USDC, usdtRaw: '1003', tokenRaw: '1000', needRaw: '990', txHash: tx.hash, logIndex: 1, blockNumber: '7' });
+  assert.deepEqual(v2SwapEvents(V2, tx, account), []);
+  const sel = (sig: string) => toFunctionSelector(sig);
+  assert.equal(swapperErrorOf(new Error(`UserOperation reverted during simulation with reason: ${sel('PegExceeded(uint256,uint256)')}${'00'.repeat(64)}`)), 'PegExceeded');
+  assert.equal(swapperErrorOf(Object.assign(new Error('bundler said no'), { cause: { message: 'execution reverted', data: sel('WindowExceeded(uint256,uint256)') + '11'.repeat(64) } })), 'WindowExceeded');
+  assert.equal(swapperErrorOf(new Error('reverted: PegExceeded(1003, 1000)')), 'PegExceeded');
+  assert.deepEqual([swapperErrorOf(new Error('VaultShortfall')), swapperErrorOf(null)], [null, null]);
 });

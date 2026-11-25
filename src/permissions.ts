@@ -255,7 +255,9 @@ type BuiltPolicies = { call: Policy; gas: Policy; timestamp: Policy };
 /** Default remains the original deployment policy: adding initConfig would move CREATE2 accounts.
  * Yield is installed only by owner renewal, once the existing account address is known.
  */
-export type RoutingV2Scope = { executor: Address; account: Address };
+export type RoutingV2Scope = { executor: Address; account: Address;
+  /** AtpBorrowCashSwapper of this deployment (`topUp` / `cashOut` only), when the key was installed with it. */
+  swapper?: Address };
 export function sessionCallPermissions(executorAddress: Address, yieldAccount?: Address, borrowAccount?: Address, borrowMarkets?: readonly Hex[], routingV2?: RoutingV2Scope) {
   return [
     { target: executorAddress, selector: EXECUTOR_SELECTOR },
@@ -269,7 +271,7 @@ export function sessionCallPermissions(executorAddress: Address, yieldAccount?: 
     ...(borrowAccount === undefined ? [] : borrowSessionPermissions(borrowAccount, borrowMarkets)),
     // Routing v2 (src/strategy-earn-v2.ts): the six account functions on AtpBorrowExecutorV2, argument 0 pinned. Appended
     // last so every key installed before v2 rebuilds the same permissionId.
-    ...(routingV2 === undefined ? [] : v2SessionPermissions(routingV2.executor, routingV2.account)),
+    ...(routingV2 === undefined ? [] : v2SessionPermissions(routingV2.executor, routingV2.account, routingV2.swapper)),
   ];
 }
 
@@ -528,7 +530,8 @@ export async function buildSessionPermissions(args: BuildSessionPermissionsArgs)
   if (borrowAccount !== undefined && (chainId !== 97 || isAddressEqual(borrowAccount, zeroAddress) || yieldAccount === undefined ||
       !isAddressEqual(borrowAccount, yieldAccount))) throw new Error('策略加息升權只支援 chain 97 的既有帳戶，且必須與生息升權同一個帳戶');
   if (args.routingV2 !== undefined && (isAddressEqual(args.routingV2.account, zeroAddress) || isAddressEqual(args.routingV2.executor, zeroAddress) ||
-      isAddressEqual(args.routingV2.executor, executorAddress))) throw new Error('路由 v2 升權需要既有帳戶與 v2 executor（不能是 AtpExecutor）');
+      isAddressEqual(args.routingV2.executor, executorAddress) || (args.routingV2.swapper !== undefined && (isAddressEqual(args.routingV2.swapper, zeroAddress) ||
+      isAddressEqual(args.routingV2.swapper, executorAddress) || isAddressEqual(args.routingV2.swapper, args.routingV2.executor))))) throw new Error('路由 v2 升權需要既有帳戶與 v2 executor（不能是 AtpExecutor）');
   const policies = buildPolicies(executorAddress, SESSION_VALID_AFTER, validUntil, chainId, yieldAccount, borrowAccount, args.borrowMarkets, args.routingV2);
 
   // 型別理由同 src/kernel.ts：SDK 把 kernelVersion 收窄成 GetKernelVersion<"0.7">。

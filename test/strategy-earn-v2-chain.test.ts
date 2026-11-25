@@ -8,11 +8,11 @@ import { createV2Reader, v2PublicRpcs } from '../src/strategy-earn-v2-chain.js';
 import { fromMainnetRates, fromTestnetMocks, reportCalldata, reportDue, runRateReport } from '../src/strategy-earn-v2-rates.js';
 import { runV2KeeperRound, v2AutoRound, v2MinCollectRaw, v2RewardHolders, v2UnwindForSale } from '../src/strategy-earn-v2-scheduler.js';
 import type { V2Ledger, V2Tx } from '../src/strategy-earn-v2-scheduler.js';
-import { loanTokenNeeds, planLoanTokenSwaps } from '../src/strategy-earn-v2-swap.js';
-import { boxRewardSignature, v2ConsentCalls, V2_EXECUTOR_ABI, V2_REGISTRY_ABI } from '../src/strategy-earn-v2.js';
+import { boxRewardSignature, cashOutMinUsdt, topUpMaxUsdtIn, v2ConsentCalls, V2_EXECUTOR_ABI, V2_REGISTRY_ABI, V2_SWAPPER_ABI } from '../src/strategy-earn-v2.js';
 import type { Call, RouteEvent } from '../src/strategy-earn-v2.js';
 import type { RewardEvent } from '../src/strategy-rewards.js';
-import { E18, W, WORLD_NOW as NOW, world } from './fixtures/v2-world.js';
+import { toFunctionSelector } from 'viem';
+import { E18, SWAPPER, USDC_POOL, W, WORLD_NOW as NOW, WS, world } from './fixtures/v2-world.js';
 
 const fn = (c: Call) => c.to === W.v2.executor ? decodeFunctionData({ abi: V2_EXECUTOR_ABI, data: c.data }).functionName : c.to === W.v2.registry ? decodeFunctionData({ abi: V2_REGISTRY_ABI, data: c.data }).functionName : `approve:${c.to}`;
 const argsOf = (c: Call) => decodeFunctionData({ abi: V2_EXECUTOR_ABI, data: c.data }).args as readonly unknown[];
@@ -137,7 +137,6 @@ test('review round 3: with only interest left in a token, lens.routeDebt answers
   assert.deepEqual(read.state.holdings.filter(h => h.position).map(h => h.position!.debtUsd), [0.205, 0]);
   // The account's debt in the token is lens.tokenDebt, read once (draft6 §5), and it is what the net value and the swap planner use.
   assert.equal(read.tokens.USDT!.debtRaw, dust);
-  assert.deepEqual(loanTokenNeeds(read, USDC), []);
   // MAX goes only on the route that carries the share; the other one just gets its collateral back (repay 0).
   const api = createStrategyEarnV2Api({ v2: W.v2, reader, now: () => NOW });
   const off = await api.close(W.account, { symbols: ['NVDAB', 'QQQB'] });
@@ -283,6 +282,7 @@ test('turn off keeps the reward recipient on the withdrawn consent; a later full
   // 1. A plain turn-off (not an exit): close, withdraw consent — the recipient the owner set stays; rewards stay in the account.
   openVenus(w);
   const off = await api.close(W.account, { symbols: ['NVDAB'] });
+  if (off.status !== 'ready') throw new Error('close not ready');
   const last = off.calls.at(-1)!;
   assert.deepEqual([last.to, decodeFunctionData({ abi: V2_REGISTRY_ABI, data: last.data }).args], [W.v2.registry, [0n, W.owner, false]]);
   assert.ok(!off.calls.some(c => c.to === W.v2.executor && fn(c) === 'executeSweepRewards'));
@@ -450,24 +450,194 @@ test('rate report: due when never reported, 12 hours old, or a value moved 0.25%
   assert.deepEqual(fromMainnetRates(await reader.book(), m.snapshot).routes.map(r => [r.borrowIncentiveBps, r.collateralIncentiveBps]), [[50, 100], [0, 0], [0, 0], [0, 0]]);
 });
 
-test('swap needs: another loan token left after its routes closed is dust to sell; a route the box and the account cannot repay is a gap to buy; the cash token is never swapped', async () => {
-  const w = world(), reader = createV2Reader(w.readerDeps);
-  consenting(w, 0n);
-  w.setBalance(USDC, W.account, 3n * E18); w.setBalance(USDT, W.account, 500n * E18);
-  assert.deepEqual(loanTokenNeeds(await reader.account(W.account), USDT).map(n => [n.symbol, n.kind, n.amountRaw]), [['USDC', 'dust', 3n * E18]]);
-  w.setBalance(USDC, W.account, 5n * 10n ** 17n);
-  assert.deepEqual(loanTokenNeeds(await reader.account(W.account), USDT), []); // under 1 token: not worth a trade
-  // QQQB on Lista/USDC: 300 owed, 280 in the vault + 5 idle + 0.5 in the account -> buy the 14.5 gap +0.5%.
-  w.state.positions.set(w.ids.qqqListaUsdc, { collateral: 2n * E18, collateralValue: 1000n * E18, debt: 300n * E18, routeDebt: 300n * E18, principal: 300n * E18, openedAt: 1 });
-  w.state.holdings.set(w.ids.listaUsdc, { assets: 280n * E18, since: 1 }); w.state.idle.set(USDC, 5n * E18);
-  const needs = loanTokenNeeds(await reader.account(W.account), USDT);
-  const gap = 145n * 10n ** 17n;
-  assert.deepEqual(needs.map(n => [n.symbol, n.kind, n.amountRaw]), [['USDC', 'gap', gap + gap * 50n / 10_000n + 1n]]);
-  // No trade path on this chain (the stablecoins are not strategy assets, chain 97 has no pool): reported, not guessed.
-  assert.deepEqual((await planLoanTokenSwaps(needs, null)).unavailable.map(u => u.reason), ['no trade path for this token on this chain']);
-  const quoted = await planLoanTokenSwaps([...needs, { symbol: 'USDC', token: USDC, kind: 'dust', amountRaw: 2n * E18, why: '' }],
-    { sell: async (_t, amount) => ({ side: 'sell', amount }), buy: async () => ({ unavailable: 'asset not allowed for this strategy' }) });
-  assert.deepEqual([quoted.steps.map(s => s.step), quoted.unavailable.map(u => u.reason)], [[{ side: 'sell', amount: 2n * E18 }], ['asset not allowed for this strategy']]);
+// ---------------------------------------------------------------------------
+// Cash swapper (AtpBorrowCashSwapper, spec §17) against the fake chain: `world(WS)`
+// ---------------------------------------------------------------------------
+const swapFn = (c: Call) => c.to === SWAPPER ? decodeFunctionData({ abi: V2_SWAPPER_ABI, data: c.data }).functionName : fn(c);
+const swapArgs = (c: Call) => (decodeFunctionData({ abi: V2_SWAPPER_ABI, data: c.data }).args as readonly unknown[]).map(x => typeof x === 'string' ? x.toLowerCase() : x);
+/** QQQB on Lista/USDC: 300 owed, `vault` in the USDC vault; consent given; USDT and USDC approved to the swapper unless `approved` is false. */
+function shortUsdc(w: ReturnType<typeof world>, o: { vault?: bigint; usdt?: bigint; approved?: boolean; enabled?: boolean } = {}) {
+  w.state.policy = { maxDebt: 10_000n * E18, rewardRecipient: W.owner, strategyId: 57n, enabled: o.enabled ?? true };
+  w.state.positions.set(w.ids.qqqListaUsdc, { collateral: 2n * E18, collateralValue: 1000n * E18, debt: 300n * E18, routeDebt: 300n * E18, principal: 300n * E18, openedAt: 1_795_000_000, ltvBps: 3000 });
+  w.state.holdings.set(w.ids.listaUsdc, { assets: o.vault ?? 280n * E18, since: 1_795_000_000 });
+  w.state.principalUsd = 300n * E18;
+  w.setBalance(USDT, W.account, o.usdt ?? 100n * E18);
+  if (o.approved !== false) { w.setAllowance(USDT, W.account, SWAPPER, maxUint256); w.setAllowance(USDC, W.account, SWAPPER, maxUint256); }
+}
+const DRIFT = 300n * E18 / 5_000n + 1n, SHORT = 300n * E18 + DRIFT - 280n * E18, BOUGHT = SHORT + SHORT / 100n + 1n;
+
+test('cash swapper, account read: shortfall and topUpCap (their own request, 30M gas), the window, allowances to the swapper; leftover loan token counts in the net value', async () => {
+  const w = world(WS), reader = createV2Reader(w.readerDeps);
+  const gas: (bigint | undefined)[] = [], inner = w.readerDeps.multicall;
+  const watched = createV2Reader({ ...w.readerDeps, multicall: (reads, opts) => { gas.push(opts?.gas); return inner(reads, opts); } });
+  shortUsdc(w, { approved: false });
+  w.state.swap.windowStart = 1_800_000_000;
+  w.setBalance(USDC, W.account, 2n * E18);
+  w.setAllowance(USDT, W.account, SWAPPER, 7n);
+  const read = await watched.account(W.account);
+  // gap = 300 − 280 (vault) − 0 (idle); cap = (debt − idle) × 1.01; the window resets 24 hours after it opened.
+  assert.deepEqual(read.tokens.USDC!.swap, { token: USDC, gapRaw: 20n * E18, capRaw: 303n * E18, windowEndsAt: 1_800_086_400, usdtRaw: 100n * E18, usdtAllowanceRaw: 7n, tokenAllowanceRaw: 0n });
+  assert.equal(read.tokens.USDT!.swap, undefined); // the cash token is never swapped
+  assert.deepEqual(read.swapperAllowances, { [USDT]: 7n, [USDC]: 0n });
+  assert.deepEqual(gas.filter(g => g !== undefined), [30_000_000n], 'only the shortfall request carries a gas limit, and it is not under 10M');
+  // The position carries the quote; the net value counts the account's own USDC at 1 USD: 280 + 2 − 300.
+  assert.deepEqual([read.state.holdings.find(h => h.symbol === 'QQQB')!.swap, read.earnNetUsd], [read.tokens.USDC!.swap, -18n * E18]);
+  // A vault that cannot be read: `shortfall` reverts -> the gap is unknown (null), the cap still answers.
+  w.state.swap.unreadable = true;
+  assert.deepEqual([(await reader.account(W.account)).tokens.USDC!.swap!.gapRaw, (await reader.account(W.account)).tokens.USDC!.swap!.capRaw], [null, 303n * E18]);
+  // Nothing owed in the token: no shortfall read at all (one request fewer), the quote only carries the allowances.
+  const count = async () => { const before = w.state.requests; const r = await reader.account(W.account); return { requests: w.state.requests - before, r }; };
+  const owing = await count();
+  w.state.positions.clear(); w.state.holdings.clear();
+  const idle = await count();
+  assert.deepEqual([owing.requests - idle.requests, idle.r.tokens.USDC!.swap!.gapRaw, idle.r.tokens.USDC!.swap!.capRaw], [1, 0n, 0n]);
+  assert.deepEqual(await reader.leftovers(W.account), [{ symbol: 'USDC', token: USDC, cashRaw: 2n * E18, debtRaw: 0n, allowanceRaw: 0n }]);
+  // Without a swapper on the deployment nothing of this is read.
+  const plain = world(), plainRead = await createV2Reader(plain.readerDeps).account(W.account);
+  assert.deepEqual([plainRead.swapperAllowances, plainRead.tokens.USDC!.swap, await createV2Reader(plain.readerDeps).leftovers(W.account)], [{}, undefined, []]);
+});
+
+test('cash swapper, scheduler: the round that closes a short USDC route tops up, closes and sells the leftover in one UserOp; reserved cash is never spent', async () => {
+  const run = async (o: Parameters<typeof shortUsdc>[1] & { reserved?: bigint | Error; fail?: (calls: Call[]) => Error | null } = {}) => {
+    const w = world(WS), reader = createV2Reader(w.readerDeps), sent: Call[][] = [], lines: string[] = [], led = ledger();
+    shortUsdc(w, { enabled: false, ...o }); // the strategy was turned off: the engine closes
+    const note = await v2AutoRound({ v2: WS, reader, account: W.account, portfolioId: 9, now: NOW, dryRun: false, ledger: led.l, log: l => lines.push(l),
+      ...(o.reserved === undefined ? {} : { reservedUsdt: async () => { if (o.reserved instanceof Error) throw o.reserved; return o.reserved as bigint; } }),
+      send: async calls => { const e = o.fail?.(calls); if (e) throw e; sent.push(calls); return tx(sent.length); } }).then(n => ({ note: n, error: null as Error | null }), (error: Error) => ({ note: null, error }));
+    return { ...note, sent, lines };
+  };
+  const ok = await run();
+  assert.deepEqual(ok.sent.map(c => c.map(swapFn)), [['topUp', 'executeReduce', 'cashOut']]);
+  assert.deepEqual(swapArgs(ok.sent[0]![0]!).slice(0, 3), [USDC, BOUGHT, topUpMaxUsdtIn(BOUGHT)]);
+  assert.deepEqual(swapArgs(ok.sent[0]![2]!).slice(0, 3), [USDC, maxUint256, cashOutMinUsdt(280n * E18 + BOUGHT - 300n * E18 - DRIFT)]);
+  assert.match(ok.note!, /已執行：QQQB close/);
+  // 100 USDT in the account, 90 of it held for a running buy job: 10 cannot buy the ~20.3 gap -> not sent, logged with the reason.
+  const reserved = await run({ reserved: 90n * E18 });
+  assert.deepEqual([reserved.sent.length, reserved.error], [0, null]);
+  assert.ok(reserved.lines.some(l => /not sent: needs \d+ more USDT in the account/.test(l)), reserved.lines.join('\n'));
+  // The reservation cannot be read: no USDT is spent on a guess.
+  const blind = await run({ reserved: new Error('db down') });
+  assert.equal(blind.sent.length, 0);
+  assert.ok(blind.lines.some(l => /reserved cash unreadable/.test(l)));
+  // The owner has not approved the swapper (consented before it existed): waits, says so.
+  const unapproved = await run({ approved: false });
+  assert.equal(unapproved.sent.length, 0);
+  assert.ok(unapproved.lines.some(l => /not approved USDT to the cash swapper/.test(l)));
+});
+
+test('cash swapper, scheduler: PegExceeded is an alert (tagged failure + a structured error line); WindowExceeded waits for the window without a failure', async () => {
+  const run = async (selector: string) => {
+    const w = world(WS), reader = createV2Reader(w.readerDeps), lines: string[] = [], led = ledger();
+    shortUsdc(w, { enabled: false });
+    let tries = 0;
+    const result = await v2AutoRound({ v2: WS, reader, account: W.account, portfolioId: 9, now: NOW, dryRun: false, ledger: led.l, log: l => lines.push(l),
+      send: async () => { tries++; throw new Error(`UserOperation reverted during simulation with reason: ${toFunctionSelector(selector)}${'00'.repeat(64)}`); } }).then(note => ({ note, error: null as Error | null }), (error: Error) => ({ note: null, error }));
+    return { ...result, lines, tries };
+  };
+  const peg = await run('PegExceeded(uint256,uint256)');
+  assert.match(peg.error!.message, /^\[STRATEGY_PEG_EXCEEDED\] \[STRATEGY_ROUTING\]/);
+  const alert = peg.lines.map(l => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return null; } }).find(x => x?.msg === 'strategy_peg_exceeded');
+  assert.deepEqual([alert?.level, alert?.portfolioId, alert?.account], ['error', 9, W.account]);
+  const window = await run('WindowExceeded(uint256,uint256)');
+  assert.equal(window.error, null, 'not a failure: nothing to back off from');
+  assert.match(window.note!, /^\[STRATEGY_TOPUP_WINDOW\]/);
+  assert.equal(window.lines.filter(l => /WindowExceeded/.test(l) && /等視窗重開/.test(l)).length, 1, 'the reason is logged once');
+  // The next round reads the used-up window itself and does not send at all.
+  const w = world(WS), reader = createV2Reader(w.readerDeps), lines: string[] = [], led = ledger();
+  shortUsdc(w, { enabled: false });
+  w.state.swap.cap = 0n; w.state.swap.windowStart = Math.floor(NOW.getTime() / 1000) - 3600;
+  let sent = 0;
+  assert.equal(await v2AutoRound({ v2: WS, reader, account: W.account, portfolioId: 9, now: NOW, dryRun: false, ledger: led.l, log: l => lines.push(l), send: async () => { sent++; return tx(1); } }), null);
+  assert.equal(sent, 0);
+  assert.ok(lines.some(l => /24-hour top-up window is used up .*it resets at 2026-11-26T02:00:00.000Z/.test(l)), lines.join('\n'));
+});
+
+test('cash swapper, scheduler: loan token a close left in the account is sold by a later round — also after the strategy was turned off; a swap that landed is written to the log', async () => {
+  const w = world(WS), reader = createV2Reader(w.readerDeps), sent: Call[][] = [], lines: string[] = [], led = ledger();
+  // Turned off earlier: no route, no vault, consent off with the recipient kept; 3 USDC from the vault's surplus in the account.
+  w.state.policy = { maxDebt: 0n, rewardRecipient: W.owner, strategyId: 57n, enabled: false };
+  w.setBalance(USDC, W.account, 3n * E18); w.setAllowance(USDC, W.account, SWAPPER, maxUint256);
+  const cashed = { address: SWAPPER, topics: ['0x' + '00'.repeat(32)], data: '0x', logIndex: 0 };
+  void cashed;
+  const args = { v2: WS, reader, account: W.account, portfolioId: 9, now: NOW, dryRun: false, ledger: led.l, log: (l: string) => lines.push(l), send: async (calls: Call[]) => { sent.push(calls); return tx(sent.length); } };
+  assert.match((await v2AutoRound(args))!, /USDC 已換回 USDT tx=0x0+1$/);
+  assert.deepEqual([sent.map(c => c.map(swapFn)), swapArgs(sent[0]![0]!).slice(0, 3)], [[['cashOut']], [USDC, maxUint256, 3n * E18 * 997n / 1_000n]]);
+  // Not approved to the swapper: said once per round, nothing sent. Dust: nothing at all. Never used v2: not even read.
+  sent.length = 0; w.setAllowance(USDC, W.account, SWAPPER, 0n);
+  assert.equal(await v2AutoRound(args), null);
+  assert.ok(lines.some(l => /cannot sell for USDT yet/.test(l)));
+  w.setAllowance(USDC, W.account, SWAPPER, maxUint256); w.setBalance(USDC, W.account, 10n ** 11n);
+  assert.equal(await v2AutoRound(args), null);
+  w.setBalance(USDC, W.account, 3n * E18); w.state.policy.rewardRecipient = '0x0000000000000000000000000000000000000000';
+  const before = w.state.requests;
+  assert.equal(await v2AutoRound(args), null);
+  assert.deepEqual([sent.length, w.state.requests - before], [0, 1]);
+  // A full exit (sell all / delete) sells it too, without holding the sale back.
+  w.state.policy.rewardRecipient = W.owner;
+  assert.equal(await v2UnwindForSale({ ...args, steps: [{ tokenIn: W.NVDA, amountIn: E18 }], exit: true }), null);
+  assert.deepEqual(sent.map(c => c.map(swapFn)), [['cashOut']]);
+  assert.ok(lines.some(l => /剩餘借款幣已換回 USDT/.test(l)));
+  // An ordinary sale does not touch it.
+  sent.length = 0;
+  assert.equal(await v2UnwindForSale({ ...args, steps: [{ tokenIn: W.NVDA, amountIn: E18 }] }), null);
+  assert.equal(sent.length, 0);
+});
+
+test('cash swapper, before a sale (session key): top-up + close + cash-out; with too little free USDT the part it can free; pools are internal to the portfolio', async () => {
+  const run = async (usdt: bigint) => {
+    const w = world(WS), reader = createV2Reader(w.readerDeps), sent: Call[][] = [], led = ledger();
+    shortUsdc(w, { usdt });
+    const note = await v2UnwindForSale({ v2: WS, reader, account: W.account, portfolioId: 9, now: NOW, dryRun: false, ledger: led.l, log: () => {}, steps: [{ tokenIn: W.QQQ, amountIn: E18 }],
+      send: async calls => { sent.push(calls); return tx(sent.length); } });
+    return { note, sent };
+  };
+  const full = await run(100n * E18);
+  assert.deepEqual(full.sent.map(c => c.map(swapFn)), [['topUp', 'executeReduce', 'cashOut']]);
+  assert.match(full.note!, /賣出前已還款取回/);
+  const part = await run(5n * E18);
+  const bought = 5n * E18 * 1_000n / 1_003n;
+  assert.deepEqual([part.sent.map(c => c.map(swapFn)), swapArgs(part.sent[0]![0]!)[1], (argsOf(part.sent[0]![1]!) as readonly unknown[])[3]], [[['topUp', 'executeReduce']], bought, 280n * E18 + bought - 1n]);
+  // My mix flow accounting: USDT paid into / out of the swapper's pool is not a withdrawal or a deposit of the mix.
+  const { mixFlowDirection } = await import('../src/mix-flows.js');
+  const env = process.env.STRATEGY_EARN_V2_DEPLOYMENT;
+  process.env.STRATEGY_EARN_V2_DEPLOYMENT = JSON.stringify({ ...WS, cashSwapper: { address: SWAPPER, pools: { USDC: USDC_POOL } } });
+  try {
+    const m = { account: W.account, owner: W.owner } as never;
+    assert.deepEqual([mixFlowDirection(W.account, USDC_POOL, m), mixFlowDirection(USDC_POOL, W.account, m), mixFlowDirection(W.account, W.owner, m)], [null, null, 'withdrawal']);
+  } finally { if (env === undefined) delete process.env.STRATEGY_EARN_V2_DEPLOYMENT; else process.env.STRATEGY_EARN_V2_DEPLOYMENT = env; }
+});
+
+test('cash swapper, owner API: consent adds the swapper approvals an account lacks; an owner close signs them with its top-up and cash-out; a close it cannot cover is not handed out', async () => {
+  const w = world(WS), reader = createV2Reader(w.readerDeps);
+  const api = createStrategyEarnV2Api({ v2: WS, reader, now: () => NOW, reservedUsdt: async () => w.state.vaultReward });
+  consenting(w);
+  const weights = [{ asset: W.NVDA, weightBps: 10_000 }];
+  // First consent: USDT and USDC to the swapper, then the consent exactly as before.
+  const first = await api.auto(W.account, W.owner, { budgetRaw: 0n, weights, keyReady: true });
+  if (first.status !== 'ready') throw new Error('auto not ready');
+  const approves = (calls: readonly Call[]) => calls.filter(c => c.data.startsWith('0x095ea7b3')).map(c => [c.to, ('0x' + c.data.slice(34, 74)) as Address]);
+  assert.deepEqual(approves(first.calls!).filter(([, spender]) => spender === SWAPPER), [[USDT, SWAPPER], [USDC, SWAPPER]]);
+  assert.deepEqual(first.calls!.slice(0, 2).map(c => c.to), [USDT, USDC]);
+  // Already approved: not asked again.
+  w.setAllowance(USDT, W.account, SWAPPER, maxUint256); w.setAllowance(USDC, W.account, SWAPPER, maxUint256);
+  const again = await api.auto(W.account, W.owner, { budgetRaw: 0n, weights, keyReady: true });
+  assert.deepEqual(approves((again as { calls: Call[] }).calls).filter(([, spender]) => spender === SWAPPER), []);
+  // Owner close of a short USDC route on an account that never approved the swapper: the approvals ride in the exit.
+  const w2 = world(WS), api2 = createStrategyEarnV2Api({ v2: WS, reader: createV2Reader(w2.readerDeps), now: () => NOW, reservedUsdt: async () => w2.state.vaultReward });
+  shortUsdc(w2, { approved: false });
+  const off = await api2.close(W.account, { symbols: ['QQQB'] });
+  if (off.status !== 'ready') throw new Error('close not ready');
+  assert.deepEqual(off.calls.map(c => c.data.startsWith('0x095ea7b3') ? `approve:${c.to}` : swapFn(c)), [`approve:${USDT}`, `approve:${USDC}`, 'topUp', 'executeReduce', 'cashOut', 'setStrategyPolicy']);
+  assert.deepEqual(off.batches.flat().length, off.calls.length);
+  assert.deepEqual(off.batches.at(-1)!.map(swapFn).at(-1), 'setStrategyPolicy');
+  // 100 USDT in the account, all of it held for a running job: nothing to top up with -> unavailable, no calls that would revert.
+  w2.state.vaultReward = 100n * E18;
+  assert.deepEqual(await api2.close(W.account, { symbols: ['QQQB'] }), { status: 'unavailable', reason: 'top_up_unavailable', message: 'Temporarily unavailable.' });
+  // A covered route: no top-up, no USDT approval; the surplus is sold (so only the USDC approval is asked for).
+  w2.state.vaultReward = 0n; w2.state.holdings.set(w2.ids.listaUsdc, { assets: 310n * E18, since: 1 });
+  const covered = await api2.close(W.account, { symbols: ['QQQB'] });
+  if (covered.status !== 'ready') throw new Error('close not ready');
+  assert.deepEqual(covered.calls.map(c => c.data.startsWith('0x095ea7b3') ? `approve:${c.to}` : swapFn(c)), [`approve:${USDC}`, 'executeReduce', 'cashOut', 'setStrategyPolicy']);
 });
 
 test('reads never use the paid RPC: the public node list is the default, replaceable for a fork', () => {

@@ -202,7 +202,8 @@ function validateRenewal(install: Hex, grant: Hex, c: PaymasterConfig, account: 
     // 'yield+borrow' is what GET /renewal-params installs on chain 97 since backend#204 (src/renewal.ts): yield and
     // Strategy Earn calls, argument 0 pinned to this account, current market list.
     toCallPolicy({ policyVersion: CallPolicyVersion.V0_0_4, policyAddress: p.callPolicy, permissions: sessionCallPermissions(c.executor,
-      scope === 'plain' ? undefined : account, scope === 'yield+borrow' ? account : undefined, undefined, v2 === null ? undefined : { executor: v2.executor, account }) }),
+      scope === 'plain' ? undefined : account, scope === 'yield+borrow' ? account : undefined, undefined,
+      v2 === null ? undefined : { executor: v2.executor, account, ...(v2.swapper ? { swapper: v2.swapper } : {}) }) }),
     toGasPolicy({ policyAddress: p.gasPolicy, allowed: SESSION_GAS_ALLOWED_WEI, enforcePaymaster: true, allowedPaymaster: c.address }),
     toTimestampPolicy({ policyAddress: p.timestampPolicy, validAfter, validUntil }),
   ];

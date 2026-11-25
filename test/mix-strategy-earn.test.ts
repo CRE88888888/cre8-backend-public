@@ -230,6 +230,10 @@ test('mix owner calls on routing v2: approval+enroll, then the v2 re-consent (mi
   run([...enrollCalls, ...reconsent({ venues: ['lista'] })]);
   run([...enrollCalls, ...reconsent({ venues: ['venus', 'lista'], newCollaterals: selected })]);
   run([...enrollCalls, ...reconsent({ newCollaterals: [] })]);
+  // Cash swapper (spec §17): approvals of USDT and the other loan tokens to it — and only those — may ride in the tail.
+  const loans = Object.values(v2.loanTokens) as Address[];
+  run([...enrollCalls, ...reconsent({ swapperApprovals: loans })]);
+  run([...enrollCalls, ...reconsent({ venues: ['lista'], newCollaterals: selected, swapperApprovals: [T.contracts.usdt as Address] })]);
   // The v1 tail is judged exactly as before, with or without a v2 deployment for the owner.
   run([...enrollCalls, ...tail]);
   run(enrollCalls);
@@ -249,6 +253,11 @@ test('mix owner calls on routing v2: approval+enroll, then the v2 re-consent (mi
     ['a loan token approved to the v2 executor', [policy, approveTo(T.contracts.usdt, v2.executor)]],
     ['an approval to a stranger next to the policy', [policy, approveTo(aapl.collateral, stranger)]],
     ['a v1 consent call mixed in', [policy, ...consentCalls([{ market: aapl, maxDebtRaw: 1n }])]],
+    ['a portfolio asset approved to the cash swapper', [policy, approveTo(aapl.collateral, v2.swapper!)]],
+    ['the reward token approved to the cash swapper', [policy, approveTo(v2.rewardTokens[0]!, v2.swapper!)]],
+    ['the same loan token approved to the cash swapper twice', [policy, approveTo(T.contracts.usdt, v2.swapper!), approveTo(T.contracts.usdt, v2.swapper!)]],
+    ['cash swapper approvals without the policy', [approveTo(T.contracts.usdt, v2.swapper!)]],
+    ['a top-up in the owner tail', [policy, v2Calls.topUp(v2, loans.find(t => t.toLowerCase() !== T.contracts.usdt.toLowerCase())!, E18, 2_000_000_000n)]],
     ['an executor call (open) in the owner tail', [policy, v2Calls.open(v2, account, ('0x' + 'a1'.repeat(32)) as Hex, ('0x' + 'b1'.repeat(32)) as Hex, E18, E18, 2_000_000_000n)]],
   ];
   for (const [name, calls] of bad) assert.throws(() => run([...enrollCalls, ...calls]), /待確認/, name);

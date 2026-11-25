@@ -19,6 +19,7 @@ import type { RouteEventKind, StrategyEarnV2 } from './strategy-earn-v2.js';
 import { createStrategyEarnV2Api } from './strategy-earn-v2-api.js';
 import type { StrategyEarnV2Api } from './strategy-earn-v2-api.js';
 import { defaultV2Reader, v2EstimateGas } from './strategy-earn-v2-chain.js';
+import { reservedCash } from './withdrawable-cash.js';
 export { STRATEGY_EARN_97, assertNotStrategyVault, isStrategyVault } from './strategy-earn-guard.js';
 
 /**
@@ -381,7 +382,10 @@ export function defaultStrategyEarnV2Api(v2: StrategyEarnV2): StrategyEarnV2Api 
   if (!api) {
     const ledger = routeLedger((sql, params) => dbQuery(sql, params));
     api = createStrategyEarnV2Api({ v2, reader: defaultV2Reader(v2), now: () => new Date(), estimateGas: (account, call) => v2EstimateGas(v2, account, call),
-      recordRoutes: (chainId, events) => ledger.record(chainId, events), recordRewards: (chainId, events) => rewardsStore().record(chainId, events) });
+      recordRoutes: (chainId, events) => ledger.record(chainId, events), recordRewards: (chainId, events) => rewardsStore().record(chainId, events),
+      reservedUsdt: async account => { const rows = (await dbQuery(`select b.reserved_input_raw::text,b.reserved_fee_raw::text,b.withdrawal_raw::text,b.yield_raw::text from strategy_cash_balances b
+        join smart_accounts s on (s.chain_id,s.portfolio_id)=(b.chain_id,b.portfolio_id) where s.chain_id=$1 and s.address=$2 and s.retired_at is null`, [v2.chainId, account.toLowerCase()])).rows as Record<string, unknown>[];
+        return rows.reduce((sum, row) => sum + reservedCash(row), 0n); } });
     defaultV2Apis.set(key, api);
   }
   return api;
@@ -447,7 +451,7 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
   async function v2KeyReady(id: number, account: Address, v2: StrategyEarnV2) {
     const rows = (await deps.query<{ permissions: unknown }>(`select permissions from session_keys where portfolio_id = $1 and status = 'active' and expires_at > now()
       order by (split_part(key_ref, '/', 6))::bigint desc limit 1`, [id])).rows;
-    return rows[0] !== undefined && v2Authorized(rows[0].permissions, account, v2.executor) && sessionPermissionFlagOf(rows[0].permissions) === SESSION_PERMISSION_FLAG;
+    return rows[0] !== undefined && v2Authorized(rows[0].permissions, account, v2.executor, v2.swapper) && sessionPermissionFlagOf(rows[0].permissions) === SESSION_PERMISSION_FLAG;
   }
   const live = async () => { try { const chain = deps.chain(); return { chain, head: await chain.head() }; } catch { return null; } };
   // Where the money sits (public, for "Where your money goes"): the collateral market contract (Venus collateral vToken, or

@@ -138,7 +138,7 @@ export async function buildRenewalKey(args: BuildRenewalKeyArgs): Promise<Renewa
     validUntil,
     // Chain 97 owner renewal installs yield and, since backend#204, the Strategy Earn calls on AtpBorrowExecutor.
     ...(chainId === 97 && args.accountAddress !== undefined ? { yieldAccount: args.accountAddress, borrowAccount: args.accountAddress } : {}),
-    ...(v2 !== null && args.accountAddress !== undefined ? { routingV2: { executor: v2.executor, account: args.accountAddress } } : {}),
+    ...(v2 !== null && args.accountAddress !== undefined ? { routingV2: { executor: v2.executor, account: args.accountAddress, ...(v2.swapper ? { swapper: v2.swapper } : {}) } } : {}),
   });
 
   return {

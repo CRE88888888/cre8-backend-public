@@ -10,9 +10,10 @@ import { runDcaRound } from './dca.js';
 import { STRATEGY_EARN_97 } from './strategy-earn-guard.js';
 import { noteRoundOutcome } from './alerts.js';
 import { runStrategyRewardsRound } from './strategy-rewards.js';
-import { routeLedger, strategyEarnV2, strategyEarnV2For, v2Audience, v2Authorized } from './strategy-earn-v2.js';
+import { routeLedger, strategyEarnV2, strategyEarnV2For, v2Audience, v2InstalledScope } from './strategy-earn-v2.js';
 import type { StrategyEarnV2 } from './strategy-earn-v2.js';
 import { defaultV2Reader } from './strategy-earn-v2-chain.js';
+import { reservedCash } from './withdrawable-cash.js';
 import { runV2KeeperRound, v2AutoRound, v2RewardHolders, v2UnwindForSale } from './strategy-earn-v2-scheduler.js';
 import type { V2Ledger } from './strategy-earn-v2-scheduler.js';
 import { rewardsStore } from './strategy-rewards.js';
@@ -503,7 +504,7 @@ export type SessionKeyRef = {
   /** The permission flag the key was installed with (keys from before SESSION_PERMISSION_FLAG carry the legacy one). */
   permissionFlag?: Hex;
   /** Present only when the owner renewal installed the routing v2 scope (src/strategy-earn-v2.ts). */
-  routingV2?: { executor: Address; account: Address };
+  routingV2?: { executor: Address; account: Address; swapper?: Address };
   keyRef: `m/44'/60'/${string}`;
   permissionId: Hex;
   sessionKeyAddress: Address;
@@ -1151,10 +1152,15 @@ const SQL_ACTIVE_SESSION_KEYS = `
    order by (split_part(k.key_ref, '/', 6))::bigint desc
 `;
 
-/** A key's routing v2 grant as installed, when a v2 deployment is configured for this chain and the key carries its whole scope. */
+/**
+ * A key's routing v2 grant exactly as installed (executor, and the cash swapper when the key has it), read off the key's
+ * own snapshot: a key installed for an earlier v2 deployment must still rebuild to its own permissionId after the
+ * manifest moved on. Whether the grant is for TODAY's deployment is the sender's check (`v2Args`).
+ */
 function routingV2Of(permissions: unknown, account: Address, chainId: number): Pick<SessionKeyRef, 'routingV2'> {
-  const v2 = strategyEarnV2(chainId);
-  return v2 !== null && v2Authorized(permissions, account, v2.executor) ? { routingV2: { executor: v2.executor, account } } : {};
+  if (strategyEarnV2(chainId) === null) return {};
+  const scope = v2InstalledScope(permissions, account);
+  return scope === null ? {} : { routingV2: scope };
 }
 
 /** A key's #204 borrow grant as installed: account plus the exact market list, so the policy rebuilds to the same id. */
@@ -1665,10 +1671,15 @@ function defaultStrategyEarnSteps(deps: ResolvedDeps): NonNullable<SchedulerDeps
   const v2Of = async (due: DuePortfolio): Promise<StrategyEarnV2 | null> => strategyEarnV2For(deps.chainId, await accountOwner(deps.query, deps.chainId, due.account));
   const v2Args = async (v2: StrategyEarnV2, due: DuePortfolio, dryRun: boolean, held?: readonly string[]) => {
     const key = dryRun ? null : await resolved(due);
-    // Only a key whose installed policy carries the whole routing v2 scope for this account and this executor.
-    const usable = key !== null && key.routingV2 !== undefined && isAddressEqual(key.routingV2.executor, v2.executor) ? key : null;
+    // Only a key whose installed policy carries the whole routing v2 scope for this account, this executor and (when the
+    // deployment has one) this cash swapper. A key from before the swapper, or for an earlier executor, waits for a renewal.
+    const usable = key !== null && key.routingV2 !== undefined && isAddressEqual(key.routingV2.executor, v2.executor) &&
+      (!v2.swapper || (key.routingV2.swapper !== undefined && isAddressEqual(key.routingV2.swapper, v2.swapper))) ? key : null;
     return { v2, reader: defaultV2Reader(v2), account: due.account, portfolioId: due.portfolioId, now: deps.clock(), dryRun, ...(held === undefined ? {} : { held }),
-      send: usable === null ? null : (calls: StrategyEarnCall[]) => sendStrategyEarnWithSessionKey(due.account, usable, calls, v2.executor), ledger: v2SchedulerLedger(deps.query), log: deps.log };
+      // A top-up (cash swapper) spends only free cash: never what a running buy job or a reservation holds.
+      reservedUsdt: async () => { const rows = (await deps.query('select reserved_input_raw::text,reserved_fee_raw::text,withdrawal_raw::text,yield_raw::text from strategy_cash_balances where chain_id = $1 and portfolio_id = $2',
+        [deps.chainId, due.portfolioId])).rows as Record<string, unknown>[]; return rows.reduce((sum, row) => sum + reservedCash(row), 0n); },
+      send: usable === null ? null : (calls: StrategyEarnCall[]) => sendStrategyEarnWithSessionKey(due.account, usable, calls, v2.swapper ? [v2.executor, v2.swapper] : [v2.executor]), ledger: v2SchedulerLedger(deps.query), log: deps.log };
   };
   const both = (notes: (string | null)[]) => { const said = notes.filter((n): n is string => n !== null); return said.length === 0 ? null : said.join('；'); };
   return {
@@ -1727,11 +1738,11 @@ const strategyEarnSteps = (deps: ResolvedDeps) => deps.strategyEarn ?? defaultSt
 
 /**
  * One sponsored session-key UserOp of AtpBorrowExecutor calls (the CallPolicy only allows those, pinned to this account).
- * `target`: the one contract every call must go to — the v1 AtpBorrowExecutor, or the routing v2 executor.
+ * `targets`: the contracts a call may go to — the v1 AtpBorrowExecutor, or the routing v2 executor and its cash swapper.
  */
-async function sendStrategyEarnWithSessionKey(accountAddress: Address, sessionKey: SessionKeyRef, calls: StrategyEarnCall[], target: Address = STRATEGY_EARN_97.executor): Promise<StrategyEarnTx> {
+async function sendStrategyEarnWithSessionKey(accountAddress: Address, sessionKey: SessionKeyRef, calls: StrategyEarnCall[], targets: readonly Address[] = [STRATEGY_EARN_97.executor as Address]): Promise<StrategyEarnTx> {
   const publicClient = defaultPublicClient();
-  if (calls.length === 0 || calls.some(c => !isAddressEqual(c.to, target))) throw new Error('strategy earn session calls must target the strategy executor only');
+  if (calls.length === 0 || calls.some(c => !targets.some(t => isAddressEqual(c.to, t)))) throw new Error('strategy earn session calls must target the strategy executor only');
   const account = await sessionKernelAccount({ account: accountAddress, sessionKey, executor: executorAddress() }, publicClient);
   const paymaster = schedulerPaymaster(accountAddress);
   if (!paymaster) throw new Error('chain 97 strategy earn needs the paymaster');

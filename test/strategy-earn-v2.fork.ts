@@ -1,6 +1,6 @@
 /** Routing v2 fork acceptance (opt-in, not in CI): FORK_RPC_URL=http://127.0.0.1:<port> bun test ./test/strategy-earn-v2.fork.ts --timeout=600000
- * Needs a local anvil fork of chain 97 taken after the v2 deployment (block 144628034). Impersonation only; never touches a public chain.
- * Account: cre8-contracts RoutingDemoAccount (enrolled in AtpRegistry, holds NVDAB, nothing on v1). Every call is sent from
+ * Needs a local anvil fork of chain 97 taken after the draft6 v2 deployment and its cash swapper (block 144712650). Impersonation only; never touches a public chain.
+ * Account: cre8-contracts RoutingDemoAccount of the draft6 set (enrolled in AtpRegistry, holds NVDAB, nothing on v1, every demo position closed). Every call is sent from
  * the account itself: exactly the calldata the owner's UserOp / the scheduler's session-key UserOp carries. Reads go through
  * the same reader the services use (AtpBorrowLensV2 + Multicall3), pointed at the fork.
  */
@@ -14,15 +14,14 @@ import { createV2Reader, v2Multicall } from '../src/strategy-earn-v2-chain.js';
 import { fromTestnetMocks, reportCalldata, reportDue, runRateReport } from '../src/strategy-earn-v2-rates.js';
 import { runV2KeeperRound, v2AutoRound, v2UnwindForSale } from '../src/strategy-earn-v2-scheduler.js';
 import type { V2Ledger, V2Tx } from '../src/strategy-earn-v2-scheduler.js';
-import { loanTokenNeeds } from '../src/strategy-earn-v2-swap.js';
-import { strategyEarnV2, v2Calls, v2RescueCall, v2SessionPermissions, V2_EXECUTOR_ABI, V2_REGISTRY_ABI } from '../src/strategy-earn-v2.js';
+import { strategyEarnV2, v2Calls, v2RescueCall, v2SessionPermissions, v2SwapEvents, V2_CASH_OUT_MIN_RAW, V2_EXECUTOR_ABI, V2_REGISTRY_ABI, V2_SWAPPER_ABI, V2_SWAPPER_SELECTORS } from '../src/strategy-earn-v2.js';
 import type { Call, RouteEvent } from '../src/strategy-earn-v2.js';
 import { readStrategyEarnV2Collateral } from '../src/snapshot.js';
 import type { RewardEvent } from '../src/strategy-rewards.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
 
 const rpc = process.env.FORK_RPC_URL;
-const A = '0x65c3251f4854a53cc01c2386a44ec372f292c37c' as Address; // RoutingDemoAccount
+const A = '0xd641d5aa6c479288e9c02f4862303c1070ed3fb1' as Address; // RoutingDemoAccount (draft6 set)
 const OWNER = '0x09bbb9a06a0c49ad24bddb18808944041783054e' as Address; // AtpRegistry owner (lines, rates) and the demo account's reward recipient
 const OPERATOR = '0xd8ce3295e05ca138e0d0d7214c4fd630c43f9d7f' as Address; // registry.rateReporter
 const KEEPER = '0x4a07cdac26afdc89eb47d653a95b8abf6b1f4b0a' as Address;
@@ -69,7 +68,9 @@ function setup() {
   const now = async () => { clock = Number((await client.getBlock()).timestamp) * 1000; return new Date(clock); };
   return { v2, client, local, reader, from, sender, ledger, routes, rewards, now, clock: () => new Date(clock) };
 }
-const names = (calls: readonly Call[], v2: { executor: Address }) => calls.map(c => c.to === v2.executor ? decodeFunctionData({ abi: V2_EXECUTOR_ABI, data: c.data }).functionName : c.to);
+const names = (calls: readonly Call[], v2: { executor: Address; swapper?: Address | null }) => calls.map(c => c.to === v2.executor ? decodeFunctionData({ abi: V2_EXECUTOR_ABI, data: c.data }).functionName
+  : c.to === v2.swapper ? decodeFunctionData({ abi: V2_SWAPPER_ABI, data: c.data }).functionName : c.data.startsWith('0x095ea7b3') ? 'approve' : c.to);
+const ERC20 = parseAbi(['function balanceOf(address) view returns (uint256)', 'function allowance(address,address) view returns (uint256)', 'function transfer(address,uint256) returns (bool)', 'function mint(address to, uint256 amount)']);
 
 test('routing v2 fork: consent -> open on the best route -> hold -> vault left on a 0% vault is switched back -> rewards box -> account -> rate report -> deleverage at the health line -> repay before a sale -> full exit', { skip }, async () => {
   const s = setup(), { v2, reader, client } = s;
@@ -181,9 +182,10 @@ test('routing v2 fork: consent -> open on the best route -> hold -> vault left o
   assert.equal(read.routes.filter(r => r.collateralRaw > 0n || r.routeDebtRaw > 0n).length, 0);
   assert.equal(read.state.holdings.find(h => h.collateral === NVDAB)!.freeCollateralRaw, held.freeCollateralRaw, 'every share is back in the account');
   assert.equal(s.routes.at(-1)!.kind, 'close');
-  // The surplus interest came back in the loan token (USD1): not the portfolio's cash token, so it is a swap need.
-  const needs = loanTokenNeeds(read, v2.loanTokens.USDT!);
-  assert.ok(needs.some(n => n.symbol === 'USD1' && n.kind === 'dust') && needs.every(n => n.kind === 'dust' && n.symbol !== 'USDT'), JSON.stringify(needs.map(n => [n.symbol, n.kind])));
+  // The surplus interest came back in the loan token (USD1) and was sold for USDT in the same UserOp (cash swapper): the
+  // account is left with no USD1 worth selling.
+  assert.ok(read.tokens.USD1!.cashRaw < V2_CASH_OUT_MIN_RAW, `USD1 left in the account: ${read.tokens.USD1!.cashRaw}`);
+  assert.ok(lines.some(l => /"msg":"strategy_cash_swap".*"kind":"cash_out"/.test(l)), 'the cash-out is in the log');
 
   mark('exit');
   // 9. Consent is still on: the next quiet round opens again. Then the owner turns everything off as a full exit:
@@ -194,7 +196,9 @@ test('routing v2 fork: consent -> open on the best route -> hold -> vault left o
   await s.now();
   const off = await api.close(A, { symbols: ['NVDAB'], exit: true });
   assert.equal(off.status, 'ready');
-  assert.deepEqual(names(off.calls, v2), ['executeReduce', 'executeSweepRewards', v2.registry]);
+  if (off.status !== 'ready') throw new Error('close not ready');
+  // Reopened seconds ago: the vault holds the debt and no certain surplus yet -> the plain close (a leftover, if any, is the next round's).
+  assert.deepEqual(names(off.calls, v2).filter(n => n !== 'topUp' && n !== 'cashOut'), ['executeReduce', 'executeSweepRewards', v2.registry]);
   for (const batch of off.batches) { const tx = await send(batch); await api.confirm(1, A, OWNER, tx); }
   read = await reader.account(A, [NVDAB]);
   assert.deepEqual([read.routes.filter(r => r.collateralRaw > 0n).length, read.consent, read.rewards[0]!.accountRaw, read.rewards[0]!.boxRaw], [0, false, 0n, 0n]);
@@ -264,7 +268,7 @@ test('routing v2 fork: the deployed CallPolicy (0.0.4) enforces the v2 session s
   const w = await s.from(wallet);
   // The whole scope a canary account's renewal installs: plain + yield + v1 borrow + routing v2.
   const policy = toCallPolicy({ policyAddress: T.contracts.callPolicy as Address, policyVersion: CallPolicyVersion.V0_0_4,
-    permissions: sessionCallPermissions(T.contracts.executor as Address, wallet, wallet, undefined, { executor: v2.executor, account: wallet }) });
+    permissions: sessionCallPermissions(T.contracts.executor as Address, wallet, wallet, undefined, { executor: v2.executor, account: wallet, swapper: v2.swapper! }) });
   const id = pad(`0x${Date.now().toString(16).slice(-8).padStart(8, '0')}`, { size: 32, dir: 'right' });
   const abi = parseAbi(['function onInstall(bytes data) payable',
     'struct PackedUserOperation { address sender; uint256 nonce; bytes initCode; bytes callData; bytes32 accountGasLimits; uint256 preVerificationGas; bytes32 gasFees; bytes paymasterAndData; bytes signature; }',
@@ -303,4 +307,139 @@ test('routing v2 fork: the deployed CallPolicy (0.0.4) enforces the v2 session s
   assert.equal(await check([{ ...v2Calls.open(v2, wallet, R, V, 1n, 1n, D), to: T.contracts.executor as Address }]), 'denied', 'v2 selector on AtpExecutor');
   assert.equal(await check([{ ...v2Calls.open(v2, wallet, R, V, 1n, 1n, D), to: v2.registry }]), 'denied', 'v2 selector on the registry');
   assert.ok(!v2SessionPermissions(v2.executor, wallet).some(p => p.selector === toFunctionSelector('executeRescue(address,bytes32,uint256)')));
+  // Cash swapper (spec §17): exactly topUp and cashOut on the swapper; its owner functions, any other selector, the same
+  // selectors on another contract, and approvals to it are refused.
+  const usdc = v2.loanTokens.USDC!, swapper = v2.swapper!;
+  assert.deepEqual(v2SessionPermissions(v2.executor, wallet, swapper).slice(6).map(p => [p.target, p.selector]), V2_SWAPPER_SELECTORS.map(sel => [swapper, sel]));
+  assert.equal(await check([v2Calls.topUp(v2, usdc, 1n, D)]), 'ok', 'topUp');
+  assert.equal(await check([v2Calls.cashOut(v2, usdc, maxUint256, 0n, D)]), 'ok', 'cashOut');
+  assert.equal(await check([v2Calls.topUp(v2, usdc, 1n, D), v2Calls.close(v2, wallet, R, V, 0n, D), v2Calls.cashOut(v2, usdc, maxUint256, 0n, D)]), 'ok', 'top-up + close + cash-out in one UserOp');
+  assert.equal(await check([v2Calls.topUp(v2, usdc, 1n, D), v2Calls.migrate(v2, wallet, { routeId: R, vaultId: V }, { routeId: V, vaultId: R }, 1n, 0n, D)]), 'ok', 'top-up + migrate');
+  const owned = parseAbi(['function setPool(address token, address pool)', 'function setLimits(uint16 maxPegBps, uint16 bufferBps)', 'function shortfall(address account, address token)']);
+  assert.equal(await check([{ to: swapper, data: encodeFunctionData({ abi: owned, functionName: 'setPool', args: [usdc, other] }) }]), 'denied', 'setPool');
+  assert.equal(await check([{ to: swapper, data: encodeFunctionData({ abi: owned, functionName: 'setLimits', args: [100, 500] }) }]), 'denied', 'setLimits');
+  assert.equal(await check([{ to: swapper, data: encodeFunctionData({ abi: owned, functionName: 'shortfall', args: [wallet, usdc] }) }]), 'denied', 'shortfall as a transaction');
+  assert.equal(await check([v2Calls.topUp(v2, usdc, 1n, D), { to: swapper, data: encodeFunctionData({ abi: owned, functionName: 'setPool', args: [usdc, other] }) }]), 'denied', 'setPool after an allowed call');
+  assert.equal(await check([{ ...v2Calls.topUp(v2, usdc, 1n, D), to: v2.registry }]), 'denied', 'topUp selector on the registry');
+  assert.equal(await check([{ ...v2Calls.cashOut(v2, usdc, 1n, 0n, D), to: T.contracts.executor as Address }]), 'denied', 'cashOut selector on AtpExecutor');
+  assert.equal(await check([{ to: v2.loanTokens.USDT!, data: encodeFunctionData({ abi: parseAbi(['function approve(address,uint256)']), functionName: 'approve', args: [swapper, maxUint256] }) }]), 'denied', 'approve to the swapper');
+  // A key installed before the swapper (executor scope only) cannot reach it at all.
+  const oldPolicy = toCallPolicy({ policyAddress: T.contracts.callPolicy as Address, policyVersion: CallPolicyVersion.V0_0_4,
+    permissions: sessionCallPermissions(T.contracts.executor as Address, wallet, wallet, undefined, { executor: v2.executor, account: wallet }) });
+  const oldId = pad(`0x${(Date.now() + 1).toString(16).slice(-8).padStart(8, '0')}`, { size: 32, dir: 'right' });
+  assert.equal((await mined(client, await w.writeContract({ address: T.contracts.callPolicy as Address, abi, functionName: 'onInstall', args: [concatHex([oldId, oldPolicy.getPolicyData()])], gas: 6_000_000n }))).status, 'success');
+  const checkOld = async (call: { to: Address; data: Hex }) => {
+    const callData = await encodeCallDataEpV07([{ to: call.to, data: call.data, value: 0n }]);
+    try { const { result } = await client.simulateContract({ account: wallet, address: T.contracts.callPolicy as Address, abi, functionName: 'checkUserOpPolicy',
+      args: [oldId, { sender: wallet, nonce: 0n, initCode: '0x', callData, accountGasLimits: pad('0x', { size: 32 }), preVerificationGas: 0n, gasFees: pad('0x', { size: 32 }), paymasterAndData: '0x', signature: '0x' }] }); return result === 0n ? 'ok' : 'denied'; } catch { return 'denied'; }
+  };
+  assert.deepEqual([await checkOld(v2Calls.topUp(v2, usdc, 1n, D)), await checkOld(v2Calls.open(v2, wallet, R, V, 1n, 1n, D))], ['denied', 'ok']);
+});
+
+test('routing v2 fork, cash swapper: a USD1 route whose vault earned less than the loan cost cannot be closed; topUp from the account\'s USDT -> close -> cashOut leaves the account with USDT only; the 24-hour window stops a second lap', { skip }, async () => {
+  const s = setup(), { v2, reader, client } = s;
+  const send = s.sender(A), lines: string[] = [];
+  const api = createStrategyEarnV2Api({ v2, reader, now: s.clock });
+  const step = async (o: object = {}) => ({ v2, reader, account: A, portfolioId: 1, now: await s.now(), dryRun: false, send, ledger: s.ledger, log: (l: string) => lines.push(l), held: [NVDAB], ...o });
+  const deadline = async () => BigInt(Math.floor((await s.now()).getTime() / 1000) + 600);
+  const USDT = v2.loanTokens.USDT!, USD1 = v2.loanTokens.USD1!, swapper = v2.swapper!;
+  const bal = (token: Address, who: Address = A) => client.readContract({ address: token, abi: ERC20, functionName: 'balanceOf', args: [who] });
+  assert.equal((await client.readContract({ address: swapper, abi: V2_SWAPPER_ABI, functionName: 'executor' })).toLowerCase(), v2.executor);
+
+  // Start with no loan token other than USDT in the account (the deployment drill left some USD1 behind): what this test
+  // ends with is then only what the flow itself leaves.
+  for (const token of [v2.loanTokens.USDC!, USD1, v2.loanTokens.U!]) {
+    const left = await bal(token);
+    if (left > 0n) { const w = await s.from(A); await mined(client, await w.writeContract({ address: token, abi: ERC20, functionName: 'transfer', args: [OWNER, left], gas: 200_000n })); }
+  }
+  mark('swapper: consent');
+  // 1. Consent: besides the usual calls, USDT and USDC / USD1 / U are approved to the swapper (the account never did).
+  const auto = await api.auto(A, OWNER, { budgetRaw: 0n, weights: [{ asset: NVDAB, weightBps: 10_000 }], keyReady: true });
+  if (auto.status !== 'ready') throw new Error('consent unavailable');
+  assert.equal(names(auto.calls!, v2).filter(n => n === 'approve').length >= 4, true);
+  await send(auto.calls!);
+  let read = await reader.account(A, [NVDAB]);
+  assert.ok(Object.values(read.swapperAllowances).every(x => x === maxUint256) && Object.keys(read.swapperAllowances).length === 4, JSON.stringify(read.swapperAllowances, (_k, v) => typeof v === 'bigint' ? v.toString() : v));
+  // A second consent asks for none of them again.
+  const again = await api.auto(A, OWNER, { budgetRaw: 0n, weights: [{ asset: NVDAB, weightBps: 10_000 }], keyReady: true });
+  if (again.status !== 'ready') throw new Error('consent unavailable');
+  assert.ok(!again.calls!.some(c => c.data.startsWith('0x095ea7b3') && c.data.toLowerCase().includes(swapper.slice(2))), 'no swapper approval is repeated');
+
+  mark('swapper: open, then the vault pays nothing for 60 days');
+  // 2. Open on today's best route (Lista NVDAB/USD1, session key), then the money sits in Venus vUSD1 at 0% while the loan costs 1.8%.
+  const gas = { open: { estimate: 0n, used: 0n } };
+  const m = await reader.market();
+  assert.match(await v2AutoRound(await step({ send: async (calls: Call[]) => {
+    // Gas: what a plain eth_estimateGas says for this executeOpen against what it uses (the sender doubles the bundler's estimate).
+    gas.open.estimate = await client.estimateGas({ account: A, to: calls[0]!.to, data: calls[0]!.data });
+    const wallet = await s.from(A), hash = await wallet.sendTransaction({ to: calls[0]!.to, data: calls[0]!.data, gas: gas.open.estimate * 2n });
+    const r = await mined(client, hash);
+    if (r.status !== 'success') throw new Error('executeOpen ran out of gas at twice the estimate');
+    gas.open.used = (r as unknown as { gasUsed: bigint }).gasUsed;
+    return { hash, blockNumber: r.blockNumber, logs: r.logs };
+  } })) ?? '', /NVDAB open\(best_route\)/);
+  read = await reader.account(A, [NVDAB]);
+  const pos = read.routes[0]!;
+  assert.deepEqual([pos.route.venue, pos.route.loanSymbol], ['lista', 'USD1']);
+  const venusVault = m.vaults.find(v => v.venue === 'venus' && v.tokenSymbol === 'USD1')!;
+  await send([v2Calls.switchVault(v2, A, pos.vault!.vaultId, venusVault.vaultId, maxUint256, await deadline())]);
+  await s.local.increaseTime({ seconds: 60 * 86_400 }); await s.local.mine({ blocks: 1 });
+  await s.now();
+  read = await reader.account(A, [NVDAB]);
+  const q = read.tokens.USD1!.swap!;
+  // The swapper's own numbers: a gap (debt above the box), a cap = (debt − idle) × 1.01, no window open (one opened by an
+  // earlier test on the same fork is 60 days stale); the route cannot be closed.
+  assert.ok(q.gapRaw !== null && q.gapRaw > 0n && q.capRaw > q.gapRaw && q.windowEndsAt * 1000 < s.clock().getTime(), JSON.stringify(q, (_k, v) => typeof v === 'bigint' ? v.toString() : v));
+  assert.ok(read.tokens.USD1!.debtRaw > read.vaults.reduce((sum, v) => sum + v.assetsRaw, 0n), 'the vault holds less than the debt');
+  await assert.rejects(send([v2Calls.close(v2, A, pos.route.routeId, venusVault.vaultId, 0n, await deadline())]), /reverted/, 'VaultShortfall without a top-up');
+
+  mark('swapper: no USDT -> the sale frees what the box can repay');
+  // 3. Before a sale with no USDT in the account: nothing to top up with -> repay what the box holds, take back that share (as before the swapper).
+  const usdt0 = await bal(USDT);
+  if (usdt0 > 0n) { const w = await s.from(A); await mined(client, await w.writeContract({ address: USDT, abi: ERC20, functionName: 'transfer', args: [OWNER, usdt0], gas: 200_000n })); }
+  const dry = await v2UnwindForSale({ ...await step({ dryRun: true }), steps: [{ tokenIn: NVDAB, amountIn: pos.collateralRaw }] });
+  assert.match(dry ?? '', /short of USD1/);
+
+  mark('swapper: USDT in the account -> topUp + close + cashOut');
+  // 4. With USDT in the account (10 USDT: a little cash, far more than the gap): one "UserOp" tops up, closes and sells the leftover.
+  const funder = await s.from(OWNER);
+  try { await mined(client, await funder.writeContract({ address: USDT, abi: ERC20, functionName: 'mint', args: [A, 10n * 10n ** 18n], gas: 300_000n })); } catch { /* not mintable by this owner: fall through to a transfer */ }
+  if (await bal(USDT) === 0n) { const holder = await s.from(v2.swapperPools![0]!); await mined(client, await holder.writeContract({ address: USDT, abi: ERC20, functionName: 'transfer', args: [A, 10n * 10n ** 18n], gas: 300_000n })); }
+  const usdtBefore = await bal(USDT), collateralBefore = await bal(NVDAB);
+  assert.equal(usdtBefore, 10n * 10n ** 18n);
+  const sentCalls: Call[][] = [];
+  const txs: V2Tx[] = [];
+  const selling = await v2UnwindForSale({ ...await step({ send: async (calls: Call[]) => { sentCalls.push(calls); const tx = await send(calls); txs.push(tx); return tx; } }), steps: [{ tokenIn: NVDAB, amountIn: pos.collateralRaw }] });
+  assert.match(selling ?? '', /賣出前已還款取回：NVDAB top up \d+ USD1 from USDT, repay \d+ USD1, take back, sell the USD1 left/);
+  assert.deepEqual(sentCalls.map(c => names(c, v2)), [['topUp', 'executeReduce', 'cashOut']]);
+  read = await reader.account(A, [NVDAB]);
+  const swaps = txs.flatMap(tx => v2SwapEvents(v2, tx, A));
+  assert.deepEqual(swaps.map(e => [e.kind, e.token]), [['top_up', USD1], ['cash_out', USD1]]);
+  const [topped, cashed] = swaps as [typeof swaps[number], typeof swaps[number]];
+  // Bought what was planned (the gap + buffer), paid within 0.3% of 1:1; sold everything left, got within 0.3% of 1:1.
+  assert.ok(topped.tokenRaw > q.gapRaw! && topped.tokenRaw < q.capRaw && topped.usdtRaw <= topped.tokenRaw * 1_003n / 1_000n + 1n, `${topped.tokenRaw} for ${topped.usdtRaw}`);
+  assert.ok(cashed.usdtRaw >= cashed.tokenRaw * 997n / 1_000n, `${cashed.tokenRaw} for ${cashed.usdtRaw}`);
+  // The route is closed, every share is back, the box is empty, and the account holds USDT only: no USD1, USDC or U.
+  assert.deepEqual([read.routes.filter(r => r.collateralRaw > 0n || r.routeDebtRaw > 0n).length, read.tokens.USD1!.debtRaw, read.tokens.USD1!.idleRaw, await bal(NVDAB) - collateralBefore], [0, 0n, 0n, pos.collateralRaw]);
+  assert.deepEqual([await bal(USD1), await bal(v2.loanTokens.USDC!), await bal(v2.loanTokens.U!)], [0n, 0n, 0n]);
+  const usdtAfter = await bal(USDT);
+  // What the round trip cost in USDT is the gap itself plus the swap fees on the buffer: well under 1% of the debt.
+  assert.equal(usdtAfter, usdtBefore - topped.usdtRaw + cashed.usdtRaw);
+  assert.ok(usdtBefore - usdtAfter < read.state.principalUsdRaw + pos.routeDebtRaw / 50n, `cost ${usdtBefore - usdtAfter}`);
+  assert.ok(lines.filter(l => /"msg":"strategy_cash_swap"/.test(l)).length === 2, 'both swaps are in the log');
+  assert.deepEqual(s.routes.at(-1)!.kind, 'close');
+
+  mark('swapper: the window');
+  // 5. The 24-hour window of USD1 is open now and carries what was bought.
+  const [start, bought] = await client.readContract({ address: swapper, abi: V2_SWAPPER_ABI, functionName: 'topUpWindowOf', args: [A, USD1] });
+  assert.ok(start > 0n && bought === topped.tokenRaw);
+  // A top-up with nothing owed is refused by the contract (NoShortfall / no debt): a leaked key cannot park USDT in the box.
+  await assert.rejects(send([v2Calls.topUp(v2, USD1, 10n ** 18n, await deadline())]), /reverted/);
+  // Leftover follow-up: nothing is left to sell, so the next round does nothing at all.
+  assert.deepEqual((await reader.leftovers(A)).map(l => [l.symbol, l.cashRaw]), [['USDC', 0n], ['USD1', 0n], ['U', 0n]]);
+  // Turn the strategy off (owner) so the account ends clean.
+  const off = await api.close(A, { symbols: [] });
+  if (off.status === 'ready' && off.calls.length > 0) for (const batch of off.batches) await send(batch);
+  console.log(JSON.stringify({ gap: q.gapRaw!.toString(), cap: q.capRaw.toString(), toppedUp: topped.tokenRaw.toString(), usdtIn: topped.usdtRaw.toString(), cashedOut: cashed.tokenRaw.toString(), usdtOut: cashed.usdtRaw.toString(),
+    openGas: { estimate: gas.open.estimate.toString(), used: gas.open.used.toString() } }));
 });

@@ -18,6 +18,9 @@ export const W = {
   QQQ: A(0x71), NVDA: A(0x72), vNVDA: A(0x82), vUSDT: A(0xb2), vUSDC: A(0xb4), listaUsdcVault: A(0xb1), aavePool: A(0xb3), aUSDT: A(0xb5),
   listaQqqUsdc: ('0x' + '1a'.repeat(32)) as Hex, listaNvdaUsdt: ('0x' + '2b'.repeat(32)) as Hex,
 };
+/** The same deployment with a cash swapper (AtpBorrowCashSwapper, spec §17) and its USDC pool: `world(WS)`. */
+export const SWAPPER = A(0xe8), USDC_POOL = A(0xe9);
+export const WS: StrategyEarnV2 = { ...W.v2, swapper: SWAPPER, swapperPools: [USDC_POOL] };
 export type RouteRow = { venue: 1 | 2; collateral: Address; loan: Address; listaId: Hex; collateralVToken: Address; loanVToken: Address; enabled: boolean; retired: boolean;
   status: { open: boolean; borrowBps: number; collateralBps?: number; borrowIncentiveBps?: number; collateralIncentiveBps?: number; liquidity: bigint; capLeft: bigint; targetBps: number; deleverageBps: number; liquidationBps: number };
   minLoan?: bigint; minDebt?: bigint };
@@ -27,7 +30,7 @@ export type Position = { collateral: bigint; collateralValue: bigint; debt: bigi
 const ZERO32 = ('0x' + '00'.repeat(32)) as Hex;
 const rate = (bps: number) => BigInt(bps) * 10n ** 14n;
 
-export function world() {
+export function world(deployment: StrategyEarnV2 = W.v2) {
   const route = (venue: 1 | 2, collateral: Address, loan: Address, listaId: Hex, borrowBps: number, o: Partial<RouteRow> = {}): RouteRow => ({ venue, collateral, loan, listaId, collateralVToken: venue === 1 ? W.vNVDA : A(0), loanVToken: venue === 1 ? (loan === W.v2.loanTokens.USDT ? W.vUSDT : W.vUSDC) : A(0),
     enabled: true, retired: false, status: { open: true, borrowBps, liquidity: 1_000_000n * E18, capLeft: 100_000n * E18, targetBps: 3000, deleverageBps: 4000, liquidationBps: 6000 }, ...o });
   const vault = (kind: 1 | 2 | 3, token: Address, target: Address, receipt: Address, supplyBps: number, o: Partial<VaultRow> = {}): VaultRow => ({ kind, token, target, receipt, enabled: true, retired: false,
@@ -55,6 +58,8 @@ export function world() {
     vaultReward: 0n, calls: 0, requests: 0,
     /** Has the account delegated borrowing to the v2 executor on each venue (Venus approvedDelegates / Moolah isAuthorized)? */
     delegated: { venus: false, lista: false },
+    /** Cash swapper: `unreadable` makes `shortfall` revert (a vault cannot be read); `cap` overrides `topUpCap`; `windowStart` is the open window. */
+    swap: { unreadable: false, cap: null as bigint | null, windowStart: 0 },
   };
   const bal = (token: Address, who: Address) => state.balances.get(`${token}:${who}`.toLowerCase()) ?? 0n;
   const routeIds = () => [...routes.keys()], vaultIds = () => [...vaults.keys()];
@@ -90,6 +95,17 @@ export function world() {
       if (fn === 'tokenDebt') { const ps = [...state.positions.entries()].map(([id, p]) => ({ r: routes.get(id)!, p })).filter(x => x.r.loan === args[1]);
         return (ps.find(x => x.r.venue === 1)?.p.debt ?? 0n) + ps.filter(x => x.r.venue === 2).reduce((s, x) => s + x.p.debt, 0n); }
     }
+    if (deployment.swapper && t === deployment.swapper) {
+      const token = (fn === 'poolOf' ? args[0] : args[1]) as Address, usdc = v2.loanTokens.USDC!;
+      if (fn === 'poolOf') return token === usdc ? USDC_POOL : A(0);
+      const debt = answer(v2.lens, 'tokenDebt', [args[0], token]) as bigint, idle = state.idle.get(token) ?? 0n;
+      const inVaults = [...state.holdings.entries()].filter(([id]) => vaults.get(id)!.token === token).reduce((sum, [, h]) => sum + h.assets, 0n);
+      const cap = state.swap.cap ?? (debt > idle ? (debt - idle) * 10_100n / 10_000n : 0n);
+      if (fn === 'topUpCap') return cap;
+      if (fn === 'shortfall') return state.swap.unreadable ? null : [debt > idle + inVaults ? debt - idle - inVaults : 0n, cap];
+      if (fn === 'topUpWindowOf') return [BigInt(state.swap.windowStart), 0n, 0n];
+      return null;
+    }
     if (t === v2.executor && fn === 'boxOf') return W.box;
     if (t === W.atpRegistry && fn === 'enrollments') return state.enrollment;
     if (t === W.oracle && fn === 'peek') return state.prices.get(args[0] as Address) ?? null;
@@ -108,7 +124,7 @@ export function world() {
     if (fn === 'maxDeposit') return [...vaults.values()].find(v => v.target === target)?.maxDeposit ?? null;
     if (fn === 'rewardOf') return state.vaultReward;
     if (fn === 'balanceOf') { const aave = [...vaults.values()].find(v => v.kind === 3 && v.token === target && v.receipt === args[0]); return aave ? aave.cash ?? 0n : bal(target, args[0] as Address); }
-    if (fn === 'allowance') return state.allowances.get(`${target}:${String(args[0])}`.toLowerCase()) ?? 0n;
+    if (fn === 'allowance') return state.allowances.get(`${target}:${String(args[0])}:${String(args[1])}`.toLowerCase()) ?? state.allowances.get(`${target}:${String(args[0])}`.toLowerCase()) ?? 0n;
     if (fn === 'decimals') return 18;
     if (fn === 'symbol') return target === W.QQQ ? 'QQQB' : target === W.NVDA ? 'NVDAB' : 'TKN';
     return null;
@@ -117,6 +133,8 @@ export function world() {
   const ids = { qqqListaUsdc: routeIdOf('lista', W.QQQ, USDC, W.listaQqqUsdc), nvdaVenusUsdt: routeIdOf('venus', W.NVDA, USDT, null), nvdaVenusUsdc: routeIdOf('venus', W.NVDA, USDC, null), nvdaListaUsdt: routeIdOf('lista', W.NVDA, USDT, W.listaNvdaUsdt),
     listaUsdc: vaultIdOf('lista', USDC, W.listaUsdcVault), venusUsdt: vaultIdOf('venus', USDT, W.vUSDT), aaveUsdt: vaultIdOf('aave', USDT, W.aavePool), venusUsdc: vaultIdOf('venus', USDC, W.vUSDC) };
   return { state, multicall, ids, setBalance: (token: Address, who: Address, amount: bigint) => state.balances.set(`${token}:${who}`.toLowerCase(), amount),
-    readerDeps: { v2: W.v2, multicall, priceOracle: W.oracle, atpRegistry: W.atpRegistry, marketTtlMs: 0, bookTtlMs: 0, now: () => WORLD_NOW.getTime(),
+    /** What `owner` approved of `token` to `spender` (a plain `token:owner` entry answers for every spender). */
+    setAllowance: (token: Address, owner: Address, spender: Address, amount: bigint) => state.allowances.set(`${token}:${owner}:${spender}`.toLowerCase(), amount),
+    readerDeps: { v2: deployment, multicall, priceOracle: W.oracle, atpRegistry: W.atpRegistry, marketTtlMs: 0, bookTtlMs: 0, now: () => WORLD_NOW.getTime(),
       asset: (t: Address) => t === W.QQQ ? { symbol: 'QQQB', decimals: 18 } : t === W.NVDA ? { symbol: 'NVDAB', decimals: 18 } : undefined } };
 }

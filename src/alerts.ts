@@ -10,6 +10,7 @@ import { readPaymasterDeposit } from './paymaster.js';
 import { perOperationCostWei } from './funding.js';
 import { sendTelegram } from './notify.js';
 import { rpcTransport } from './rpc-transport.js';
+import { MIN_ASSET_BATCH_RAW } from './strategy-execution.js';
 
 /**
  * 排程器的告警。不靠 process 記憶體；seed 比對由 scheduler 使用同一套 key 選擇規則補入。
@@ -436,10 +437,16 @@ export async function detectPortfolioStuck(query: QueryFn, stuckHours: number, n
     const observed = toInteger(fields.gross_drift_bps, 'gross_drift_bps');
     // Scheduled buying (定投): principal whose periods are not due yet waits in the account as cash on purpose. The snapshot
     // counts it as drift (testnet portfolio 4: 8 weekly periods, 8755 bps, a warn until the last period was bought).
-    const pending = pendingScheduleDrift(observed, fields.total_usd_e8, fields.pending_raw);
+    // Idle cash under the minimum batch (10 USDT with its fee) cannot be bought at all: the planner leaves it as the
+    // portfolio's cash on purpose (rebalance-plan [BELOW_MIN_BATCH] ... 留作現金), yet the snapshot counts it as drift
+    // (testnet portfolio 7: 8.62 USDT, 2584 bps, a warn forever). Whatever cash is not scheduled principal and is under
+    // that minimum is left out the same way.
+    const idle = unbuyableIdleCash(fields.cash_raw, fields.pending_raw);
+    const pending = pendingScheduleDrift(observed, fields.total_usd_e8, idle === null ? fields.pending_raw : idle.excludedRaw);
     const drift = pending === null ? observed : pending.driftBps;
     if (pending !== null && drift <= thresholdOf(fields.threshold_bps)) return [];
-    const left = pending === null ? '' : ` (${observed} bps observed; ${pending.pendingBps} bps of the portfolio is scheduled principal not due yet and is left out)`;
+    const left = pending === null ? '' : idle === null ? ` (${observed} bps observed; ${pending.pendingBps} bps of the portfolio is scheduled principal not due yet and is left out)`
+      : ` (${observed} bps observed; ${pending.pendingBps} bps of the portfolio is ${idle.scheduled ? 'scheduled principal not due yet and ' : ''}idle cash under the minimum batch, which cannot be bought, and is left out)`;
     // 一天沒進展不是「今天運氣不好」：24 小時是「需要有人去看」的門檻。
     // The scheduler looked at it recently and is waiting for a known, harmless reason (market closed, below the minimum
     // trade, budget used up): nobody has to act, so it is a warn that says why, whatever its age.
@@ -458,6 +465,21 @@ export async function detectPortfolioStuck(query: QueryFn, stuckHours: number, n
   });
 }
 
+/**
+ * Idle cash that no buy can use: what the account holds of the cash token at the snapshot (`cashRaw`) less the scheduled
+ * principal that is waiting for its periods (`pendingRaw`), when that rest is above zero and under the minimum batch
+ * (MIN_ASSET_BATCH_RAW: 10 USDT, fee included — the planner's own rule for leaving cash alone). Returns what to take out of
+ * the drift in total (the scheduled principal plus that rest), or null when there is no such cash or the row lacks the
+ * number (the alert then behaves exactly as before). Raw units of the cash token (18 decimals on BSC).
+ */
+export function unbuyableIdleCash(cashRaw: unknown, pendingRaw: unknown): { excludedRaw: string; scheduled: boolean } | null {
+  const digits = (v: unknown) => typeof v === 'string' && /^\d+$/.test(v) ? BigInt(v) : typeof v === 'bigint' && v >= 0n ? v : null;
+  const cash = digits(cashRaw);
+  if (cash === null) return null;
+  const pending = digits(pendingRaw) ?? 0n, rest = cash > pending ? cash - pending : 0n;
+  if (rest === 0n || rest >= MIN_ASSET_BATCH_RAW) return null;
+  return { excludedRaw: (pending + rest).toString(), scheduled: pending > 0n };
+}
 /** The snapshot's own threshold; a row without one (older callers / stubs) falls back to the default 100 bps. */
 function thresholdOf(value: unknown): number {
   const n = typeof value === 'number' ? value : typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : NaN;
@@ -549,10 +571,12 @@ export function waitingReason(portfolioId: number, now: Date): string | null {
  * same calendar as asset-jobs `dueSource`). Overdue = due for more than the alert's own N hours ($1) at $2: a period that
  * came due a minute ago is not "stuck" yet, one still unbought N hours later is exactly what this alert is for and is NOT
  * taken out. Only lots confirmed before the snapshot (their money is in its total).
+ * `cash_raw`: the cash token (the version's `execution.numeraire`) the account held at that snapshot, from its detail rows;
+ * NULL when the version has no such field or the snapshot has no cash row (nothing is taken out then).
  */
 const SQL_STUCK = `
   with latest as (
-    select distinct on (portfolio_id) portfolio_id, created_at, needs_rebalance, gross_drift_bps, total_usd_e8, threshold_bps
+    select distinct on (portfolio_id) portfolio_id, block, created_at, needs_rebalance, gross_drift_bps, total_usd_e8, threshold_bps
       from portfolio_snapshots
      order by portfolio_id, created_at desc
   )
@@ -561,9 +585,17 @@ const SQL_STUCK = `
          l.threshold_bps,
          l.total_usd_e8::text as total_usd_e8,
          pending.raw::text as pending_raw,
+         cash.raw::text as cash_raw,
          extract(epoch from (now() - l.created_at)) / 3600.0 as hours_since
     from latest l
     join portfolios p on p.id = l.portfolio_id
+    left join lateral (
+      select trunc(ps.amount * 1000000000000000000) as raw
+        from positions_snapshots ps
+        join strategy_versions sv on (sv.strategy_id, sv.version) = (p.strategy_id, p.version)
+       where ps.portfolio_id = l.portfolio_id and ps.block = l.block and lower(ps.asset) = lower(sv.execution->>'numeraire')
+       order by ps.ts desc limit 1
+    ) cash on true
     left join lateral (
       select coalesce(sum(trunc(a.budget_raw / a.effective_slices) * greatest(0, a.effective_slices - greatest(done.n, due.n))), 0) as raw
         from strategy_funding_lots f

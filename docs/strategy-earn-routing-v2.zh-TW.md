@@ -1,18 +1,18 @@
 # 加息策略動態路由 v2：後端這一側
 
-合約規格：cre8-contracts `docs/borrow-routing-v2.zh-TW.md`（這裡對的是 **v2.0-draft6**；ABI 與 draft5 相同。測試網目前跑的是 draft5 的程式，後端的讀法兩版都對）。選路線的規則：`docs/strategy-earn-mainnet-routing.zh-TW.md`。激勵代幣：`docs/strategy-earn-rewards.zh-TW.md`。
+合約規格：cre8-contracts `docs/borrow-routing-v2.zh-TW.md`（這裡對的是 **v2.0-draft6**，測試網 2026-11-25 起跑的就是這一版；外掛的 `AtpBorrowCashSwapper` 見規格 §17、§18）。選路線的規則：`docs/strategy-earn-mainnet-routing.zh-TW.md`。激勵代幣：`docs/strategy-earn-rewards.zh-TW.md`。
 
 | 檔案 | 做什麼 |
 | --- | --- |
-| `deploy/strategy-earn-v2.json` | v2 部署設定：executor／registry／lens／場所／adapter／借款幣／激勵代幣／金絲雀 owner。**程式裡沒有任何 v2 地址** |
+| `deploy/strategy-earn-v2.json` | v2 部署設定：executor／registry／lens／場所／adapter／借款幣／激勵代幣／`cashSwapper`（地址與池子）／金絲雀 owner。**程式裡沒有任何 v2 地址** |
 | `src/strategy-earn-v2.ts` | 部署設定與對象（`strategyEarnV2`、`strategyEarnV2For`）、calldata、執行計畫（`planExecution`、`runV2Account`）、UserOp 分批、paymaster 規則、session key 範圍、帳本列 |
 | `src/strategy-earn-v2-chain.ts` | 讀鏈：一律 `AtpBorrowLensV2`＋Multicall3，只走公開節點。路線與 vault 從 registry 列舉 |
 | `src/strategy-earn-v2-api.ts` | App 用的 owner UserOp：同意、開啟、關閉、救援、My mix 改比例的重新同意、部位 |
 | `src/strategy-earn-v2-scheduler.ts` | 排程器：自動開倉與定期重新評估、賣出前還款、keeper（減倉、收激勵） |
 | `src/strategy-earn-v2-rates.ts` | `reportRates` 每 12 小時（API 服務的 operator 金鑰） |
-| `src/strategy-earn-v2-swap.ts` | USDC／USD1／U ↔ USDT：需求計算與計畫（執行要等合約端開放，見下） |
+| `src/strategy-earn-v2-swap.ts` | USDC／USD1／U ↔ USDT（`AtpBorrowCashSwapper`）：關閉後留在帳戶的借款幣換回 USDT；補差額的計畫在 `strategy-earn-v2.ts` 的 `planTopUp`／`settleRepayment`（見下） |
 
-測試：`test/strategy-earn-routing-v2.test.ts`、`test/strategy-earn-v2-chain.test.ts`、`test/sponsor-flows.test.ts`、`test/strategy-earn.test.ts`（同一組 endpoint 由 v1 或 v2 回答）、`test/strategy-earn-v2.fork.ts`（chain 97 fork，真合約）。
+測試：`test/strategy-earn-routing-v2.test.ts`、`test/strategy-earn-v2-chain.test.ts`、`test/sponsor-flows.test.ts`（兩種帳戶的每一種 UserOp 過 `sponsor()`，含 swapper）、`test/strategy-earn.test.ts`（同一組 endpoint 由 v1 或 v2 回答）、`test/strategy-earn-v2.fork.ts`（chain 97 fork，真合約：含已部署的 CallPolicy 對 swapper 兩個 selector 的放行與其餘的拒絕、非 USDT 路線負利差 → `topUp` → 關閉 → `cashOut`）。
 
 ## 開關：誰用 v2
 
@@ -21,7 +21,7 @@
 1. **v2 在哪裡**：`strategyEarnV2(chainId)` 讀 `STRATEGY_EARN_V2_DEPLOYMENT`（一個 JSON 物件，有設就以它為準），沒設就讀 `deploy/strategy-earn-v2.json`。chain 97 已部署（2026-11-25），chain 56 沒有。session key 範圍、paymaster 允許清單、讀取用的 lens 全部跟著這份設定走；重新部署 executor 只要換這個檔案（或設變數）。格式錯就 throw。
 2. **誰可以用**：`strategyEarnV2For(chainId, owner)`。`STRATEGY_EARN_V2_AUDIENCE` 沒設＝部署設定裡的 `canaryOwners`；`all`＝所有人；`off`＝沒有人；或逗號分隔的 owner 地址。
 
-**現況（2026-11-25）：`canaryOwners` 是空的，v2 對所有人關閉。** 測試網這套 v2（draft5 程式）即將換成 draft6 的修正版重新部署，地址會全部換掉，所以先不在舊合約上留任何部位。重新部署後把新地址寫進 `deploy/strategy-earn-v2.json`，同時把 e2e harness 的測試錢包放回 `canaryOwners`，再跑上鏈驗證。
+**現況（2026-11-25）：`canaryOwners` 只有 e2e harness 的測試錢包（`0xD3Ab…D6D9`），其他人全部維持 v1。** 測試網已換成 draft6 的修正版（executor `0xeddd…600F`、registry `0x2461…CC0D`、lens `0x4fC6…a27A`）並部署了 `AtpBorrowCashSwapper`（`0x9981…0798`）。舊那套（executor `0x494C…6bB5`）的 registry 已暫停新開倉，66 條路線的本金都是 0（2026-11-25 用公開節點逐條讀 `totalPrincipal`），沒有部位要搬。
 
 不在對象裡的 owner 完全走 v1：續期不裝 v2 權限、paymaster 不贊助任何 v2 呼叫、API 與排程器不會組 v2 的交易，也不會多讀任何鏈上資料（排程器只多一次有快取的 owner 查詢；持倉快照與 My mix 金流對帳只對對象內的 owner 讀 v2）。**對所有人開啟＝把 `STRATEGY_EARN_V2_AUDIENCE` 設成 `all`，這是產品決定，這次沒有做。**
 
@@ -60,9 +60,11 @@ UserOp：一筆最多 3 個 executor 呼叫，估計 gas 合計 ≤ 600 萬（�
 
 ## paymaster 與 session key
 
-- session key：v2 executor 上六個函式（`executeOpen／Reduce／Migrate／SwitchVault／Release／SweepRewards`），第一個參數釘死是這個帳戶。加在既有權限最後面。
+- session key：v2 executor 上六個函式（`executeOpen／Reduce／Migrate／SwitchVault／Release／SweepRewards`），第一個參數釘死是這個帳戶。加在既有權限最後面。部署設定有 `cashSwapper` 時再加兩條：target＝swapper，selector 只有 `topUp`、`cashOut`（沒有帳戶參數可釘；**絕不放 `setPool`／`setLimits`**）。
+- 權限變了就是新的 permissionId：裝在 swapper 之前（或舊 executor）的 key 對今天的部署算「還沒準備好」（`v2Authorized` 要兩段都有），API 回 `renewal_required`、排程器只回報不送，owner 續期後才裝上今天的範圍。**排程器重建 key 的 policy 時，v2 範圍是從 key 自己的快照讀回來的（`v2InstalledScope`），不是拿今天的部署設定去猜**：換過 executor 之後，舊 key 仍然重建得出自己的 permissionId（v1 的動作照常簽），只是送不了 v2 的呼叫。
 - **`executeRescue` 只給 owner**（draft5 `rescueIsOwnerOnlyByPolicy` 三條都做了）：(1) 不在 session key 的允許清單（fork 測試在已部署的 CallPolicy 上驗過會被拒）；(2) paymaster 只在 UserOp 是帳戶 root validator 簽的時候贊助（看 Kernel nonce：mode 0、type 0），session key 簽的一律拒絕；(3) keeper 送出前過 `v2KeeperCall`，只放行 `executeDeleverage`、`collectRewards`。
 - 其餘規則不變：第一個參數是自己、要有 deadline、編碼標準、`setStrategyPolicy` 的收款人只能是 owner／帳戶／0、approve 給 v2 executor 只允許投資組合資產／借款幣／激勵代幣。
+- swapper（`v2SponsoredCall`）：只代付 `topUp`／`cashOut`，token 必須是 USDT 以外的借款幣、數量不是 0、要有 deadline、編碼標準，`topUp` 不接受 `MAX`。兩個都歸類為**結清**（`settle`）：不借錢、錢不離開帳戶與它自己的策略盒，所以 My mix 退出中／已退出／刪除中、v1／v2 互斥檢查都不擋。`approve(swapper)` 只允許 USDT 與借款幣（投資組合資產、激勵代幣都不行），同樣算結清；My mix 改比例的檢查（`assertMixV2Reconsent`）也放行這一種。
 
 ## API（App 用）
 
@@ -85,11 +87,30 @@ UserOp：一筆最多 3 個 executor 呼叫，估計 gas 合計 ≤ 600 萬（�
 
 數值來源：測試網讀模擬合約的公開參數（Moolah 每個市場的借款／抵押激勵、vToken 的激勵、earn vault 的利率與激勵）；主網用顯示同一份快照（`fromMainnetRates`）。
 
-## 換匯（USDC／USD1／U ↔ USDT）
+## 補差額與換回現金（`AtpBorrowCashSwapper`，規格 §17）
 
-`loanTokenNeeds` 從一次讀鏈算出兩種需求：零頭（路線關掉後留在帳戶的非 USDT 借款幣，≥ 1 顆才處理）與缺口（策略盒＋帳戶的錢不夠還某個幣的負債，多買 0.5%）。`planLoanTokenSwaps` 接報價函式產生交易。
+executor 自己不換幣。借 USDC／USD1／U 的路線，vault 長得比負債慢（或剛開倉、利息先跑了幾個區塊）就關不掉；關閉後多出來的借款幣也變不回 USDT。swapper 是唯一能把帳戶的 USDT 換成它欠的借款幣（`topUp`，直接進策略盒）與換回來（`cashOut`，回帳戶）的合約；呼叫者就是帳戶，沒有帳戶參數也沒有收款人。
 
-**執行還沒接**：換幣要走 `AtpExecutor.executeRebalance`，合約要求賣出的幣曾是該策略的資產、買入的幣現在是，而且 TWAP oracle 要有價。四種借款幣現在都不是策略資產，測試網的模擬 USDC／USD1／U 也沒有池子。排程器目前只把需求與原因記進 log。
+**owner 多簽的授權（一次）**：`USDT.approve(swapper)` 與每個非 USDT 借款幣的 `approve(swapper)`。`auto`／`open` 的同意會帶上帳戶還缺的那幾筆（讀 allowance，已經給過的不重送），所以在 swapper 之前同意過的帳戶，下次同意時補簽；owner 自己關閉（`close`）時如果這一筆用得到 swapper，缺的授權也包在同一組 batches 最前面。My mix 改比例的重新同意**目前不帶**這些授權（後端與 paymaster 已放行，但 App 的簽名前檢查還不認得，見最後一節）；授權不綁 enrollment，改比例之後仍然有效。
+
+**何時 `topUp`**（`settleRepayment`，跟它服務的那筆還款放同一個 UserOp）：關閉、部分還款、搬離一條非 USDT 路線之前，以及賣出前的還款取回。
+
+- 讀值：`swapper.shortfall(account, token)` → `(gap, cap)`、`topUpCap`、`topUpWindowOf`，只對有負債的幣讀，自己一個 eth_call、gas 給 3,000 萬（規格：不要低於 1,000 萬；gas 不夠它會 revert，不會回錯的數字）。`shortfall` revert（有 vault 讀不到）→ `gap` 當成未知，vault 的存款不算數，改用 `cap`。
+- 買多少：還款額 +0.02%（接下來幾分鐘的利息）減掉策略盒（閒置＋vault）與帳戶自己的借款幣，不夠才買；買「差額 + max(差額的 1%, 還款額的 0.04%)」，不超過 `cap`。`maxUsdtIn = 數量 × 1.003`。數量一定明確（合約的 `topUp` 沒有 `MAX`）。
+- 用哪些 USDT：只用帳戶的**可動用現金**（餘額扣掉買入工作與提領／生息的保留款，`src/withdrawable-cash.ts`）；保留款讀不到這一輪就不補。
+- USDT 不夠：定期重新評估與 owner 的關閉 → 這一步不送、記原因（owner 的 `close` 回 `unavailable`／`top_up_unavailable`）；**賣出前**（`v2PreSellPlan`）→ 買得起多少買多少、還得起多少還多少、按比例少 2% 取回抵押品，賣掉之後下一輪再補、再關（「先賣資產」走的就是這條）。差的只有那 0.02% 的餘量、策略盒照讀值其實夠還時，照舊直接送（跟沒有 swapper 時一樣）。
+- vault 讀得到但領不出來：第一筆 `[topUp, 關閉, cashOut]` 整筆 revert 時，改送 `[topUp（只算閒置，買到負債 − 閒置，最多 cap）, 關閉]`（`Step.fallback`）；USDT 不夠買這麼多就只重送不帶 `cashOut` 的那一組。
+- `WindowExceeded`（這個幣 24 小時的額度用完）：計畫階段讀到 `cap` 不夠就不送，log 寫明 `topUpWindowOf.start + 86400` 的時間；真的送出才撞到的話記一次原因、這一輪不算失敗（不進 back-off），下一輪由計畫自己等視窗，**不會每輪重送**。
+- `PegExceeded`：池子偏離 1:1 超過合約上限，重送沒有用。寫一行結構化 log（`{"level":"error","msg":"strategy_peg_exceeded",…}`），這一輪以 `[STRATEGY_PEG_EXCEEDED]` 開頭的錯誤失敗，走既有的失敗告警（連續失敗 → `portfolio_failures`／`portfolio_stuck`，detail 帶這個標記）。
+
+**何時 `cashOut`**：
+- 跟關閉放同一個 UserOp：關掉的是這個幣的最後一條路線，而且「關完帳戶裡一定有剩」（帳戶原有的借款幣＋策略盒＋補進去的 − 負債 − 0.02% ≥ 0.000001）才帶。`cashOut(token, MAX, minUsdtOut = 這個下限 × 0.997)`；合約自己的錨定上限（0.25%）管其餘的部分。
+- 之後補做：每一輪（含加息已經關掉、帳戶沒有任何路線的帳戶）看到帳戶裡有 USDC／USD1／U、而且這個幣已經沒有負債，就用 session key 換回（`leftoverCashOuts`，`minUsdtOut = 餘額 × 0.997`）。全部賣出／刪除／停利停損的那一輪也會做，owner 領回的就只有 USDT。
+- 換回之前，`earnNetUsd` 把帳戶裡的這些幣當 1 美元算（USDT 本來就是投資組合的現金，不算在這裡）。
+
+**記帳**：`ToppedUp`／`CashedOut` 目前沒有表可寫（db 0069 的 `kind` 沒有這兩種），每一筆寫一行結構化 log：`{"msg":"strategy_cash_swap","kind":"top_up"|"cash_out","portfolioId",…,"usdtRaw","tokenRaw","needRaw","txHash","logIndex"}`（排程器與 `confirm` 都寫）。需要的 migration 列在最後一節。My mix 的金流對帳把 swapper 的池子當成內部地址（USDT 付進池子、池子付回 USDT 都不算入金／出金）。
+
+**gas**：`topUp` 實測（chain 97 fork）跟 `executeReduce`、`cashOut` 同一個 UserOp 沒有問題。`executeOpen`（借款存 Lista vault）在新合約上 `eth_estimateGas` 92 萬、實際用 82 萬；後端送出時是「bundler 估計的 callGasLimit × 2、單筆上限 1,400 萬」，夠用。
 
 ## 激勵
 
@@ -99,6 +120,8 @@ UserOp：一筆最多 3 個 executor 呼叫，估計 gas 合計 ≤ 600 萬（�
 
 ## 還沒做／要注意
 
-- 換匯的執行（見上）。
-- App：`open` 回 `renewal_required` 時要像 `auto` 一樣帶續期；My mix 改比例的簽名前檢查（`checkStrategyConsent`）要認得 v2 的三種呼叫。
-- 主網：可抵押資產的價格來源（測試網用共用的借貸 oracle）；Lista USD1 vault 的單筆操作約 670 萬 gas，乘 2 之後貼近單筆上限。
+- **App（cre8-app）**：My mix 改比例的簽名前檢查（`checkStrategyConsentV2`）只認得「對 v2 executor 的 approve」。要讓改比例順便補簽 swapper 的授權，簽名資料的 `strategyV2` 要多宣告 `swapper`，App 在鏈上核對 `swapper.executor()` 就是宣告的 executor，並接受「USDT／借款幣對 swapper 的全額 approve」。在那之前後端的重新同意不送這幾筆（`v2ReconsentCalls` 的 `swapperApprovals` 沒有被 API 使用）。
+- **db**：`strategy_route_events.kind` 加 `top_up`、`cash_out`（或另開 `strategy_cash_swaps` 表：chain_id、portfolio_id、account、kind、token、usdt_raw、token_raw、need_raw、tx_hash、log_index、block_number，`(chain_id, tx_hash, log_index)` 唯一）。現在只有 log。
+- 健康度接近減倉線、策略盒不夠還時「先 `topUp` 讓第三方的 `executeDeleverage` 有錢可還」（規格 §17 第 5 點）還沒做：keeper 那一輪只有任何人可呼叫的交易，`topUp` 要 session key。
+- 定期重新評估（不是賣出）要關一條非 USDT 路線而帳戶沒有可動用的 USDT 時，只會記原因等下一輪；不會為了補差額去賣資產。
+- 主網：可抵押資產的價格來源（測試網用共用的借貸 oracle）；Lista USD1 vault 的單筆操作約 670 萬 gas，乘 2 之後貼近單筆上限；`shortfall` 的 eth_call 在主網約 560–590 萬 gas（已給 3,000 萬）。

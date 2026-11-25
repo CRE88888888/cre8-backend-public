@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createPublicClient, custom, decodeFunctionData, encodeFunctionData, erc20Abi, maxUint256 } from 'viem';
+import { toFunctionSelector, createPublicClient, custom, decodeFunctionData, encodeFunctionData, erc20Abi, maxUint256 } from 'viem';
 import type { Address, Hex } from 'viem';
 import { bscTestnet } from 'viem/chains';
 import { encodeCallDataEpV07 } from '@zerodev/sdk';
@@ -14,7 +14,9 @@ import { dcaDepositCalls, dcaReceiptApproval, dcaReturnCalls, dcaVaults } from '
 import { YIELD_EXECUTOR_ABI } from '../src/yield-abi.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
 import { config, NOW, operation, OWNER, SENDER, TEST_SIGNER } from './fixtures/paymaster.js';
-import { maxDebtFor, strategyEarnV2, v2Calls, v2ConsentCalls, v2ConsentOffCall, v2ExitBatches, v2ExitCalls, v2PreSellPlan, v2ReconsentCalls, v2RescueCall, V2_EXECUTOR_ABI, V2_REGISTRY_ABI } from '../src/strategy-earn-v2.js';
+import { maxDebtFor, strategyEarnV2, v2Calls, v2ConsentCalls, v2ConsentOffCall, v2ExitBatches, v2ExitCalls, v2PreSellPlan, v2ReconsentCalls, v2RescueCall, v2SwapperApprovalCalls, V2_EXECUTOR_ABI, V2_REGISTRY_ABI, V2_SWAPPER_ABI } from '../src/strategy-earn-v2.js';
+const SWAPPER_OWNER_ABI = [{ type: 'function', name: 'setPool', inputs: [{ type: 'address' }, { type: 'address' }], outputs: [], stateMutability: 'nonpayable' },
+  { type: 'function', name: 'setLimits', inputs: [{ type: 'uint16' }, { type: 'uint16' }], outputs: [], stateMutability: 'nonpayable' }] as const;
 import type { PreSellPosition, StrategyEarnV2 } from '../src/strategy-earn-v2.js';
 
 /**
@@ -374,17 +376,18 @@ test('reward tokens (LISTA / XVS): only a plain transfer to the owner wallet, on
 const V2: StrategyEarnV2 = { chainId: 97, executor: '0x20000000000000000000000000000000000000e2', registry: '0x20000000000000000000000000000000000000e3', lens: '0x20000000000000000000000000000000000000e6',
   venusComptroller: '0x20000000000000000000000000000000000000e4', moolah: '0x20000000000000000000000000000000000000e5',
   loanTokens: { USDT: usdt.toLowerCase() as Address, USDC: '0x20000000000000000000000000000000000000a2' }, rewardTokens: ['0x2000000000000000000000000000000000000091'],
-  adapters: ['0x20000000000000000000000000000000000000e7'], canaryOwners: [] };
+  adapters: ['0x20000000000000000000000000000000000000e7'], canaryOwners: [], swapper: '0x20000000000000000000000000000000000000e8', swapperPools: ['0x20000000000000000000000000000000000000e9'] };
+const USDC2 = V2.loanTokens.USDC!;
 /** Kernel v3 nonces: owner (root validator; the SDK writes the ECDSA validator's address in the id) and a session key (permission id). */
 const ROOT = (BigInt('0x845adb2c711129d4f3966735ed98a9f09fc4ce57') << 80n) | 3n, SESSION = (2n << 240n) | (0xdeadbeefn << 208n) | 3n;
 const R1 = ('0x' + 'a1'.repeat(32)) as Hex, R2 = ('0x' + 'a2'.repeat(32)) as Hex, VA = ('0x' + 'b1'.repeat(32)) as Hex, VB = ('0x' + 'b2'.repeat(32)) as Hex;
 async function renewalV2(v2: StrategyEarnV2 = V2): Promise<Call[]> {
   const session = await buildSessionPermissions({ publicClient: offline as never, sessionKeyAddress: '0x2000000000000000000000000000000000000002',
-    executorAddress: executor, validUntil: NOW + 30 * 86400, yieldAccount: account, borrowAccount: account, routingV2: { executor: v2.executor, account } });
+    executorAddress: executor, validUntil: NOW + 30 * 86400, yieldAccount: account, borrowAccount: account, routingV2: { executor: v2.executor, account, ...(v2.swapper ? { swapper: v2.swapper } : {}) } });
   return session.initConfig.map((data) => ({ to: account, data: data as Hex, value: 0n }));
 }
 function v2Flows(r: Call[], V2x: StrategyEarnV2 = V2): [string, Call[], 'risk' | 'settle'][] {
-  const V2 = V2x;
+  const V2 = V2x, USDC2 = V2.loanTokens.USDC!;
   const deadline = BigInt(NOW + 600), E = 10n ** 18n;
   const consent = v2ConsentCalls(V2, { maxDebtUsdRaw: maxDebtFor(5000), rewardRecipient: owner, venues: ['venus', 'lista'], collaterals: [asset], loanTokens: Object.values(V2.loanTokens) as Address[], rewardTokens: V2.rewardTokens }).map(asCall);
   const selling = (o: Partial<PreSellPosition> & { routeId: Hex; vaultId: Hex }): PreSellPosition => ({ symbol: 'NVDAB', collateral: asset, freeCollateralRaw: 0n, postedRaw: 10n * E, routeDebtRaw: 1000n * E, venue: 'lista', loan: 'USDT', ...o });
@@ -419,6 +422,21 @@ function v2Flows(r: Call[], V2x: StrategyEarnV2 = V2): [string, Call[], 'risk' |
     ['My mix weight change tail adding an asset that only routes through the other venue: delegation + re-consent + approval',
       v2ReconsentCalls(V2, { maxDebtUsdRaw: maxDebtFor(800), rewardRecipient: owner, newCollaterals: [asset], venues: ['lista'] }).map(asCall), 'risk'],
     ['full exit after a plain turn-off: only the reward sweep (scheduler session key)', [asCall(v2Calls.sweepRewards(V2, account, V2.rewardTokens[0]!, maxUint256, deadline))], 'settle'],
+    // Cash swapper (AtpBorrowCashSwapper, spec §17): top-up before a repayment, cash-out after a close, and the owner's approvals to it.
+    ['consent with the approvals to the cash swapper (USDT + the other loan tokens)', v2ConsentCalls(V2, { maxDebtUsdRaw: maxDebtFor(5000), rewardRecipient: owner, venues: ['lista'], collaterals: [asset], loanTokens: Object.values(V2.loanTokens) as Address[],
+      rewardTokens: V2.rewardTokens, swapperApprovals: Object.values(V2.loanTokens) as Address[] }).map(asCall), 'risk'],
+    ['approvals to the cash swapper alone (an account that consented before the swapper existed)', v2SwapperApprovalCalls(V2, Object.values(V2.loanTokens) as Address[]).map(asCall), 'settle'],
+    ['top-up alone', [asCall(v2Calls.topUp(V2, USDC2, E, deadline))], 'settle'],
+    ['cash-out alone: everything the account holds', [asCall(v2Calls.cashOut(V2, USDC2, maxUint256, E, deadline))], 'settle'],
+    ['top-up + close + cash-out in one UserOp (scheduler session key)', [asCall(v2Calls.topUp(V2, USDC2, E, deadline)), asCall(v2Calls.close(V2, account, R1, VA, 0n, deadline)), asCall(v2Calls.cashOut(V2, USDC2, maxUint256, 1n, deadline))], 'settle'],
+    ['top-up + partial repayment', [asCall(v2Calls.topUp(V2, USDC2, E, deadline)), asCall(v2Calls.reduce(V2, account, R1, VA, E, 0n, 0n, deadline))], 'settle'],
+    ['top-up + atomic move off a short route', [asCall(v2Calls.topUp(V2, USDC2, E, deadline)), asCall(v2Calls.migrate(V2, account, { routeId: R1, vaultId: VA }, { routeId: R2, vaultId: VB }, 3n * E, 0n, deadline))], 'risk'],
+    ['before a sale, a USDC route the box cannot cover: top-up + close + cash-out (v2PreSellPlan)', v2PreSellPlan(V2, account, [selling({ routeId: R2, vaultId: VB, loan: 'USDC', vaultAssetsRaw: 900n * E,
+      swap: { token: USDC2, gapRaw: 100n * E, capRaw: 1010n * E, windowEndsAt: 0, usdtRaw: 500n * E, usdtAllowanceRaw: maxUint256, tokenAllowanceRaw: maxUint256 } })], deadline, NOW * 1000).calls.map(asCall), 'settle'],
+    ...v2ExitBatches(V2, account, { routes: [{ routeId: R2, vaultId: VB, routeDebtRaw: 1000n * E, cashRaw: 0n, loan: 'USDC', vaultAssetsRaw: 990n * E, idleRaw: 0n, lastOfToken: true,
+      swap: { token: USDC2, gapRaw: 10n * E, capRaw: 1010n * E, windowEndsAt: 0, usdtRaw: 500n * E, usdtAllowanceRaw: maxUint256, tokenAllowanceRaw: maxUint256 } }],
+      swapperApprovals: [V2.loanTokens.USDT!, USDC2], cashOuts: [], deadline, withdrawConsent: true, rewardRecipient: owner, now: NOW * 1000 }, () => null)
+      .map((batch, i): [string, Call[], 'risk' | 'settle'] => [`owner turn-off of a short USDC route, batch ${i + 1} (swapper approvals, top-up, close, cash-out, consent off)`, batch.map(asCall), 'settle']),
   ];
 }
 
@@ -440,6 +458,7 @@ for (const kind of ['fund', 'mix'] as const) {
     const deadline = BigInt(NOW + 600), E = 10n ** 18n;
     const ex = (functionName: string, args: readonly unknown[]): Call => ({ to: V2.executor, value: 0n, data: encodeFunctionData({ abi: V2_EXECUTOR_ABI, functionName: functionName as never, args: args as never }) });
     const policy = (maxDebt: bigint, recipient: Address, enabled: boolean): Call => ({ to: V2.registry, value: 0n, data: encodeFunctionData({ abi: V2_REGISTRY_ABI, functionName: 'setStrategyPolicy', args: [maxDebt, recipient, enabled] }) });
+    const sw = (functionName: string, args: readonly unknown[], abi: readonly unknown[] = V2_SWAPPER_ABI): Call => ({ to: V2.swapper!, value: 0n, data: encodeFunctionData({ abi, functionName, args } as never) });
     const lending = (to: Address, fn: 'updateDelegate' | 'setAuthorization', who: Address): Call => ({ to, value: 0n, data: encodeFunctionData({ abi: STRATEGY_EARN_ABI, functionName: fn, args: [who, true] }) });
     const strict: [string, Call[]][] = [
       ['open for another account', [ex('executeOpen', [stranger, R1, VA, E, E, deadline])]],
@@ -468,6 +487,21 @@ for (const kind of ['fund', 'mix'] as const) {
       ['a portfolio asset approved to a stranger next to a v2 call', [approve(asset, stranger), ex('executeRelease', [account, VA, deadline])]],
       ['native value on a v2 call', [{ ...ex('executeRelease', [account, VA, deadline]), value: 1n }]],
       ['a v2 close with a token sent to a stranger', [ex('executeRelease', [account, VA, deadline]), transfer(usdt, stranger, 1n)]],
+      // Cash swapper: only topUp / cashOut of a loan token other than USDT; approvals to it only on USDT and loan tokens.
+      ['swapper: setPool through the account', [sw('setPool', [USDC2, stranger], SWAPPER_OWNER_ABI)]],
+      ['swapper: setLimits through the account', [sw('setLimits', [100, 500], SWAPPER_OWNER_ABI)]],
+      ['swapper: top-up of USDT', [sw('topUp', [usdt, E, E, deadline])]],
+      ['swapper: top-up of a portfolio asset', [sw('topUp', [asset, E, E, deadline])]],
+      ['swapper: top-up of "everything"', [sw('topUp', [USDC2, maxUint256, maxUint256, deadline])]],
+      ['swapper: top-up of nothing', [sw('topUp', [USDC2, 0n, 0n, deadline])]],
+      ['swapper: top-up without a deadline', [sw('topUp', [USDC2, E, E, 0n])]],
+      ['swapper: cash-out of a reward token', [sw('cashOut', [V2.rewardTokens[0]!, E, 0n, deadline])]],
+      ['swapper: cash-out without a deadline', [sw('cashOut', [USDC2, E, 0n, 0n])]],
+      ['swapper: trailing bytes', [{ ...asCall(v2Calls.topUp(V2, USDC2, E, deadline)), data: (v2Calls.topUp(V2, USDC2, E, deadline).data + '00') as Hex }]],
+      ['swapper: native value', [{ ...asCall(v2Calls.topUp(V2, USDC2, E, deadline)), value: 1n }]],
+      ['swapper: a portfolio asset approved to it', [approve(asset, V2.swapper!)]],
+      ['swapper: a reward token approved to it', [approve(V2.rewardTokens[0]!, V2.swapper!)]],
+      ['swapper: a top-up next to a token sent to a stranger', [asCall(v2Calls.topUp(V2, USDC2, E, deadline)), transfer(usdt, stranger, 1n)]],
     ];
     for (const [name, calls] of strict) {
       const h = harness(kind, { v2: V2 });
@@ -517,6 +551,8 @@ for (const kind of ['fund', 'mix'] as const) {
     await assert.rejects(harness(kind).sponsor(rescue, ROOT), code('PAYMASTER_CALL_FORBIDDEN', 403));
     // Every ordinary v2 flow is the same whoever signs (the scheduler sends them with the session key).
     for (const [name, calls] of v2Flows(await renewalV2()).slice(3, 8)) await assert.doesNotReject(harness(kind, { v2: V2 }).sponsor(calls, SESSION), `${kind}: ${name} (session key)`);
+    // The cash swapper's two functions are the session key's too (the scheduler tops up and cashes out with it).
+    for (const [name, calls] of v2Flows(await renewalV2()).filter(f => /top-up|cash-out/.test(f[0]) && !/owner turn-off|approvals/.test(f[0]))) await assert.doesNotReject(harness(kind, { v2: V2 }).sponsor(calls, SESSION), `${kind}: ${name} (session key)`);
   });
 
   test(`routing v2, ${kind} account: one account uses v1 or v2, never both — adding risk on one generation is refused while the other is in use`, async () => {
@@ -564,3 +600,15 @@ for (const kind of ['fund', 'mix'] as const) {
     } finally { if (before === undefined) delete process.env.STRATEGY_EARN_V2_AUDIENCE; else process.env.STRATEGY_EARN_V2_AUDIENCE = before; }
   });
 }
+
+test('routing v2 session scope, golden: keys installed before the cash swapper rebuild to the same permissionId; the swapper scope is a new one (so those keys renew)', async () => {
+  const id = async (routingV2?: { executor: Address; account: Address; swapper?: Address }) => (await buildSessionPermissions({ publicClient: offline as never, sessionKeyAddress: '0x2000000000000000000000000000000000000002',
+    executorAddress: executor, validUntil: 1_900_000_000, yieldAccount: '0x1000000000000000000000000000000000000005', borrowAccount: '0x1000000000000000000000000000000000000005', ...(routingV2 ? { routingV2 } : {}) }));
+  const a = '0x1000000000000000000000000000000000000005' as Address;
+  const [v1, v2Only, withSwapper] = [await id(), await id({ executor: V2.executor, account: a }), await id({ executor: V2.executor, account: a, swapper: V2.swapper! })];
+  // The first two are byte for byte what origin/main (before the swapper) produced: installed keys keep validating.
+  assert.deepEqual([v1.permissionId, v2Only.permissionId, withSwapper.permissionId], ['0xb27e1419', '0x015b88d9', '0x9bc6110d']);
+  assert.deepEqual([v1.policySnapshot.call.permissions.length, v2Only.policySnapshot.call.permissions.length, withSwapper.policySnapshot.call.permissions.length], [7, 13, 15]);
+  assert.deepEqual(withSwapper.policySnapshot.call.permissions.slice(13).map(p => [p.target, p.selector, p.rules.length, p.valueLimit]),
+    [toFunctionSelector('topUp(address,uint256,uint256,uint256)'), toFunctionSelector('cashOut(address,uint256,uint256,uint256)')].map(selector => [V2.swapper, selector, 0, '0']));
+});

@@ -1,23 +1,24 @@
 {
-  "note": "Strategy Earn routing v2 deployments (cre8-contracts deployments/*.json `borrowV2`). The backend reads every v2 address from here (or from STRATEGY_EARN_V2_DEPLOYMENT, which wins): executor, registry, lens, the session-key scope and the paymaster allowlist all follow this file. After a redeploy, replace the entry; routes and vaults are discovered from the registry, they are not listed here. `canaryOwners`: owners whose accounts use v2 while STRATEGY_EARN_V2_AUDIENCE is unset; empty = v2 is off for everyone (v1 for all). 2026-11-25: left empty on purpose, this deployment (draft5 code) is about to be replaced by the draft6 one; list the e2e harness owner again together with the new addresses.",
+  "note": "Strategy Earn routing v2 deployments (cre8-contracts deployments/*.json `borrowV2`). The backend reads every v2 address from here (or from STRATEGY_EARN_V2_DEPLOYMENT, which wins): executor, registry, lens, the cash swapper, the session-key scope and the paymaster allowlist all follow this file. After a redeploy, replace the entry (a new executor needs a new cash swapper); routes and vaults are discovered from the registry, they are not listed here. `cashSwapper`: AtpBorrowCashSwapper (docs/borrow-routing-v2 §17) bound to this executor — `address` is what the backend uses, `pools` are informational (`poolOf` on chain decides). `canaryOwners`: owners whose accounts use v2 while STRATEGY_EARN_V2_AUDIENCE is unset; empty = v2 is off for everyone (v1 for all). 2026-11-25: the draft6 set (executor 0xeddd…600F) replaced the draft5 one (executor 0x494C…6bB5, registry paused, no principal left on any of its 66 routes); the only canary owner is the e2e harness wallet.",
   "deployments": [
     {
       "chainId": 97,
-      "interfaceVersion": "v2.0-draft5 (code 1888572; the draft6 fixes are not deployed yet)",
-      "gitCommit": "1888572dc89cf7720bce50a9b96f6e28086474a8",
+      "interfaceVersion": "v2.0-draft6",
+      "gitCommit": "465a6e5236f13be995f815e44a7c6fb5b3837888",
       "deployedAtBlocks": [
-        144626656,
-        144628034
+        144707011,
+        144707575
       ],
-      "executor": "0x494C106498e8221D3f72474f36995C191ACf6bB5",
-      "registry": "0x7eae73a76Ff2359fE1aB059A77Dd36840A32559E",
-      "lens": "0x18A55C04aE72A00ED7790577FbdA9159DAc94000",
+      "executor": "0xeddd943d855a5F5A2880BBFD411449A65182600F",
+      "registry": "0x2461599b76dA4EDd0A128DdCcb3DC3BEAA54CC0D",
+      "lens": "0x4fC68ead312aCfFCBF20f77884804F484226a27A",
+      "boxImplementation": "0x42EfA4422e81E126D83D9322ab3aD5faC6a4cC76",
       "venusComptroller": "0x93AB77260c8C62b26698bBB0ee8da3E175b9ad8D",
       "moolah": "0x993237aC050512f3749bfEE2dE759b6B86Aea653",
       "adapters": [
-        "0x3548A7641bae787A48E263f8aF053899e46fF02d",
-        "0x861e91a0a3d46c391587323B3FE32A43E53CFe91",
-        "0x432f96D0790f3bc3ceBed379Fd476F367CE63BAa"
+        "0x6242869aDEe4ad6Df35505d0Cabb76249FD49D58",
+        "0x769567B0e45F04Cd962c11CdC95018870Fa1AF66",
+        "0x06DD79a73A9351B3580ae0769F35209910BDEe7c"
       ],
       "loanTokens": {
         "USDT": "0x7Ad6E310B0F6744B66d97Cb7cb525BD974501cb5",
@@ -28,7 +29,18 @@
       "rewardTokens": [
         "0xFfE08AC6f45A4aE5Ae2a692f0965EA46CE7d822c"
       ],
-      "canaryOwners": []
+      "cashSwapper": {
+        "address": "0x99811a1115B36F8310deaDAda818cAE685360798",
+        "gitCommit": "df96fcc222d53e6540d9566d72c9a754908beaac",
+        "pools": {
+          "USDC": "0xB880D719455D11627A37cAc49493bFb54C884A01",
+          "USD1": "0x85945fAE445F06C129D61CF962849534c8332586",
+          "U": "0x8A84c8EBe1c97Ab212600714DdCb53760F25Ba32"
+        }
+      },
+      "canaryOwners": [
+        "0xD3Ab39B62E221bF9E8bA19fE19b2638767d3D6D9"
+      ]
     }
   ]
 }

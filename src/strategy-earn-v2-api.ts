@@ -1,11 +1,11 @@
-import { maxUint256 } from 'viem';
+import { decodeFunctionData, maxUint256 } from 'viem';
 import type { Address, Hex, Log } from 'viem';
 import { planAccount } from './strategy-earn-routing.js';
 import type { Costs, Decision, Holding } from './strategy-earn-routing.js';
 import { marketIdOf } from './strategy-earn-v2-chain.js';
 import type { V2AccountRead, V2Market, V2Reader } from './strategy-earn-v2-chain.js';
-import { BORROW_BUFFER_BPS, maxDebtFor, planExecution, v2ConsentCalls, v2ExitBatches, v2ExitCalls, v2ReconsentCalls, v2RescueCall, v2RouteEvents } from './strategy-earn-v2.js';
-import type { Call, ExitRoute, RouteEvent, StrategyEarnV2 } from './strategy-earn-v2.js';
+import { BORROW_BUFFER_BPS, V2_CASH_OUT_MIN_RAW, V2_SWAPPER_ABI, maxDebtFor, planExecution, swapEventLine, v2ConsentCalls, v2ExitBatches, v2ExitPlan, v2MissingSwapperApprovals, v2ReconsentCalls, v2RescueCall, v2RouteEvents, v2SwapEvents } from './strategy-earn-v2.js';
+import type { Call, ExitInput, ExitRoute, RouteEvent, StrategyEarnV2, SwapQuote } from './strategy-earn-v2.js';
 import { rewardEvents } from './strategy-rewards.js';
 import type { RewardEvent } from './strategy-rewards.js';
 
@@ -28,7 +28,11 @@ export type V2ApiDeps = { v2: StrategyEarnV2; reader: V2Reader; now: () => Date;
   costs?: Costs;
   recordRoutes?: (chainId: number, events: readonly RouteEvent[]) => Promise<void>;
   recordRewards?: (chainId: number, events: readonly RewardEvent[]) => Promise<void>;
-  rewardSymbol?: (token: Address) => string | undefined };
+  rewardSymbol?: (token: Address) => string | undefined;
+  /** USDT in the account a running buy job or a reservation still needs: an owner-signed top-up never spends it. Absent: none. */
+  reservedUsdt?: (account: Address) => Promise<bigint>;
+  /** Where the cash swapper's events are written until the ledger has a table for them; default: stdout. */
+  log?: (line: string) => void };
 
 /** What each eligible asset would be worth (USD) for the plan: what the account holds plus `extraUsd` (new money by weight). */
 function holdingsFor(read: V2AccountRead, extraUsd: (token: Address) => number, enabled: boolean): Holding[] {
@@ -55,7 +59,10 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
     const floor = read.state.principalUsdRaw * 11_000n / 10_000n;
     const maxDebtUsdRaw = [planned, current, floor].reduce((a, b) => (a > b ? a : b));
     const venues = [...new Set(m.routes.filter(r => collaterals.includes(r.collateral)).map(r => r.venue))].filter(venue => !granted[venue]);
-    return { maxDebtUsdRaw, calls: v2ConsentCalls(v2, { maxDebtUsdRaw, rewardRecipient: owner, venues, collaterals, loanTokens: Object.values(v2.loanTokens) as Address[], rewardTokens: v2.rewardTokens }) };
+    // Cash swapper (spec §17): USDT (top-up) and the other loan tokens (cash-out) are approved to it once, with the consent.
+    // Only what is missing, so an account that consented before the swapper existed signs them the next time it consents.
+    const swapperApprovals = v2MissingSwapperApprovals(v2, token => read.swapperAllowances[token] ?? 0n);
+    return { maxDebtUsdRaw, calls: v2ConsentCalls(v2, { maxDebtUsdRaw, rewardRecipient: owner, venues, collaterals, loanTokens: Object.values(v2.loanTokens) as Address[], rewardTokens: v2.rewardTokens, swapperApprovals }) };
   };
   const gasOf = async (account: Address, calls: readonly Call[]) => {
     const gas = new Map<string, bigint | null>();
@@ -148,17 +155,38 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
      */
     async close(account: Address, input: { symbols: readonly string[]; exit?: boolean }) {
       const read = await reader.account(account);
+      const reserved = deps.reservedUsdt && Object.values(read.tokens).some(t => t.swap) ? await deps.reservedUsdt(account) : 0n;
+      for (const t of Object.values(read.tokens)) if (t.swap) t.swap.usdtRaw = t.swap.usdtRaw > reserved ? t.swap.usdtRaw - reserved : 0n;
       const open = read.routes.filter(r => r.collateralRaw > 0n || r.routeDebtRaw > 0n);
       const chosen = open.filter(r => input.symbols.includes(r.route.symbol));
       const all = open.every(r => chosen.includes(r));
-      const routes: ExitRoute[] = chosen.map(r => ({ routeId: r.route.routeId, vaultId: (r.vault?.vaultId ?? ('0x' + '00'.repeat(32))) as Hex, routeDebtRaw: r.routeDebtRaw, cashRaw: read.tokens[r.route.loanSymbol]!.cashRaw }));
+      // The owner signs this exit, so approvals the cash swapper still lacks are signed in it: plan as if they were there.
+      const approved = (q: SwapQuote | undefined) => q ? { swap: { ...q, usdtAllowanceRaw: maxUint256, tokenAllowanceRaw: maxUint256 } } : {};
+      const routes: ExitRoute[] = chosen.map(r => { const t = read.tokens[r.route.loanSymbol]!; return { routeId: r.route.routeId, vaultId: (r.vault?.vaultId ?? ('0x' + '00'.repeat(32))) as Hex, routeDebtRaw: r.routeDebtRaw, cashRaw: t.cashRaw,
+        loan: r.route.loanSymbol, vaultAssetsRaw: read.vaults.find(v => v.vault.vaultId === r.vault?.vaultId)?.assetsRaw ?? 0n, idleRaw: t.idleRaw, ...approved(t.swap),
+        lastOfToken: !open.some(x => x.route.loan === r.route.loan && !chosen.includes(x)) }; });
+      // Loan token other than USDT already in the account with nothing owed in it and no route of it being closed now: sold too.
+      const cashOuts = Object.entries(read.tokens).filter(([symbol, t]) => t.swap !== undefined && t.debtRaw === 0n && t.cashRaw >= V2_CASH_OUT_MIN_RAW && !chosen.some(r => r.route.loanSymbol === symbol))
+        .map(([, t]) => ({ token: t.token, amountRaw: t.cashRaw }));
       // What stays in the box once every route of a token is closed: vaults other than the one each close names.
       const named = new Set(routes.map(r => r.vaultId));
       const leftoverVaults = all ? read.vaults.filter(v => v.assetsRaw > 0n && (!named.has(v.vault.vaultId) || !chosen.some(r => r.route.loan === v.vault.token))).map(v => v.vault.vaultId) : [];
       const rewards = input.exit && all ? read.rewards.filter(r => r.boxRaw > 0n || r.accountRaw > 0n && r.allowanceRaw >= r.accountRaw)
         .map(r => ({ token: r.token, accountAmountRaw: r.accountRaw > 0n && r.allowanceRaw >= r.accountRaw ? maxUint256 : 0n })) : [];
-      const args = { routes, leftoverVaults, rewards, deadline: deadline(), withdrawConsent: all && read.policy.enabled, rewardRecipient: read.policy.rewardRecipient };
-      const calls = v2ExitCalls(v2, account, args);
+      const base: ExitInput = { routes, leftoverVaults, rewards, cashOuts, deadline: deadline(), withdrawConsent: all && read.policy.enabled, rewardRecipient: read.policy.rewardRecipient, now: deps.now().getTime() };
+      const first = v2ExitPlan(v2, account, base);
+      // A route in USDC / USD1 / U whose box is short, and no way to top it up now (no USDT in the account, or the token's
+      // 24-hour window is used up): a close that would only revert is not handed out.
+      if (first.blocked.length > 0) return { status: 'unavailable' as const, reason: 'top_up_unavailable', message: TEMPORARILY };
+      // Approvals to the swapper this exit uses and the account lacks: USDT for a top-up, the token itself for a cash-out.
+      const usdt = v2.loanTokens.USDT?.toLowerCase() as Address | undefined, uses = new Set<Address>();
+      for (const c of first.calls) {
+        if (!v2.swapper || c.to !== v2.swapper) continue;
+        const d = decodeFunctionData({ abi: V2_SWAPPER_ABI, data: c.data });
+        if (d.functionName === 'topUp' && usdt) uses.add(usdt); else if (d.functionName === 'cashOut') uses.add(d.args[0].toLowerCase() as Address);
+      }
+      const args: ExitInput = { ...base, swapperApprovals: [...uses].filter(t => (read.swapperAllowances[t] ?? 0n) < 2n ** 128n) };
+      const calls = v2ExitPlan(v2, account, args).calls;
       if (calls.length === 0) return { status: 'ready' as const, version: 2 as const, asset: input.symbols[0] ?? null, assets: [], calls: [], batches: [] };
       const batches = v2ExitBatches(v2, account, args, await gasOf(account, calls));
       return { status: 'ready' as const, version: 2 as const, asset: chosen[0]?.route.symbol ?? null, assets: chosen.map(r => r.route.symbol), calls, batches };
@@ -209,7 +237,10 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
       const box = (await reader.account(account)).box;
       const rewards = rewardEvents(tx, { portfolioId: id, account, holders: [account, box], owner, tokens: v2.rewardTokens.map(address => ({ symbol: deps.rewardSymbol?.(address) ?? 'LISTA', address })) });
       if (rewards.length > 0 && deps.recordRewards) await deps.recordRewards(v2.chainId, rewards);
-      return { routes: routes.length, rewards: rewards.length, kinds: [...routes.map(e => e.kind as string), ...rewards.map(e => `reward_${e.kind}`)] };
+      // Top-ups and cash-outs have no table yet: one structured log line each.
+      const swaps = v2SwapEvents(v2, tx, account);
+      for (const e of swaps) (deps.log ?? console.log)(swapEventLine(v2.chainId, id, e));
+      return { routes: routes.length, rewards: rewards.length, kinds: [...routes.map(e => e.kind as string), ...rewards.map(e => `reward_${e.kind}`), ...swaps.map(e => e.kind as string)] };
     },
   };
 }

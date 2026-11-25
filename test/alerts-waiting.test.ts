@@ -91,7 +91,7 @@ test('drift alert: restoring ignores stale, future-dated and malformed entries, 
 });
 
 test('drift alert: scheduled principal that is not due yet is left out (portfolio 4: 8 weekly periods, 8755 bps until the last one was bought)', async () => {
-  const { pendingScheduleDrift } = await import('../src/alerts.js');
+  const { pendingScheduleDrift, unbuyableIdleCash } = await import('../src/alerts.js');
   const E8 = 10n ** 8n, E18 = 10n ** 18n;
   // 800 USDT portfolio, first of 8 periods bought: 700 waits as cash for the 7 periods to come.
   assert.deepEqual(pendingScheduleDrift(8755, (800n * E8).toString(), (700n * E18).toString()), { driftBps: 40, pendingBps: 8750 });
@@ -103,6 +103,23 @@ test('drift alert: scheduled principal that is not due yet is left out (portfoli
   // More pending than the snapshot's total, or more than the observed drift: nothing left to report, never negative.
   assert.deepEqual(pendingScheduleDrift(8755, (800n * E8).toString(), (900n * E18).toString()), { driftBps: 0, pendingBps: 10_000 });
   assert.deepEqual(pendingScheduleDrift(300, (800n * E8).toString(), (700n * E18).toString()), { driftBps: 0, pendingBps: 8750 });
+
+  // Idle cash under the minimum batch (10 USDT, fee included) cannot be bought: it is taken out too, on top of any
+  // scheduled principal; 10 USDT or more is a batch and stays; a row without the cash number changes nothing.
+  assert.deepEqual(unbuyableIdleCash((862n * E18 / 100n).toString(), '0'), { excludedRaw: (862n * E18 / 100n).toString(), scheduled: false });
+  assert.deepEqual(unbuyableIdleCash((705n * E18).toString(), (700n * E18).toString()), { excludedRaw: (705n * E18).toString(), scheduled: true });
+  for (const [cashRaw, pendingRaw] of [[(10n * E18).toString(), '0'], [(712n * E18).toString(), (700n * E18).toString()], [(700n * E18).toString(), (700n * E18).toString()], ['0', '0'], [undefined, '0'], ['x', '0'], [null, undefined]] as const)
+    assert.equal(unbuyableIdleCash(cashRaw, pendingRaw), null, `${String(cashRaw)}/${String(pendingRaw)}`);
+  const idleRows = [
+    { portfolio_id: 7, hours_since: 30, gross_drift_bps: 2584, threshold_bps: 100, total_usd_e8: (3336n * E8 / 100n).toString(), pending_raw: '0', cash_raw: (862n * E18 / 100n).toString() }, // testnet portfolio 7
+    { portfolio_id: 8, hours_since: 30, gross_drift_bps: 3266, threshold_bps: 100, total_usd_e8: (3674n * E8 / 100n).toString(), pending_raw: '0', cash_raw: (12n * E18).toString() },          // 12 USDT can be bought
+    { portfolio_id: 9, hours_since: 30, gross_drift_bps: 4000, threshold_bps: 100, total_usd_e8: (3336n * E8 / 100n).toString(), pending_raw: '0', cash_raw: (862n * E18 / 100n).toString() }, // un-buyable cash + real drift
+    { portfolio_id: 10, hours_since: 30, gross_drift_bps: 8800, threshold_bps: 100, total_usd_e8: (800n * E8).toString(), pending_raw: (700n * E18).toString(), cash_raw: (705n * E18).toString() }, // schedule + 5 USDT of dust
+  ];
+  const idle = await detectPortfolioStuck(async () => ({ rows: idleRows }), 6, NOW);
+  assert.deepEqual(idle.map(f => f.portfolioId), [8, 9], 'portfolio 7 (and the scheduled one with dust) no longer alert');
+  assert.match(String(idle[0]!.detail), /^portfolio 8: last observation showed 3266 bps drift \(still above the threshold\)/);
+  assert.match(String(idle[1]!.detail), /^portfolio 9: last observation showed 1910 bps drift \(4000 bps observed; 2583 bps of the portfolio is idle cash under the minimum batch, which cannot be bought, and is left out\)/);
 
   const seen: unknown[][] = [];
   const rows = [

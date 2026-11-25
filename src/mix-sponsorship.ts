@@ -63,12 +63,19 @@ export function assertMixV2Reconsent(tail: readonly { target: Address; value: bi
   const selected = ctx.selectedAssets.map(a => a.toLowerCase() as Address);
   const seen = new Set<string>();
   let policies = 0;
+  const APPROVE = '0x095ea7b3', swapper = v2.swapper?.toLowerCase();
+  const loanTokens = Object.values(v2.loanTokens).map(t => t!.toLowerCase());
   for (const call of tail) {
     const target = call.target.toLowerCase();
-    if (call.value !== 0n || seen.has(target)) throw denied();
-    seen.add(target);
+    // An approval is keyed by token and spender: a loan token may be approved once to the executor and once to the cash swapper.
+    const key = call.callData.toLowerCase().startsWith(APPROVE) ? `${target}:${call.callData.slice(34, 74).toLowerCase()}` : target;
+    if (call.value !== 0n || seen.has(key)) throw denied();
+    seen.add(key);
     let kind;
     try { kind = v2SponsoredCall(v2, call, { sender: ctx.account, owner: ctx.owner, assets: selected, rootSigned: true }); } catch { throw denied(); }
+    // Cash swapper (spec §17): the one thing in this tail that is not 'risk' — an approval of USDT or another loan token
+    // to the swapper, and to nobody else (v2SponsoredCall checked the token, the amount encoding and the spender).
+    if (kind === 'settle' && swapper !== undefined && key === `${target}:${swapper.slice(2)}` && loanTokens.includes(target)) continue;
     if (kind !== 'risk') throw denied(); // a delegation granted, consent given, an approval to the v2 executor — nothing else
     if (target === v2.registry.toLowerCase()) {
       // The recipient is the mix's owner: v2SponsoredCall would also let the account itself or nobody through.

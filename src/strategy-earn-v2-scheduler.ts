@@ -3,9 +3,10 @@ import type { Address, Hex, Log } from 'viem';
 import type { Costs } from './strategy-earn-routing.js';
 import { V2_DEFAULT_COSTS } from './strategy-earn-v2-api.js';
 import type { V2AccountRead, V2Market, V2Reader } from './strategy-earn-v2-chain.js';
-import { boxRewardSignature, runV2Account, strandedSmallPosition, v2Batches, v2Calls, v2KeeperCall, v2PreSellPlan, v2RouteEvents } from './strategy-earn-v2.js';
+import { boxRewardSignature, runV2Account, strandedSmallPosition, swapEventLine, swapperErrorOf, v2Batches, v2Calls, v2KeeperCall, v2PreSellPlan, v2RouteEvents, v2SwapEvents } from './strategy-earn-v2.js';
 import type { Call, PreSellPosition, RouteEvent, Step, StrategyEarnV2 } from './strategy-earn-v2.js';
-import { loanTokenNeeds, planLoanTokenSwaps } from './strategy-earn-v2-swap.js';
+import { leftoverCashOuts } from './strategy-earn-v2-swap.js';
+import type { Leftover } from './strategy-earn-v2-swap.js';
 import { rewardEvents } from './strategy-rewards.js';
 import type { RewardEvent, RewardSignature } from './strategy-rewards.js';
 
@@ -18,6 +19,11 @@ import type { RewardEvent, RewardSignature } from './strategy-rewards.js';
  * - `runV2KeeperRound`: every scheduler round, with the keeper key — `executeDeleverage` at the health line (the contract's
  *   only anyone-callable trigger) and reward tokens from the strategy box into the account (`collectRewards`).
  * Every read goes through the public-node reader; every session-key UserOp carries at most three executor calls.
+ *
+ * Cash swapper (spec §17, src/strategy-earn-v2-swap.ts): a repayment in USDC / USD1 / U the box cannot cover is topped up
+ * from the account's USDT in the same UserOp (`topUp`), and loan token left in the account once nothing is owed in it is
+ * sold for USDT (`cashOut`) — with the close, or by the next round. `PegExceeded` is an operations alert; `WindowExceeded`
+ * waits for the token's 24-hour window instead of being resent every round.
  */
 export type V2Tx = { hash: Hex; blockNumber: bigint; logs: readonly Log[] };
 export type V2Send = (calls: Call[]) => Promise<V2Tx>;
@@ -29,10 +35,71 @@ export type V2StepArgs = { v2: StrategyEarnV2; reader: V2Reader; account: Addres
   held?: readonly string[];
   /** Is yield strategy v1 still in use on this account (a position, debt or consent)? One account uses v1 or v2, never both:
    * while this answers true the round adds nothing on v2 (it only reports). */
-  v1Active?: () => Promise<boolean> };
+  v1Active?: () => Promise<boolean>;
+  /** USDT in the account that a running buy job or a withdrawal / yield reservation still needs (src/withdrawable-cash.ts):
+   * a top-up never spends it. Absent: nothing is reserved. A read that throws: no USDT is spent on top-ups this round. */
+  reservedUsdt?: () => Promise<bigint> };
 
 const shortError = (error: unknown) => String((error as Error)?.message ?? error).split('\n')[0]!.slice(0, 160);
+type SwapWatch = { peg: boolean; window: boolean; other: boolean };
+/**
+ * A session send that also (a) writes one log line per `ToppedUp` / `CashedOut` that landed (the record until the ledger
+ * has a table for them) and (b) names a cash swapper failure: `PegExceeded` -> a structured error line (alert) and a
+ * tagged error; `WindowExceeded` -> the reason, once. Everything else passes through untouched.
+ */
+function watchSwaps(args: Pick<V2StepArgs, 'v2' | 'portfolioId' | 'account' | 'log'>, send: V2Send, seen: SwapWatch): V2Send {
+  return async calls => {
+    const swaps = args.v2.swapper ? calls.some(c => isAddressEqual(c.to, args.v2.swapper!)) : false;
+    try {
+      const tx = await send(calls);
+      if (swaps) for (const e of v2SwapEvents(args.v2, tx, args.account)) args.log(swapEventLine(args.v2.chainId, args.portfolioId, e));
+      return tx;
+    } catch (error) {
+      const name = swaps ? swapperErrorOf(error) : null;
+      if (name === 'PegExceeded') {
+        seen.peg = true;
+        args.log(JSON.stringify({ level: 'error', msg: 'strategy_peg_exceeded', chainId: args.v2.chainId, portfolioId: args.portfolioId, account: args.account, detail: shortError(error) }));
+        throw new Error(`[STRATEGY_PEG_EXCEEDED] 借款幣與 USDT 的池子偏離 1:1 超過合約上限，補差額／換回現金被擋下（需要人處理，重送沒有用）：${shortError(error)}`);
+      }
+      if (name === 'WindowExceeded') {
+        if (!seen.window) args.log(`[strategy-routing] portfolio ${args.portfolioId}: 補差額被擋：這個借款幣 24 小時內的額度用完了（WindowExceeded），等視窗重開再送，不每輪重送`);
+        seen.window = true;
+        throw new Error(`[STRATEGY_TOPUP_WINDOW] 24 小時補差額額度用完：${shortError(error)}`);
+      }
+      seen.other = true;
+      throw error;
+    }
+  };
+}
+/**
+ * Loan token other than USDT left in the account with nothing owed in it (a vault's surplus, the unused part of a top-up
+ * buffer): sold for USDT with the session key, one UserOp. Returns the note for the round, or null when there is nothing
+ * to sell (or it could not be sent: logged, the next round tries again — it never blocks anything).
+ */
+async function cashOutLeftovers(args: V2StepArgs, send: V2Send | null, leftovers: readonly Leftover[]): Promise<string | null> {
+  const plan = leftoverCashOuts(args.v2, leftovers, deadlineOf(args.now));
+  for (const n of plan.unapproved) args.log(`[strategy-routing] portfolio ${args.portfolioId}: holds ${n.cashRaw} ${n.symbol} it cannot sell for USDT yet — the owner has not approved it to the cash swapper (the next consent adds it)`);
+  if (plan.calls.length === 0) return null;
+  const what = plan.sold.map(x => x.symbol).join('、');
+  if (args.dryRun || send === null) { args.log(`[strategy-routing] portfolio ${args.portfolioId}: would sell leftover ${what} for USDT (${args.dryRun ? 'dry run' : 'no routing v2 session scope yet'})`); return null; }
+  try { const tx = await send(plan.calls); return `[STRATEGY_ROUTING] 關閉後留在帳戶的 ${what} 已換回 USDT tx=${tx.hash}`; }
+  catch (error) { args.log(`[strategy-routing] portfolio ${args.portfolioId}: leftover ${what} not sold this round, the next one retries: ${shortError(error)}`); return null; }
+}
 const deadlineOf = (now: Date) => BigInt(Math.floor(now.getTime() / 1000) + 30 * 60);
+/**
+ * The USDT a top-up may spend is the account's free cash: what a running buy job or a reservation holds is taken off every
+ * quote of this read (the quotes share the account's one USDT balance).
+ */
+async function freeUsdtOnly(args: Pick<V2StepArgs, 'reservedUsdt' | 'log' | 'portfolioId'>, read: V2AccountRead): Promise<void> {
+  const quotes = Object.values(read.tokens).flatMap(t => t.swap ? [t.swap] : []);
+  if (quotes.length === 0 || !args.reservedUsdt) return;
+  let reserved: bigint | null;
+  try { reserved = await args.reservedUsdt(); } catch { reserved = null; args.log(`[strategy-routing] portfolio ${args.portfolioId}: reserved cash unreadable, no USDT is used for top-ups this round`); }
+  for (const q of quotes) q.usdtRaw = reserved === null ? 0n : q.usdtRaw > reserved ? q.usdtRaw - reserved : 0n;
+}
+/** The account's own loan tokens other than USDT, from a full account read (the same shape `reader.leftovers` answers). */
+const leftoversOf = (read: V2AccountRead): Leftover[] => Object.entries(read.tokens).filter(([, t]) => t.swap !== undefined)
+  .map(([symbol, t]) => ({ symbol, token: t.token, cashRaw: t.cashRaw, debtRaw: t.debtRaw, allowanceRaw: t.swap!.tokenAllowanceRaw }));
 async function recordRoutes(args: Pick<V2StepArgs, 'v2' | 'ledger' | 'portfolioId' | 'account' | 'log'>, m: V2Market, tx: V2Tx, reason?: string | null) {
   // A ledger failure never undoes or repeats the chain action: it is logged and the tx hash stays in the log line.
   try { await args.ledger.routes(args.v2.chainId, v2RouteEvents(args.v2, tx, { portfolioId: args.portfolioId, account: args.account, lookup: m.lookup, ...(reason === undefined ? {} : { reason }) })); }
@@ -46,28 +113,43 @@ async function recordRoutes(args: Pick<V2StepArgs, 'v2' | 'ledger' | 'portfolioI
 export async function v2AutoRound(args: V2StepArgs): Promise<string | null> {
   const { v2, reader, account } = args;
   const touched = await reader.touched(account);
-  if (!touched.enabled && touched.routes.length === 0) return null;
+  const seen: SwapWatch = { peg: false, window: false, other: false };
+  const send = args.send === null ? null : watchSwaps(args, args.send, seen);
+  if (!touched.enabled && touched.routes.length === 0) {
+    // The strategy was turned off earlier (the reward recipient outlives that): loan token a close left in the account is
+    // still sold for USDT. An account that never used v2 is not read at all.
+    if (!v2.swapper || isAddressEqual(touched.rewardRecipient, zeroAddress)) return null;
+    return cashOutLeftovers(args, send, await reader.leftovers(account));
+  }
   // Hard rule (cre8-contracts borrow-routing-v2 §12, review round 3): the contract's ForeignDebt check does not stop every
   // path, so v2 never opens, tops up or moves anything while v1 still holds something on the account.
   if (args.v1Active && await args.v1Active()) return '[STRATEGY_ROUTING] 這個帳戶還有 v1 加息部位或同意，v2 不動作（一個帳戶只用其中一種）';
   const [m, read] = await Promise.all([reader.market(), reader.account(account, (args.held ?? []) as Address[])]);
+  await freeUsdtOnly(args, read);
   const sent: Hex[] = [];
   const result = await runV2Account({ v2, portfolioId: args.portfolioId, account, snapshot: m.snapshot, state: read.state, costs: args.costs ?? V2_DEFAULT_COSTS, now: args.now.getTime(), deadline: deadlineOf(args.now),
-    limits: m.limits, dryRun: args.dryRun || args.send === null, log: args.log,
-    send: async calls => { const tx = await args.send!(calls); sent.push(tx.hash); return tx; },
+    limits: m.limits, dryRun: args.dryRun || send === null, log: args.log,
+    send: async calls => { const tx = await send!(calls); sent.push(tx.hash); return tx; },
     // executeDeleverage is the keeper round's (runV2KeeperRound): no keeper here, the step is logged as left for it.
     record: async (step: Step, tx) => recordRoutes(args, m, tx as V2Tx, step.reason) });
-  // Loan tokens other than the cash token that need a swap (dust after a close, or a gap that blocks one): planned and
-  // logged; nothing trades them on a chain where they are not tradable (src/strategy-earn-v2-swap.ts).
-  const numeraire = v2.loanTokens.USDT;
-  if (numeraire) for (const u of (await planLoanTokenSwaps(loanTokenNeeds(read, numeraire), null)).unavailable)
-    args.log(`[strategy-routing] portfolio ${args.portfolioId}: ${u.need.kind === 'gap' ? 'needs' : 'holds'} ${u.need.amountRaw} ${u.need.symbol} (${u.need.why}) — ${u.reason}`);
+  // Loan token other than USDT left in the account with nothing owed in it any more (what a close of an earlier round, or
+  // an owner-signed one, left behind): sold for USDT. After this round sent something the account is read again.
+  let cashed: string | null = null;
+  if (v2.swapper && !args.dryRun) {
+    try { cashed = await cashOutLeftovers(args, send, result.sent > 0 ? await reader.leftovers(account) : leftoversOf(read)); }
+    catch (error) { args.log(`[strategy-routing] portfolio ${args.portfolioId}: leftover loan token not read this round: ${shortError(error)}`); }
+  }
   const acted = (result.plan?.steps ?? []).filter(s => s.calls.length > 0 && s.via === 'session');
-  if (acted.length === 0) return null;
+  if (acted.length === 0) return cashed;
   const what = acted.map(s => `${s.symbol} ${s.action}(${s.reason})`).join('、');
-  if (args.dryRun || args.send === null) return `[STRATEGY_ROUTING] 可執行：${what}（${args.dryRun ? 'dry-run' : '沒有路由 v2 的 session 權限，等 owner 續期'}，未送出）`;
-  if (result.failed > 0) throw new Error(`[STRATEGY_ROUTING] ${what}：${result.sent} 筆完成、${result.failed} 筆未完成${sent.length > 0 ? ` tx=${sent.join(',')}` : ''}`);
-  return `[STRATEGY_ROUTING] 已執行：${what} tx=${sent.join(',')}${result.consentShort ? '；同意的上限不夠，等 owner 重新同意' : ''}`;
+  if (args.dryRun || send === null) return `[STRATEGY_ROUTING] 可執行：${what}（${args.dryRun ? 'dry-run' : '沒有路由 v2 的 session 權限，等 owner 續期'}，未送出）`;
+  if (result.failed > 0) {
+    const done = `${what}：${result.sent} 筆完成、${result.failed} 筆未完成${sent.length > 0 ? ` tx=${sent.join(',')}` : ''}`;
+    // Only the 24-hour top-up window stood in the way: not a failure to back off from — the plan waits for the window itself.
+    if (seen.window && !seen.peg && !seen.other) return `[STRATEGY_TOPUP_WINDOW] ${done}；補差額的 24 小時額度用完，等視窗重開`;
+    throw new Error(`${seen.peg ? '[STRATEGY_PEG_EXCEEDED] ' : ''}[STRATEGY_ROUTING] ${done}`);
+  }
+  return `[STRATEGY_ROUTING] 已執行：${what} tx=${sent.join(',')}${result.consentShort ? '；同意的上限不夠，等 owner 重新同意' : ''}${cashed ? `；${cashed}` : ''}`;
 }
 
 /**
@@ -84,7 +166,9 @@ export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tok
   const mayHoldRewards = args.exit === true && (touched.vaults.length > 0 || !isAddressEqual(touched.rewardRecipient, zeroAddress));
   if (touched.routes.length === 0 && !mayHoldRewards) return null;
   const [m, read] = await Promise.all([reader.market(), reader.account(account)]);
+  await freeUsdtOnly(args, read);
   const deadline = deadlineOf(args.now);
+  const seen: SwapWatch = { peg: false, window: false, other: false };
   const positions: PreSellPosition[] = [];
   for (const r of read.routes.filter(x => x.collateralRaw > 0n)) {
     const need = args.steps.filter(s => s.tokenIn.toLowerCase() === r.route.collateral).reduce((sum, s) => sum + s.amountIn, 0n);
@@ -93,9 +177,16 @@ export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tok
     const t = read.tokens[r.route.loanSymbol]!;
     positions.push({ symbol: r.route.symbol, collateral: r.route.collateral, freeCollateralRaw: h.freeCollateralRaw, postedRaw: r.collateralRaw, routeDebtRaw: r.routeDebtRaw,
       vaultAssetsRaw: read.vaults.filter(v => v.vault.token === r.route.loan).reduce((s, v) => s + v.assetsRaw, 0n), idleRaw: t.idleRaw, cashRaw: t.cashRaw, minDebtRaw: r.limits.minDebtRaw,
-      routeId: r.route.routeId, vaultId: (r.vault?.vaultId ?? ('0x' + '00'.repeat(32))) as Hex, venue: r.route.venue, loan: r.route.loanSymbol });
+      routeId: r.route.routeId, vaultId: (r.vault?.vaultId ?? ('0x' + '00'.repeat(32))) as Hex, venue: r.route.venue, loan: r.route.loanSymbol, ...(t.swap ? { swap: t.swap } : {}) });
   }
-  const plan = v2PreSellPlan(v2, account, positions, deadline);
+  // A route of the same token that this sale does not close keeps the token's leftover as its repayment fallback.
+  for (const p of positions) if (read.routes.some(r => r.route.loanSymbol === p.loan && r.routeDebtRaw > 0n && !positions.some(x => x.routeId === r.route.routeId))) p.lastOfToken = false;
+  const plan = v2PreSellPlan(v2, account, positions, deadline, args.now.getTime());
+  if (plan.retryAt !== undefined) args.log(`[strategy-routing] portfolio ${args.portfolioId}: 補差額的 24 小時額度用完，${new Date(plan.retryAt * 1000).toISOString()} 之後再補；這一輪先還得起的部分`);
+  // A full exit also sells loan token already sitting in the account with nothing owed in it (left by an earlier close),
+  // so the owner takes back USDT only. Tokens this plan closes are sold in the same UserOp as their close (v2PreSellPlan).
+  const closing = new Set(positions.map(p => p.loan));
+  const cashOuts = args.exit && v2.swapper ? leftoverCashOuts(v2, leftoversOf(read).filter(l => !closing.has(l.symbol)), deadline).calls : [];
   // A full exit also sends the reward tokens on (the account's own only when the owner approved them at consent). The
   // contract sends to the policy's recipient; without one it only moves box -> account, and a sweep of the account's own
   // tokens alone would revert (nothing moves), so that part is only asked for when there is a recipient.
@@ -104,15 +195,15 @@ export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tok
     const fromAccount = toOwner && r.accountRaw > 0n && r.allowanceRaw >= r.accountRaw;
     return r.boxRaw > 0n || fromAccount ? [v2Calls.sweepRewards(v2, account, r.token, fromAccount ? maxUint256 : 0n, deadline)] : [];
   }) : [];
-  if (plan.notes.length === 0 && sweeps.length === 0) return null;
-  const calls = [...plan.calls, ...sweeps];
+  if (plan.notes.length === 0 && sweeps.length === 0 && cashOuts.length === 0) return null;
+  const calls = [...plan.calls, ...cashOuts, ...sweeps];
   const blocking = plan.notes.length > 0;
   if (calls.length === 0) return `[STRATEGY_EARN_UNWINDING] ${plan.notes.join('；')}`;
   if (args.dryRun || args.send === null) {
     if (!blocking) return null;
     return `[STRATEGY_EARN_UNWINDING] 賣出前需先還款取回：${plan.notes.join('；')}（${args.dryRun ? 'dry-run' : '沒有路由 v2 的 session 權限，等 owner 續期'}，未送出）`;
   }
-  const send = args.send, txs: Hex[] = [];
+  const send = watchSwaps(args, args.send, seen), txs: Hex[] = [];
   const sendAll = async () => {
     for (const batch of v2Batches(calls)) {
       let landed: V2Tx[];
@@ -128,8 +219,8 @@ export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tok
   };
   if (!blocking) {
     // Only reward tokens to send: never a reason to hold the sale back. A failure is logged and the next exit round tries again.
-    try { await sendAll(); } catch (error) { args.log(`[strategy-routing] portfolio ${args.portfolioId} 退出：激勵代幣這一輪沒送出（不擋賣出）：${shortError(error)}`); return null; }
-    args.log(`[strategy-routing] portfolio ${args.portfolioId} 退出：激勵代幣已送到 ${toOwner ? 'owner 錢包' : '投資組合帳戶'} tx=${txs.join(',')}`); return null;
+    try { await sendAll(); } catch (error) { args.log(`[strategy-routing] portfolio ${args.portfolioId} 退出：${cashOuts.length === 0 ? '激勵代幣' : sweeps.length === 0 ? '剩餘借款幣' : '激勵代幣／剩餘借款幣'}這一輪沒送出（不擋賣出）：${shortError(error)}`); return null; }
+    args.log(`[strategy-routing] portfolio ${args.portfolioId} 退出：${sweeps.length > 0 ? `激勵代幣已送到 ${toOwner ? 'owner 錢包' : '投資組合帳戶'}` : ''}${cashOuts.length > 0 ? `${sweeps.length > 0 ? '、' : ''}剩餘借款幣已換回 USDT` : ''} tx=${txs.join(',')}`); return null;
   }
   await sendAll();
   return `[STRATEGY_EARN_UNWINDING] 賣出前已還款取回：${plan.notes.join('；')} tx=${txs.join(',')}${txs.length > 1 ? `（分 ${txs.length} 筆）` : ''}；下一輪再賣`;

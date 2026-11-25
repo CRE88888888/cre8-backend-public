@@ -5,8 +5,8 @@ import { STRATEGY_EARN_97 } from './strategy-earn-guard.js';
 import { STABLES } from './strategy-earn-mainnet.js';
 import type { RouteOption, RoutingSnapshot, RoutingVault, Stable, Venue } from './strategy-earn-mainnet.js';
 import type { RouteKey } from './strategy-earn-routing.js';
-import { V2_EXECUTOR_ABI, V2_LENS_ABI, V2_REGISTRY_ABI } from './strategy-earn-v2.js';
-import type { Call, RouteLimits, RouteLookup, StrategyEarnV2, V2AccountState, V2Holding } from './strategy-earn-v2.js';
+import { V2_EXECUTOR_ABI, V2_LENS_ABI, V2_REGISTRY_ABI, V2_SWAPPER_ABI } from './strategy-earn-v2.js';
+import type { Call, RouteLimits, RouteLookup, StrategyEarnV2, SwapQuote, V2AccountState, V2Holding } from './strategy-earn-v2.js';
 
 /**
  * Chain reads for Strategy Earn routing v2 (cre8-contracts docs/borrow-routing-v2 §6, interface draft5).
@@ -61,16 +61,21 @@ const bpsOf = (rate: bigint) => Number(rate / 10n ** 14n);
 
 type Read = { target: Address; abi: Abi; functionName: string; args?: readonly unknown[] };
 /** A decoded multicall result: the value, or null when that one call failed (missing function on a mock, a revert). */
-export type V2Multicall = (reads: readonly Read[]) => Promise<(unknown | null)[]>;
+export type V2Multicall = (reads: readonly Read[], opts?: { gas?: bigint }) => Promise<(unknown | null)[]>;
+/**
+ * Gas given to the eth_call that reads the cash swapper's `shortfall` (spec §17: it walks the box's vaults, 5.6–5.9M with
+ * a Lista vault on mainnet; short of gas it reverts, it never answers a wrong number). Never under 10M.
+ */
+export const V2_SHORTFALL_CALL_GAS = 30_000_000n;
 /** Multicall3 over eth_call, `chunk` reads per request. Throws only when the node itself fails. */
 export function v2Multicall(client: Pick<PublicClient, 'call'>, chunk = 40): V2Multicall {
-  return async reads => {
+  return async (reads, opts) => {
     const out: (unknown | null)[] = [];
     for (let i = 0; i < reads.length; i += chunk) {
       const part = reads.slice(i, i + chunk);
       const data = encodeFunctionData({ abi: MULTICALL_ABI, functionName: 'aggregate3',
         args: [part.map(r => ({ target: r.target, allowFailure: true, callData: encodeFunctionData({ abi: r.abi, functionName: r.functionName, args: r.args ?? [] } as never) }))] });
-      const res = await client.call({ to: MULTICALL3, data });
+      const res = await client.call({ to: MULTICALL3, data, ...(opts?.gas === undefined ? {} : { gas: opts.gas }) });
       if (!res.data) throw new Error('multicall returned nothing');
       const results = decodeFunctionResult({ abi: MULTICALL_ABI, functionName: 'aggregate3', data: res.data }) as readonly { success: boolean; returnData: Hex }[];
       part.forEach((r, k) => {
@@ -127,9 +132,14 @@ export type V2AccountRead = { account: Address; box: Address; state: V2AccountSt
   vaults: { vault: V2Vault; assetsRaw: bigint; since: number; shouldExit: boolean }[];
   /** Per loan token: the account's whole debt in it (`lens.tokenDebt`: Venus plus every Lista position — never a sum of
    * `routeDebt`s, spec §5), idle in the box (`lens.idleOf`), the account's own balance and its allowance to the executor. */
-  tokens: Record<string, { token: Address; debtRaw: bigint; idleRaw: bigint; cashRaw: bigint; allowanceRaw: bigint }>;
+  tokens: Record<string, { token: Address; debtRaw: bigint; idleRaw: bigint; cashRaw: bigint; allowanceRaw: bigint;
+    /** The cash swapper's numbers for this token (spec §17); absent for USDT, without a swapper, or when the token has no pool. */
+    swap?: SwapQuote }>;
+  /** What the account has approved to the cash swapper, per loan token (lowercase address); empty without a swapper. */
+  swapperAllowances: Record<string, bigint>;
   rewards: { token: Address; boxRaw: bigint; accountRaw: bigint; allowanceRaw: bigint }[];
-  /** Net value of the strategy money: vault holdings + idle − debt, loan tokens at 1 USD (18 decimals). Collateral is counted with the holdings. */
+  /** Net value of the strategy money: vault holdings + idle + loan tokens other than USDT left in the account − debt, loan
+   * tokens at 1 USD (18 decimals). Collateral is counted with the holdings. */
   earnNetUsd: bigint };
 
 /** Raw token units as a number of whole tokens (USD for a loan token), exact to 6 decimals. */
@@ -144,6 +154,7 @@ export function createV2Reader(deps: V2ReaderDeps) {
   const reg = (functionName: string, args: readonly unknown[] = []): Read => ({ target: v2.registry, abi: V2_REGISTRY_ABI, functionName, args });
   const lens = (functionName: string, args: readonly unknown[] = []): Read => ({ target: v2.lens, abi: V2_LENS_ABI, functionName, args });
   const venue = (target: Address, functionName: string, args: readonly unknown[] = []): Read => ({ target, abi: VENUE_ABI, functionName, args });
+  const swapper = (functionName: string, args: readonly unknown[] = []): Read => ({ target: v2.swapper!, abi: V2_SWAPPER_ABI, functionName, args });
   const must = <T>(v: unknown | null, what: string): T => { if (v === null || v === undefined) throw new Error('routing v2 read failed: ' + what); return v as T; };
 
   let book: V2Book | null = null, bookInflight: Promise<V2Book> | null = null;
@@ -305,6 +316,7 @@ export function createV2Reader(deps: V2ReaderDeps) {
       ...v2.rewardTokens.flatMap(t => [venue(t, 'balanceOf', [box]), venue(t, 'balanceOf', [account]), venue(t, 'allowance', [account, v2.executor])]),
       ...eligible.flatMap(t => [venue(t, 'balanceOf', [account]), ...(oracle ? [venue(oracle, 'peek', [t])] : [])]),
       ...venusLoans.map(([, vToken]) => venue(vToken, 'borrowBalanceStored', [account])),
+      ...(v2.swapper ? tokens.flatMap(([, t]) => [venue(t, 'allowance', [account, v2.swapper!]), swapper('poolOf', [t]), swapper('topUpWindowOf', [account, t])]) : []),
     ]);
     let at = 0;
     type RS = { shouldDeleverage: boolean; targetLtv: bigint; deleverageLtv: bigint; liquidationLtv: bigint; ltv: bigint; collateral: bigint; collateralValue: bigint; debt: bigint; routeDebt: bigint; principal: bigint; openedAt: bigint };
@@ -332,6 +344,24 @@ export function createV2Reader(deps: V2ReaderDeps) {
     const free = new Map<string, { freeRaw: bigint; priceE8: bigint | null }>();
     for (const t of eligible) { free.set(t, { freeRaw: must<bigint>(res[at], 'balance ' + t), priceE8: oracle ? res[at + 1] as bigint | null : null }); at += oracle ? 2 : 1; }
     const venusOwed = new Map(venusLoans.map(([symbol], i) => [symbol, (res[at + i] as bigint | null) ?? 0n]));
+    at += venusLoans.length;
+    // Cash swapper (spec §17): allowances and the pool of every loan token in the same request; `shortfall` / `topUpCap`
+    // only for the tokens the account owes, in a request of their own with enough gas for the vault walk.
+    const swapperAllowances: Record<string, bigint> = {};
+    if (v2.swapper) {
+      const usdt = v2.loanTokens.USDT?.toLowerCase();
+      const rows = tokens.map(([symbol, token], i) => ({ symbol, token, allowance: (res[at + i * 3] as bigint | null) ?? 0n, pool: res[at + i * 3 + 1] as Address | null, window: res[at + i * 3 + 2] as readonly [bigint, bigint, bigint] | null }));
+      for (const r of rows) swapperAllowances[r.token.toLowerCase()] = r.allowance;
+      const swappable = rows.filter(r => r.token.toLowerCase() !== usdt && r.pool !== null && r.pool !== zeroAddress);
+      const owing = swappable.filter(r => tokenReads[r.symbol]!.debtRaw > 0n);
+      const quotes = owing.length === 0 ? [] : await multicall(owing.flatMap(r => [swapper('shortfall', [account, r.token]), swapper('topUpCap', [account, r.token])]), { gas: V2_SHORTFALL_CALL_GAS });
+      for (const r of swappable) {
+        const k = owing.indexOf(r), gap = k < 0 ? null : quotes[k * 2] as readonly [bigint, bigint] | null, cap = k < 0 ? 0n : quotes[k * 2 + 1] as bigint | null;
+        const start = r.window ? Number(r.window[0]) : 0;
+        tokenReads[r.symbol]!.swap = { token: r.token, gapRaw: k < 0 ? 0n : gap?.[0] ?? null, capRaw: gap?.[1] ?? cap ?? 0n, windowEndsAt: start > 0 ? start + 86_400 : 0,
+          usdtRaw: usdt ? Object.values(tokenReads).find(t => t.token.toLowerCase() === usdt)?.cashRaw ?? 0n : 0n, usdtAllowanceRaw: usdt ? swapperAllowances[usdt] ?? 0n : 0n, tokenAllowanceRaw: r.allowance };
+      }
+    }
 
     // The box's holding per loan token: the vault with the most in it is "the" vault of that token's positions.
     const holdingOf = (token: Address) => vaultReads.filter(v => v.vault.token === token).sort((x, y) => (y.assetsRaw > x.assetsRaw ? 1 : y.assetsRaw < x.assetsRaw ? -1 : 0))[0] ?? null;
@@ -352,6 +382,7 @@ export function createV2Reader(deps: V2ReaderDeps) {
       const t = tokenReads[own.route.loanSymbol]!, h = holdingOf(own.route.loan);
       const since = Math.max(own.openedAt, h?.since ?? 0) * 1000;
       holdings.push({ ...base, postedRaw, routeDebtRaw: own.routeDebtRaw, vaultAssetsRaw: h?.assetsRaw ?? 0n, idleRaw: t.idleRaw, cashRaw: t.cashRaw, minDebtRaw: own.limits.minDebtRaw,
+        loan: own.route.loanSymbol, ...(t.swap ? { swap: t.swap } : {}),
         position: { route: routeKeyOf(own.route, own.vault), debtUsd: usd(own.routeDebtRaw), since: since || now(), ltvBps: own.ltvBps, deleverageLtvBps: own.deleverageLtvBps, shouldDeleverage: own.shouldDeleverage, postedUsd } });
     }
     // draft5 ForeignDebt: the account owes the token on Venus and holds no v2 Venus position in it.
@@ -359,8 +390,12 @@ export function createV2Reader(deps: V2ReaderDeps) {
     // The account's debt per token is lens.tokenDebt (draft6 §5 "how the backend reads debt"), never a sum of routeDebt.
     const debtTotal = Object.values(tokenReads).reduce((sum, t) => sum + t.debtRaw, 0n);
     const boxTotal = vaultReads.reduce((s, v) => s + v.assetsRaw, 0n) + Object.values(tokenReads).reduce((s, t) => s + t.idleRaw, 0n);
-    return { account, box, policy: { ...policy, rewardRecipient: lower(policy.rewardRecipient) }, enrollment, consent: enabled, routes: routeReads, vaults: vaultReads, tokens: tokenReads, rewards,
-      earnNetUsd: boxTotal - debtTotal,
+    // Loan tokens other than USDT sitting in the account (a vault's surplus, the unused part of a top-up buffer) are strategy
+    // money until they are sold for USDT: counted at 1 USD (spec §17 point 6). USDT in the account is the portfolio's cash.
+    const usdtToken = v2.loanTokens.USDT?.toLowerCase();
+    const leftoverTotal = v2.swapper ? Object.values(tokenReads).reduce((s, t) => s + (t.token.toLowerCase() === usdtToken ? 0n : t.cashRaw), 0n) : 0n;
+    return { account, box, policy: { ...policy, rewardRecipient: lower(policy.rewardRecipient) }, enrollment, consent: enabled, routes: routeReads, vaults: vaultReads, tokens: tokenReads, rewards, swapperAllowances,
+      earnNetUsd: boxTotal + leftoverTotal - debtTotal,
       state: { enabled, policyMaxDebtUsdRaw: policy.maxDebt, principalUsdRaw: principalUsd, holdings, ...(foreignVenusLoans.length > 0 ? { foreignVenusLoans } : {}) } };
   }
 
@@ -379,6 +414,20 @@ export function createV2Reader(deps: V2ReaderDeps) {
     async box(account: Address): Promise<{ box: Address; deployed: boolean }> {
       const [box, vaults] = await multicall([{ target: v2.executor, abi: V2_EXECUTOR_ABI, functionName: 'boxOf', args: [account] }, reg('accountVaults', [account])]);
       return { box: lower(must<Address>(box, 'boxOf')), deployed: must<Hex[]>(vaults, 'accountVaults').length > 0 };
+    },
+    /**
+     * Loan tokens other than USDT the account itself holds, with what it owes in each and what it approved to the cash
+     * swapper: one request, for an account whose routes are all closed (nothing else is read for it). [] without a swapper.
+     */
+    async leftovers(account: Address): Promise<{ symbol: Stable; token: Address; cashRaw: bigint; debtRaw: bigint; allowanceRaw: bigint }[]> {
+      if (!v2.swapper) return [];
+      const usdt = v2.loanTokens.USDT?.toLowerCase(), list = (Object.entries(v2.loanTokens) as [Stable, Address][]).filter(([, t]) => t.toLowerCase() !== usdt);
+      const res = await multicall(list.flatMap(([, t]) => [venue(t, 'balanceOf', [account]), lens('tokenDebt', [account, t]), venue(t, 'allowance', [account, v2.swapper!]), swapper('poolOf', [t])]));
+      return list.flatMap(([symbol, token], i) => {
+        const pool = res[i * 4 + 3];
+        if (typeof pool !== 'string' || pool === zeroAddress) return [];
+        return [{ symbol, token, cashRaw: must<bigint>(res[i * 4], 'balance ' + symbol), debtRaw: must<bigint>(res[i * 4 + 1], 'tokenDebt ' + symbol), allowanceRaw: (res[i * 4 + 2] as bigint | null) ?? 0n }];
+      });
     },
     /** Drop the cached market (after this process sent a transaction that changes it). */
     invalidate() { market = null; } };

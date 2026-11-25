@@ -797,3 +797,30 @@ test('My mix weight change on a deployment with a cash swapper: the re-consent a
   const { strategyEarnV2 } = await import('../src/strategy-earn-v2.js');
   assert.equal(strategyV2Addresses(strategyEarnV2(97, {}))!.cashSwapper, '0x99811a1115B36F8310deaDAda818cAE685360798'.toLowerCase());
 });
+
+test('owner turn-off of a short USDC route is one UserOp: the close that cannot be estimated without its top-up stays with it (and with the cash-out and the consent)', async () => {
+  const { AFTER_TOP_UP_GAS } = await import('../src/strategy-earn-v2-api.js');
+  const estimates: string[] = [];
+  // As on chain: the close reverts when estimated alone (the box is short until the top-up lands) -> no estimate.
+  const api = (w: ReturnType<typeof world>, estimate: (name: string) => bigint | null) => createStrategyEarnV2Api({ v2: WS, reader: createV2Reader(w.readerDeps), now: () => NOW,
+    estimateGas: async (_account, call) => { const name = fn(call); estimates.push(name); return estimate(name); } });
+  const shape = (r: { batches: Call[][] }) => r.batches.map(b => b.map(c => c.data.startsWith('0x095ea7b3') ? 'approve' : swapFn(c)));
+  const w = world(WS);
+  shortUsdc(w);
+  const off = await api(w, name => name === 'executeReduce' ? null : 400_000n).close(W.account, { symbols: ['QQQB'] });
+  if (off.status !== 'ready') throw new Error('close not ready');
+  assert.deepEqual(shape(off), [['topUp', 'executeReduce', 'cashOut', 'setStrategyPolicy']]);
+  assert.ok(AFTER_TOP_UP_GAS <= 3_000_000n);
+  // An account that still has to approve the swapper: the two approvals and the top-up fill the first UserOp, the close and the rest follow.
+  const w2 = world(WS);
+  shortUsdc(w2, { approved: false });
+  const first = await api(w2, name => name === 'executeReduce' ? null : 400_000n).close(W.account, { symbols: ['QQQB'] });
+  if (first.status !== 'ready') throw new Error('close not ready');
+  assert.deepEqual(shape(first), [['approve', 'approve', 'topUp'], ['executeReduce', 'cashOut', 'setStrategyPolicy']]);
+  // A call of unknown gas that has no top-up in front of it still goes alone, as before (a covered close whose estimate failed for another reason).
+  const w3 = world(WS);
+  shortUsdc(w3, { vault: 310n * E18 });
+  const alone = await api(w3, () => null).close(W.account, { symbols: ['QQQB'] });
+  if (alone.status !== 'ready') throw new Error('close not ready');
+  assert.deepEqual(shape(alone), [['executeReduce'], ['cashOut', 'setStrategyPolicy']]);
+});

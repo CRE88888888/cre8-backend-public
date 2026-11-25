@@ -4,7 +4,7 @@ import { planAccount } from './strategy-earn-routing.js';
 import type { Costs, Decision, Holding } from './strategy-earn-routing.js';
 import { marketIdOf } from './strategy-earn-v2-chain.js';
 import type { V2AccountRead, V2Market, V2Reader } from './strategy-earn-v2-chain.js';
-import { BORROW_BUFFER_BPS, V2_CASH_OUT_MIN_RAW, V2_SWAPPER_ABI, maxDebtFor, planExecution, strategyV2Addresses, swapEventLine, v2ConsentCalls, v2ExitBatches, v2ExitPlan, v2MissingSwapperApprovals, v2ReconsentCalls, v2RescueCall, v2CashEvents, v2RouteEvents } from './strategy-earn-v2.js';
+import { BORROW_BUFFER_BPS, V2_CASH_OUT_MIN_RAW, V2_SWAPPER_ABI, V2_SWAPPER_SELECTORS, maxDebtFor, planExecution, strategyV2Addresses, swapEventLine, v2ConsentCalls, v2ExitBatches, v2ExitPlan, v2MissingSwapperApprovals, v2ReconsentCalls, v2RescueCall, v2CashEvents, v2RouteEvents } from './strategy-earn-v2.js';
 import type { Call, ExitInput, ExitRoute, RouteEvent, StrategyEarnV2, SwapEvent, SwapQuote } from './strategy-earn-v2.js';
 import { rewardEvents } from './strategy-rewards.js';
 import type { RewardEvent } from './strategy-rewards.js';
@@ -19,6 +19,9 @@ const TEMPORARILY = 'Temporarily unavailable.';
 const E18 = 10n ** 18n;
 /** Raw token units as a number of whole tokens (USD for a loan token), exact to 6 decimals. */
 const usd = (raw: bigint, decimals = 18) => Number(raw / 10n ** BigInt(Math.max(0, decimals - 6))) / 10 ** Math.min(6, decimals);
+/** Stand-in gas for a repayment whose own estimate fails because it needs the top-up placed right before it (see `gasOf`):
+ * half of what one UserOp may add up to (V2_USER_OP_ESTIMATE_GAS), above every close measured on chain 97 (0.7–1.3M). */
+export const AFTER_TOP_UP_GAS = 3_000_000n;
 /** Testnet gas is ~0.1 gwei; the engine only needs the order of magnitude for its "30 days ≥ 3× cost" rule. */
 export const V2_DEFAULT_COSTS: Costs = { gasUsdPerTx: 0.05 };
 
@@ -71,6 +74,14 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
   const gasOf = async (account: Address, calls: readonly Call[]) => {
     const gas = new Map<string, bigint | null>();
     await Promise.all(calls.map(async c => { gas.set(c.to + c.data, c.to === v2.executor && deps.estimateGas ? await deps.estimateGas(account, c) : c.to === v2.executor ? null : 0n); }));
+    // A repayment that only works after its top-up cannot be estimated on its own (it reverts with VaultShortfall), and a
+    // call of unknown gas gets a UserOp to itself: the owner's turn-off then went out as three UserOps — top-up, close,
+    // cash-out (testnet 2026-11-25, portfolio 32). Such a call gets a stand-in figure instead, so it shares the UserOp with
+    // the top-up in front of it and the cash-out behind it; the bundler still estimates the real gas of that UserOp.
+    calls.forEach((c, i) => {
+      const before = calls[i - 1];
+      if (i > 0 && c.to === v2.executor && gas.get(c.to + c.data) === null && v2.swapper && before!.to === v2.swapper && before!.data.startsWith(V2_SWAPPER_SELECTORS[0]!)) gas.set(c.to + c.data, AFTER_TOP_UP_GAS);
+    });
     return (c: Call) => gas.get(c.to + c.data) ?? null;
   };
 

@@ -7,6 +7,8 @@ import type { V2AccountRead, V2Market, V2Reader } from './strategy-earn-v2-chain
 import { BORROW_BUFFER_BPS, V2_CASH_OUT_ALONE_MIN_RAW, V2_CASH_OUT_MIN_RAW, V2_SWAPPER_ABI, V2_SWAPPER_SELECTORS, maxDebtFor, planExecution, strategyV2Addresses, swapEventLine, v2ConsentCalls, v2ExitBatches, v2ExitPlan, v2MissingSwapperApprovals, v2ReconsentCalls, v2RescueCall, v2CashEvents, v2RouteEvents } from './strategy-earn-v2.js';
 import type { Call, ExitInput, ExitRoute, RouteEvent, StrategyEarnV2, SwapEvent, SwapQuote } from './strategy-earn-v2.js';
 import { rewardEvents } from './strategy-rewards.js';
+import { V2_CONSENT_KEY, consentIsStale, distinctCeiling } from './strategy-earn-after-sell-all.js';
+import type { ConsentBefore, ConsentSinceSellAll } from './strategy-earn-after-sell-all.js';
 import type { RewardEvent } from './strategy-rewards.js';
 
 /**
@@ -38,6 +40,10 @@ export type V2ApiDeps = { v2: StrategyEarnV2; reader: V2Reader; now: () => Date;
   cashClaims?: (account: Address) => Promise<{ claimedRaw: bigint; ownRaw: bigint }>;
   /** Cash ledger booking of a receipt's `ToppedUp` / `CashedOut` (src/strategy-cash-swaps.ts). Absent: only unclaimed USDT is offered to a top-up. */
   bookSwaps?: (portfolioId: number, account: Address, events: readonly SwapEvent[]) => Promise<unknown>;
+  /** The owner's consent requests since the account's last finished "sell all", and the writer of one (src/strategy-earn-after-sell-all.ts).
+   * Absent: every consent on chain counts and nothing is written. */
+  consentSince?: (account: Address) => Promise<ConsentSinceSellAll>;
+  noteConsent?: (account: Address, before: ConsentBefore) => Promise<void>;
   /** One structured line per cash swapper event; default: stdout. */
   log?: (line: string) => void };
 
@@ -60,11 +66,13 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
    * is never sent again: Venus (`Delegation status unchanged`) and Moolah (`already set`) revert on a delegation that
    * changes nothing, which would take the whole UserOp with it — a second consent, or any `open` after the first one.
    */
-  const consent = (m: V2Market, owner: Address, collaterals: readonly Address[], plannedDebtUsd: number, read: V2AccountRead, granted: { venus: boolean; lista: boolean }) => {
+  const consent = (m: V2Market, owner: Address, collaterals: readonly Address[], plannedDebtUsd: number, read: V2AccountRead, granted: { venus: boolean; lista: boolean }, replaces?: bigint) => {
     const planned = maxDebtFor(plannedDebtUsd), current = read.consent ? read.policy.maxDebt : 0n;
     // Never lower a ceiling that still covers open principal.
     const floor = read.state.principalUsdRaw * 11_000n / 10_000n;
-    const maxDebtUsdRaw = [planned, current, floor].reduce((a, b) => (a > b ? a : b));
+    const highest = [planned, current, floor].reduce((a, b) => (a > b ? a : b));
+    // `replaces`: the ceiling on chain this consent must be told from once it lands (a consent asked for after "sell all").
+    const maxDebtUsdRaw = replaces === undefined ? highest : distinctCeiling(highest, replaces);
     const venues = [...new Set(m.routes.filter(r => collaterals.includes(r.collateral)).map(r => r.venue))].filter(venue => !granted[venue]);
     // Cash swapper (spec §17): USDT (top-up) and the other loan tokens (cash-out) are approved to it once, with the consent.
     // Only what is missing, so an account that consented before the swapper existed signs them the next time it consents.
@@ -117,7 +125,8 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
         // The contracts this account's v2 position lives on, the same object the signing payload of a My mix weight change
         // carries (`strategyV2Addresses`): the app has no v2 address of its own (position details, pre-signature checks).
         strategyV2: strategyV2Addresses(v2)!,
-        earnNetUsd: read.earnNetUsd.toString(), autoOpen: positions.length === 0 && read.consent, positions,
+        // After a finished "sell all" the consent left on chain is not one (src/strategy-earn-after-sell-all.ts).
+        earnNetUsd: read.earnNetUsd.toString(), autoOpen: positions.length === 0 && read.consent && !(deps.consentSince && consentIsStale(await deps.consentSince(account), { [V2_CONSENT_KEY]: read.policy.maxDebt })), positions,
         rewards: read.rewards.map(r => ({ token: r.token, boxRaw: r.boxRaw.toString(), accountRaw: r.accountRaw.toString() })) };
     },
 
@@ -137,7 +146,12 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
         ? { asset: d.symbol, status: 'ready' as const, maxDebtRaw: maxDebtFor(d.targetDebtUsd).toString(), extraApyBps: d.to.extraBps }
         : { asset: d.symbol, status: 'unavailable' as const, reason: d.reason, message: TEMPORARILY });
       if (!assets.some(a => a.status === 'ready')) return { status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY, assets };
-      const c = consent(m, owner, tokens, targetOf(plan.decisions), read, await reader.delegations(account));
+      // The account sold everything earlier: this request is what makes a consent count again. It is written with the
+      // ceiling it replaces, and the new ceiling differs from it (src/strategy-earn-after-sell-all.ts).
+      const sold = deps.consentSince && deps.noteConsent ? await deps.consentSince(account) !== null : false;
+      const before = read.policy.enabled ? read.policy.maxDebt : 0n;
+      const c = consent(m, owner, tokens, targetOf(plan.decisions), read, await reader.delegations(account), sold ? before : undefined);
+      if (sold) await deps.noteConsent!(account, { [V2_CONSENT_KEY]: before.toString() });
       return { status: 'ready' as const, version: 2 as const, authorization: input.keyReady ? 'ready' as const : 'renewal_required' as const, assets, calls: c.calls, batches: [c.calls] };
     },
 

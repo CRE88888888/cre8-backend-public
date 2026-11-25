@@ -11,6 +11,8 @@ import type { V2Ledger, V2Tx } from '../src/strategy-earn-v2-scheduler.js';
 import { boxRewardSignature, cashOutMinUsdt, topUpMaxUsdtIn, v2ConsentCalls, V2_CASH_OUT_ALONE_MIN_RAW, V2_EXECUTOR_ABI, V2_REGISTRY_ABI, V2_SWAPPER_ABI } from '../src/strategy-earn-v2.js';
 import type { Call, RouteEvent, SwapEvent } from '../src/strategy-earn-v2.js';
 import type { RewardEvent } from '../src/strategy-rewards.js';
+import { V2_CONSENT_KEY } from '../src/strategy-earn-after-sell-all.js';
+import type { ConsentBefore, ConsentSinceSellAll } from '../src/strategy-earn-after-sell-all.js';
 import { toFunctionSelector } from 'viem';
 import { E18, SWAPPER, USDC_POOL, W, WORLD_NOW as NOW, WS, world } from './fixtures/v2-world.js';
 
@@ -850,4 +852,61 @@ test('owner turn-off of a short USDC route is one UserOp: the close that cannot 
   const alone = await api(w3, () => null).close(W.account, { symbols: ['QQQB'] });
   if (alone.status !== 'ready') throw new Error('close not ready');
   assert.deepEqual(shape(alone), [['executeReduce'], ['cashOut', 'setStrategyPolicy']]);
+});
+
+// ---- After "sell all" (src/strategy-earn-after-sell-all.ts; testnet portfolio 35, 2026-11-26) ----
+test('after "sell all" (routing v2 scheduler): a later buy without Earn extra is not opened by the consent left on chain; a consent asked for again and landed is; an open position is never held back', async () => {
+  const w = world(), reader = createV2Reader(w.readerDeps);
+  const sent: Call[][] = [], lines: string[] = [], led = ledger();
+  const round = (since?: ConsentSinceSellAll) => v2AutoRound({ v2: W.v2, reader, account: W.account, portfolioId: 9, now: NOW, dryRun: false, send: async (calls: Call[]) => { sent.push(calls); return tx(sent.length); },
+    ledger: led.l, log: (l: string) => lines.push(l), held: [W.NVDA], ...(since === undefined ? {} : { consentSince: async () => since }) });
+  // Everything was sold with the session key: the policy is still enabled (10,000) and the new buy's 10 NVDAB sit free.
+  consenting(w);
+  assert.deepEqual([await round([]), sent.length], [null, 0]);
+  assert.match(lines.at(-1) ?? '', /全部賣出後 owner 沒有再選加息/);
+  // Earn extra ticked at the new buy, the UserOp never landed: the chain still holds the ceiling the request was to replace.
+  assert.deepEqual([await round([{ [V2_CONSENT_KEY]: String(10_000n * E18) }]), sent.length], [null, 0]);
+  // Ticked and landed (the new ceiling is never the old one): opened as on a first buy.
+  w.state.policy = { ...w.state.policy, maxDebt: 10_000n * E18 + 1n };
+  assert.match(await round([{ [V2_CONSENT_KEY]: String(10_000n * E18) }]) ?? '', /NVDAB open\(best_route\)/);
+  assert.deepEqual([sent.length, sent[0]!.map(fn)], [1, ['executeOpen']]);
+  // An account that never finished a "sell all", and a caller without the reader: unchanged.
+  sent.length = 0;
+  assert.match(await round(null) ?? '', /NVDAB open\(best_route\)/);
+  assert.match(await round() ?? '', /NVDAB open\(best_route\)/);
+  assert.equal(sent.length, 2);
+  // A position is open (not sold out, or turned on by hand): the round manages it exactly as without the rule — in
+  // particular it is not closed as "strategy turned off".
+  const open = world(), sentOpen: Call[][] = [], linesOpen: string[] = [];
+  openVenus(open);
+  const args = (o: object) => ({ v2: W.v2, reader: createV2Reader(open.readerDeps), account: W.account, portfolioId: 9, now: NOW, dryRun: false, send: async (calls: Call[]) => { sentOpen.push(calls); return tx(sentOpen.length); },
+    ledger: led.l, log: (l: string) => linesOpen.push(l), held: [W.NVDA], ...o });
+  const plain = await v2AutoRound(args({})), plainSent = sentOpen.map(b => b.map(fn));
+  sentOpen.length = 0;
+  assert.equal(await v2AutoRound(args({ consentSince: async () => [] })), plain);
+  assert.deepEqual(sentOpen.map(b => b.map(fn)), plainSent);
+  assert.equal(linesOpen.some(l => /沒有再選加息|strategy turned off/.test(l)), false);
+});
+
+test('after "sell all" (routing v2 API): autoOpen reads off until Earn extra is chosen again; /auto writes the request with the ceiling it replaces and never repeats it', async () => {
+  const w = world(), reader = createV2Reader(w.readerDeps);
+  const notes: [Address, ConsentBefore][] = [];
+  const api = (since: ConsentSinceSellAll) => createStrategyEarnV2Api({ v2: W.v2, reader, now: () => NOW, estimateGas: async () => 700_000n,
+    consentSince: async () => since, noteConsent: async (account, before) => { notes.push([account, before]); } });
+  consenting(w);
+  const autoOpen = async (since: ConsentSinceSellAll) => (await api(since).portfolio(9, W.account)).autoOpen;
+  assert.deepEqual([await autoOpen(null), await autoOpen([]), await autoOpen([{ [V2_CONSENT_KEY]: String(10_000n * E18) }]), await autoOpen([{ [V2_CONSENT_KEY]: '0' }])], [true, false, false, true]);
+  const weights = [{ asset: W.NVDA, weightBps: 10_000 }];
+  const ceiling = async (since: ConsentSinceSellAll) => { const r = await api(since).auto(W.account, W.owner, { budgetRaw: 1_000n * E18, weights, keyReady: true });
+    if (r.status !== 'ready') throw new Error('auto not ready');
+    return (decodeFunctionData({ abi: V2_REGISTRY_ABI, data: r.calls.find(c => c.to === W.v2.registry)!.data }).args as readonly [bigint, Address, boolean])[0]; };
+  // Never sold: the ceiling already on chain is kept (it covers the plan) and nothing is written.
+  assert.deepEqual([await ceiling(null), notes.length], [10_000n * E18, 0]);
+  // Sold: one wei above the ceiling it replaces, and the request says which one that was.
+  assert.equal(await ceiling([]), 10_000n * E18 + 1n);
+  assert.deepEqual(notes, [[W.account, { [V2_CONSENT_KEY]: String(10_000n * E18) }]]);
+  // Sold and the consent had been withdrawn on chain since: nothing to tell it from.
+  w.state.policy = { ...w.state.policy, maxDebt: 0n, enabled: false };
+  assert.ok(await ceiling([]) > 0n);
+  assert.deepEqual(notes[1], [W.account, { [V2_CONSENT_KEY]: '0' }]);
 });

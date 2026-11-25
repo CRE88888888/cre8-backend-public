@@ -21,6 +21,8 @@ import type { StrategyEarnV2Api } from './strategy-earn-v2-api.js';
 import { defaultV2Reader, v2EstimateGas } from './strategy-earn-v2-chain.js';
 import { claimedCash } from './withdrawable-cash.js';
 import { settleCashSwaps } from './strategy-cash-swaps.js';
+import { consentIsStale, consentSinceSellAll, distinctCeiling, noteConsentRequest } from './strategy-earn-after-sell-all.js';
+import type { ConsentBefore, ConsentSinceSellAll } from './strategy-earn-after-sell-all.js';
 export { STRATEGY_EARN_97, assertNotStrategyVault, isStrategyVault } from './strategy-earn-guard.js';
 
 /**
@@ -353,6 +355,12 @@ export function defaultStrategyEarnChain(): StrategyEarnChain {
   return cachedChain;
 }
 
+/** Shares posted or debt on any v1 market of this account (the first half of strategyEarnV1Active). */
+async function v1Posted(chain: StrategyEarnChain, account: Address, block: bigint): Promise<boolean> {
+  const ids = await chain.accountMarkets(account, block);
+  const entered = strategyMarkets().filter(m => ids.includes(m.marketId));
+  return (await Promise.all(entered.map(async m => (await chain.collateral(m.marketId, account, block)) > 0n || (await chain.status(m.marketId, account, block)).debt > 0n))).some(Boolean);
+}
 /**
  * Does v1 (AtpBorrowExecutor) hold anything for this account: shares posted, debt, or a consent waiting for a fill?
  * One account uses v1 or routing v2, never both (cre8-contracts borrow-routing-v2 §12; the contract's ForeignDebt check does
@@ -384,6 +392,8 @@ export function defaultStrategyEarnV2Api(v2: StrategyEarnV2): StrategyEarnV2Api 
     const ledger = routeLedger((sql, params) => dbQuery(sql, params));
     api = createStrategyEarnV2Api({ v2, reader: defaultV2Reader(v2), now: () => new Date(), estimateGas: (account, call) => v2EstimateGas(v2, account, call),
       recordRoutes: (chainId, events) => ledger.record(chainId, events), recordRewards: (chainId, events) => rewardsStore().record(chainId, events),
+      consentSince: account => consentSinceSellAll(dbQuery, v2.chainId, account),
+      noteConsent: (account, before) => noteConsentRequest(dbQuery, v2.chainId, account, before),
       // An owner-signed top-up spends the portfolio's own cash and USDT no bucket of the cash ledger claims; `confirm` books it
       // (src/strategy-cash-swaps.ts), and the scheduler's recovery scan does if that call never comes.
       cashClaims: async account => { const rows = (await dbQuery(`select b.unallocated_hold_raw::text,b.stack_prefund_raw::text,b.allocated_cash_raw::text,b.reserved_input_raw::text,b.reserved_fee_raw::text,b.withdrawal_raw::text,b.yield_raw::text
@@ -458,6 +468,7 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
     return rows[0] !== undefined && v2Authorized(rows[0].permissions, account, v2.executor, v2.swapper) && sessionPermissionFlagOf(rows[0].permissions) === SESSION_PERMISSION_FLAG;
   }
   const live = async () => { try { const chain = deps.chain(); return { chain, head: await chain.head() }; } catch { return null; } };
+  const sinceSellAll = (account: Address) => consentSinceSellAll(deps.query, deps.chainId, account);
   // Where the money sits (public, for "Where your money goes"): the collateral market contract (Venus collateral vToken, or
   // Lista Moolah + market id), the USDT loan market (Venus vUSDT / the same Moolah market) and the strategy vault.
   const contracts = (m: StrategyMarket) => ({ collateralMarket: m.protocol === 'venus' ? m.collateralVToken : STRATEGY_EARN_97.listaMoolah, listaMarketId: m.listaId,
@@ -601,8 +612,9 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
       const earnNetUsd = positions.reduce((sum, p) => sum + ('earnNetUsd' in p && p.earnNetUsd !== undefined ? BigInt(p.earnNetUsd) : 0n), 0n);
       // autoOpen: the owner consented (a market's borrow policy is enabled) but nothing is posted yet — the buy has not
       // filled. The scheduler opens it after the fill (strategyEarnAutoOpen); the app shows the switch as on, "starts when your order fills".
+      // After a finished "sell all" the consent left on chain is not one (src/strategy-earn-after-sell-all.ts).
       const autoOpen = positions.some(p => p.status === 'on') ? false
-        : await consentedMarkets(chain, account, head.number, markets).then(c => c.size > 0, () => false);
+        : await consentedMarkets(chain, account, head.number, markets).then(async c => c.size > 0 && !consentIsStale(await sinceSellAll(account), Object.fromEntries(c))).catch(() => false);
       return { portfolioId: id, account, status: 'ok' as const, reason: null, message: null, updatedAt: new Date(Number(head.timestamp) * 1000).toISOString(),
         earnNetUsd: earnNetUsd.toString(), autoOpen, positions };
     },
@@ -699,6 +711,22 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
       const quoted = await consentQuotes(chain, account, head, eligible, usdtPrice, (m, price, held) =>
         budget * BigInt(weights.find(x => x.asset === m.collateral)?.weightBps ?? 0) / 10_000n * usdtPrice / 10n ** 8n + usdValue(held, price, m.decimals));
       const ready = quoted.filter((q): q is Extract<typeof q, { status: 'ready' }> => q.status === 'ready');
+      // The account sold everything earlier: this request is what makes a consent count again (src/strategy-earn-after-sell-all.ts).
+      // It is written with the ceilings it replaces, and each new ceiling differs from the one on chain.
+      if (ready.length > 0) {
+        try {
+          if (await sinceSellAll(account) !== null) {
+            const before: ConsentBefore = {};
+            const policies = await Promise.all(ready.map(q => chain.policy(account, q.market.marketId, head.number)));
+            ready.forEach((q, i) => {
+              const was = policies[i]!.enabled ? policies[i]!.maxDebt : 0n;
+              before[q.market.marketId] = was.toString();
+              q.maxDebtRaw = distinctCeiling(q.maxDebtRaw, was);
+            });
+            await noteConsentRequest(deps.query, deps.chainId, account, before);
+          }
+        } catch { return { status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY }; }
+      }
       const assets = quoted.map(q => q.status === 'ready' ? { asset: q.market.symbol, status: q.status, maxDebtRaw: q.maxDebtRaw.toString(), extraApyBps: q.extraApyBps }
         : { asset: q.market.symbol, status: q.status, reason: q.reason, message: TEMPORARILY });
       if (ready.length === 0) return { status: 'unavailable' as const, reason: eligible.length === 0 ? 'no_eligible_asset' : 'data_unavailable', message: TEMPORARILY, assets };
@@ -1078,7 +1106,9 @@ export type StrategyEarnStepArgs = { chain: StrategyEarnChain; account: Address;
   /** Markets the session key may call (its installed ONE_OF list); absent = every market. A key renewed before
    * cre8-contracts#67 holds only the five #65 markets: calls for the others would fail the whole UserOp. */
   sendable?: readonly Hex[];
-  ledger: StrategyEarnLedger; log: (line: string) => void };
+  ledger: StrategyEarnLedger; log: (line: string) => void;
+  /** The owner's consent requests since the account's last finished "sell all" (src/strategy-earn-after-sell-all.ts). Absent: every consent counts. */
+  consentSince?: () => Promise<ConsentSinceSellAll> };
 /**
  * One session-key UserOp carries at most this many markets. A UserOp is capped at MAX_USER_OP_GAS (14M) and the sender
  * doubles the estimated call gas, so one UserOp for a whole portfolio stopped fitting at about seven markets
@@ -1151,6 +1181,12 @@ export async function strategyEarnAutoOpen(args: StrategyEarnStepArgs): Promise<
   // Consent given under the current enrollment only: after a My mix weight change, consent from before it is void on chain.
   const consented = await consentedMarkets(chain, account, head.number, candidates);
   if (consented.size === 0) return null;
+  // Everything was sold and the owner has not chosen Earn extra again: the consent left on chain opens nothing. An
+  // account that has something posted (bought more, or turned on by hand) is never held back.
+  if (args.consentSince && consentIsStale(await args.consentSince(), Object.fromEntries(consented)) && !await v1Posted(chain, account, head.number)) {
+    args.log(`[strategy-earn] portfolio ${args.portfolioId}: 全部賣出後 owner 沒有再選加息，鏈上留著的舊同意不算，這一輪不開`);
+    return null;
+  }
   const usdtPrice = await chain.price(TESTNET_97.contracts.usdt as Address, head.number);
   const calls: Call[] = [];
   const opened: string[] = [];

@@ -9,6 +9,8 @@ import { leftoverCashOuts } from './strategy-earn-v2-swap.js';
 import type { Leftover } from './strategy-earn-v2-swap.js';
 import { rewardEvents } from './strategy-rewards.js';
 import type { RewardEvent, RewardSignature } from './strategy-rewards.js';
+import { V2_CONSENT_KEY, consentIsStale } from './strategy-earn-after-sell-all.js';
+import type { ConsentSinceSellAll } from './strategy-earn-after-sell-all.js';
 
 /**
  * Routing v2 in the scheduler (cre8-contracts docs/borrow-routing-v2, draft5). Three entry points, all for one account:
@@ -60,7 +62,9 @@ export type V2StepArgs = { v2: StrategyEarnV2; reader: V2Reader; account: Addres
   /** The round could not finish a repayment for lack of USDT: this much more of it is needed in the account (raw). */
   onCashNeed?: (usdtRaw: bigint) => void;
   /** A top-up or a cash-out was refused with PegExceeded (the alert: src/alerts.ts noteStrategyPegExceeded). */
-  onPegExceeded?: (detail: string) => void };
+  onPegExceeded?: (detail: string) => void;
+  /** The owner's consent requests since the account's last finished "sell all" (src/strategy-earn-after-sell-all.ts). Absent: every consent counts. */
+  consentSince?: () => Promise<ConsentSinceSellAll> };
 
 const shortError = (error: unknown) => String((error as Error)?.message ?? error).split('\n')[0]!.slice(0, 160);
 type SwapWatch = { peg: boolean; window: boolean; other: boolean };
@@ -191,6 +195,13 @@ export async function v2AutoRound(args: V2StepArgs): Promise<string | null> {
   if (args.v1Active && await args.v1Active()) return '[STRATEGY_ROUTING] 這個帳戶還有 v1 加息部位或同意，v2 不動作（一個帳戶只用其中一種）';
   const [m, read] = await Promise.all([reader.market(), reader.account(account, (args.held ?? []) as Address[])]);
   await spendableUsdtOnly(args, read);
+  // Everything was sold and the owner has not chosen Earn extra again: the consent left on chain opens nothing (the
+  // round goes on as for an account without consent). An account with a position is never held back.
+  if (read.state.enabled && args.consentSince && !read.routes.some(r => r.collateralRaw > 0n || r.routeDebtRaw > 0n)
+    && consentIsStale(await args.consentSince(), { [V2_CONSENT_KEY]: read.policy.maxDebt })) {
+    read.state.enabled = false;
+    args.log(`[strategy-routing] portfolio ${args.portfolioId}: 全部賣出後 owner 沒有再選加息，鏈上留著的舊同意不算，這一輪不開`);
+  }
   const sent: Hex[] = [];
   const result = await runV2Account({ v2, portfolioId: args.portfolioId, account, snapshot: m.snapshot, state: read.state, costs: args.costs ?? V2_DEFAULT_COSTS, now: args.now.getTime(), deadline: deadlineOf(args.now),
     limits: m.limits, dryRun: args.dryRun || send === null, log: args.log,

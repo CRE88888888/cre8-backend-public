@@ -25,7 +25,7 @@ import type { AssetExecution } from './strategy-execution.js';
 import { reservedCash, withdrawableCash } from './withdrawable-cash.js';
 import { rpcTransport } from './rpc-transport.js';
 import { accountHoldsOnlyCash, pausedBySellAll, RESUME_AFTER_SELL_ALL_SQL } from './sell-all-resume.js';
-import { CANCEL_SELL_ALL_SQL, NEW_MONEY_ENDS_SELL_ALL_SQL } from './sell-all-intent.js';
+import { CANCEL_SELL_ALL_SQL, FINISH_SELL_ALL_SQL, NEW_MONEY_ENDS_SELL_ALL_SQL } from './sell-all-intent.js';
 
 export type FundingSource = { kind: 'faucet_claim'; claimId: string } | { kind: 'welcome_grant'; grantId: string }
   | { kind: 'wallet_transfer'; txHash: Hex }
@@ -315,6 +315,9 @@ export function createPortfolioStrategyService(overrides: Partial<PortfolioStrat
           allocation?.effectiveAllocation ? JSON.stringify(allocation.effectiveAllocation) : null, allocation?.allocationReason ?? 'version', JSON.stringify(allocation?.cappedAssets ?? [])]);
       // New money wakes an idle-backed-off portfolio (scheduler IDLE_BACKOFF_SECONDS) for the next round.
       if (inserted.rows.length === 1) await client.query('update portfolios set next_run_at=null where id=$1', [id]);
+      // Paused and nothing but cash left: a "sell all" that is still open has in fact sold everything. It is closed as
+      // finished here (not as cancelled just below), so the consent left on chain no longer counts (src/strategy-earn-after-sell-all.ts).
+      if (inserted.rows.length === 1 && resume) await client.query(FINISH_SELL_ALL_SQL, [id]);
       if (inserted.rows.length === 1 && resume) await client.query(RESUME_AFTER_SELL_ALL_SQL, [id]);
       // The same new money while a "sell all" is still unfinished ends that request (src/sell-all-intent.ts).
       if (inserted.rows.length === 1 && source.kind !== 'dca_tranche') await client.query(NEW_MONEY_ENDS_SELL_ALL_SQL, [id]);

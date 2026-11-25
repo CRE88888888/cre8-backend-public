@@ -7,6 +7,9 @@ import { closePool, getPool, migrate, query } from '../src/db.js';
 import { claimDuePortfolios } from '../src/scheduler.js';
 import { singlePortfolioClaim } from '../src/operator.js';
 import { CANCEL_SELL_ALL_SQL, NEW_MONEY_ENDS_SELL_ALL_SQL, SELL_ALL_KIND, SELL_ALL_OF_PORTFOLIO_SQL, requestSellAll, sellAllRetryAt, settleSellAll, sharesTakenBack, withdrawSellAll } from '../src/sell-all-intent.js';
+import { FINISH_SELL_ALL_SQL } from '../src/sell-all-intent.js';
+import { RESUME_AFTER_SELL_ALL_SQL } from '../src/sell-all-resume.js';
+import { CONSENT_REQUEST_KIND, consentIsStale, consentSinceSellAll, noteConsentRequest } from '../src/strategy-earn-after-sell-all.js';
 import { canonicalConfigHash, validateAssetConfig } from '../src/strategy-execution.js';
 import type { Allocation } from '../src/strategies.js';
 import { TESTNET_97 } from '../src/testnet-profile.js';
@@ -278,3 +281,48 @@ test('sell all request: a My mix that already exits on its own (exiting, exited,
     client.release();
   }
 });
+
+test('Earn extra after "sell all" (real Postgres): a finished sale is found by account, the owner\'s consent requests since then are read back, a cancelled sale changes nothing', { skip: !DB }, tidy(async () => {
+  await migrate();
+  const id = await portfolio({ state: 'paused' });
+  const account = (await query<{ address: string }>('select address from smart_accounts where portfolio_id=$1', [id])).rows[0]!.address as Address;
+  const since = () => consentSinceSellAll(query, 97, account.toUpperCase().replace('0X', '0x') as Address);
+  // Never sold: every consent counts (null). A request written now is older than any later sale.
+  assert.equal(await since(), null);
+  await noteConsentRequest(query, 97, account, { v2: '7' });
+  // A request the owner cancelled by buying again while assets were still held is not a finished sale.
+  await requestSellAll(run, 97, id);
+  await query(CANCEL_SELL_ALL_SQL, [id]);
+  assert.equal(await since(), null);
+  // Finished by the scheduler / `/close`: sold, and nothing asked for since.
+  await requestSellAll(run, 97, id);
+  await settleSellAll(run, id, { outcome: 'noop', over: true, tracked: true });
+  assert.deepEqual(await since(), []);
+  assert.equal(consentIsStale(await since(), { v2: 5n }), true);
+  // The owner ticks Earn extra at the next buys: each request is a row, kept in order, with what it replaces.
+  await noteConsentRequest(query, 97, account, { v2: '5' });
+  await noteConsentRequest(query, 97, account, { v2: '5' });
+  await noteConsentRequest(query, 97, account, { [`0x${'ab'.repeat(32)}`]: '0' });
+  assert.deepEqual(await since(), [{ v2: '5' }, { v2: '5' }, { [`0x${'ab'.repeat(32)}`]: '0' }]);
+  assert.deepEqual([consentIsStale(await since(), { v2: 5n }), consentIsStale(await since(), { v2: 6n })], [true, false]);
+  const rows = (await query<{ kind: string; state: string; dedup_key: string }>("select kind,state,dedup_key from user_notifications where portfolio_id=$1 and kind=$2 order by id", [id, CONSENT_REQUEST_KIND])).rows;
+  assert.deepEqual(rows.map(r => `${r.dedup_key.replace(`${id}:`, '#')} ${r.state}`), ['#1 pending', '#2 pending', '#3 pending', '#4 pending']);
+  // New money into a paused account that holds nothing but cash while the request is still open (funding lot / DCA
+  // deposit): the request ends as finished — not as cancelled — and the portfolio is resumed. Sold again: nothing since.
+  await requestSellAll(run, 97, id);
+  await query(FINISH_SELL_ALL_SQL, [id]);
+  await query(RESUME_AFTER_SELL_ALL_SQL, [id]);
+  await query(NEW_MONEY_ENDS_SELL_ALL_SQL, [id]);
+  assert.deepEqual((await requests(id)).slice(-1), ['#3 delivered']);
+  assert.equal((await state(id)).schedule_state, 'active');
+  assert.deepEqual(await since(), []);
+  // Another account's rows are never read.
+  const other = await portfolio();
+  const otherAccount = (await query<{ address: string }>('select address from smart_accounts where portfolio_id=$1', [other])).rows[0]!.address as Address;
+  assert.equal(await consentSinceSellAll(query, 97, otherAccount), null);
+  // A portfolio without a cash ledger row cannot hold a request: nothing is written, nothing fails.
+  const bare = await portfolio({ ledger: false });
+  const bareAccount = (await query<{ address: string }>('select address from smart_accounts where portfolio_id=$1', [bare])).rows[0]!.address as Address;
+  await noteConsentRequest(query, 97, bareAccount, { v2: '1' });
+  assert.equal((await query('select 1 from user_notifications where portfolio_id=$1', [bare])).rows.length, 0);
+}));

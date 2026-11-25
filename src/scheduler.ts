@@ -23,6 +23,7 @@ import { runV2KeeperRound, v2AutoRound, v2RewardHolders, v2UnwindForSale } from 
 import { SELL_ALL_OPEN_SQL, sellAllOver, sellAllRetryAt, settleSellAll } from './sell-all-intent.js';
 import type { V2Ledger, V2UnwindWait } from './strategy-earn-v2-scheduler.js';
 import { rewardsStore } from './strategy-rewards.js';
+import { consentSinceSellAll } from './strategy-earn-after-sell-all.js';
 import { dbStrategyEarnLedger, defaultStrategyEarnChain, runStrategyEarnRound, strategyEarnAutoOpen, strategyEarnUnwindForSale, strategyEarnV1Active, strategyKeeperWriter } from './strategy-earn.js';
 import type { Call as StrategyEarnCall, StrategyEarnSend, StrategyEarnTx } from './strategy-earn.js';
 import { assertUserOpCapacity, boundedCallGasLimit, executionBatchSize, MAX_USER_OP_STEPS, userOpGasOverhead } from './execution-batch.js';
@@ -1717,7 +1718,8 @@ function defaultStrategyEarnSteps(deps: ResolvedDeps): NonNullable<SchedulerDeps
   const args = async (due: DuePortfolio, dryRun: boolean, held?: readonly string[]) => {
     const key = dryRun ? null : await session(due);
     return { chain: defaultStrategyEarnChain(), account: due.account, portfolioId: due.portfolioId, now: deps.clock(), dryRun, ...(held === undefined ? {} : { held }),
-      send: key?.send ?? null, ...(key?.markets === undefined ? {} : { sendable: key.markets }), ledger: dbStrategyEarnLedger, log: deps.log };
+      send: key?.send ?? null, ...(key?.markets === undefined ? {} : { sendable: key.markets }), ledger: dbStrategyEarnLedger, log: deps.log,
+      consentSince: () => consentSinceSellAll(deps.query, deps.chainId, due.account) };
   };
   // Routing v2 (src/strategy-earn-v2-scheduler.ts): only for accounts of an owner in the v2 audience (a canary list today).
   // For everyone else `v2Of` is null after one cached owner lookup and nothing below runs. One account is on v1 or on v2,
@@ -1737,6 +1739,7 @@ function defaultStrategyEarnSteps(deps: ResolvedDeps): NonNullable<SchedulerDeps
         from strategy_cash_balances where chain_id = $1 and portfolio_id = $2`, [deps.chainId, due.portfolioId])).rows as Record<string, unknown>[];
         return { claimedRaw: rows.reduce((sum, row) => sum + claimedCash(row), 0n), ownRaw: rows.reduce((sum, row) => sum + BigInt(String(row.allocated_cash_raw)), 0n) }; },
       onPegExceeded: (detail: string) => noteStrategyPegExceeded(due.portfolioId, detail, deps.clock()),
+      consentSince: () => consentSinceSellAll(deps.query, deps.chainId, due.account),
       recoverSwaps: () => recoverCashSwaps({ reader: v2LogReader(v2), run: deps.withTransaction, box: async () => (await defaultV2Reader(v2).box(due.account)).box }, v2, { chainId: deps.chainId, portfolioId: due.portfolioId, account: due.account }),
       send: usable === null ? null : (calls: StrategyEarnCall[]) => sendStrategyEarnWithSessionKey(due.account, usable, calls, v2.swapper ? [v2.executor, v2.swapper] : [v2.executor]),
       ledger: { ...v2SchedulerLedger(deps.query), swaps: (portfolioId: number, account: Address, events) => settleCashSwaps(deps.withTransaction, v2, { chainId: deps.chainId, portfolioId, account }, events) } satisfies V2Ledger, log: deps.log };

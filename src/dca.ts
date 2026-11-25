@@ -23,7 +23,7 @@ import type { SavedYieldOperation, YieldEvidence, YieldOperationJournal, YieldPl
 import { yieldSessionAvailable } from './yield-session.js';
 import { rpcTransport } from './rpc-transport.js';
 import { accountHoldsOnlyCash, pausedBySellAll, RESUME_AFTER_SELL_ALL_SQL } from './sell-all-resume.js';
-import { NEW_MONEY_ENDS_SELL_ALL_SQL, SELL_ALL_OF_PORTFOLIO_SQL } from './sell-all-intent.js';
+import { FINISH_SELL_ALL_SQL, NEW_MONEY_ENDS_SELL_ALL_SQL, SELL_ALL_OF_PORTFOLIO_SQL } from './sell-all-intent.js';
 
 /**
  * DCA (定投, docs/dca.zh-TW.md, db 0064). The user moves the whole total into the portfolio's own smart account,
@@ -364,7 +364,9 @@ export function createDca(overrides: Partial<DcaDeps> = {}) {
           where id=$1 and state='awaiting_deposit'`, [plan.id, deposited.toString(), hash]);
         // "Sell all" paused this portfolio and a paused portfolio's DCA waits in the vault ([DCA_PORTFOLIO_PAUSED]): the
         // owner's deposit resumes it (src/sell-all-resume.ts), so the periods are bought like on a first buy.
-        if (await pausedBySellAll(p, deps.holdsOnlyCash)) await deps.query(RESUME_AFTER_SELL_ALL_SQL, [id]);
+        // Nothing but cash left: a "sell all" that is still open has sold everything and is closed as finished, not as
+        // cancelled (src/strategy-earn-after-sell-all.ts).
+        if (await pausedBySellAll(p, deps.holdsOnlyCash)) { await deps.query(FINISH_SELL_ALL_SQL, [id]); await deps.query(RESUME_AFTER_SELL_ALL_SQL, [id]); }
         // The same deposit while a "sell all" is still unfinished ends that request (src/sell-all-intent.ts).
         await deps.query(NEW_MONEY_ENDS_SELL_ALL_SQL, [id]);
         return { status: 'confirmed' as const, state: 'active' };

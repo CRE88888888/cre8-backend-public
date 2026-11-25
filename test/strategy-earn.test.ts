@@ -10,8 +10,11 @@ import { MemoryRateLimitStore, RequestRateLimiter } from '../src/ratelimit.js';
 import { createServer } from '../src/server.js';
 import {
   assertNotStrategyVault, borrowPlan, closeCalls, createStrategyEarn, extraApy, isStrategyVault, openCalls, runStrategyEarnRound, strategyEarnDrillAccounts,
-  STRATEGY_EARN_97 as S, STRATEGY_EARN_ABI, strategyMarkets, usdValue,
+  STRATEGY_EARN_97 as S, STRATEGY_EARN_ABI, strategyEarnAutoOpen, strategyMarkets, usdValue,
 } from '../src/strategy-earn.js';
+import { SOLD_KIND, V2_CONSENT_KEY, consentIsStale, distinctCeiling } from '../src/strategy-earn-after-sell-all.js';
+import type { ConsentSinceSellAll } from '../src/strategy-earn-after-sell-all.js';
+import { SELL_ALL_KIND } from '../src/sell-all-intent.js';
 import type { StatusReading, StrategyEarnChain, StrategyKeeperWriter } from '../src/strategy-earn.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
 import { yieldProfile } from '../src/yield-domain.js';
@@ -277,7 +280,7 @@ test('#199 HTTP: public markets with short cache; portfolio routes need login; 4
 
 test('portfolio view: autoOpen = consented (policy enabled) but nothing posted yet, so the app keeps the switch on until the fill', async () => {
   const base: Fake = { statuses: Object.fromEntries(markets.map(m => [m.marketId, status()])), ids: [], held: 0n, collateral: 0n, prices: {}, rewards: { vault: 0n, collateral: 0n } };
-  const view = (f: Fake) => createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio() as never }).portfolio(3, account);
+  const view = (f: Fake) => createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio() as never, query: (async () => ({ rows: [] })) as never }).portfolio(3, account);
   const none = await view(base);
   assert.equal('autoOpen' in none && none.autoOpen, false);
   const armed = await view({ ...base, policies: { [nvda.marketId]: { maxDebt: 100n * E18, enabled: true } } });
@@ -368,4 +371,74 @@ test('routing v2 behind the same endpoints: only an owner in the v2 audience rea
   broken = true;
   assert.deepEqual([(await mine.portfolio(3, canary)).status, (await mine.auto(3, canary, { budgetRaw: '5' })).status, (await mine.close(3, canary, { asset: 'NVDAB' })).status,
     (await mine.open(3, canary, { asset: 'NVDAB', collateralRaw: '1' })).status], ['unavailable', 'unavailable', 'unavailable', 'unavailable']);
+});
+
+// ---- After "sell all" (src/strategy-earn-after-sell-all.ts): the consent left on chain is not the buyer's choice ----
+test('after "sell all": a consent counts again only when a request made since then landed (the ceiling on chain changed); never sold = every consent counts', () => {
+  assert.equal(SOLD_KIND, SELL_ALL_KIND);
+  const chain = { [nvda.marketId]: 1000n * E18 };
+  assert.equal(consentIsStale(null, chain), false, 'no finished sell all');
+  assert.equal(consentIsStale([], chain), true, 'sold, Earn extra not chosen again');
+  assert.equal(consentIsStale([{ [nvda.marketId]: String(1000n * E18) }], chain), true, 'asked, never signed: the chain is as it was');
+  assert.equal(consentIsStale([{ [nvda.marketId]: String(1000n * E18) }, { [nvda.marketId]: String(900n * E18) }], chain), false, 'one of the requests landed');
+  assert.equal(consentIsStale([{ [nvda.marketId]: '0' }], chain), false, 'there was no consent before it');
+  assert.equal(consentIsStale([{ [qqq.marketId]: '0' }], chain), true, 'a request for another market');
+  assert.equal(consentIsStale([{ [nvda.marketId]: 'x' }], chain), true);
+  assert.equal(consentIsStale([{ [V2_CONSENT_KEY]: '5' }], { [V2_CONSENT_KEY]: 0n }), true, 'nothing usable on chain');
+  assert.deepEqual([distinctCeiling(5n, 5n), distinctCeiling(5n, 4n), distinctCeiling(5n, 0n)], [6n, 5n, 5n]);
+});
+
+test('after "sell all" (v1 scheduler): a later buy without Earn extra is not posted; with it (consent landed) it is; buying more while a position is open works as before', async () => {
+  const stale = { [nvda.marketId]: { maxDebt: 1000n * E18, enabled: true } };
+  const sold: Fake = { statuses: Object.fromEntries(markets.map(m => [m.marketId, status()])), ids: [], held: 10n * E18, collateral: 0n,
+    prices: { [nvda.collateral]: 100n * 10n ** 8n }, rewards: { vault: 0n, collateral: 0n }, policies: stale };
+  const sent: unknown[][] = [];
+  const open = (f: Fake, since?: ConsentSinceSellAll) => strategyEarnAutoOpen({ chain: fakeChain(f), account, portfolioId: 3, now: new Date('2026-11-26T00:00:00Z'), dryRun: false, held: [nvda.collateral],
+    send: async calls => { sent.push(calls); return tx0; }, ledger: noLedger, log: () => {}, ...(since === undefined ? {} : { consentSince: async () => since }) });
+  // Sold everything, bought again without Earn extra (the app sends nothing): the old consent opens nothing.
+  assert.deepEqual([await open(sold, []), sent.length], [null, 0]);
+  // Earn extra was ticked but the consent never landed (the chain still holds the ceiling the request was about to replace).
+  assert.deepEqual([await open(sold, [{ [nvda.marketId]: String(1000n * E18) }]), sent.length], [null, 0]);
+  // Ticked and landed: the scheduler posts and borrows as on a first buy.
+  assert.match(await open({ ...sold, policies: { [nvda.marketId]: { maxDebt: 1000n * E18 + 1n, enabled: true } } }, [{ [nvda.marketId]: String(1000n * E18) }]) ?? '', /已自動開啟：NVDAB/);
+  assert.equal(sent.length, 1);
+  // Not sold out — a position is open and the owner bought more: the new shares follow it, request or not.
+  assert.match(await open({ ...sold, ids: [nvda.marketId], collateral: 5n * E18 }, []) ?? '', /已自動開啟：NVDAB/);
+  // An account that never finished a "sell all", and a caller without the reader: unchanged.
+  assert.match(await open(sold, null) ?? '', /已自動開啟：NVDAB/);
+  assert.match(await open(sold) ?? '', /已自動開啟：NVDAB/);
+  assert.equal(sent.length, 4);
+});
+
+test('after "sell all" (v1 API): autoOpen reads off until Earn extra is chosen again; /auto writes the request with the ceilings it replaces and never repeats one', async () => {
+  const f: Fake = { statuses: Object.fromEntries(markets.map(m => [m.marketId, status()])), ids: [], held: 0n, collateral: 0n, prices: { [nvda.collateral]: 100n * 10n ** 8n },
+    rewards: { vault: 0n, collateral: 0n }, weights: [{ asset: nvda.collateral, weightBps: 10_000 }], policies: { [nvda.marketId]: { maxDebt: 100n * E18, enabled: true } } };
+  const written: unknown[][] = [];
+  const earn = (f: Fake, since: ConsentSinceSellAll) => createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio() as never, v2: null,
+    query: (async (sql: string, params?: unknown[]) => {
+      if (sql.includes('insert into user_notifications')) { written.push(params ?? []); return { rows: [] }; }
+      return { rows: sql.includes('jsonb_agg') && since !== null ? [{ requests: since }] : [] };
+    }) as never });
+  const autoOpen = async (f: Fake, since: ConsentSinceSellAll) => { const v = await earn(f, since).portfolio(3, account); return 'autoOpen' in v && v.autoOpen; };
+  // Portfolio 15 (2026-11-26): everything sold, nothing posted, the policy still enabled -> it read `true`.
+  assert.deepEqual([await autoOpen(f, null), await autoOpen(f, []), await autoOpen(f, [{ [nvda.marketId]: String(100n * E18) }]), await autoOpen(f, [{ [nvda.marketId]: '0' }])], [true, false, false, true]);
+  // Never sold: /auto writes nothing and the ceiling is the planned one.
+  const first = await earn(f, null).auto(3, account, { budgetRaw: String(1000n * E18) });
+  assert.equal(first.status, 'ready');
+  const quoted = 'assets' in first ? first.assets?.[0] : undefined;
+  const planned = BigInt(quoted && 'maxDebtRaw' in quoted && quoted.maxDebtRaw ? quoted.maxDebtRaw : '0');
+  assert.ok(planned > 0n); assert.equal(written.length, 0);
+  // Sold, and the chain still holds exactly that ceiling: the new consent is one wei above it, and the request says what it replaces.
+  const same = { ...f, policies: { [nvda.marketId]: { maxDebt: planned, enabled: true } } };
+  const again = await earn(same, []).auto(3, account, { budgetRaw: String(1000n * E18) });
+  assert.equal(again.status, 'ready');
+  if (again.status !== 'ready' || !('calls' in again)) throw new Error('auto not ready');
+  assert.deepEqual(again.assets.map(a => 'maxDebtRaw' in a ? a.maxDebtRaw : null), [String(planned + 1n)]);
+  const policy = again.calls.map(c => decodeFunctionData({ abi: STRATEGY_EARN_ABI, data: c.data })).find(c => c.functionName === 'setBorrowPolicy');
+  assert.deepEqual(policy?.args, [nvda.marketId, planned + 1n, true]);
+  assert.deepEqual(written, [[97, account, JSON.stringify({ [nvda.marketId]: String(planned) })]]);
+  // The request cannot be written: no consent is handed out (it would never count).
+  const broken = createStrategyEarn({ chainId: 97, chain: () => fakeChain(same), owned: ownedPortfolio() as never, v2: null,
+    query: (async (sql: string) => { if (sql.includes('insert into user_notifications')) throw new Error('db down'); return { rows: sql.includes('jsonb_agg') ? [{ requests: [] }] : [] }; }) as never });
+  assert.equal((await broken.auto(3, account, { budgetRaw: String(1000n * E18) })).status, 'unavailable');
 });

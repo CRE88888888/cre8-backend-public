@@ -69,3 +69,23 @@ test('#76 renewal approvals: USDT, the strategy assets, held tokens and what the
   }
   assert.deepEqual(await chainExecutorApprovals({ chainId: 56, account: ACCOUNT, executor: NEW, strategyId: 7, publicClient: {} as PublicClient }, db), []);
 });
+
+test('#76 My mix: a renewal plus approvals to the current executor is a migration only for a legacy key, only profile tokens, max amount', async () => {
+  const { mixExecutorMigration } = await import('../src/paymaster.js');
+  const { encodeFunctionData: enc } = await import('viem');
+  const c = { chainId: 97, executor: NEW } as never;
+  const sender = ACCOUNT;
+  const pair = [{ target: sender, value: 0n, callData: '0x01' as const }, { target: sender, value: 0n, callData: '0x02' as const }];
+  const approve = (token: string, spender: Address = NEW, amount = maxUint256) =>
+    ({ target: token as Address, value: 0n, callData: enc({ abi: erc20Abi, functionName: 'approve', args: [spender, amount] }) });
+  const usdt = TESTNET_97.contracts.usdt;
+  const legacy = describePolicies({ executorAddress: OLD, chainId: 97 }), current = describePolicies({ executorAddress: NEW, chainId: 97 });
+  const db = (permissions: unknown) => (async () => ({ rows: [{ permissions }] }));
+  assert.equal(await mixExecutorMigration(sender, [...pair, approve(usdt)], c, db(legacy)), true);
+  assert.equal(await mixExecutorMigration(sender, [...pair, approve(usdt)], c, db(current)), false, 'a current key needs no migration');
+  assert.equal(await mixExecutorMigration(sender, [...pair, approve(usdt, OLD)], c, db(legacy)), false, 'only the current executor');
+  assert.equal(await mixExecutorMigration(sender, [...pair, approve(usdt, NEW, 5n)], c, db(legacy)), false, 'only the max amount');
+  assert.equal(await mixExecutorMigration(sender, [...pair, approve('0x000000000000000000000000000000000000beef')], c, db(legacy)), false, 'only profile tokens');
+  assert.equal(await mixExecutorMigration(sender, [approve(usdt)], c, db(legacy)), false, 'the renewal pair must lead');
+  assert.equal(await mixExecutorMigration(sender, [...pair, approve(usdt)], { chainId: 56, executor: NEW } as never, db(legacy)), false);
+});

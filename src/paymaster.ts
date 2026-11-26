@@ -25,7 +25,7 @@ import type { PoolClient } from 'pg';
 import { query, withTransaction } from './db.js';
 import { AppError } from './errors.js';
 import { TESTNET_97, testnetAssets } from './testnet-profile.js';
-import { SESSION_GAS_ALLOWED_WEI, SESSION_PERMISSION_FLAG, sessionCallPermissions } from './permissions.js';
+import { keyNeedsExecutorRenewal, SESSION_GAS_ALLOWED_WEI, SESSION_PERMISSION_FLAG, sessionCallPermissions } from './permissions.js';
 import { YIELD_REGISTRY_ABI } from './yield-abi.js';
 import { BORROW_CALL_ABI, isStrategyMarketId, isStrategyVault, STRATEGY_EARN_97 } from './strategy-earn-guard.js';
 import { MAX_USER_OP_GAS } from './execution-batch.js';
@@ -408,6 +408,25 @@ export function validateSponsoredCalls(op: PackedSponsorOperation, c: PaymasterC
     throw rejected('PAYMASTER_CALL_FORBIDDEN', 403, `call ${at}/${calls.length} to ${call?.target ?? '?'} ${call?.callData.slice(0, 10) ?? ''}: ${
       checkName(error)}`);
   }
+}
+
+/**
+ * A My mix renewal after the executor changed (cre8-contracts#76): the renewal pair first, then only canonical
+ * `approve(c.executor, max)` on USDT, a profile asset or a Cash Earn receipt — and the account's newest installed key is
+ * for a superseded executor. Anything else is judged by the usual My mix rules.
+ */
+export async function mixExecutorMigration(sender: Address, calls: readonly { target: Address; value: bigint; callData: Hex }[], c: PaymasterConfig,
+  db: (text: string, params: unknown[]) => Promise<{ rows: unknown[] }>): Promise<boolean> {
+  if (c.chainId !== 97 || calls.length < 3 || !isAddressEqual(calls[0]!.target, sender) || !isAddressEqual(calls[1]!.target, sender)) return false;
+  const approve = encodeFunctionData({ abi: TOKEN_ABI, functionName: 'approve', args: [c.executor, MAX_UINT256] }).toLowerCase();
+  const tokens = new Set([...testnetAssets().map(a => a.address.toLowerCase()), ...TESTNET_97.yieldMarkets.map(m => m.receipt.toLowerCase())]);
+  if (!calls.slice(2).every(call => call.value === 0n && call.callData.toLowerCase() === approve && tokens.has(call.target.toLowerCase()) &&
+      !isStrategyVault({ address: call.target }))) return false;
+  const rows = (await db(`select k.permissions from session_keys k join smart_accounts sa on sa.portfolio_id=k.portfolio_id
+      where sa.chain_id=97 and lower(sa.address)=lower($1) and sa.retired_at is null and k.status='active'
+      order by (split_part(k.key_ref,'/',6))::bigint desc limit 1`, [sender])).rows;
+  const permissions = rows[0] && typeof rows[0] === 'object' ? Reflect.get(rows[0], 'permissions') : undefined;
+  return keyNeedsExecutorRenewal(permissions, c.executor);
 }
 
 /** eth-infinitism v0.7.0 7af70c8993a6f42973f520ae0752386a5032abe7, samples/VerifyingPaymaster.sol:getHash.
@@ -1114,7 +1133,12 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
             call.callData.startsWith(toFunctionSelector('executeWithdraw(address,bytes32,uint256,uint256,uint256)')) && mixDca(call) !== 'redeem')) {
           throw rejected('PAYMASTER_CALL_FORBIDDEN', 403, 'my mix: per-asset yield call');
         }
-        const ownerChange = calls.some(call => isAddressEqual(call.target, c.registry) ||
+        // cre8-contracts#76 replaced the executor: a mix account whose newest key is for a superseded executor renews it with
+        // `approve(executor, max)` on profile tokens it needs (renewal-params `approvals`). That restores, and never widens,
+        // what its enrollment let the old executor move, so it needs no pending mix change (validateSponsoredCalls still
+        // checks every call, the renewal pair against the allowed scopes).
+        const migration = await mixExecutorMigration(op.sender, calls, c, deps.query ?? query);
+        const ownerChange = !migration && calls.some(call => isAddressEqual(call.target, c.registry) ||
           call.callData.startsWith(toFunctionSelector('approve(address,uint256)')) && mixDca(call) !== 'approval' && mixStrategy(call) === null);
         for (const call of calls) {
           if (call.callData.startsWith(toFunctionSelector('transfer(address,uint256)')) && !isAddressEqual(call.target, TESTNET_97.contracts.usdt) && !isRewardToken(call.target)) {

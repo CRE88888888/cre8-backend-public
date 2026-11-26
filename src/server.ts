@@ -26,7 +26,7 @@ import { createWaitlistService } from './waitlist.js';
 import { resolveOperatorWallets } from './waitlist-access.js';
 export { resolveOperatorWallets } from './waitlist-access.js';
 import { createWaitlistInviteService } from './waitlist-invites.js';
-import { waitlistOpenSignup } from './waitlist-gate.js';
+import { viewPassMatches, waitlistGate, waitlistOpenSignup } from './waitlist-gate.js';
 import { createWaitlistTaskService } from './waitlist-tasks.js';
 import { claimFaucetUsdt } from './faucet.js';
 import { claimFaucetGas } from './gas-faucet.js';
@@ -841,6 +841,23 @@ async function route(
     const wallet = await deps.auth.authenticate(req.headers.authorization);
     await deps.rateLimiter.wallet('assets', wallet);
     sendJson(res, 200, { assets: await deps.listAssets() });
+    return;
+  }
+
+  // Public switch state for the sign-in screen (deploy/waitlist-gate.json): whether X + Google gets in without a code,
+  // and whether the view-only pass is on. POST checks a pass; it grants no session and no waitlist approval.
+  if (root === 'waitlist' && segments.length === 2 && segments[1] === 'gate') {
+    if (method === 'GET') {
+      const gate = waitlistGate();
+      sendJson(res, 200, { openSignup: !gate.inviteRequired, viewPass: gate.accessCodeHash !== null });
+      return;
+    }
+    if (method !== 'POST') return methodNotAllowed(res, ['GET', 'POST']);
+    await deps.rateLimiter.auth(deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
+    const body: unknown = await readJsonBody(req);
+    const code = typeof body === 'object' && body !== null ? (body as { code?: unknown }).code : undefined;
+    if (!viewPassMatches(code)) throw new AppError(404, 'INVITE_INVALID', 'invite code is invalid');
+    sendJson(res, 200, { viewPass: true });
     return;
   }
 

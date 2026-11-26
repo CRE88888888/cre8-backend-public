@@ -15,7 +15,7 @@ import { query, withTransaction } from './db.js';
 import { AppError, ForbiddenError, NotFoundError, ValidationError } from './errors.js';
 import { describeGasStatus } from './funding.js';
 import type { GasStatus } from './funding.js';
-import { buildSessionPermissions, deriveSessionKeyFor, sessionValidUntil, sudoValidator } from './permissions.js';
+import { buildSessionPermissions, deriveSessionKeyFor, keyNeedsExecutorRenewal, sessionValidUntil, sudoValidator } from './permissions.js';
 import { requireTypedVersion } from './strategies.js';
 import type { Allocation } from './strategies.js';
 import { configuredChainId, TESTNET_97 } from './testnet-profile.js';
@@ -469,6 +469,9 @@ export type SessionKeySummary = {
   keyRef: string;
   expiresAt: string;
   status: string;
+  /** true = this key was installed for an AtpExecutor the chain 97 profile has replaced (cre8-contracts#76): nothing is
+   * sent for this portfolio until the owner signs `GET renewal-params` (initConfig + its `approvals`). */
+  renewalRequired: boolean;
 };
 
 /** `GET /portfolios` 的一列：`Portfolio` 再加一個「這組權限現在是哪一把 key」。 */
@@ -593,6 +596,7 @@ function toSessionKeySummary(row: SessionKeyRow): SessionKeySummary {
     keyRef: row.key_ref,
     expiresAt: row.expires_at.toISOString(),
     status: row.status,
+    renewalRequired: row.status === 'active' && configuredChainId() === 97 && keyNeedsExecutorRenewal(permissions, TESTNET_97.contracts.executor as Address),
   };
 }
 

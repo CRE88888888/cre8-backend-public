@@ -31,7 +31,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import type { Address, PublicClient } from 'viem';
 
 import { readGlobalPaused, REGISTRY_ABI, EXECUTOR_BUY_ABI, EXECUTOR_ABI, readSecondaryHealth } from '../src/chain.js';
-import { TESTNET_97, testnetAssets } from '../src/testnet-profile.js';
+import { TESTNET_97, TESTNET_97_EXECUTOR_DEPLOYMENT_BLOCK, testnetAssets } from '../src/testnet-profile.js';
 import { checkTestnetProfile } from '../src/testnet-preflight.js';
 import { pancakeRouterForChain } from '../src/addresses.js';
 import { activeChain } from '../src/chain-object.js';
@@ -607,7 +607,8 @@ async function main(): Promise<number> {
     try { maxBuyBps = await client.readContract({ address: executor, abi: EXECUTOR_BUY_ABI, functionName: 'maxBuyBps' }); } catch { /* unreadable fails */ }
     try { numeraire = await client.readContract({ address: executor, abi: EXECUTOR_BUY_ABI, functionName: 'numeraire' }); } catch { /* unreadable fails */ }
     checkBuyConfig(maxBuyBps, numeraire, args.strict, config.chainId === 97 ? TESTNET_97.contracts.usdt : USDT_ADDRESS, config.chainId === 97 ? 20000 : 10000).forEach(record);
-    const deploymentBlock = process.env.EXECUTOR_DEPLOYMENT_BLOCK?.trim();
+    // Chain 97 pins its executor in the profile, and with it the block it was deployed in (cre8-contracts#76 replaced it).
+    const deploymentBlock = config.chainId === 97 ? TESTNET_97_EXECUTOR_DEPLOYMENT_BLOCK.toString() : process.env.EXECUTOR_DEPLOYMENT_BLOCK?.trim();
     if (deploymentBlock === undefined || !/^\d+$/.test(deploymentBlock)) {
       fail('executor venues', '缺少合法的 EXECUTOR_DEPLOYMENT_BLOCK', '填 executor 部署 receipt 的 blockNumber，才能完整列出 venue 並避免從 genesis 掃描');
     } else {

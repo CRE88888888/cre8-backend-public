@@ -449,6 +449,7 @@ test('listPortfolios reports the active session key (permissionId + address from
     keyRef: OLD_KEY_REF,
     expiresAt: activeExpiry.toISOString(),
     status: 'active',
+    renewalRequired: false,
   });
 });
 
@@ -504,9 +505,10 @@ test('GET /portfolios/:id/renewal-params returns everything the front end needs 
       assert.equal(res.status, 200);
       const body = (await res.json()) as RenewalParams;
 
-      // 完整形狀：前端會照這 16 個鍵寫，多一個少一個都是契約變更。
+      // 完整形狀：前端會照這 17 個鍵寫，多一個少一個都是契約變更（`approvals`：cre8-contracts#76 換 executor 後的授權）。
       assert.deepEqual(Object.keys(body).sort(), [
         'accountAddress',
+        'approvals',
         'bundlerUrl',
         'chainId',
         'entryPoint',
@@ -525,6 +527,7 @@ test('GET /portfolios/:id/renewal-params returns everything the front end needs 
       ]);
 
       assert.equal(body.portfolioId, PORTFOLIO_ID);
+      assert.deepEqual(body.approvals, [], 'not chain 97: no approvals are read or returned');
       assert.equal(body.strategyId, STRATEGY_ID);
       assert.equal(body.chainId, CHAIN_ID);
       assert.equal(body.ownerAddress, WALLET_LOWER, 'ownerAddress is the sudo owner, not the session key');

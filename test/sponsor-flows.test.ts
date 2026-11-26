@@ -13,7 +13,7 @@ import { closeCalls, consentCalls, openCalls, STRATEGY_EARN_97 as S, STRATEGY_EA
 import type { StrategyEarnChain } from '../src/strategy-earn.js';
 import { dcaDepositCalls, dcaReceiptApproval, dcaReturnCalls, dcaVaults } from '../src/dca-calls.js';
 import { YIELD_EXECUTOR_ABI } from '../src/yield-abi.js';
-import { TESTNET_97 as T } from '../src/testnet-profile.js';
+import { TESTNET_97 as T, TESTNET_97_SUPERSEDED } from '../src/testnet-profile.js';
 import { config, NOW, operation, OWNER, SENDER, TEST_SIGNER } from './fixtures/paymaster.js';
 import { maxDebtFor, strategyEarnV2, v2Calls, v2ConsentCalls, v2ConsentOffCall, v2ExitBatches, v2ExitCalls, v2PreSellPlan, v2ReconsentCalls, v2RescueCall, v2SwapperApprovalCalls, V2_EXECUTOR_ABI, V2_REGISTRY_ABI, V2_SWAPPER_ABI } from '../src/strategy-earn-v2.js';
 const SWAPPER_OWNER_ABI = [{ type: 'function', name: 'setPool', inputs: [{ type: 'address' }, { type: 'address' }], outputs: [], stateMutability: 'nonpayable' },
@@ -676,8 +676,9 @@ for (const kind of ['fund', 'mix'] as const) {
 }
 
 test('routing v2 session scope, golden: keys installed before the cash swapper rebuild to the same permissionId; the swapper scope is a new one (so those keys renew)', async () => {
+  // Pinned to the executor these keys were installed for (superseded by cre8-contracts#76; they still rebuild against it).
   const id = async (routingV2?: { executor: Address; account: Address; swapper?: Address }) => (await buildSessionPermissions({ publicClient: offline as never, sessionKeyAddress: '0x2000000000000000000000000000000000000002',
-    executorAddress: executor, validUntil: 1_900_000_000, yieldAccount: '0x1000000000000000000000000000000000000005', borrowAccount: '0x1000000000000000000000000000000000000005', ...(routingV2 ? { routingV2 } : {}) }));
+    executorAddress: TESTNET_97_SUPERSEDED.executors[0]!, validUntil: 1_900_000_000, yieldAccount: '0x1000000000000000000000000000000000000005', borrowAccount: '0x1000000000000000000000000000000000000005', ...(routingV2 ? { routingV2 } : {}) }));
   const a = '0x1000000000000000000000000000000000000005' as Address;
   const [v1, v2Only, withSwapper] = [await id(), await id({ executor: V2.executor, account: a }), await id({ executor: V2.executor, account: a, swapper: V2.swapper! })];
   // The first two are byte for byte what origin/main (before the swapper) produced: installed keys keep validating.

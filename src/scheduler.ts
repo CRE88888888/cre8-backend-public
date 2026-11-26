@@ -136,7 +136,7 @@ import { createBundlerClient, entryPoint07Abi, formatUserOperation, formatUserOp
 import type { GetUserOperationReturnType, UserOperationReceipt } from 'viem/account-abstraction';
 import { noteLandedBlock, rpcBatch, rpcTransport } from './rpc-transport.js';
 import { activeChain } from './chain-object.js';
-import { testnetAssets, TESTNET_97 } from './testnet-profile.js';
+import { testnetAssets, TESTNET_97, TESTNET_97_SUPERSEDED } from './testnet-profile.js';
 import { signPreparedOperation } from './user-operation.js';
 import { KERNEL_V3_3_ADDRESSES, kernelAddressesForChain } from './addresses.js';
 import { detectAlerts, detectPriceKeeperLowGas, detectRelayerLowGas, formatAlert, recordAlerts, resolveAlerts, PRICE_SOURCE_FAILURE_ROUNDS, priceSourceAlertAssets } from './alerts.js';
@@ -146,7 +146,7 @@ import { getConfig, getSessionKeyConfig, requireSessionKeyConfig } from './confi
 import { errorMessage, query as dbQuery, withTransaction, withPortfolioLock } from './db.js';
 import { errorChain as describeErrorChain } from './errors.js';
 import { AppError } from './errors.js';
-import { borrowKeyMarkets, buildSessionPermissions, SESSION_PERMISSION_FLAG_LEGACY, sessionPermissionFlagOf, yieldAuthorization } from './permissions.js';
+import { borrowKeyMarkets, buildSessionPermissions, installedExecutorOf, SESSION_PERMISSION_FLAG_LEGACY, sessionPermissionFlagOf, yieldAuthorization } from './permissions.js';
 import { DEFAULT_DEADLINE_SECONDS as PLAN_DEFAULT_DEADLINE_SECONDS, planRebalance, readMaxLegUsdE8, refreshFloors, minimumDepositUsdtWei, checkTradeMinimums, checkBuyFeeReserve } from './rebalance-plan.js';
 import { writeSnapshot as writeSnapshotImpl } from './snapshot.js';
 import type { PlanPartial, PlannedStep, RebalancePlan, RefreshFloorsResult } from './rebalance-plan.js';
@@ -520,6 +520,9 @@ export type SessionKeyRef = {
   permissionFlag?: Hex;
   /** Present only when the owner renewal installed the routing v2 scope (src/strategy-earn-v2.ts). */
   routingV2?: { executor: Address; account: Address; swapper?: Address };
+  /** The AtpExecutor the key was installed for (its snapshot). Absent = today's. A key for a superseded executor
+   * (cre8-contracts#76) still signs its Strategy Earn calls; rebalances wait for the owner's renewal. */
+  executor?: Address;
   keyRef: `m/44'/60'/${string}`;
   permissionId: Hex;
   sessionKeyAddress: Address;
@@ -1190,6 +1193,7 @@ async function beginOperation(
 type PrecheckFailure = {
   code:
     | 'SESSION_KEY_NOT_INSTALLED'
+    | 'SESSION_KEY_RENEWAL_REQUIRED'
     | 'SESSION_KEY_DERIVATION_MISMATCH'
     | 'SESSION_KEY_DERIVATION_FAILED'
     | 'ALLOWANCE_TOO_LOW'
@@ -1298,6 +1302,9 @@ async function resolveSessionKey(
       continue;
     }
 
+    // The executor the key was installed for: a key from before cre8-contracts#76 rebuilds against the old one.
+    const installedExecutor = args.chainId === 97 ? installedExecutorOf(row.permissions) : null;
+    const keyExecutor = installedExecutor ?? (args.chainId === 97 ? TESTNET_97.contracts.executor as Address : null);
     return {
       ok: true,
       key: {
@@ -1306,7 +1313,8 @@ async function resolveSessionKey(
         sessionKeyAddress: sessionKeyAddress.toLowerCase() as Address,
         validUntil,
         owner,
-        ...(args.chainId === 97 && yieldAuthorization(row.permissions, args.account, TESTNET_97.contracts.executor).status === 'ready' ? { yieldAccount: args.account } : {}),
+        ...(keyExecutor !== null && yieldAuthorization(row.permissions, args.account, keyExecutor).status === 'ready' ? { yieldAccount: args.account } : {}),
+        ...(installedExecutor !== null && !isAddressEqual(installedExecutor, TESTNET_97.contracts.executor) ? { executor: installedExecutor } : {}),
         ...installedKeyScope(row.permissions, args.account, args.chainId),
       },
     };
@@ -1456,6 +1464,12 @@ async function runPrechecks(
     return { failures: [{ code: 'SESSION_KEY_NOT_INSTALLED', detail: resolution.reason }], sessionKey: null };
   }
 
+  // cre8-contracts#76: a key installed for a superseded executor cannot call today's. Nothing is sent until the owner renews
+  // (the app runs the renewal with the approvals to the new executor before the owner's next action).
+  if (resolution.key.executor !== undefined && !isAddressEqual(resolution.key.executor, args.executor)) {
+    return { failures: [{ code: 'SESSION_KEY_RENEWAL_REQUIRED', detail: `session key 是給舊 executor ${resolution.key.executor} 的，要 owner 續期（renewal）後才會再送` }], sessionKey: null };
+  }
+
   // 前置檢查 a2：seed 派生不出 DB 記的那把 → blocked（**不是** failed），operations 一列都不寫。
   const derivationFailure = await checkSessionKeyDerivation(resolution.key, deps.deriveSessionKeyAddress);
   if (derivationFailure !== null) return { failures: [derivationFailure], sessionKey: null };
@@ -1520,7 +1534,9 @@ export async function sessionKernelAccount(args: Pick<ExecuteArgs, 'account' | '
   const permissions = await buildSessionPermissions({
     publicClient,
     sessionKeyAddress: keyAccount.address,
-    executorAddress: args.executor,
+    // A key installed for a superseded executor rebuilds against that one (its permissionId); it may only sign what its
+    // policy allows there and on the Strategy Earn executors, which is all its callers send (see runPrechecks).
+    executorAddress: args.sessionKey.executor ?? args.executor,
     validUntil: args.sessionKey.validUntil,
     ...(args.sessionKey.yieldAccount === undefined ? {} : { yieldAccount: args.sessionKey.yieldAccount }),
     ...(args.sessionKey.borrowAccount === undefined ? {} : { borrowAccount: args.sessionKey.borrowAccount }),
@@ -2030,9 +2046,13 @@ function resolveDeps(args: { thresholdBps: number }, provided: SchedulerDeps) {
     checkTradingMinimums: provided.checkTradingMinimums ?? ((steps: readonly PlannedStep[], purpose: 'ordinary' | 'exit', blockNumber: bigint, assetBudgetRaw?:bigint, finalAssets?:ReadonlySet<string>, rebalanceReserveRaw?:bigint) =>
       checkTradeMinimums(defaultPublicClient(), provided.executor ?? executorAddress(), steps, purpose, blockNumber, assetBudgetRaw, finalAssets, rebalanceReserveRaw)),
     hasBoughtBefore: provided.hasBoughtBefore ?? (async (account: Address, executor: Address, blockNumber: bigint) => {
-      const [start] = await defaultPublicClient().readContract({ address: executor,
-        abi: parseAbi(['function buyWindowOf(address) view returns(uint64 start,uint192 bought)']), functionName: 'buyWindowOf', args: [account], blockNumber });
-      return start > 0n;
+      // An account that bought on a superseded executor (cre8-contracts#76) has bought before too.
+      for (const at of [executor, ...(chainId === 97 ? TESTNET_97_SUPERSEDED.executors.filter(e => !isAddressEqual(e, executor)) : [])]) {
+        const [start] = await defaultPublicClient().readContract({ address: at,
+          abi: parseAbi(['function buyWindowOf(address) view returns(uint64 start,uint192 bought)']), functionName: 'buyWindowOf', args: [account], blockNumber });
+        if (start > 0n) return true;
+      }
+      return false;
     }),
     withPortfolioLock: provided.withPortfolioLock ?? withPortfolioLock,
     withMixPortfolioLock: provided.withMixPortfolioLock ?? withMixPortfolioLock,

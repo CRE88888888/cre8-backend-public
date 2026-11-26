@@ -48,8 +48,10 @@ test('session permission cannot be used for ERC-1271: new installs carry NOT_FOR
   const fresh = await buildSessionPermissions(args);
   assert.equal(fresh.permissionId, golden.permissionId);
   assert.equal(fresh.policySnapshot.permissionFlag, '0x0002');
-  // The same key as installed before 2026-11-24 (this vector's id in the previous golden file): rebuilt byte for byte.
-  const legacy = await buildSessionPermissions({ ...args, permissionFlag: SESSION_PERMISSION_FLAG_LEGACY });
+  // The same key as installed before 2026-11-24 (this vector's id in the previous golden file): rebuilt byte for byte, against
+  // the executor it was installed for (superseded by cre8-contracts#76).
+  const { TESTNET_97_SUPERSEDED } = await import('../src/testnet-profile.js');
+  const legacy = await buildSessionPermissions({ ...args, executorAddress: TESTNET_97_SUPERSEDED.executors[0]!, permissionFlag: SESSION_PERMISSION_FLAG_LEGACY });
   assert.equal(legacy.permissionId, '0xe2ff633f');
   assert.notEqual(legacy.permissionId, fresh.permissionId);
   assert.notDeepEqual(legacy.initConfig, fresh.initConfig);

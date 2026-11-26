@@ -1,6 +1,7 @@
 import { strategyEarnV2, v2Audience } from './strategy-earn-v2.js';
 import { defaultV2Reader, v2HasState } from './strategy-earn-v2-chain.js';
 import { withMixPortfolioLock, mixBusy } from './mix-store.js';
+import { encodeFunctionData, erc20Abi, maxUint256 } from 'viem';
 import type { Address, Hex, PublicClient } from 'viem';
 import { KERNEL_V3_3_ADDRESSES, KERNEL_VERSION_STRING } from './addresses.js';
 import { getChain } from './chain.js';
@@ -16,6 +17,7 @@ import {
 } from './permissions.js';
 import type { SessionKeyMaterial, SessionPolicySnapshot } from './permissions.js';
 import { requireOwnedPortfolio } from './portfolios.js';
+import { TESTNET_97, testnetAssets } from './testnet-profile.js';
 
 /**
  * Session key 續期的後端那一半。
@@ -186,6 +188,13 @@ export type RenewalParams = {
   permissionId: Hex;
   policySnapshot: SessionPolicySnapshot;
   initConfig: Hex[];
+  /**
+   * `approve(executorAddress, max)` for every token this account will need the executor to move and has not approved it
+   * yet: USDT, the strategy's assets, whatever else it holds, and the Cash Earn receipts it holds (a DCA redemption).
+   * Empty once everything is approved. After cre8-contracts#76 replaced the executor, the owner signs these with the
+   * initConfig in the same UserOp (the paymaster sponsors both), so the account is whole again in one signature.
+   */
+  approvals: { to: Address; data: Hex; value: '0' }[];
   /** 前端要打哪個 bundler。 */
   bundlerUrl: string;
 };
@@ -207,7 +216,40 @@ export type RenewalParamsDeps = {
   validUntil: () => number;
   buildRenewalKey: typeof buildRenewalKey;
   bundlerUrl: string;
+  /** Approvals the account still lacks for the executor (`RenewalParams.approvals`). Default: read on chain 97, none elsewhere. */
+  executorApprovals: (args: { chainId: number; account: Address; executor: Address; strategyId: number; publicClient: PublicClient }) => Promise<RenewalParams['approvals']>;
 };
+
+const VERSION_ASSETS_SQL = `select allocation from strategy_versions where strategy_id = $1`;
+
+/** Chain 97: USDT, every asset of the portfolio's strategy versions, every other profile asset or Cash Earn receipt the
+ * account holds — each one whose allowance to `executor` is zero. One multicall for balances, one for allowances. */
+export async function chainExecutorApprovals(args: { chainId: number; account: Address; executor: Address; strategyId: number; publicClient: PublicClient },
+  db: { query: typeof query } = { query }): Promise<RenewalParams['approvals']> {
+  if (args.chainId !== 97) return [];
+  const lower = (a: string) => a.toLowerCase() as Address;
+  const versionAssets = (await db.query<{ allocation: unknown }>(VERSION_ASSETS_SQL, [args.strategyId])).rows.flatMap(row => {
+    const assets: unknown = row.allocation && typeof row.allocation === 'object' ? Reflect.get(row.allocation, 'assets') : null;
+    return Array.isArray(assets) ? assets.flatMap((a: unknown) => {
+      const address: unknown = a && typeof a === 'object' ? Reflect.get(a, 'address') : null;
+      return typeof address === 'string' && /^0x[0-9a-fA-F]{40}$/.test(address) ? [lower(address)] : [];
+    }) : [];
+  });
+  const profileAssets = testnetAssets().map(a => lower(a.address));
+  const receipts = TESTNET_97.yieldMarkets.map(m => lower(m.receipt));
+  const holdable = [...new Set([...profileAssets, ...receipts])];
+  const balances = await args.publicClient.multicall({ allowFailure: false,
+    contracts: holdable.map(token => ({ address: token, abi: erc20Abi, functionName: 'balanceOf' as const, args: [args.account] as const })) });
+  const held = holdable.filter((_, i) => (balances[i] ?? 0n) > 0n);
+  const usdt = lower(TESTNET_97.contracts.usdt);
+  const known = new Set(holdable);
+  // Only tokens the paymaster may sponsor an approval of (profile assets and Cash Earn receipts).
+  const tokens = [...new Set([usdt, ...versionAssets, ...held])].filter(token => known.has(token));
+  const allowances = await args.publicClient.multicall({ allowFailure: false,
+    contracts: tokens.map(token => ({ address: token, abi: erc20Abi, functionName: 'allowance' as const, args: [args.account, args.executor] as const })) });
+  const data = encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [args.executor, maxUint256] });
+  return tokens.filter((_, i) => (allowances[i] ?? 0n) === 0n).map(to => ({ to, data, value: '0' as const }));
+}
 
 /**
  * 回傳前端組「續期 UserOp」所需的一切：**派生新 key、算權限、不簽章、不上鏈、不寫 DB**。
@@ -241,6 +283,9 @@ export async function buildRenewalParams(
     validUntil,
   });
 
+  const approvals = await (deps.executorApprovals ?? chainExecutorApprovals)({ chainId: portfolio.chainId, account: portfolio.accountAddress as Address,
+    executor: sessionKeyConfig.executorAddress, strategyId: portfolio.strategyId, publicClient });
+
   return {
     portfolioId: portfolio.id,
     strategyId: portfolio.strategyId,
@@ -257,6 +302,7 @@ export async function buildRenewalParams(
     permissionId: key.permissionId,
     policySnapshot: key.policySnapshot,
     initConfig: key.initConfig,
+    approvals,
     bundlerUrl: deps.bundlerUrl ?? resolveBundlerUrl(),
   };
 }

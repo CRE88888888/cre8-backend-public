@@ -329,6 +329,33 @@ function borrowSnapshotMatches(snapshot: unknown, account: Address, markets: rea
   }));
 }
 
+/**
+ * The AtpExecutor a stored key snapshot was installed for: the target of its plain `executeRebalance` permission (no
+ * argument rules). null when the snapshot has none. A key whose executor is not today's (cre8-contracts#76 replaced it)
+ * still rebuilds to its own permissionId with this address, so the Strategy Earn calls it carries keep working; but it
+ * can no longer call the current executor, so rebalances, DCA and portfolio yield wait for the owner's renewal.
+ */
+export function installedExecutorOf(snapshot: unknown): Address | null {
+  if (!snapshot || typeof snapshot !== 'object') return null;
+  const call: unknown = Reflect.get(snapshot, 'call');
+  if (!call || typeof call !== 'object') return null;
+  const permissions: unknown = Reflect.get(call, 'permissions');
+  if (!Array.isArray(permissions)) return null;
+  for (const permission of permissions as unknown[]) {
+    if (!permission || typeof permission !== 'object') continue;
+    const target: unknown = Reflect.get(permission, 'target'), rules: unknown = Reflect.get(permission, 'rules');
+    if (Reflect.get(permission, 'selector') === EXECUTOR_SELECTOR && typeof target === 'string' && /^0x[0-9a-fA-F]{40}$/.test(target) &&
+        (rules === undefined || (Array.isArray(rules) && rules.length === 0))) return target.toLowerCase() as Address;
+  }
+  return null;
+}
+
+/** True when the key snapshot was installed for an executor other than `current` (an owner renewal is required). */
+export function keyNeedsExecutorRenewal(snapshot: unknown, current: Address): boolean {
+  const installed = installedExecutorOf(snapshot);
+  return installed !== null && !isAddressEqual(installed, current);
+}
+
 export function yieldAuthorization(snapshot: unknown, account: Address, executor: Address):
   { status: 'ready' } | { status: 'authorization_required'; code: 'SESSION_AUTHORIZATION_REQUIRED'; message: string } {
   const required = { status: 'authorization_required', code: 'SESSION_AUTHORIZATION_REQUIRED',

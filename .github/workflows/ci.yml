@@ -102,6 +102,7 @@ jobs:
           test/deployment.test.ts
           test/worker-health.test.ts
           test/alto.test.ts
+          test/executor-migration.test.ts
           test/testnet-profile.test.ts
           test/testnet-launch-funds.test.ts
           test/price-keeper.test.ts

@@ -3,9 +3,9 @@ export const TESTNET_97 = {
   "chainId": 97,
   "mode": "public",
   "note": "deployed on public BSC testnet (chain 97)",
-  "verifiedAtBlock": 143775403,
-  "generatedAt": "2026-11-20T05:37:10Z",
-  "gitCommit": "cc53e91a833c62d3efe3c8e4c76d3dde2ab8ecf7",
+  "verifiedAtBlock": 144935225,
+  "generatedAt": "2026-11-26T06:54:22Z",
+  "gitCommit": "de4225f495d675a11509e523e7df38a7377a00a0",
   "versioning": {
     "enrollAbi": "enroll(address,uint256,uint16)",
     "publicationDelaySeconds": 86400,
@@ -32,8 +32,8 @@ export const TESTNET_97 = {
     "ownedDeployer": "0xc92079ccb13ebd608d5cd03f5e302dcde5b37096",
     "registry": "0x7ff384fc959bf70ff7b2f011c6a84a36244264ea",
     "router": "0x8e9371550fc397144d198a7c159c2da5d143239e",
-    "executor": "0xb65ec2ec6f5ab0a345b50caa454cf792c1ef2bb9",
-    "yieldRegistry": "0xa234531b1ace7b7106562a5554f1f8b173f7087b",
+    "executor": "0x027f11bef2f93eefac9df7c466218375713043a6",
+    "yieldRegistry": "0x8ed07a58607c45cb7430bacc620df60a0faf074b",
     "yieldView": "0xc8eeba84f9c74b2d879dfaedb02a0a523aa02657",
     "usdt": "0x7ad6e310b0f6744b66d97cb7cb525bd974501cb5",
     "feed.USDT/USD": "0x1f720990c22c7496eda9156ead91ca334ef097db",
@@ -1310,5 +1310,5 @@ export const TESTNET_97 = {
     }
   ],
   "yieldMarketCountNote": "C3 table heading says 32, but has 30 rows (21 Venus, 4 Lista, 5 Aave); no unspecified markets added",
-  "sourceCommit": "cc53e91a833c62d3efe3c8e4c76d3dde2ab8ecf7"
+  "sourceCommit": "de4225f495d675a11509e523e7df38a7377a00a0"
 } as const;

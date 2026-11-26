@@ -13,17 +13,21 @@ const PERMISSION = parseAbi([
 
 /** API selection and the final pre-reservation check share time/installation evidence.
  * A dependency failure is unknown, never proof that it is safe to try a different key.
+ *
+ * `now` as a clock function is read again after the head block arrives: the head is refused when it is newer than
+ * the clock, and a clock read before the request loses that race whenever a block lands in between (0.45 s blocks).
  */
-export async function yieldSessionAvailable(client: PublicClient, policies: unknown, account: Address, executor: Address, now: Date): Promise<boolean> {
+export async function yieldSessionAvailable(client: PublicClient, policies: unknown, account: Address, executor: Address, now: Date | (() => Date)): Promise<boolean> {
   if (yieldAuthorization(policies, account, executor).status !== 'ready') return false;
+  const clock = typeof now === 'function' ? now : () => now;
   const p = object(policies), timestamp = object(p.timestamp);
   const until = timestamp.validUntil, after = timestamp.validAfter;
-  const wall = Math.floor(now.getTime() / 1000);
+  const wall = Math.floor(clock().getTime() / 1000);
   if (typeof until !== 'number' || !Number.isSafeInteger(until) || until <= wall ||
       typeof after !== 'number' || !Number.isSafeInteger(after) || after < 0 || after > wall ||
       typeof p.permissionId !== 'string' || !/^0x[0-9a-fA-F]{8}$/.test(p.permissionId)) return false;
   const block = await client.getBlock({ blockTag: 'latest' });
-  if (block.number===null||block.hash===null||await client.getChainId() !== 97 || !fresh(new Date(Number(block.timestamp) * 1000), now)) throw unavailable();
+  if (block.number===null||block.hash===null||await client.getChainId() !== 97 || !fresh(new Date(Number(block.timestamp) * 1000), clock())) throw unavailable();
   if (block.timestamp >= BigInt(until) || block.timestamp < BigInt(after)) return false;
   const id=pad(concatHex(['0x02',`0x${p.permissionId.slice(2)}`]),{size:21,dir:'right'});
   const [installed,validation,minimumNonce,allowed]=await Promise.all([

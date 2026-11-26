@@ -103,3 +103,16 @@ test('#112-r2 GasPolicy zero is unavailable, one wei remains live, and unknown a
   f.sessionState.exhausted=[s.permissionId.slice(2)];assert.equal(await available(),false);
   f.sessionState.exhausted=[];f.sessionState.gasFailure=true;await assert.rejects(available());
 });
+
+test('2026-11-26: a clock function is read again after the head arrives — a head newer than the clock read before the request is fresh, a fixed time keeps failing closed',async()=>{
+  const f=yieldFixture(['venus']),head=Math.floor(+f.at/1000);
+  const s=await buildSessionPermissions({publicClient:f.client,sessionKeyAddress:f.account,executorAddress:f.executor,validUntil:head+86400,yieldAccount:f.account});
+  // The clock said one second before the head when the check started (a block landed while the request was on its way).
+  const before=new Date((head-1)*1000);
+  await assert.rejects(yieldSessionAvailable(f.client,s.policySnapshot,f.account,f.executor,before),'a fixed time: the head is in its future');
+  let reads=0;
+  assert.equal(await yieldSessionAvailable(f.client,s.policySnapshot,f.account,f.executor,()=>reads++===0?before:f.at),true);
+  assert.equal(reads,2,'once for the validity window, once after the head block');
+  // A head ahead of the clock even after it arrived (node clock ahead) still fails closed.
+  await assert.rejects(yieldSessionAvailable(f.client,s.policySnapshot,f.account,f.executor,()=>before));
+});

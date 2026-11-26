@@ -4,8 +4,8 @@ import { decodeFunctionData, encodeFunctionData, encodeAbiParameters, encodeEven
 import type { Address, Hex } from 'viem';
 import { AppError } from '../src/errors.js';
 import { validateSponsoredCalls } from '../src/paymaster.js';
-import { createDca, dcaEarned, duePeriods, periodAt, planJson, restorePlan, runDcaRound, trancheTarget } from '../src/dca.js';
-import type { DcaChain, DcaDeps, PlanRow } from '../src/dca.js';
+import { createDca, DCA_NOTE_FRESH_MS, dcaEarned, duePeriods, periodAt, planJson, restorePlan, runDcaRound, trancheTarget, waitingOfError, waitingOfStep } from '../src/dca.js';
+import type { DcaChain, DcaDeps, DcaNote, PlanRow } from '../src/dca.js';
 import { DCA_VAULT_ABI, dcaDepositCalls, dcaReceiptApproval, dcaReturnCalls, dcaVaultCall, dcaVaults } from '../src/dca-calls.js';
 import type { CashEarnChain, PositionReading, VaultReading } from '../src/cash-earn.js';
 import type { OwnedPortfolio } from '../src/portfolios.js';
@@ -116,6 +116,7 @@ const transferLog = (from: string, to: string, value: bigint, logIndex = 3) => (
 
 function harness(opts: { balance?: bigint; classified?: bigint; shares?: bigint; value?: bigint; keyReady?: boolean; now?: Date; allocation?: string[] } = {}) {
   const plans: Row[] = [], actions: Row[] = [], log: string[] = [], submitted: unknown[] = [], credited: unknown[] = [], cash: unknown[][] = [];
+  const notes = new Map<string, DcaNote>();
   let now = opts.now ?? new Date('2026-11-23T15:00:00Z'); // US market open (10:00 New York)
   const state = { shares: opts.shares ?? 0n, value: opts.value ?? 0n, receipts: new Map<string, Row>() };
   const portfolio: OwnedPortfolio = { id: 7, userId: 'u', strategyId: 3, version: 1, scheduleState: 'active', createdAt: '', chainId: 97,
@@ -202,8 +203,9 @@ function harness(opts: { balance?: bigint; classified?: bigint; shares?: bigint;
     },
     reconcile: async () => { throw new Error('no receipt'); },
     credit: async (id, own, evidence) => { credited.push({ id, own, evidence }); return { id: String(credited.length + 40) }; },
+    note: async (planId, note) => { notes.set(planId, note); }, noted: async planId => notes.get(planId) ?? null,
   };
-  return { deps, plans, actions, log, submitted, credited, state, cash, setNow: (d: Date) => { now = d; } };
+  return { deps, plans, actions, log, submitted, credited, state, cash, notes, setNow: (d: Date) => { now = d; } };
 }
 
 test('DCA create: validates input and minimum per period, needs the money in the account, returns deposit + executor approval calls', async () => {
@@ -566,6 +568,95 @@ test('DCA view: a due period that is not being bought says why (portfolio paused
   assert.deepEqual(await view({ keyReady: false }), ['authorization_required', false]);
   assert.deepEqual(await view({ startAt: new Date('2026-11-24T15:00:00Z'), schedule: 'paused' }), [null, false], 'not due yet: nothing is waiting');
   assert.deepEqual(await view({ inflight: true, schedule: 'paused' }), [null, false], 'this period is being bought');
+});
+
+test('2026-11-26 plan 9: every reason a due period was not redeemed is kept for the view (waitingReason) and logged in full', async () => {
+  // Step results and thrown codes -> the value the App reads. Anything else (redeemed, not due, reconciling) waits on nothing.
+  for (const [line, reason] of [[null, 'account_busy'], ['[DCA_PORTFOLIO_PAUSED] 組合暫停中，餘額留在 vault', 'portfolio_paused'], ['[MARKET_CLOSED] 美股休市，本期留在 vault 到開盤', 'market_closed'],
+    ['[DCA_AUTHORIZATION_REQUIRED] 需要 owner 更新 session 權限（renewal）', 'authorization_required'], ['[DCA_APPROVAL_REQUIRED] 帳戶尚未授權 executor 領出', 'approval_required'],
+    ['[PREVIOUS_INFLIGHT] 帳戶其他操作待對帳', 'account_busy'], ['[DCA_LIQUIDITY] vault 可領現金不足，下輪再試', 'vault_liquidity'], ['[DCA_VAULT_UNKNOWN]', 'temporarily_unavailable'],
+    ['[DCA_VERSION_UNAVAILABLE]', 'temporarily_unavailable'], ['[DCA_ZERO_SHARES]', 'temporarily_unavailable'], ['[DCA_NOT_DUE]', null], ['[DCA_NOT_ACTIVE]', null],
+    ['[DCA_REDEEMED] 第 1/2 期 10 USDT 已回到帳戶', null], ['[DCA_RECONCILED] confirmed', null], ['[DCA_EMPTY] vault 已無餘額，定投結束', null]] as const) assert.equal(waitingOfStep(line), reason, String(line));
+  for (const [code, reason] of [['PAYMASTER_EXIT_INVALID', 'sponsorship_unavailable'], ['PAYMASTER_EXIT_AUTHORIZATION_PENDING', 'sponsorship_unavailable'], ['PAYMASTER_QUOTA_EXCEEDED', 'sponsorship_unavailable'],
+    ['GAS_BUDGET_EXCEEDED', 'sponsorship_unavailable'], ['SESSION_AUTHORIZATION_REQUIRED', 'authorization_required'], ['YIELD_UNAVAILABLE', 'temporarily_unavailable'],
+    ['YIELD_DEPENDENCY_UNAVAILABLE', 'temporarily_unavailable'], ['DCA_UNAVAILABLE', 'temporarily_unavailable']] as const) assert.equal(waitingOfError(code), reason, code);
+
+  const start = new Date('2026-11-23T15:00:00Z');
+  const scene = () => {
+    const h = harness({ allocation: ['0x' + '11'.repeat(20)], keyReady: true });
+    h.plans.push(dcaPlanRow());
+    h.state.shares = 20n * E18; h.state.value = 20n * E18;
+    const base = (h.deps.chain as () => DcaChain)(), approved: DcaChain = { ...base, earn: { ...base.earn, allowance: async () => maxUint256 } };
+    h.deps.chain = () => approved; h.deps.sessionKey = async () => testKey;
+    const logs: string[] = [];
+    const round = (dryRun = false) => runDcaRound({ dryRun, limit: 10, log: l => logs.push(l) }, h.deps);
+    const waiting = async () => (await createDca(h.deps).get(7, owner)).plan?.waitingReason;
+    return { h, logs, round, waiting, base };
+  };
+
+  // What plan 9 hit: the paymaster refused the redemption. Four rounds, and the App was told nothing was in the way.
+  const a = scene();
+  assert.equal(await a.waiting(), null, 'before any attempt: the next round buys it');
+  const refused = new AppError(403, 'PAYMASTER_EXIT_INVALID', 'paymaster sponsorship rejected: PAYMASTER_EXIT_INVALID',
+    { cause: new AppError(403, 'PAYMASTER_EXIT_INVALID', 'paymaster sponsorship rejected: PAYMASTER_EXIT_INVALID', { cause: new Error('exit: head block 144895550 is -1 s old (allowed 0 to 60)') }) });
+  a.h.deps.submit = async () => { throw refused; };
+  assert.deepEqual(await a.round(), { checked: 0, credited: 0, blocked: 1 });
+  assert.match(a.logs.join('\n'), /plan 1: blocked PAYMASTER_EXIT_INVALID：.*exit: head block 144895550 is -1 s old \(allowed 0 to 60\)/, 'the log carries the full cause');
+  const note = a.h.notes.get('1');
+  assert.deepEqual(note && { reason: note.reason, periodsDone: note.periodsDone, at: note.at }, { reason: 'sponsorship_unavailable', periodsDone: 0, at: start.toISOString() });
+  assert.match(note?.detail ?? '', /blocked PAYMASTER_EXIT_INVALID：.*-1 s old/);
+  assert.equal(await a.waiting(), 'sponsorship_unavailable');
+  // The state's own reasons come first (the scheduler would stop there before trying).
+  const paused = a.h.deps.query as unknown as (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }>;
+  a.h.deps.query = (async (sql: string, params: unknown[] = []) => sql.replace(/\s+/g, ' ').startsWith('select schedule_state,strategy_id')
+    ? { rows: [{ schedule_state: 'paused', strategy_id: '3', version: 1, selling: false }] } : paused(sql, params)) as unknown as DcaDeps['query'];
+  assert.equal(await a.waiting(), 'portfolio_paused');
+  a.h.deps.query = paused as unknown as DcaDeps['query'];
+  // A note says nothing once it is old (the scheduler stopped trying, or the reason is gone)...
+  a.h.setNow(new Date(start.getTime() + DCA_NOTE_FRESH_MS));
+  assert.equal(await a.waiting(), 'sponsorship_unavailable');
+  a.h.setNow(new Date(start.getTime() + DCA_NOTE_FRESH_MS + 1));
+  assert.equal(await a.waiting(), null);
+  // ...or once that period went through: the note of period 1 is not the reason period 2 waits.
+  const b = scene();
+  b.h.notes.set('1', { reason: 'sponsorship_unavailable', detail: 'x', periodsDone: 0, at: start.toISOString() });
+  assert.deepEqual(await b.round(), { checked: 1, credited: 1, blocked: 0 });
+  assert.equal(b.h.plans[0]?.periods_done, 1);
+  b.h.setNow(new Date(start.getTime() + 86_400_000 + 60_000));
+  assert.equal(await b.waiting(), null);
+
+  // The step's own stops, each through a real round.
+  const approval = scene(); approval.h.deps.chain = () => approval.base;
+  assert.deepEqual(await approval.round(), { checked: 1, credited: 0, blocked: 0 });
+  assert.equal(await approval.waiting(), 'approval_required');
+  const liquidity = scene(), dry = (liquidity.h.deps.chain as () => DcaChain)();
+  liquidity.h.deps.chain = () => ({ ...dry, earn: { ...dry.earn, position: async () => ({ sharesRaw: 20n * E18, valueRaw: 20n * E18, maxWithdrawRaw: 1n }) } });
+  await liquidity.round();
+  assert.equal(await liquidity.waiting(), 'vault_liquidity');
+  const busy = scene(); busy.h.deps.lock = async () => null;
+  await busy.round();
+  assert.match(busy.logs.join('\n'), /plan 1: 帳戶處理中，下輪再試/);
+  assert.equal(await busy.waiting(), 'account_busy');
+  const unsettled = scene(), q = unsettled.h.deps.query as unknown as (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }>;
+  unsettled.h.deps.query = (async (sql: string, params: unknown[] = []) => sql.includes('from operations') ? { rows: [{ id: 1 }] } : q(sql, params)) as unknown as DcaDeps['query'];
+  await unsettled.round();
+  assert.equal(await unsettled.waiting(), 'account_busy');
+  const key = scene(); key.h.deps.sessionKey = async () => null;
+  await key.round();
+  assert.equal(key.h.notes.get('1')?.reason, 'authorization_required');
+  const dependency = scene(); dependency.h.deps.sessionKey = async () => { throw new AppError(503, 'YIELD_UNAVAILABLE', 'x'); };
+  assert.deepEqual(await dependency.round(), { checked: 0, credited: 0, blocked: 1 });
+  assert.equal(await dependency.waiting(), 'temporarily_unavailable');
+
+  // A dry run writes nothing; a note that cannot be written or read never fails the round or the view.
+  const rehearsal = scene(); rehearsal.h.deps.chain = () => rehearsal.base;
+  await rehearsal.round(true);
+  assert.equal(rehearsal.h.notes.size, 0);
+  const broken = scene(); broken.h.deps.chain = () => broken.base;
+  broken.h.deps.note = async () => { throw new Error('db down'); }; broken.h.deps.noted = async () => { throw new Error('db down'); };
+  assert.deepEqual(await broken.round(), { checked: 1, credited: 0, blocked: 0 });
+  assert.match(broken.logs.join('\n'), /plan 1: 等待原因未寫入：db down/);
+  assert.equal(await broken.waiting(), null);
 });
 
 test("DCA round for one portfolio (an owner's own buy): only the plan of that portfolio's account is stepped and credited", async () => {

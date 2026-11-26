@@ -37,7 +37,17 @@ unknown，也不據此做本金或利息結算。inner revert 也消耗 nonce，
 1. 新授權先保存 chain/account、hash、executionKey、nonce、validUntil、purpose；不保存任何簽章／金鑰。
    自動解除要求 `finalized` 區塊的 timestamp **嚴格大於** validUntil，該 nonce key 的 EntryPoint
    nonce **仍等於原 nonce**，且回讀同區塊 hash 相符。EntryPoint v0.7 在等於 validUntil 時仍可接受，
-   所以等號不解除。RPC／finalized 不支援／nonce 已改變／證據缺漏均保留鎖。已消耗者仍走前述 receipt 對帳。
+   所以等號不解除。RPC／finalized 不支援／證據缺漏均保留鎖。已消耗者仍先走前述 receipt 對帳。
+   **2026-11-26 修訂（nonce 已改變）：** 原本「nonce 已改變」一律保留鎖，靠 receipt 對帳解除。但 receipt 回溯只有
+   1024 個區塊（每塊 0.45 秒，不到 8 分鐘），而 owner 自己送的退出（全部領回錢包的 USDT 轉帳算 exit）沒有人替它
+   對帳，預留永遠停在 `reserved`。超過 8 分鐘後同一帳戶的下一筆退出（例如定投每期領出）就永遠被
+   `PAYMASTER_EXIT_AUTHORIZATION_PENDING` 擋住：receipt 找不到，nonce 又已經變了。portfolio 50 在 01:31 領回，
+   01:53 起的定投因此買不了。現在 `finalized` 區塊上該 nonce key 的 EntryPoint nonce **已超過**原 nonce 時也解除
+   （不必等到期）：nonce 只會往上，原授權不可能再被 EntryPoint 接受。解除證據寫 `reason:"finalized_nonce_consumed"`
+   與當時的 nonce；**不算「未使用」**（`unusedExitUsage` 的每日三次與 10% 未使用額度只數
+   `expired_finalized_nonce_unchanged`），成本照樣留帳。receipt 對帳先套用，找得到 receipt 的仍照成功／失敗記。
+   代價：這種解除不知道原授權是成交了還是被別的操作占掉 nonce，ledger 記為 `failed`／`expired`；有人可以領一張
+   退出授權不送、再用一筆一般操作占掉同一個 nonce 來換下一張，每換一張要花一筆一般操作的每日額度。
    取得證據後，在 chain/account 鎖內重讀全部仍在途授權；同 executionKey 的所有在途授權均須有證據。
    同 SQL transaction 寫入不可變解除證據、將 sponsorship 標 expired、gas lock 標 failed；原成本／UTC 日不變，
    不觸碰 yield action 的 unknown、本金或利息。相同 executionKey 再簽時重新取得 reserved 鎖。

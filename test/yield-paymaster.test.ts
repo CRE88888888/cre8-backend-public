@@ -4,7 +4,8 @@ import { createServer } from 'node:http';
 import { encodeCallDataEpV07 } from '@zerodev/sdk';
 import { concatHex, decodeFunctionData, encodeAbiParameters, encodeFunctionData, erc20Abi, getAddress, pad, parseAbi, toEventSelector, toFunctionSelector, toHex, zeroAddress } from 'viem';
 import { entryPoint07Abi } from 'viem/account-abstraction';
-import { createPaymasterService, gasExecutionKey, pureYieldWithdraw, validateSponsoredCalls } from '../src/paymaster.js';
+import { createPaymasterService, gasExecutionKey, pureYieldWithdraw, validateSponsoredCalls, verifyYieldWithdraw } from '../src/paymaster.js';
+import { AppError } from '../src/errors.js';
 import type { Reservation } from '../src/paymaster.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
 import { YIELD_EXECUTOR_ABI, YIELD_REGISTRY_ABI } from '../src/yield-abi.js';
@@ -221,4 +222,34 @@ test('#113 runtime DB failures, malformed rows and invalid values fail closed wi
     await assert.rejects(writeYieldState(key,{},unexpected));
   }
   for(const value of [undefined,NaN,Infinity,1n])await assert.rejects(writeYieldState('fact-test',value,unexpected));
+});
+
+test('2026-11-26 plan 9: the exit check reads its clock after the head block arrives, and every refusal says which check failed', async () => {
+  const op = operation({ callData: await encodeCallDataEpV07([call('executeWithdraw')]) });
+  const T0 = NOW;
+  /** `wall`: what the clock says; reading the head takes `takes` seconds and returns a block stamped `stamp`. */
+  const run = async (o: { takes: number; stamp: (wallAfter: number) => number; nonce?: bigint; chain?: number; balance?: bigint; units?: bigint; plan?: boolean }) => {
+    let wall = T0;
+    const client = {
+      getBlock: async () => { wall += o.takes; return { number: 144895550n, hash: `0x${'ab'.repeat(32)}`, timestamp: BigInt(o.stamp(wall)) }; },
+      getChainId: async () => o.chain ?? 97,
+      readContract: async (args: { functionName: string }) => args.functionName === 'getNonce' ? o.nonce ?? op.nonce : args.functionName === 'balanceOf' ? o.balance ?? 5n : o.units ?? 0n,
+    };
+    const error = await verifyYieldWithdraw(op, c, () => wall, async () => ({ rows: o.plan ? [{}] : [] }), client as never).then(() => null, (e: unknown) => e);
+    assert.ok(error instanceof AppError);
+    return `${error.code}: ${(error.cause as Error | undefined)?.message}`;
+  };
+  // Before: the clock was the one read when sponsor() started. The reads before this one take a second or more and a
+  // block lands every 0.45 s, so a node at the head answered with a block "newer than now": refused, no reason given.
+  // Now the head is compared with the clock after it arrived: it passes this check and goes on to the next ones.
+  assert.equal(await run({ takes: 2, stamp: wall => wall, nonce: op.nonce + 1n }), "PAYMASTER_EXIT_INVALID: exit: nonce 0 is not the account's next one (1) at block 144895550");
+  // A head that really is in the future (node clock ahead) or stale is still refused, and says so.
+  assert.equal(await run({ takes: 0, stamp: wall => wall + 1 }), 'PAYMASTER_EXIT_INVALID: exit: head block 144895550 is -1 s old (allowed 0 to 60)');
+  assert.equal(await run({ takes: 0, stamp: wall => wall - 61 }), 'PAYMASTER_EXIT_INVALID: exit: head block 144895550 is 61 s old (allowed 0 to 60)');
+  assert.equal(await run({ takes: 0, stamp: wall => wall, chain: 56 }), 'PAYMASTER_EXIT_INVALID: exit: not chain 97');
+  assert.equal(await run({ takes: 0, stamp: wall => wall - 60, balance: 0n }), `PAYMASTER_EXIT_INVALID: exit: withdraws 1 of market ${market.marketId}, the account holds 0`);
+  assert.equal(await run({ takes: 0, stamp: wall => wall }), `PAYMASTER_EXIT_INVALID: exit: market ${market.marketId} is neither a yield position nor an open DCA plan of this account`);
+  // An open DCA plan's own market passes the holding checks; the fake node has no eth_call, and that failure is named too
+  // (the error's class and short message only: never the node's text, which can carry its URL and the signed request).
+  assert.match(await run({ takes: 0, stamp: wall => wall, plan: true }), /^PAYMASTER_EXIT_UNAVAILABLE: exit: TypeError: $/);
 });

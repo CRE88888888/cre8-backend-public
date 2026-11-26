@@ -807,7 +807,10 @@ test('#112-r2 expired unsigned exit unlocks only with finalized unchanged nonce,
     await reserveSponsorship(r);await new Promise<void>(resolve=>setTimeout(resolve,3100));
     const unchanged=async()=>assert.equal((await query<{state:string}>('select state from gas_budget_reservations where execution_key=$1',[r.budget.executionKey])).rows[0]?.state,'reserved');
     assert.equal(await reconcile(),0,'validUntil equality is still valid on EntryPoint');await unchanged();
-    timestamp++;nonce++;assert.equal(await reconcile(),0,'consumed nonce is not proof of an unused signature');await unchanged();nonce--;
+    // A used-up nonce is never proof of an UNUSED signature: it is its own kind of evidence (the authorization can never
+    // execute again), released under another reason and not counted as unused (test/paymaster-exit-quota.db.test.ts, plan 9).
+    timestamp++;nonce++;
+    assert.deepEqual((await (await import('../src/paymaster-exit-reconciliation.js')).expiredExitProofs(settings,sender)).map(p=>p.consumedNonce),[nonce.toString()]);await unchanged();nonce--;
     for(const bad of ['rpc','reorg']){mode=bad;await assert.rejects(reconcile());await unchanged();}mode='ok';
     const {readYieldState}=await import('../src/yield-runtime-state.js');
     const {expiredExitProofs,applyExpiredExitProofs}=await import('../src/paymaster-exit-reconciliation.js');

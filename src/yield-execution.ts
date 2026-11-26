@@ -292,7 +292,7 @@ async function submitYieldWithSession(args: YieldSubmitArgs): Promise<YieldEvide
   const attempts = args.maxQuoteAttempts ?? 3;
   if (!Number.isSafeInteger(attempts) || attempts < 1 || attempts > 3) throw fail('YIELD_INVALID_ACTION', '報價重試上限必須是 1 到 3', 400);
   const publicClient = args.publicClient;
-  if (!await yieldSessionAvailable(publicClient, args.policies, args.account, TESTNET_97.contracts.executor, new Date()))
+  if (!await yieldSessionAvailable(publicClient, args.policies, args.account, TESTNET_97.contracts.executor, () => new Date()))
     throw fail('SESSION_AUTHORIZATION_REQUIRED', '需要更新授權：生息 permission 未安裝或已過期', 409);
   const account = await sessionKernelAccount({ account: args.account, executor: TESTNET_97.contracts.executor,
     sessionKey: yieldSessionKey(args.sessionKey, args.policies, args.account) }, publicClient);

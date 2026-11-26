@@ -9,7 +9,12 @@ import { readYieldState, writeYieldState } from './yield-runtime-state.js';
 import { rpcTransport } from './rpc-transport.js';
 
 export type ExitFacts={chainId:number;account:Address;userOpHash:Hex;executionKey:string;nonce:string;validUntil:number;purpose:string};
-export type ExpiredExitProof={facts:ExitFacts;blockNumber:string;blockHash:Hex;blockTimestamp:number;checkedAt:number;operator:string;reference:string};
+/** `consumedNonce`: the EntryPoint nonce of the authorization's key at the finalized block, when it is past the
+ * authorization's own nonce (the proof is then "its nonce is used up", not "it expired with its nonce untouched"). */
+export type ExpiredExitProof={facts:ExitFacts;blockNumber:string;blockHash:Hex;blockTimestamp:number;checkedAt:number;operator:string;reference:string;consumedNonce?:string};
+/** The proof says this authorization can never execute again: expired with its nonce untouched, or its nonce used up. */
+const proves=(p:ExpiredExitProof):boolean=>p.consumedNonce===undefined?p.blockTimestamp>p.facts.validUntil
+  :/^\d+$/.test(p.consumedNonce)&&BigInt(p.consumedNonce)>BigInt(p.facts.nonce)&&BigInt(p.consumedNonce)>>64n===BigInt(p.facts.nonce)>>64n;
 type ReadConfig=Pick<PaymasterConfig,'chainId'|'rpcUrl'|'timeoutMs'>;
 type Query=(sql:string,params?:readonly unknown[])=>Promise<{rows:unknown[]}>;
 const fail=()=>new AppError(503,'PAYMASTER_EXIT_UNAVAILABLE','exit reconciliation evidence unavailable');
@@ -75,6 +80,17 @@ async function pending(chainId:number,account:Address,db:Query){
   }
   return result;
 }
+/**
+ * Evidence that an outstanding exit authorization of `account` can never execute again, read at a FINALIZED block:
+ * - expired and its nonce untouched: it was never used (`expired_finalized_nonce_unchanged`, counted as unused);
+ * - the EntryPoint nonce of its key is past its own nonce: that nonce is used up, by this operation or by another
+ *   one, so the EntryPoint refuses it for good (`finalized_nonce_consumed`). Valid before its expiry too.
+ * The second case is what a public exit leaves behind: nobody reconciles an owner's own UserOp (a full cash-out to
+ * the wallet is an exit), so its reservation stays `reserved`, and the sponsor's own search for its
+ * UserOperationEvent covers the last 1,024 blocks only (under 8 minutes at 0.45 s a block). 2026-11-26, portfolio 50:
+ * cash-out at 01:31, a DCA period due from 01:53 was refused with PAYMASTER_EXIT_AUTHORIZATION_PENDING and would
+ * have been refused forever (the nonce had moved, so "expired with its nonce untouched" could never be shown).
+ */
 export async function expiredExitProofs(c:ReadConfig,account:Address,db:Query=query,audit={operator:'automatic',reference:'finalized-entrypoint-nonce'}):Promise<ExpiredExitProof[]>{
   try{
     if(c.chainId!==97)throw fail();
@@ -82,18 +98,21 @@ export async function expiredExitProofs(c:ReadConfig,account:Address,db:Query=qu
     const locks=(await db("select execution_key from gas_budget_reservations where chain_id=$1 and account=$2 and purpose='exit' and state in ('reserved','submitted','unknown')",[c.chainId,account])).rows;
     if(!locks.length)return[];
     const keys=new Set(locks.map(row=>record(row).execution_key));
-    const entries=await pending(c.chainId,account,db),now=Math.floor(Date.now()/1000);
-    const exits=entries?.filter(e=>keys.has(e.facts.executionKey)&&e.facts.purpose==='exit'&&e.facts.validUntil<now)??[];if(!exits.length)return[];
+    const entries=await pending(c.chainId,account,db);
+    const exits=entries?.filter(e=>keys.has(e.facts.executionKey)&&e.facts.purpose==='exit')??[];if(!exits.length)return[];
     const client=createPublicClient({transport:rpcTransport('paymaster-exit-reconciliation', c.rpcUrl,{timeout:c.timeoutMs,retryCount:0})});
-    const block=await client.getBlock({blockTag:'finalized'});
+    // The clock is read after the block arrives: a block is never newer than the moment it was received.
+    const block=await client.getBlock({blockTag:'finalized'}),now=Math.floor(Date.now()/1000);
     if(await client.getChainId()!==97||block.number===null||block.hash===null||block.timestamp>BigInt(now))throw fail();
     const proofs:ExpiredExitProof[]=[];
     for(const {facts}of exits){
-      // v0.7 accepts timestamp == validUntil. Only a FINALIZED strictly later block is proof.
-      if(block.timestamp<=BigInt(facts.validUntil))continue;
+      const expired=facts.validUntil<now&&block.timestamp>BigInt(facts.validUntil);
       const nonce=await client.readContract({address:TESTNET_97.contracts.entryPoint,abi:parseAbi(['function getNonce(address,uint192) view returns(uint256)']),functionName:'getNonce',args:[account,BigInt(facts.nonce)>>64n],blockNumber:block.number});
-      if(nonce!==BigInt(facts.nonce))continue;
-      proofs.push({facts,blockNumber:block.number.toString(),blockHash:block.hash,blockTimestamp:Number(block.timestamp),checkedAt:now,...audit});
+      const proof={facts,blockNumber:block.number.toString(),blockHash:block.hash,blockTimestamp:Number(block.timestamp),checkedAt:now,...audit};
+      // The key's nonce only counts up: once past the authorization's, the EntryPoint never accepts it again.
+      if(nonce>BigInt(facts.nonce))proofs.push({...proof,consumedNonce:nonce.toString()});
+      // v0.7 accepts timestamp == validUntil. Only a FINALIZED strictly later block is proof.
+      else if(nonce===BigInt(facts.nonce)&&expired)proofs.push(proof);
     }
     if((await client.getBlock({blockNumber:block.number})).hash!==block.hash)throw fail();
     return proofs;
@@ -108,13 +127,15 @@ export async function applyExpiredExitProofs(db:Pick<PoolClient,'query'>,chainId
   let released=0;
   for(const executionKey of new Set(proofs.map(p=>p.facts.executionKey))){
     const active=entries.filter(e=>e.facts.executionKey===executionKey);
-    if(!active.length||active.some(e=>!proofs.some(p=>JSON.stringify(p.facts)===JSON.stringify(e.facts)&&p.facts.purpose==='exit'&&p.blockTimestamp>p.facts.validUntil&&p.checkedAt<=Date.now()/1000&&Date.now()/1000-p.checkedAt<60)))continue;
+    if(!active.length||active.some(e=>!proofs.some(p=>JSON.stringify(p.facts)===JSON.stringify(e.facts)&&p.facts.purpose==='exit'&&proves(p)&&p.checkedAt<=Date.now()/1000&&Date.now()/1000-p.checkedAt<60)))continue;
     const reservation=(await db.query<{day:string}>("select to_char(utc_day,'YYYY-MM-DD') as day from gas_budget_reservations where chain_id=$1 and account=$2 and execution_key=$3 and purpose='exit' and state in ('reserved','submitted','unknown')",[chainId,account,executionKey])).rows[0];if(!reservation)continue;
     await db.query("select pg_advisory_xact_lock(hashtextextended('gas_budget_reservations:'||$1::bigint::text||':'||$2::text||':'||$3::text,0))",[chainId,account,reservation.day]);
     const evidence=proofs.filter(p=>active.some(e=>e.facts.userOpHash===p.facts.userOpHash));
     const day=(await db.query<{day:string}>("select to_char(transaction_timestamp() at time zone 'UTC','YYYY-MM-DD') as day")).rows[0]?.day;
     if(!day)throw fail();
-    await writeYieldState(`release-${evidence[0]?.facts.userOpHash.slice(2)}`,{reason:'expired_finalized_nonce_unchanged',utcDay:day,evidence},(sql,params)=>db.query(sql,params?[...params]:[]));
+    // Only "expired with its nonce untouched" is an unused signature (unusedExitUsage counts that reason alone).
+    const reason=evidence.every(p=>p.consumedNonce===undefined)?'expired_finalized_nonce_unchanged':'finalized_nonce_consumed';
+    await writeYieldState(`release-${evidence[0]?.facts.userOpHash.slice(2)}`,{reason,utcDay:day,evidence},(sql,params)=>db.query(sql,params?[...params]:[]));
     await db.query("update paymaster_sponsorships set state='expired',updated_at=greatest(updated_at,clock_timestamp()) where user_op_hash=any($1::text[]) and state not in ('confirmed','failed','expired')",[active.map(e=>e.facts.userOpHash)]);
     await db.query("update gas_budget_reservations set state='failed',updated_at=greatest(updated_at,clock_timestamp()) where execution_key=$1 and state in ('reserved','submitted','unknown')",[executionKey]);released++;
   }

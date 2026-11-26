@@ -24,6 +24,7 @@ import { yieldSessionAvailable } from './yield-session.js';
 import { rpcTransport } from './rpc-transport.js';
 import { accountHoldsOnlyCash, pausedBySellAll, RESUME_AFTER_SELL_ALL_SQL } from './sell-all-resume.js';
 import { FINISH_SELL_ALL_SQL, NEW_MONEY_ENDS_SELL_ALL_SQL, SELL_ALL_OF_PORTFOLIO_SQL } from './sell-all-intent.js';
+import { readYieldState, writeYieldState } from './yield-runtime-state.js';
 
 /**
  * DCA (定投, docs/dca.zh-TW.md, db 0064). The user moves the whole total into the portfolio's own smart account,
@@ -80,8 +81,33 @@ const OPEN = "('awaiting_deposit','active','paused')";
 /** `$1` portfolio id. An unfinished "sell all" (src/sell-all-intent.ts) counts as paused. */
 const PORTFOLIO_STATE_SQL = `select schedule_state,strategy_id::text,version,${SELL_ALL_OF_PORTFOLIO_SQL} as selling from portfolios p where p.id=$1`;
 type PortfolioState = { schedule_state: string; strategy_id: string; version: number; selling?: boolean };
-/** Why a period whose time has come is not being bought (the scheduler's own skip order, src/dca.ts step). */
-export type DcaWaitingReason = 'portfolio_paused' | 'market_closed' | 'authorization_required';
+/**
+ * Why a period whose time has come is not being bought. The first three are read from the current state (the
+ * scheduler's own skip order, src/dca.ts step); the others are what the scheduler's last attempt ran into
+ * (`DcaNote`): the account has another operation unsettled or was busy, the vault cannot pay the period out right
+ * now, the account has not approved the executor for the vault shares, the gas sponsorship was refused, or a read or
+ * dependency failed. All of them are retried every round; an app that does not know a value shows a plain wait.
+ */
+export type DcaWaitingReason = 'portfolio_paused' | 'market_closed' | 'authorization_required'
+  | 'account_busy' | 'vault_liquidity' | 'approval_required' | 'sponsorship_unavailable' | 'temporarily_unavailable';
+/** The scheduler's last attempt at a due period that did not go through: reason, its full log line, for which period, when. */
+export type DcaNote = { reason: DcaWaitingReason; detail: string; periodsDone: number; at: string };
+/** A note older than this says nothing about now (the scheduler tries every round, about two minutes apart). */
+export const DCA_NOTE_FRESH_MS = 10 * 60_000;
+/** The waiting reason behind a step's one-line result (`null` = the account lock was busy); null = nothing is waiting. */
+export function waitingOfStep(line: string | null): DcaWaitingReason | null {
+  if (line === null) return 'account_busy';
+  const code = /^\[([A-Z_]+)\]/.exec(line)?.[1];
+  return code === 'DCA_PORTFOLIO_PAUSED' ? 'portfolio_paused' : code === 'MARKET_CLOSED' ? 'market_closed'
+    : code === 'DCA_AUTHORIZATION_REQUIRED' ? 'authorization_required' : code === 'DCA_APPROVAL_REQUIRED' ? 'approval_required'
+    : code === 'PREVIOUS_INFLIGHT' ? 'account_busy' : code === 'DCA_LIQUIDITY' ? 'vault_liquidity'
+    : code === 'DCA_VAULT_UNKNOWN' || code === 'DCA_VERSION_UNAVAILABLE' || code === 'DCA_ZERO_SHARES' ? 'temporarily_unavailable' : null;
+}
+/** The waiting reason behind an error code thrown by a step. */
+export function waitingOfError(code: string): DcaWaitingReason {
+  return code.startsWith('PAYMASTER_') || code.startsWith('GAS_BUDGET_') ? 'sponsorship_unavailable'
+    : /AUTHORIZATION|PERMISSION|SESSION/.test(code) ? 'authorization_required' : 'temporarily_unavailable';
+}
 const INFLIGHT = "('prepared','sending','submitted','unknown')";
 
 export type DcaChain = {
@@ -129,7 +155,16 @@ export type DcaDeps = {
   sessionKey: (portfolioId: number, account: Address, now: Date) => Promise<{ sessionKey: SessionKeyRef; policies: unknown } | null>;
   /** The account holds nothing but cash right now (src/sell-all-resume.ts). Read only for a paused portfolio. */
   holdsOnlyCash: (portfolioId: number) => Promise<boolean>;
+  /** Remember / read back why the scheduler's last attempt at a plan's due period did not go through. Best effort. */
+  note: (planId: string, note: DcaNote) => Promise<void>;
+  noted: (planId: string) => Promise<DcaNote | null>;
 };
+/** One row per plan in yield_runtime_state (`cursor-` rows may be rewritten): API and scheduler are separate processes. */
+const noteKey = (planId: string) => `cursor-dca-plan-${planId}`;
+async function readNote(planId: string): Promise<DcaNote | null> {
+  const v = await readYieldState(noteKey(planId)) as Partial<DcaNote> | null;
+  return v && typeof v.reason === 'string' && typeof v.detail === 'string' && typeof v.periodsDone === 'number' && typeof v.at === 'string' ? v as DcaNote : null;
+}
 
 let cachedClient: PublicClient | undefined;
 function liveClient(): PublicClient {
@@ -144,6 +179,7 @@ function defaults(): DcaDeps {
     chainId: Number(process.env.CHAIN_ID?.trim() || '56'), vaults: dcaVaults(), executor: TESTNET_97.contracts.executor as Address,
     query: dbQuery, transaction: withTransaction, owned: requireOwnedPortfolio, chain: () => createDcaChain(liveClient()), now: () => new Date(),
     lock: withMixPortfolioLock, publicClient: liveClient, holdsOnlyCash: accountHoldsOnlyCash,
+    note: (planId, note) => writeYieldState(noteKey(planId), note), noted: readNote,
     sessionKey: (portfolioId, account, now) => usableSessionKey(dbQuery, liveClient(), TESTNET_97.contracts.executor as Address, portfolioId, account, now),
     submit: async args => (await import('./yield-execution.js')).submitYieldAction(args),
     reconcile: async saved => (await import('./yield-execution.js')).reconcileYieldOperation(liveClient(), resolveBundlerUrl(), saved),
@@ -161,7 +197,8 @@ async function usableSessionKey(query: Query, client: PublicClient, executor: Ad
   const owner = (await query<{ owner: Address }>('select owner from smart_accounts where chain_id=97 and portfolio_id=$1', [portfolioId])).rows[0]?.owner;
   if (!owner) return null;
   for (const key of keys) {
-    if (!await yieldSessionAvailable(client, key.permissions, account, executor, now)) continue;
+    // A clock, not `now`: the check compares the head it reads with the time AFTER that read (src/yield-session.ts).
+    if (!await yieldSessionAvailable(client, key.permissions, account, executor, () => new Date())) continue;
     const policies = key.permissions as { permissionId?: unknown; sessionKeyAddress?: unknown; timestamp?: { validUntil?: unknown } };
     const validUntil = policies.timestamp?.validUntil;
     if (!/^m\/44'\/60'\/[0-9'/]+$/.test(key.key_ref) || typeof validUntil !== 'number' || !Number.isSafeInteger(validUntil) ||
@@ -264,12 +301,19 @@ export function createDca(overrides: Partial<DcaDeps> = {}) {
     const inflight = (await deps.query<{ id: string }>(`select id::text from dca_actions where plan_id=$1 and state in ${INFLIGHT} limit 1`, [plan.id])).rows.length > 0;
     const due = next !== null && next <= deps.now(), waitingForMarket = due && !await marketOpen(p, plan.owner);
     const authorization = await keyReady(p.id, plan.account) ? 'ready' as const : 'renewal_required' as const;
-    // A due period that is not being bought says why, in the order the scheduler skips it. null while due = the next round buys it.
+    // A due period that is not being bought says why, in the order the scheduler skips it; then what the scheduler's
+    // last attempt at this period ran into, while that is recent. null while due = the next round buys it.
     let waitingReason: DcaWaitingReason | null = null;
     if (due && !inflight) {
       const state = (await deps.query<PortfolioState>(PORTFOLIO_STATE_SQL, [p.id])).rows[0];
       waitingReason = !state || state.schedule_state !== 'active' || state.selling === true ? 'portfolio_paused'
         : waitingForMarket ? 'market_closed' : authorization !== 'ready' ? 'authorization_required' : null;
+      if (waitingReason === null) {
+        let note: DcaNote | null = null;
+        try { note = await deps.noted(plan.id); } catch { note = null; }
+        const age = note ? deps.now().getTime() - new Date(note.at).getTime() : NaN;
+        if (note && note.periodsDone === done && age >= 0 && age <= DCA_NOTE_FRESH_MS) waitingReason = note.reason;
+      }
     }
     return { id: plan.id, state: plan.state, vaultId: vault.id, vaultName: vault.name, apyBps: v?.apyBps ?? null, frequency: plan.frequency,
       periods: plan.periods, periodsDone: done, totalRaw: plan.total_raw, trancheRaw: plan.tranche_raw, startAt: plan.start_at.toISOString(),
@@ -606,6 +650,14 @@ export async function runDcaRound(options: { dryRun: boolean; limit: number; log
     : await d.query<PlanRow & { current_portfolio: string | null }>(`select q.* from (${due}) q where q.current_portfolio=$2::text order by q.id::bigint limit $1`,
       [options.limit, String(options.portfolioId)])).rows;
   let checked = 0, credited = 0, blocked = 0;
+  // Every reason a due period was not redeemed this round is kept for the plan's view (`waitingReason`). Until
+  // 2026-11-26 only three of them were visible: plan 9 was refused by the paymaster four rounds in a row while the
+  // App said nothing was in the way. Never fails the round.
+  const remember = async (plan: PlanRow, reason: DcaWaitingReason | null, detail: string) => {
+    if (reason === null || d.dryRun) return;
+    try { await d.note(plan.id, { reason, detail: detail.slice(0, 600), periodsDone: plan.periods_done, at: d.now().toISOString() }); }
+    catch (error) { d.log(`[dca] plan ${plan.id}: 等待原因未寫入：${errorChain(error)}`); }
+  };
   for (const plan of plans) {
     const portfolioId = Number(plan.current_portfolio);
     if (!Number.isSafeInteger(portfolioId) || portfolioId <= 0) { blocked++; continue; }
@@ -614,12 +666,15 @@ export async function runDcaRound(options: { dryRun: boolean; limit: number; log
       checked++;
       if (reason === null) d.log(`[dca] plan ${plan.id}: 帳戶處理中，下輪再試`);
       else if (reason !== '[DCA_NOT_DUE]' && reason !== '[DCA_NOT_ACTIVE]') d.log(`[dca] plan ${plan.id}: ${reason}`);
+      await remember(plan, waitingOfStep(reason), reason ?? '帳戶處理中，下輪再試');
       if (!d.dryRun) credited += await creditPending(d, plan, portfolioId);
     } catch (error) {
       blocked++;
       const code = error instanceof AppError ? error.code : 'DCA_UNAVAILABLE';
       // The code alone never said why (2026-11-25 plan 7: three rounds of "blocked YIELD_…" and no cause anywhere).
-      d.log(`[dca] plan ${plan.id}: blocked ${code}：${errorChain(error)}`);
+      const line = `blocked ${code}：${errorChain(error)}`;
+      d.log(`[dca] plan ${plan.id}: ${line}`);
+      await remember(plan, waitingOfError(code), line);
     }
   }
   return { checked, credited, blocked };

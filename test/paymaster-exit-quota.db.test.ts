@@ -304,3 +304,73 @@ test('#114 legacy releases without utcDay count today and later status changes n
     }
   } finally { await clean([sender]); }
 });
+
+/**
+ * 2026-11-26, portfolio 50 (a fund account that was sold out and cashed out, then got a DCA plan). The owner's full
+ * cash-out to the wallet is an exit: its reservation stays `reserved` (nobody reconciles a public UserOp), and the
+ * sponsor's own search for its UserOperationEvent only covers the last 1,024 blocks (under 8 minutes). A DCA period
+ * redemption 22 minutes later was refused with PAYMASTER_EXIT_AUTHORIZATION_PENDING, and would have been forever: the
+ * nonce had moved, so "expired with its nonce untouched" could never be shown either.
+ */
+test('2026-11-26 plan 9: a cash-out whose nonce is used up no longer holds the exit slot — a DCA period redemption is sponsored, on a fund account and on a My mix', async () => {
+  const { encodeCallDataEpV07 } = await import('@zerodev/sdk');
+  const { erc20Abi } = await import('viem');
+  const { dcaVaults } = await import('../src/dca-calls.js');
+  const vault = dcaVaults().find(v => v.id === 'venus_usdt'); assert.ok(vault);
+  // Kernel nonce shapes: the owner's root validator and a session key (permission) validator are separate nonce keys.
+  const ROOT = (BigInt('0x845adb2c711129d4f3966735ed98a9f09fc4ce57') << 80n) | 5n, SESSION = (2n << 240n) | (0xdeadbeefn << 208n) | 0n;
+  for (const kind of ['fund', 'mix'] as const) {
+    const sender = account();
+    // The EntryPoint nonce of the cash-out's key at the finalized block; the finalized block is always before the cash-out's expiry.
+    const chain = { rootNonce: ROOT, reads: 0 };
+    const server = createServer(async (req, res) => {
+      let body = ''; for await (const part of req) body += String(part);
+      const rpc: { id: number; method: string } = JSON.parse(body);
+      if (rpc.method === 'eth_call') chain.reads++;
+      const result = rpc.method === 'eth_chainId' ? '0x61' : rpc.method === 'eth_call' ? encodeAbiParameters([{ type: 'uint256' }], [chain.rootNonce])
+        : { number: '0x64', hash: keccak256(toHex('finalized')), timestamp: toHex(Math.floor(Date.now() / 1000) - 3) };
+      res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ jsonrpc: '2.0', id: rpc.id, result }));
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const endpoint = server.address(); assert.ok(endpoint && typeof endpoint !== 'string');
+    const c = { ...config({ CHAIN_ID: '97', PAYMASTER_SIGNER_PRIVATE_KEY: TEST_SIGNER, RPC_URL: `http://127.0.0.1:${endpoint.port}` }), timeoutMs: 2000 };
+    const service = createPaymasterService({ config: c, checkChain: async () => {}, verifyYieldWithdraw: async () => [], expiredExitProofs: (cfg, a, db) => expiredExitProofs(cfg, a, db),
+      // A cash-out that takes everything is an exit (readBudgetContext, read from the chain in production).
+      readBudgetContext: async () => ({ purpose: 'exit', nativePrice: 1n, priceSource: 'test:plan9' }),
+      mixLock: async (_id, work) => work(), strategyV2: null,
+      // The account lookup of each kind; every other statement (the exit ledger) goes to the real database.
+      query: async (sql, params) => sql.includes('select s.owner') ? { rows: [{ owner: OWNER, user_id: OWNER, mix_id: kind === 'mix' ? '5' : null }] }
+        : sql.includes('from mixes m where') ? { rows: [{ id: '5', owner: OWNER, account: sender, triggered_at: null, status: 'active', delete_requested_at: null }] }
+        : sql.includes('mix_switch_intents') ? { rows: [] } : sql.includes('select ms.exit_assets') ? { rows: [{ exit_assets: [] }] }
+        : sql.includes('from strategy_cash_balances b') ? { rows: [] } : query(sql, params ? [...params] : []) });
+    const cashOut = operation({ sender, nonce: ROOT, callData: await encodeCallDataEpV07([{ to: T.contracts.usdt, value: 0n,
+      data: encodeFunctionData({ abi: erc20Abi, functionName: 'transfer', args: [OWNER as Address, 99n * 10n ** 18n] }) }]) });
+    const redemption = (deadline: number) => encodeCallDataEpV07([{ to: T.contracts.executor, value: 0n, data: encodeFunctionData({ abi: YIELD_EXECUTOR_ABI, functionName: 'executeWithdraw',
+      args: [sender, vault.marketId, 10n ** 9n, 1n, BigInt(deadline)] }) }]);
+    const state = async () => (await query<{ purpose: string; state: string }>('select purpose,state from gas_budget_reservations where account=$1 order by created_at,execution_key', [sender])).rows.map(r => `${r.purpose}:${r.state}`);
+    try {
+      await service.sponsor({ userOperation: cashOut }, OWNER);
+      assert.deepEqual(await state(), ['exit:reserved'], `${kind}: the cash-out holds the exit slot`);
+      // Not mined yet (its nonce is still the account's next one) and not expired: the slot is rightly held, and the refusal says by what.
+      const first = operation({ sender, nonce: SESSION, callData: await redemption(Math.floor(Date.now() / 1000) + 900) });
+      const held = await service.sponsor({ userOperation: first }, OWNER).then(() => null, (e: unknown) => e);
+      assert.ok(denied('PAYMASTER_EXIT_AUTHORIZATION_PENDING')(held), `${kind}: ${String(held)}`);
+      assert.match(((held as AppError).cause as Error).message, /^exit: an earlier exit authorization of this account is still outstanding \(reserved, issued \d+ s ago\)$/);
+      assert.ok(chain.reads > 0, 'the finalized nonce was read');
+      // Mined: the key's nonce moved past the cash-out's. That authorization can never execute again, expired or not.
+      chain.rootNonce = ROOT + 1n;
+      const signed = await service.sponsor({ userOperation: first }, OWNER);
+      assert.ok(signed.paymasterData.length > 2, `${kind}: the DCA period redemption is sponsored`);
+      assert.deepEqual((await state()).sort(), ['exit:failed', 'exit:reserved'], `${kind}: the cash-out's slot is released, the redemption holds it now`);
+      const sponsorships = (await query<{ state: string }>('select state from paymaster_sponsorships where sender=$1 order by created_at', [sender])).rows.map(r => r.state);
+      assert.deepEqual(sponsorships.sort(), ['expired', 'reserved']);
+      const release = (await query<{ value: { reason: string; evidence: { consumedNonce?: string; operator: string }[] } }>(
+        `select value from yield_runtime_state where kind='release' and value->'evidence'->0->'facts'->>'account'=$1`, [sender])).rows;
+      assert.equal(release.length, 1);
+      assert.equal(release[0]?.value.reason, 'finalized_nonce_consumed');
+      assert.deepEqual(release[0]?.value.evidence.map(e => [e.consumedNonce, e.operator]), [[(ROOT + 1n).toString(), 'automatic']]);
+      // A used-up nonce is not an unused signature: it does not count toward the three unused exits a day.
+      assert.equal((await unusedExitUsage(query, 97, sender, new Date().toISOString().slice(0, 10))).count, 0n);
+    } finally { await new Promise<void>(resolve => server.close(() => resolve())); await clean([sender]); }
+  }
+});

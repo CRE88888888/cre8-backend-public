@@ -107,6 +107,8 @@ export type PaymasterDeps = {
   reserve?: (request: Reservation) => Promise<number | void>;
   readBudgetContext?: (op: PackedSponsorOperation, config: PaymasterConfig) => Promise<BudgetContext>;
   verifyYieldWithdraw?: (op: PackedSponsorOperation, config: PaymasterConfig, now: number, query: Query) => Promise<readonly ConsumedAuthorization[]>;
+  /** Evidence that earlier exit authorizations of the account can never execute again (src/paymaster-exit-reconciliation.ts). */
+  expiredExitProofs?: (config: PaymasterConfig, account: Address, query: Query) => Promise<ExpiredExitProof[]>;
   /** Internal scheduler evidence, bound to the exact canonical Kernel calldata. Never request input. */
   exitCallData?: Hex;
   /** Public chain-97 ordinary requests may reserve up to three distinct gas estimates per nonce. */
@@ -580,30 +582,41 @@ const EXIT_READ = parseAbi(['function balanceOf(address) view returns(uint256)',
 const USER_OP_EVENT = parseAbiItem('event UserOperationEvent(bytes32 indexed userOpHash,address indexed sender,address indexed paymaster,uint256 nonce,bool success,uint256 actualGasCost,uint256 actualGasUsed)');
 /** Public sponsorship has no trusted scheduler plan. Prove holdings and simulate the entire
  * exact Kernel batch, so duplicate markets cannot borrow the same balance twice.
+ *
+ * `clock`: unix seconds, read AFTER the head block arrives. The head is refused when it is older than 60 s or newer
+ * than the clock (yield-domain `fresh`). Until 2026-11-26 the clock was the one read when sponsor() started, a
+ * second or more before this read (owner lookup, call checks, checkChain, budget price), so a node that was at the
+ * head answered with a block "from the future" and the exit was refused as PAYMASTER_EXIT_INVALID with no reason
+ * (DCA plan 9: three of four scheduler rounds). Every refusal now says which check failed.
  */
-async function verifyYieldWithdraw(op:PackedSponsorOperation,c:PaymasterConfig,now:number,db:Query):Promise<readonly ConsumedAuthorization[]>{
+export async function verifyYieldWithdraw(op:PackedSponsorOperation,c:PaymasterConfig,clock:()=>number,db:Query,client:Pick<PublicClient,'getBlock'|'getChainId'|'readContract'|'call'|'getLogs'|'getTransaction'|'getTransactionReceipt'>=rpc(c)):Promise<readonly ConsumedAuthorization[]>{
+  const invalid=(reason:string)=>rejected('PAYMASTER_EXIT_INVALID',403,`exit: ${reason}`);
+  const unavailable=(reason:string)=>rejected('PAYMASTER_EXIT_UNAVAILABLE',503,`exit: ${reason}`);
   try{
-    const client=rpc(c),block=await client.getBlock({blockTag:'latest'});
-    if(c.chainId!==97||await client.getChainId()!==97||op.initCode!=='0x'||block.number===null||block.hash===null||
-      !fresh(new Date(Number(block.timestamp)*1000),new Date(now*1000)))throw rejected('PAYMASTER_EXIT_INVALID',403);
+    const block=await client.getBlock({blockTag:'latest'}),now=clock();
+    if(c.chainId!==97||await client.getChainId()!==97)throw invalid('not chain 97');
+    if(op.initCode!=='0x')throw invalid('account not deployed');
+    if(block.number===null||block.hash===null)throw invalid('head block is pending');
+    if(!fresh(new Date(Number(block.timestamp)*1000),new Date(now*1000)))throw invalid(`head block ${block.number} is ${BigInt(now)-block.timestamp} s old (allowed 0 to 60)`);
     const nonce=await client.readContract({address:TESTNET_97.contracts.entryPoint,abi:EXIT_READ,functionName:'getNonce',args:[op.sender,op.nonce>>64n],blockNumber:block.number});
-    if(nonce!==op.nonce)throw rejected('PAYMASTER_EXIT_INVALID',403);
+    if(nonce!==op.nonce)throw invalid(`nonce ${op.nonce&((1n<<64n)-1n)} is not the account's next one (${nonce&((1n<<64n)-1n)}) at block ${block.number}`);
     const amounts=new Map<Hex,bigint>();
     for(const call of sponsoredCalls(op)){
       const decoded=decodeFunctionData({abi:EXECUTOR_ABI,data:call.callData});
-      if(!isAddressEqual(call.target,c.executor)||decoded.functionName!=='executeWithdraw')throw rejected('PAYMASTER_EXIT_INVALID',403);
+      if(!isAddressEqual(call.target,c.executor)||decoded.functionName!=='executeWithdraw')throw invalid('not an executor withdraw');
       amounts.set(decoded.args[1],(amounts.get(decoded.args[1])??0n)+decoded.args[2]);
     }
     for(const [id,amount]of amounts){
-      const market=TESTNET_97.yieldMarkets.find(m=>m.marketId===id);if(!market)throw rejected('PAYMASTER_EXIT_INVALID',403);
+      const market=TESTNET_97.yieldMarkets.find(m=>m.marketId===id);if(!market)throw invalid(`unknown market ${id}`);
       const [balance,units]=await Promise.all([
         client.readContract({address:market.receipt,abi:EXIT_READ,functionName:'balanceOf',args:[op.sender],blockNumber:block.number}),
         client.readContract({address:TESTNET_97.contracts.yieldRegistry,abi:EXIT_READ,functionName:'accountUnits',args:[op.sender,id],blockNumber:block.number}),
       ]);
+      if(amount===0n||amount>balance)throw invalid(`withdraws ${amount} of market ${id}, the account holds ${balance}`);
       // DCA (db 0064): the vault shares were deposited by the account itself (untracked by the registry);
       // a session-key redemption of an open plan's own market is still a pure exit back to account cash.
-      if(amount===0n||amount>balance||units===0n&&!(await db(`select 1 from dca_plans where chain_id=$1 and account=$2 and market_id=$3
-        and state in ('active','paused') limit 1`,[c.chainId,op.sender.toLowerCase(),id.toLowerCase()])).rows.length)throw rejected('PAYMASTER_EXIT_INVALID',403);
+      if(units===0n&&!(await db(`select 1 from dca_plans where chain_id=$1 and account=$2 and market_id=$3
+        and state in ('active','paused') limit 1`,[c.chainId,op.sender.toLowerCase(),id.toLowerCase()])).rows.length)throw invalid(`market ${id} is neither a yield position nor an open DCA plan of this account`);
     }
     let data=op.callData;
     let stateOverride:Parameters<typeof client.call>[0]['stateOverride'];
@@ -630,26 +643,27 @@ async function verifyYieldWithdraw(op:PackedSponsorOperation,c:PaymasterConfig,n
         fromBlock:block.number>1024n?block.number-1024n:0n,toBlock:block.number});
       for(const log of logs){
         if(log.removed||log.blockNumber===null||log.blockHash===null)continue;
-        if((await client.getBlock({blockNumber:log.blockNumber})).hash!==log.blockHash)throw rejected('PAYMASTER_EXIT_UNAVAILABLE',503);
+        if((await client.getBlock({blockNumber:log.blockNumber})).hash!==log.blockHash)throw unavailable('a consumed authorization is no longer in a canonical block');
         const [tx,receipt]=await Promise.all([client.getTransaction({hash:log.transactionHash}),client.getTransactionReceipt({hash:log.transactionHash})]);
         if(tx.hash!==log.transactionHash||tx.blockHash!==log.blockHash||tx.blockNumber!==log.blockNumber||!tx.to||!isAddressEqual(tx.to,TESTNET_97.contracts.entryPoint)||
           receipt.status!=='success'||receipt.transactionHash!==tx.hash||receipt.blockHash!==log.blockHash||receipt.blockNumber!==log.blockNumber||
           !receipt.logs.some(candidate=>!candidate.removed&&candidate.transactionHash===log.transactionHash&&candidate.blockHash===log.blockHash&&candidate.blockNumber===log.blockNumber&&
             candidate.logIndex===log.logIndex&&isAddressEqual(candidate.address,log.address)&&candidate.data===log.data&&
-            candidate.topics.length===log.topics.length&&candidate.topics.every((topic,index)=>topic===log.topics[index])))throw rejected('PAYMASTER_EXIT_UNAVAILABLE',503);
+            candidate.topics.length===log.topics.length&&candidate.topics.every((topic,index)=>topic===log.topics[index])))throw unavailable('a consumed authorization has no matching successful EntryPoint transaction');
         const decoded=decodeFunctionData({abi:entryPoint07Abi,data:tx.input});
         const packed=decoded.functionName==='handleOps'?decoded.args[0]:decoded.functionName==='handleAggregatedOps'?decoded.args[0].flatMap(group=>group.userOps):[];
         const originals=packed.filter(original=>packedOperationHash(original,c.chainId)===log.args.userOpHash);
         const original=originals[0];
-        if(originals.length!==1||!original||!isAddressEqual(original.sender,op.sender)||original.nonce!==log.args.nonce)throw rejected('PAYMASTER_EXIT_UNAVAILABLE',503);
+        if(originals.length!==1||!original||!isAddressEqual(original.sender,op.sender)||original.nonce!==log.args.nonce)throw unavailable('a consumed authorization does not match its original operation');
         consumed.push({userOpHash:log.args.userOpHash,executionKey:gasExecutionKey(c.chainId,original),success:log.args.success});
       }
     }
-    if((await client.getBlock({blockNumber:block.number})).hash!==block.hash)throw rejected('PAYMASTER_EXIT_UNAVAILABLE',503);
+    if((await client.getBlock({blockNumber:block.number})).hash!==block.hash)throw unavailable('the head block was replaced while reading');
     return consumed;
   }catch(error){
-    if(error instanceof AppError&&error.code==='PAYMASTER_EXIT_INVALID')throw error;
-    throw rejected('PAYMASTER_EXIT_UNAVAILABLE',503);
+    if(error instanceof AppError&&(error.code==='PAYMASTER_EXIT_INVALID'||error.code==='PAYMASTER_EXIT_UNAVAILABLE'))throw error;
+    // Never the raw RPC/DB text (it can carry the node URL and the signed request): the error's class and viem's short message only.
+    throw unavailable(error instanceof Error?`${error.name}: ${String((error as {shortMessage?:unknown}).shortMessage??'').slice(0,160)}`:'unknown failure');
   }
 }
 
@@ -836,7 +850,9 @@ export async function reserveSponsorship(r: Reservation, transaction: typeof wit
         await client.query("update paymaster_sponsorships set state=$4,updated_at=greatest(updated_at,clock_timestamp()) where chain_id=$1 and sender=$2 and user_op_hash=$3 and state not in ('confirmed','failed')",[c.chainId,r.op.sender,proof.userOpHash,proof.success?'confirmed':'failed']);
       }
       await applyExpiredExitProofs(client,c.chainId,r.op.sender,r.expiredAuthorizations??[]);
-      const pendingExit=pureYieldWithdraw(r.op,c)&&(await client.query("select execution_key from gas_budget_reservations where chain_id=$1 and account=$2 and purpose='exit' and state in ('reserved','submitted','unknown') limit 1",[c.chainId,r.op.sender])).rows.length>0;
+      // What still holds the account's exit slot, for the refusal's reason (state and age only: no hashes of the request).
+      const pendingExit=!pureYieldWithdraw(r.op,c)?undefined:(await client.query<{state:string;age:string}>(`select state,floor(extract(epoch from clock_timestamp()-created_at))::text as age
+        from gas_budget_reservations where chain_id=$1 and account=$2 and purpose='exit' and state in ('reserved','submitted','unknown') order by created_at limit 1`,[c.chainId,r.op.sender])).rows[0];
       // A request that arrived earlier may acquire the execution lock later. Refresh after waiting.
       const now = (r.now ?? (() => Math.floor(Date.now() / 1000)))();
       const candidates = await client.query<{ user_op_hash: Hex; valid_until: Date; state:string }>(`select user_op_hash,valid_until,state
@@ -890,7 +906,7 @@ export async function reserveSponsorship(r: Reservation, transaction: typeof wit
       // At most one unconsumed authorization per yield-exit account. Exact live retries above
       // reuse it. Canonically consumed signatures permit the next real exit immediately;
       // all historical gas/site charges remain, including expired or failed requests.
-      if(pendingExit)throw rejected('PAYMASTER_EXIT_AUTHORIZATION_PENDING',429);
+      if(pendingExit)throw rejected('PAYMASTER_EXIT_AUTHORIZATION_PENDING',429,`exit: an earlier exit authorization of this account is still outstanding (${pendingExit.state}, issued ${pendingExit.age} s ago)`);
       const usage = await client.query<{ count: string; gas: string; wei: string; account_count: string; account_gas: string; account_wei: string }>(`
         select count(*)::text as count, coalesce(sum(gas_limit),0)::text as gas, coalesce(sum(max_cost_wei),0)::text as wei,
           count(*) filter (where sender = $3)::text as account_count,
@@ -1212,8 +1228,12 @@ export function createPaymasterService(deps: PaymasterDeps = {}) {
       let signed=await authorization(op,c,validUntil);
       if (intentToSubmit?.user_op_hash && intentToSubmit.user_op_hash !== signed.userOpHash) throw rejected('PAYMASTER_CALL_FORBIDDEN', 403);
       if (pureYieldWithdraw(op, c)) {
-        consumedAuthorizations=await bounded((deps.verifyYieldWithdraw??verifyYieldWithdraw)({...op,paymasterAndData:signed.paymasterAndData},c,now,deps.query??query),c.timeoutMs);
-        if(!deps.verifyYieldWithdraw)expiredAuthorizations=await bounded(expiredExitProofs(c,op.sender,deps.query??query),c.timeoutMs);
+        const exitOp={...op,paymasterAndData:signed.paymasterAndData};
+        consumedAuthorizations=await bounded(deps.verifyYieldWithdraw?deps.verifyYieldWithdraw(exitOp,c,now,deps.query??query)
+          :verifyYieldWithdraw(exitOp,c,deps.now??(()=>Math.floor(Date.now()/1000)),deps.query??query),c.timeoutMs);
+        // Tests that replace the chain verification have no node to read a finalized block from, unless they bring this too.
+        const proofs=deps.expiredExitProofs??(deps.verifyYieldWithdraw?undefined:expiredExitProofs);
+        if(proofs)expiredAuthorizations=await bounded(proofs(c,op.sender,deps.query??query),c.timeoutMs);
       }
       const ordinaryGasRetry = attemptKey !== undefined && context.purpose === 'ordinary';
       const reservedUntil = await (deps.reserve ?? reserveSponsorship)({ hash: signed.userOpHash, op, config: c, validUntil, now: deps.now ?? (() => Math.floor(Date.now() / 1000)), ...cost,

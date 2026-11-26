@@ -435,7 +435,11 @@ export function createDca(overrides: Partial<DcaDeps> = {}) {
       // Only cash nobody else has claimed: funding lots, job reserves and other buckets stay untouched.
       const classified = BigInt((await deps.query<{ n: string }>(`select coalesce((select unallocated_hold_raw+stack_prefund_raw+allocated_cash_raw+reserved_input_raw+
         reserved_fee_raw+withdrawal_raw+yield_raw from strategy_cash_balances where chain_id=97 and portfolio_id=$1),0)::text as n`, [id])).rows[0]?.n ?? '0');
-      const free = balance > classified ? balance - classified : 0n;
+      // The ledger claims more cash than the account holds: it has not caught up with a recent move (2026-11-26: a sell-all
+      // withdrawal stays classified for about a minute). How much is free cannot be known yet, so the app must wait and ask
+      // again — never send the total a second time. Retryable, distinct from "not in the account".
+      if (classified > balance) throw new AppError(409, 'DCA_CASH_RECONCILING', '帳戶的現金帳還在對帳（剛賣出或領回），稍等再試；不要再轉一次。');
+      const free = balance - classified;
       if (free < total) throw new AppError(409, 'DCA_FUNDS_NOT_IN_ACCOUNT', `請先把 ${usdt(total)} USDT 轉進這個組合的帳戶（目前可用 ${usdt(free)}）。`);
       const calls: Call[] = [...dcaDepositCalls(vault, account, total, allowance), ...(receiptAllowance < UINT256_MAX / 2n ? [dcaReceiptApproval(vault, deps.executor)] : [])];
       const planId = await deps.transaction(async db => {

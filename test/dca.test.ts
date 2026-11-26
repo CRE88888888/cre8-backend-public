@@ -231,6 +231,10 @@ test('DCA create: validates input and minimum per period, needs the money in the
   // 1,200 in the account but 100 already belongs to a funding lot: 1,100 is free.
   await assert.rejects(dca.create(7, owner, { totalRaw: (1_150n * E18).toString(), periods: 10, frequency: 'weekly' }), isError(409, 'DCA_FUNDS_NOT_IN_ACCOUNT'));
   await assert.rejects(dca.create(7, '0x00000000000000000000000000000000000000ff', { totalRaw: '1', periods: 2, frequency: 'daily' }), isError(403, 'FORBIDDEN'));
+  // Right after a sell-all the ledger still classifies the withdrawn cash: more classified than held = still reconciling,
+  // a retryable answer that is not "transfer the total" (the app must never send it twice).
+  const lagging = createDca(harness({ balance: 40n * E18, classified: 99n * E18 }).deps);
+  await assert.rejects(lagging.create(7, owner, { totalRaw: (40n * E18).toString(), periods: 2, frequency: 'daily' }), isError(409, 'DCA_CASH_RECONCILING'));
   const r = await dca.create(7, owner, { totalRaw: (1_000n * E18).toString(), periods: 10, frequency: 'weekly' });
   assert.equal(r.status, 'ready');
   if (r.status !== 'ready') return;

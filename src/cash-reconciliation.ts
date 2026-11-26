@@ -1,17 +1,22 @@
 import { decodeEventLog, erc20Abi, keccak256, toHex } from 'viem';
 import type { Address, Hex, PublicClient } from 'viem';
 import type { SchedulerQueryFn } from './scheduler.js';
+import { isLogRangeRefusal } from './rpc-transport.js';
 
 export type CashWithdrawal = { txHash:Hex; logIndex:number; blockNumber:bigint; blockHash:Hex; amount:bigint };
 const identity=(chainId:number,e:CashWithdrawal)=>`cash-withdrawal:${chainId}:${e.txHash}:${e.logIndex}`;
 const commitment=(e:CashWithdrawal)=>keccak256(toHex(JSON.stringify([e.txHash,e.logIndex,e.blockNumber.toString(),e.blockHash,e.amount.toString()])));
 
 /**
- * 每段 eth_getLogs 的區塊數（含頭尾）。5,000＝會回日誌的 chain-97 節點裡最小的範圍上限（bsc-prebsc-dataseed：
- * `exceed maximum block range 5000`；publicnode 是 50,000）。原本 10,000：publicnode 限流、查詢改走下一個節點時
- * 每一段都被拒，整個組合那一輪 [CASH_RECONCILIATION_UNAVAILABLE]（2026-11-25 portfolio 4）。
+ * 每段 eth_getLogs 的區塊數（含頭尾）。先用 10,000（publicnode 收到 50,000）；節點說範圍太大時，那一段改成每
+ * `WITHDRAWAL_LOG_NARROW` 塊重讀。5,000＝會回日誌的 chain-97 節點裡最小的範圍上限（bsc-prebsc-dataseed：
+ * `exceed maximum block range 5000`）。
+ * - 只用 10,000：publicnode 限流、請求改走下一個節點時每一段都被拒，整個組合那一輪
+ *   [CASH_RECONCILIATION_UNAVAILABLE]（2026-11-25 portfolio 4）。
+ * - 只用 5,000：請求數加倍，重啟後第一次整段掃描從 3.6–4.8 秒變成 9.4–9.8 秒（2026-11-26 portfolio 1、4）。
  */
-export const WITHDRAWAL_LOG_CHUNK=5_000n;
+export const WITHDRAWAL_LOG_CHUNK=10_000n;
+export const WITHDRAWAL_LOG_NARROW=5_000n;
 /** 同時在飛的 getLogs 段數。 */
 export const WITHDRAWAL_LOG_CONCURRENCY=6;
 /**
@@ -49,7 +54,15 @@ export async function readCashWithdrawals(client:PublicClient,query:SchedulerQue
     await Promise.all(Array.from({length:Math.min(WITHDRAWAL_LOG_CONCURRENCY,ranges.length)},async()=>{
       for(let i=next++;i<ranges.length;i=next++){
         const [start,end]=ranges[i]!;
-        chunks[i]=await client.getLogs({address:args.cash,event:erc20Abi.find(e=>e.type==='event'&&e.name==='Transfer'),args:{from:args.account,to:owner.owner as Address},fromBlock:start,toBlock:end,strict:true});
+        const read=(fromBlock:bigint,toBlock:bigint)=>client.getLogs({address:args.cash,event:erc20Abi.find(e=>e.type==='event'&&e.name==='Transfer'),args:{from:args.account,to:owner.owner as Address},fromBlock,toBlock,strict:true});
+        try{chunks[i]=await read(start,end);}
+        catch(error){
+          // 範圍被節點拒絕：同一段改成窄的幾段照順序重讀（涵蓋的區塊完全相同）；其他錯誤、或已經夠窄，照舊整次失敗。
+          if(end-start<WITHDRAWAL_LOG_NARROW||!isLogRangeRefusal(error))throw error;
+          const parts:WithdrawalLog[]=[];
+          for(let from=start;from<=end;from+=WITHDRAWAL_LOG_NARROW)parts.push(...await read(from,from+WITHDRAWAL_LOG_NARROW-1n<end?from+WITHDRAWAL_LOG_NARROW-1n:end));
+          chunks[i]=parts;
+        }
       }
     }));
     const logs=[...(cached?.logs.filter(log=>log.blockNumber!==null&&log.blockNumber<=args.blockNumber)??[]),...chunks.flat()];

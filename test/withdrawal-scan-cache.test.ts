@@ -51,6 +51,25 @@ test('the next round only scans past the stable height; the known withdrawal is 
   assert.deepEqual(f.ranges, [[head - WITHDRAWAL_REORG_MARGIN + 1n, next]], 'only the unstable tail and new blocks are scanned');
 });
 
+test('a node that refuses 10,000-block ranges gives the same withdrawals, one by one, through the 5,000-block re-read', async () => {
+  const head = 130n + 3n * WITHDRAWAL_LOG_CHUNK + 77n;
+  const wide = fixture();
+  const expected = await readCashWithdrawals(wide.client, wide.query, wide.args(head));
+  assert.equal(expected.length, 1);
+  const f = fixture();
+  const refused: [bigint, bigint][] = [];
+  const narrow = createPublicClient({ transport: custom({ request: async ({ method, params }) => {
+    if (method === 'eth_getLogs') {
+      const filter = (params as [{ fromBlock: string; toBlock: string }])[0];
+      if (BigInt(filter.toBlock) - BigInt(filter.fromBlock) > 5_000n) { refused.push([BigInt(filter.fromBlock), BigInt(filter.toBlock)]); throw new Error('exceed maximum block range 5000'); }
+    }
+    return f.client.transport.request({ method, params });
+  } }, { retryCount: 0 }) });
+  assert.deepEqual(await readCashWithdrawals(narrow, f.query, f.args(head)), expected);
+  assert.equal(refused.length, 3);
+  assert.ok(f.ranges.every(([from, to]) => to - from < 5_000n));
+});
+
 test('a cached withdrawal that no longer verifies fails closed and forces a full rescan next round', async () => {
   const f = fixture();
   const head = 130n + 2n * WITHDRAWAL_LOG_CHUNK;

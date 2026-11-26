@@ -125,6 +125,15 @@ function wantsAddress(error: unknown): boolean {
   return false;
 }
 
+/** A node refused this `eth_getLogs` for its width (its own block-range or answer-size cap): a narrower range may pass. */
+export function isLogRangeRefusal(error: unknown): boolean {
+  for (let e: unknown = error, depth = 0; e && depth < 8; e = (e as { cause?: unknown }).cause, depth++) {
+    const x = e as { message?: string; details?: string };
+    if (/block range|response size exceeded/i.test(`${x.details ?? ''} ${x.message ?? ''}`)) return true;
+  }
+  return false;
+}
+
 function reasonOf(error: unknown): string {
   const text = error instanceof Error ? `${(error as { details?: string }).details ?? ''} ${error.message}` : String(error);
   // Never log the URL (it carries the provider key).

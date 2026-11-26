@@ -9,30 +9,48 @@ import { TEST_ACCOUNT, TEST_OWNER } from './fixtures/strategy-rpc.js';
 // tst 2026-11-21：入金幾小時後提領對帳一次查整段 eth_getLogs，超過 RPC 跨度上限，組合每輪都被擋，
 // 而且真正的錯誤被 STRATEGY_UNAVAILABLE 蓋掉，log 看不到。
 
-test('withdrawal logs are read in chunks no wider than WITHDRAWAL_LOG_CHUNK, covering every block once', async () => {
-  const ranges: [bigint, bigint][] = [];
-  const client = createPublicClient({ transport: custom({ request: async ({ method, params }) => {
-    if (method === 'eth_chainId') return '0x61';
-    if (method === 'eth_getLogs') {
-      const filter = (params as [{ fromBlock: string; toBlock: string }])[0];
-      ranges.push([BigInt(filter.fromBlock), BigInt(filter.toBlock)]);
-      // bsc-prebsc-dataseed, the node a log read fails over to when publicnode rate-limits (probed 2026-11-25).
-      if (BigInt(filter.toBlock) - BigInt(filter.fromBlock) > 5_000n) throw new Error('exceed maximum block range 5000');
-      return [];
-    }
-    throw new Error(`unexpected ${method}`);
-  } }, { retryCount: 0 }) });
-  const query: SchedulerQueryFn = async (sql) => ({ rows: sql.includes('smart_accounts') ? [{ owner: TEST_OWNER }] : [{ block_number: '100', log_index: '0' }] });
-  // 2026-11-25 portfolio 4: 10,000-block ranges were refused by that node and the round ended [CASH_RECONCILIATION_UNAVAILABLE].
+test('withdrawal logs are read 10,000 blocks at a time; a range the node refuses for its width is read again 5,000 at a time, covering every block once; any other failure still fails the read', async () => {
+  const { WITHDRAWAL_LOG_NARROW, resetWithdrawalScanCache } = await import('../src/cash-reconciliation.js');
   const { CASH_SWAP_LOG_CHUNK } = await import('../src/strategy-cash-swaps.js');
-  assert.equal(WITHDRAWAL_LOG_CHUNK, 5_000n); assert.equal(CASH_SWAP_LOG_CHUNK, 5_000n);
+  assert.equal(WITHDRAWAL_LOG_CHUNK, 10_000n); assert.equal(WITHDRAWAL_LOG_NARROW, 5_000n); assert.equal(CASH_SWAP_LOG_CHUNK, 5_000n);
+  const node = (answer: (from: bigint, to: bigint) => void) => {
+    const asked: [bigint, bigint][] = [], answered: [bigint, bigint][] = [];
+    const client = createPublicClient({ transport: custom({ request: async ({ method, params }) => {
+      if (method === 'eth_chainId') return '0x61';
+      if (method === 'eth_getLogs') {
+        const filter = (params as [{ fromBlock: string; toBlock: string }])[0];
+        const range: [bigint, bigint] = [BigInt(filter.fromBlock), BigInt(filter.toBlock)];
+        asked.push(range); answer(...range); answered.push(range);
+        return [];
+      }
+      throw new Error(`unexpected ${method}`);
+    } }, { retryCount: 0 }) });
+    return { client, asked, answered };
+  };
+  const query: SchedulerQueryFn = async (sql) => ({ rows: sql.includes('smart_accounts') ? [{ owner: TEST_OWNER }] : [{ block_number: '100', log_index: '0' }] });
   const to = 100n + 2n * WITHDRAWAL_LOG_CHUNK + 5n;
-  assert.deepEqual(await readCashWithdrawals(client, query, { chainId: 97, portfolioId: 1, account: TEST_ACCOUNT, cash: TESTNET_97.contracts.usdt, blockNumber: to }), []);
-  assert.deepEqual(ranges, [
-    [100n, 100n + WITHDRAWAL_LOG_CHUNK - 1n],
-    [100n + WITHDRAWAL_LOG_CHUNK, 100n + 2n * WITHDRAWAL_LOG_CHUNK - 1n],
-    [100n + 2n * WITHDRAWAL_LOG_CHUNK, to],
-  ]);
+  const read = (client: ReturnType<typeof node>['client']) => { resetWithdrawalScanCache(); return readCashWithdrawals(client, query, { chainId: 97, portfolioId: 1, account: TEST_ACCOUNT, cash: TESTNET_97.contracts.usdt, blockNumber: to }); };
+  const byStart = (ranges: [bigint, bigint][]) => [...ranges].sort((x, y) => Number(x[0] - y[0]));
+
+  // publicnode (takes 50,000 blocks): one request per 10,000 blocks, as before.
+  const wide = node(() => {});
+  assert.deepEqual(await read(wide.client), []);
+  assert.deepEqual(wide.asked, [[100n, 100n + WITHDRAWAL_LOG_CHUNK - 1n], [100n + WITHDRAWAL_LOG_CHUNK, 100n + 2n * WITHDRAWAL_LOG_CHUNK - 1n], [100n + 2n * WITHDRAWAL_LOG_CHUNK, to]]);
+
+  // bsc-prebsc-dataseed, where a log read lands when publicnode rate-limits (probed 2026-11-25; portfolio 4 ended
+  // [CASH_RECONCILIATION_UNAVAILABLE] on exactly this answer): the refused ranges are read again in halves.
+  const narrow = node((from, end) => { if (end - from > 5_000n) throw new Error('exceed maximum block range 5000'); });
+  assert.deepEqual(await read(narrow.client), []);
+  assert.deepEqual(byStart(narrow.answered), [[100n, 5_099n], [5_100n, 10_099n], [10_100n, 15_099n], [15_100n, 20_099n], [20_100n, to]], 'every block answered exactly once');
+  assert.equal(narrow.asked.length, 2 + 5, 'two wide ranges refused once each; the 6-block tail was never too wide');
+
+  // Anything else (rate limit on every node, a dead RPC) is not a width problem: no second attempt, the read fails closed.
+  const dead = node(() => { throw new Error('fixture RPC unavailable'); });
+  await assert.rejects(read(dead.client), /CASH_RECONCILIATION_UNAVAILABLE/);
+  assert.ok(dead.asked.every(([from, end]) => end - from + 1n > WITHDRAWAL_LOG_NARROW || end === to), 'no narrow re-read');
+  // A node that refuses even the narrow ranges fails the read too.
+  const tiny = node((from, end) => { if (end - from > 1_000n) throw new Error('exceed maximum block range 1000'); });
+  await assert.rejects(read(tiny.client), /CASH_RECONCILIATION_UNAVAILABLE/);
 });
 
 test('the scheduler log line shows the real error and its cause, with URLs masked', () => {

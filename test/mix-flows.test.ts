@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createPublicClient, custom, encodeAbiParameters, encodeEventTopics, erc20Abi, toHex, parseAbi } from 'viem';
-import { mixFlowDirection, readMixFlows, verifyMixBlock } from '../src/mix-flows.js';
+import { MIX_FLOW_LOG_CHUNK, MIX_FLOW_LOG_CONCURRENCY, mixFlowDirection, readMixFlows, verifyMixBlock } from '../src/mix-flows.js';
 import { TESTNET_97 as T } from '../src/testnet-profile.js';
 const m = { id: '1', owner: T.roles.keeper, account: T.roles.operator };
 const hash = toHex(178n, { size: 32 }), blockHash = toHex(16n, { size: 32 });
@@ -90,6 +90,60 @@ test('mix flow reader rejects missing, failed, reorged and timed-out RPC proof; 
   state.chain = 56; await assert.rejects(readMixFlows(client, m, 16n, 16n)); state.chain = 97;
   state.fail = true;
   await assert.rejects(readMixFlows(client, m, 16n, 16n), e => e instanceof Error && !e.message.includes('SECRET_RPC_CREDENTIAL'));
+});
+
+test('cash-flow log ranges: at most 5,000 blocks each, every block read once, a few ranges in flight; the flows are the same, one by one, as reading range by range; any failed range fails the read', async () => {
+  assert.equal(MIX_FLOW_LOG_CHUNK, 5_000n); assert.equal(MIX_FLOW_LOG_CONCURRENCY, 3);
+  // Deposits and withdrawals spread over 23,000 blocks, two of them on range borders (5,000 | 5,001) and two in one block.
+  const moves = [[1n, 'in', 5n], [4_999n, 'out', 2n], [5_000n, 'in', 7n], [5_001n, 'in', 11n], [12_345n, 'out', 3n], [12_345n, 'in', 13n], [20_000n, 'in', 17n], [23_000n, 'out', 1n]] as const;
+  const logOf = ([block, way, amount]: (typeof moves)[number], index: number) => ({ address: T.contracts.usdt,
+    topics: encodeEventTopics({ abi: erc20Abi, eventName: 'Transfer', args: way === 'in' ? { from: m.owner, to: m.account } : { from: m.account, to: m.owner } }),
+    data: encodeAbiParameters([{ type: 'uint256' }], [amount]), blockNumber: toHex(block), blockHash: toHex(block + 1_000_000n, { size: 32 }),
+    transactionHash: toHex(BigInt(index) + 500n, { size: 32 }), transactionIndex: '0x0', logIndex: toHex(index), removed: false });
+  const all = moves.map(logOf);
+  const state = { ranges: [] as [bigint, bigint][], inFlight: 0, most: 0, failAt: null as bigint | null };
+  const client = createPublicClient({ transport: custom({ request: async ({ method, params }) => {
+    if (method === 'eth_chainId') return '0x61';
+    if (method === 'eth_getLogs') {
+      const filter = (params as { fromBlock: string; toBlock: string; topics: (string | null)[] }[])[0]!;
+      const from = BigInt(filter.fromBlock), to = BigInt(filter.toBlock);
+      state.ranges.push([from, to]); state.inFlight += 1; state.most = Math.max(state.most, state.inFlight);
+      try { await new Promise(resolve => setTimeout(resolve, 2)); } finally { state.inFlight -= 1; }
+      if (state.failAt !== null && from <= state.failAt && state.failAt <= to) throw new Error('fixture: exceed maximum block range 5000');
+      const account = `0x${m.account.slice(2).toLowerCase().padStart(64, '0')}`;
+      return all.filter(log => BigInt(log.blockNumber) >= from && BigInt(log.blockNumber) <= to &&
+        (filter.topics[1] === null || filter.topics[1] === undefined ? log.topics[2] === account : log.topics[1] === account));
+    }
+    if (method === 'eth_getBlockByNumber') { const n = BigInt(String((params as unknown[])[0])); return { number: toHex(n), hash: toHex(n + 1_000_000n, { size: 32 }), timestamp: toHex(n), transactions: [] }; }
+    if (method === 'eth_getTransactionReceipt') {
+      const log = all.find(entry => entry.transactionHash === (params as string[])[0])!;
+      return { transactionHash: log.transactionHash, transactionIndex: '0x0', blockNumber: log.blockNumber, blockHash: log.blockHash, status: '0x1', from: m.owner, to: T.contracts.usdt,
+        gasUsed: '0x1', cumulativeGasUsed: '0x1', effectiveGasPrice: '0x1', type: '0x2', contractAddress: null, logs: [log], logsBloom: '0x' + '0'.repeat(512) };
+    }
+    throw new Error(`unexpected RPC method ${method}`);
+  } }, { retryCount: 0 }) });
+  const key = (flows: Awaited<ReturnType<typeof readMixFlows>>) => flows.map(f => [f.kind, f.blockNumber, f.logIndex, f.txHash, f.blockHash, f.amountRaw, f.quantityRaw, f.asset, f.at.getTime()].join(':')).sort();
+
+  const whole = await readMixFlows(client, m, 1n, 23_000n);
+  assert.equal(whole.length, 8);
+  // Each range is asked twice (transfers in, transfers out); none is wider than the cap; together they cover every block once.
+  const asked = [...new Set(state.ranges.map(([from, to]) => `${from}-${to}`))];
+  assert.deepEqual(asked.sort((a, b) => Number(a.split('-')[0]) - Number(b.split('-')[0])), ['1-5000', '5001-10000', '10001-15000', '15001-20000', '20001-23000']);
+  assert.equal(state.ranges.length, 10);
+  assert.ok(state.ranges.every(([from, to]) => to - from + 1n <= MIX_FLOW_LOG_CHUNK));
+  assert.ok(state.most > 2 && state.most <= 2 * MIX_FLOW_LOG_CONCURRENCY, `requests in flight at once: ${state.most}`);
+  // The same flows as reading the span in pieces, whatever the pieces (the batches of a catching-up scan), one by one.
+  for (const cuts of [[23_000n], [4_999n, 5_000n, 5_001n, 23_000n], [2_000n, 12_344n, 12_345n, 19_999n, 23_000n], [7n, 6_007n, 23_000n]]) {
+    const pieces: Awaited<ReturnType<typeof readMixFlows>> = [];
+    let from = 1n;
+    for (const to of cuts) { pieces.push(...await readMixFlows(client, m, from, to)); from = to + 1n; }
+    assert.deepEqual(key(pieces), key(whole), `pieces ending at ${cuts.join(', ')}`);
+  }
+  // One range that cannot be read fails the whole read: nothing is returned for the ranges that did answer.
+  state.failAt = 16_000n;
+  await assert.rejects(readMixFlows(client, m, 1n, 23_000n), /目前無法確認/);
+  state.failAt = null;
+  assert.deepEqual(key(await readMixFlows(client, m, 1n, 23_000n)), key(whole));
 });
 
 test('saved cash-flow headers: a finalized block is read once per client, every other block on every call; same hashes as reading one by one', async () => {

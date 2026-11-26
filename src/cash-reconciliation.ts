@@ -6,8 +6,12 @@ export type CashWithdrawal = { txHash:Hex; logIndex:number; blockNumber:bigint; 
 const identity=(chainId:number,e:CashWithdrawal)=>`cash-withdrawal:${chainId}:${e.txHash}:${e.logIndex}`;
 const commitment=(e:CashWithdrawal)=>keccak256(toHex(JSON.stringify([e.txHash,e.logIndex,e.blockNumber.toString(),e.blockHash,e.amount.toString()])));
 
-/** 每段 eth_getLogs 的區塊數（含頭尾）。 */
-export const WITHDRAWAL_LOG_CHUNK=10_000n;
+/**
+ * 每段 eth_getLogs 的區塊數（含頭尾）。5,000＝會回日誌的 chain-97 節點裡最小的範圍上限（bsc-prebsc-dataseed：
+ * `exceed maximum block range 5000`；publicnode 是 50,000）。原本 10,000：publicnode 限流、查詢改走下一個節點時
+ * 每一段都被拒，整個組合那一輪 [CASH_RECONCILIATION_UNAVAILABLE]（2026-11-25 portfolio 4）。
+ */
+export const WITHDRAWAL_LOG_CHUNK=5_000n;
 /** 同時在飛的 getLogs 段數。 */
 export const WITHDRAWAL_LOG_CONCURRENCY=6;
 /**

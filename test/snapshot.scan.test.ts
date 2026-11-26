@@ -497,7 +497,7 @@ test('游標起點晚於部署塊 → universe_complete=false，但不 blocked�
 // ⑤ 掃描失敗：universe_complete = false、游標不動、不 blocked
 // ---------------------------------------------------------------------------
 
-test('getLogs 失敗 → universe_complete=false、游標一格都不動、不 blocked；漂移照算', async () => {
+test('getLogs 第一段就失敗 → universe_complete=false、游標一格都不動、不 blocked；漂移照算', async () => {
   const chain = stubChain({
     codeFrom: new Map([[ACCOUNT.toLowerCase(), DEPLOYMENT]]),
     failingRanges: [{ fromBlock: DEPLOYMENT, toBlock: BLOCK }],
@@ -514,13 +514,13 @@ test('getLogs 失敗 → universe_complete=false、游標一格都不動、不 b
   assert.deepEqual({ ...logged[0], ms: 0, scanMs: 0 }, { msg: 'holdings_scan', portfolio: PORTFOLIO_ID, mix: false, ms: 0, head: BLOCK.toString(),
     cursor: (DEPLOYMENT - 1n).toString(), cursorAfter: (DEPLOYMENT - 1n).toString(), gapBlocks: (BLOCK - DEPLOYMENT + 1n).toString(),
     chunks: Number((BLOCK - DEPLOYMENT + 2_000n) / 2_000n), chunksOk: 0, scanMs: 0,
-    failedRange: [DEPLOYMENT.toString(), (DEPLOYMENT + 1_999n > BLOCK ? BLOCK : DEPLOYMENT + 1_999n).toString()], failure: logged[0]?.failure, flowSyncs: [] });
+    failedRange: [DEPLOYMENT.toString(), (DEPLOYMENT + 1_999n > BLOCK ? BLOCK : DEPLOYMENT + 1_999n).toString()], failure: logged[0]?.failure, remaining: null, flowSyncs: [] });
   assert.match(String(logged[0]?.failure), /^getLogs \[\d+, \d+\] 失敗/);
 
   assert.match(result.scan.incompleteReasons.join('；'), /getLogs/);
   assert.equal(result.scan.universeComplete, false);
   assert.equal(result.scan.scannedRange, null, '一塊都沒掃成功');
-  // 游標不前進（連失敗前成功的塊都不算）：下一次多掃一次，總比留一個永遠看不到的洞好。
+  // 沒有任何連續掃成功的區段：游標不前進（它只越過確實完整掃過的部分，不留洞）。
   assert.equal(result.scan.cursor.lastScannedBlock, DEPLOYMENT - 1n);
   assert.deepEqual(db.saves, [], '失敗時完全不可以寫游標');
 
@@ -535,6 +535,19 @@ test('getLogs 失敗 → universe_complete=false、游標一格都不動、不 b
     `[scan 4] failure=${result.scan.incompleteReasons[0]?.slice(0, 40)}… cursor=${result.scan.cursor.lastScannedBlock} ` +
       `saves=${db.saves.length} blocked=${result.blocked.length} complete=${header.params[8]} universe_complete=${header.params[12]}`,
   );
+});
+
+test('自建組合規劃前還要補讀哪一段入出金：游標這一輪追上 head 就不用；沒追上就從游標補到 head；落後超過一次規劃的上限 → 不規劃（下一輪游標會再前進）', async () => {
+  const { mixFlowCatchUp, MIX_FLOW_CATCHUP_MAX_BLOCKS } = await import('../src/snapshot.js');
+  assert.equal(MIX_FLOW_CATCHUP_MAX_BLOCKS, 1_500_000n);
+  const scan = (last: bigint, scanned: boolean) => ({ cursor: { portfolioId: 7, startBlock: 1n, lastScannedBlock: last }, scannedRange: scanned ? { fromBlock: last - 9n, toBlock: last } : null });
+  const head = 5_000_000n;
+  assert.equal(mixFlowCatchUp(scan(head, true), head), null, '這一輪掃到 head：每一批都在寫游標前同步過了');
+  assert.deepEqual(mixFlowCatchUp(scan(head, false), head), { fromBlock: head, over: false }, '游標本來就在 head：照舊重讀 head 那一塊');
+  assert.deepEqual(mixFlowCatchUp(scan(head - 1_200n, true), head), { fromBlock: head - 1_199n, over: false }, '這一輪只前進了一部分（上限或失敗）：剩下的補讀');
+  assert.deepEqual(mixFlowCatchUp(scan(head - 1_200n, false), head), { fromBlock: head - 1_199n, over: false }, '第一段就失敗：整段補讀');
+  assert.deepEqual(mixFlowCatchUp(scan(head - MIX_FLOW_CATCHUP_MAX_BLOCKS, false), head), { fromBlock: head - MIX_FLOW_CATCHUP_MAX_BLOCKS + 1n, over: false }, '剛好等於上限：讀');
+  assert.deepEqual(mixFlowCatchUp(scan(head - MIX_FLOW_CATCHUP_MAX_BLOCKS - 1n, true), head), { fromBlock: head - MIX_FLOW_CATCHUP_MAX_BLOCKS, over: true }, '超過上限一塊：這一輪不規劃');
 });
 
 test('已存下來的候選（0010）＋ getLogs 失敗 → 仍然被記錄（不 blocked）：候選重讀與日誌掃描解耦', async () => {

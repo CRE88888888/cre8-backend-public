@@ -8,6 +8,10 @@ import {
   findDeploymentBlock,
   formatScanLog,
   formatScanStatus,
+  PROGRESS_BATCH_CHUNKS,
+  SCAN_CONCURRENCY,
+  SCAN_ROUND_BUDGET_MS,
+  SCAN_ROUND_MAX_CHUNKS,
   loadCandidates,
   loadCursor,
   saveCandidates,
@@ -23,7 +27,8 @@ import type { QueryFn, ScanCursor, ScanStats } from '../src/holdings-scan.js';
  *
  * 這支檔案要釘住的是 0009 修的那個 bug 的四個面向：
  * 1. **只看轉入。** 帳戶轉出去的東西不是持倉；ERC-721 形狀的 Transfer（4 個 topic）不是 ERC-20。
- * 2. **分塊，而且失敗不前進游標。** 一個洞會讓某筆轉入永遠不被看到。
+ * 2. **分塊，而且游標只越過確實完整掃過的連續區段。** 一個洞會讓某筆轉入永遠不被看到（失敗那一段與之後的都不算）；
+ *    失敗前連續掃成功的部分算數，一輪有上限、下一輪從游標接續（2b）。
  * 3. **餘額 0 的候選不算持倉。** 歷史上進來又出去的東西不該進「帳戶現在有什麼」的觀測記錄。
  * 4. **universe_complete 只在游標覆蓋到部署塊時為 true。** 那是「掃描有沒有覆蓋帳戶一生」的唯一訊號，
  *    與漂移可不可信無關（策略外持倉只記錄、不阻擋，見 src/holdings-scan.ts 檔頭）。
@@ -150,7 +155,7 @@ test('scanIncomingTransfers：topics[2] 釘死帳戶、topics[1] 是 null，ERC-
 });
 
 // ---------------------------------------------------------------------------
-// 2. 分塊 + 失敗不前進
+// 2. 分塊 + 失敗的那一段不算
 // ---------------------------------------------------------------------------
 
 test('scanIncomingTransfers：區間按 chunkSize 切塊，每塊都發一次 getLogs', async () => {
@@ -177,6 +182,30 @@ test('scanIncomingTransfers：中途 403 → 停在那一塊，回報失敗範�
   assert.deepEqual(result.coveredRange, { fromBlock: 100n, toBlock: 2_099n }, '只有第一塊算數');
   assert.deepEqual(result.tokens, [CAKE], '失敗前看到的候選照樣回傳（它可能是真的持倉）');
   assert.equal(chain.calls.length, 2, '失敗就停，不要繼續往後掃');
+});
+
+test('scanIncomingTransfers：幾段一起發時，排在失敗那一段後面的段就算回來了也不算；喊停時回報還沒掃的那一段', async () => {
+  const chain = stubChain({
+    logs: [transferLog(150n, CAKE, ACCOUNT), transferLog(4_500n, KNOWN, ACCOUNT)],
+    failingRanges: [{ fromBlock: 2_100n, toBlock: 4_099n }],
+  });
+  const failed = await scanIncomingTransfers(stubClient(chain), { account: ACCOUNT, fromBlock: 100n, toBlock: 9_000n, chunkSize: 2_000n, concurrency: 3 });
+  assert.deepEqual(failed.coveredRange, { fromBlock: 100n, toBlock: 2_099n });
+  assert.deepEqual(failed.failedRange, { fromBlock: 2_100n, toBlock: 4_099n });
+  assert.deepEqual(failed.tokens, [CAKE], '洞後面那一段（4100–6099）看到的東西不算掃過：下一輪從洞重掃時才算');
+  assert.equal(failed.remainingRange, null);
+  assert.equal(chain.calls.length, 3, '同一組的三段發出去了，下一組沒有');
+
+  // 喊停：第一組一定做；之後每一組開始前問一次。
+  chain.failingRanges = []; chain.calls = [];
+  let asked = 0;
+  const stopped = await scanIncomingTransfers(stubClient(chain), { account: ACCOUNT, fromBlock: 100n, toBlock: 9_000n, chunkSize: 2_000n, concurrency: 2, shouldStop: () => ++asked >= 2 });
+  assert.equal(stopped.failure, null);
+  assert.deepEqual(stopped.coveredRange, { fromBlock: 100n, toBlock: 8_099n });
+  assert.deepEqual(stopped.remainingRange, { fromBlock: 8_100n, toBlock: 9_000n });
+  assert.deepEqual(chain.calls.map((call) => call.fromBlock), [100n, 2_100n, 4_100n, 6_100n]);
+  const first = await scanIncomingTransfers(stubClient(chain), { account: ACCOUNT, fromBlock: 100n, toBlock: 9_000n, chunkSize: 2_000n, concurrency: 2, shouldStop: () => true });
+  assert.deepEqual(first.coveredRange, { fromBlock: 100n, toBlock: 4_099n }, '一開始就喊停：仍然做第一組');
 });
 
 // ---------------------------------------------------------------------------
@@ -368,12 +397,12 @@ test('scanPortfolioHoldings：部署塊取不到 → universeComplete false', as
   assert.equal(result.scannedRange, null, '游標已在 head，沒有新區塊可掃');
 });
 
-test('scanPortfolioHoldings：這一輪 getLogs 失敗 → universeComplete false 且游標一格都不動', async () => {
+test('scanPortfolioHoldings：這一輪第一段 getLogs 就失敗 → universeComplete false 且游標一格都不動', async () => {
   const chain = stubChain({ head: 10_000n, codeFrom: new Map([[ACCOUNT.toLowerCase(), 100n]]), failingRanges: [{ fromBlock: 9_401n, toBlock: 9_500n }] });
   const { query: q, writes } = fakeQuery([{ start_block: '100', last_scanned_block: '9400' }]);
   const result = await scanPortfolioHoldings({ client: stubClient(chain), query: q, portfolioId: 5, account: ACCOUNT, knownTokens: [], head: 10_000n });
   assert.equal(result.universeComplete, false);
-  assert.equal(writes.length, 0, '失敗時不寫游標（連失敗前已成功的塊也不寫）');
+  assert.equal(writes.length, 0, '第一段就失敗：沒有任何連續掃成功的區段，游標不寫');
   assert.equal(result.cursor.lastScannedBlock, 9_400n);
   assert.match(formatScanStatus(result).join('\n'), /宇宙完整性\s+⚠ 未確認/);
 });
@@ -388,20 +417,25 @@ test('holdings_scan log：掃描回報游標、缺口、掃到哪、為什麼停
   assert.ok(stats !== null);
   const reported = stats as ScanStats;
   assert.deepEqual({ ...reported, scanMs: 0 }, { cursorBefore: 5_000n, head: 10_000n, chunkSize: 2_000n, asked: { fromBlock: 5_001n, toBlock: 10_000n },
-    coveredTo: 7_000n, failedRange: { fromBlock: 7_001n, toBlock: 9_000n }, failure: 'getLogs [7001, 9000] 失敗：模擬 403 Archive requests（getLogs [7001, 9000]）', scanMs: 0 });
+    coveredTo: 7_000n, failedRange: { fromBlock: 7_001n, toBlock: 9_000n }, failure: 'getLogs [7001, 9000] 失敗：模擬 403 Archive requests（getLogs [7001, 9000]）',
+    remainingRange: null, scanMs: 0 });
+  assert.equal(result.cursor.lastScannedBlock, 7_000n, '失敗那一段之前連續掃成功的部分算數');
   const entry = formatScanLog({ portfolioId: 7, personalMix: true, stats: reported, cursorAfter: result.cursor.lastScannedBlock, ms: 30_565,
     flowSyncs: [{ via: 'catchup', fromBlock: 5_001n, toBlock: 10_000n, ms: 12_000.4, failure: null }] });
   assert.equal(entry?.level, 'warn');
-  assert.deepEqual(JSON.parse(entry?.line ?? ''), { msg: 'holdings_scan', portfolio: 7, mix: true, ms: 30_565, head: '10000', cursor: '5000', cursorAfter: '5000',
-    gapBlocks: '5000', chunks: 3, chunksOk: 1, scanMs: reported.scanMs, failedRange: ['7001', '9000'], failure: reported.failure,
+  assert.deepEqual(JSON.parse(entry?.line ?? ''), { msg: 'holdings_scan', portfolio: 7, mix: true, ms: 30_565, head: '10000', cursor: '5000', cursorAfter: '7000',
+    gapBlocks: '5000', chunks: 3, chunksOk: 1, scanMs: reported.scanMs, failedRange: ['7001', '9000'], failure: reported.failure, remaining: null,
     flowSyncs: [{ via: 'catchup', from: '5001', to: '10000', ms: 12_000, failure: null }] });
 
-  // 平常的一輪（一段以內、沒失敗、不慢）不寫 log；慢、缺口超過一段、或現金流同步失敗才寫。
-  const quiet: ScanStats = { cursorBefore: 9_000n, head: 10_000n, chunkSize: 2_000n, asked: { fromBlock: 9_001n, toBlock: 10_000n }, coveredTo: 10_000n, failedRange: null, failure: null, scanMs: 40 };
+  // 平常的一輪（兩段以內、沒失敗、不慢）不寫 log；慢、缺口超過兩段、或現金流同步失敗才寫。
+  const quiet: ScanStats = { cursorBefore: 9_000n, head: 10_000n, chunkSize: 2_000n, asked: { fromBlock: 9_001n, toBlock: 10_000n }, coveredTo: 10_000n, failedRange: null, failure: null, remainingRange: null, scanMs: 40 };
   assert.equal(formatScanLog({ portfolioId: 7, personalMix: true, stats: quiet, cursorAfter: 10_000n, flowSyncs: [], ms: 300 }), null);
   assert.equal(formatScanLog({ portfolioId: 7, personalMix: false, stats: { ...quiet, asked: null, coveredTo: null }, cursorAfter: 10_000n, flowSyncs: [], ms: 300 }), null);
-  assert.equal(formatScanLog({ portfolioId: 7, personalMix: true, stats: quiet, cursorAfter: 10_000n, flowSyncs: [], ms: 2_000 })?.level, 'info');
-  assert.equal(formatScanLog({ portfolioId: 7, personalMix: true, stats: { ...quiet, cursorBefore: 7_999n, asked: { fromBlock: 8_000n, toBlock: 10_000n } }, cursorAfter: 10_000n, flowSyncs: [], ms: 300 })?.level, 'info');
+  assert.equal(formatScanLog({ portfolioId: 7, personalMix: true, stats: quiet, cursorAfter: 10_000n, flowSyncs: [], ms: 9_000 }), null, '整段觀測慢（讀餘額、報價）不是掃描慢');
+  assert.equal(formatScanLog({ portfolioId: 7, personalMix: true, stats: { ...quiet, scanMs: 1_200 }, cursorAfter: 10_000n, ms: 2_100,
+    flowSyncs: [{ via: 'advance', fromBlock: 9_001n, toBlock: 10_000n, ms: 800, failure: null }] })?.level, 'info', '掃描＋入出金同步合計 2 秒以上');
+  assert.equal(formatScanLog({ portfolioId: 7, personalMix: true, stats: { ...quiet, cursorBefore: 6_000n, asked: { fromBlock: 6_001n, toBlock: 10_000n } }, cursorAfter: 10_000n, flowSyncs: [], ms: 300 }), null, '兩段以內是平常的一輪（15 分鐘約 2,000 多塊）');
+  assert.equal(formatScanLog({ portfolioId: 7, personalMix: true, stats: { ...quiet, cursorBefore: 5_999n, asked: { fromBlock: 6_000n, toBlock: 10_000n } }, cursorAfter: 10_000n, flowSyncs: [], ms: 300 })?.level, 'info');
   const syncFailed = formatScanLog({ portfolioId: 7, personalMix: true, stats: null, cursorAfter: null, ms: 300,
     flowSyncs: [{ via: 'advance', fromBlock: 9_001n, toBlock: 10_000n, ms: 250, failure: 'HttpRequestError: HTTP request failed. | URL: <url>' }] });
   assert.equal(syncFailed?.level, 'warn');
@@ -416,6 +450,181 @@ test('holdings_scan log：掃描回報游標、缺口、掃到哪、為什麼停
   const failure = (leaked as ScanStats | null)?.failure ?? '';
   assert.match(failure, /^getLogs \[9401, 10000\] 失敗：HTTP request failed\. URL: <url> x+$/);
   assert.ok(!failure.includes('secret-key-value') && failure.length <= 300);
+});
+
+// ---------------------------------------------------------------------------
+// 2b. 游標只越過確實完整掃過的連續區段：部分進度保留、每輪有上限、下一輪接續、結果與一次掃完相同
+// ---------------------------------------------------------------------------
+
+/** 一輪掃描 + 它對外做的事（游標寫入、`beforeAdvance` 的範圍、發出去的 getLogs 範圍），chunk 用 10 塊讓測試小。 */
+async function round(chain: StubChain, db: ReturnType<typeof fakeQuery>, options: { budget?: { maxMs?: number; maxChunks?: number; now?: () => number };
+  beforeAdvance?: (range: { fromBlock: bigint; toBlock: bigint }) => Promise<void>; known?: Address[] } = {}) {
+  const advanced: { fromBlock: bigint; toBlock: bigint }[] = [];
+  const events: string[] = [];
+  const q: QueryFn = async (text, params) => {
+    if (text.includes('insert into portfolio_scan_cursors')) events.push(`cursor:${String(params?.[2])}`);
+    if (text.includes('insert into portfolio_holding_candidates')) events.push('candidates');
+    return db.query(text, params);
+  };
+  const before = chain.calls.length;
+  let stats: ScanStats | null = null;
+  const run = scanPortfolioHoldings({ client: stubClient(chain), query: q, portfolioId: 5, account: ACCOUNT, knownTokens: options.known ?? [KNOWN], head: chain.head, chunkSize: 10n,
+    ...(options.budget === undefined ? {} : { budget: options.budget }), onScan: (reported) => { stats = reported; },
+    beforeAdvance: async (range) => { events.push(`advance:${range.fromBlock}-${range.toBlock}`); await options.beforeAdvance?.(range); advanced.push(range); } });
+  let result: Awaited<typeof run> | null = null, error: unknown = null;
+  try { result = await run; } catch (cause) { error = cause; }
+  return { result, error, advanced, events, calls: chain.calls.slice(before), stats: stats as ScanStats | null };
+}
+const cursorOf = (db: ReturnType<typeof fakeQuery>): string | undefined => db.writes.length === 0 ? undefined : String(db.writes[db.writes.length - 1]?.[2]);
+/** 每一塊恰好被哪幾次 getLogs 查到（塊 → 次數）：驗「沒有洞、沒有重掃」。 */
+function coverage(calls: { fromBlock: bigint; toBlock: bigint }[], from: bigint, to: bigint): { missing: bigint[]; twice: bigint[] } {
+  const missing: bigint[] = [], twice: bigint[] = [];
+  for (let block = from; block <= to; block++) {
+    const hits = calls.filter((call) => call.fromBlock <= block && block <= call.toBlock).length;
+    if (hits === 0) missing.push(block); else if (hits > 1) twice.push(block);
+  }
+  return { missing, twice };
+}
+const TOKENS = ['0x00000000000000000000000000000000000000a1', '0x00000000000000000000000000000000000000a2', '0x00000000000000000000000000000000000000a3',
+  '0x00000000000000000000000000000000000000a4', '0x00000000000000000000000000000000000000a5'] as Address[];
+/** 1,000 塊的缺口（100 段），五顆宇宙外代幣散在裡面；a1 進來兩次（first_seen 只記第一次）。 */
+const busyChain = (overrides: Partial<StubChain> = {}): StubChain => stubChain({ head: 2_000n, codeFrom: new Map([[ACCOUNT.toLowerCase(), 100n]]),
+  logs: [transferLog(1_003n, TOKENS[0]!, ACCOUNT), transferLog(1_250n, TOKENS[1]!, ACCOUNT), transferLog(1_251n, KNOWN, ACCOUNT), transferLog(1_499n, TOKENS[2]!, ACCOUNT),
+    transferLog(1_500n, TOKENS[3]!, ACCOUNT), transferLog(1_777n, TOKENS[0]!, ACCOUNT), transferLog(2_000n, TOKENS[4]!, ACCOUNT),
+    { block: 1_600n, address: NFT, topics: [TRANSFER_TOPIC, addressTopic(OTHER), addressTopic(ACCOUNT), addressTopic(OTHER)] }], // ERC-721 形狀：不是候選
+  balances: new Map(TOKENS.map((token) => [`${token}:${ACCOUNT.toLowerCase()}`, 1n])), decimals: new Map(TOKENS.map((token) => [token, 18])), ...overrides });
+const candidatesOf = (db: ReturnType<typeof fakeQuery>) => [...db.candidates.entries()].map(([asset, row]) => `${asset}@${row.firstSeenBlock}`).sort();
+const START = [{ start_block: '100', last_scanned_block: '1000' }];
+
+test('上限的預設值：一批 25 段、一輪最多 150 段／4 秒、兩個查詢一起發', () => {
+  assert.deepEqual([PROGRESS_BATCH_CHUNKS, SCAN_ROUND_MAX_CHUNKS, SCAN_ROUND_BUDGET_MS, SCAN_CONCURRENCY], [25, 150, 4_000, 2]);
+});
+
+test('部分進度保留：中途失敗時游標前進到失敗那一段之前（先落地候選、先做 beforeAdvance），失敗那段與之後的不算；下一輪從那裡接續、不重掃', async () => {
+  // 第 31 段 [1301, 1310] 失敗。第 1 批（25 段，[1001, 1250]）完整；第 2 批掃到 [1251, 1300] 為止。
+  const chain = busyChain({ failingRanges: [{ fromBlock: 1_305n, toBlock: 1_305n }] });
+  const db = fakeQuery([...START]);
+  const first = await round(chain, db);
+  assert.equal(first.error, null);
+  assert.deepEqual(first.advanced, [{ fromBlock: 1_001n, toBlock: 1_250n }, { fromBlock: 1_251n, toBlock: 1_300n }]);
+  assert.equal(cursorOf(db), '1300');
+  assert.equal(first.result?.cursor.lastScannedBlock, 1_300n);
+  assert.deepEqual(first.result?.scannedRange, { fromBlock: 1_001n, toBlock: 1_300n });
+  assert.equal(first.result?.universeComplete, false);
+  assert.match(first.result?.incompleteReasons.join('；') ?? '', /getLogs \[1301, 1310\] 失敗/);
+  assert.deepEqual(first.stats?.failedRange, { fromBlock: 1_301n, toBlock: 1_310n });
+  // 每一批的順序：候選落地 → beforeAdvance → 寫游標。游標永遠最後。
+  assert.deepEqual(first.events, ['candidates', 'advance:1001-1250', 'cursor:1250', 'advance:1251-1300', 'cursor:1300']);
+  assert.deepEqual(candidatesOf(db), [`${TOKENS[0]}@1003`, `${TOKENS[1]}@1250`], '失敗前看到的候選已經在表裡');
+  // 失敗那一段之後、同一組一起發出去的那一段 [1311, 1320] 就算回來了也不算掃過。
+  assert.ok(first.calls.every((call) => call.toBlock <= 1_320n), '失敗就停，不繼續往後掃');
+  assert.deepEqual(coverage(first.calls, 1_001n, 1_300n), { missing: [], twice: [] });
+
+  // 第二輪（節點恢復）：從 1301 接續到 head；兩輪合起來每一塊恰好算數一次，[1001, 1300] 沒有被重掃。
+  chain.failingRanges = [];
+  const second = await round(chain, db);
+  assert.equal(second.calls[0]?.fromBlock, 1_301n);
+  assert.ok(second.calls.every((call) => call.fromBlock >= 1_301n), '已經掃過的不重掃');
+  assert.deepEqual(coverage(second.calls, 1_301n, 2_000n), { missing: [], twice: [] });
+  assert.deepEqual([...first.advanced, ...second.advanced].map((range) => [range.fromBlock, range.toBlock]),
+    [[1_001n, 1_250n], [1_251n, 1_300n], [1_301n, 1_550n], [1_551n, 1_800n], [1_801n, 2_000n]]);
+  assert.equal(cursorOf(db), '2000');
+  assert.equal(second.result?.universeComplete, true);
+});
+
+test('一輪有段數上限：到了就停、剩下的下一輪接著掃；每一輪都前進、沒有一塊被掃兩次或漏掉', async () => {
+  const chain = busyChain();
+  const db = fakeQuery([...START]);
+  const cursors: (string | undefined)[] = [];
+  const all: { fromBlock: bigint; toBlock: bigint }[] = [];
+  for (let n = 0; n < 4; n++) {
+    const done = await round(chain, db, { budget: { maxChunks: 30 } });
+    assert.equal(done.error, null);
+    all.push(...done.calls); cursors.push(cursorOf(db));
+    assert.ok(done.calls.length <= 30, `一輪最多 30 段（第 ${n + 1} 輪 ${done.calls.length} 段）`);
+    if (n < 3) {
+      assert.equal(done.result?.universeComplete, false, '還沒掃到 head 的那一輪不可以說宇宙完整');
+      assert.match(done.result?.incompleteReasons.join('；') ?? '', /下一輪接著掃/);
+      assert.deepEqual(done.stats?.remainingRange, { fromBlock: BigInt(cursors[n]!) + 1n, toBlock: 2_000n });
+      assert.equal(done.stats?.failure, null);
+    } else assert.equal(done.result?.universeComplete, true);
+  }
+  assert.deepEqual(cursors, ['1300', '1600', '1900', '2000']);
+  assert.deepEqual(coverage(all, 1_001n, 2_000n), { missing: [], twice: [] });
+  // 已追上 head 之後的一輪：一段都不掃。
+  const idle = await round(chain, db, { budget: { maxChunks: 30 } });
+  assert.deepEqual(idle.calls, []); assert.equal(idle.result?.scannedRange, null);
+});
+
+test('一輪有時間上限：時間到就停在已掃完的地方（至少前進一組查詢），下一輪接續', async () => {
+  const chain = busyChain();
+  const db = fakeQuery([...START]);
+  // 假時鐘：每問一次時間就過 100 毫秒；上限 1,000 毫秒。
+  let clock = 0;
+  const first = await round(chain, db, { budget: { maxMs: 1_000, now: () => (clock += 100) } });
+  assert.equal(first.error, null);
+  const reached = BigInt(cursorOf(db) ?? '0');
+  assert.ok(reached > 1_000n && reached < 2_000n, `時間到時停在中間（${reached}）`);
+  assert.equal(first.result?.cursor.lastScannedBlock, reached);
+  assert.deepEqual(first.stats?.remainingRange, { fromBlock: reached + 1n, toBlock: 2_000n });
+  assert.deepEqual(coverage(first.calls, 1_001n, reached), { missing: [], twice: [] });
+  assert.ok(first.calls.every((call) => call.toBlock <= reached), '時間到之後不再發查詢');
+  // 時間一開始就用完：仍然前進一組（兩段），不會一輪都不動。
+  const starved = await round(chain, db, { budget: { maxMs: 0 } });
+  assert.equal(starved.calls.length, SCAN_CONCURRENCY);
+  assert.equal(cursorOf(db), (reached + 20n).toString());
+  // 不設上限地跑完剩下的。
+  const rest = await round(chain, db);
+  assert.equal(cursorOf(db), '2000'); assert.equal(rest.result?.universeComplete, true);
+  assert.deepEqual(coverage([...first.calls, ...starved.calls, ...rest.calls], 1_001n, 2_000n), { missing: [], twice: [] });
+});
+
+test('beforeAdvance（入出金同步）失敗：游標停在上一批的終點、錯誤往外拋；下一輪從那裡重做那一批，前一批不重來', async () => {
+  const chain = busyChain();
+  const db = fakeQuery([...START]);
+  let fail = true;
+  const failing = async (range: { fromBlock: bigint; toBlock: bigint }) => { if (fail && range.fromBlock === 1_251n) throw new Error('fixture: flow sync unavailable'); };
+  const first = await round(chain, db, { beforeAdvance: failing });
+  assert.match(String(first.error), /flow sync unavailable/);
+  assert.deepEqual(first.advanced, [{ fromBlock: 1_001n, toBlock: 1_250n }]);
+  assert.equal(cursorOf(db), '1250', '游標絕不越過入出金還沒同步的區段');
+  assert.equal(first.stats?.coveredTo, 1_250n, '拋錯的那一輪也回報掃到哪');
+  assert.deepEqual(candidatesOf(db), [`${TOKENS[0]}@1003`, `${TOKENS[1]}@1250`, `${TOKENS[2]}@1499`, `${TOKENS[3]}@1500`], '第二批看到的候選已落地（多記無害，少記才有害）');
+  fail = false;
+  const second = await round(chain, db, { beforeAdvance: failing });
+  assert.equal(second.error, null);
+  assert.equal(second.calls[0]?.fromBlock, 1_251n);
+  assert.deepEqual(second.advanced.map((range) => [range.fromBlock, range.toBlock]), [[1_251n, 1_500n], [1_501n, 1_750n], [1_751n, 2_000n]]);
+  assert.equal(cursorOf(db), '2000');
+});
+
+test('完整性：分很多輪、中間失敗過、有上限地掃完，跟一次掃完的結果逐筆相同（候選、第一次出現的塊、餘額、beforeAdvance 涵蓋的區間）', async () => {
+  const oneShot = { chain: busyChain(), db: fakeQuery([...START]) };
+  const whole = await round(oneShot.chain, oneShot.db, { budget: { maxChunks: 10_000, maxMs: 3_600_000 } });
+  assert.equal(whole.error, null); assert.equal(cursorOf(oneShot.db), '2000');
+  assert.deepEqual(candidatesOf(oneShot.db), [`${TOKENS[0]}@1003`, `${TOKENS[1]}@1250`, `${TOKENS[2]}@1499`, `${TOKENS[3]}@1500`, `${TOKENS[4]}@2000`]);
+
+  // 同一條鏈：每輪上限 7 段，而且第 3、6、9 輪各有一段失敗（每次不同位置），直到掃完。
+  const chain = busyChain(), db = fakeQuery([...START]);
+  const advanced: { fromBlock: bigint; toBlock: bigint }[] = [];
+  let last: Awaited<ReturnType<typeof round>> | null = null;
+  for (let n = 1; n <= 60 && cursorOf(db) !== '2000'; n++) {
+    const at = BigInt(cursorOf(db) ?? '1000');
+    chain.failingRanges = n % 3 === 0 ? [{ fromBlock: at + 25n, toBlock: at + 25n }] : [];
+    const before = cursorOf(db);
+    last = await round(chain, db, { budget: { maxChunks: 7 } });
+    assert.equal(last.error, null);
+    advanced.push(...last.advanced);
+    assert.notEqual(cursorOf(db), before, `第 ${n} 輪有前進`);
+  }
+  assert.equal(cursorOf(db), '2000');
+  assert.deepEqual(candidatesOf(db), candidatesOf(oneShot.db), '候選與 first_seen_block 逐筆相同');
+  assert.deepEqual(last?.result?.unknownHoldings, whole.result?.unknownHoldings);
+  assert.equal(last?.result?.universeComplete, true);
+  // beforeAdvance 的區間首尾相接、剛好蓋滿 [1001, 2000]：沒有一塊的入出金沒同步，也沒有一塊同步兩次。
+  let next = 1_001n;
+  for (const range of advanced) { assert.equal(range.fromBlock, next); assert.ok(range.toBlock >= range.fromBlock); next = range.toBlock + 1n; }
+  assert.equal(next, 2_001n);
 });
 
 test('scanPortfolioHoldings：新游標從部署塊開始（知道部署塊才有機會讓 universeComplete 為 true）', async () => {

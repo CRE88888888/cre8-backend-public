@@ -54,6 +54,15 @@ async function strategyBoxOf(client: PublicClient, account: Address): Promise<st
   if (v2 === null) return null;
   return (await client.readContract({ address: v2.executor, abi: V2_EXECUTOR_ABI, functionName: 'boxOf', args: [account] })).toLowerCase();
 }
+/**
+ * Blocks per `eth_getLogs` of the cash-flow scan (inclusive), and how many ranges are in flight at once (two requests
+ * each: transfers in and transfers out). 5,000 is the smallest range cap among the chain-97 nodes that serve logs
+ * (bsc-prebsc-dataseed: `exceed maximum block range 5000`; publicnode takes 50,000), so a range is never refused by the
+ * node the request fails over to. The filter names the basket's own tokens and the account, so an answer stays small.
+ * Was 2,000 blocks, one range after the other: a cursor a few days behind cost hundreds of round trips per plan.
+ */
+export const MIX_FLOW_LOG_CHUNK = 5_000n;
+export const MIX_FLOW_LOG_CONCURRENCY = 3;
 export async function readMixFlows(client: PublicClient, m: MixFlowAccount, fromBlock: bigint, toBlock: bigint, options: MixFlowOptions = {}): Promise<MixFlow[]> {
   try {
   if (fromBlock < 0n || toBlock < fromBlock || await client.getChainId() !== 97) throw mixUnavailable();
@@ -62,13 +71,24 @@ export async function readMixFlows(client: PublicClient, m: MixFlowAccount, from
   if (assets.length === 0) throw mixUnavailable();
   const prices = new Map<Address, MixFlowQuote>();
   let box: Promise<string | null> | undefined;
-  for (let from = fromBlock; from <= toBlock; from += 2000n) {
-    const to = from + 1999n < toBlock ? from + 1999n : toBlock;
-    const [incoming, outgoing] = await Promise.all([
-      client.getLogs({ address: assets, event: erc20Abi.find(e => e.type === 'event' && e.name === 'Transfer'), args: { to: m.account }, fromBlock: from, toBlock: to, strict: true }),
-      client.getLogs({ address: assets, event: erc20Abi.find(e => e.type === 'event' && e.name === 'Transfer'), args: { from: m.account }, fromBlock: from, toBlock: to, strict: true }),
-    ]);
-    for (const log of [...incoming, ...outgoing]) {
+  // Every range is read (a few at a time); any failed read fails the whole call. The logs are then handled range by
+  // range in block order, exactly as when the ranges were read one after the other.
+  const ranges: { from: bigint; to: bigint }[] = [];
+  for (let from = fromBlock; from <= toBlock; from += MIX_FLOW_LOG_CHUNK) ranges.push({ from, to: from + MIX_FLOW_LOG_CHUNK - 1n < toBlock ? from + MIX_FLOW_LOG_CHUNK - 1n : toBlock });
+  const transfer = erc20Abi.find(e => e.type === 'event' && e.name === 'Transfer');
+  const readRange = async ({ from, to }: { from: bigint; to: bigint }) => (await Promise.all([
+    client.getLogs({ address: assets, event: transfer, args: { to: m.account }, fromBlock: from, toBlock: to, strict: true }),
+    client.getLogs({ address: assets, event: transfer, args: { from: m.account }, fromBlock: from, toBlock: to, strict: true }),
+  ])).flat();
+  const read: Awaited<ReturnType<typeof readRange>>[] = new Array(ranges.length);
+  let next = 0, failed = false;
+  await Promise.all(Array.from({ length: Math.min(MIX_FLOW_LOG_CONCURRENCY, ranges.length) }, async () => {
+    for (let i = next++; i < ranges.length && !failed; i = next++) {
+      try { read[i] = await readRange(ranges[i]!); } catch (error) { failed = true; throw error; }
+    }
+  }));
+  for (const logs of read) {
+    for (const log of logs) {
       if (log.removed || log.logIndex === null || log.transactionHash === null || log.blockHash === null || log.blockNumber === null) throw mixUnavailable();
       const event = decodeEventLog({ abi: erc20Abi, eventName: 'Transfer', data: log.data, topics: log.topics });
       const kind = mixFlowDirection(event.args.from, event.args.to, m);

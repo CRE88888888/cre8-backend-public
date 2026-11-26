@@ -165,6 +165,24 @@ export type PlanDeps = {
   observeOnly?: boolean;
 };
 
+/**
+ * The most blocks one plan reads for a private basket's cash flows beyond its scan cursor: 300 ranges of 5,000 blocks
+ * (600 small requests, six in flight: a few seconds), about 13 days of chain 97. A basket further behind is not planned
+ * until the cursor has caught up enough (the scan moves it on every round, by its own budget).
+ */
+export const MIX_FLOW_CATCHUP_MAX_BLOCKS = 1_500_000n;
+
+/**
+ * What a private basket's plan at `block` still has to read for its cash flows after the scan: nothing when the scan
+ * moved the cursor to `block` in this round (every batch was synced before its cursor write); otherwise from the cursor
+ * to `block` (a cursor already at `block` re-reads that one block, as before). `over`: more than one plan may read.
+ */
+export function mixFlowCatchUp(scan: Pick<HoldingScanResult, 'scannedRange' | 'cursor'>, block: bigint): { fromBlock: bigint; over: boolean } | null {
+  if (scan.scannedRange !== null && scan.cursor.lastScannedBlock >= block) return null;
+  const fromBlock = scan.cursor.lastScannedBlock < block ? scan.cursor.lastScannedBlock + 1n : block;
+  return { fromBlock, over: block - fromBlock + 1n > MIX_FLOW_CATCHUP_MAX_BLOCKS };
+}
+
 /** `plan.scan` when `observeOnly` skipped the scan: universe completeness is unknown, nothing advanced. */
 function unscanned(portfolioId: number, block: bigint): HoldingScanResult {
   return { portfolioId, block, cursor: { portfolioId, startBlock: block, lastScannedBlock: block - 1n }, scannedRange: null,
@@ -607,10 +625,20 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
   ]);
   cursorAfter = deps.observeOnly === true ? null : observed[1].cursor.lastScannedBlock;
 
-  if (personalMix && deps.observeOnly !== true && (observed[1].scannedRange === null || observed[1].cursor.lastScannedBlock < block)) {
-    const fromBlock = observed[1].cursor.lastScannedBlock < block ? observed[1].cursor.lastScannedBlock + 1n : block;
-    await syncFlows('catchup', { fromBlock, toBlock: block });
+  // A private basket is planned only with its cash flows known through `block`. The scan above synced them up to the
+  // cursor (batch by batch, before each cursor write); whatever the cursor has not reached yet (a failed range, this
+  // round's budget) is synced here, flows only. The cursor does not move for it: the holdings scan of that part is
+  // still owed, and next round starts from the cursor again.
+  const catchUp = personalMix && deps.observeOnly !== true ? mixFlowCatchUp(observed[1], block) : null;
+  if (catchUp !== null && catchUp.over) {
+    // Too far behind to read in one plan: fail closed (nothing is planned on unknown flows). Every round moves the
+    // cursor on by its budget, so the rest shrinks until it fits.
+    flowSyncs.push({ via: 'catchup', fromBlock: catchUp.fromBlock, toBlock: block, ms: 0,
+      failure: `not read: ${block - catchUp.fromBlock + 1n} blocks behind the head, over the ${MIX_FLOW_CATCHUP_MAX_BLOCKS} of one plan; the cursor moves on every round` });
+    const { mixUnavailable } = await import('./mix-store.js');
+    throw mixUnavailable('mix flow catch-up over the per-plan bound');
   }
+  if (catchUp !== null) await syncFlows('catchup', { fromBlock: catchUp.fromBlock, toBlock: block });
   } finally {
     logScan();
   }

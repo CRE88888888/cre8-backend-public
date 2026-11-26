@@ -87,11 +87,40 @@ export function isProviderFailure(error: unknown): boolean {
   });
 }
 
-/** This node cannot answer this request (pruned state, a block it has not seen yet, a log range over its own cap); another node may. */
+/**
+ * This node cannot answer this request (pruned state, a block it has not seen yet, a log range over its own cap, a log
+ * query it only takes with a contract address); another node may.
+ * `specify an address`: publicnode answers an `eth_getLogs` that names no contract with code -32701 "Please specify an
+ * address in your request …". The holdings scan asks exactly that (every token that ever paid the account in), so in
+ * the scheduler, where publicnode comes first, it failed on its first range for every portfolio and no scan cursor
+ * moved (2026-11-26 01:22 UTC, `holdings_scan` lines of portfolios 48 and 49: chunksOk=0 after 88–95 ms).
+ * bsc-prebsc-dataseed takes the same query.
+ */
 export function isNodeGap(error: unknown): boolean {
   for (let e: unknown = error, depth = 0; e && depth < 8; e = (e as { cause?: unknown }).cause, depth++) {
     const x = e as { message?: string; details?: string };
-    if (/missing trie node|historical state|state (?:is )?not available|header not found|unknown block|block not found|block range|response size exceeded/i.test(`${x.details ?? ''} ${x.message ?? ''}`)) return true;
+    if (/missing trie node|historical state|state (?:is )?not available|header not found|unknown block|block not found|block range|response size exceeded|specify an address/i.test(`${x.details ?? ''} ${x.message ?? ''}`)) return true;
+  }
+  return false;
+}
+
+/**
+ * Node URL -> until when it is not asked for an `eth_getLogs` that names no contract (it said it only takes those with
+ * an address), and what it said. The holdings scan sends one such request per 2,000 blocks: without this every one of
+ * them paid a refused round trip to that node first (and counted against its rate limit). Asked again after ten
+ * minutes, so a lifted restriction is noticed. The node stays first for everything else.
+ */
+export const ADDRESSLESS_LOGS_SKIP_MS = 10 * 60_000;
+const addresslessLogsRefused = new Map<string, { until: number; error: unknown }>();
+function isAddresslessLogs(req: { method: string; params?: unknown }): boolean {
+  if (req.method !== 'eth_getLogs' || !Array.isArray(req.params)) return false;
+  const filter: unknown = req.params[0];
+  return typeof filter === 'object' && filter !== null && (filter as { address?: unknown }).address == null;
+}
+function wantsAddress(error: unknown): boolean {
+  for (let e: unknown = error, depth = 0; e && depth < 8; e = (e as { cause?: unknown }).cause, depth++) {
+    const x = e as { message?: string; details?: string };
+    if (/specify an address/i.test(`${x.details ?? ''} ${x.message ?? ''}`)) return true;
   }
   return false;
 }
@@ -199,13 +228,21 @@ export function rpcTransport(source: string, url: string | null | undefined, opt
       const paid = paidFallback(req.method);
       const candidates = inOrder(!paid ? s : preferPublic ? [...s, p] : [p, ...s], now());
       let failure: unknown, gap: unknown;
+      const addressless = isAddresslessLogs(req);
       for (const [index, candidate] of candidates.entries()) {
+        if (addressless) {
+          const refused = addresslessLogsRefused.get(candidate.key);
+          if (refused !== undefined && refused.until > now()) { gap ??= refused.error; continue; }
+        }
         count(`${source}:${candidate.name}`, req.method);
         try { return await candidate.request(req, opts); }
         catch (error) {
           const down = isProviderFailure(error);
           if (!down && !isNodeGap(error)) throw error;
-          if (!down) { gap ??= error; continue; }
+          if (!down) {
+            if (addressless && wantsAddress(error)) addresslessLogsRefused.set(candidate.key, { until: now() + ADDRESSLESS_LOGS_SKIP_MS, error });
+            gap ??= error; continue;
+          }
           failure ??= error;
           demotedUntil.set(candidate.key, now() + RPC_BREAKER_MS);
           const next = candidates[index + 1]?.name;
@@ -229,7 +266,7 @@ export function rpcTransport(source: string, url: string | null | undefined, opt
 }
 
 /** Test hook. */
-export function resetRpcTransport(): void { demotedUntil.clear(); lastFailoverLog.clear(); usage.clear(); chainIds.clear(); heads.clear(); }
+export function resetRpcTransport(): void { demotedUntil.clear(); lastFailoverLog.clear(); usage.clear(); chainIds.clear(); heads.clear(); addresslessLogsRefused.clear(); }
 
 /**
  * Multicall batching for the bulk readers (scheduler, snapshot, status, Strategy Earn): concurrent readContract calls

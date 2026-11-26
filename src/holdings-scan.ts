@@ -27,11 +27,21 @@ import type { Address, Hex, PublicClient } from 'viem';
  *    假設了答案。轉出（topics[1] = 帳戶）不看：那些代幣是「曾經持有」，不是「現在持有」。真實
  *    持倉一律由 `balanceOf` 決定，日誌只用來產生候選。
  *
- * 2. **分塊掃描，失敗不前進游標。** 一次 `getLogs` 掃整個歷史是做不到的：公共 BSC RPC 對
+ * 2. **分塊掃描，游標只越過「確實完整掃過」的連續區段。** 一次 `getLogs` 掃整個歷史是做不到的：公共 BSC RPC 對
  *    `eth_getLogs` 的區塊跨度有上限，而 anvil fork 對舊塊的請求會走上游 archive → 403
- *    （docs/pitfalls §2.1）。所以游標式增量掃描是唯一可行的形狀。這一輪掃不完或中途失敗，
- *    `last_scanned_block` 一格都不動——**包括失敗前已經成功的那幾個塊**：一個洞會讓某筆轉入
- *    永遠不被看到，而不推進只是下次多掃一次。寧可重做，不可漏看。
+ *    （docs/pitfalls §2.1）。所以游標式增量掃描是唯一可行的形狀。不變的規則：**游標後面不可以有洞**——
+ *    一個洞會讓某筆轉入永遠不被看到。所以失敗的那一段與它之後的任何一段都不算掃過。
+ *
+ *    原本的寫法更保守：「這一輪掃不完或中途失敗，`last_scanned_block` 一格都不動，包括失敗前已經成功的那幾段
+ *    ——不推進只是下次多掃一次」。這句話在缺口很小時成立，缺口大時不成立（2026-11-25 測試網 portfolio 7：游標
+ *    落後幾天，每輪從同一個起點重掃、被公開節點限流、又整輪作廢，缺口只會更大，每輪 30 秒握著共用市場通道）。
+ *    「失敗前已成功的連續區段」裡沒有洞：那些日誌確實讀到了，裡面的候選也已經先落地（`saveCandidates` 在寫游標
+ *    之前），所以游標越過它不會漏看任何東西。現在的規則：
+ *      * 一輪分成幾批（`PROGRESS_BATCH_CHUNKS` 段一批）。每一批：掃轉入 → 候選落地 → `beforeAdvance`（自建組合
+ *        的入出金同步，範圍就是這一批）→ 寫游標。三步任何一步失敗，游標停在上一批的終點，這一批下一輪重來。
+ *      * 一批中途失敗時，游標只前進到失敗那一段之前（連續成功的部分），失敗那一段與之後的都不算。
+ *      * 一輪有時間與段數上限（`SCAN_ROUND_BUDGET_MS`／`SCAN_ROUND_MAX_CHUNKS`）：到了就停，剩下的下一輪從
+ *        游標接著掃。沒掃到 head 的那一輪 `universeComplete = false`，原因寫明還剩哪一段。
  *
  * 3. **游標覆蓋不到部署塊時，`universeComplete` 是 false 但不算 blocked。** 「還不知道」與
  *    「知道有問題」是兩件事：前者要在表頭標明「宇宙完整性未確認」，後者才擋漂移。把前者也擋掉，
@@ -64,7 +74,7 @@ export const TRANSFER_TOPIC: Hex = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163
  * 2000 的理由是三個上限裡最緊的那個：
  *   * 公共 BSC RPC 的 `eth_getLogs` 跨度上限常見是 2k–10k（更小的有 1k），2000 落在多數節點都
  *     能吃下的區間；
- *   * 失敗不前進游標，所以 chunk 的大小 = 每次失敗要重做的量：太大會讓一支一直 403 的 RPC 每次
+ *   * 失敗的那一段要整段重做，所以 chunk 的大小 = 每次失敗要重做的量：太大會讓一支一直 403 的 RPC 每次
  *     都白掃幾萬個塊；
  *   * 上游可讀視窗（docs/pitfalls §2.1：publicnode 約 75–80 分鐘）在 BSC 0.75s 出塊下約 6000 個
  *     塊——2000 留了 3 倍餘裕，讓一個 chunk 的請求時間不會踩到那個邊界。
@@ -94,9 +104,11 @@ export type TransferScan = {
   firstSeenBlock: Map<string, bigint>;
   /** 連續且成功掃過的區間；null = 一塊都沒掃成功。 */
   coveredRange: { fromBlock: bigint; toBlock: bigint } | null;
-  /** 失敗的那一塊（沒有失敗時 null）。游標不前進時，這個範圍就是下次要重掃的地方。 */
+  /** 失敗的那一塊（沒有失敗時 null）。游標停在它前面，下一輪從這裡重掃。 */
   failedRange: { fromBlock: bigint; toBlock: bigint } | null;
   failure: string | null;
+  /** 呼叫端喊停（`shouldStop`）時還沒掃的那一段；不是失敗，只是這一次沒輪到。沒喊停時 null。 */
+  remainingRange: { fromBlock: bigint; toBlock: bigint } | null;
   /** ERC-20 形狀的 Transfer 日誌數。 */
   logCount: number;
   /** 4 個 topic 的 Transfer（ERC-721 形狀）：不是本檔能定價的東西，計數但不當候選。 */
@@ -154,8 +166,11 @@ const ERC20_ABI = [
   },
 ] as const;
 
+/** The node's own words first (viem keeps them in `details`, after the URL and the request body in `message`). */
 function reasonOf(cause: unknown): string {
-  return cause instanceof Error ? cause.message : String(cause);
+  if (!(cause instanceof Error)) return String(cause);
+  const details = (cause as { details?: unknown }).details;
+  return typeof details === 'string' && details !== '' && !cause.message.startsWith(details) ? `${details}｜${cause.message}` : cause.message;
 }
 
 /** `address` → 32-byte 左補零的 topic（小寫）。 */
@@ -310,14 +325,20 @@ function logBlockNumber(value: unknown, index: number, fallback: bigint): bigint
  * 只看轉入：`topics[2]`（to）＝帳戶，不帶 `address`（代幣合約未知正是要被找出來的東西）。任何一塊
  * 失敗就停在那一塊，回報失敗範圍，**不假裝後面的塊掃過了**；前面成功的部分照樣回傳（裡面若有
  * 有餘額的策略外代幣，那是要被記錄下來的觀測，不是要被擋下的問題）。
+ *
+ * `concurrency`：同時在飛的段數（預設 1）。同一組裡排在失敗那一段後面的段就算成功也丟掉——`coveredRange`
+ * 永遠是從 `fromBlock` 起連續成功的部分。`shouldStop`：每一組開始前問一次（第一組不問，所以每次呼叫至少
+ * 前進一組）；回 true 就停，剩下的寫在 `remainingRange`。
  */
 export async function scanIncomingTransfers(
   client: PublicClient,
-  args: { account: Address; fromBlock: bigint; toBlock: bigint; chunkSize?: bigint },
+  args: { account: Address; fromBlock: bigint; toBlock: bigint; chunkSize?: bigint; concurrency?: number; shouldStop?: () => boolean },
 ): Promise<TransferScan> {
   const chunkSize = args.chunkSize ?? DEFAULT_CHUNK_SIZE;
   if (chunkSize <= 0n) throw new RangeError(`chunkSize 必須是正數（收到 ${chunkSize}）`);
   if (args.fromBlock > args.toBlock) throw new RangeError(`fromBlock(${args.fromBlock}) 大於 toBlock(${args.toBlock})`);
+  const concurrency = args.concurrency ?? 1;
+  if (!Number.isInteger(concurrency) || concurrency < 1) throw new RangeError(`concurrency 必須是正整數（收到 ${concurrency}）`);
 
   const to = addressTopic(args.account);
   const tokens = new Set<string>();
@@ -325,12 +346,31 @@ export async function scanIncomingTransfers(
   let logCount = 0;
   let ignoredLogCount = 0;
   let coveredTo: bigint | null = null;
+  const result = (rest: Pick<TransferScan, 'failedRange' | 'failure' | 'remainingRange'>): TransferScan => ({
+    tokens: [...tokens] as Address[],
+    firstSeenBlock,
+    coveredRange: coveredTo === null ? null : { fromBlock: args.fromBlock, toBlock: coveredTo },
+    ...rest,
+    logCount,
+    ignoredLogCount,
+  });
 
-  for (let start = args.fromBlock; start <= args.toBlock; start += chunkSize) {
-    const end = start + chunkSize - 1n > args.toBlock ? args.toBlock : start + chunkSize - 1n;
-    try {
-      const logs = await getIncomingTransferLogs(client, { to, fromBlock: start, toBlock: end });
-      for (const log of logs) {
+  for (let start = args.fromBlock; start <= args.toBlock; ) {
+    if (coveredTo !== null && args.shouldStop?.() === true) {
+      return result({ failedRange: null, failure: null, remainingRange: { fromBlock: start, toBlock: args.toBlock } });
+    }
+    const group: { start: bigint; end: bigint }[] = [];
+    for (let from = start; from <= args.toBlock && group.length < concurrency; from += chunkSize) {
+      group.push({ start: from, end: from + chunkSize - 1n > args.toBlock ? args.toBlock : from + chunkSize - 1n });
+    }
+    const settled = await Promise.allSettled(group.map((chunk) => getIncomingTransferLogs(client, { to, fromBlock: chunk.start, toBlock: chunk.end })));
+    for (const [index, chunk] of group.entries()) {
+      const outcome = settled[index]!;
+      if (outcome.status === 'rejected') {
+        return result({ failedRange: { fromBlock: chunk.start, toBlock: chunk.end },
+          failure: `getLogs [${chunk.start}, ${chunk.end}] 失敗：${reasonOf(outcome.reason)}`, remainingRange: null });
+      }
+      for (const log of outcome.value) {
         if (!isErc20LogTopics(log.topics)) {
           ignoredLogCount += 1;
           continue;
@@ -339,28 +379,11 @@ export async function scanIncomingTransfers(
         tokens.add(log.address.toLowerCase());
         if (!firstSeenBlock.has(log.address.toLowerCase())) firstSeenBlock.set(log.address.toLowerCase(), log.blockNumber);
       }
-      coveredTo = end;
-    } catch (cause) {
-      return {
-        tokens: [...tokens] as Address[],
-        firstSeenBlock,
-        coveredRange: coveredTo === null ? null : { fromBlock: args.fromBlock, toBlock: coveredTo },
-        failedRange: { fromBlock: start, toBlock: end },
-        failure: `getLogs [${start}, ${end}] 失敗：${reasonOf(cause)}`,
-        logCount,
-        ignoredLogCount,
-      };
+      coveredTo = chunk.end;
     }
+    start = group[group.length - 1]!.end + 1n;
   }
-  return {
-    tokens: [...tokens] as Address[],
-    firstSeenBlock,
-    coveredRange: { fromBlock: args.fromBlock, toBlock: args.toBlock },
-    failedRange: null,
-    failure: null,
-    logCount,
-    ignoredLogCount,
-  };
+  return result({ failedRange: null, failure: null, remainingRange: null });
 }
 
 /** 候選扣掉已知宇宙 → 逐顆讀 `balanceOf(account)`，回傳真的有餘額的。 */
@@ -580,6 +603,8 @@ export type ScanStats = {
   failedRange: { fromBlock: bigint; toBlock: bigint } | null;
   /** The failure as it goes to a log: URLs masked (an RPC URL can carry a key), one line, capped. */
   failure: string | null;
+  /** Left for the next round by the round budget (no failure); null otherwise. */
+  remainingRange: { fromBlock: bigint; toBlock: bigint } | null;
   scanMs: number;
 };
 
@@ -593,7 +618,7 @@ export type FlowSyncStat = { via: 'advance' | 'catchup'; fromBlock: bigint; toBl
 export const SCAN_LOG_SLOW_MS = 2_000;
 
 /**
- * The `holdings_scan` log line of one plan, or null when there is nothing to say (the usual round: at most one chunk,
+ * The `holdings_scan` log line of one plan, or null when there is nothing to say (the usual round: at most two chunks,
  * no failure, fast). Block numbers, counts, durations and a masked failure only: no key, no URL.
  * `cursorAfter`: `last_scanned_block` when the scan returned; null when it threw (nothing is known to have moved).
  */
@@ -602,7 +627,10 @@ export function formatScanLog(args: { portfolioId: number; personalMix: boolean;
   const { stats } = args;
   const failed = stats?.failure != null || args.flowSyncs.some((sync) => sync.failure !== null);
   const gap = stats === null || stats.asked === null ? 0n : stats.asked.toBlock - stats.asked.fromBlock + 1n;
-  if (!failed && args.ms < SCAN_LOG_SLOW_MS && (stats === null || gap <= stats.chunkSize)) return null;
+  // Two chunks is an ordinary round (15 minutes of chain 97 is a little over 2,000 blocks): only a larger gap is worth a line.
+  // Slow = the log scan plus the flow syncs (`ms` is the whole observation, which also reads balances and prices).
+  const spent = (stats?.scanMs ?? 0) + args.flowSyncs.reduce((sum, sync) => sum + sync.ms, 0);
+  if (!failed && spent < SCAN_LOG_SLOW_MS && (stats === null || gap <= 2n * stats.chunkSize)) return null;
   const chunks = (blocks: bigint) => (stats === null || blocks <= 0n ? 0 : Number((blocks + stats.chunkSize - 1n) / stats.chunkSize));
   const line = JSON.stringify({
     msg: 'holdings_scan',
@@ -619,16 +647,35 @@ export function formatScanLog(args: { portfolioId: number; personalMix: boolean;
       scanMs: stats.scanMs,
       failedRange: stats.failedRange === null ? null : [stats.failedRange.fromBlock.toString(), stats.failedRange.toBlock.toString()],
       failure: stats.failure,
+      remaining: stats.remainingRange === null ? null : [stats.remainingRange.fromBlock.toString(), stats.remainingRange.toBlock.toString()],
     }),
     flowSyncs: args.flowSyncs.map((sync) => ({ via: sync.via, from: sync.fromBlock.toString(), to: sync.toBlock.toString(), ms: Math.round(sync.ms), failure: sync.failure })),
   });
   return { level: failed ? 'warn' : 'info', line };
 }
 
+/** 幾段一批。一批＝一個「掃轉入 → 候選落地 → `beforeAdvance` → 寫游標」的單位：失敗最多重做一批。25 段＝50,000 塊。 */
+export const PROGRESS_BATCH_CHUNKS = 25;
+/** 同時在飛的轉入日誌查詢數（跟自建組合現金流同步原本的「兩個查詢一起發」同一個量級，不多打公開節點）。 */
+export const SCAN_CONCURRENCY = 2;
+/**
+ * 一輪掃描的上限：到了就停，剩下的下一輪從游標接著掃（規劃是握著共用市場通道做的，不能為了追進度握 30 秒）。
+ * 平常一輪的缺口是一段（15 分鐘 ≈ 2,000 塊），碰不到上限；只有游標落後很多（排程器停了幾天、帳戶久沒被處理）才會。
+ * 150 段＝300,000 塊（鏈上約 37 小時）。時間上限在每一組查詢開始前檢查，所以一輪最多超出一組查詢的時間。
+ */
+export const SCAN_ROUND_BUDGET_MS = 4_000;
+export const SCAN_ROUND_MAX_CHUNKS = 150;
+
 export type ScanDeps = {
+  /**
+   * 游標要越過 `range` 之前先做的事（自建組合：把這一段的入出金同步進帳本）。每一批呼叫一次，範圍就是那一批
+   * 連續掃成功的部分；它拋錯時游標停在上一批的終點，錯誤照樣往外拋。
+   */
   beforeAdvance?: (range: { fromBlock: bigint; toBlock: bigint }) => Promise<void>;
-  /** Called once, right after the log scan (before balances, `beforeAdvance` and the cursor write). */
+  /** Called once per round, when the log scan is over (also when `beforeAdvance` or a write threw), before balances are read. */
   onScan?: (stats: ScanStats) => void;
+  /** 一輪的上限（測試用；預設 SCAN_ROUND_BUDGET_MS／SCAN_ROUND_MAX_CHUNKS）。`now` 回毫秒。 */
+  budget?: { maxMs?: number; maxChunks?: number; now?: () => number };
   client: PublicClient;
   query: QueryFn;
   portfolioId: number;
@@ -643,7 +690,7 @@ export type ScanDeps = {
 };
 
 /**
- * 一輪持有掃描：部署塊 → 游標 → 分塊掃轉入 → 讀餘額 → 決定宇宙完整性 → （成功才）寫游標。
+ * 一輪持有掃描：部署塊 → 游標 → 一批一批（掃轉入 → 候選落地 → `beforeAdvance` → 寫游標）→ 讀餘額 → 決定宇宙完整性。
  *
  * 游標「第一次」的起點挑選：知道部署塊就從部署塊開始（那才有機會讓 `universeComplete` 變 true），
  * 不知道就從 head 開始——本機 fork 沒能力回填歷史，假裝掃過創世以來才是真正的錯。從 head 開始的
@@ -662,39 +709,84 @@ export async function scanPortfolioHoldings(deps: ScanDeps): Promise<HoldingScan
   const cursor: ScanCursor =
     existing ?? { portfolioId: deps.portfolioId, startBlock: deployment.block ?? block, lastScannedBlock: (deployment.block ?? block) - 1n };
 
-  const fromBlock = cursor.lastScannedBlock + 1n;
-  const scanStarted = performance.now();
-  const scan =
-    fromBlock > block
-      ? null
-      : await scanIncomingTransfers(deps.client, {
-          account: deps.account,
-          fromBlock,
-          toBlock: block,
-          chunkSize: deps.chunkSize,
-        });
-  deps.onScan?.({
-    cursorBefore: cursor.lastScannedBlock,
-    head: block,
-    chunkSize: deps.chunkSize ?? DEFAULT_CHUNK_SIZE,
-    asked: scan === null ? null : { fromBlock, toBlock: block },
-    coveredTo: scan?.coveredRange?.toBlock ?? null,
-    failedRange: scan?.failedRange ?? null,
-    failure: scan?.failure == null ? null : scanFailureForLog(scan.failure),
-    scanMs: Math.round(performance.now() - scanStarted),
-  });
-
   const known = new Set(deps.knownTokens.map((token) => token.toLowerCase()));
+  const chunkSize = deps.chunkSize ?? DEFAULT_CHUNK_SIZE;
+  if (chunkSize <= 0n) throw new RangeError(`chunkSize 必須是正數（收到 ${chunkSize}）`);
+  const now = deps.budget?.now ?? (() => performance.now());
+  const maxMs = deps.budget?.maxMs ?? SCAN_ROUND_BUDGET_MS;
+  const maxChunks = Math.max(1, deps.budget?.maxChunks ?? SCAN_ROUND_MAX_CHUNKS);
 
-  // ① 這一輪日誌看到的宇宙外代幣先落地（first_seen_block 只記第一次）。掃描失敗也照寫——見
-  //    SQL_INSERT_CANDIDATES 的註解。
+  // 一批一批往前（檔頭 ②）：① 掃轉入 → ② 這一批看到的宇宙外代幣先落地（first_seen_block 只記第一次；掃描失敗也照寫，
+  // 見 SQL_INSERT_CANDIDATES 的註解）→ ③ `beforeAdvance` → ④ 寫游標。游標只越過 ①②③ 都做完的連續區段。
+  const fromBlock = cursor.lastScannedBlock + 1n;
   const discovered: { asset: Address; firstSeenBlock: bigint }[] = [];
-  for (const token of scan?.tokens ?? []) {
-    const asset = token.toLowerCase() as Address;
-    if (known.has(asset)) continue;
-    discovered.push({ asset, firstSeenBlock: scan?.firstSeenBlock.get(asset) ?? scan?.coveredRange?.toBlock ?? block });
+  let advanced = cursor;
+  let scanFailure: string | null = null;
+  let failedRange: { fromBlock: bigint; toBlock: bigint } | null = null;
+  let remainingRange: { fromBlock: bigint; toBlock: bigint } | null = null;
+  let chunksDone = 0;
+  let scanMs = 0;
+  const roundStarted = now();
+  const outOfTime = (): boolean => now() - roundStarted >= maxMs;
+  try {
+    for (let from = fromBlock; from <= block; ) {
+      // 第一批一定做（每一輪至少前進一組查詢）；之後每一批開始前看上限。
+      if (chunksDone > 0 && (chunksDone >= maxChunks || outOfTime())) {
+        remainingRange = { fromBlock: from, toBlock: block };
+        break;
+      }
+      const batchChunks = BigInt(Math.min(PROGRESS_BATCH_CHUNKS, maxChunks - chunksDone));
+      const batchTo = from + chunkSize * batchChunks - 1n > block ? block : from + chunkSize * batchChunks - 1n;
+      const batchStarted = now();
+      const scan = await scanIncomingTransfers(deps.client, {
+        account: deps.account,
+        fromBlock: from,
+        toBlock: batchTo,
+        chunkSize,
+        concurrency: SCAN_CONCURRENCY,
+        shouldStop: outOfTime,
+      });
+      scanMs += now() - batchStarted;
+
+      const found: { asset: Address; firstSeenBlock: bigint }[] = [];
+      for (const token of scan.tokens) {
+        const asset = token.toLowerCase() as Address;
+        if (known.has(asset)) continue;
+        found.push({ asset, firstSeenBlock: scan.firstSeenBlock.get(asset) ?? scan.coveredRange?.toBlock ?? block });
+      }
+      await saveCandidates(deps.query, { portfolioId: deps.portfolioId, candidates: found });
+      for (const candidate of found) if (!discovered.some((seen) => seen.asset === candidate.asset)) discovered.push(candidate);
+
+      if (scan.coveredRange !== null) {
+        await deps.beforeAdvance?.(scan.coveredRange);
+        advanced = { ...cursor, lastScannedBlock: scan.coveredRange.toBlock };
+        await saveCursor(deps.query, advanced);
+        chunksDone += Number((scan.coveredRange.toBlock - scan.coveredRange.fromBlock + chunkSize) / chunkSize);
+      }
+      if (scan.failure !== null) {
+        scanFailure = scan.failure;
+        failedRange = scan.failedRange;
+        break;
+      }
+      if (scan.remainingRange !== null) {
+        remainingRange = { fromBlock: scan.remainingRange.fromBlock, toBlock: block };
+        break;
+      }
+      from = batchTo + 1n;
+    }
+  } finally {
+    deps.onScan?.({
+      cursorBefore: cursor.lastScannedBlock,
+      head: block,
+      chunkSize,
+      asked: fromBlock > block ? null : { fromBlock, toBlock: block },
+      coveredTo: advanced.lastScannedBlock > cursor.lastScannedBlock ? advanced.lastScannedBlock : null,
+      failedRange,
+      failure: scanFailure === null ? null : scanFailureForLog(scanFailure),
+      remainingRange,
+      scanMs: Math.round(scanMs),
+    });
   }
-  await saveCandidates(deps.query, { portfolioId: deps.portfolioId, candidates: discovered });
 
   // ② 重讀**候選表的全部列**（∪ 這一輪新發現的），而不只是這一輪日誌看到的。
   //    這一步刻意與日誌掃描解耦：`scan === null`（游標已追上 head、沒有新日誌）或 `scan.failure`
@@ -736,7 +828,12 @@ export async function scanPortfolioHoldings(deps: ScanDeps): Promise<HoldingScan
         `那之前的轉入沒有被觀察過，宇宙可能缺項（本機 fork 無法回填歷史）`,
     );
   }
-  if (scan?.failure != null) incompleteReasons.push(scan.failure);
+  if (scanFailure !== null) incompleteReasons.push(scanFailure);
+  if (remainingRange !== null) {
+    incompleteReasons.push(
+      `這一輪掃到 ${advanced.lastScannedBlock}（每輪上限 ${maxChunks} 段／${maxMs} 毫秒）：[${remainingRange.fromBlock}, ${remainingRange.toBlock}] 下一輪接著掃`,
+    );
+  }
   if (held.unreadableCandidates.length > 0) {
     incompleteReasons.push(
       `${held.unreadableCandidates.length} 個候選代幣的 balanceOf 讀不到，無法確認餘額：` +
@@ -744,19 +841,11 @@ export async function scanPortfolioHoldings(deps: ScanDeps): Promise<HoldingScan
     );
   }
 
-  // 只有「掃描成功」才寫游標。失敗時連失敗前已成功的那幾個塊都不寫（見檔頭 ②）。
-  let advanced = cursor;
-  if (scan !== null && scan.failure === null && scan.coveredRange !== null) {
-    await deps.beforeAdvance?.(scan.coveredRange);
-    advanced = { ...cursor, lastScannedBlock: scan.coveredRange.toBlock };
-    await saveCursor(deps.query, advanced);
-  }
-
   return {
     portfolioId: deps.portfolioId,
     block,
     cursor: advanced,
-    scannedRange: scan === null ? null : scan.coveredRange,
+    scannedRange: advanced.lastScannedBlock > cursor.lastScannedBlock ? { fromBlock, toBlock: advanced.lastScannedBlock } : null,
     candidateCount: candidateAssets.length,
     unknownHoldings: held.unknownHoldings,
     zeroBalanceCount: held.zeroBalanceCount,

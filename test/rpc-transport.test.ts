@@ -3,17 +3,17 @@ import { test } from 'node:test';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { createPublicClient } from 'viem';
-import { isNodeGap, isProviderFailure, PUBLIC_RPCS_97, publicRpcs, resetRpcTransport, rpcTransport, RPC_BREAKER_MS, secondaryRpc } from '../src/rpc-transport.js';
+import { ADDRESSLESS_LOGS_SKIP_MS, isNodeGap, isProviderFailure, PUBLIC_RPCS_97, publicRpcs, resetRpcTransport, rpcTransport, RPC_BREAKER_MS, secondaryRpc } from '../src/rpc-transport.js';
 
 /** Two local JSON-RPC nodes: `limit` answers like the 2026-11-23 provider ("Request exceeds defined limit"). */
-type Mode = 'ok' | 'limit' | 'revert' | 'http429' | 'http403' | 'http502' | 'html' | 'hang' | 'gap';
+type Mode = 'ok' | 'limit' | 'revert' | 'http429' | 'http403' | 'http502' | 'html' | 'hang' | 'gap' | 'needsAddress';
 async function node(behaviour: () => Mode, head: bigint) {
   const calls: string[] = [];
   const server = createServer((req, res) => {
     let raw = '';
     req.on('data', (chunk) => { raw += String(chunk); });
     req.on('end', () => {
-      const body = JSON.parse(raw) as { id: number; method: string };
+      const body = JSON.parse(raw) as { id: number; method: string; params?: { address?: unknown }[] };
       calls.push(body.method);
       const mode = behaviour();
       const send = (status: number, payload: unknown) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(payload)); };
@@ -23,6 +23,9 @@ async function node(behaviour: () => Mode, head: bigint) {
       if (mode === 'http502') { res.writeHead(502); res.end('Bad Gateway'); return; }
       if (mode === 'html') { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<html>maintenance</html>'); return; }
       if (mode === 'gap') return send(200, { jsonrpc: '2.0', id: body.id, error: { code: -32000, message: 'missing trie node 3009b80a (path ) state 0x12 is not available' } });
+      // publicnode's answer to an eth_getLogs that names no contract (probed 2026-11-26).
+      if (mode === 'needsAddress' && body.method === 'eth_getLogs' && body.params?.[0]?.address === undefined) return send(200, { jsonrpc: '2.0', id: body.id,
+        error: { code: -32701, message: 'Please specify an address in your request or, to remove restrictions, order a dedicated full node here: https://www.allnodes.com/bnb/host' } });
       if (mode === 'limit') return send(200, { jsonrpc: '2.0', id: body.id, error: { code: -32005, message: 'Request exceeds defined limit.' } });
       if (mode === 'revert' && body.method === 'eth_call') return send(200, { jsonrpc: '2.0', id: body.id, error: { code: 3, message: 'execution reverted', data: '0x' } });
       const result = body.method === 'eth_chainId' ? '0x61' : body.method === 'eth_blockNumber' ? `0x${head.toString(16)}` : body.method === 'eth_getBalance' ? '0x5' : body.method === 'eth_getLogs' ? [] : '0x';
@@ -164,6 +167,35 @@ test('RPC_URL first (API transaction paths): a 403 from RPC_URL goes to the publ
     assert.equal(await client.getBalance({ address: '0x00000000000000000000000000000000000000a1' }), 5n);
     assert.deepEqual([primary, a, b].map((n) => n.calls.filter(m => m === 'eth_getBalance').length), [1, 1, 2], 'both failed nodes wait at the back');
   } finally { primary.stop(); a.stop(); b.stop(); }
+});
+
+test('2026-11-26: a public node that only takes eth_getLogs with a contract address hands the holdings scan (no address) to the next node and keeps its place', async () => {
+  resetRpcTransport();
+  let t = 1_000_000, bMode: Mode = 'ok';
+  const paid = await node(() => 'ok', 100n), a = await node(() => 'needsAddress', 100n), b = await node(() => bMode, 100n), lines: string[] = [];
+  try {
+    const client = createPublicClient({ transport: rpcTransport('scheduler', paid.url, {}, { secondary: [a.url, b.url], preferPublic: true, schedulerRole: true, now: () => t, log: (l) => lines.push(l) }) });
+    const count = (n: { calls: string[] }) => n.calls.filter(m => m === 'eth_getLogs').length;
+    // The holdings scan's own request: Transfer to the account from any contract.
+    const scan = () => client.request({ method: 'eth_getLogs', params: [{ topics: ['0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef', null,
+      '0x00000000000000000000000000000000000000000000000000000000000000a1'], fromBlock: '0x1', toBlock: '0x2' }] });
+    assert.deepEqual(await scan(), []); assert.deepEqual(await scan(), []); assert.deepEqual(await scan(), []);
+    assert.equal(count(a), 1, 'refused once, then not asked for this kind of request'); assert.equal(count(b), 3);
+    // With a contract address the first node answers itself, as before: it keeps its place for everything else.
+    assert.deepEqual(await client.getLogs({ address: '0x00000000000000000000000000000000000000a1', fromBlock: 1n, toBlock: 2n }), []);
+    assert.equal(await client.getBalance({ address: '0x00000000000000000000000000000000000000a1' }), 5n);
+    assert.equal(count(a), 2); assert.equal(count(b), 3); assert.equal(b.calls.filter(m => m === 'eth_getBalance').length, 0);
+    // When no other node can answer either, the caller gets the refusing node's own words (and the scan fails that range).
+    bMode = 'gap';
+    await assert.rejects(scan(), /specify an address/);
+    bMode = 'ok';
+    // Ten minutes later it is asked again (the restriction may be gone); still refusing, it is skipped again.
+    t += ADDRESSLESS_LOGS_SKIP_MS - 1; await scan(); assert.equal(count(a), 2);
+    t += 1; await scan(); assert.equal(count(a), 3); await scan(); assert.equal(count(a), 3);
+    assert.equal(lines.length, 0, 'not a node failure: no failover line'); assert.equal(paid.calls.length, 0, 'a scheduler bulk read never goes to the paid RPC');
+  } finally { paid.stop(); a.stop(); b.stop(); }
+  assert.equal(isNodeGap(new Error('RPC Request failed.', { cause: new Error('Please specify an address in your request or, to remove restrictions, order a dedicated full node here: <url>') })), true);
+  assert.equal(isProviderFailure(Object.assign(new Error('Please specify an address in your request or, to remove restrictions, order a dedicated full node here: <url>'), { code: -32701 })), false);
 });
 
 test('a node without the requested state passes the read on but keeps its place; a revert is never passed on', async () => {

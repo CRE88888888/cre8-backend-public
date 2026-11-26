@@ -18,6 +18,7 @@ import { UnauthorizedError } from '../src/errors.js';
 import { RequestRateLimiter, MemoryRateLimitStore } from '../src/ratelimit.js';
 import { loadRateLimitConfig } from '../src/config.js';
 import { syncMixAccountFlows, syncMixEnrollmentFlows } from '../src/mix-flows.js';
+import { scanPortfolioHoldings } from '../src/holdings-scan.js';
 import { loadMixRuntime, decideMixTick, prepareMixTick, recordMixSwitchResidual, mixSwitchExitsPending } from '../src/mix-runtime.js';
 import { recordMixExitFailure, MIX_EXIT_MAX_RETRIES } from '../src/mix-runtime.js';
 import { claimDuePortfolios } from '../src/scheduler.js';
@@ -436,6 +437,89 @@ test('mix principal ledger deduplicates canonical replay, rewinds a reorg and pr
     await assert.rejects(syncMixAccountFlows(client, m, { fromBlock: 16n, toBlock: 20n }, { ...deps, query: async () => { throw new Error('fixture DB unavailable'); } }));
     assert.deepEqual((await db.query("select state,count(*)::int as n from mix_cash_flows where mix_id=$1 group by state order by state", [made.mixId])).rows, counts);
   });
+});
+
+test('a basket catching up in many bounded rounds, with failed log reads and a failed flow sync on the way, ends with the same ledger, row by row, as one scan; the cursor is never ahead of the ledger', async () => {
+  const HEAD = 2_000n, START = 1_000n;
+  // Deposits and withdrawals of the basket between the cursor and head, and one token nobody expected (an airdrop).
+  const AIRDROP = '0x00000000000000000000000000000000000000a7' as const;
+  const moves = [[1_001n, 'in', 50n], [1_010n, 'out', 5n], [1_011n, 'in', 7n], [1_250n, 'in', 11n], [1_251n, 'out', 2n], [1_499n, 'in', 13n], [1_500n, 'in', 17n], [1_777n, 'out', 3n], [2_000n, 'in', 19n]] as const;
+  const run = async (rounds: 'one' | 'many') => {
+    let outcome: { ledger: unknown[]; candidates: unknown[]; cursor: string; roundsRun: number; failedRounds: number } | null = null;
+    await fixture(async (service, db) => {
+      const made = await service.create({ assets: [{ assetId: T.assets.WBNB.token, weightBps: 10000 }] }, owner, randomUUID());
+      const joined = await service.confirm(made.mixId, owner, { txHash: toHex(8n, { size: 32 }) }); assert.ok(joined.portfolioId);
+      const portfolioId = joined.portfolioId;
+      await db.query('insert into portfolio_scan_cursors(portfolio_id,start_block,last_scanned_block) values($1,1,$2) on conflict(portfolio_id) do update set last_scanned_block=$2', [portfolioId, START.toString()]);
+      const m = { id: String(made.mixId), owner, account: made.account };
+      const account = `0x${made.account.slice(2).toLowerCase().padStart(64, '0')}`;
+      const flowLog = ([block, way, amount]: (typeof moves)[number], index: number) => ({ address: T.contracts.usdt,
+        topics: encodeEventTopics({ abi: erc20Abi, eventName: 'Transfer', args: way === 'in' ? { from: owner, to: made.account } : { from: made.account, to: owner } }),
+        data: encodeAbiParameters([{ type: 'uint256' }], [amount * WAD]), blockNumber: toHex(block), blockHash: toHex(block + 7_000_000n, { size: 32 }),
+        transactionHash: toHex(BigInt(index) + 900n, { size: 32 }), transactionIndex: '0x0', logIndex: toHex(index), removed: false });
+      const flows = moves.map(flowLog);
+      const airdrop = { address: AIRDROP, topics: encodeEventTopics({ abi: erc20Abi, eventName: 'Transfer', args: { from: owner, to: made.account } }),
+        data: encodeAbiParameters([{ type: 'uint256' }], [1n]), blockNumber: toHex(1_333n), blockHash: toHex(1_333n + 7_000_000n, { size: 32 }),
+        transactionHash: toHex(999n, { size: 32 }), transactionIndex: '0x0', logIndex: '0x63', removed: false };
+      const fail = { scanAt: null as bigint | null, flows: false };
+      const client = createPublicClient({ transport: custom({ request: async ({ method, params }) => {
+        const first: unknown = Array.isArray(params) ? params[0] : null;
+        if (method === 'eth_chainId') return '0x61';
+        if (method === 'eth_getCode') return BigInt(String((params as unknown[])[1])) >= 1n ? '0x6000' : '0x';
+        if (method === 'eth_call') return encodeAbiParameters([{ type: 'uint256' }], [18n]);
+        if (method === 'eth_getLogs') {
+          const filter = first as { address?: unknown; topics: (string | null)[]; fromBlock: string; toBlock: string };
+          const from = BigInt(filter.fromBlock), to = BigInt(filter.toBlock), inRange = (log: { blockNumber: string }) => BigInt(log.blockNumber) >= from && BigInt(log.blockNumber) <= to;
+          if (filter.address === undefined) { // the holdings scan: a transfer in, from any token
+            if (fail.scanAt !== null && from <= fail.scanAt && fail.scanAt <= to) throw new Error('fixture: Please specify an address in your request');
+            return [...flows.filter(log => log.topics[2] === account), airdrop].filter(inRange);
+          }
+          if (fail.flows) throw new Error('fixture: flow logs unavailable');
+          return flows.filter(log => inRange(log) && (filter.topics[1] === null || filter.topics[1] === undefined ? log.topics[2] === account : log.topics[1] === account));
+        }
+        if (method === 'eth_getBlockByNumber') { const at = BigInt(String(first)); return { number: toHex(at), hash: toHex(at + 7_000_000n, { size: 32 }), timestamp: toHex(at), transactions: [] }; }
+        if (method === 'eth_getTransactionReceipt') {
+          const log = flows.find(entry => entry.transactionHash === first); assert.ok(log);
+          return { transactionHash: log.transactionHash, transactionIndex: '0x0', blockNumber: log.blockNumber, blockHash: log.blockHash, status: '0x1', from: owner, to: T.contracts.usdt,
+            gasUsed: '0x1', cumulativeGasUsed: '0x1', effectiveGasPrice: '0x1', type: '0x2', contractAddress: null, logs: [log], logsBloom: '0x' + '0'.repeat(512) };
+        }
+        throw new Error(`unexpected fixture method ${method}`);
+      } }, { retryCount: 0 }) });
+      const deps = { query: (sql: string, values?: readonly unknown[]) => db.query(sql, values ? [...values] : []), transaction: <R>(work: (c: import('pg').PoolClient) => Promise<R>) => work(db) };
+      const cursor = async () => BigInt((await db.query<{ b: string }>('select last_scanned_block::text as b from portfolio_scan_cursors where portfolio_id=$1', [portfolioId])).rows[0]?.b ?? '0');
+      const ledger = async () => (await db.query(`select kind,amount_raw::text,tx_hash,log_index::text,block_number::text,block_hash,asset,quantity_raw::text,state
+        from mix_cash_flows where mix_id=$1 and block_number>$2 order by block_number,log_index`, [made.mixId, START.toString()])).rows;
+      const scan = (budget: { maxChunks: number }) => scanPortfolioHoldings({ client, query: deps.query, portfolioId, account: made.account, knownTokens: [T.contracts.usdt, T.assets.WBNB.token],
+        head: HEAD, chunkSize: 10n, budget, beforeAdvance: range => syncMixAccountFlows(client, m, range, deps, portfolioId) });
+      let roundsRun = 0, failedRounds = 0;
+      if (rounds === 'one') { await scan({ maxChunks: 10_000 }); roundsRun = 1; }
+      else for (; roundsRun < 80 && await cursor() < HEAD; roundsRun++) {
+        const before = await cursor();
+        fail.scanAt = roundsRun % 3 === 1 ? before + 35n : null;   // a log range the node refuses, at a different place each time
+        fail.flows = roundsRun === 2 || roundsRun === 5;            // the flow sync itself fails: that round throws
+        const result = await scan({ maxChunks: 7 }).catch(() => null);
+        if (result === null) failedRounds++;
+        const now = await cursor();
+        assert.ok(now >= before, 'the cursor never goes back');
+        if (fail.flows) assert.equal(now, before, 'a round whose flow sync failed moved nothing');
+        else assert.ok(now > before, `round ${roundsRun} moved on`);
+        // The invariant everything rests on: whatever is at or under the cursor is in the ledger already.
+        const saved = new Set((await ledger()).map(row => String((row as { tx_hash: string }).tx_hash)));
+        for (const log of flows) if (BigInt(log.blockNumber) <= now) assert.ok(saved.has(log.transactionHash), `flow in block ${BigInt(log.blockNumber)} is saved before the cursor passed it (${now})`);
+      }
+      const candidates = (await db.query('select asset,first_seen_block::text from portfolio_holding_candidates where portfolio_id=$1 order by asset', [portfolioId])).rows;
+      outcome = { ledger: await ledger(), candidates, cursor: (await cursor()).toString(), roundsRun, failedRounds };
+    });
+    assert.ok(outcome !== null);
+    return outcome as { ledger: unknown[]; candidates: unknown[]; cursor: string; roundsRun: number; failedRounds: number };
+  };
+  const one = await run('one'), many = await run('many');
+  assert.equal(one.cursor, '2000'); assert.equal(many.cursor, '2000');
+  assert.equal(one.ledger.length, moves.length);
+  assert.deepEqual(many.ledger, one.ledger, 'every deposit and withdrawal, the same rows');
+  assert.deepEqual(many.candidates, one.candidates);
+  assert.deepEqual(one.candidates, [{ asset: AIRDROP, first_seen_block: '1333' }]);
+  assert.ok(many.roundsRun > 10 && many.failedRounds === 2, `rounds ${many.roundsRun}, failed ${many.failedRounds}`);
 });
 
 test('creation retry after account failure preserves registration, original defaults and resolved Import, even after source deletion', async () => {

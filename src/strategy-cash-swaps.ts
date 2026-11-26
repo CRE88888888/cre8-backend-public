@@ -69,8 +69,12 @@ async function bookCashSwap(query: SchedulerQueryFn, c: CashSwapContext, e: Swap
   if (done.rows.length !== 1) throw new Error('missing cash ledger row');
 }
 
-/** Blocks per `eth_getLogs` (public BSC nodes refuse wider spans) and how far back the recovery scan looks (about two days). */
-export const CASH_SWAP_LOG_CHUNK = 10_000n;
+/**
+ * Blocks per `eth_getLogs` and how far back the recovery scan looks (about two days). 5,000 is the smallest range cap
+ * among the chain-97 nodes that serve logs (bsc-prebsc-dataseed; publicnode takes 50,000): with 10,000 every range was
+ * refused whenever the request failed over from publicnode.
+ */
+export const CASH_SWAP_LOG_CHUNK = 5_000n;
 export const CASH_SWAP_LOOKBACK_BLOCKS = 240_000n;
 export type CashSwapLogFilter = { address: Address; events: readonly unknown[]; args: Record<string, Address | readonly Address[]>; fromBlock: bigint; toBlock: bigint };
 export type CashSwapLogReader = { getBlockNumber(): Promise<bigint>; getLogs(filter: CashSwapLogFilter): Promise<readonly Log[]> };

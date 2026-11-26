@@ -16,11 +16,16 @@ test('withdrawal logs are read in chunks no wider than WITHDRAWAL_LOG_CHUNK, cov
     if (method === 'eth_getLogs') {
       const filter = (params as [{ fromBlock: string; toBlock: string }])[0];
       ranges.push([BigInt(filter.fromBlock), BigInt(filter.toBlock)]);
+      // bsc-prebsc-dataseed, the node a log read fails over to when publicnode rate-limits (probed 2026-11-25).
+      if (BigInt(filter.toBlock) - BigInt(filter.fromBlock) > 5_000n) throw new Error('exceed maximum block range 5000');
       return [];
     }
     throw new Error(`unexpected ${method}`);
   } }, { retryCount: 0 }) });
   const query: SchedulerQueryFn = async (sql) => ({ rows: sql.includes('smart_accounts') ? [{ owner: TEST_OWNER }] : [{ block_number: '100', log_index: '0' }] });
+  // 2026-11-25 portfolio 4: 10,000-block ranges were refused by that node and the round ended [CASH_RECONCILIATION_UNAVAILABLE].
+  const { CASH_SWAP_LOG_CHUNK } = await import('../src/strategy-cash-swaps.js');
+  assert.equal(WITHDRAWAL_LOG_CHUNK, 5_000n); assert.equal(CASH_SWAP_LOG_CHUNK, 5_000n);
   const to = 100n + 2n * WITHDRAWAL_LOG_CHUNK + 5n;
   assert.deepEqual(await readCashWithdrawals(client, query, { chainId: 97, portfolioId: 1, account: TEST_ACCOUNT, cash: TESTNET_97.contracts.usdt, blockNumber: to }), []);
   assert.deepEqual(ranges, [

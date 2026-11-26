@@ -638,10 +638,12 @@ for (const kind of ['fund', 'mix'] as const) {
       for (const [name, calls] of settle) { const h = harness(kind, { wired: true }); await assert.doesNotReject(h.sponsor(calls), `${kind}: ${name} ${why}`); assert.deepEqual([h.asked, h.seen.reservations], [[], 1], name); }
     };
     try {
-      // This owner is not in the shipped deployment's canary list, and the shipped audience is the canary list.
-      delete process.env.STRATEGY_EARN_V2_AUDIENCE; delete process.env.STRATEGY_EARN_V2_DEPLOYMENT;
+      // This owner is not in the shipped deployment's canary list; the shipped audience is `all` (2026-11-26), so the
+      // outside-the-audience rules are checked on the same file with `"audience": "canary"`.
+      delete process.env.STRATEGY_EARN_V2_AUDIENCE;
       assert.ok(!real.canaryOwners.includes(owner.toLowerCase() as Address));
-      assert.deepEqual([real.audience, real.newOpensPaused], ['canary', false]);
+      assert.deepEqual([real.audience, real.newOpensPaused], ['all', false]);
+      process.env.STRATEGY_EARN_V2_DEPLOYMENT = JSON.stringify({ ...file, audience: 'canary' });
       await closedToNew('outside the audience');
       for (const [name, calls] of await flows(kind)) await assert.doesNotReject(harness(kind, { wired: true }).sponsor(calls), `${kind} outside the audience: ${name}`);
       // v1 risk from an owner outside the audience is checked against v2 too: the account may still be on v2 from when its
@@ -652,13 +654,13 @@ for (const kind of ['fund', 'mix'] as const) {
       assert.deepEqual(clean.asked, ['v2']);
       await assert.rejects(harness(kind, { wired: true, inUse: 'v2' }).sponsor(v1Open), code('PAYMASTER_CALL_FORBIDDEN', 403));
       // In the audience (the variable): the same UserOps against the configured executor / registry are sponsored.
+      delete process.env.STRATEGY_EARN_V2_DEPLOYMENT;
       process.env.STRATEGY_EARN_V2_AUDIENCE = owner;
       for (const [name, calls] of v2f) { const h = harness(kind, { wired: true }); await assert.doesNotReject(h.sponsor(calls), `${kind}: ${name} in the audience`); assert.equal(h.seen.reservations, 1); }
       // A v2 call aimed at any other "executor" is not a v2 call: refused.
       await assert.rejects(harness(kind, { wired: true }).sponsor([asCall(v2Calls.release(V2, account, VA, BigInt(NOW + 600)))]), code('PAYMASTER_CALL_FORBIDDEN', 403));
-      // The same from the configuration file alone: `"audience": "all"` opens v2 to every owner, no variable needed.
-      delete process.env.STRATEGY_EARN_V2_AUDIENCE;
-      process.env.STRATEGY_EARN_V2_DEPLOYMENT = JSON.stringify({ ...file, audience: 'all' });
+      // The same from the shipped configuration file alone: `"audience": "all"` opens v2 to every owner, no variable needed.
+      delete process.env.STRATEGY_EARN_V2_AUDIENCE; delete process.env.STRATEGY_EARN_V2_DEPLOYMENT;
       for (const [name, calls] of v2f) await assert.doesNotReject(harness(kind, { wired: true }).sponsor(calls), `${kind}: ${name} with audience all in the file`);
       // `newOpensPaused`: nobody starts anything new — not an owner on the canary list, not with the audience at `all`, not
       // with the variable naming this owner — and everything that settles is sponsored all the same.
@@ -695,9 +697,14 @@ test('renewal: the routing v2 scope is installed for an owner in the audience, a
     return v2InstalledScope(k.policySnapshot, account);
   };
   const before = { audience: process.env.STRATEGY_EARN_V2_AUDIENCE, deployment: process.env.STRATEGY_EARN_V2_DEPLOYMENT };
+  const file = JSON.parse(readFileSync(new URL('../deploy/strategy-earn-v2.json', import.meta.url), 'utf8')).deployments[0];
   try {
     delete process.env.STRATEGY_EARN_V2_AUDIENCE; delete process.env.STRATEGY_EARN_V2_DEPLOYMENT;
     const scope = { executor: real.executor, account, swapper: real.swapper };
+    // The shipped file (`"audience": "all"`): every owner is in the audience, the scope is installed without asking.
+    assert.deepEqual([await key(owner, false), asked], [scope, []]);
+    // The same file with `"audience": "canary"` (this owner is not on the list):
+    process.env.STRATEGY_EARN_V2_DEPLOYMENT = JSON.stringify({ ...file, audience: 'canary' });
     // Outside the audience, nothing on v2: the key is exactly what it was before v2 existed (one question about the account).
     assert.deepEqual([await key(owner, false), asked], [null, [account]]);
     // Outside the audience, the account is on v2 (or used it): the new key keeps the v2 scope, so the scheduler can still repay and close.
@@ -709,8 +716,7 @@ test('renewal: the routing v2 scope is installed for an owner in the audience, a
     process.env.STRATEGY_EARN_V2_AUDIENCE = owner;
     assert.deepEqual([await key(owner, false), asked], [scope, []]);
     delete process.env.STRATEGY_EARN_V2_AUDIENCE;
-    const file = JSON.parse(readFileSync(new URL('../deploy/strategy-earn-v2.json', import.meta.url), 'utf8')).deployments[0];
-    process.env.STRATEGY_EARN_V2_DEPLOYMENT = JSON.stringify({ ...file, canaryOwners: [owner], newOpensPaused: true });
+    process.env.STRATEGY_EARN_V2_DEPLOYMENT = JSON.stringify({ ...file, audience: 'canary', canaryOwners: [owner], newOpensPaused: true });
     assert.deepEqual([await key(owner, false), asked], [scope, []]);
   } finally {
     if (before.audience === undefined) delete process.env.STRATEGY_EARN_V2_AUDIENCE; else process.env.STRATEGY_EARN_V2_AUDIENCE = before.audience;

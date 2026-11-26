@@ -48,7 +48,7 @@
 - **回退（出事時）**：同一個檔把 `"newOpensPaused"` 改成 `true`，部署 api 再部署 scheduler。之後沒有人能在 v2 新開（新開的走 v1）；既有部位照管、照關、到健康線照樣減倉。要連名單一起收回就把 `"audience"` 改回 `"canary"`——既有部位一樣照管。
 - 解除：`"newOpensPaused"` 改回 `false` 再部署。
 
-**現況（2026-11-25）：`canaryOwners` 只有 e2e harness 的測試錢包（`0xD3Ab…D6D9`），其他人全部維持 v1。** 當天在測試網用兩種帳戶跑過的流程與交易見 PR #285–#289 的說明。 測試網已換成 draft6 的修正版（executor `0xeddd…600F`、registry `0x2461…CC0D`、lens `0x4fC6…a27A`）並部署了 `AtpBorrowCashSwapper`（`0x9981…0798`）。舊那套（executor `0x494C…6bB5`）的 registry 已暫停新開倉，66 條路線的本金都是 0（2026-11-25 用公開節點逐條讀 `totalPrincipal`），沒有部位要搬。
+**現況（2026-11-26）：`audience` 已改成 `"all"`，所有人新開都走 v2。** 2026-11-25 以前 `canaryOwners` 只有 e2e harness 的測試錢包（`0xD3Ab…D6D9`），其他人維持 v1。 當天在測試網用兩種帳戶跑過的流程與交易見 PR #285–#289 的說明。 測試網已換成 draft6 的修正版（executor `0xeddd…600F`、registry `0x2461…CC0D`、lens `0x4fC6…a27A`）並部署了 `AtpBorrowCashSwapper`（`0x9981…0798`）。舊那套（executor `0x494C…6bB5`）的 registry 已暫停新開倉，66 條路線的本金都是 0（2026-11-25 用公開節點逐條讀 `totalPrincipal`），沒有部位要搬。
 
 不能新開、帳戶在 v2 上也沒有東西的 owner 完全走 v1：續期不裝 v2 權限、API 與排程器不會組 v2 的交易。多出來的讀取：持倉快照每次一個 `accountRoutes`；其餘每個帳戶每 10 分鐘最多一次「v2 上有沒有東西」（見上）；這種 owner 送 v1 加風險的 UserOp 時 paymaster 也問同一題（一個帳戶只用一種）。**對所有人開啟＝把設定檔的 `audience` 改成 `all`，這是產品決定，還沒有做。**
 

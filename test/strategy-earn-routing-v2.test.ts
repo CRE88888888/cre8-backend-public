@@ -69,13 +69,18 @@ test('every v2 address comes from deployment configuration: the manifest file, o
   assert.throws(() => strategyEarnV2(97, { STRATEGY_EARN_V2_MANIFEST: new URL('./fixtures/borrow-routing-v2.signatures.json', import.meta.url).pathname }), /no deployments/);
 });
 
-test('audience: v2 is for the deployment\'s canary owners only until STRATEGY_EARN_V2_AUDIENCE says otherwise; everyone else stays on v1', () => {
-  // The manifest shipped today lists one owner, the e2e harness wallet: v2 is on for that owner's accounts and off (v1) for everyone else.
+test('audience: with `canary`, v2 is for the deployment\'s canary owners only until STRATEGY_EARN_V2_AUDIENCE says otherwise; everyone else stays on v1', () => {
+  // The manifest shipped today (2026-11-26) is `"audience": "all"`: every owner starts on v2; the canary list (the e2e harness wallet) stays in the file.
   const harnessOwner = '0xd3ab39b62e221bf9e8ba19fe19b2638767d3d6d9' as Address;
   assert.deepEqual(strategyEarnV2(97, {})!.canaryOwners, [harnessOwner]);
-  assert.equal(strategyEarnV2For(97, harnessOwner, {})!.chainId, 97);
   const other = A(0x1234), canary = A(0xd3ab);
-  for (const who of [other, canary, owner, null, undefined, 'not an address']) assert.equal(strategyEarnV2For(97, who, {}), null);
+  for (const who of [harnessOwner, other, canary, owner]) assert.equal(strategyEarnV2For(97, who, {})!.chainId, 97);
+  for (const who of [null, undefined, 'not an address']) assert.equal(strategyEarnV2For(97, who, {}), null);
+  // The same file with `"audience": "canary"`: the harness wallet only, everyone else stays on v1.
+  const shippedFile = JSON.parse(readFileSync(new URL('../deploy/strategy-earn-v2.json', import.meta.url), 'utf8')).deployments[0];
+  const asCanary = { STRATEGY_EARN_V2_DEPLOYMENT: JSON.stringify({ ...shippedFile, audience: 'canary' }) };
+  assert.equal(strategyEarnV2For(97, harnessOwner, asCanary)!.chainId, 97);
+  for (const who of [other, canary, owner, null, undefined, 'not an address']) assert.equal(strategyEarnV2For(97, who, asCanary), null);
   // A deployment that lists a canary owner: that owner only, whatever the letter case.
   const listed = { STRATEGY_EARN_V2_DEPLOYMENT: JSON.stringify({ ...JSON.parse(MANIFEST), chainId: 97, canaryOwners: [canary] }) };
   assert.equal(strategyEarnV2For(97, canary, listed)!.chainId, 97);
@@ -91,16 +96,16 @@ test('audience: v2 is for the deployment\'s canary owners only until STRATEGY_EA
 
 test('audience in the configuration file: `"audience": "all"` is the same as STRATEGY_EARN_V2_AUDIENCE=all (the variable still wins); `newOpensPaused` stops every new start whoever is listed, and leaves the deployment in place', () => {
   const file = JSON.parse(readFileSync(new URL('../deploy/strategy-earn-v2.json', import.meta.url), 'utf8')).deployments[0];
-  // What ships today: the canary list, nothing paused. Opening v2 to everyone is a later decision ("audience": "all").
-  assert.deepEqual([file.audience, file.newOpensPaused], ['canary', false]);
-  assert.deepEqual([strategyEarnV2(97, {})!.audience, strategyEarnV2(97, {})!.newOpensPaused], ['canary', false]);
+  // What ships today (2026-11-26): open to every owner, nothing paused. The canary list stays in the file for a switch back.
+  assert.deepEqual([file.audience, file.newOpensPaused], ['all', false]);
+  assert.deepEqual([strategyEarnV2(97, {})!.audience, strategyEarnV2(97, {})!.newOpensPaused], ['all', false]);
   const env = (o: object, extra: Record<string, string> = {}) => ({ STRATEGY_EARN_V2_DEPLOYMENT: JSON.stringify({ ...file, ...o }), ...extra });
   const other = A(0x1234), canary = (file.canaryOwners[0] as string).toLowerCase();
   // `canary` (also when the field is absent, as in a manifest written before it existed): the listed owners only.
   const { audience: _a, newOpensPaused: _p, ...old } = file;
-  for (const e of [env({}), env({ audience: 'canary' }), { STRATEGY_EARN_V2_DEPLOYMENT: JSON.stringify(old) }]) assert.deepEqual([v2Audience(97, canary, e), v2Audience(97, other, e), v2MayOpen(97, canary, e), v2NewOpensPaused(97, e)], [true, false, true, false]);
+  for (const e of [env({ audience: 'canary' }), { STRATEGY_EARN_V2_DEPLOYMENT: JSON.stringify(old) }]) assert.deepEqual([v2Audience(97, canary, e), v2Audience(97, other, e), v2MayOpen(97, canary, e), v2NewOpensPaused(97, e)], [true, false, true, false]);
   // `all` in the file = every owner, exactly what the variable `all` answers — with no variable set on either service.
-  const all = env({ audience: 'all' }), byVariable = env({}, { STRATEGY_EARN_V2_AUDIENCE: 'all' });
+  const all = env({ audience: 'all' }), byVariable = env({ audience: 'canary' }, { STRATEGY_EARN_V2_AUDIENCE: 'all' });
   for (const who of [other, canary, owner]) {
     assert.deepEqual([v2Audience(97, who, all), v2MayOpen(97, who, all), strategyEarnV2For(97, who, all)?.executor], [true, true, file.executor.toLowerCase()]);
     assert.deepEqual([v2Audience(97, who, all), v2MayOpen(97, who, all), strategyEarnV2For(97, who, all)?.executor], [v2Audience(97, who, byVariable), v2MayOpen(97, who, byVariable), strategyEarnV2For(97, who, byVariable)?.executor]);
@@ -109,7 +114,7 @@ test('audience in the configuration file: `"audience": "all"` is the same as STR
   assert.equal(strategyEarnV2For(56, other, all), null); // the deployment is for chain 97
   // The variable, when set, still wins over the file (as before).
   assert.equal(v2Audience(97, other, { ...all, STRATEGY_EARN_V2_AUDIENCE: 'off' }), false);
-  assert.deepEqual([v2Audience(97, other, { ...all, STRATEGY_EARN_V2_AUDIENCE: A(1) }), v2Audience(97, A(1), { ...env({}), STRATEGY_EARN_V2_AUDIENCE: A(1) }), v2Audience(97, canary, { ...env({}), STRATEGY_EARN_V2_AUDIENCE: A(1) })], [false, true, false]);
+  assert.deepEqual([v2Audience(97, other, { ...all, STRATEGY_EARN_V2_AUDIENCE: A(1) }), v2Audience(97, A(1), { ...env({ audience: 'canary' }), STRATEGY_EARN_V2_AUDIENCE: A(1) }), v2Audience(97, canary, { ...env({ audience: 'canary' }), STRATEGY_EARN_V2_AUDIENCE: A(1) })], [false, true, false]);
   // A value that is not one of the two, or a pause that is not a boolean, is a broken manifest: it throws, it is never read as "all" or "not paused".
   for (const bad of [{ audience: 'everyone' }, { audience: true }, { audience: 'ALL' }, { newOpensPaused: 'yes' }, { newOpensPaused: 1 }, { newOpensPaused: null }]) assert.throws(() => strategyEarnV2(97, env(bad)), /audience|newOpensPaused/);
   // newOpensPaused: nobody may start — not a listed owner, not with the audience at `all`, not with the variable — while the

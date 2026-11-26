@@ -4,6 +4,7 @@ import type { PrivyConfig } from './config.js';
 import { query, withTransaction } from './db.js';
 import { AppError, UnauthorizedError, ValidationError } from './errors.js';
 import { MAX_PRIVY_TOKEN_LENGTH } from './privy.js';
+import type { OpenSignup } from './waitlist-gate.js';
 
 export type WaitlistStatus = 'waiting' | 'approved' | 'revoked';
 export type WaitlistEntry = {
@@ -173,8 +174,11 @@ export function createWaitlistService(options: {
   repository?: WaitlistRepository;
   config?: () => PrivyConfig | null;
   now?: () => number;
+  /** deploy/waitlist-gate.json open sign-up; defaults to none (server.ts wires the real one). */
+  openSignup?: OpenSignup;
 } = {}) {
   const repository = options.repository ?? new PostgresWaitlistRepository();
+  const openSignup = options.openSignup ?? (async () => {});
   const verify = (token: unknown) => verifyIdentity(token, (options.config ?? getPrivyConfig)(), (options.now ?? Date.now)());
   const storage = async <T>(fn: () => Promise<T>): Promise<T> => {
     try { return await fn(); }
@@ -187,12 +191,14 @@ export function createWaitlistService(options: {
     async join(body: unknown) {
       const identity = await verify(isRecord(body) ? body.identityToken : undefined);
       const x = xIdentity(identity.privyUserId, identity.accounts);
+      await openSignup(identity.privyUserId, identity.accounts);
       return publicEntry(await storage(() => repository.join(x)));
     },
     async me(authorization: string | undefined) {
       const match = /^Bearer ([^\s]+)$/i.exec(authorization ?? '');
       if (!match) throw new UnauthorizedError();
       const identity = await verify(match[1]);
+      await openSignup(identity.privyUserId, identity.accounts);
       const row = await storage(() => repository.find(identity.privyUserId));
       if (!row) throw notJoined();
       return publicEntry(row);

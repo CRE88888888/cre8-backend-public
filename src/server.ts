@@ -26,6 +26,7 @@ import { createWaitlistService } from './waitlist.js';
 import { resolveOperatorWallets } from './waitlist-access.js';
 export { resolveOperatorWallets } from './waitlist-access.js';
 import { createWaitlistInviteService } from './waitlist-invites.js';
+import { waitlistOpenSignup } from './waitlist-gate.js';
 import { createWaitlistTaskService } from './waitlist-tasks.js';
 import { claimFaucetUsdt } from './faucet.js';
 import { claimFaucetGas } from './gas-faucet.js';
@@ -371,7 +372,7 @@ const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
   claimFaucetGas,
   sponsorUserOperation,
   privyLogin: loginWithPrivy,
-  waitlist: createWaitlistService(),
+  waitlist: createWaitlistService({ openSignup: waitlistOpenSignup }),
   waitlistInvites: createWaitlistInviteService(),
   waitlistTasks: createWaitlistTaskService(),
   auth: { authenticate, issueNonce, login, logout },

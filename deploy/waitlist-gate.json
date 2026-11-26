@@ -1,0 +1,4 @@
+{
+  "note": "Invite-code switch for Privy sign-in (src/waitlist-gate.ts). inviteRequired false (opened 2026-11-26 for ~2 days): a verified Privy login with an X or Google account is approved in `waitlist` on /auth/privy, /waitlist/join and /waitlist/me (approved_by 'open-signup', login_method/login_label recorded like an invite redemption); email-only and SIWE logins still need an invite, operator wallets unchanged, revoked entries stay revoked. To turn invites back on: set inviteRequired to true, merge, and redeploy the api service (the file is read once per process). Users approved while it was open stay approved; revoke them from /operator if needed. A missing or malformed file means inviteRequired true.",
+  "inviteRequired": false
+}

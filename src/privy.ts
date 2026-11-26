@@ -6,6 +6,8 @@ import type { PrivyConfig } from './config.js';
 import { query } from './db.js';
 import { requireWaitlistAccess } from './waitlist-access.js';
 import type { WaitlistAccess } from './waitlist-access.js';
+import { waitlistOpenSignup } from './waitlist-gate.js';
+import type { OpenSignup } from './waitlist-gate.js';
 import { AppError, UnauthorizedError, ValidationError } from './errors.js';
 
 /** Identity tokens contain linked accounts; plain access tokens cannot establish a new owner. */
@@ -42,6 +44,8 @@ type PrivyLoginOptions = {
   users?: PrivyUserRepository;
   issueSession?: typeof issueSession;
   access?: WaitlistAccess;
+  /** deploy/waitlist-gate.json open sign-up (X/Google auto-approval); defaults to none so tests keep the invite gate. */
+  openSignup?: OpenSignup;
   now?: () => number;
 };
 
@@ -114,6 +118,7 @@ export function createPrivyLogin(options: PrivyLoginOptions = {}): (body: unknow
       }
     }
     const [candidate] = wallets;
+    await (options.openSignup ?? (async () => {}))(userId, accounts);
     await access(owner ?? (wallets.size === 1 ? candidate ?? '' : ''), userId);
     if (owner === null) {
       if (wallets.size !== 1 || candidate === undefined) {
@@ -132,4 +137,4 @@ export function createPrivyLogin(options: PrivyLoginOptions = {}): (body: unknow
   };
 }
 
-export const loginWithPrivy = createPrivyLogin();
+export const loginWithPrivy = createPrivyLogin({ openSignup: waitlistOpenSignup });

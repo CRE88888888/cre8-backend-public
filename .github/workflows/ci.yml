@@ -78,6 +78,7 @@ jobs:
           test/strategy-earn-v2.test.ts
           test/strategy-earn-v2-chain.test.ts
           test/waitlist-tasks.test.ts
+          test/waitlist-gate.test.ts
           test/mix-http.test.ts
           test/model-returns.test.ts
           test/info-drafter.test.ts

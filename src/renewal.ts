@@ -17,7 +17,7 @@ import {
 } from './permissions.js';
 import type { SessionKeyMaterial, SessionPolicySnapshot } from './permissions.js';
 import { requireOwnedPortfolio } from './portfolios.js';
-import { TESTNET_97, testnetAssets } from './testnet-profile.js';
+import { TESTNET_97, TESTNET_97_SUPERSEDED, testnetAssets } from './testnet-profile.js';
 
 /**
  * Session key 續期的後端那一半。
@@ -223,7 +223,8 @@ export type RenewalParamsDeps = {
 const VERSION_ASSETS_SQL = `select allocation from strategy_versions where strategy_id = $1`;
 
 /** Chain 97: USDT, every asset of the portfolio's strategy versions, every other profile asset or Cash Earn receipt the
- * account holds — each one whose allowance to `executor` is zero. One multicall for balances, one for allowances. */
+ * account holds or had approved to a superseded executor (so the account ends up with what it had: one signature, not a
+ * second approval round at its next buy) — each one whose allowance to `executor` is zero. Three multicalls. */
 export async function chainExecutorApprovals(args: { chainId: number; account: Address; executor: Address; strategyId: number; publicClient: PublicClient },
   db: { query: typeof query } = { query }): Promise<RenewalParams['approvals']> {
   if (args.chainId !== 97) return [];
@@ -241,10 +242,14 @@ export async function chainExecutorApprovals(args: { chainId: number; account: A
   const balances = await args.publicClient.multicall({ allowFailure: false,
     contracts: holdable.map(token => ({ address: token, abi: erc20Abi, functionName: 'balanceOf' as const, args: [args.account] as const })) });
   const held = holdable.filter((_, i) => (balances[i] ?? 0n) > 0n);
+  const superseded = TESTNET_97_SUPERSEDED.executors.filter(e => e.toLowerCase() !== args.executor.toLowerCase());
+  const before = superseded.length === 0 ? [] : await args.publicClient.multicall({ allowFailure: false,
+    contracts: superseded.flatMap(old => holdable.map(token => ({ address: token, abi: erc20Abi, functionName: 'allowance' as const, args: [args.account, old] as const }))) });
+  const approvedBefore = holdable.filter((_, i) => superseded.some((_, j) => (before[j * holdable.length + i] ?? 0n) > 0n));
   const usdt = lower(TESTNET_97.contracts.usdt);
   const known = new Set(holdable);
   // Only tokens the paymaster may sponsor an approval of (profile assets and Cash Earn receipts).
-  const tokens = [...new Set([usdt, ...versionAssets, ...held])].filter(token => known.has(token));
+  const tokens = [...new Set([usdt, ...versionAssets, ...held, ...approvedBefore])].filter(token => known.has(token));
   const allowances = await args.publicClient.multicall({ allowFailure: false,
     contracts: tokens.map(token => ({ address: token, abi: erc20Abi, functionName: 'allowance' as const, args: [args.account, args.executor] as const })) });
   const data = encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [args.executor, maxUint256] });

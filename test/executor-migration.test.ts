@@ -40,7 +40,7 @@ test('#76 EXECUTOR_ADDRESS still set to the superseded executor resolves to the 
   assert.equal(loadSessionKeyConfig({ CHAIN_ID: '97', EXECUTOR_ADDRESS: OLD }).executorAddress?.toLowerCase(), NEW.toLowerCase());
 });
 
-test('#76 renewal approvals: USDT, the strategy assets and held tokens without an allowance to the executor, nothing else', async () => {
+test('#76 renewal approvals: USDT, the strategy assets, held tokens and what the old executor had, without an allowance to the new one, nothing else', async () => {
   const usdt = TESTNET_97.contracts.usdt.toLowerCase() as Address;
   const symbols = Object.keys(TESTNET_97.assets);
   const versionAsset = TESTNET_97.assets[symbols[0] as keyof typeof TESTNET_97.assets].token.toLowerCase() as Address;
@@ -48,16 +48,19 @@ test('#76 renewal approvals: USDT, the strategy assets and held tokens without a
   const heldAsset = TESTNET_97.assets[symbols[2] as keyof typeof TESTNET_97.assets].token.toLowerCase() as Address;
   const heldReceipt = TESTNET_97.yieldMarkets[0]!.receipt.toLowerCase() as Address;
   const stray = '0x000000000000000000000000000000000000beef' as Address;
+  const oldApproved = TESTNET_97.assets[symbols[3] as keyof typeof TESTNET_97.assets].token.toLowerCase() as Address;
   const multicall = async ({ contracts }: { contracts: { address: Address; functionName: string; args: readonly Address[] }[] }) =>
     contracts.map((c) => {
       const token = c.address.toLowerCase();
       if (c.functionName === 'balanceOf') return token === heldAsset || token === heldReceipt ? 5n : 0n;
+      // What the account had approved to the superseded executor comes back too.
+      if (c.args[1] === OLD) return token === oldApproved || token === approvedAsset ? maxUint256 : 0n;
       assert.equal(c.args[1], NEW);
       return token === approvedAsset ? maxUint256 : 0n;
     });
   const db = { query: (async () => ({ rows: [{ allocation: { assets: [{ address: versionAsset }, { address: approvedAsset }, { address: stray }] } }] })) as never };
   const approvals = await chainExecutorApprovals({ chainId: 97, account: ACCOUNT, executor: NEW, strategyId: 7, publicClient: { multicall } as unknown as PublicClient }, db);
-  assert.deepEqual(approvals.map((a) => a.to), [usdt, versionAsset, heldAsset, heldReceipt]);
+  assert.deepEqual(approvals.map((a) => a.to), [usdt, versionAsset, heldAsset, heldReceipt, oldApproved]);
   for (const a of approvals) {
     const call = decodeFunctionData({ abi: erc20Abi, data: a.data });
     assert.equal(call.functionName, 'approve');

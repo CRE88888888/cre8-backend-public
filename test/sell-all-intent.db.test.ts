@@ -5,7 +5,7 @@ import type { Address } from 'viem';
 import { detectSellAllOverdue, resetRoundOutcomes } from '../src/alerts.js';
 import { closePool, getPool, migrate, query } from '../src/db.js';
 import { claimDuePortfolios } from '../src/scheduler.js';
-import { singlePortfolioClaim } from '../src/operator.js';
+import { NOT_BEFORE_SQL, PARTIAL_SALE_HOLD_SECONDS, singlePortfolioClaim } from '../src/operator.js';
 import { FREE_CASH_SQL } from '../src/paymaster.js';
 import { sellAllCashHold } from '../src/sell-all-hold.js';
 import { CANCEL_SELL_ALL_SQL, NEW_MONEY_ENDS_SELL_ALL_SQL, SELL_ALL_KIND, SELL_ALL_OF_PORTFOLIO_SQL, requestSellAll, sellAllRetryAt, settleSellAll, sharesTakenBack, withdrawSellAll } from '../src/sell-all-intent.js';
@@ -175,6 +175,27 @@ test('sell all request (real Postgres): the call whose round did nothing takes i
   await withdrawSellAll(run, first.created); // an old id never reaches the open request
   assert.deepEqual(await requests(id), ['#1 failed', '#2 pending']);
   assert.equal((await claimed(id))?.sellAll, true);
+}));
+
+test('partial sale (real Postgres): after shares were taken back and not sold the scheduler stays away for the hold, then comes back by itself; the owner can still sell at once', { skip: !DB }, tidy(async () => {
+  await migrate();
+  const id = await portfolio();
+  // Due now (never run): the scheduler would claim it this very round — and post the freed shares again.
+  assert.ok(await claimed(id, 0));
+  await run(NOT_BEFORE_SQL, [id, PARTIAL_SALE_HOLD_SECONDS]);
+  assert.equal(await claimed(id, PARTIAL_SALE_HOLD_SECONDS - 30), undefined, 'not claimed while the caller may still come back');
+  assert.ok(await claimed(id, PARTIAL_SALE_HOLD_SECONDS + 30), 'afterwards the ordinary round runs again (and puts the position back)');
+  // No request row, no pause: nothing has to be cleaned up when the sale is abandoned.
+  assert.deepEqual([await requests(id), (await state(id)).schedule_state], [[], 'active']);
+  // The owner's own call does not wait for the hold: `/redeem` claims the one portfolio whatever its next round is.
+  const own = (await claimDuePortfolios(1, new Date(), { chainId: 97, advance: true, withTransaction: singlePortfolioClaim(id, undefined, { preserveNextRunAt: true }) })).map(due => due.portfolioId);
+  assert.deepEqual(own, [id]);
+  assert.equal(await claimed(id, PARTIAL_SALE_HOLD_SECONDS - 30), undefined, 'and leaves the hold as it was');
+  // A round that is already further away is never pulled closer; a later hold never shortens an earlier one.
+  await query("update portfolios set next_run_at = now() + interval '1 hour' where id = $1", [id]);
+  await run(NOT_BEFORE_SQL, [id, PARTIAL_SALE_HOLD_SECONDS]);
+  assert.equal(await claimed(id, 1800), undefined);
+  assert.ok(await claimed(id, 3700));
 }));
 
 test('sharesTakenBack: less posted of any asset than before the round means a repay-and-take-back landed', () => {

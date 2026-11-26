@@ -21,7 +21,7 @@ import { recoverCashSwaps, settleCashSwaps } from './strategy-cash-swaps.js';
 import { computeDrift } from './drift.js';
 import { runV2KeeperRound, v2AutoRound, v2QuietRound, v2RewardHolders, v2UnwindForSale } from './strategy-earn-v2-scheduler.js';
 import { SELL_ALL_OPEN_SQL, sellAllOver, sellAllRetryAt, settleSellAll } from './sell-all-intent.js';
-import type { V2Ledger, V2UnwindWait } from './strategy-earn-v2-scheduler.js';
+import type { UnwindFreed, V2Ledger, V2UnwindWait } from './strategy-earn-v2-scheduler.js';
 import { rewardsStore } from './strategy-rewards.js';
 import { consentSinceSellAll } from './strategy-earn-after-sell-all.js';
 import { dbStrategyEarnLedger, defaultStrategyEarnChain, runStrategyEarnRound, strategyEarnAutoOpen, strategyEarnUnwindForSale, strategyEarnV1Active, strategyKeeperWriter } from './strategy-earn.js';
@@ -134,7 +134,7 @@ import type { Address, Hex, PublicClient } from 'viem';
 import { hdKeyToAccount } from 'viem/accounts';
 import { createBundlerClient, entryPoint07Abi, formatUserOperation, formatUserOperationReceipt, getUserOperationHash } from 'viem/account-abstraction';
 import type { GetUserOperationReturnType, UserOperationReceipt } from 'viem/account-abstraction';
-import { rpcBatch, rpcTransport } from './rpc-transport.js';
+import { noteLandedBlock, rpcBatch, rpcTransport } from './rpc-transport.js';
 import { activeChain } from './chain-object.js';
 import { testnetAssets, TESTNET_97 } from './testnet-profile.js';
 import { signPreparedOperation } from './user-operation.js';
@@ -500,6 +500,12 @@ export type PortfolioRunResult = {
    * 判準是結果不是過程：`shrunk` 只是證據，**可以是空的**（缺口是被跳過而不是被縮小）。
    */
   partial: PlanPartial | null;
+  /**
+   * An owner's partial sale: this round repaid part of the Strategy Earn debt and took back the shares the sale was
+   * short of (landed on chain, `note` names the transactions), then went on to the sale in the same round. Set whatever
+   * became of the sale: a round that carries it and did not sell has still moved the account (src/operator.ts).
+   */
+  earnFreed?: { note: string; block: bigint };
 };
 
 /** DB 的 session key（只存派生路徑，私鑰不落 DB）＋ 鏈上要用的三個欄位。 */
@@ -621,7 +627,9 @@ export type SchedulerDeps = {
     /** A `V2UnwindWait` answer: some posted shares cannot be freed this round and the sale must not wait for them. */
     /** `spare`: asked again after such an answer when the sale found nothing free to sell either — take back the shares the
      * debt that is left does not need (routing v2 spareCollateral), so the next round has something to sell. */
-    unwind(due: DuePortfolio, steps: readonly PlannedStep[], dryRun: boolean, exit?: boolean, posted?: boolean, spare?: boolean): Promise<string | V2UnwindWait | null>;
+    /** `partial`: an owner's partial sale (never an exit) — repay and take back only what the sale is short of, and answer
+     * `UnwindFreed` once all of it landed: the sale is then sent in the same round (2026-11-26, testnet portfolio 55). */
+    unwind(due: DuePortfolio, steps: readonly PlannedStep[], dryRun: boolean, exit?: boolean, posted?: boolean, spare?: boolean, partial?: boolean): Promise<string | V2UnwindWait | UnwindFreed | null>;
   };
   /** The sale a cash raise sends (see planCashRaise). Default: one sale of the asset with the most free value, quoted like a redeem. */
   planCashRaise?: (input: RebalancePlanningInput, needUsdtRaw: bigint, at: { chainId: number; now: Date }) => Promise<RebalancePlan>;
@@ -1685,6 +1693,8 @@ async function sendRebalanceWithSessionKey(args: ExecuteArgs): Promise<Execution
     // Asked once a second: `createKernelAccountClient` sets that itself (measured on chain 97: 1.4–2.8 s until the receipt).
     const receipt = await client.waitForUserOperationReceipt({ hash: userOpHash, timeout: USER_OP_RECEIPT_TIMEOUT_MS });
     mark('send:receipt');
+    // The "after" snapshot, the reconciliation and the owner's next request must not read a block before this one.
+    noteLandedBlock(receipt.receipt.blockNumber);
     await settleGasBudget(budgetKey, receipt.success ? 'confirmed' : 'failed');
 
     // ---- ③ 三層判定（§8.16）：只驗 receipt.status 就是把「上鏈但什麼都沒換」記成成功 -----------------
@@ -1785,18 +1795,27 @@ function defaultStrategyEarnSteps(deps: ResolvedDeps): NonNullable<SchedulerDeps
         v2Round: async (touched, mayOpen) => v2AutoRound({ ...await v2Args(v2, due, dryRun, held), touched, mayOpen, ...(onCashNeed ? { onCashNeed } : {}),
           v1Active: async () => { const chain = defaultStrategyEarnChain(); return strategyEarnV1Active(chain, due.account, (await chain.head()).number); } }) });
     },
-    unwind: async (due, steps, dryRun, exit, posted = true, spare = false) => {
+    unwind: async (due, steps, dryRun, exit, posted = true, spare = false, partial = false) => {
       if (deps.chainId !== 97) return null;
       // Nothing posted (a full exit after the strategy was simply turned off): v1 has nothing to take back, so it is not read.
-      const v1 = posted ? await strategyEarnUnwindForSale({ ...await args(due, dryRun), steps, ...(exit ? { exit } : {}) }) : null;
+      const v1 = posted ? await strategyEarnUnwindForSale({ ...await args(due, dryRun), steps, ...(exit ? { exit } : {}), ...(partial ? { partial } : {}) }) : null;
       // Before a sale every account with something on v2 repays and takes its shares back, whoever its owner is.
       const scope = await v2Scope(due);
       const touched = scope === null ? null : scope.mayOpen ? await defaultV2Reader(scope.v2).touched(due.account) : await defaultV2Reader(scope.v2).touchedOutside(due.account);
       const second = scope === null || touched === null || !v2HasState(touched) ? null
-        : await v2UnwindForSale({ ...await v2Args(scope.v2, due, dryRun), touched, mayOpen: scope.mayOpen, steps, ...(exit ? { exit } : {}), ...(spare ? { spare } : {}) });
+        : await v2UnwindForSale({ ...await v2Args(scope.v2, due, dryRun), touched, mayOpen: scope.mayOpen, steps, ...(exit ? { exit } : {}), ...(spare ? { spare } : {}), ...(partial ? { partial } : {}) });
+      // An owner's partial sale whose shares are back (`UnwindFreed`): the sale goes ahead now, unless the other generation
+      // holds it back (then its note stands and the freed one is told with it: the next call sells).
+      const isFreed = (x: unknown): x is UnwindFreed => x !== null && typeof x === 'object' && 'freed' in x;
+      const freed = [v1, second].filter(isFreed);
+      if (freed.length > 0) {
+        const others = [v1, second].filter(x => x !== null && !isFreed(x));
+        if (others.length === 0) return { freed: freed.map(f => f.freed).join('；'), block: freed.reduce((max, f) => f.block > max ? f.block : max, 0n) };
+        return both([...freed.map(f => `${f.freed}；下一輪再賣`), ...others.map(x => typeof x === 'string' ? x : (x as V2UnwindWait).note)]);
+      }
       // A note from either generation holds the sale back, whatever the other says. Otherwise "sell what is free" stands
       // (one account is on v1 or on v2, never both; two such answers are simply joined).
-      const answers = [v1, second], waits = answers.filter((x): x is V2UnwindWait => x !== null && typeof x === 'object');
+      const answers = [v1, second] as (string | V2UnwindWait | null)[], waits = answers.filter((x): x is V2UnwindWait => x !== null && typeof x === 'object');
       if (waits.length === 0 || answers.some(x => typeof x === 'string')) return both(answers.map(x => x !== null && typeof x === 'object' ? x.note : x));
       return { note: waits.map(w => w.note).join('；'), stuck: waits.flatMap(w => w.stuck), needUsdtRaw: waits.reduce((sum, w) => sum + w.needUsdtRaw, 0n) };
     },
@@ -1864,6 +1883,8 @@ async function sendStrategyEarnWithSessionKey(accountAddress: Address, sessionKe
     await settleGasBudget(budgetKey, 'submitted');
     const receipt = await client.waitForUserOperationReceipt({ hash, timeout: USER_OP_RECEIPT_TIMEOUT_MS });
     await settleGasBudget(budgetKey, receipt.success ? 'confirmed' : 'failed');
+    // Whatever this process reads next must not be older than this transaction (src/rpc-transport.ts).
+    noteLandedBlock(receipt.receipt.blockNumber);
     if (receipt.receipt.status !== 'success' || receipt.success !== true) throw new Error(`strategy earn UserOp failed tx=${receipt.receipt.transactionHash}`);
     return { hash: receipt.receipt.transactionHash, blockNumber: receipt.receipt.blockNumber, logs: receipt.logs };
   } catch (error) {
@@ -2915,7 +2936,16 @@ async function decideAndMaybeExecute(
   if (due.personalMix && !ctx.dryRun && await ctx.deps.reconcileMix(due.portfolioId)) {
     return { ...base, outcome: 'noop', reason: '組合變更已對帳，下輪使用最新組合處理交易。' };
   }
-  let plan = await ctx.deps.planPortfolio(due.portfolioId);
+  let plan: PortfolioPlan;
+  try { plan = await ctx.deps.planPortfolio(due.portfolioId); }
+  catch (error) {
+    // The account could not be read (2026-11-26, portfolio 55: the yield read timed out behind a rate-limited node).
+    // Nothing is in flight here (unresolved operations were looked at above) and nothing was planned or sent, so the
+    // answer does not say "reconcile first" — the app read that as "an earlier trade is still being confirmed".
+    if (due.executionKind === undefined || isBuyVersionError(error)) throw error;
+    ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} 拋錯：${errorChain(error)}`);
+    return { ...base, outcome: 'blocked', reason: '[STRATEGY_UNAVAILABLE] 帳戶的鏈上資料這一輪沒讀完，沒有規劃也沒有送出，下一輪重讀' };
+  }
 
   // Legacy drift portfolios mirror the effective target version for display.
   // Typed funding lots keep their immutable source/version identities: a changed active
@@ -3102,11 +3132,21 @@ async function decideAndMaybeExecute(
   // of an account whose strategy was simply turned off earlier still have to reach the owner's wallet.
   const sharesPosted = (plan.snapshot.strategyEarnCollateral?.length ?? 0) > 0, exitSale = (rebalance.purpose ?? 'ordinary') === 'exit';
   if (sharesPosted || exitSale && ctx.deps.chainId === 97) {
-    let pending: string | V2UnwindWait | null;
+    let pending: string | V2UnwindWait | UnwindFreed | null;
     const unwinding = performance.now();
-    try { pending = await strategyEarnSteps(ctx.deps).unwind(due, rebalance.steps, ctx.dryRun, exitSale, sharesPosted).finally(() => notePhase('strategyEarnUnwind', unwinding)); }
+    // An owner's partial sale repays and takes back only what it is short of, and is sent in this same round.
+    const ownerPartial = rebalance.ownerSale === true && !exitSale && !ctx.dryRun;
+    try { pending = await strategyEarnSteps(ctx.deps).unwind(due, rebalance.steps, ctx.dryRun, exitSale, sharesPosted, false, ownerPartial).finally(() => notePhase('strategyEarnUnwind', unwinding)); }
     catch (error) { return { ...base, outcome: 'blocked', reason: `[STRATEGY_EARN_UNWIND_FAILED] 賣出前還款取回未完成，下一輪重試：${oneLine(error)}` }; }
-    if (pending !== null && typeof pending === 'object') {
+    if (pending !== null && typeof pending === 'object' && 'freed' in pending) {
+      // The shares are back in the account; the steps were planned from holdings that counted them, so they stand. Every
+      // read from here on (floors, balance, allowance, nonce, simulation) must see the block the take-back landed in.
+      if (!ownerPartial) return { ...base, outcome: 'blocked', reason: `${pending.freed}；下一輪再賣` };
+      noteLandedBlock(pending.block);
+      // Set on the caller's own object: a throw further down (runOne's catch) still reports that the account moved.
+      base.earnFreed = { note: pending.freed, block: pending.block };
+      ctx.deps.log(`[scheduler] portfolio ${due.portfolioId} ${pending.freed}；同一輪接著賣出`);
+    } else if (pending !== null && typeof pending === 'object') {
       // Routing v2: some posted shares cannot be freed this round (the box is used up and the top-up has no USDT, or has
       // to wait for its 24-hour window or the pool's peg). The sale is what brings the USDT in, so it is not held back:
       // - a full exit sells what the account holds free now; a later round frees and sells the rest;
@@ -3122,7 +3162,7 @@ async function decideAndMaybeExecute(
         // USDT had been withdrawn). Ask once more for the shares the debt that is left does not need; the next round sells
         // them and their USDT pays the rest. Nothing to spare -> the wait stands.
         if (ctx.dryRun) return { ...base, outcome: 'blocked', reason: wait.note };
-        let spared: string | V2UnwindWait | null;
+        let spared: string | V2UnwindWait | UnwindFreed | null;
         try { spared = await strategyEarnSteps(ctx.deps).unwind(due, rebalance.steps, ctx.dryRun, exitSale, sharesPosted, true); }
         catch (error) { return { ...base, outcome: 'blocked', reason: `[STRATEGY_EARN_UNWIND_FAILED] 賣出前還款取回未完成，下一輪重試：${oneLine(error)}` }; }
         return { ...base, outcome: 'blocked', reason: typeof spared === 'string' ? spared : wait.note };

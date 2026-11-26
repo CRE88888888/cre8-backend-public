@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { createPublicClient } from 'viem';
-import { ADDRESSLESS_LOGS_SKIP_MS, isNodeGap, isProviderFailure, PUBLIC_RPCS_97, publicRpcs, resetRpcTransport, rpcTransport, RPC_BREAKER_MS, secondaryRpc } from '../src/rpc-transport.js';
+import { ADDRESSLESS_LOGS_SKIP_MS, HEAD_CACHE_MS, isNodeGap, isProviderFailure, LANDED_FLOOR_MS, LANDED_WAIT_MS, landedFloor, noteLandedBlock, PUBLIC_RPCS_97, publicRpcs, resetRpcTransport, rpcTransport, RPC_BREAKER_MS, secondaryRpc } from '../src/rpc-transport.js';
 
 /** Two local JSON-RPC nodes: `limit` answers like the 2026-11-23 provider ("Request exceeds defined limit"). */
 type Mode = 'ok' | 'limit' | 'revert' | 'http429' | 'http403' | 'http502' | 'html' | 'hang' | 'gap' | 'needsAddress';
@@ -224,4 +224,118 @@ test('a node without the requested state passes the read on but keeps its place;
   assert.deepEqual(publicRpcs(`${PUBLIC_RPCS_97[1]}/`, 97), PUBLIC_RPCS_97.filter((_, index) => index !== 1));
   assert.equal(PUBLIC_RPCS_97.length, 4); assert.equal(new Set(PUBLIC_RPCS_97).size, 4);
   for (const url of PUBLIC_RPCS_97) { const parsed = new URL(url); assert.equal(parsed.protocol, 'https:'); assert.equal(parsed.pathname, '/'); assert.equal(parsed.search, ''); assert.equal(parsed.username, ''); }
+});
+
+/**
+ * A node with a head that moves and state that depends on the block asked for: the balance is 5 before block `landedAt`
+ * and 9 from it on (a transaction of ours landed there). `serves`: the head of the server that answers state reads — a
+ * load-balanced provider whose other server is still behind says "header not found" for a block it has not seen.
+ */
+async function chainNode(state: { head: bigint; serves?: bigint }, landedAt: bigint) {
+  const calls: { method: string; tag: unknown }[] = [];
+  const server = createServer((req, res) => {
+    let raw = '';
+    req.on('data', (chunk) => { raw += String(chunk); });
+    req.on('end', () => {
+      const body = JSON.parse(raw) as { id: number; method: string; params?: unknown[] };
+      const at = body.method === 'eth_getBlockByNumber' ? 0 : 1, tag = body.params?.[at];
+      calls.push({ method: body.method, tag });
+      const send = (payload: object) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ jsonrpc: '2.0', id: body.id, ...payload })); };
+      if (body.method === 'eth_blockNumber') return send({ result: `0x${state.head.toString(16)}` });
+      const serving = state.serves ?? state.head;
+      const block = tag === 'latest' || tag === undefined ? serving : BigInt(tag as string);
+      // A block the answering server has not seen: null for a block read (as geth answers), an error for state.
+      if (block > serving) return send(body.method === 'eth_getBlockByNumber' ? { result: null } : { error: { code: -32000, message: 'header not found' } });
+      if (body.method === 'eth_getBalance') return send({ result: block >= landedAt ? '0x9' : '0x5' });
+      if (body.method === 'eth_getBlockByNumber') return send({ result: { number: `0x${block.toString(16)}`, hash: `0x${'ab'.repeat(32)}`, timestamp: '0x1', transactions: [] } });
+      send({ result: '0x' });
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, calls, stop: () => { server.closeAllConnections(); server.close(); } };
+}
+
+test('2026-11-26 read your own writes: after a transaction of ours lands, head and `latest` reads are only answered by a node that has reached its block', async () => {
+  resetRpcTransport();
+  const account = '0x00000000000000000000000000000000000000a1';
+  // The first node in the order is 3 blocks behind the block our take-back landed in (120); the second has it.
+  const behind = { head: 117n }, ahead = { head: 121n }, paidHead = { head: 121n };
+  let t = 1_000_000;
+  const sleeps: number[] = [];
+  const paid = await chainNode(paidHead, 120n), a = await chainNode(behind, 120n), b = await chainNode(ahead, 120n);
+  try {
+    const client = createPublicClient({ transport: rpcTransport('scheduler', paid.url, {}, { secondary: [a.url, b.url], preferPublic: true, schedulerRole: true, now: () => t,
+      sleep: async (ms) => { sleeps.push(ms); t += ms; behind.head += 1n; } }) });
+    // Before anything landed: the first node answers, old state and all — nothing changes for ordinary reads.
+    assert.equal(await client.getBalance({ address: account }), 5n);
+    assert.deepEqual([a.calls.map(c => c.method), b.calls.length], [['eth_getBalance'], 0]);
+    assert.equal(landedFloor(t), null);
+    // Our transaction landed in block 120.
+    noteLandedBlock(120n, t);
+    assert.equal(landedFloor(t), 120n);
+    a.calls.length = 0;
+    // `latest` state: the lagging node is asked for its head and skipped; the next one answers, pinned to its own head.
+    assert.equal(await client.getBalance({ address: account }), 9n, 'never the balance from before our transaction');
+    assert.deepEqual(a.calls, [{ method: 'eth_blockNumber', tag: undefined }]);
+    assert.deepEqual(b.calls, [{ method: 'eth_blockNumber', tag: undefined }, { method: 'eth_getBalance', tag: '0x79' }]);
+    // The head itself and the latest block: from a node at or past 120 as well (a plan pinned to them sees the transaction).
+    t += HEAD_CACHE_MS;
+    assert.equal(await client.getBlockNumber({ cacheTime: 0 }), 121n);
+    assert.equal((await client.getBlock()).number, 121n);
+    assert.equal(b.calls.filter(c => c.method === 'eth_getBlockByNumber')[0]!.tag, '0x79');
+    // A read at an explicit block is the caller's own choice and is left alone (no head lookup, the first node answers).
+    a.calls.length = 0; b.calls.length = 0;
+    assert.equal(await client.getBalance({ address: account, blockNumber: 110n }), 5n);
+    assert.deepEqual([a.calls, b.calls.length], [[{ method: 'eth_getBalance', tag: '0x6e' }], 0]);
+    // The lagging node is not demoted: once it has caught up it answers in its normal place again.
+    behind.head = 122n; t += HEAD_CACHE_MS; a.calls.length = 0; b.calls.length = 0;
+    assert.equal(await client.getBalance({ address: account }), 9n);
+    assert.deepEqual([a.calls.map(c => c.method), a.calls[1]!.tag, b.calls.length], [['eth_blockNumber', 'eth_getBalance'], '0x7a', 0]);
+    // A minute later nothing is enforced any more.
+    t += LANDED_FLOOR_MS; a.calls.length = 0;
+    assert.equal(landedFloor(t), null);
+    await client.getBalance({ address: account });
+    assert.deepEqual(a.calls, [{ method: 'eth_getBalance', tag: 'latest' }]);
+
+    // Every node is behind (the block landed at 130; the nodes are at 122 and 121): the read waits for one to get there.
+    noteLandedBlock(130n, t); noteLandedBlock(125n, t);
+    assert.equal(landedFloor(t), 130n, 'a lower block noted later never lowers the floor');
+    ahead.head = 121n; paidHead.head = 100n; sleeps.length = 0;
+    assert.equal(await client.getBalance({ address: account }), 9n);
+    assert.equal(behind.head, 130n);
+    assert.ok(sleeps.length === 8 && sleeps.every(ms => ms === 250), JSON.stringify(sleeps));
+    // No node gets there within the wait: the read fails as a node gap. It never answers with older state.
+    noteLandedBlock(10_000n, t);
+    await assert.rejects(client.getBalance({ address: account }), (error: unknown) => isNodeGap(error) && /no RPC node has reached block 10000/.test(String((error as { details?: string }).details ?? '') + String(error)));
+    assert.ok(sleeps.reduce((sum, ms) => sum + ms, 0) >= LANDED_WAIT_MS);
+    // Nonsense is ignored.
+    resetRpcTransport();
+    for (const bad of [null, undefined, 0n, -5, 'not a number']) noteLandedBlock(bad as never, t);
+    assert.equal(landedFloor(t), null);
+    noteLandedBlock('0x7b', t);
+    assert.equal(landedFloor(t), 123n);
+  } finally { paid.stop(); a.stop(); b.stop(); resetRpcTransport(); }
+});
+
+test('2026-11-26 read your own writes on a load-balanced provider: its head says it is there, the server answering the read is not — the next node answers', async () => {
+  resetRpcTransport();
+  const account = '0x00000000000000000000000000000000000000a1';
+  // RPC_URL first (an API source): its head is 121 but state reads are served by a server still at 118.
+  const balanced = { head: 121n, serves: 118n }, other = { head: 120n };
+  let t = 2_000_000;
+  const p = await chainNode(balanced, 120n), s = await chainNode(other, 120n);
+  try {
+    const client = createPublicClient({ transport: rpcTransport('paymaster', p.url, {}, { secondary: s.url, preferPublic: false, now: () => t, sleep: async (ms) => { t += ms; } }) });
+    noteLandedBlock(120n, t);
+    assert.equal(await client.getBalance({ address: account }), 9n);
+    assert.deepEqual(p.calls, [{ method: 'eth_blockNumber', tag: undefined }, { method: 'eth_getBalance', tag: '0x79' }], 'asked at its own head: the lagging server cannot answer with old state');
+    assert.deepEqual(s.calls, [{ method: 'eth_blockNumber', tag: undefined }, { method: 'eth_getBalance', tag: '0x78' }]);
+    // The latest block from that provider: its lagging server answers null for the pinned number — the next node answers.
+    p.calls.length = 0; s.calls.length = 0;
+    assert.equal((await client.getBlock()).number, 120n);
+    assert.deepEqual([p.calls.at(-1), s.calls.at(-1)], [{ method: 'eth_getBlockByNumber', tag: '0x79' }, { method: 'eth_getBlockByNumber', tag: '0x78' }]);
+    // Unpinned, the same provider would have answered 5 (the state from before our transaction).
+    t += LANDED_FLOOR_MS;
+    assert.equal(await client.getBalance({ address: account }), 5n);
+  } finally { p.stop(); s.stop(); resetRpcTransport(); }
 });

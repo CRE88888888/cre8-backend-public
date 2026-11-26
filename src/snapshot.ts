@@ -394,7 +394,9 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
   // 一次觀測 = 一個塊。塊高在這裡先定下來，之後 registry 的 enrollment/version、持倉餘額、池子的
   // slot0/observe 全部釘在這個塊上。少釘任何一個，「同一份觀測」就不成立：餘額是 block N、價格是
   // head，同一塊重跑得到不同價格——一個看起來正常、其實每次都不一樣的漂移數字。
-  const block = deps.block ?? (await client.getBlockNumber());
+  // `cacheTime: 0`: viem keeps a client's last head for 4 s (bscTestnet carries no block time), and the scheduler's client
+  // lives as long as the process — a plan made right after our own transaction landed was pinned to a block before it.
+  const block = deps.block ?? (await client.getBlockNumber({ cacheTime: 0 }));
 
   const { strategyId, onchainStrategyId, account, personalMix, owner } = await loadPortfolioContext(query, portfolioId, chainId);
   const mixBlockHash = personalMix ? (await client.getBlock({ blockNumber: block })).hash : null;

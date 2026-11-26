@@ -9,7 +9,7 @@ import type { Decision, PricedRoute, RouteKey } from '../src/strategy-earn-routi
 import { boxRewardSignature, maxDebtFor, planExecution, routeIdOf, routeIds, strategyEarnV2, V2_EVENTS_ABI, V2_EXECUTOR_ABI, V2_INTERFACE_VERSION, V2_REGISTRY_ABI, V2_SESSION_SELECTORS,
   routeMessage, runV2Account, v2Authorized, v2RouteEvents, v2Calls, v2ConsentCalls, v2ExitCalls, v2RateReport, v2SessionPermissions, vaultIdOf } from '../src/strategy-earn-v2.js';
 import type { Call, PositionState, PreSellPosition, StrategyEarnV2, V2Holding } from '../src/strategy-earn-v2.js';
-import { isRootSignedNonce, spareCollateral, strandedSmallPosition, strategyEarnV2For, v2Audience, v2MayOpen, v2NewOpensPaused, withoutNewRisk, v2Batches, v2ExitBatches, v2InternalAddresses, v2KeeperCall, v2PreSellPlan, v2ReconsentCalls, v2RescueCall, v2SponsoredCall, V2_LENS_ABI } from '../src/strategy-earn-v2.js';
+import { isRootSignedNonce, proportionalRepayment, spareCollateral, strandedSmallPosition, strategyEarnV2For, v2Audience, v2MayOpen, v2NewOpensPaused, withoutNewRisk, v2Batches, v2ExitBatches, v2InternalAddresses, v2KeeperCall, v2PreSellPlan, v2ReconsentCalls, v2RescueCall, v2SponsoredCall, V2_LENS_ABI } from '../src/strategy-earn-v2.js';
 import { V2_CASH_OUT_MIN_RAW, V2_SWAPPER_ABI, V2_SWAPPER_SELECTORS, cashOutMinUsdt, partialRepayment, planTopUp, settleBudget, settleRepayment, swapEventLine, swapperErrorOf, topUpMaxUsdtIn, v2ExitPlan, v2InstalledScope,
   v2MissingSwapperApprovals, v2SwapEvents, v2SwapperApprovalCalls } from '../src/strategy-earn-v2.js';
 import type { SwapQuote } from '../src/strategy-earn-v2.js';
@@ -241,6 +241,45 @@ test('planner: Lista never leaves a loan under the venue minimum — a partial r
   assert.deepEqual(repay(14)[2], maxUint256); // would leave 14 < 15
   assert.equal(repay(14, venusUsdt)[2], 86n * E); // Venus has no such minimum
   assert.equal(plan([decision('QQQB', 'reduce', 'negative_carry', listaUsdc, listaUsdc, 200)], [state('QQQB', QQQ, { routeDebtRaw: 100n * E })]).steps[0]!.skipped, 'already at or under the target');
+});
+
+test('2026-11-26 portfolio 55, pre-sell of an owner\'s partial sale: only the shares the sale is short of come back with their share of the debt; the position stays open', () => {
+  const b = routeIds(V2, QQQ, listaUsdc), n = routeIds(V2, NVDA, venusUsdt);
+  const pos = (o: Partial<PreSellPosition>): PreSellPosition => ({ symbol: 'QQQB', collateral: QQQ, freeCollateralRaw: 0n, postedRaw: 10n * E, routeDebtRaw: 1000n * E, vaultAssetsRaw: 1005n * E,
+    routeId: b.routeId, vaultId: b.vaultId, venue: 'lista', loan: 'USDC', ...o });
+  const reduce = (c: { data: Hex }) => (decode(c.data).args as readonly unknown[]).slice(3, 6);
+  // Everything posted, the sale takes 4 of the 10 shares: repay 40% of the debt, 2% more, and take back exactly 4.
+  const pay = (1000n * E * 4n * E * 10_000n + 10n * E * 9_800n - 1n) / (10n * E * 9_800n);
+  let p = v2PreSellPlan(V2, account, [pos({ needRaw: 4n * E })], DEADLINE, undefined, { partial: true });
+  assert.deepEqual([p.calls.length, reduce(p.calls[0]!), p.short, p.stuck], [1, [pay, 4n * E, 0n], undefined, []]);
+  assert.ok(pay > 400n * E && pay < 409n * E, 'a little over the pro-rata 400: the ratio never rises');
+  // What is left is healthier, never worse: debt ÷ posted after <= before.
+  assert.ok((1000n * E - pay) * 10n * E <= 1000n * E * 6n * E);
+  assert.match(p.notes[0]!, /^QQQB repay \d+ of \d+ USDC, take back 4000000000000000000 of 10000000000000000000; the position stays open$/);
+  // Some shares are free already: only the rest comes back.
+  p = v2PreSellPlan(V2, account, [pos({ freeCollateralRaw: 3n * E, postedRaw: 7n * E, needRaw: 4n * E })], DEADLINE, undefined, { partial: true });
+  assert.deepEqual(reduce(p.calls[0]!).slice(1), [1n * E, 0n]);
+  // The same position without `partial` (a full exit, or the callers from before): closed whole, as it always was.
+  assert.deepEqual(reduce(v2PreSellPlan(V2, account, [pos({ needRaw: 4n * E })], DEADLINE).calls[0]!), [maxUint256, maxUint256, 0n]);
+  // The sale needs every posted share, or the rest would owe less than the venue's minimum: close.
+  assert.deepEqual(reduce(v2PreSellPlan(V2, account, [pos({ needRaw: 10n * E })], DEADLINE, undefined, { partial: true }).calls[0]!), [maxUint256, maxUint256, 0n]);
+  assert.deepEqual(reduce(v2PreSellPlan(V2, account, [pos({ needRaw: 4n * E, minDebtRaw: 600n * E })], DEADLINE, undefined, { partial: true }).calls[0]!), [maxUint256, maxUint256, 0n]);
+  // The box cannot pay even that share (and holds no USDT to top up with): the old "short" plan — less comes back than the
+  // sale needs, and the plan says so (`short`): that sale waits for the next round.
+  p = v2PreSellPlan(V2, account, [pos({ needRaw: 4n * E, vaultAssetsRaw: 100n * E })], DEADLINE, undefined, { partial: true });
+  assert.deepEqual([reduce(p.calls[0]!)[0], p.short], [100n * E - 1n, true]);
+  // Two assets of one sale borrowing the same token share the box: the second partial sees what the first used.
+  p = v2PreSellPlan(V2, account, [pos({ needRaw: 4n * E, vaultAssetsRaw: 700n * E }), pos({ symbol: 'NVDAB', collateral: NVDA, needRaw: 4n * E, vaultAssetsRaw: 700n * E })], DEADLINE, undefined, { partial: true });
+  assert.deepEqual([reduce(p.calls[0]!)[0], reduce(p.calls[1]!)[0], p.short], [pay, 700n * E - pay - 1n, true]);
+  // Venus (no venue minimum, one shared debt): the same rule on the route's own debt.
+  p = v2PreSellPlan(V2, account, [pos({ symbol: 'NVDAB', collateral: NVDA, routeId: n.routeId, vaultId: n.vaultId, venue: 'venus', loan: 'USDT', needRaw: 1n * E })], DEADLINE, undefined, { partial: true });
+  assert.deepEqual(reduce(p.calls[0]!).slice(1), [1n * E, 0n]);
+  // proportionalRepayment on its own: nothing to do without debt, shares or a need; the whole position -> null (close).
+  assert.equal(proportionalRepayment({ debtRaw: 0n, postedRaw: 10n, takeRaw: 4n, floorRaw: 0n }), null);
+  assert.equal(proportionalRepayment({ debtRaw: 100n, postedRaw: 10n, takeRaw: 0n, floorRaw: 0n }), null);
+  assert.equal(proportionalRepayment({ debtRaw: 100n, postedRaw: 10n, takeRaw: 10n, floorRaw: 0n }), null);
+  assert.deepEqual(proportionalRepayment({ debtRaw: 9_800n, postedRaw: 100n, takeRaw: 50n, floorRaw: 0n }), { payRaw: 5_000n, takeRaw: 50n });
+  assert.equal(proportionalRepayment({ debtRaw: 9_800n, postedRaw: 100n, takeRaw: 99n, floorRaw: 0n }), null, 'the 2% on top would make it the whole debt');
 });
 
 test('exit and pre-sell: Venus routes close one after another, leftovers are released, rewards swept, consent withdrawn last', () => {

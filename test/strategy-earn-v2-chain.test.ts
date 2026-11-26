@@ -279,6 +279,50 @@ test('My mix weight change adds an asset whose only route is on the other venue:
   assert.deepEqual((await api.reconsent(W.account, W.owner, { assets: added, totalValueUsd: 2_000n * E18 })).map(c => c.to), [W.v2.registry, W.QQQ, W.NVDA]);
 });
 
+test('2026-11-26 portfolio 55: before an owner\'s partial sale only the shares it is short of are repaid for and taken back, and the step says the sale can go on now', async () => {
+  const w = world(), reader = createV2Reader(w.readerDeps);
+  openVenus(w); // 10 NVDAB posted, none free, 441 USDT owed, 442 in the vault
+  const sent: Call[][] = [], led = ledger();
+  const args = <T extends object>(o: T) => ({ v2: W.v2, reader, account: W.account, portfolioId: 55, now: NOW, dryRun: false, ledger: led.l, log: () => {},
+    send: async (calls: Call[]) => { sent.push(calls); return { ...tx(sent.length), blockNumber: 144_893_940n + BigInt(sent.length) }; }, steps: [{ tokenIn: W.NVDA, amountIn: 4n * E18 }], ...o });
+  // Partial: one executeReduce for 4 of the 10 shares and their share of the debt (2% more), never the whole position.
+  const freed = await v2UnwindForSale(args({ partial: true }));
+  const pay = (441n * E18 * 4n * E18 * 10_000n + 10n * E18 * 9_800n - 1n) / (10n * E18 * 9_800n);
+  assert.deepEqual([sent.length, sent[0]!.map(fn), argsOf(sent[0]![0]!).slice(3, 5)], [1, ['executeReduce'], [pay, 4n * E18]]);
+  assert.ok(freed !== null && typeof freed === 'object' && 'freed' in freed, String(freed));
+  assert.equal(freed.block, 144_893_941n, 'the block the take-back landed in: the sale must not read anything older');
+  assert.match(freed.freed, /^\[STRATEGY_EARN_UNWINDING\] 賣出前已還款取回：NVDAB repay \d+ of 441000000000000000000 USDT, take back 4000000000000000000 of 10000000000000000000; the position stays open tx=0x0+1$/);
+  // The same sale as it was before (and as a full exit still is): the whole position is closed and the sale waits a round.
+  sent.length = 0;
+  const whole = await v2UnwindForSale(args({}));
+  assert.deepEqual([argsOf(sent[0]![0]!).slice(3, 5), typeof whole], [[maxUint256, maxUint256], 'string']);
+  assert.match(String(whole), /；下一輪再賣$/);
+  sent.length = 0;
+  assert.match(String(await v2UnwindForSale(args({ partial: true, exit: true }))), /；下一輪再賣$/, '`partial` never applies to a full exit');
+  assert.deepEqual(argsOf(sent[0]![0]!).slice(3, 5), [maxUint256, maxUint256]);
+  // The box cannot pay that share: the old "short" repayment goes out, fewer shares come back than the sale needs, so the
+  // answer is the old one — the sale waits for the next round.
+  sent.length = 0;
+  w.state.holdings.set(w.ids.aaveUsdt, { assets: 50n * E18, since: 1_795_000_000 });
+  const short = await v2UnwindForSale(args({ partial: true }));
+  assert.deepEqual([sent.length, typeof short], [1, 'string']);
+  assert.match(String(short), /short of USDT.*；下一輪再賣$/);
+  // The venue (or the bundler's simulation) refuses the partial repayment and nothing landed: the same call falls back to
+  // what every sale did before — the whole position repaid and taken back — and the sale waits for the next round.
+  sent.length = 0;
+  w.state.holdings.set(w.ids.aaveUsdt, { assets: 442n * E18, since: 1_795_000_000 });
+  const lines: string[] = [];
+  const refused = await v2UnwindForSale(args({ partial: true, log: (l: string) => lines.push(l),
+    send: async (calls: Call[]) => { sent.push(calls); if (argsOf(calls[0]!)[3] !== maxUint256) throw new Error('UserOperation reverted during simulation with reason: BudgetExceeded()'); return tx(sent.length); } }));
+  assert.deepEqual([sent.length, argsOf(sent[1]![0]!).slice(3, 5), typeof refused], [2, [maxUint256, maxUint256], 'string']);
+  assert.match(String(refused), /；下一輪再賣$/);
+  assert.ok(lines.some(l => /部分還款取回沒送出（UserOperation reverted during simulation with reason: BudgetExceeded\(\)），這次賣出改走整個部位還款取回/.test(l)));
+  // Enough free shares for the sale: nothing to do, nothing sent.
+  sent.length = 0;
+  w.setBalance(W.NVDA, W.account, 4n * E18);
+  assert.deepEqual([await v2UnwindForSale(args({ partial: true })), sent.length], [null, 0]);
+});
+
 test('turn off keeps the reward recipient on the withdrawn consent; a later full exit with no route and no vault left still sends the reward tokens to the owner', async () => {
   const w = world(), reader = createV2Reader(w.readerDeps);
   const api = createStrategyEarnV2Api({ v2: W.v2, reader, now: () => NOW });

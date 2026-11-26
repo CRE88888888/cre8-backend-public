@@ -327,6 +327,51 @@ test('#204 unwind before a sale (Lista, its own debt): repay first then take sha
   assert.ok(all.length > 0 && all.every(c => c.to === S.executor));
 });
 
+test('2026-11-26 (v1): before an owner\'s partial sale only the shares it is short of are repaid for and taken back; the position stays open and the sale goes on in the same round', async () => {
+  // 10 QQQB posted, none free, 300 USDT owed against 1,000 USD of collateral, 301 in the vault. The sale takes 4 shares.
+  const f: Fake = { ids: [qqq.marketId], collateral: { [qqq.marketId]: 10n * E18 }, balances: {}, prices: { [qqq.collateral]: 100n * 10n ** 8n, [T.contracts.usdt]: 10n ** 8n },
+    statuses: { [qqq.marketId]: status({ debt: 300n * E18, vaultAssets: 301n * E18, health: { collateralValue: 1000n * E18, liquidationValue: 0n, debtValue: 300n * E18, healthFactor: 0n } }) } };
+  const steps = [{ tokenIn: qqq.collateral, amountIn: 4n * E18 }];
+  const run = async (fake: Fake, o: { partial?: boolean; exit?: boolean } = { partial: true }) => {
+    let sent: { to: Address; data: Hex }[] = [];
+    const answer = await strategyEarnUnwindForSale({ ...stepArgs(fake, async calls => { sent = calls; return { ...tx([]), blockNumber: 144_893_940n }; }).args, steps, ...o });
+    return { answer, calls: sent.map(c => [decode(c.data).functionName, decode(c.data).args]) };
+  };
+  const deadline = BigInt(Math.floor(now.getTime() / 1000) + 30 * 60);
+  // 40% of the shares -> 40% of the debt, 2% more (122.45 of 300), and exactly the 4 shares: debt ÷ posted never rises.
+  const pay = (300n * E18 * 4n * E18 * 10_000n + 10n * E18 * 9_800n - 1n) / (10n * E18 * 9_800n);
+  const part = await run(f);
+  assert.deepEqual(part.calls, [['executeRepay', [account, qqq.marketId, pay, true, deadline]], ['executeWithdrawCollateral', [account, qqq.marketId, 4n * E18, deadline]]]);
+  assert.ok((300n * E18 - pay) * 10n <= 300n * E18 * 6n);
+  assert.ok(part.answer !== null && typeof part.answer === 'object' && 'freed' in part.answer, String(part.answer));
+  assert.equal(part.answer.block, 144_893_940n);
+  assert.match(part.answer.freed, /^\[STRATEGY_EARN_UNWINDING\] 賣出前已還款取回：QQQB 先還 122\.44 USDT、取回 4，部位續開 tx=0x(AB){32}$/);
+  // As before for everyone else: without `partial` (and for a full exit) the position is closed and the sale waits a round.
+  for (const o of [{}, { partial: true, exit: true }]) {
+    const whole = await run(f, o);
+    assert.deepEqual(whole.calls.map(c => [c[0], (c[1] as readonly unknown[])[2]]), [['executeRepay', maxUint256], ['executeWithdrawCollateral', maxUint256]]);
+    assert.match(String(whole.answer), /先還清再取回 tx=.*；下一輪再賣$/);
+  }
+  // A whole close that a partial sale needs (it takes every posted share) also lets the sale go on at once.
+  const all = await strategyEarnUnwindForSale({ ...stepArgs(f, async () => ({ ...tx([]), blockNumber: 7n })).args, steps: [{ tokenIn: qqq.collateral, amountIn: 10n * E18 }], partial: true });
+  assert.deepEqual(all !== null && typeof all === 'object' && 'freed' in all ? all.block : null, 7n);
+  // What would be left owes less than our own floor (1 USD): close instead of leaving dust debt.
+  const tiny = { ...f, statuses: { [qqq.marketId]: status({ debt: 15n * E16 * 10n, vaultAssets: 2n * E18, health: { collateralValue: 1000n * E18, liquidationValue: 0n, debtValue: 15n * E16 * 10n, healthFactor: 0n } }) } };
+  assert.deepEqual((await run(tiny)).calls.map(c => (c[1] as readonly unknown[])[2]), [maxUint256, maxUint256]);
+  // The vault cannot pay even that share: the old "vault 不足" plan, fewer shares than the sale needs — it waits a round.
+  const short = { ...f, statuses: { [qqq.marketId]: status({ debt: 300n * E18, vaultAssets: 50n * E18, health: { collateralValue: 1000n * E18, liquidationValue: 0n, debtValue: 300n * E18, healthFactor: 0n } }) } };
+  const waits = await run(short);
+  assert.equal(typeof waits.answer, 'string');
+  assert.match(String(waits.answer), /vault 不足.*；下一輪再賣$/);
+  // The venue (or the bundler's simulation) refuses the partial repayment and nothing landed: the same call falls back to
+  // the whole close, as every sale did before; that sale waits for the next round.
+  const batches: unknown[][] = [];
+  const refused = await strategyEarnUnwindForSale({ ...stepArgs(f, async calls => { batches.push(calls.map(c => (decode(c.data).args as readonly unknown[])[2]));
+    if (batches.length === 1) throw new Error('UserOperation reverted during simulation'); return tx([]); }).args, steps, partial: true });
+  assert.deepEqual([batches.length, batches[1], typeof refused], [2, [maxUint256, maxUint256], 'string']);
+  assert.match(String(refused), /先還清再取回 tx=.*；下一輪再賣$/);
+});
+
 test('sell all with the vault short and no USDT (v1): once nothing can be repaid or taken back the exit sells what is free; any other sale still waits', async () => {
   // After the first round: the vault is empty, the account has no USDT, and what stays posted is just what the rest of the
   // debt needs (0.34 of 10 shares); 9.66 shares are back in the account. Before, the sale waited for USDT only it could bring.

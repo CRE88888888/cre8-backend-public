@@ -697,7 +697,7 @@ export type ScanDeps = {
  * 游標永遠 `universeComplete = false`（head > 部署塊），這正是它該有的答案。
  */
 export async function scanPortfolioHoldings(deps: ScanDeps): Promise<HoldingScanResult> {
-  const block = deps.head ?? (await deps.client.getBlockNumber());
+  const block = deps.head ?? (await deps.client.getBlockNumber({ cacheTime: 0 }));
   const existing = await loadCursor(deps.query, deps.portfolioId);
   const deployment = (existing === null || (deps.searchFromBlock ?? 0n) >= existing.startBlock ? null : await deploymentNotBeforeCursor(deps.client, deps.account, block, existing.startBlock)) ??
     await findDeploymentBlock(deps.client, {

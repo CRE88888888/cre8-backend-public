@@ -40,6 +40,12 @@ export type V2UnwindWait = { note: string;
   stuck: Address[];
   /** USDT their top-ups are still short of (raw). 0: they wait for something else (the 24-hour window, the pool's peg). */
   needUsdtRaw: bigint };
+/**
+ * An owner's partial sale: the shares it was short of are back in the account — their share of the debt repaid, the rest of
+ * each position still open — and the sale goes ahead in the same round. `block`: the block the last of it landed in; what
+ * the sale reads next must not be older (src/rpc-transport.ts noteLandedBlock).
+ */
+export type UnwindFreed = { freed: string; block: bigint };
 export type V2StepArgs = { v2: StrategyEarnV2; reader: V2Reader; account: Address; portfolioId: number; now: Date; dryRun: boolean;
   /** null: the newest session key does not carry the routing v2 scope (the owner has not renewed) — the step only reports. */
   send: V2Send | null; ledger: V2Ledger; log: (line: string) => void; costs?: Costs;
@@ -277,10 +283,16 @@ export async function v2QuietRound(input: { v2: StrategyEarnV2; reader: Pick<V2R
  * full exit: sell all / delete / take profit): reward tokens in the box and the account go to the owner's wallet with the
  * same session key (`executeSweepRewards`, spec §9). Returns a block reason, or null when the sale can go ahead.
  */
-export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tokenIn: string; amountIn: bigint }[]; exit?: boolean;
+type V2UnwindArgs = V2StepArgs & { steps: readonly { tokenIn: string; amountIn: bigint }[]; exit?: boolean;
   /** The sale has nothing free to sell (the caller planned it without the stuck shares and found nothing): a position
    * with nothing to repay takes back the shares its debt does not need, so there is something to sell next round. */
-  spare?: boolean }): Promise<string | V2UnwindWait | null> {
+  spare?: boolean;
+  /** An owner's partial sale (never with `exit`): repay and take back only what the sale is short of (v2PreSellPlan
+   * `partial`), and answer `UnwindFreed` once all of it has landed — the sale is sent in the same round. */
+  partial?: boolean };
+export async function v2UnwindForSale(args: V2UnwindArgs & { partial?: false }): Promise<string | V2UnwindWait | null>;
+export async function v2UnwindForSale(args: V2UnwindArgs): Promise<string | V2UnwindWait | UnwindFreed | null>;
+export async function v2UnwindForSale(args: V2UnwindArgs): Promise<string | V2UnwindWait | UnwindFreed | null> {
   const { v2, reader, account } = args;
   const touched = args.touched ?? await reader.touched(account);
   // A full exit also looks at an account with no route and no vault left: its strategy was simply turned off earlier (the
@@ -290,6 +302,7 @@ export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tok
   const m = await reader.market();
   const deadline = deadlineOf(args.now);
   const seen: SwapWatch = { peg: false, window: false, other: false };
+  const partial = args.partial === true && args.exit !== true;
   /** What this sale needs from one read of the account. `swapper: false`: plan as if there were no cash swapper (no top-up, no cash-out). */
   const build = async (swapper: boolean) => {
     const read = await reader.account(account);
@@ -302,14 +315,14 @@ export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tok
       const h = read.state.holdings.find(x => x.collateral === r.route.collateral);
       if (need === 0n || !h || need <= h.freeCollateralRaw) continue;
       const t = read.tokens[r.route.loanSymbol]!;
-      positions.push({ symbol: r.route.symbol, collateral: r.route.collateral, freeCollateralRaw: h.freeCollateralRaw, postedRaw: r.collateralRaw, routeDebtRaw: r.routeDebtRaw,
+      positions.push({ symbol: r.route.symbol, collateral: r.route.collateral, freeCollateralRaw: h.freeCollateralRaw, needRaw: need, postedRaw: r.collateralRaw, routeDebtRaw: r.routeDebtRaw,
         vaultAssetsRaw: read.vaults.filter(v => v.vault.token === r.route.loan).reduce((s, v) => s + v.assetsRaw, 0n), idleRaw: t.idleRaw, cashRaw: t.cashRaw, minDebtRaw: r.limits.minDebtRaw,
         routeId: r.route.routeId, vaultId: (r.vault?.vaultId ?? ('0x' + '00'.repeat(32))) as Hex, venue: r.route.venue, loan: r.route.loanSymbol, ...(swapper && t.swap ? { swap: t.swap } : {}),
         collateralValueUsd: r.collateralValueUsd, targetLtvBps: r.targetLtvBps, budgetDebtRaw: r.route.venue === 'venus' ? venusDebt : r.debtRaw });
     }
     // A route of the same token that this sale does not close keeps the token's leftover as its repayment fallback.
     for (const p of positions) if (read.routes.some(r => r.route.loanSymbol === p.loan && r.routeDebtRaw > 0n && !positions.some(x => x.routeId === r.route.routeId))) p.lastOfToken = false;
-    const plan = v2PreSellPlan(v2, account, positions, deadline, args.now.getTime(), args.spare ? { spare: true } : {});
+    const plan = v2PreSellPlan(v2, account, positions, deadline, args.now.getTime(), { ...(args.spare ? { spare: true } : {}), ...(partial ? { partial: true } : {}) });
     // A full exit also sells loan token already sitting in the account with nothing owed in it (left by an earlier close),
     // so the owner takes back USDT only. Tokens this plan closes are sold in the same UserOp as their close (v2PreSellPlan).
     const closing = new Set(positions.map(p => p.loan));
@@ -338,6 +351,9 @@ export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tok
     return `[STRATEGY_EARN_UNWINDING] 賣出前需先還款取回：${b.plan.notes.join('；')}（${args.dryRun ? 'dry-run' : '沒有路由 v2 的 session 權限，等 owner 續期'}，未送出）`;
   }
   const send = watchSwaps(args, args.send, seen), txs: Hex[] = [];
+  /** The highest block anything of this step landed in. */
+  let landedBlock = 0n;
+  const note = (tx: V2Tx) => { txs.push(tx.hash); if (typeof tx.blockNumber === 'bigint' && tx.blockNumber > landedBlock) landedBlock = tx.blockNumber; };
   const sendAll = async (calls: readonly Call[], read: V2AccountRead) => {
     for (const batch of v2Batches(calls)) {
       let landed: V2Tx[];
@@ -346,18 +362,26 @@ export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tok
         // A UserOp that does not fit (or reverts as a whole) is retried one call at a time; what landed stays.
         if (batch.length === 1) throw new Error(`${txs.length > 0 ? `已完成 ${txs.length} 筆（tx=${txs.join(',')}），其餘未完成：` : ''}${shortError(error)}`);
         landed = [];
-        for (const call of batch) { const tx = await send([call]); landed.push(tx); txs.push(tx.hash); await recordRoutes(args, m, tx, 'sale'); await recordRewards(args, read, tx); }
+        for (const call of batch) { const tx = await send([call]); landed.push(tx); note(tx); await recordRoutes(args, m, tx, 'sale'); await recordRewards(args, read, tx); }
         continue;
       }
-      for (const tx of landed) { txs.push(tx.hash); await recordRoutes(args, m, tx, 'sale'); await recordRewards(args, read, tx); }
+      for (const tx of landed) { note(tx); await recordRoutes(args, m, tx, 'sale'); await recordRewards(args, read, tx); }
     }
   };
   const usesSwapper = (calls: readonly Call[]) => v2.swapper !== undefined && v2.swapper !== null && calls.some(c => isAddressEqual(c.to, v2.swapper!));
   try { await sendAll(b.calls, b.read); }
   catch (error) {
+    // A partial repayment the venue (or the bundler's simulation) refused, with nothing landed: this sale is handled the
+    // way every sale was before — the whole position repaid and taken back; the sale then waits for the next round.
+    if (partial && b.plan.proportional === true && txs.length === 0) {
+      args.log(`[strategy-routing] portfolio ${args.portfolioId}: 部分還款取回沒送出（${shortError(error)}），這次賣出改走整個部位還款取回`);
+      return v2UnwindForSale({ ...args, partial: false });
+    }
     if (!usesSwapper(b.calls)) {
       // Only reward tokens to send: never a reason to hold the sale back. A failure is logged and the next exit round tries again.
       if (!b.blocking) { args.log(`[strategy-routing] portfolio ${args.portfolioId} 退出：激勵代幣這一輪沒送出（不擋賣出）：${shortError(error)}`); return null; }
+      // What did land is named, so the caller never reports "nothing was sent" for a step that moved the account.
+      if (txs.length > 0 && !/tx=0x/.test(shortError(error))) throw new Error(`已完成 ${txs.length} 筆（tx=${txs.join(',')}），其餘未完成：${shortError(error)}`);
       throw error;
     }
     // A top-up or a cash-out did not go through (the pool is off its peg, the token's 24-hour window is used up, a
@@ -382,7 +406,10 @@ export async function v2UnwindForSale(args: V2StepArgs & { steps: readonly { tok
   }
   // Only reward tokens / leftover loan token went out while every position waits: the sale goes ahead with what is free.
   if (onlyWaits(b)) return waitOf(b);
-  return `[STRATEGY_EARN_UNWINDING] 賣出前已還款取回：${b.plan.notes.join('；')} tx=${txs.join(',')}${txs.length > 1 ? `（分 ${txs.length} 筆）` : ''}；下一輪再賣`;
+  const done = `[STRATEGY_EARN_UNWINDING] 賣出前已還款取回：${b.plan.notes.join('；')} tx=${txs.join(',')}${txs.length > 1 ? `（分 ${txs.length} 筆）` : ''}`;
+  // An owner's partial sale whose every position could be freed in full: nothing waits, so the sale is sent now.
+  if (partial && b.plan.stuck.length === 0 && b.plan.short !== true && landedBlock > 0n) return { freed: done, block: landedBlock };
+  return `${done}；下一輪再賣`;
 }
 
 async function recordRewards(args: Pick<V2StepArgs, 'v2' | 'ledger' | 'portfolioId' | 'account' | 'log'>, read: Pick<V2AccountRead, 'box' | 'policy'>, tx: V2Tx, owner?: Address) {

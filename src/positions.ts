@@ -377,7 +377,7 @@ export async function readPositions(
     seen.add(key);
   }
 
-  const block = args.block ?? (await client.getBlockNumber());
+  const block = args.block ?? (await client.getBlockNumber({ cacheTime: 0 }));
   const priceToken = args.priceToken ?? twapPriceInUsdt;
 
   const [nativeBalanceWei, readBalances] = await Promise.all([

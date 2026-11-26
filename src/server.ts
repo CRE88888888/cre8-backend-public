@@ -54,7 +54,7 @@ import {
   runOperatorRebalance,
 } from './operator.js';
 import type { OperatorActivityRow, OperatorPlanPreview, OperatorRebalanceResult, PortfolioStatusReader } from './operator.js';
-import { rpcTransport } from './rpc-transport.js';
+import { noteLandedBlock, rpcTransport } from './rpc-transport.js';
 
 /** Hard cap on request bodies: strategy payloads are small; anything bigger is a mistake or an attack. */
 const MAX_BODY_BYTES = 1_000_000;
@@ -1485,12 +1485,23 @@ async function bundlerRelayRoute(
   }
 
   const payload = await upstreamRes.text();
+  // The owner's own UserOp (buy transfer, Strategy Earn consent, withdrawal) landed: what this API reads for the request
+  // that follows (confirm, funding lot, rebalance, cash) must not be older than its block (src/rpc-transport.ts).
+  if (method === 'eth_getUserOperationReceipt') noteLandedBlock(userOpReceiptBlock(payload));
   res.writeHead(upstreamRes.status, {
     'content-type': upstreamRes.headers.get('content-type') ?? 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(payload),
     'cache-control': 'no-store',
   });
   res.end(payload);
+}
+
+/** The block of a UserOp receipt in a bundler answer, or null (not mined yet, an error, or anything unexpected). */
+export function userOpReceiptBlock(payload: string): string | null {
+  try {
+    const block: unknown = (JSON.parse(payload) as { result?: { receipt?: { blockNumber?: unknown } } | null })?.result?.receipt?.blockNumber;
+    return typeof block === 'string' && /^0x[0-9a-fA-F]{1,16}$/.test(block) ? block : null;
+  } catch { return null; }
 }
 
 /** 取 JSON-RPC 的 `method`；讀不到就回空字串（= 一定不在白名單，回 403 而不是轉發一個殘缺請求）。 */

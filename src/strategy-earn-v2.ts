@@ -574,6 +574,20 @@ export function partialRepayment(input: { debtRaw: bigint; postedRaw: bigint; ha
   return take === 0n ? null : { payRaw: pay, takeRaw: take };
 }
 /**
+ * An owner's partial sale needs `takeRaw` of the posted shares (2026-11-26, testnet portfolio 55: a 20 USDT sale closed a
+ * whole position). Repay that share of the debt, 2% more (the mirror of partialRepayment: debt ÷ budget does not rise and
+ * health does not fall, whatever interest accrues before inclusion), and take back exactly those shares; the rest of the
+ * position stays open at the ratio it had. null -> the caller closes the whole position, as before: the sale needs
+ * everything that is posted, the repayment would be the whole debt, or it would leave a Lista debt under `floorRaw`.
+ */
+export function proportionalRepayment(input: { debtRaw: bigint; postedRaw: bigint; takeRaw: bigint; floorRaw: bigint }): { payRaw: bigint; takeRaw: bigint } | null {
+  const { debtRaw: debt, postedRaw: posted, takeRaw: take, floorRaw: floor } = input;
+  if (debt <= 0n || posted <= 0n || take <= 0n || take >= posted) return null;
+  const pay = (debt * take * 10_000n + posted * 9_800n - 1n) / (posted * 9_800n);
+  if (pay >= debt || debt - pay < floor) return null;
+  return { payRaw: pay, takeRaw: take };
+}
+/**
  * Posted shares the debt that is left does not need (2026-11-25, testnet portfolio 37: the sale's USDT was withdrawn before
  * the last repayment, leaving about 2 USDT of shares posted against a debt of 0.0000004 USD1, no USDT and nothing free to
  * sell). The executor lets collateral leave without a repayment as long as the debt stays inside the budget afterwards
@@ -849,6 +863,8 @@ export function v2ExitBatches(v2: StrategyEarnV2, account: Address, input: ExitI
 
 /** One posted asset the sale needs back. */
 export type PreSellPosition = PositionState & { routeId: Hex; vaultId: Hex; venue: 'venus' | 'lista'; loan: string;
+  /** What the sale takes of this asset in all (raw). With `partial`, only `needRaw - freeCollateralRaw` comes back. */
+  needRaw?: bigint;
   /** false: another open route of the account (not in this sale) borrows the same token — its leftover is not sold. */
   lastOfToken?: boolean;
   /** For `spare` (spareCollateral): the posted shares' value (lens `collateralValue`, USD 1e18), the route's target ratio,
@@ -862,17 +878,25 @@ export type PreSellPosition = PositionState & { routeId: Hex; vaultId: Hex; venu
  * A Lista partial repayment is cut so that `minDebt` stays (the contract would cut it the same way).
  * `spare` (the sale has nothing free to sell either, so no USDT will come in): a position with nothing to repay takes back
  * the shares its debt does not need (spareCollateral) — selling them pays the rest next round.
+ * `partial` (an owner's partial sale): a position the sale needs only part of repays that share and takes back just those
+ * shares (proportionalRepayment); it stays open. Where that does not work (see there, or the box cannot pay it) the
+ * position is handled as above.
  */
-export function v2PreSellPlan(v2: StrategyEarnV2, account: Address, positions: readonly PreSellPosition[], deadline: bigint, now: number = Date.now(), options: { spare?: boolean } = {}): { calls: Call[]; notes: string[];
+export function v2PreSellPlan(v2: StrategyEarnV2, account: Address, positions: readonly PreSellPosition[], deadline: bigint, now: number = Date.now(), options: { spare?: boolean; partial?: boolean } = {}): { calls: Call[]; notes: string[];
   /** A top-up that has to wait (unix seconds): the 24-hour window of some token is used up. */
   retryAt?: number;
   /** Collateral (lowercase) whose posted part cannot be freed this round: the box and the account's own loan token are used
    * up and the top-up has nothing to buy with (or has to wait). The sale goes ahead with what the account holds free. */
   stuck: Address[];
   /** USDT the stuck positions still need for their top-ups (raw; 0 when the wait is not about USDT). */
-  needUsdtRaw: bigint } {
+  needUsdtRaw: bigint;
+  /** Some position gives back fewer shares than the sale needs of it this round (the box is short, or nothing can be
+   * repaid): the sale of that asset has to wait for a later round. Absent when every position is freed as far as needed. */
+  short?: true;
+  /** Some position is only repaid in part and stays open (`partial`): if the venue refuses that, the caller plans again without it. */
+  proportional?: true } {
   const calls: Call[] = [], notes: string[] = [], stuck: Address[] = [];
-  let needUsdtRaw = 0n;
+  let needUsdtRaw = 0n, short = false, proportional = false;
   // Routes that share a loan token share the box's money for it (and the top-up cap, and the account's USDT): what an
   // earlier close in this plan uses is gone.
   const budget = settleBudget();
@@ -886,6 +910,19 @@ export function v2PreSellPlan(v2: StrategyEarnV2, account: Address, positions: r
     // box's money for the later ones), and never when a route outside this sale still borrows it (`lastOfToken: false`).
     const before = left(p), route: SettleRoute = { loan: p.loan, routeDebtRaw: debt, vaultAssetsRaw: p.vaultAssetsRaw ?? 0n, idleRaw: p.idleRaw ?? 0n, cashRaw: p.cashRaw ?? 0n, ...(p.swap ? { swap: p.swap } : {}),
       lastOfToken: !positions.slice(i + 1).some(x => x.loan === p.loan && (x.routeDebtRaw ?? 0n) > 0n && (x.postedRaw ?? 0n) > 0n) && p.lastOfToken !== false };
+    // An owner's partial sale: only the shares the sale is short of come back, with their share of the debt.
+    const share = options.partial && p.needRaw !== undefined
+      ? proportionalRepayment({ debtRaw: debt, postedRaw: posted, takeRaw: p.needRaw - p.freeCollateralRaw, floorRaw: p.minDebtRaw ?? 0n }) : null;
+    if (share !== null) {
+      // A repayment the box cannot make leaves the shared budget as it was (settleRepayment returns before it draws on it).
+      const some = settleRepayment(v2, route, budget, { repayRaw: share.payRaw, deadline, now, close: false });
+      if (!some.blocked) {
+        calls.push(...some.before, v2Calls.reduce(v2, account, p.routeId, p.vaultId, share.payRaw, share.takeRaw, some.maxCashInRaw, deadline));
+        notes.push(`${p.symbol} ${some.toppedUpRaw > 0n ? `top up ${some.toppedUpRaw} ${p.loan} from USDT, ` : ''}repay ${share.payRaw} of ${debt} ${p.loan}, take back ${share.takeRaw} of ${posted}; the position stays open`);
+        proportional = true;
+        continue;
+      }
+    }
     // The box (with a top-up from the account's USDT where the token is not USDT) and the account's own loan token cover
     // the debt -> close, and sell what is left of the loan token.
     const full = settleRepayment(v2, route, budget, { repayRaw: debt, deadline, now, close: true });
@@ -901,6 +938,7 @@ export function v2PreSellPlan(v2: StrategyEarnV2, account: Address, positions: r
     const bought = part && !part.blocked ? part.toppedUpRaw : 0n;
     const have = before.vault + before.idle + before.cash + bought;
     const some = partialRepayment({ debtRaw: debt, postedRaw: posted, haveRaw: have, floorRaw: p.minDebtRaw ?? 0n });
+    short = true;
     if (some === null) {
       const spare = options.spare && p.collateralValueUsd !== undefined && p.targetLtvBps !== undefined
         ? spareCollateral({ postedRaw: posted, collateralValueUsd: p.collateralValueUsd, budgetDebtRaw: p.budgetDebtRaw ?? debt, targetLtvBps: p.targetLtvBps }) : null;
@@ -917,7 +955,7 @@ export function v2PreSellPlan(v2: StrategyEarnV2, account: Address, positions: r
     budget.vault.set(p.loan, 0n); budget.idle.set(p.loan, 0n); budget.cash.set(p.loan, 0n);
     notes.push(`${p.symbol} short of ${p.loan}: ${bought > 0n ? `top up ${bought} from USDT, ` : ''}repay ${pay}, take back ${take} of ${posted}; the sale pays the rest`);
   }
-  return { calls, notes, stuck, needUsdtRaw, ...(retryAt === undefined ? {} : { retryAt }) };
+  return { calls, notes, stuck, needUsdtRaw, ...(retryAt === undefined ? {} : { retryAt }), ...(short ? { short: true as const } : {}), ...(proportional ? { proportional: true as const } : {}) };
 }
 
 // ---------------------------------------------------------------------------

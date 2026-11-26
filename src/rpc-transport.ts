@@ -68,6 +68,62 @@ let usageSince = Date.now();
 let usageTimer: ReturnType<typeof setInterval> | undefined;
 
 /**
+ * Read your own writes (2026-11-26). Right after a transaction of ours lands, the next step reads the chain again: the
+ * sale after a repay-and-take-back, the "after" snapshot of a trade, the confirmation of an owner's UserOp. With several
+ * nodes in rotation (and providers that are load-balanced themselves) the node answering that read can still be a few
+ * blocks behind the one that served the receipt, so the step saw the state from before its own transaction.
+ *
+ * `noteLandedBlock(n)` says "a transaction this process cares about landed in block n". For LANDED_FLOOR_MS after that,
+ * every request that asks for the head or for state at `latest` is only answered by a node that has reached n:
+ *   - the node's own head is asked first (cached HEAD_CACHE_MS, like every eth_blockNumber); a node behind n is skipped
+ *     (it keeps its place: it is healthy, only behind);
+ *   - the request is then pinned to that head (`latest` -> its number), so a load-balanced provider whose other server
+ *     is still behind answers "header not found" — a node gap, the next node is asked — instead of old state;
+ *   - when no node has reached n the request waits (LANDED_POLL_MS a turn, LANDED_WAIT_MS in all), then fails as a node
+ *     gap. It never answers with state older than n.
+ * Requests at an explicit block, `pending` reads, logs and writes are untouched, and nothing changes while no block
+ * was noted in the last minute. Local forks and other chains have one node and no floor.
+ */
+export const LANDED_FLOOR_MS = 60_000;
+export const LANDED_WAIT_MS = 8_000;
+export const LANDED_POLL_MS = 250;
+let landed: { block: bigint; until: number } | null = null;
+/** A transaction this process sent, relayed or confirmed landed in `block`: reads from now on must not be older. */
+export function noteLandedBlock(block: bigint | number | string | null | undefined, now: number = Date.now()): void {
+  let n: bigint;
+  try { n = block === null || block === undefined ? 0n : BigInt(block); } catch { return; }
+  if (n <= 0n) return;
+  landed = { block: landed !== null && landed.until > now && landed.block > n ? landed.block : n, until: now + LANDED_FLOOR_MS };
+}
+/** The block reads must have reached right now, or null. */
+export function landedFloor(now: number = Date.now()): bigint | null {
+  return landed !== null && landed.until > now ? landed.block : null;
+}
+/** Where a request carries its block tag, for the requests the floor applies to. */
+const LATEST_AT: Readonly<Record<string, number>> = { eth_call: 1, eth_getBalance: 1, eth_getCode: 1, eth_getTransactionCount: 1, eth_getStorageAt: 2, eth_getBlockByNumber: 0 };
+/** Does this request ask for the head, or for state at `latest`? */
+function readsLatest(req: { method: string; params?: unknown }): boolean {
+  if (req.method === 'eth_blockNumber') return true;
+  const at = LATEST_AT[req.method];
+  if (at === undefined || !Array.isArray(req.params)) return false;
+  const tag: unknown = req.params[at];
+  // eth_call without a block parameter means `latest`; the others always carry theirs.
+  return tag === 'latest' || tag === undefined && req.method === 'eth_call' && req.params.length === 1;
+}
+/** The same request at an explicit block. */
+function pinned<R extends { method: string; params?: unknown }>(req: R, head: bigint): R {
+  const at = LATEST_AT[req.method];
+  if (at === undefined || !Array.isArray(req.params)) return req;
+  const params: unknown[] = [...(req.params as unknown[])];
+  params[at] = `0x${head.toString(16)}`;
+  return { ...req, params };
+}
+/** No node has reached the noted block yet. Worded as a node gap so callers' own re-reads (src/node-lag.ts) treat it as lag. */
+class BehindLandedBlock extends Error {
+  constructor(block: bigint) { super(`block not found: no RPC node has reached block ${block} yet (a transaction of ours landed there)`); this.name = 'BehindLandedBlock'; }
+}
+
+/**
  * The node, not the request, is the problem: any HTTP error status (403, 429, 5xx…), a body that is not JSON, a timeout,
  * a connection failure, or a quota / rate-limit / access answer.
  */
@@ -208,9 +264,12 @@ function inOrder(nodes: readonly RpcNode[], now: number): RpcNode[] {
  * `deps.secondary` replaces the public node list (one URL, a list, or null for none); tests use it.
  */
 export function rpcTransport(source: string, url: string | null | undefined, options: HttpTransportConfig = {},
-  deps: { now?: () => number; log?: (line: string) => void; secondary?: string | readonly string[] | null; preferPublic?: boolean; schedulerRole?: boolean } = {}): Transport {
+  deps: { now?: () => number; log?: (line: string) => void; secondary?: string | readonly string[] | null; preferPublic?: boolean; schedulerRole?: boolean;
+    /** Tests: the pause between two looks for a node that has reached the noted block. */
+    sleep?: (ms: number) => Promise<void> } = {}): Transport {
   const publicUrls = deps.secondary === undefined ? publicRpcs(url) : deps.secondary === null ? [] : typeof deps.secondary === 'string' ? [deps.secondary] : [...deps.secondary];
   const now = deps.now ?? Date.now, log = deps.log ?? ((line: string) => console.warn(line));
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   if (publicUrls.length === 0) {
     const plain = http(url ?? undefined, options);
     return (args) => {
@@ -232,7 +291,7 @@ export function rpcTransport(source: string, url: string | null | undefined, opt
     const base = primary(args);
     const p: RpcNode = { name: 'primary', key: url ?? '', request: base.request };
     const s: RpcNode[] = publics.map((transport, index) => ({ name: index === 0 ? 'public' : `public${index + 1}`, key: publicUrls[index] ?? '', request: transport(args).request }));
-    const request = (async (req, opts) => {
+    const walk = (async (req: { method: string; params?: unknown }, opts: unknown, floor: bigint | null) => {
       // Scheduler bulk read: public nodes only. When all of them fail, this round's work for the portfolio is skipped.
       const paid = paidFallback(req.method);
       const candidates = inOrder(!paid ? s : preferPublic ? [...s, p] : [p, ...s], now());
@@ -244,7 +303,18 @@ export function rpcTransport(source: string, url: string | null | undefined, opt
           if (refused !== undefined && refused.until > now()) { gap ??= refused.error; continue; }
         }
         count(`${source}:${candidate.name}`, req.method);
-        try { return await candidate.request(req, opts); }
+        try {
+          if (floor === null) return await candidate.request(req as never, opts as never);
+          // Read your own writes: this node's head first; behind the noted block -> the next node, and it keeps its place.
+          if (req.method !== 'eth_blockNumber') count(`${source}:${candidate.name}`, 'eth_blockNumber');
+          const head = BigInt(await candidate.request({ method: 'eth_blockNumber' } as never, opts as never) as string);
+          if (head < floor) { gap ??= new BehindLandedBlock(floor); continue; }
+          if (req.method === 'eth_blockNumber') return `0x${head.toString(16)}`;
+          const answer = await candidate.request(pinned(req, head) as never, opts as never);
+          // A block this server has not seen is answered with null, not with an error: the same lag, the next node.
+          if (answer === null && req.method === 'eth_getBlockByNumber') { gap ??= new BehindLandedBlock(floor); continue; }
+          return answer;
+        }
         catch (error) {
           const down = isProviderFailure(error);
           if (!down && !isNodeGap(error)) throw error;
@@ -269,13 +339,25 @@ export function rpcTransport(source: string, url: string | null | undefined, opt
       }
       // A node that only lacked the data says more to the caller's own re-read (src/node-lag.ts) than a dead node does.
       throw gap ?? failure;
+    });
+    const request = (async (req, opts) => {
+      const floor = readsLatest(req) ? landedFloor(now()) : null;
+      if (floor === null) return walk(req, opts, null);
+      // Every node is still behind the noted block (or its provider's other server is): wait for one to get there.
+      for (const started = now(); ;) {
+        try { return await walk(req, opts, floor); }
+        catch (error) {
+          if (!isNodeGap(error) || now() - started >= LANDED_WAIT_MS) throw error;
+          await sleep(LANDED_POLL_MS);
+        }
+      }
     }) as EIP1193RequestFn;
     return { ...base, request };
   };
 }
 
 /** Test hook. */
-export function resetRpcTransport(): void { demotedUntil.clear(); lastFailoverLog.clear(); usage.clear(); chainIds.clear(); heads.clear(); addresslessLogsRefused.clear(); }
+export function resetRpcTransport(): void { demotedUntil.clear(); lastFailoverLog.clear(); usage.clear(); chainIds.clear(); heads.clear(); addresslessLogsRefused.clear(); landed = null; }
 
 /**
  * Multicall batching for the bulk readers (scheduler, snapshot, status, Strategy Earn): concurrent readContract calls

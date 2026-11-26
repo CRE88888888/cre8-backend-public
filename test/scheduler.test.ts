@@ -45,7 +45,7 @@ import type {
   ReconcileInput,
 } from '../src/scheduler.js';
 import type { PortfolioPlan } from '../src/snapshot.js';
-import { buildRedeemPlan, runOperatorClose, runOperatorRedeem, runOperatorRebalance } from '../src/operator.js';
+import { buildRedeemPlan, PARTIAL_SALE_EXTRA_ROUNDS, PARTIAL_SALE_HOLD_SECONDS, PARTIAL_SALE_RETRY_PAUSE_MS, runOperatorClose, runOperatorRedeem, runOperatorRebalance } from '../src/operator.js';
 import { sellFixture } from './fixtures/max-leg.js';
 
 /**
@@ -3904,6 +3904,159 @@ test('#40 DB failure after confirmed sale keeps tx/progress visible and gives a 
   assert.ok(result.txHash);
   assert.match(result.reason, /DB 延後排程失敗/);
   assert.ok(!JSON.stringify(result).includes('secret-token'));
+});
+
+/** The `/redeem` fixture with every DOGE share posted for Strategy Earn and a recorded unwind step. */
+function partialSaleCase(answers: (ReturnType<NonNullable<SchedulerDeps['strategyEarn']>['unwind']> extends Promise<infer T> ? T : never)[]) {
+  const unwinds: { exit: boolean | undefined; partial: boolean | undefined; sold: bigint }[] = [];
+  let opens = 0;
+  const strategyEarn: NonNullable<SchedulerDeps['strategyEarn']> = {
+    open: async () => { opens += 1; return 'opened'; },
+    unwind: async (_due, steps, _dry, exit, _posted, _spare, partial) => { unwinds.push({ exit, partial, sold: steps.reduce((sum, step) => sum + step.amountIn, 0n) }); return answers.shift() ?? null; },
+  };
+  const c = exitCase('active', { strategyEarn });
+  c.chain.plan.snapshot.strategyEarnCollateral = [{ asset: DOGE_HELD(c).asset as Address, marketId: MARKET, amount: DOGE_HELD(c).amountWei }];
+  const sleeps: number[] = [], logs: string[] = [];
+  return { c, unwinds, sleeps, logs, opens: () => opens, options: { ...c.options, sleep: async (ms: number) => { sleeps.push(ms); }, log: (line: string) => logs.push(line) } };
+}
+const FREED = { freed: `[STRATEGY_EARN_UNWINDING] 賣出前已還款取回：DOGE repay 9632732983988432775 of 38528000000000000000 USDT, take back 4 of 10; the position stays open tx=0x${'39'.repeat(32)}`, block: 144_893_940n };
+
+test('2026-11-26 portfolio 55: a partial sale with every share posted repays and takes back what it needs and sells in the SAME call; the strategy is never asked to close', async () => {
+  const p = partialSaleCase([FREED]);
+  const result = await runOperatorRedeem(PORTFOLIO_ID, OWNER, 200000000000n, p.options);
+  assert.equal(result.outcome, 'executed', result.reason);
+  assert.ok(result.txHash);
+  assert.equal(p.c.chain.executeCalls.length, 1, 'the sale went out in the round that took the shares back');
+  assert.deepEqual(p.unwinds.map(u => [u.exit, u.partial]), [[false, true]], 'one unwind, asked as a partial sale (not an exit)');
+  assert.ok(p.unwinds[0]!.sold > 0n);
+  assert.equal('earnFreed' in result, false, 'sold: nothing is left half done');
+  assert.equal(p.sleeps.length, 0);
+  assert.equal(p.opens(), 0, 'a sale never opens the strategy');
+  assert.ok(p.logs.some(line => /賣出前已還款取回.*同一輪接著賣出/.test(line)));
+  // Scheduling as after any partial sale (the scheduler comes back after the follow-up delay).
+  assert.deepEqual(p.c.f.state.writes.filter(w => w.sql.includes('greatest(next_run_at')).map(w => w.params), [[PORTFOLIO_ID, PARTIAL_FOLLOW_UP_SECONDS]]);
+});
+
+test('2026-11-26 portfolio 55: the take-back landed and the sale\'s send failed (sponsorship timed out): the same call sells the freed shares on its next round', async () => {
+  const p = partialSaleCase([FREED]);
+  // Round 1: shares back, then the send fails before anything is broadcast. Round 2: the shares are free, the sale lands.
+  p.c.chain.executeError = 'paymaster sponsorship rejected: PAYMASTER_DEPENDENCY_UNAVAILABLE';
+  p.options.sleep = async (ms: number) => { p.sleeps.push(ms); p.c.chain.executeError = null; delete p.c.chain.plan.snapshot.strategyEarnCollateral; };
+  const result = await runOperatorRedeem(PORTFOLIO_ID, OWNER, 200000000000n, p.options);
+  assert.equal(result.outcome, 'executed', result.reason);
+  assert.equal('earnFreed' in result, false);
+  assert.deepEqual(p.sleeps, [PARTIAL_SALE_RETRY_PAUSE_MS]);
+  assert.equal(p.unwinds.length, 1, 'nothing is posted for the second round to take back');
+  assert.ok(p.logs.some(line => /\[redeem\] portfolio \d+: 加息抵押已還款取回、賣出還沒成交.*同一次請求再跑一輪/.test(line)));
+});
+
+test('2026-11-26 portfolio 55: shares taken back and the sale never lands — the answer says so (never "nothing was sent"), and the scheduler stays away for a while', async () => {
+  const p = partialSaleCase([FREED]);
+  p.c.chain.executeError = 'paymaster sponsorship rejected: PAYMASTER_DEPENDENCY_UNAVAILABLE';
+  const result = await runOperatorRedeem(PORTFOLIO_ID, OWNER, 200000000000n, p.options);
+  assert.equal(result.outcome, 'blocked', 'the app goes on calling on this answer (web-sell-all.ts UNWOUND)');
+  assert.match(result.reason, /^\[STRATEGY_EARN_UNWINDING\] 賣出前已還款取回：DOGE repay .* tx=0x(39){32}；下一輪再賣（這次賣出還沒成交：Send failed \(nothing landed\)/);
+  assert.equal(result.earnFreed, true);
+  assert.equal(result.txHash, null);
+  assert.equal(result.remainingUsdE8, '20000000000', 'everything asked for is still to sell');
+  assert.equal(p.sleeps.length, PARTIAL_SALE_EXTRA_ROUNDS, 'the round ran again as often as allowed');
+  assert.equal(p.unwinds.length, 1 + PARTIAL_SALE_EXTRA_ROUNDS);
+  // The freed shares stay free for the caller's next call: the scheduler's own round (which would post them again) waits.
+  assert.deepEqual(p.c.f.state.writes.filter(w => w.sql.includes('greatest(next_run_at')).map(w => w.params), [[PORTFOLIO_ID, PARTIAL_SALE_HOLD_SECONDS]]);
+});
+
+test('2026-11-26: the pre-sale step freed only part of what the sale needs (its own "next round" note): the same call runs the next round; a step that sent nothing is one round and not flagged', async () => {
+  const NEXT = `[STRATEGY_EARN_UNWINDING] 賣出前已還款取回：DOGE short of USD1: repay 100, take back 3 of 10; the sale pays the rest tx=0x${'48'.repeat(32)}；下一輪再賣`;
+  // Round 1 takes back part and waits; round 2 finds the rest free (nothing more to take back) and sells.
+  const p = partialSaleCase([NEXT, null]);
+  const result = await runOperatorRedeem(PORTFOLIO_ID, OWNER, 200000000000n, p.options);
+  assert.deepEqual([result.outcome, p.unwinds.length, p.sleeps.length, 'earnFreed' in result], ['executed', 2, 1, false]);
+  // A step that needed a take-back and sent nothing (no session permission) moved nothing: one round, no flag, no hold.
+  const n = partialSaleCase(['[STRATEGY_EARN_UNWINDING] 賣出前需先還款取回：DOGE（沒有策略加息 session 權限，等 owner 續期，未送出）']);
+  const none = await runOperatorRedeem(PORTFOLIO_ID, OWNER, 200000000000n, n.options);
+  assert.deepEqual([none.outcome, 'earnFreed' in none, n.sleeps.length, n.c.f.state.writes.some(w => w.sql.includes('greatest(next_run_at'))], ['blocked', false, 0, false]);
+});
+
+test('2026-11-26: the pre-sale step keeps freeing only part of what the sale needs: its own note comes back as it is, flagged, and the scheduler stays away', async () => {
+  const NEXT = `[STRATEGY_EARN_UNWINDING] 賣出前已還款取回：DOGE short of USD1: repay 100, take back 3 of 10; the sale pays the rest tx=0x${'48'.repeat(32)}；下一輪再賣`;
+  // It never becomes enough within the call: the step's own note comes back as it is (the app goes on calling on it), flagged.
+  const q = partialSaleCase([NEXT, NEXT, NEXT]);
+  const waiting = await runOperatorRedeem(PORTFOLIO_ID, OWNER, 200000000000n, q.options);
+  assert.deepEqual([waiting.outcome, waiting.reason, waiting.earnFreed, q.unwinds.length], ['blocked', NEXT, true, 1 + PARTIAL_SALE_EXTRA_ROUNDS]);
+  assert.deepEqual(q.c.f.state.writes.filter(w => w.sql.includes('greatest(next_run_at')).map(w => w.params), [[PORTFOLIO_ID, PARTIAL_SALE_HOLD_SECONDS]]);
+});
+
+test('2026-11-26: a pre-sale step that failed after part of it landed is never reported as "nothing was sent"', async () => {
+  // The step failed after part of it landed (its failure names the transaction): the same — never "nothing was sent".
+  const f = partialSaleCase([]);
+  const failing: NonNullable<SchedulerDeps['strategyEarn']> = { open: async () => null, unwind: async () => { throw new Error(`已完成 1 筆（tx=0x${'ab'.repeat(32)}），其餘未完成：bundler down`); } };
+  const broke = await runOperatorRedeem(PORTFOLIO_ID, OWNER, 200000000000n, { ...f.options, runSchedulerOnce: async (args: Parameters<typeof runSchedulerOnce>[0], provided: SchedulerDeps = {}) =>
+    f.c.options.runSchedulerOnce(args, { ...provided, strategyEarn: failing }) });
+  assert.deepEqual([broke.outcome, broke.earnFreed], ['blocked', true]);
+  assert.match(broke.reason, /^\[STRATEGY_EARN_UNWIND_FAILED\].*已完成 1 筆/);
+});
+
+test('2026-11-26 portfolio 55, first press: a round that could not even read the account ([STRATEGY_UNAVAILABLE] before any plan) is run once more in the same call', async () => {
+  const c = exitCase('active');
+  const blockedRound = (reason: string): PortfolioRunResult => ({ portfolioId: PORTFOLIO_ID, strategyId: STRATEGY_ID, account: ACCOUNT, outcome: 'blocked', reason, nextRunAt: NOW, plan: null, execution: null, partial: null });
+  const unread = '[STRATEGY_UNAVAILABLE] 讀鏈／DB／鎖資料不完整，保留原預算與原交易身分，先對帳';
+  const rounds = (answers: PortfolioRunResult[]) => { let calls = 0; const sleeps: number[] = [];
+    return { calls: () => calls, sleeps, options: { ...c.options, sleep: async (ms: number) => { sleeps.push(ms); },
+      runSchedulerOnce: async () => { const result = answers[Math.min(calls, answers.length - 1)]!; calls += 1; return { claimed: 1, dryRun: false, results: [result] }; } } }; };
+  // The yield read timed out (rate-limited node) on the first round; the second one reads and sells.
+  const sold: PortfolioRunResult = { ...blockedRound(''), outcome: 'executed', reason: 'Landed on-chain: tx 0xdef456 (attempt 1)', execution: { status: 'success', userOpHash: '0xabc123', txHash: '0xdef456', gasUsed: '1', error: null } };
+  const once = rounds([blockedRound(unread), sold]);
+  const result = await runOperatorRedeem(PORTFOLIO_ID, OWNER, 200000000000n, once.options);
+  assert.deepEqual([result.outcome, result.txHash, once.calls(), once.sleeps], ['executed', '0xdef456', 2, [PARTIAL_SALE_RETRY_PAUSE_MS]]);
+  // Still unreadable: twice, then the answer as it is. Nothing moved, so no flag and no hold.
+  const never = rounds([blockedRound(unread)]);
+  const blocked = await runOperatorRedeem(PORTFOLIO_ID, OWNER, 200000000000n, never.options);
+  assert.deepEqual([blocked.outcome, blocked.reason, never.calls(), 'earnFreed' in blocked], ['blocked', unread, 2, false]);
+  // Any other blocked round (market closed, queue busy, an operation still in flight) is one round, as before.
+  for (const reason of ['[MARKET_CLOSED] 股票休市，等待交易時段', '[DEX_QUEUED] 共用市場正處理另一基金，稍後重報價', 'portfolio 還在 submitted（1 筆未決操作），結果未知，先對帳，不重送']) {
+    const single = rounds([blockedRound(reason)]);
+    await runOperatorRedeem(PORTFOLIO_ID, OWNER, 200000000000n, single.options);
+    assert.equal(single.calls(), 1, reason);
+  }
+  // The day's sponsorship is used up: never sent again from the same call.
+  const quota = rounds([{ ...blockedRound('[GAS_BUDGET_EXCEEDED] 普通操作每日 gas／美元預算不足，延至下一個 UTC 日'), execution: { status: 'error', errorCode: 'PAYMASTER_QUOTA_EXCEEDED', userOpHash: null, txHash: null, gasUsed: null, error: 'quota' } }]);
+  await runOperatorRedeem(PORTFOLIO_ID, OWNER, 200000000000n, quota.options);
+  assert.equal(quota.calls(), 1);
+});
+
+test('2026-11-26: a partial sale whose send fails before anything is broadcast runs once more in the same call, and only once', async () => {
+  // No Strategy Earn at all: the first send times out at the paymaster, the second lands.
+  const c = exitCase('active');
+  const sleeps: number[] = [];
+  c.chain.executeError = 'timeout after 5000 ms';
+  const once = await runOperatorRedeem(PORTFOLIO_ID, OWNER, 200000000000n, { ...c.options, sleep: async (ms: number) => { sleeps.push(ms); c.chain.executeError = null; } });
+  assert.deepEqual([once.outcome, sleeps.length, c.chain.executeCalls.length], ['executed', 1, 2]);
+  // It keeps failing: two tries, then the failure as it is — nothing moved, so nothing is flagged or held.
+  const d = exitCase('active');
+  d.chain.executeError = 'timeout after 5000 ms';
+  sleeps.length = 0;
+  const failed = await runOperatorRedeem(PORTFOLIO_ID, OWNER, 200000000000n, { ...d.options, sleep: async (ms: number) => { sleeps.push(ms); } });
+  assert.deepEqual([failed.outcome, sleeps.length, 'earnFreed' in failed], ['failed', 1, false]);
+  assert.equal(d.f.state.writes.some(w => w.sql.includes('greatest(next_run_at')), false);
+});
+
+test('2026-11-26: a partial sale whose UserOp was accepted (outcome unknown) is never sent again from the same call; sell all keeps one round a call and is never asked as a partial sale', async () => {
+  const sleeps: number[] = [];
+  // Accepted by the bundler, outcome unknown: reconciled by the next call, never sent again from this one.
+  const u = exitCase('active');
+  u.chain.executeResult = { ...u.chain.executeResult, status: 'unknown', error: 'receipt timeout' };
+  const unknown = await runOperatorRedeem(PORTFOLIO_ID, OWNER, 200000000000n, { ...u.options, sleep: async (ms: number) => { sleeps.push(ms); } });
+  assert.deepEqual([unknown.outcome, unknown.remainingUsdE8, sleeps.length, u.chain.executeCalls.length], ['blocked', null, 0, 1]);
+  // The same with shares taken back first: the unknown outcome keeps its own answer, the flag still says the account moved.
+  const p = partialSaleCase([FREED]);
+  p.c.chain.executeResult = { ...p.c.chain.executeResult, status: 'unknown', error: 'receipt timeout' };
+  const both = await runOperatorRedeem(PORTFOLIO_ID, OWNER, 200000000000n, p.options);
+  assert.deepEqual([both.outcome, both.earnFreed, p.sleeps.length], ['blocked', true, 0]);
+  assert.match(both.reason, /^送出結果未知/);
+  // Sell all keeps its own machinery: asked as an exit, never as a partial sale, and one round a call.
+  const all = partialSaleCase([`[STRATEGY_EARN_UNWINDING] 賣出前已還款取回：DOGE 先還清再取回 tx=0x${'ab'.repeat(32)}；下一輪再賣`]);
+  const closed = await runOperatorClose(PORTFOLIO_ID, OWNER, { ...all.options, quoteAggregator: async () => null });
+  assert.deepEqual([closed.outcome, all.unwinds.map(x => [x.exit, x.partial]), all.sleeps.length, 'earnFreed' in closed], ['blocked', [[true, false]], 0, false]);
 });
 
 function pancakeInput(step: PlannedStep): Hex {

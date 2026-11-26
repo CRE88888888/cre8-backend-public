@@ -31,7 +31,7 @@ import { createPublicClient, custom, decodeFunctionData, encodeAbiParameters, ht
 import { createPlatformStatusReader, EXECUTOR_BUY_ABI, EXECUTOR_PAUSE_ABI, PLATFORM_STATUS_CACHE_TTL_MS, PLATFORM_STATUS_RPC_TIMEOUT_MS } from '../src/chain.js';
 import type { PlatformStatusConfig } from '../src/chain.js';
 import { closePool, query as dbQuery } from '../src/db.js';
-import { createServer, resolveOperatorWallets } from '../src/server.js';
+import { createServer, resolveOperatorWallets, userOpReceiptBlock } from '../src/server.js';
 import { assertNoSecretSlices, runScript } from './fixtures/secret-output.js';
 import { loadPrivyConfig } from '../src/config.js';
 import { SESSION_TTL_MS, sha256Hex } from '../src/auth.js';
@@ -1331,4 +1331,12 @@ test('GET /me/dca: one request for every portfolio of the owner; display reads h
     assert.deepEqual([(await call('/me/dca')).status, (await call('/portfolios/7/dca')).status], [200, 200]);
   }, { dca, mixes, rateLimiter: new RequestRateLimiter({ ...loadRateLimitConfig({}), planPerMinute: 0, readPerMinute: 4 }, new MemoryRateLimitStore(), () => 1_000) });
   assert.deepEqual([loadRateLimitConfig({}).planPerMinute, loadRateLimitConfig({}).readPerMinute, loadRateLimitConfig({ RATE_LIMIT_READ_PER_MINUTE: '45' }).readPerMinute], [30, 120, 45]);
+});
+
+test('2026-11-26 bundler relay: the block of an owner UserOp\'s receipt is read from the bundler\'s answer (later reads must not be older); anything else is ignored', () => {
+  const receipt = (blockNumber: unknown) => JSON.stringify({ jsonrpc: '2.0', id: 1, result: { userOpHash: '0xabc', success: true, receipt: { transactionHash: '0xdef', blockNumber } } });
+  assert.equal(userOpReceiptBlock(receipt('0x8a2e9d6')), '0x8a2e9d6');
+  // Not mined yet, an error answer, a body that is not JSON, a block that is not a hex quantity: nothing to note.
+  for (const body of [JSON.stringify({ jsonrpc: '2.0', id: 1, result: null }), JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32601, message: 'nope' } }),
+    '<html>502</html>', '', receipt(144894100), receipt('144894100'), receipt('0x'), receipt(null), JSON.stringify([1, 2])]) assert.equal(userOpReceiptBlock(body), null, body);
 });

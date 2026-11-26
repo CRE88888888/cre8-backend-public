@@ -761,6 +761,8 @@ export type RebalanceDeps = {
   belowExecutorMinimum?: (plan: PortfolioPlan) => Promise<boolean>;
   /** Sell all: what the account has posted for Strategy Earn right now (default: one observation of the account). */
   postedShares?: (portfolioId: number) => Promise<NonNullable<PortfolioPlan['snapshot']['strategyEarnCollateral']>>;
+  /** Tests: the pause before a partial sale runs its round once more (PARTIAL_SALE_RETRY_PAUSE_MS). */
+  sleep?: (ms: number) => Promise<void>;
 };
 
 /**
@@ -1398,6 +1400,12 @@ export type RedeemResult = {
    * `sellAllPending` is true. A caller must not read `remainingUsdE8: "0"` alone as "done".
    */
   sellAllDone?: boolean;
+  /**
+   * Partial sale only: this call repaid part of the Strategy Earn debt and took shares back (landed on chain), and the
+   * sale itself has not landed. The account did move: the caller must not tell the owner that nothing was sent. Calling
+   * again sells the shares that are now free; left alone, the scheduler posts them again (PARTIAL_SALE_HOLD_SECONDS).
+   */
+  earnFreed?: true;
 };
 
 /**
@@ -1411,6 +1419,31 @@ export const MIN_SELL_USD_E8 = MIN_BATCH_USDT * 100_000_000n;
  * executor's floor and the fee leave nothing). A remainder smaller than this is never sold on its own.
  */
 export const SELL_MIN_STEP_USD_E8 = 100_000_000n;
+/**
+ * An owner's partial sale is finished inside one call where it can be (2026-11-26, testnet portfolio 55: the take-back
+ * landed, the sale's sponsorship timed out after 5 s, and the app said "nothing was sent"). The round runs again, at
+ * most this many more times, when:
+ *   - shares were repaid and taken back in this call and the sale has not landed (any reason short of "sent, outcome
+ *     unknown"): they are free now, the next round only has to sell them;
+ *   - the send failed before anything was broadcast, or the round could not even read the account ([STRATEGY_UNAVAILABLE]
+ *     before any plan) — once.
+ * Never after a UserOp was accepted (outcome unknown), never when the day's sponsorship is used up.
+ */
+export const PARTIAL_SALE_EXTRA_ROUNDS = 2;
+export const PARTIAL_SALE_RETRY_PAUSE_MS = 1_000;
+/**
+ * Shares a partial sale took back and has not sold yet stay free this long: the scheduler's own round (which would post
+ * them again and borrow) does not come before, so the caller's next call — or the owner pressing sell again — finds them.
+ * After that the scheduler's ordinary round puts the position back as the strategy wants it.
+ */
+export const PARTIAL_SALE_HOLD_SECONDS = 180;
+/** `$1` portfolio id, `$2` seconds: the scheduler's next round comes no sooner than that (a later time already set stays). */
+export const NOT_BEFORE_SQL = "update portfolios set next_run_at = greatest(next_run_at, now() + $2::int * interval '1 second') where id = $1";
+/**
+ * A round's answer that says a repay-and-take-back landed without the sale: the pre-sale step's own note (it could not
+ * free everything the sale needs, or the sale is a full exit), or its failure note naming the transactions that did land.
+ */
+const EARN_FREED = /^\[STRATEGY_EARN_UNWINDING\] 賣出前已還款取回|^\[STRATEGY_EARN_UNWIND_FAILED\].*tx=0x[0-9a-fA-F]{64}/;
 
 export async function runOperatorRedeem(portfolioId: number, wallet: string, amount: RedeemAmount, deps: RebalanceDeps = {}): Promise<RedeemResult> {
   const value = typeof amount === 'bigint' ? amount : amount.sellUsdE8;
@@ -1448,6 +1481,25 @@ async function runOperatorSell(portfolioId: number, wallet: string, request: Sel
   const planning: { result: RedeemPlanningResult | null; first: RedeemPlanningResult | null } = { result: null, first: null };
   // From the first plan of the round only: a second one leaves out shares that stay posted for now (V2UnwindWait).
   let over: boolean | null = null;
+  /** Partial sale: shares this call repaid and took back (a round's `earnFreed`), whatever a later round of it did. */
+  let freed: NonNullable<PortfolioRunResult['earnFreed']> | null = null;
+  /** Partial sale: some round of this call moved the Strategy Earn position on chain (`freed`, or a round that said so itself). */
+  let moved = false;
+  /** The scheduler's own round was already put off for the shares this call took back (once is enough). */
+  let held = false;
+  // As soon as shares are back and unsold: the scheduler's next round (it would post them again) waits, so they are still
+  // free for this call's next round, the app's next call, or the owner pressing sell again.
+  const hold = async () => {
+    if (held) return;
+    try { await query(NOT_BEFORE_SQL, [portfolioId, PARTIAL_SALE_HOLD_SECONDS]); held = true; }
+    catch (error) { (deps.log ?? console.warn)(`[redeem] portfolio ${portfolioId}: next_run_at not moved after the take-back, the scheduler may post the shares again before the next call (${errorChain(error)})`); }
+  };
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  let result: PortfolioRunResult | undefined;
+  // Read through a function: the plan is written by the round's callback, which the compiler does not follow.
+  const lastPlan = (): RedeemPlanningResult | null => planning.result;
+  for (let extra = 0; ; extra++) {
+  planning.result = null;
   const round = await (deps.runSchedulerOnce ?? runSchedulerOnce)(
     // skipKeepers / afterSnapshotInBackground: the owner is waiting for this one sale (see their notes in scheduler.ts).
     { dryRun: false, limit: 1, skipAlerts: true, skipKeepers: true },
@@ -1467,10 +1519,17 @@ async function runOperatorSell(portfolioId: number, wallet: string, request: Sel
     },
   );
   const candidate = round.results[0];
-  const result = candidate?.portfolioId === portfolioId ? candidate : undefined;
-  const details = planning.result;
+  result = candidate?.portfolioId === portfolioId ? candidate : undefined;
+  if (result?.earnFreed !== undefined) freed ??= result.earnFreed;
+  if (result !== undefined && (result.earnFreed !== undefined || result.outcome === 'blocked' && EARN_FREED.test(result.reason))) moved = true;
+  if (!closing && moved && result?.outcome !== 'executed') await hold();
+  if (closing || extra >= PARTIAL_SALE_EXTRA_ROUNDS || !partialSaleRunsAgain(result, { freed: moved, planned: lastPlan() !== null, extra })) break;
+  (deps.log ?? console.info)(`[redeem] portfolio ${portfolioId}: ${moved ? '加息抵押已還款取回、賣出還沒成交' : '這一輪沒送出'}（${result?.reason ?? '未認領'}），同一次請求再跑一輪`);
+  await sleep(PARTIAL_SALE_RETRY_PAUSE_MS);
+  }
+  const details = lastPlan();
   const requested = typeof request === 'bigint' ? request : 'sellUsdE8' in request ? request.sellUsdE8 : details?.portfolioTotalUsdE8 ?? 0n;
-  const outcome = result === undefined || result.portfolioId !== portfolioId ? 'blocked' : operatorOutcome(result);
+  let outcome: OperatorRebalanceOutcome = result === undefined || result.portfolioId !== portfolioId ? 'blocked' : operatorOutcome(result);
   // Sell all: what is left is counted from the whole account (the first plan), less what this round sold. Counting from
   // the second plan answered "0 left" while about 2% of the position was still posted (2026-11-25, portfolio 37), and the
   // app withdrew the USDT the repayment of that rest needed.
@@ -1481,13 +1540,18 @@ async function runOperatorSell(portfolioId: number, wallet: string, request: Sel
   let reason = result?.reason ?? `排程器沒有認領 portfolio ${portfolioId}（排程狀態或 smart account 不允許）`;
   const nothingToSell = whole?.plan.kind === 'noop' && whole.plan.reason === 'nothing to sell';
   if (nothingToSell) reason = 'nothing to sell';
+  // Partial sale: shares were taken back and the sale has not landed. Say so first (the app goes on calling on this
+  // note, and must not report "nothing was sent"); a UserOp whose outcome is unknown keeps its own answer.
+  const stranded = !closing && moved && outcome !== 'executed';
+  if (stranded && freed !== null && result?.execution?.status !== 'unknown' && !EARN_FREED.test(reason)) { outcome = 'blocked'; reason = `${freed.note}；下一輪再賣（這次賣出還沒成交：${reason}）`; }
+  if (stranded) await hold();
   if (outcome === 'executed' || closing && over === true) {
     try {
       if (closing) {
         // Paused once a batch is sold or nothing is left, as before; the request closes when nothing is left.
         await settleSellAll(query, portfolioId, { outcome, over: over === true, tracked });
       } else {
-        await query("update portfolios set next_run_at = greatest(next_run_at, now() + $2::int * interval '1 second') where id = $1", [portfolioId, PARTIAL_FOLLOW_UP_SECONDS]);
+        await query(NOT_BEFORE_SQL, [portfolioId, PARTIAL_FOLLOW_UP_SECONDS]);
       }
     } catch {
       // A successful transaction must stay visible even if the subsequent scheduling write fails.
@@ -1532,7 +1596,21 @@ async function runOperatorSell(portfolioId: number, wallet: string, request: Sel
     // Done: the round found nothing left (`over`), or it sold everything the account held and nothing was posted.
     ...(closing ? { sellAllPending: tracked && over !== true,
       sellAllDone: over === true || outcome === 'executed' && remaining === 0n && posted !== null && (posted as readonly unknown[]).length === 0 } : {}),
+    ...(stranded ? { earnFreed: true as const } : {}),
   };
+}
+
+/** Whether an owner's partial sale runs its round once more inside the same call (see PARTIAL_SALE_EXTRA_ROUNDS). */
+function partialSaleRunsAgain(result: PortfolioRunResult | undefined, at: { freed: boolean; planned: boolean; extra: number }): boolean {
+  if (result === undefined || result.outcome === 'executed') return false;
+  const execution = result.execution;
+  // Accepted by the bundler (or possibly so): reconciled by the next round, never sent again from here.
+  if (execution !== null && (execution.status === 'unknown' || execution.status === 'success' || execution.status === 'error' && (execution.userOpHash !== null || execution.txHash !== null))) return false;
+  if (execution?.errorCode === 'GAS_BUDGET_EXCEEDED' || execution?.errorCode === 'PAYMASTER_QUOTA_EXCEEDED') return false;
+  if (at.freed) return true;
+  if (at.extra > 0) return false;
+  if (execution?.status === 'error') return true;
+  return !at.planned && /^\[STRATEGY_UNAVAILABLE\]/.test(result.reason);
 }
 
 /** A promise that never rejects: lets independent reads start together while each failure still surfaces where it is awaited. */

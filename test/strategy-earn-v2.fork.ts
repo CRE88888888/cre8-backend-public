@@ -934,3 +934,119 @@ test('routing v2 fork, minimum buy: assets that borrow a few USD open, close bef
   assert.equal(await v2AutoRound(await step()), null, 'consent withdrawn: nothing reopens');
   console.log(JSON.stringify({ minBuy: { btcDebt: debtOf('BTCB'), goldDebt: debtOf('XAUt'), usdt: (await bal(v2.loanTokens.USDT!)).toString(), offCalls: names(off.calls, v2), lines: lines.length } }));
 });
+
+/**
+ * 2026-11-26, testnet portfolio 55 (fund "幣圈基礎設施", routing v2, every share posted): a 20 USDT partial sale closed a
+ * whole position, the sale waited for another call, and its send then failed. Here, against the real contracts: the
+ * pre-sale step of a partial sale repays only the share of the debt the sold shares carry and takes back exactly those
+ * shares — the position stays open, no worse than before; a second partial sale right after it does the same; and shares
+ * that were taken back and then NOT sold are posted again by the scheduler's next quiet round.
+ * "Sold" is played by moving the freed shares out of the account (the swap itself is the fund executor's, tested elsewhere).
+ */
+test('routing v2 fork, owner partial sale with every share posted: 20 then 10 USD of one asset come back with their share of the debt, positions stay open; unsold freed shares are posted again', { skip }, async () => {
+  const s = setup(), { v2, reader, client } = s;
+  const X = MIX_ACCOUNT, send = s.sender(X), lines: string[] = [];
+  const BTCB = (T.assets.BTCB.token as string).toLowerCase() as Address, XAUT = (T.assets.XAUt.token as string).toLowerCase() as Address;
+  const pools: Record<string, Address> = { [BTCB]: T.assets.BTCB.pool as Address, [XAUT]: T.assets.XAUt.pool as Address };
+  const SINK = '0x000000000000000000000000000000000000dEaD' as Address;
+  const bal = (token: Address, who: Address = X, blockNumber?: bigint) => client.readContract({ address: token, abi: ERC20, functionName: 'balanceOf', args: [who], ...(blockNumber === undefined ? {} : { blockNumber }) });
+  const move = async (token: Address, from: Address, to: Address, amount: bigint) => { if (amount === 0n) return; const w = await s.from(from); const r = await mined(client, await w.writeContract({ address: token, abi: ERC20, functionName: 'transfer', args: [to, amount], gas: 300_000n })); assert.equal(r.status, 'success'); };
+  const hold = async (token: Address, usd: number) => {
+    await move(token, X, SINK, await bal(token));
+    await move(token, pools[token]!, X, await bal(token, pools[token]!) / 100_000n);
+    const h = (await reader.account(X, [token])).state.holdings.find(x => x.collateral === token)!;
+    const want = h.freeCollateralRaw * BigInt(Math.round(usd * 1e6)) / BigInt(Math.round(h.collateralUsd * 1e6));
+    if (want < h.freeCollateralRaw) await move(token, X, SINK, h.freeCollateralRaw - want); else await move(token, pools[token]!, X, want - h.freeCollateralRaw);
+    return want;
+  };
+  const weights = [{ asset: BTCB, weightBps: 5_000 }, { asset: XAUT, weightBps: 5_000 }];
+  const api = createStrategyEarnV2Api({ v2, reader, now: s.clock, recordRoutes: s.ledger.routes, log: () => {} });
+  const sent: Call[][] = [];
+  const tracked = async (calls: Call[]) => { sent.push(calls); return send(calls); };
+  const step = async (o: object = {}) => ({ v2, reader, account: X, portfolioId: 55, now: await s.now(), dryRun: false, send: tracked, ledger: s.ledger, log: (l: string) => lines.push(l), held: [BTCB, XAUT], ...o });
+  const routeOf = async (symbol: string) => (await reader.account(X, [BTCB, XAUT])).routes.find(r => r.route.symbol === symbol && (r.collateralRaw > 0n || r.routeDebtRaw > 0n));
+  const usd = (raw: bigint) => Number(raw / 10n ** 12n) / 1e6;
+
+  await s.now();
+  for (const token of [v2.loanTokens.USDT!, v2.loanTokens.USD1!, v2.loanTokens.USDC!, v2.loanTokens.U!]) await move(token, X, SINK, await bal(token));
+  mark('partial sale: 50 USD of BTCB + 50 USD of XAUt, consent, the scheduler posts every share');
+  const btc = await hold(BTCB, 50), gold = await hold(XAUT, 50);
+  const auto = await api.auto(X, CANARY, { budgetRaw: 0n, weights, keyReady: true });
+  assert.equal(auto.status, 'ready');
+  if (auto.status !== 'ready') return;
+  await send(auto.calls);
+  assert.match(await v2AutoRound(await step()) ?? '', /open\(best_route\)/);
+  assert.deepEqual([await bal(BTCB), await bal(XAUT)], [0n, 0n], 'every share is posted: the state of a v2 fund after its buy');
+  const before = { btc: (await routeOf('BTCB'))!, gold: (await routeOf('XAUt'))! };
+  assert.ok(before.btc.collateralRaw === btc && before.gold.collateralRaw === gold && before.btc.routeDebtRaw > 0n && before.gold.routeDebtRaw > 0n);
+  await s.local.increaseTime({ seconds: 600 }); await s.local.mine({ blocks: 1 });
+
+  mark('partial sale: sell 20 USD (40% of the BTCB), everything posted');
+  const first = btc * 2n / 5n;
+  sent.length = 0;
+  const freed = await v2UnwindForSale({ ...await step(), steps: [{ tokenIn: BTCB, amountIn: first }], partial: true });
+  assert.ok(freed !== null && typeof freed === 'object' && 'freed' in freed, `the sale goes on in the same round: ${String(freed)}`);
+  assert.deepEqual(sent.map(batch => names(batch, v2)), [['executeReduce']], 'one reduce: no close, no top-up, no cash-out');
+  const reduce = decodeFunctionData({ abi: V2_EXECUTOR_ABI, data: sent[0]![0]!.data }).args as readonly unknown[];
+  assert.ok(reduce[3] !== maxUint256 && reduce[4] === first, 'an explicit share of the debt and exactly the shares the sale is short of');
+  const after1 = { btc: (await routeOf('BTCB'))!, gold: (await routeOf('XAUt'))! };
+  assert.deepEqual([await bal(BTCB), after1.btc.collateralRaw], [first, btc - first], 'exactly the sold shares are free; the rest is still posted');
+  // About 40% of the debt was repaid (2% more than pro rata, plus whatever interest accrued), never all of it.
+  const repaid1 = before.btc.routeDebtRaw - after1.btc.routeDebtRaw;
+  assert.ok(repaid1 * 100n >= before.btc.routeDebtRaw * 39n && repaid1 * 100n <= before.btc.routeDebtRaw * 43n, `repaid ${usd(repaid1)} of ${usd(before.btc.routeDebtRaw)}`);
+  assert.ok(after1.btc.routeDebtRaw > 0n, 'the position stays open');
+  // Health is not worse: debt per posted share did not rise.
+  assert.ok(after1.btc.routeDebtRaw * before.btc.collateralRaw <= before.btc.routeDebtRaw * after1.btc.collateralRaw, 'debt ÷ collateral did not rise');
+  // The other asset was not touched at all.
+  assert.deepEqual([after1.gold.collateralRaw, await bal(XAUT)], [gold, 0n]);
+  assert.ok(after1.gold.routeDebtRaw >= before.gold.routeDebtRaw, 'only interest moved the other position');
+  // What the sale reads next must not be older than the block the take-back landed in: one block earlier the shares are
+  // still posted and the account holds none (the stale read a lagging node would give).
+  assert.equal(await bal(BTCB, X, freed.block), first);
+  assert.equal(await bal(BTCB, X, freed.block - 1n), 0n, 'a read one block before `block` still sees nothing free');
+  // The strategy's own money: what left the vault is what was repaid (nothing was cashed out or left idle in the account).
+  const read1 = await reader.account(X, [BTCB, XAUT]);
+  for (const [symbol, t] of Object.entries(read1.tokens)) if (symbol !== 'USDT') assert.ok(t.cashRaw < V2_CASH_OUT_ALONE_MIN_RAW, `${symbol} in the account: ${t.cashRaw}`);
+  await move(BTCB, X, SINK, first); // the sale
+
+  mark('partial sale: at once another 10 USD of the same asset');
+  const second = btc / 5n;
+  sent.length = 0;
+  const again = await v2UnwindForSale({ ...await step(), steps: [{ tokenIn: BTCB, amountIn: second }], partial: true });
+  assert.ok(again !== null && typeof again === 'object' && 'freed' in again, String(again));
+  assert.ok(again.block > freed.block);
+  assert.deepEqual(sent.map(batch => names(batch, v2)), [['executeReduce']]);
+  const after2 = (await routeOf('BTCB'))!;
+  assert.deepEqual([await bal(BTCB), after2.collateralRaw], [second, btc - first - second]);
+  assert.ok(after2.routeDebtRaw > 0n && after2.routeDebtRaw < after1.btc.routeDebtRaw);
+  assert.ok(after2.routeDebtRaw * after1.btc.collateralRaw <= after1.btc.routeDebtRaw * after2.collateralRaw, 'debt ÷ collateral did not rise');
+  assert.equal(await v2UnwindForSale({ ...await step(), steps: [{ tokenIn: BTCB, amountIn: second }], partial: true }), null, 'the shares are free now: a repeated call has nothing to take back');
+  await move(BTCB, X, SINK, second); // the second sale
+  // The quiet round after the sales: nothing to do — the position was left at its ratio, not below the top-up threshold.
+  const quiet = await v2AutoRound(await step());
+  assert.ok(quiet === null || !/BTCB/.test(quiet), `no BTCB move after a clean partial sale: ${quiet}`);
+  assert.equal((await routeOf('BTCB'))!.collateralRaw, btc - first - second);
+
+  mark('partial sale: shares taken back and never sold are posted again by the next quiet round');
+  const third = gold / 2n;
+  const stranded = await v2UnwindForSale({ ...await step(), steps: [{ tokenIn: XAUT, amountIn: third }], partial: true });
+  assert.ok(stranded !== null && typeof stranded === 'object' && 'freed' in stranded, String(stranded));
+  const halfway = (await routeOf('XAUt'))!;
+  assert.deepEqual([await bal(XAUT), halfway.collateralRaw], [third, gold - third]);
+  // The sale never happens (its send failed and the owner went away). The scheduler's round puts the position back.
+  const restored = await v2AutoRound(await step());
+  assert.match(restored ?? '', /XAUt open\(top_up\)/, String(restored));
+  const back = (await routeOf('XAUt'))!;
+  assert.deepEqual([await bal(XAUT), back.collateralRaw], [0n, gold], 'every share is posted again');
+  assert.ok(back.routeDebtRaw > halfway.routeDebtRaw, 'and borrowed against again');
+
+  mark('partial sale: a sale of everything that is left still closes clean');
+  const rest = btc - first - second;
+  const closing = await v2UnwindForSale({ ...await step(), steps: [{ tokenIn: BTCB, amountIn: rest }, { tokenIn: XAUT, amountIn: gold }], exit: true });
+  assert.match(String(closing ?? ''), /\[STRATEGY_EARN_UNWINDING\] 賣出前已還款取回/);
+  const end = await reader.account(X, [BTCB, XAUT]);
+  assert.equal(end.routes.filter(r => r.collateralRaw > 0n || r.routeDebtRaw > 0n).length, 0, String(closing));
+  assert.deepEqual([await bal(BTCB), await bal(XAUT)], [rest, gold]);
+  console.log(JSON.stringify({ partialSale: { debtBefore: usd(before.btc.routeDebtRaw), afterFirst: usd(after1.btc.routeDebtRaw), afterSecond: usd(after2.routeDebtRaw), goldHalfway: usd(halfway.routeDebtRaw), goldRestored: usd(back.routeDebtRaw),
+    notes: [freed.freed, again.freed, stranded.freed].map(n => n.replace(/ tx=.*/, '')) } }));
+});

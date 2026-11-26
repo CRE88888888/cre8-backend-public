@@ -62,6 +62,9 @@ test('scheduler never quotes or sends pending/exited/missing-state mixes, and DB
     const result = await runSchedulerOnce({ dryRun: false, now: mixClock, skipAlerts: true }, f.deps);
     assert.ok(['noop','blocked'].includes(result.results[0]?.outcome ?? ''));
     assert.doesNotMatch(result.results[0]?.reason ?? '', /credential/);
+    // 2026-11-26: an account that could not be read has nothing in flight and sent nothing — the reason must not say
+    // "reconcile first" (the app showed "an earlier trade is still being confirmed" for a plain read timeout).
+    if (mode === 'rpc') { assert.match(result.results[0]?.reason ?? '', /^\[STRATEGY_UNAVAILABLE\] 帳戶的鏈上資料這一輪沒讀完，沒有規劃也沒有送出/); assert.doesNotMatch(result.results[0]?.reason ?? '', /先對帳|結果未知/); }
     assert.deepEqual(f.counts(), { quotes: 0, sends: 0, writes: mode === 'pending' ? 1 : 0 });
   }
 });

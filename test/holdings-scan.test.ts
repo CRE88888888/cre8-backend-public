@@ -6,6 +6,7 @@ import {
   addressTopic,
   DEFAULT_CHUNK_SIZE,
   findDeploymentBlock,
+  formatScanLog,
   formatScanStatus,
   loadCandidates,
   loadCursor,
@@ -15,7 +16,7 @@ import {
   scanPortfolioHoldings,
   touchCandidates,
 } from '../src/holdings-scan.js';
-import type { QueryFn, ScanCursor } from '../src/holdings-scan.js';
+import type { QueryFn, ScanCursor, ScanStats } from '../src/holdings-scan.js';
 
 /**
  * `src/holdings-scan.ts` 的測試：鏈用 stub、游標用真的 Postgres。
@@ -375,6 +376,46 @@ test('scanPortfolioHoldings：這一輪 getLogs 失敗 → universeComplete fals
   assert.equal(writes.length, 0, '失敗時不寫游標（連失敗前已成功的塊也不寫）');
   assert.equal(result.cursor.lastScannedBlock, 9_400n);
   assert.match(formatScanStatus(result).join('\n'), /宇宙完整性\s+⚠ 未確認/);
+});
+
+test('holdings_scan log：掃描回報游標、缺口、掃到哪、為什麼停；平常的一輪不出聲；失敗原因遮掉網址', async () => {
+  // 游標落後 5,000 塊（3 段），第 2 段失敗。
+  const chain = stubChain({ head: 10_000n, codeFrom: new Map([[ACCOUNT.toLowerCase(), 100n]]), failingRanges: [{ fromBlock: 7_500n, toBlock: 7_600n }] });
+  const { query: q } = fakeQuery([{ start_block: '100', last_scanned_block: '5000' }]);
+  let stats: ScanStats | null = null;
+  const result = await scanPortfolioHoldings({ client: stubClient(chain), query: q, portfolioId: 7, account: ACCOUNT, knownTokens: [], head: 10_000n,
+    onScan: (reported) => { stats = reported; } });
+  assert.ok(stats !== null);
+  const reported = stats as ScanStats;
+  assert.deepEqual({ ...reported, scanMs: 0 }, { cursorBefore: 5_000n, head: 10_000n, chunkSize: 2_000n, asked: { fromBlock: 5_001n, toBlock: 10_000n },
+    coveredTo: 7_000n, failedRange: { fromBlock: 7_001n, toBlock: 9_000n }, failure: 'getLogs [7001, 9000] 失敗：模擬 403 Archive requests（getLogs [7001, 9000]）', scanMs: 0 });
+  const entry = formatScanLog({ portfolioId: 7, personalMix: true, stats: reported, cursorAfter: result.cursor.lastScannedBlock, ms: 30_565,
+    flowSyncs: [{ via: 'catchup', fromBlock: 5_001n, toBlock: 10_000n, ms: 12_000.4, failure: null }] });
+  assert.equal(entry?.level, 'warn');
+  assert.deepEqual(JSON.parse(entry?.line ?? ''), { msg: 'holdings_scan', portfolio: 7, mix: true, ms: 30_565, head: '10000', cursor: '5000', cursorAfter: '5000',
+    gapBlocks: '5000', chunks: 3, chunksOk: 1, scanMs: reported.scanMs, failedRange: ['7001', '9000'], failure: reported.failure,
+    flowSyncs: [{ via: 'catchup', from: '5001', to: '10000', ms: 12_000, failure: null }] });
+
+  // 平常的一輪（一段以內、沒失敗、不慢）不寫 log；慢、缺口超過一段、或現金流同步失敗才寫。
+  const quiet: ScanStats = { cursorBefore: 9_000n, head: 10_000n, chunkSize: 2_000n, asked: { fromBlock: 9_001n, toBlock: 10_000n }, coveredTo: 10_000n, failedRange: null, failure: null, scanMs: 40 };
+  assert.equal(formatScanLog({ portfolioId: 7, personalMix: true, stats: quiet, cursorAfter: 10_000n, flowSyncs: [], ms: 300 }), null);
+  assert.equal(formatScanLog({ portfolioId: 7, personalMix: false, stats: { ...quiet, asked: null, coveredTo: null }, cursorAfter: 10_000n, flowSyncs: [], ms: 300 }), null);
+  assert.equal(formatScanLog({ portfolioId: 7, personalMix: true, stats: quiet, cursorAfter: 10_000n, flowSyncs: [], ms: 2_000 })?.level, 'info');
+  assert.equal(formatScanLog({ portfolioId: 7, personalMix: true, stats: { ...quiet, cursorBefore: 7_999n, asked: { fromBlock: 8_000n, toBlock: 10_000n } }, cursorAfter: 10_000n, flowSyncs: [], ms: 300 })?.level, 'info');
+  const syncFailed = formatScanLog({ portfolioId: 7, personalMix: true, stats: null, cursorAfter: null, ms: 300,
+    flowSyncs: [{ via: 'advance', fromBlock: 9_001n, toBlock: 10_000n, ms: 250, failure: 'HttpRequestError: HTTP request failed. | URL: <url>' }] });
+  assert.equal(syncFailed?.level, 'warn');
+  assert.equal((JSON.parse(syncFailed?.line ?? '') as { scan: string }).scan, 'not reported');
+
+  // RPC 的錯誤訊息會帶網址（可能含 key）：進 log 前遮掉、壓成一行、截短。
+  const leaking = stubClient(stubChain({ head: 10_000n, codeFrom: new Map([[ACCOUNT.toLowerCase(), 100n]]) }));
+  (leaking as unknown as { request: unknown }).request = async () => { throw new Error(`HTTP request failed.\nURL: https://rpc.invalid/v1/secret-key-value\n${'x'.repeat(900)}`); };
+  let leaked: ScanStats | null = null;
+  await scanPortfolioHoldings({ client: leaking, query: fakeQuery([{ start_block: '100', last_scanned_block: '9400' }]).query, portfolioId: 7, account: ACCOUNT, knownTokens: [],
+    head: 10_000n, onScan: (reported) => { leaked = reported; } });
+  const failure = (leaked as ScanStats | null)?.failure ?? '';
+  assert.match(failure, /^getLogs \[9401, 10000\] 失敗：HTTP request failed\. URL: <url> x+$/);
+  assert.ok(!failure.includes('secret-key-value') && failure.length <= 300);
 });
 
 test('scanPortfolioHoldings：新游標從部署塊開始（知道部署塊才有機會讓 universeComplete 為 true）', async () => {

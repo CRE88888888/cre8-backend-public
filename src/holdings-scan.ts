@@ -563,8 +563,72 @@ export async function touchCandidates(
 // 一輪掃描
 // ---------------------------------------------------------------------------
 
+/**
+ * What one round's log scan was asked and how far it got. Diagnostics only (the `holdings_scan` log line of
+ * snapshot.ts): nothing here feeds a decision. 2026-11-25: a private basket's plan took 30 s every round and nothing
+ * said whether the cursor moved, where the scan stopped or why.
+ */
+export type ScanStats = {
+  /** `last_scanned_block` before this round (`start_block - 1` for a new cursor). */
+  cursorBefore: bigint;
+  head: bigint;
+  chunkSize: bigint;
+  /** null = the cursor was already at head: nothing to scan. */
+  asked: { fromBlock: bigint; toBlock: bigint } | null;
+  /** Last block of the contiguous part that was read; null = not one chunk succeeded. */
+  coveredTo: bigint | null;
+  failedRange: { fromBlock: bigint; toBlock: bigint } | null;
+  /** The failure as it goes to a log: URLs masked (an RPC URL can carry a key), one line, capped. */
+  failure: string | null;
+  scanMs: number;
+};
+
+/** One line, URLs masked, capped: safe for a log. */
+export function scanFailureForLog(text: string): string {
+  return text.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'`)]+/gi, '<url>').replace(/\s+/g, ' ').trim().slice(0, 300);
+}
+
+/** One cash-flow sync of a private basket inside a plan: `advance` = before the cursor write, `catchup` = the cursor stayed behind head. */
+export type FlowSyncStat = { via: 'advance' | 'catchup'; fromBlock: bigint; toBlock: bigint; ms: number; failure: string | null };
+export const SCAN_LOG_SLOW_MS = 2_000;
+
+/**
+ * The `holdings_scan` log line of one plan, or null when there is nothing to say (the usual round: at most one chunk,
+ * no failure, fast). Block numbers, counts, durations and a masked failure only: no key, no URL.
+ * `cursorAfter`: `last_scanned_block` when the scan returned; null when it threw (nothing is known to have moved).
+ */
+export function formatScanLog(args: { portfolioId: number; personalMix: boolean; stats: ScanStats | null; cursorAfter: bigint | null;
+  flowSyncs: readonly FlowSyncStat[]; ms: number }): { level: 'info' | 'warn'; line: string } | null {
+  const { stats } = args;
+  const failed = stats?.failure != null || args.flowSyncs.some((sync) => sync.failure !== null);
+  const gap = stats === null || stats.asked === null ? 0n : stats.asked.toBlock - stats.asked.fromBlock + 1n;
+  if (!failed && args.ms < SCAN_LOG_SLOW_MS && (stats === null || gap <= stats.chunkSize)) return null;
+  const chunks = (blocks: bigint) => (stats === null || blocks <= 0n ? 0 : Number((blocks + stats.chunkSize - 1n) / stats.chunkSize));
+  const line = JSON.stringify({
+    msg: 'holdings_scan',
+    portfolio: args.portfolioId,
+    mix: args.personalMix,
+    ms: Math.round(args.ms),
+    ...(stats === null ? { scan: 'not reported' } : {
+      head: stats.head.toString(),
+      cursor: stats.cursorBefore.toString(),
+      cursorAfter: args.cursorAfter === null ? null : args.cursorAfter.toString(),
+      gapBlocks: gap.toString(),
+      chunks: chunks(gap),
+      chunksOk: stats.asked === null || stats.coveredTo === null ? 0 : chunks(stats.coveredTo - stats.asked.fromBlock + 1n),
+      scanMs: stats.scanMs,
+      failedRange: stats.failedRange === null ? null : [stats.failedRange.fromBlock.toString(), stats.failedRange.toBlock.toString()],
+      failure: stats.failure,
+    }),
+    flowSyncs: args.flowSyncs.map((sync) => ({ via: sync.via, from: sync.fromBlock.toString(), to: sync.toBlock.toString(), ms: Math.round(sync.ms), failure: sync.failure })),
+  });
+  return { level: failed ? 'warn' : 'info', line };
+}
+
 export type ScanDeps = {
   beforeAdvance?: (range: { fromBlock: bigint; toBlock: bigint }) => Promise<void>;
+  /** Called once, right after the log scan (before balances, `beforeAdvance` and the cursor write). */
+  onScan?: (stats: ScanStats) => void;
   client: PublicClient;
   query: QueryFn;
   portfolioId: number;
@@ -599,6 +663,7 @@ export async function scanPortfolioHoldings(deps: ScanDeps): Promise<HoldingScan
     existing ?? { portfolioId: deps.portfolioId, startBlock: deployment.block ?? block, lastScannedBlock: (deployment.block ?? block) - 1n };
 
   const fromBlock = cursor.lastScannedBlock + 1n;
+  const scanStarted = performance.now();
   const scan =
     fromBlock > block
       ? null
@@ -608,6 +673,16 @@ export async function scanPortfolioHoldings(deps: ScanDeps): Promise<HoldingScan
           toBlock: block,
           chunkSize: deps.chunkSize,
         });
+  deps.onScan?.({
+    cursorBefore: cursor.lastScannedBlock,
+    head: block,
+    chunkSize: deps.chunkSize ?? DEFAULT_CHUNK_SIZE,
+    asked: scan === null ? null : { fromBlock, toBlock: block },
+    coveredTo: scan?.coveredRange?.toBlock ?? null,
+    failedRange: scan?.failedRange ?? null,
+    failure: scan?.failure == null ? null : scanFailureForLog(scan.failure),
+    scanMs: Math.round(performance.now() - scanStarted),
+  });
 
   const known = new Set(deps.knownTokens.map((token) => token.toLowerCase()));
 

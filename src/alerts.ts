@@ -558,11 +558,23 @@ export const ROUND_OUTCOME_TTL_MS = 2 * 60 * 60_000;
 const WAITING = /\[(MARKET_CLOSED|BASKET_WAITING|DEFERRED_MIN_ASSET|NO_DUE_SLOT|SLOT_RECORDED|BELOW_MIN_STEP|BELOW_MIN_BATCH|BELOW_MIN_DEPOSIT|[A-Z_]*BUDGET[A-Z_]*)\]|低於最小交易額|低於批次最小額|低於執行器最小步|下一次再平衡為/;
 const roundOutcomes = new Map<number, { outcome: string; reason: string; at: number }>();
 /**
+ * Rounds that never looked at the portfolio: the shared DEX lane or the portfolio's own lock was taken, or the round was
+ * blocked whole because the executor's pause flag could not be read. Nothing was read and nothing was decided, so such
+ * a round says nothing new about the portfolio: the word of the last round that did look stays, with its own time
+ * (it still expires after ROUND_OUTCOME_TTL_MS, so a portfolio nobody has looked at for two hours alerts as before).
+ * 2026-11-25: portfolio 7 (waiting for its 2026-12-21 rebalance) went critical at 17:42 and 19:06 UTC, each time right
+ * after such a round replaced `下一次再平衡為 …` (17:42 [EXECUTOR_PAUSE_UNAVAILABLE] during an RPC outage, 19:06
+ * [DEX_QUEUED] in the first rounds after a restart), and cleared when its next real round said the date again.
+ */
+const NOT_EXAMINED = /^\[(DEX_QUEUED|PORTFOLIO_LOCK_BUSY|EXECUTOR_PAUSE_UNAVAILABLE)\]/;
+/**
  * The scheduler reports every portfolio it processes (same process as the alert evaluation). The heartbeat saves the map
  * every round and a new process takes it back at start (roundOutcomeSnapshot / restoreRoundOutcomes), so alerts keep
  * their reasons across a restart; anything older than the TTL still falls back to the strict form.
  */
 export function noteRoundOutcome(portfolioId: number, outcome: string, reason: string | undefined, now: Date): void {
+  const last = roundOutcomes.get(portfolioId);
+  if (outcome === 'blocked' && NOT_EXAMINED.test(reason ?? '') && last !== undefined && now.getTime() - last.at <= ROUND_OUTCOME_TTL_MS) return;
   roundOutcomes.set(portfolioId, { outcome, reason: reason ?? '', at: now.getTime() });
 }
 export const resetRoundOutcomes = () => roundOutcomes.clear();

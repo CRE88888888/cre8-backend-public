@@ -10,8 +10,9 @@ import { getConfig } from './config.js';
 import { query as dbQuery } from './db.js';
 import { computeDrift } from './drift.js';
 import type { DriftReport, Holding, TargetWeight } from './drift.js';
-import { scanPortfolioHoldings } from './holdings-scan.js';
-import type { HoldingScanResult } from './holdings-scan.js';
+import { formatScanLog, scanFailureForLog, scanPortfolioHoldings } from './holdings-scan.js';
+import type { FlowSyncStat, HoldingScanResult, ScanStats } from './holdings-scan.js';
+import { errorChain } from './errors.js';
 import type { PriceableAsset, PositionSnapshot, PriceTokenFn } from './positions.js';
 import { readPositions } from './positions.js';
 
@@ -548,7 +549,33 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
   if (v2Posted !== null) {
     for (const c of v2Posted) { const had = strategyEarn.find(x => x.asset === c.asset); if (had) had.amount += c.amount; else strategyEarn.push(c); }
   }
-  const [snapshot, scan, lending] = await Promise.all([
+  // The `holdings_scan` log line: where the log scan and the private basket's cash-flow sync started, how far they got,
+  // how long they took and why they stopped (2026-11-25: portfolio 7 planned for 30 s every round and no line said why).
+  const scanStarted = performance.now();
+  let scanStats: ScanStats | null = null;
+  let cursorAfter: bigint | null = null;
+  const flowSyncs: FlowSyncStat[] = [];
+  const syncFlows = async (via: FlowSyncStat['via'], range: { fromBlock: bigint; toBlock: bigint }): Promise<void> => {
+    const started = performance.now();
+    let failure: string | null = null;
+    try {
+      const { syncMixFlowRange } = await import('./mix-flows.js');
+      await syncMixFlowRange(client, portfolioId, range);
+    } catch (error) {
+      failure = scanFailureForLog(errorChain(error));
+      throw error;
+    } finally {
+      flowSyncs.push({ via, ...range, ms: performance.now() - started, failure });
+    }
+  };
+  const logScan = (): void => {
+    if (deps.observeOnly === true) return;
+    const entry = formatScanLog({ portfolioId, personalMix, stats: scanStats, cursorAfter, flowSyncs, ms: performance.now() - scanStarted });
+    if (entry !== null) (entry.level === 'warn' ? console.warn : console.info)(entry.line);
+  };
+  let observed: [PositionSnapshot, HoldingScanResult, YieldRead | null];
+  try {
+  observed = await Promise.all([
     readPositions(client, {
       portfolioId,
       account,
@@ -566,10 +593,8 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
       ...(personalMix ? { priceSource: 'oracle' as const } : {}),
     }),
     deps.observeOnly === true ? Promise.resolve(unscanned(portfolioId, block)) : scanPortfolioHoldings({
-      ...(personalMix ? { beforeAdvance: async (range: { fromBlock: bigint; toBlock: bigint }) => {
-        const { syncMixFlowRange } = await import('./mix-flows.js');
-        await syncMixFlowRange(client, portfolioId, range);
-      } } : {}),
+      ...(personalMix ? { beforeAdvance: (range: { fromBlock: bigint; toBlock: bigint }) => syncFlows('advance', range) } : {}),
+      onScan: (stats) => { scanStats = stats; },
       client,
       query,
       portfolioId,
@@ -580,12 +605,16 @@ export async function planPortfolio(portfolioId: number, deps: PlanDeps = {}): P
     }),
     yieldRead,
   ]);
+  cursorAfter = deps.observeOnly === true ? null : observed[1].cursor.lastScannedBlock;
 
-  if (personalMix && deps.observeOnly !== true && (scan.scannedRange === null || scan.cursor.lastScannedBlock < block)) {
-    const { syncMixFlowRange } = await import('./mix-flows.js');
-    const fromBlock = scan.cursor.lastScannedBlock < block ? scan.cursor.lastScannedBlock + 1n : block;
-    await syncMixFlowRange(client, portfolioId, { fromBlock, toBlock: block });
+  if (personalMix && deps.observeOnly !== true && (observed[1].scannedRange === null || observed[1].cursor.lastScannedBlock < block)) {
+    const fromBlock = observed[1].cursor.lastScannedBlock < block ? observed[1].cursor.lastScannedBlock + 1n : block;
+    await syncFlows('catchup', { fromBlock, toBlock: block });
   }
+  } finally {
+    logScan();
+  }
+  const [snapshot, scan, lending] = observed;
 
   if (personalMix) {
     const { verifyMixBlock } = await import('./mix-flows.js');

@@ -159,6 +159,56 @@ test('drift alert: a basket waiting for its own scheduled rebalance date reports
   assert.deepEqual((await detectPortfolioStuck(stuckRows([drift(7)]), 6, due)).map(f => [f.portfolioId, f.severity]), [[7, 'warn']]);
 });
 
+test('a round that never looked at the portfolio (lane busy, lock busy, pause flag unreadable) keeps the last real word, across a restart too; a failed round, a passed date or two hours without a real look report as before', async () => {
+  const drift = (id: number, hours = 102.1) => ({ portfolio_id: id, hours_since: hours, gross_drift_bps: 1882 });
+  const severities = async (ids: number[], at: Date) => (await detectPortfolioStuck(stuckRows(ids.map(id => drift(id))), 6, at)).map(f => [f.portfolioId, f.severity]);
+  const DEX = '[DEX_QUEUED] 共用市場正處理另一基金，稍後重報價';
+  // The previous process: portfolio 7 waits for 2026-12-21, 8's date has passed, 9's last round failed. Then a deploy.
+  noteRoundOutcome(7, 'noop', '下一次再平衡為 2026-12-21T00:00:00.000Z。', NOW);
+  noteRoundOutcome(8, 'noop', '下一次再平衡為 2026-11-24T13:29:59.000Z。', NOW);
+  noteRoundOutcome(9, 'failed', 'send failed', NOW);
+  const saved = JSON.parse(JSON.stringify(roundOutcomeSnapshot(NOW))) as unknown;
+  resetRoundOutcomes();
+  const started = new Date(NOW.getTime() + 60_000);
+  assert.equal(restoreRoundOutcomes(saved, started), 3);
+  assert.deepEqual(await severities([7, 8, 9, 10], started), [[8, 'warn'], [9, 'critical'], [10, 'critical']]);
+  // The first rounds of the new process find the lane taken (2026-11-25 19:05 UTC): nothing was looked at.
+  const queued = new Date(started.getTime() + 4 * 60_000);
+  for (const reason of [DEX, '[DEX_QUEUED] 共用市場仍有未知操作，等待對帳', '[PORTFOLIO_LOCK_BUSY] 投組已被另一輪鎖定，這一輪不規劃、不送交易',
+    '[EXECUTOR_PAUSE_UNAVAILABLE] 讀不到 executor.globalPaused()，這一輪全部 blocked，不送交易']) {
+    for (const id of [7, 8, 9, 10]) noteRoundOutcome(id, 'blocked', reason, queued);
+    assert.equal(scheduledRebalanceAhead(7, queued)?.toISOString(), '2026-12-21T00:00:00.000Z');
+    // 7 stays silent; the passed date, the failed round and the portfolio nobody ever looked at are still reported.
+    assert.deepEqual(await severities([7, 8, 9, 10], queued), [[8, 'warn'], [9, 'critical'], [10, 'critical']]);
+  }
+  // The heartbeat keeps saving the real word with its own time, so the next restart has it too.
+  assert.deepEqual(roundOutcomeSnapshot(queued)[7], { outcome: 'noop', reason: '下一次再平衡為 2026-12-21T00:00:00.000Z。', at: NOW.toISOString() });
+  // Any other blocked round did look and replaces it, as before.
+  noteRoundOutcome(7, 'blocked', '[STRATEGY_EXECUTION_UNAVAILABLE] 無法確認執行結果', queued);
+  assert.deepEqual(await severities([7], queued), [[7, 'critical']]);
+  // A real round says the date again, then that round fails: critical.
+  noteRoundOutcome(7, 'noop', '下一次再平衡為 2026-12-21T00:00:00.000Z。', queued);
+  assert.deepEqual(await severities([7], queued), []);
+  noteRoundOutcome(7, 'failed', 'send failed', queued); noteRoundOutcome(7, 'blocked', DEX, queued);
+  assert.deepEqual(await severities([7], queued), [[7, 'critical']]);
+  // Nobody has really looked for longer than the TTL (the lane never frees): the old word no longer counts.
+  resetRoundOutcomes();
+  noteRoundOutcome(7, 'noop', '下一次再平衡為 2026-12-21T00:00:00.000Z。', NOW);
+  const stale = new Date(NOW.getTime() + ROUND_OUTCOME_TTL_MS + 1);
+  noteRoundOutcome(7, 'blocked', DEX, new Date(stale.getTime() - 60_000));
+  assert.deepEqual(await severities([7], new Date(stale.getTime() - 60_000)), []);
+  assert.deepEqual(await severities([7], stale), [[7, 'critical']]);
+  noteRoundOutcome(7, 'blocked', DEX, stale);
+  assert.equal(roundOutcomeSnapshot(stale)[7]?.reason, DEX);
+  assert.deepEqual(await severities([7], stale), [[7, 'critical']]);
+  // The date itself arrives while the lane is taken: reported (the wait is over).
+  resetRoundOutcomes();
+  const due = new Date('2026-12-21T00:00:01Z');
+  noteRoundOutcome(7, 'noop', '下一次再平衡為 2026-12-21T00:00:00.000Z。', new Date(due.getTime() - 60_000));
+  noteRoundOutcome(7, 'blocked', DEX, due);
+  assert.deepEqual(await severities([7], due), [[7, 'warn']]);
+});
+
 test('PegExceeded on a top-up or a cash-out is a critical alert on that portfolio while it keeps happening; it joins a drift alert on the same portfolio and resolves once it has not been seen for two hours', async () => {
   const { detectAlerts, noteStrategyPegExceeded, resetStrategyPegSightings, strategyPegFindings, STRATEGY_PEG_TTL_MS } = await import('../src/alerts.js');
   resetStrategyPegSightings();

@@ -503,7 +503,19 @@ test('getLogs 失敗 → universe_complete=false、游標一格都不動、不 b
     failingRanges: [{ fromBlock: DEPLOYMENT, toBlock: BLOCK }],
   });
   const db = stubDb();
-  const result = await plan({ chain, db });
+  // 掃描失敗要留下一行 holdings_scan log（游標在哪、缺口多大、停在哪、為什麼）；成功的一般輪次不寫。
+  const warned: string[] = [];
+  const warn = console.warn;
+  console.warn = (line: unknown) => { warned.push(String(line)); };
+  let result: Awaited<ReturnType<typeof plan>>;
+  try { result = await plan({ chain, db }); } finally { console.warn = warn; }
+  const logged = warned.map((line) => { try { return JSON.parse(line) as Record<string, unknown>; } catch { return {}; } }).filter((line) => line.msg === 'holdings_scan');
+  assert.equal(logged.length, 1);
+  assert.deepEqual({ ...logged[0], ms: 0, scanMs: 0 }, { msg: 'holdings_scan', portfolio: PORTFOLIO_ID, mix: false, ms: 0, head: BLOCK.toString(),
+    cursor: (DEPLOYMENT - 1n).toString(), cursorAfter: (DEPLOYMENT - 1n).toString(), gapBlocks: (BLOCK - DEPLOYMENT + 1n).toString(),
+    chunks: Number((BLOCK - DEPLOYMENT + 2_000n) / 2_000n), chunksOk: 0, scanMs: 0,
+    failedRange: [DEPLOYMENT.toString(), (DEPLOYMENT + 1_999n > BLOCK ? BLOCK : DEPLOYMENT + 1_999n).toString()], failure: logged[0]?.failure, flowSyncs: [] });
+  assert.match(String(logged[0]?.failure), /^getLogs \[\d+, \d+\] 失敗/);
 
   assert.match(result.scan.incompleteReasons.join('；'), /getLogs/);
   assert.equal(result.scan.universeComplete, false);

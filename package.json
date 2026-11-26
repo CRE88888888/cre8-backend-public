@@ -17,7 +17,7 @@
     "price-keeper": "bun scripts/price-keeper.ts"
   },
   "dependencies": {
-    "@scure/bip32": "1.7.0",
+    "@scure/bip32": "2.4.0",
     "@zerodev/ecdsa-validator": "^5.4.9",
     "@zerodev/permissions": "5.5.11",
     "@zerodev/sdk": "5.5.12",

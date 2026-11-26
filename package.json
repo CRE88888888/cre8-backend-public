@@ -19,14 +19,14 @@
   "dependencies": {
     "@scure/bip32": "1.7.0",
     "@zerodev/ecdsa-validator": "^5.4.9",
-    "@zerodev/permissions": "5.5.11",
+    "@zerodev/permissions": "5.6.5",
     "@zerodev/sdk": "5.5.12",
     "dotenv": "^18.0.10",
     "fast-xml-parser": "5.12.1",
-    "jose": "6.2.17",
+    "jose": "6.2.18",
     "pg": "^8.23.1",
     "tslib": "^2.9.1",
-    "viem": "^2.57.17"
+    "viem": "^2.58.4"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",

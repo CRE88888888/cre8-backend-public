@@ -838,3 +838,99 @@ for (const [kind, loan] of [['fund', 'USD1'], ['mix', 'USDT'], ['mix', 'USD1'], 
       turnOff: { debtLeftAfterOwner: leftB.routeDebtRaw.toString(), needUsdt: need.toString(), raised: raise.toString(), booked: booked.map(b => `${b.kind}:${b.usdtRaw}`) } }));
   });
 }
+
+/**
+ * 2026-11-26, the minimum buy (50 USDT). The engine used to open nothing that would borrow under 10 USD, so a 50 USDT buy
+ * over two assets (25 each, ratio 20–35%: 5.00 and 8.75) was answered "unavailable" although the app offered the strategy.
+ * The floor is 1 USD now (the venue's own minimum loan, lens `minLoan`, is 0 on chain 97). Here: about 25 USD of XAUt and
+ * 6 USD of BTCB (a loan of about 1.20: just over the floor) — both open, both close before a sale with every share back,
+ * both open again, and the owner's turn-off a day later leaves no debt, no box money and no loan token worth selling.
+ * An asset under the floor (4 USD of BTCB: a 0.80 loan) is refused as `too_small`, not as temporarily unavailable.
+ */
+test('routing v2 fork, minimum buy: assets that borrow a few USD open, close before a sale, reopen and are turned off clean; under 1 USD is too_small', { skip }, async () => {
+  const s = setup(), { v2, reader, client } = s;
+  const X = MIX_ACCOUNT, send = s.sender(X), lines: string[] = [];
+  const BTCB = (T.assets.BTCB.token as string).toLowerCase() as Address, XAUT = (T.assets.XAUt.token as string).toLowerCase() as Address;
+  const pools: Record<string, Address> = { [BTCB]: T.assets.BTCB.pool as Address, [XAUT]: T.assets.XAUt.pool as Address };
+  const SINK = '0x000000000000000000000000000000000000dEaD' as Address;
+  const bal = (token: Address, who: Address = X) => client.readContract({ address: token, abi: ERC20, functionName: 'balanceOf', args: [who] });
+  const move = async (token: Address, from: Address, to: Address, amount: bigint) => { if (amount === 0n) return; const w = await s.from(from); const r = await mined(client, await w.writeContract({ address: token, abi: ERC20, functionName: 'transfer', args: [to, amount], gas: 300_000n })); assert.equal(r.status, 'success'); };
+  /** Leave the account holding `usd` worth of the token (lending oracle price, as the reader values it). */
+  const hold = async (token: Address, usd: number) => {
+    await move(token, X, SINK, await bal(token));
+    await move(token, pools[token]!, X, await bal(token, pools[token]!) / 100_000n);
+    const h = (await reader.account(X, [token])).state.holdings.find(x => x.collateral === token)!;
+    assert.ok(h.collateralUsd > 0, 'the probe amount has a price');
+    const want = h.freeCollateralRaw * BigInt(Math.round(usd * 1e6)) / BigInt(Math.round(h.collateralUsd * 1e6));
+    if (want < h.freeCollateralRaw) await move(token, X, SINK, h.freeCollateralRaw - want); else await move(token, pools[token]!, X, want - h.freeCollateralRaw);
+    return want;
+  };
+  const weights = [{ asset: BTCB, weightBps: 5_000 }, { asset: XAUT, weightBps: 5_000 }];
+  const api = createStrategyEarnV2Api({ v2, reader, now: s.clock, recordRoutes: s.ledger.routes, log: () => {} });
+  const step = async (o: object = {}) => ({ v2, reader, account: X, portfolioId: 1, now: await s.now(), dryRun: false, send, ledger: s.ledger, log: (l: string) => lines.push(l), held: [BTCB, XAUT], ...o });
+  const open = async () => (await reader.account(X, [BTCB, XAUT])).routes.filter(r => r.collateralRaw > 0n || r.routeDebtRaw > 0n);
+  const usd = (raw: bigint) => Number(raw / 10n ** 12n) / 1e6;
+
+  await s.now();
+  assert.equal((await open()).length, 0, 'nothing on v2 at the fork block');
+  // Like an account right after a minimum buy: everything invested, no USDT and no other loan token.
+  for (const token of [v2.loanTokens.USDT!, v2.loanTokens.USD1!, v2.loanTokens.USDC!, v2.loanTokens.U!]) await move(token, X, SINK, await bal(token));
+
+  mark('min buy: 4 USD of BTCB is under the floor');
+  const gold = await hold(XAUT, 25);
+  await hold(BTCB, 4);
+  const small = await api.auto(X, CANARY, { budgetRaw: 0n, weights, keyReady: true });
+  assert.deepEqual([small.status, small.assets.map(a => [a.asset, a.status, 'reason' in a ? a.reason : null]).sort()], ['ready', [['BTCB', 'unavailable', 'too_small'], ['XAUt', 'ready', null]]]);
+  assert.equal(small.assets.find(a => a.asset === 'BTCB')!.message, 'Amount too small.');
+  const one = await api.open(X, CANARY, { symbol: 'BTCB', collateralRaw: await bal(BTCB), weights, keyReady: true });
+  assert.deepEqual([one.status, 'reason' in one ? one.reason : null, 'message' in one ? one.message : null], ['unavailable', 'too_small', 'Amount too small.']);
+  // What the public markets list tells the app: the least value of each asset the strategy opens with (1 USD ÷ ratio).
+  const mins = await api.minimums();
+  assert.deepEqual([mins.BTCB, Math.round(mins.XAUt! * 1e4) / 1e4], [5, 2.8571]);
+
+  mark('min buy: 6 USD of BTCB + 25 USD of XAUt, consent');
+  const btc = await hold(BTCB, 6);
+  const auto = await api.auto(X, CANARY, { budgetRaw: 0n, weights, keyReady: true });
+  assert.deepEqual([auto.status, auto.assets.map(a => [a.asset, a.status]).sort()], ['ready', [['BTCB', 'ready'], ['XAUt', 'ready']]]);
+  if (auto.status !== 'ready') return;
+  await send(auto.calls);
+
+  mark('min buy: the scheduler opens both');
+  assert.match(await v2AutoRound(await step()) ?? '', /已執行：(XAUt open\(best_route\)、BTCB open\(best_route\)|BTCB open\(best_route\)、XAUt open\(best_route\))/);
+  let routes = await open();
+  const debtOf = (symbol: string) => usd(routes.find(r => r.route.symbol === symbol)?.routeDebtRaw ?? 0n);
+  assert.deepEqual(routes.map(r => r.route.symbol).sort(), ['BTCB', 'XAUt']);
+  assert.ok(debtOf('BTCB') > 1.1 && debtOf('BTCB') < 1.25, `BTCB debt ${debtOf('BTCB')}`);
+  assert.ok(debtOf('XAUt') > 8.3 && debtOf('XAUt') < 8.8, `XAUt debt ${debtOf('XAUt')}`);
+  assert.deepEqual([await bal(BTCB), await bal(XAUT)], [0n, 0n], 'every share is posted');
+  const view = await api.portfolio(1, X);
+  assert.deepEqual([view.positions.map(p => [p.asset, p.status]).sort(), view.autoOpen], [[['BTCB', 'on'], ['XAUt', 'on']], false]);
+  assert.equal(await v2AutoRound(await step()), null, 'the next round has nothing to do');
+
+  mark('min buy: a sale of everything takes both back first');
+  await s.local.increaseTime({ seconds: 3_600 }); await s.local.mine({ blocks: 1 });
+  const selling = await v2UnwindForSale({ ...await step(), steps: [{ tokenIn: BTCB, amountIn: btc }, { tokenIn: XAUT, amountIn: gold }] });
+  assert.match(String(selling ?? ''), /\[STRATEGY_EARN_UNWINDING\] 賣出前已還款取回/);
+  let read = await reader.account(X, [BTCB, XAUT]);
+  assert.equal(read.routes.filter(r => r.collateralRaw > 0n || r.routeDebtRaw > 0n).length, 0, String(selling));
+  assert.deepEqual([await bal(BTCB), await bal(XAUT)], [btc, gold], 'every share is back in the account, free to sell');
+  for (const [symbol, t] of Object.entries(read.tokens)) if (symbol !== 'USDT') assert.ok(t.cashRaw < V2_CASH_OUT_ALONE_MIN_RAW && t.debtRaw === 0n, `${symbol} left: ${t.cashRaw}`);
+
+  mark('min buy: consent is still on, both open again; a day later the owner turns it off');
+  assert.match(await v2AutoRound(await step()) ?? '', /BTCB open\(best_route\)/);
+  routes = await open();
+  assert.equal(routes.length, 2);
+  await s.local.increaseTime({ seconds: 86_400 }); await s.local.mine({ blocks: 1 });
+  await s.now();
+  const off = await api.close(X, { symbols: ['BTCB', 'XAUt'] });
+  assert.equal(off.status, 'ready');
+  if (off.status !== 'ready') return;
+  assert.equal(names(off.calls, v2).filter(n => n === 'executeReduce').length, 2);
+  for (const batch of off.batches) await send(batch);
+  read = await reader.account(X, [BTCB, XAUT]);
+  assert.deepEqual([read.routes.filter(r => r.collateralRaw > 0n || r.routeDebtRaw > 0n).length, read.policy.enabled, read.vaults.reduce((sum, v) => sum + v.assetsRaw, 0n)], [0, false, 0n]);
+  assert.deepEqual([await bal(BTCB), await bal(XAUT)], [btc, gold], 'every share is back');
+  for (const [symbol, t] of Object.entries(read.tokens)) if (symbol !== 'USDT') assert.ok(t.cashRaw < V2_CASH_OUT_ALONE_MIN_RAW && t.debtRaw === 0n && t.idleRaw === 0n, `${symbol} left: cash ${t.cashRaw} idle ${t.idleRaw} debt ${t.debtRaw}`);
+  assert.equal(await v2AutoRound(await step()), null, 'consent withdrawn: nothing reopens');
+  console.log(JSON.stringify({ minBuy: { btcDebt: debtOf('BTCB'), goldDebt: debtOf('XAUt'), usdt: (await bal(v2.loanTokens.USDT!)).toString(), offCalls: names(off.calls, v2), lines: lines.length } }));
+});

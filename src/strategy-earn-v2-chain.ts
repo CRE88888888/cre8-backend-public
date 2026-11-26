@@ -5,7 +5,7 @@ import { STRATEGY_EARN_97 } from './strategy-earn-guard.js';
 import { STABLES } from './strategy-earn-mainnet.js';
 import type { RouteOption, RoutingSnapshot, RoutingVault, Stable, Venue } from './strategy-earn-mainnet.js';
 import type { RouteKey } from './strategy-earn-routing.js';
-import { V2_EXECUTOR_ABI, V2_LENS_ABI, V2_REGISTRY_ABI, V2_SWAPPER_ABI } from './strategy-earn-v2.js';
+import { BORROW_BUFFER_BPS, V2_EXECUTOR_ABI, V2_LENS_ABI, V2_REGISTRY_ABI, V2_SWAPPER_ABI } from './strategy-earn-v2.js';
 import type { Call, RouteLimits, RouteLookup, StrategyEarnV2, SwapQuote, V2AccountState, V2Holding } from './strategy-earn-v2.js';
 
 /**
@@ -318,6 +318,10 @@ export function createV2Reader(deps: V2ReaderDeps) {
       (options[r.symbol] ??= []).push({ protocol: r.venue, venue: r.venue, ratioBps: r.targetLtvBps, factorBps: r.liquidationLtvBps, extraBps: Math.trunc(carryBps * r.targetLtvBps / 10_000) + r.collateralBps,
         loan: r.loanSymbol, marketId: marketIdOf(r), borrowApyBps: r.borrowBps, incentiveBps: r.borrowIncentiveBps, netBorrowBps, liquidityUsd, lltvBps: r.liquidationLtvBps, limited: liquidityUsd < 50_000,
         vault, carryBps, collateralIncentiveBps: r.collateralBps,
+        // The venue's minimum loan (Moolah `minLoan`; 0 on Venus and on the chain-97 mock) as the engine needs it: the
+        // smallest TARGET debt that still opens — the executor borrows BORROW_BUFFER_BPS of the target (planExecution);
+        // two millionths on top for the rounding to 6 decimals on the way.
+        ...(r.limits.minLoanRaw > 0n ? { minBorrowUsd: usd(r.limits.minLoanRaw * 10_000n / BORROW_BUFFER_BPS) + 0.000002 } : {}),
         ...(r.collateralRoomRaw === null || price === null ? {} : { collateralRoomUsd: usd(r.collateralRoomRaw, r.decimals) * price }) });
     }
     const byRoute = new Map(routeReads.map(r => [r.routeId, r])), byVault = new Map(b.vaults.map(v => [v.vaultId, v])), allRoutes = new Map(b.routes.map(r => [r.routeId, r]));

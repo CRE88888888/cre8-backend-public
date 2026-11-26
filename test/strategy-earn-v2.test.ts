@@ -260,14 +260,14 @@ test('#204 auto-open: only consented markets with an open gate and a non-dust ho
     policies: { [nvda.marketId]: { maxDebt: 100n * E18, enabled: true }, [tsla.marketId]: { maxDebt: 1000n * E18, enabled: true },
       [qqq.marketId]: { maxDebt: 1000n * E18, enabled: true }, [markets[4]!.marketId]: { maxDebt: 1000n * E18, enabled: false } },
     balances: { [nvda.collateral]: 10n * E18, [tsla.collateral]: 2n * E18, [qqq.collateral]: 5n * E18, [markets[4]!.collateral]: 5n * E18, [markets[2]!.collateral]: 5n * E18 },
-    prices: { [nvda.collateral]: 100n * 10n ** 8n, [tsla.collateral]: 4n * 10n ** 8n, [qqq.collateral]: 100n * 10n ** 8n },
+    prices: { [nvda.collateral]: 100n * 10n ** 8n, [tsla.collateral]: 1n * 10n ** 8n, [qqq.collateral]: 100n * 10n ** 8n },
     statuses: { [qqq.marketId]: status({ gate: 2 }) },
   };
   let sent: { to: Address; data: Hex }[] = [];
   const { args, recorded } = stepArgs(f, async calls => { sent = calls; logIndex = 0; return tx([log(ex, 'CollateralSupplied', 4, { account, marketId: nvda.marketId, amount: 10n * E18, collateral: 10n * E18 }),
     log(ex, 'Borrowed', 5, { account, marketId: nvda.marketId, amount: 99n * E18, vaultShares: 1n, ltv: 1n })]); });
   const note = await strategyEarnAutoOpen(args);
-  // NVDAB: 1,000 USD x 30% x 98% = 294 USDT planned, capped at 99% of the 100 USDT ceiling. TSLAB 8 USD is dust; QQQB gate closed; MSTRB not consented; SPCXB no policy.
+  // NVDAB: 1,000 USD x 30% x 98% = 294 USDT planned, capped at 99% of the 100 USDT ceiling. TSLAB 2 USD would borrow 0.60 (under the 1 USD floor); QQQB gate closed; MSTRB not consented; SPCXB no policy.
   assert.deepEqual(sent.map(c => [c.to, decode(c.data).functionName, decode(c.data).args]), [
     [S.executor, 'executeSupplyCollateral', [account, nvda.marketId, 10n * E18, deadline]], [S.executor, 'executeBorrow', [account, nvda.marketId, 99n * E18, deadline]]]);
   assert.match(note ?? '', /^\[STRATEGY_EARN_OPEN\] 已自動開啟：NVDAB 10／借 99\.00 USDT 存 vault tx=0x/);
@@ -669,11 +669,11 @@ test('#67 XAUt (6 decimals): values, auto-open plan and the vault-short take-bac
   let sent: { to: Address; data: Hex }[] = [];
   await strategyEarnAutoOpen(stepArgs(f, async calls => { sent = calls; return tx([]); }).args);
   assert.deepEqual(sent.map(c => [decode(c.data).functionName, decode(c.data).args[2]]), [['executeSupplyCollateral', 2_000_000n], ['executeBorrow', 2652076n * 10n ** 15n]]);
-  // Dust boundary: 10 USD is the minimum. 2,586 raw = 9.997 USD -> skipped; 2,587 raw = 10.0014 USD -> opened.
+  // Dust boundary: a target debt of 1 USD (2.857 USD of XAUt at 35%). 739 raw = 2.8570 USD -> 0.99994 -> skipped; 740 raw = 2.8608 USD -> 1.0013 -> opened.
   sent = [];
-  await strategyEarnAutoOpen(stepArgs({ ...f, balances: { [xaut.collateral]: 2_586n } }, async calls => { sent = calls; return tx([]); }).args);
+  await strategyEarnAutoOpen(stepArgs({ ...f, balances: { [xaut.collateral]: 739n } }, async calls => { sent = calls; return tx([]); }).args);
   assert.deepEqual(sent, []);
-  await strategyEarnAutoOpen(stepArgs({ ...f, balances: { [xaut.collateral]: 2_587n } }, async calls => { sent = calls; return tx([]); }).args);
+  await strategyEarnAutoOpen(stepArgs({ ...f, balances: { [xaut.collateral]: 740n } }, async calls => { sent = calls; return tx([]); }).args);
   assert.equal(sent.length, 2);
   // POST auto: 50% of 1,000 USDT new money + 1 XAUt held (3,866 USD) = 4,366 x 35% x 98% x 110% = 1,647.2918 USDT ceiling.
   const r = await createStrategyEarn({ v2: null, chainId: 97, chain: () => chainOf({ ...f, balances: { [xaut.collateral]: 1_000_000n }, weights: [{ asset: xaut.collateral, weightBps: 5000 }] }),
@@ -816,4 +816,34 @@ test('routing v2 scheduler: a full exit whose posted shares cannot be freed yet 
   c.deps.strategyEarn = { open: async () => null, unwind: async (_d, steps) => steps[0]!.amountIn > 63n * E18 ? { ...wait, needUsdtRaw: 0n } : null };
   const waiting = await runSchedulerOnce({ dryRun: false, now: at, skipAlerts: true }, c.deps);
   assert.deepEqual([raises, waiting.results[0]?.outcome, waiting.results[0]?.reason], [[], 'blocked', wait.note]);
+});
+
+test('minimum size (2026-11-26), v1: the buy quote, the owner\'s switch and the scheduler share one floor (a 1 USD loan) and answer too_small, not temporarily unavailable', async () => {
+  const weights = [{ asset: nvda.collateral, weightBps: 5000 }, { asset: tsla.collateral, weightBps: 5000 }];
+  const earn = (f: Fake) => createStrategyEarn({ v2: null, chainId: 97, chain: () => chainOf(f), owned: owned(), query: keyRows(borrowSnap) });
+  // A minimum buy, 50 USDT over two assets: 25 USD each at 30% = 7.50. Both get consent — and both are what the scheduler
+  // opens (until now it skipped any holding under 10 USD, whatever the quote had said).
+  const buy = await earn({ weights }).auto(3, account, { budgetRaw: String(50n * E18) });
+  assert.ok('assets' in buy);
+  assert.deepEqual([buy.status, buy.assets.map(a => [a.asset, a.status])], ['ready', [['NVDAB', 'ready'], ['TSLAB', 'ready']]]);
+  // 5 USDT: 2.50 each would borrow 0.75. Nothing opens, and the answer says it is the amount.
+  assert.deepEqual(await earn({ weights }).auto(3, account, { budgetRaw: String(5n * E18) }), { status: 'unavailable', reason: 'too_small', message: 'Amount too small.', assets: [
+    { asset: 'NVDAB', status: 'unavailable', reason: 'too_small', message: 'Amount too small.' }, { asset: 'TSLAB', status: 'unavailable', reason: 'too_small', message: 'Amount too small.' }] });
+  // 6 USDT at 80/20: NVDAB 4.80 (1.44) opens, TSLAB 1.20 (0.36) does not — no consent is asked for it.
+  const part = await earn({ weights: [{ asset: nvda.collateral, weightBps: 8000 }, { asset: tsla.collateral, weightBps: 2000 }] }).auto(3, account, { budgetRaw: String(6n * E18) });
+  assert.ok('assets' in part && 'calls' in part);
+  assert.deepEqual(part.assets.map(a => [a.asset, a.status, 'reason' in a ? a.reason : null]), [['NVDAB', 'ready', null], ['TSLAB', 'unavailable', 'too_small']]);
+  assert.equal(part.calls!.filter(c => decode(c.data).functionName === 'setBorrowPolicy').length, 1);
+  // The owner's switch on what is held: 3 USD of NVDAB (0.90) is too small, 4 USD (1.20) opens.
+  const held: Fake = { balances: { [nvda.collateral]: 4n * E18 } };
+  assert.deepEqual(await earn(held).open(3, account, { asset: 'NVDAB', collateralRaw: String(3n * E18) }), { status: 'unavailable', asset: 'NVDAB', reason: 'too_small', message: 'Amount too small.' });
+  assert.equal((await earn(held).open(3, account, { asset: 'NVDAB', collateralRaw: String(4n * E18) })).status, 'ready');
+  // The scheduler after the fill: 25 USD of NVDAB opens (7.35 borrowed), 3 USD of TSLAB stays as it is.
+  let sent: { to: Address; data: Hex }[] = [];
+  const f: Fake = { policies: { [nvda.marketId]: { maxDebt: 100n * E18, enabled: true }, [tsla.marketId]: { maxDebt: 100n * E18, enabled: true } }, balances: { [nvda.collateral]: 25n * E18, [tsla.collateral]: 3n * E18 } };
+  await strategyEarnAutoOpen(stepArgs(f, async calls => { sent = calls; return tx([]); }).args);
+  assert.deepEqual(sent.map(c => [decode(c.data).functionName, decode(c.data).args[1], decode(c.data).args[2]]), [['executeSupplyCollateral', nvda.marketId, 25n * E18], ['executeBorrow', nvda.marketId, 735n * E16]]);
+  // The public list: the least value of an asset the strategy opens with, 1 USD ÷ 30% plus 5% headroom, rounded up to a cent.
+  const view = await createStrategyEarn({ v2: null, chainId: 97, chain: () => chainOf({}), marketsCacheMs: 0, mainnetRates: { get: async () => null } }).markets();
+  assert.deepEqual(view.markets.filter(m => m.asset === 'NVDAB' || m.asset === 'TSLAB').map(m => [m.asset, m.minValueUsd]), [['NVDAB', 3.5], ['TSLAB', 3.5]]);
 });

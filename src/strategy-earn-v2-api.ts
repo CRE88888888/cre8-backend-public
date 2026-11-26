@@ -1,6 +1,6 @@
 import { decodeFunctionData, maxUint256 } from 'viem';
 import type { Address, Hex, Log } from 'viem';
-import { planAccount } from './strategy-earn-routing.js';
+import { minOpenValueUsd, planAccount } from './strategy-earn-routing.js';
 import type { Costs, Decision, Holding } from './strategy-earn-routing.js';
 import { marketIdOf, v2Active } from './strategy-earn-v2-chain.js';
 import type { V2AccountRead, V2Market, V2Reader } from './strategy-earn-v2-chain.js';
@@ -18,6 +18,9 @@ import type { RewardEvent } from './strategy-rewards.js';
  * Owner-signed flows only; the scheduler's session-key steps are in src/strategy-earn-v2-scheduler.ts.
  */
 const TEMPORARILY = 'Temporarily unavailable.';
+/** Not temporary: the holding is under the minimum the strategy opens with (ours, or the venue's minimum loan). */
+export const TOO_SMALL = 'Amount too small.';
+const messageOf = (reason: string) => reason === 'too_small' ? TOO_SMALL : TEMPORARILY;
 const E18 = 10n ** 18n;
 /** Raw token units as a number of whole tokens (USD for a loan token), exact to 6 decimals. */
 const usd = (raw: bigint, decimals = 18) => Number(raw / 10n ** BigInt(Math.max(0, decimals - 6))) / 10 ** Math.min(6, decimals);
@@ -98,6 +101,18 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
      * so "nothing" may come from the reader's ten-minute memory (`touchedOutside`) instead of a request. */
     async active(account: Address, outside = false): Promise<boolean> { return v2Active(outside ? await reader.touchedOutside(account) : await reader.touched(account)); },
 
+    /**
+     * Per asset symbol, the smallest value (USD) of it in a portfolio for which the strategy opens now (`minOpenValueUsd`:
+     * our floor or the venue's minimum loan, over the route's ratio); assets with no route to borrow on are absent.
+     * From the reader's cached market snapshot: the public markets list carries it, so the app never offers the strategy
+     * for an amount it would not open with.
+     */
+    async minimums(): Promise<Record<string, number>> {
+      const m = await reader.market(), at = deps.now().getTime(), out: Record<string, number> = {};
+      for (const symbol of Object.keys(m.snapshot.options)) { const least = minOpenValueUsd(m.snapshot, symbol, at); if (least !== null) out[symbol] = least; }
+      return out;
+    },
+
     /** Positions of this portfolio account. Net value of the strategy money = vault holdings + idle in the box − debt. */
     async portfolio(id: number, account: Address) {
       const [m, read] = await Promise.all([reader.market(), reader.account(account)]);
@@ -145,8 +160,10 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
       const plan = planAccount({ snapshot: m.snapshot, holdings: holdingsFor(read, t => usd(input.budgetRaw) * weight(t) / 10_000, true).filter(h => tokens.includes(tokenOf(m, h.symbol)!)), costs, now: deps.now().getTime() });
       const assets = plan.decisions.map(d => d.to && d.action !== 'close' && d.targetDebtUsd > 0
         ? { asset: d.symbol, status: 'ready' as const, maxDebtRaw: maxDebtFor(d.targetDebtUsd).toString(), extraApyBps: d.to.extraBps }
-        : { asset: d.symbol, status: 'unavailable' as const, reason: d.reason, message: TEMPORARILY });
-      if (!assets.some(a => a.status === 'ready')) return { status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY, assets };
+        : { asset: d.symbol, status: 'unavailable' as const, reason: d.reason, message: messageOf(d.reason) });
+      // Nothing opens, and for at least one asset only because of the amount: say so (a larger amount would open it).
+      if (!assets.some(a => a.status === 'ready')) { const reason = assets.some(a => a.status === 'unavailable' && a.reason === 'too_small') ? 'too_small' : 'data_unavailable';
+        return { status: 'unavailable' as const, reason, message: messageOf(reason), assets }; }
       // The account sold everything earlier: this request is what makes a consent count again. It is written with the
       // ceiling it replaces, and the new ceiling differs from it (src/strategy-earn-after-sell-all.ts).
       const sold = deps.consentSince && deps.noteConsent ? await deps.consentSince(account) !== null : false;
@@ -160,7 +177,7 @@ export function createStrategyEarnV2Api(deps: V2ApiDeps) {
     async open(account: Address, owner: Address, input: { symbol: string; collateralRaw: bigint; weights: readonly { asset: Address; weightBps: number }[]; keyReady: boolean }) {
       const m = await reader.market();
       const token = tokenOf(m, input.symbol);
-      const unavailable = (reason: string) => ({ status: 'unavailable' as const, asset: input.symbol, reason, message: TEMPORARILY });
+      const unavailable = (reason: string) => ({ status: 'unavailable' as const, asset: input.symbol, reason, message: messageOf(reason) });
       if (!token) return unavailable('no_route');
       const tokens = [...new Set([token, ...eligibleTokens(m, input.weights.filter(w => w.weightBps > 0).map(w => w.asset))])];
       const read = await reader.account(account, tokens);

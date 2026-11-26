@@ -516,3 +516,20 @@ test('2026-11-26 the audience only decides who may START on v2: an account that 
   // Pause lifted: the same clean account starts on v2 again.
   assert.deepEqual(await statuses(earn({ audience: true, mayOpen: true })), [1, 2, 2]);
 });
+
+test('GET /strategy-earn/markets: minValueUsd is the stricter of v1\'s floor and routing v2\'s minimum (a venue minimum loan), with 5% headroom; a v2 read that fails leaves v1\'s own', async () => {
+  const { strategyEarnV2 } = await import('../src/strategy-earn-v2.js');
+  const v2 = strategyEarnV2(97, {})!;
+  const f: Fake = { statuses: Object.fromEntries(markets.map(m => [m.marketId, status()])), ids: [], held: 0n, collateral: 0n, prices: {}, rewards: { vault: 0n, collateral: 0n } };
+  const view = async (minimums: () => Promise<Record<string, number>>) => Object.fromEntries((await createStrategyEarn({ chainId: 97, chain: () => fakeChain(f), owned: ownedPortfolio() as never, v2, v2Api: () => ({ minimums }) as never,
+    mainnetRates: noMainnet, marketsCacheMs: 0, query: (async () => ({ rows: [] })) as never }).markets()).markets.map(m => [m.asset, m.minValueUsd]));
+  // v1 alone: 1 USD ÷ 30% = 3.34 -> +5% = 3.50. v2 asks 51.0204 for NVDAB (Moolah's 15 USD ÷ 0.98 ÷ 30%): 53.58. QQQB: v2's 2.8571 is under v1's.
+  const strict = await view(async () => ({ NVDAB: 51.0204, [qqq!.symbol]: 2.8571 }));
+  assert.deepEqual([strict.NVDAB, strict[qqq!.symbol], strict.TSLAB], [53.58, 3.5, 3.5]);
+  const down = await view(async () => { throw new Error('public node down'); });
+  assert.deepEqual([down.NVDAB, down.TSLAB], [3.5, 3.5]);
+  // A market whose status cannot be read has no figure.
+  const blind = Object.fromEntries((await createStrategyEarn({ v2: null, chainId: 97, chain: () => fakeChain({ ...f, statuses: { ...f.statuses, [nvda!.marketId]: null } }), owned: ownedPortfolio() as never,
+    mainnetRates: noMainnet, marketsCacheMs: 0, query: (async () => ({ rows: [] })) as never }).markets()).markets.map(m => [m.asset, m.minValueUsd]));
+  assert.deepEqual([blind.NVDAB, blind.TSLAB], [null, 3.5]);
+});

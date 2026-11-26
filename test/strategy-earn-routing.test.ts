@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { RouteOption, RoutingSnapshot, RoutingVault, Stable } from '../src/strategy-earn-mainnet.js';
-import { liquidityOf, planAccount, ROUTING } from '../src/strategy-earn-routing.js';
+import { liquidityOf, minOpenValueUsd, planAccount, ROUTING } from '../src/strategy-earn-routing.js';
 import type { Holding, RouteKey } from '../src/strategy-earn-routing.js';
 
 const DAY = 86_400_000, NOW = 100 * DAY;
@@ -227,4 +227,54 @@ test('Venus shared debt: the loan turning bad moves every Venus position now; on
   plan = planAccount({ snapshot: snap({ NVDAB: [opt('venus', 'USDT', 300)], TSLAB: [] }, good), holdings: [held('NVDAB', 10_000, key('venus', 'USDT'), 3000, 1), held('TSLAB', 10_000, key('venus', 'USDT'), 3000, 1)], costs, now: NOW });
   assert.deepEqual(plan.decisions.map(d => [d.symbol, d.action, d.reason]), [['NVDAB', 'hold', 'best_route'], ['TSLAB', 'close', 'market_unavailable']]);
   assert.deepEqual(plan.venus, { loan: 'USDT', debtUsd: 3000 });
+});
+
+test('minimum size: our floor is 1 USD of debt, a venue\'s own minimum loan is a hard limit per route, and too small is its own reason', () => {
+  assert.equal(ROUTING.MIN_BORROW_USD, 1);
+  const vaults = [vault('USDT', 'venus', 500)];
+  const s = snap({ PDDB: [opt('lista', 'USDT', 200)] }, vaults);
+  // A minimum buy: 50 USDT over two assets = 25 USD each at 30% = 7.50. It opens (the old 10 USD floor refused it).
+  let d = one(s, idle('PDDB', 25));
+  assert.deepEqual([d.action, d.reason, d.targetDebtUsd], ['open', 'best_route', 7.5]);
+  // The floor itself: 3.30 USD would borrow 0.99, 3.40 USD 1.02.
+  d = one(s, idle('PDDB', 3.3));
+  assert.deepEqual([d.action, d.reason, d.to, d.targetDebtUsd], ['hold', 'too_small', null, 0]);
+  assert.match(d.rationale, /^PDDB hold: would borrow \$0\.99 < \$1\.00$/);
+  assert.deepEqual([one(s, idle('PDDB', 3.4)).action, one(s, idle('PDDB', 3.4)).targetDebtUsd], ['open', 1.02]);
+  // A venue minimum (Moolah minLoan 15 on mainnet = a target of 15.31): 25 USD at 30% cannot open there; 52 USD can.
+  const lista = opt('lista', 'USDT', 200, { minBorrowUsd: 15.31 });
+  d = one(snap({ PDDB: [lista] }, vaults), idle('PDDB', 25));
+  assert.deepEqual([d.action, d.reason], ['hold', 'too_small']);
+  assert.match(d.rationale, /would borrow \$7\.50 < \$15\.31/);
+  d = one(snap({ PDDB: [lista] }, vaults), idle('PDDB', 52));
+  assert.deepEqual([d.action, d.to?.venue, d.to?.minBorrowUsd, Math.round(d.targetDebtUsd * 100)], ['open', 'lista', 15.31, 1560]);
+  // An asset that also has a route without a minimum (Venus) opens there while it is small, and on the better-paying
+  // Lista route once it is large enough.
+  const both = snap({ NVDAB: [lista, opt('venus', 'USDT', 300)] }, vaults);
+  d = one(both, idle('NVDAB', 25));
+  assert.deepEqual([d.action, d.to?.venue, d.targetDebtUsd], ['open', 'venus', 7.5]);
+  d = one(both, idle('NVDAB', 100));
+  assert.deepEqual([d.action, d.to?.venue, d.targetDebtUsd], ['open', 'lista', 30]);
+  // Too small is only said when a larger holding would open: negative carry and no route keep their own reasons.
+  assert.equal(one(snap({ PDDB: [opt('lista', 'USDT', 600)] }, vaults), idle('PDDB', 2)).reason, 'negative_carry');
+  assert.equal(one(snap({ PDDB: [] }, vaults), idle('PDDB', 2)).reason, 'no_route');
+  // An open position under the minimum is not closed for its size (only never opened): it holds.
+  d = one(s, held('PDDB', 3, key('lista', 'USDT'), 0.9, 30));
+  assert.deepEqual([d.action, d.reason], ['hold', 'best_route']);
+});
+
+test('minOpenValueUsd: the least value of an asset the strategy opens with = minimum loan ÷ ratio over the routes it could borrow on now', () => {
+  const vaults = [vault('USDT', 'venus', 500)];
+  const round = (n: number | null) => n === null ? null : Math.round(n * 1e4) / 1e4;
+  // 1 USD ÷ 30%; a 35% route needs less; a venue minimum of 15.31 needs 51.03.
+  assert.equal(round(minOpenValueUsd(snap({ PDDB: [opt('lista', 'USDT', 200)] }, vaults), 'PDDB', NOW)), 3.3333);
+  assert.equal(round(minOpenValueUsd(snap({ QQQB: [opt('lista', 'USDT', 200, { ratioBps: 3500 })] }, vaults), 'QQQB', NOW)), 2.8571);
+  assert.equal(round(minOpenValueUsd(snap({ PDDB: [opt('lista', 'USDT', 200, { minBorrowUsd: 15.31 })] }, vaults), 'PDDB', NOW)), 51.0333);
+  // The route without a minimum decides when there is one.
+  assert.equal(round(minOpenValueUsd(snap({ NVDAB: [opt('lista', 'USDT', 200, { minBorrowUsd: 15.31 }), opt('venus', 'USDT', 300)] }, vaults), 'NVDAB', NOW)), 3.3333);
+  // Nothing to borrow on now (negative carry, no vault that takes deposits, stale data, unknown asset): null.
+  assert.equal(minOpenValueUsd(snap({ PDDB: [opt('lista', 'USDT', 600)] }, vaults), 'PDDB', NOW), null);
+  assert.equal(minOpenValueUsd(snap({ PDDB: [opt('lista', 'USDT', 200)] }, [vault('USDT', 'venus', 500, { eligible: false })]), 'PDDB', NOW), null);
+  assert.equal(minOpenValueUsd(snap({ PDDB: [opt('lista', 'USDT', 200)] }, vaults, NOW - ROUTING.MAX_SOURCE_AGE_MS - 1), 'PDDB', NOW), null);
+  assert.equal(minOpenValueUsd(snap({}, vaults), 'PDDB', NOW), null);
 });

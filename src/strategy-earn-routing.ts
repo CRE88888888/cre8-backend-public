@@ -34,8 +34,10 @@ export const ROUTING = {
   VAULT_SWITCH_TXS: 2,
   /** A source older than this is not acted on. */
   MAX_SOURCE_AGE_MS: 30 * 60_000,
-  /** Positions that would borrow less than this are not opened. */
-  MIN_BORROW_USD: 10,
+  /** Our own floor: a position that would borrow less than this is not opened (dust). It was 10 until 2026-11-26, which
+   * shut out every asset of a minimum buy (50 USDT over two assets at a 30% ratio borrows 7.50). BSC gas makes a 1 USD
+   * loan cheap to open and to close. A venue's own minimum loan is a separate, hard limit: `minBorrowUsd` on the route. */
+  MIN_BORROW_USD: 1,
   /** An open position is topped up only when its debt is more than this far under the target (bps of the target): the
    * executor borrows 2% under the target on purpose, and small price moves are not worth a transaction. */
   TOP_UP_MIN_GAP_BPS: 500,
@@ -55,7 +57,28 @@ export type PricedRoute = RouteKey & {
   liquidityUsd: number | null;
   /** USD of new collateral the venue can still take (Venus supply cap); null = no limit known. */
   collateralRoomUsd?: number | null;
+  /** The smallest target debt (USD) the venue lets this route open with (Moolah `minLoan`); absent = none. */
+  minBorrowUsd?: number;
 };
+/** The least a holding may plan to borrow on a route: our floor, or the venue's own minimum when that is higher. */
+export const minBorrowOn = (r: { minBorrowUsd?: number }): number => Math.max(ROUTING.MIN_BORROW_USD, r.minBorrowUsd ?? 0);
+/**
+ * The smallest value (USD) of an asset for which the strategy opens, over the routes it could borrow on now (positive
+ * carry into a vault that takes deposits, as `planAccount` judges them): min over those routes of minimum loan ÷ ratio.
+ * null = no such route. What the app compares an amount with before it offers the strategy; the engine stays the judge.
+ */
+export function minOpenValueUsd(snapshot: RoutingSnapshot, symbol: string, now: number): number | null {
+  const fresh = (venue: Venue) => { const at = snapshot.sourceAt[venue]; return at !== null && now - at <= ROUTING.MAX_SOURCE_AGE_MS; };
+  const open = snapshot.vaults.filter(v => v.eligible && fresh(v.venue)).sort((a, b) => b.apyBps - a.apyBps);
+  let least: number | null = null;
+  for (const o of snapshot.options[symbol] ?? []) {
+    const v = open.find(x => x.token === o.loan);
+    if (!fresh(o.venue) || !v || o.ratioBps <= 0 || v.apyBps - (o.borrowApyBps - o.incentiveBps) <= 0) continue;
+    const need = minBorrowOn(o) * 10_000 / o.ratioBps;
+    if (least === null || need < least) least = need;
+  }
+  return least;
+}
 export type Holding = {
   symbol: string;
   /** USD value of the asset this account holds (posted collateral included). */
@@ -112,7 +135,7 @@ function price(o: RouteOption, v: RoutingVault): PricedRoute {
   return { venue: o.venue, marketId: String(o.marketId).toLowerCase(), loan: o.loan, vault: { venue: v.venue, address: v.address.toLowerCase() },
     ratioBps: o.ratioBps, factorBps: o.factorBps, borrowApyBps: o.borrowApyBps, borrowIncentiveBps: o.incentiveBps, vaultApyBps: v.apyBps, vaultName: v.name,
     carryBps, collateralIncentiveBps: o.collateralIncentiveBps, extraBps: Math.trunc(carryBps * o.ratioBps / 10_000) + o.collateralIncentiveBps, liquidityUsd: o.liquidityUsd,
-    collateralRoomUsd: o.collateralRoomUsd ?? null };
+    collateralRoomUsd: o.collateralRoomUsd ?? null, ...(o.minBorrowUsd === undefined ? {} : { minBorrowUsd: o.minBorrowUsd }) };
 }
 /** USD per year a holding earns on a route with `debtUsd` borrowed. */
 const yearly = (r: PricedRoute, collateralUsd: number, debtUsd: number) => (debtUsd * r.carryBps + collateralUsd * r.collateralIncentiveBps) / 10_000;
@@ -154,8 +177,10 @@ export function planAccount(input: { snapshot: RoutingSnapshot; holdings: readon
     return { route, problem: null, stale: false };
   };
   const targetDebt = (h: Holding, r: PricedRoute) => h.collateralUsd * r.ratioBps / 10_000;
-  /** Best route for this holding. `needFull`: the market must be able to lend the whole target (a move); otherwise whatever fits. */
-  const best = (h: Holding, venusLoan: Stable | null, needFull: boolean, own?: RouteKey, avoidVault?: string): { route: PricedRoute; debtUsd: number; perYear: number } | null => {
+  /** Best route for this holding. `needFull`: the market must be able to lend the whole target (a move); otherwise whatever fits.
+   * A route whose debt would be under the minimum (ours, or the venue's) is not one — unless `anySize` asks for it anyway
+   * (only to tell "too small" from "no route"). */
+  const best = (h: Holding, venusLoan: Stable | null, needFull: boolean, own?: RouteKey, avoidVault?: string, anySize = false): { route: PricedRoute; debtUsd: number; perYear: number } | null => {
     let top: { route: PricedRoute; debtUsd: number; perYear: number } | null = null;
     for (const r of candidates(h.symbol, venusLoan, avoidVault)) {
       const want = targetDebt(h, r);
@@ -163,6 +188,7 @@ export function planAccount(input: { snapshot: RoutingSnapshot; holdings: readon
       const have = own && marketKey(own) === marketKey(r) ? h.position?.debtUsd ?? 0 : 0;
       const fits = Math.min(want, have + room(r));
       if (needFull && fits < want) continue;
+      if (!anySize && fits < minBorrowOn(r)) continue;
       // A venue with a supply cap (Venus bStock markets) can only take what is left under it. What this holding already
       // posted on the same venue and collateral market is inside the cap.
       const posted = own && own.venue === r.venue ? h.position?.postedUsd ?? h.collateralUsd : 0;
@@ -221,12 +247,14 @@ export function planAccount(input: { snapshot: RoutingSnapshot; holdings: readon
     if (!p) {
       if (!h.enabled || h.collateralUsd <= 0) continue;
       const b = best(h, venusLoan, false);
-      if (!b) {
+      // Nothing at this size: would a larger holding have a route? Then it is too small, not unavailable.
+      const small = b ? null : best(h, venusLoan, false, undefined, undefined, true);
+      if (small) {
+        decisions.push({ ...base, action: 'hold', reason: 'too_small', urgent: false, to: null, targetDebtUsd: 0, rationale: `${h.symbol} hold: would borrow ${usd(small.debtUsd)} < ${usd(minBorrowOn(small.route))}` });
+      } else if (!b) {
         const any = (snapshot.options[h.symbol] ?? []).length > 0;
         const reason: Reason = !any ? 'no_route' : (snapshot.options[h.symbol] ?? []).every(o => !fresh(o.venue)) ? 'stale_data' : 'negative_carry';
         decisions.push({ ...base, action: 'hold', reason, urgent: false, to: null, targetDebtUsd: 0, rationale: `${h.symbol} hold: ${reason}, nothing borrowed` });
-      } else if (b.debtUsd < ROUTING.MIN_BORROW_USD) {
-        decisions.push({ ...base, action: 'hold', reason: 'too_small', urgent: false, to: null, targetDebtUsd: 0, rationale: `${h.symbol} hold: would borrow ${usd(b.debtUsd)} < ${usd(ROUTING.MIN_BORROW_USD)}` });
       } else {
         take(b.route, b.debtUsd, 0);
         decisions.push({ ...base, action: 'open', reason: 'best_route', urgent: false, to: b.route, targetDebtUsd: b.debtUsd,

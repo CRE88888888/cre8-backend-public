@@ -60,6 +60,8 @@ export type Route = { protocol: 'venus' | 'lista'; venue: 'venus' | 'lista'; rat
   collateralIncentiveBps: number;
   /** USD of new collateral the venue can still take under its supply cap (Venus); null / absent = no limit known. */
   collateralRoomUsd?: number | null;
+  /** The smallest target debt (USD) the venue lets a position open with (Moolah `minLoan`, read from the chain the money is on); absent = none. */
+  minBorrowUsd?: number;
   /** Best borrow X → swap → deposit Y route, when it beats this one (unscaled carry gain, bps). Display only; we default to same token. */
   cross: { loan: Stable; deposit: Stable; gainBps: number } | null };
 export type MainnetRates = {

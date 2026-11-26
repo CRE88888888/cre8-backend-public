@@ -16,7 +16,8 @@ import { parseRewardSignature, rewardsStore, strategyRewardsEnabled } from './st
 import type { RewardsStore, RewardsView } from './strategy-rewards.js';
 import { routeLedger, routeMessage, strategyEarnV2, strategyEarnV2For, strategyV2Addresses, v2Audience, v2Authorized, v2MayOpen } from './strategy-earn-v2.js';
 import type { RouteEventKind, StrategyEarnV2 } from './strategy-earn-v2.js';
-import { createStrategyEarnV2Api } from './strategy-earn-v2-api.js';
+import { ROUTING } from './strategy-earn-routing.js';
+import { TOO_SMALL, createStrategyEarnV2Api } from './strategy-earn-v2-api.js';
 import type { StrategyEarnV2Api } from './strategy-earn-v2-api.js';
 import { defaultV2Reader, v2EstimateGas } from './strategy-earn-v2-chain.js';
 import { claimedCash } from './withdrawable-cash.js';
@@ -239,6 +240,16 @@ export function borrowPlan(input: { existingCollateralValue: bigint; addedCollat
 }
 
 /**
+ * The same floor as routing v2 (ROUTING.MIN_BORROW_USD): an asset whose value (USD 1e18) would borrow less than that at
+ * its target ratio is not opened — not by the owner's quote, not by the scheduler. v1's chain-97 venues have no minimum
+ * loan of their own (the Moolah mock's is 0), so this is the whole rule here.
+ */
+export const MIN_BORROW_VALUE = BigInt(ROUTING.MIN_BORROW_USD) * E18;
+export const tooSmallToBorrow = (valueUsd: bigint, targetLtv: bigint): boolean => valueUsd * targetLtv / E18 < MIN_BORROW_VALUE;
+/** The smallest value (USD) of an asset the strategy opens with at this target ratio (1e18); null when the ratio is 0. */
+export const minOpenValue = (targetLtv: bigint): number | null => targetLtv <= 0n ? null : Number(MIN_BORROW_VALUE * 1_000_000n / targetLtv) / 1e6;
+
+/**
  * Usable consent: enabled with a ceiling and given under the account's current enrollment. One enrollment read per call,
  * only when some policy is enabled. Funds never re-enroll, so for them this is just "enabled with a ceiling".
  */
@@ -254,16 +265,21 @@ export async function consentedMarkets(chain: StrategyEarnChain, account: Addres
 /**
  * The consent an owner signs for a set of target weights (`valueUsd`: what each eligible asset will be worth, USD 1e18):
  * one debt ceiling per market at the target ratio +10%, skipping markets whose gate is not open (EARN_UX D) or that
- * would borrow nothing. Leveraged products are never in STRATEGY_EARN_97.markets.
+ * would borrow nothing (and, for the buy quote, less than the floor: `tooSmallToBorrow`). Leveraged products are never in STRATEGY_EARN_97.markets.
  */
 async function consentQuotes(chain: StrategyEarnChain, account: Address, head: { number: bigint }, eligible: readonly StrategyMarket[],
-  usdtPrice: bigint, valueUsd: (m: StrategyMarket, price: bigint, held: bigint) => bigint) {
+  usdtPrice: bigint, valueUsd: (m: StrategyMarket, price: bigint, held: bigint) => bigint,
+  /** Leave out assets under the floor (`tooSmallToBorrow`): the buy quote. A My mix weight change re-consents every asset as before. */
+  floor = false) {
   type Read = { market: StrategyMarket; status: 'read'; st: StatusReading; added: bigint };
   const reads = await Promise.all(eligible.map(async m => {
     try {
       const [st, held, price] = await Promise.all([chain.status(m.marketId, account, head.number), chain.balance(m.collateral, account, head.number), chain.price(m.collateral, head.number)]);
       if (st.gate !== 0) return { market: m, status: 'unavailable' as const, reason: GATE_REASONS[st.gate] ?? 'closed' };
-      return { market: m, status: 'read' as const, st, added: valueUsd(m, price, held) };
+      const added = valueUsd(m, price, held);
+      // Under the floor the scheduler would not open it (strategyEarnAutoOpen): no consent is asked for it.
+      if (floor && tooSmallToBorrow(added, st.targetLtv)) return { market: m, status: 'unavailable' as const, reason: 'too_small' };
+      return { market: m, status: 'read' as const, st, added };
     } catch { return { market: m, status: 'unavailable' as const, reason: 'data_unavailable' }; }
   }));
   // Venus: one comptroller, one USDT loan per account. Every Venus market's `debt` / `health` is the account's whole
@@ -336,6 +352,10 @@ export function splitVenusDebt<P extends { marketId: string; debtRaw?: string; v
 const TEMPORARILY = 'Temporarily unavailable.';
 /** Server-side cache for the public GET /strategy-earn/markets (31 status reads): one chain read per minute at most. */
 export const MARKETS_CACHE_MS = 60_000;
+/** `minValueUsd` in the public markets list is the real minimum plus this much (5%): see `readMarkets`. */
+export const MIN_VALUE_HEADROOM_BPS = 500;
+/** How long the public markets list waits for routing v2's minimums before it goes out with v1's own. */
+export const V2_MINIMUMS_WAIT_MS = 4_000;
 export type StrategyEarnDeps = { chainId: number; chain: () => StrategyEarnChain; owned: typeof requireOwnedPortfolio; now: () => Date; rewards?: RewardsStore; rewardsEnabled?: boolean; ledger?: StrategyEarnLedger;
   /** The routing v2 deployment for this owner; default `strategyEarnV2(chainId)` — the chain's deployment, for everyone
    * (who may start on it is `v2Open`). Tests pass a fixed deployment or null. */
@@ -496,14 +516,15 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
   const quote = (m: StrategyMarket, s: StatusReading | null, at: string | null) => {
     if (!s) return { asset: m.symbol, marketId: m.marketId, protocol: m.protocol, status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY,
       extraApyBps: null, breakdown: null, targetLtvBps: null, deleverageLtvBps: null, liquidationLtvBps: null, borrowUtilizationBps: null, vaultUtilizationBps: null,
-      contracts: contracts(m), updatedAt: at };
+      minValueUsd: null as number | null, contracts: contracts(m), updatedAt: at };
     const apy = extraApy(s, s.targetLtv);
     const open = s.gate === 0;
     return { asset: m.symbol, marketId: m.marketId, protocol: m.protocol, status: open ? 'open' as const : 'unavailable' as const,
       reason: open ? null : GATE_REASONS[s.gate] ?? 'closed', message: open ? null : TEMPORARILY,
       extraApyBps: apy.totalBps, breakdown: apy.breakdown, targetLtvBps: toBps(s.targetLtv), deleverageLtvBps: toBps(s.deleverageLtv),
       liquidationLtvBps: toBps(s.liquidationLtv), borrowUtilizationBps: Number(s.borrowUtilizationBps), vaultUtilizationBps: Number(s.vaultUtilizationBps),
-      contracts: contracts(m), updatedAt: at };
+      // The smallest value (USD) of this asset in a portfolio for the strategy to open (see `markets`).
+      minValueUsd: minOpenValue(s.targetLtv), contracts: contracts(m), updatedAt: at };
   };
   type MarketsView = { chainId: 97; updatedAt: string | null; vault: { address: string }; markets: ReturnType<typeof quote>[] };
   async function readMarkets(previous: MarketsView | null): Promise<MarketsView> {
@@ -513,8 +534,23 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
       if (!l) return quote(m, null, at);
       try { return quote(m, await l.chain.status(m.marketId, '0x0000000000000000000000000000000000000000', l.head.number), at); } catch { return quote(m, null, at); }
     }));
+    // `minValueUsd` is one number for every visitor, so it is the stricter of the two generations: routing v2 may ask for
+    // more (a venue's own minimum loan, read from its lens). An amount the app offers the strategy for then opens on either.
+    // The v2 read (public nodes) gets a few seconds; without it the list carries v1's own figure (the same floor).
+    const v2 = typeof deps.v2 === 'function' ? null : deps.v2 === undefined ? strategyEarnV2(deps.chainId) : deps.v2;
+    let v2Min: Record<string, number> | null = null;
+    if (v2 && l) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try { v2Min = await Promise.race([v2ApiOf(v2).minimums(), new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), V2_MINIMUMS_WAIT_MS); })]); } catch { v2Min = null; }
+      finally { clearTimeout(timer); }
+    }
+    // Published with headroom (MIN_VALUE_HEADROOM_BPS): fees and a price move between the quote and the fill must not
+    // leave an asset the app counted just under the minimum. Rounded up to a cent.
+    const publish = (usd: number) => Math.ceil(usd * (10_000 + MIN_VALUE_HEADROOM_BPS) / 100 - 1e-9) / 100;
+    const priced = items.map(q => { if (q.minValueUsd === null) return q; const other = v2Min?.[q.asset];
+      return { ...q, minValueUsd: publish(other !== undefined && other > q.minValueUsd ? other : q.minValueUsd) }; });
     // A market that could not be read this time keeps its last reading (with its own older updatedAt) instead of going blank.
-    const merged = items.map(q => q.reason === 'data_unavailable' ? previous?.markets.find(p => p.marketId === q.marketId && p.reason !== 'data_unavailable') ?? q : q);
+    const merged = priced.map(q => q.reason === 'data_unavailable' ? previous?.markets.find(p => p.marketId === q.marketId && p.reason !== 'data_unavailable') ?? q : q);
     return { chainId: 97, updatedAt: at ?? previous?.updatedAt ?? null, vault: { address: STRATEGY_EARN_97.earnVault }, markets: merged };
   }
   let marketsCache: { at: number; value: MarketsView } | null = null;
@@ -578,6 +614,9 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
     // re-read in the background (one read in flight), so visitors never wait on, or multiply, the 31 status reads.
     // `mainnetRates` + per market `mainnet`: what the app displays (real BSC mainnet rates, same formula, ratio = this
     // market's target LTV). Testnet positions keep accruing at the simulated chain-97 rates above.
+    // `minValueUsd` per market: the smallest value (USD) of that asset in a portfolio for which the strategy opens (our
+    // floor, or the venue's minimum loan, over the target ratio). The app compares each asset's share of an amount with
+    // it: an asset under it is left out of the rate, and when every asset is under it the strategy is not offered.
     async markets() {
       ready();
       const ttl = deps.marketsCacheMs ?? MARKETS_CACHE_MS;
@@ -695,7 +734,7 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
       }
       const market = findMarket(b.asset);
       const l = await live();
-      const unavailable = (reason: string) => ({ status: 'unavailable' as const, asset: market.symbol, reason, message: TEMPORARILY });
+      const unavailable = (reason: string) => ({ status: 'unavailable' as const, asset: market.symbol, reason, message: reason === 'too_small' ? TOO_SMALL : TEMPORARILY });
       if (!l) return unavailable('data_unavailable');
       const { chain, head } = l;
       let s: StatusReading, held: bigint, price: bigint, usdtPrice: bigint;
@@ -705,6 +744,7 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
       } catch { return unavailable('data_unavailable'); }
       if (s.gate !== 0) return unavailable(GATE_REASONS[s.gate] ?? 'closed');
       if (collateralRaw > held) throw new ValidationError('INSUFFICIENT_HOLDING', '投資組合持有的數量不足。');
+      if (tooSmallToBorrow(usdValue(collateralRaw, price, market.decimals), s.targetLtv)) return unavailable('too_small');
       // Venus health is account-wide (every market entered in that comptroller); Lista is per market.
       const plan = borrowPlan({ existingCollateralValue: s.health.collateralValue, addedCollateralValue: usdValue(collateralRaw, price, market.decimals),
         existingDebtValue: s.health.debtValue, targetLtv: s.targetLtv, usdtPriceE8: usdtPrice, currentDebtRaw: s.debt });
@@ -745,7 +785,7 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
       const eligible = markets.filter(m => weights.some(w => w.asset === m.collateral && w.weightBps > 0));
       // USD (1e18): new money's share of this asset + what the portfolio already holds of it.
       const quoted = await consentQuotes(chain, account, head, eligible, usdtPrice, (m, price, held) =>
-        budget * BigInt(weights.find(x => x.asset === m.collateral)?.weightBps ?? 0) / 10_000n * usdtPrice / 10n ** 8n + usdValue(held, price, m.decimals));
+        budget * BigInt(weights.find(x => x.asset === m.collateral)?.weightBps ?? 0) / 10_000n * usdtPrice / 10n ** 8n + usdValue(held, price, m.decimals), true);
       const ready = quoted.filter((q): q is Extract<typeof q, { status: 'ready' }> => q.status === 'ready');
       // The account sold everything earlier: this request is what makes a consent count again (src/strategy-earn-after-sell-all.ts).
       // It is written with the ceilings it replaces, and each new ceiling differs from the one on chain.
@@ -764,8 +804,10 @@ export function createStrategyEarn(overrides: Partial<StrategyEarnDeps> = {}) {
         } catch { return { status: 'unavailable' as const, reason: 'data_unavailable', message: TEMPORARILY }; }
       }
       const assets = quoted.map(q => q.status === 'ready' ? { asset: q.market.symbol, status: q.status, maxDebtRaw: q.maxDebtRaw.toString(), extraApyBps: q.extraApyBps }
-        : { asset: q.market.symbol, status: q.status, reason: q.reason, message: TEMPORARILY });
-      if (ready.length === 0) return { status: 'unavailable' as const, reason: eligible.length === 0 ? 'no_eligible_asset' : 'data_unavailable', message: TEMPORARILY, assets };
+        : { asset: q.market.symbol, status: q.status, reason: q.reason, message: q.reason === 'too_small' ? TOO_SMALL : TEMPORARILY });
+      // Nothing opens, and for at least one asset only because of the amount: say so (same answer as routing v2).
+      if (ready.length === 0) { const small = quoted.some(q => q.status === 'unavailable' && q.reason === 'too_small');
+        return { status: 'unavailable' as const, reason: eligible.length === 0 ? 'no_eligible_asset' : small ? 'too_small' : 'data_unavailable', message: small ? TOO_SMALL : TEMPORARILY, assets }; }
       return { status: 'ready' as const, authorization: await borrowKeyReady(id, account) ? 'ready' as const : 'renewal_required' as const,
         assets, ...withBatches(consentCalls(ready.map(q => ({ market: q.market, maxDebtRaw: q.maxDebtRaw })))) };
     },
@@ -1133,8 +1175,6 @@ export async function runStrategyEarnRound(args: { dryRun: boolean; log: (line: 
 // Scheduler steps with the portfolio's session key (backend#204)
 // ---------------------------------------------------------------------------
 
-/** Below this (USD, 1e18) an idle holding is not worth a UserOp. */
-export const MIN_AUTO_OPEN_USD = 10n * E18;
 /** Sends one session-key UserOp from the account (AtpBorrowExecutor calls only) and returns the mined receipt. */
 export type StrategyEarnSend = (calls: Call[]) => Promise<StrategyEarnTx>;
 export type StrategyEarnStepArgs = { chain: StrategyEarnChain; account: Address; portfolioId: number; now: Date; dryRun: boolean;
@@ -1246,7 +1286,9 @@ export async function strategyEarnAutoOpen(args: StrategyEarnStepArgs): Promise<
     const [st, price] = await Promise.all([chain.status(m.marketId, account, head.number), chain.price(m.collateral, head.number)]);
     if (st.gate !== 0) continue;
     const added = usdValue(held, price, m.decimals);
-    if (added < MIN_AUTO_OPEN_USD) continue;
+    // The same floor the owner's quote uses (`auto` asked for no consent under it): what was quoted is what opens. It was
+    // "holding worth 10 USD" until 2026-11-26, which left the small assets of a minimum buy consented but never opened.
+    if (tooSmallToBorrow(added, st.targetLtv)) continue;
     const shared = m.protocol === 'venus' ? venus : { addedValue: 0n, borrowRaw: 0n, borrowValue: 0n };
     const debt = st.debt + shared.borrowRaw;
     const plan = borrowPlan({ existingCollateralValue: st.health.collateralValue + shared.addedValue, addedCollateralValue: added,

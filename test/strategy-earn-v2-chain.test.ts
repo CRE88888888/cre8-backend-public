@@ -1123,3 +1123,39 @@ test('public nodes: one that does not answer costs a single short timeout, the n
     assert.throws(() => v2RpcTransport([]));
   } finally { for (const s of [quietNode, good, reverting]) { s.closeAllConnections(); s.close(); } }
 });
+
+test('minimum size (2026-11-26): a minimum buy opens, an amount under the floor is `too_small` (not temporarily unavailable), a venue minimum is read from the lens, and the public minimums follow', async () => {
+  const w = world(), reader = createV2Reader(w.readerDeps);
+  const api = createStrategyEarnV2Api({ v2: W.v2, reader, now: () => NOW });
+  const weights = [{ asset: W.NVDA, weightBps: 5000 }, { asset: W.QQQ, weightBps: 5000 }];
+  // Moolah's minimum loan (15 on the NVDAB Lista route) reaches the engine as a target debt: 15 ÷ 0.98. Venus has none.
+  assert.deepEqual((await reader.market()).snapshot.options.NVDAB!.map(o => o.minBorrowUsd), [undefined, undefined, 15.306124]);
+  // 50 USDT over two assets: NVDAB 25 × 30% = 7.50 (Venus), QQQB 25 × 35% = 8.75. Both open — the old 10 USD floor refused both.
+  const buy = await api.auto(W.account, W.owner, { budgetRaw: 50n * E18, weights, keyReady: true });
+  assert.deepEqual([buy.status, buy.assets.map(a => [a.asset, a.status, 'maxDebtRaw' in a ? a.maxDebtRaw : null]).sort()], ['ready', [['NVDAB', 'ready', (825n * E18 / 100n).toString()], ['QQQB', 'ready', (9625n * E18 / 1000n).toString()]]]);
+  // 5 USDT: 0.75 and 0.875 — under 1 USD each. The answer says why.
+  const tiny = await api.auto(W.account, W.owner, { budgetRaw: 5n * E18, weights, keyReady: true });
+  assert.deepEqual({ ...tiny, assets: [...tiny.assets].sort((x, y) => x.asset.localeCompare(y.asset)) }, { status: 'unavailable', reason: 'too_small', message: 'Amount too small.', assets: [
+    { asset: 'NVDAB', status: 'unavailable', reason: 'too_small', message: 'Amount too small.' }, { asset: 'QQQB', status: 'unavailable', reason: 'too_small', message: 'Amount too small.' }] });
+  // 6 USDT: QQQB 3 × 35% = 1.05 opens, NVDAB 3 × 30% = 0.90 does not: the consent covers what opens.
+  const part = await api.auto(W.account, W.owner, { budgetRaw: 6n * E18, weights, keyReady: true });
+  assert.deepEqual([part.status, part.assets.map(a => [a.asset, a.status, 'reason' in a ? a.reason : null]).sort()], ['ready', [['NVDAB', 'unavailable', 'too_small'], ['QQQB', 'ready', null]]]);
+  // The owner's own switch on a holding under the floor: the same answer (2 USD of NVDAB = 0.60).
+  w.setBalance(W.NVDA, W.account, E18 / 75n);
+  const open = await api.open(W.account, W.owner, { symbol: 'NVDAB', collateralRaw: E18 / 75n, weights, keyReady: true });
+  assert.deepEqual(open, { status: 'unavailable', asset: 'NVDAB', reason: 'too_small', message: 'Amount too small.' });
+  // What the public markets list carries: 1 USD ÷ ratio (NVDAB has Venus, which has no minimum).
+  const round = (m: Record<string, number>) => Object.fromEntries(Object.entries(m).map(([k, v]) => [k, Math.round(v * 1e4) / 1e4]));
+  assert.deepEqual(round(await api.minimums()), { QQQB: 2.8571, NVDAB: 3.3333 });
+
+  // With only the Lista route left for NVDAB, Moolah's minimum is the limit: 25 USD (7.50) is too small, 60 USD (18.00) opens, and the minimum says 51.02.
+  for (const [, r] of w.state.routes) if (r.venue === 1) r.retired = true;
+  const w2reader = createV2Reader(w.readerDeps), api2 = createStrategyEarnV2Api({ v2: W.v2, reader: w2reader, now: () => NOW });
+  w.setBalance(W.NVDA, W.account, 0n);
+  const only = [{ asset: W.NVDA, weightBps: 10_000 }];
+  const small = await api2.auto(W.account, W.owner, { budgetRaw: 25n * E18, weights: only, keyReady: true });
+  assert.deepEqual([small.status, 'reason' in small ? small.reason : null, small.assets.map(a => [a.asset, a.status])], ['unavailable', 'too_small', [['NVDAB', 'unavailable']]]);
+  const enough = await api2.auto(W.account, W.owner, { budgetRaw: 60n * E18, weights: only, keyReady: true });
+  assert.deepEqual([enough.status, enough.assets.map(a => [a.asset, a.status])], ['ready', [['NVDAB', 'ready']]]);
+  assert.deepEqual(round(await api2.minimums()), { QQQB: 2.8571, NVDAB: 51.0204 });
+});

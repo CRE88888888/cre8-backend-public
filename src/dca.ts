@@ -85,11 +85,13 @@ type PortfolioState = { schedule_state: string; strategy_id: string; version: nu
  * Why a period whose time has come is not being bought. The first three are read from the current state (the
  * scheduler's own skip order, src/dca.ts step); the others are what the scheduler's last attempt ran into
  * (`DcaNote`): the account has another operation unsettled or was busy, the vault cannot pay the period out right
- * now, the account has not approved the executor for the vault shares, the gas sponsorship was refused, or a read or
- * dependency failed. All of them are retried every round; an app that does not know a value shows a plain wait.
+ * now, the account has not approved the executor for the vault shares, the gas sponsorship was refused, a read or
+ * dependency failed, or the account's 24-hour buy limit has no room for even one batch (`buy_limit`: the period stays
+ * in the vault until the limit's window ends). All of them are retried every round; an app that does not know a
+ * value shows a plain wait.
  */
 export type DcaWaitingReason = 'portfolio_paused' | 'market_closed' | 'authorization_required'
-  | 'account_busy' | 'vault_liquidity' | 'approval_required' | 'sponsorship_unavailable' | 'temporarily_unavailable';
+  | 'account_busy' | 'vault_liquidity' | 'approval_required' | 'sponsorship_unavailable' | 'temporarily_unavailable' | 'buy_limit';
 /** The scheduler's last attempt at a due period that did not go through: reason, its full log line, for which period, when. */
 export type DcaNote = { reason: DcaWaitingReason; detail: string; periodsDone: number; at: string };
 /** A note older than this says nothing about now (the scheduler tries every round, about two minutes apart). */
@@ -100,7 +102,7 @@ export function waitingOfStep(line: string | null): DcaWaitingReason | null {
   const code = /^\[([A-Z_]+)\]/.exec(line)?.[1];
   return code === 'DCA_PORTFOLIO_PAUSED' ? 'portfolio_paused' : code === 'MARKET_CLOSED' ? 'market_closed'
     : code === 'DCA_AUTHORIZATION_REQUIRED' ? 'authorization_required' : code === 'DCA_APPROVAL_REQUIRED' ? 'approval_required'
-    : code === 'PREVIOUS_INFLIGHT' ? 'account_busy' : code === 'DCA_LIQUIDITY' ? 'vault_liquidity'
+    : code === 'PREVIOUS_INFLIGHT' ? 'account_busy' : code === 'DCA_LIQUIDITY' ? 'vault_liquidity' : code === 'DCA_BUY_LIMIT' ? 'buy_limit'
     : code === 'DCA_VAULT_UNKNOWN' || code === 'DCA_VERSION_UNAVAILABLE' || code === 'DCA_ZERO_SHARES' ? 'temporarily_unavailable' : null;
 }
 /** The waiting reason behind an error code thrown by a step. */
@@ -155,10 +157,34 @@ export type DcaDeps = {
   sessionKey: (portfolioId: number, account: Address, now: Date) => Promise<{ sessionKey: SessionKeyRef; policies: unknown } | null>;
   /** The account holds nothing but cash right now (src/sell-all-resume.ts). Read only for a paused portfolio. */
   holdsOnlyCash: (portfolioId: number) => Promise<boolean>;
+  /**
+   * USDT the account could still buy right after `incomingRaw` more USDT lands in it, under the executor's 24-hour buy
+   * limit (AtpExecutor.buyAllowance: account value x maxBuyBps, minus what it bought in the open window), with the
+   * planner's own margin (src/rebalance-plan.ts safeBuyCap). null = unreadable: the period is redeemed as before.
+   */
+  buyRoom: (account: Address, incomingRaw: bigint, block: bigint) => Promise<{ remainingRaw: bigint; capRaw: bigint; boughtRaw: bigint; windowEndsAt: bigint } | null>;
   /** Remember / read back why the scheduler's last attempt at a plan's due period did not go through. Best effort. */
   note: (planId: string, note: DcaNote) => Promise<void>;
   noted: (planId: string) => Promise<DcaNote | null>;
 };
+/**
+ * The executor values the account when a buy lands: cash + enrolled assets (DCA vault shares are not part of it). So a
+ * redeemed period raises the cap by `incoming x maxBuyBps`, all of it backed by cash.
+ */
+async function liveBuyRoom(account: Address, incomingRaw: bigint, block: bigint): Promise<{ remainingRaw: bigint; capRaw: bigint; boughtRaw: bigint; windowEndsAt: bigint } | null> {
+  try {
+    const client = liveClient(), executor = TESTNET_97.contracts.executor as Address;
+    const [{ EXECUTOR_BUY_ABI }, { safeBuyCap }] = await Promise.all([import('./chain.js'), import('./rebalance-plan.js')]);
+    const [[cap, bought, windowEndsAt], bps, cash] = await Promise.all([
+      client.readContract({ address: executor, abi: EXECUTOR_BUY_ABI, functionName: 'buyAllowance', args: [account], blockNumber: block }),
+      client.readContract({ address: executor, abi: EXECUTOR_BUY_ABI, functionName: 'maxBuyBps', blockNumber: block }),
+      client.readContract({ address: TESTNET_97.contracts.usdt as Address, abi: erc20Abi, functionName: 'balanceOf', args: [account], blockNumber: block }),
+    ]);
+    const capAfter = cap + incomingRaw * BigInt(bps) / 10000n, cashCap = (cash + incomingRaw) * BigInt(bps) / 10000n;
+    const safe = safeBuyCap(capAfter, cashCap < capAfter ? cashCap : capAfter);
+    return { remainingRaw: safe > bought ? safe - bought : 0n, capRaw: capAfter, boughtRaw: bought, windowEndsAt };
+  } catch { return null; }
+}
 /** One row per plan in yield_runtime_state (`cursor-` rows may be rewritten): API and scheduler are separate processes. */
 const noteKey = (planId: string) => `cursor-dca-plan-${planId}`;
 async function readNote(planId: string): Promise<DcaNote | null> {
@@ -179,7 +205,7 @@ function defaults(): DcaDeps {
     chainId: Number(process.env.CHAIN_ID?.trim() || '56'), vaults: dcaVaults(), executor: TESTNET_97.contracts.executor as Address,
     query: dbQuery, transaction: withTransaction, owned: requireOwnedPortfolio, chain: () => createDcaChain(liveClient()), now: () => new Date(),
     lock: withMixPortfolioLock, publicClient: liveClient, holdsOnlyCash: accountHoldsOnlyCash,
-    note: (planId, note) => writeYieldState(noteKey(planId), note), noted: readNote,
+    note: (planId, note) => writeYieldState(noteKey(planId), note), noted: readNote, buyRoom: liveBuyRoom,
     sessionKey: (portfolioId, account, now) => usableSessionKey(dbQuery, liveClient(), TESTNET_97.contracts.executor as Address, portfolioId, account, now),
     submit: async args => (await import('./yield-execution.js')).submitYieldAction(args),
     reconcile: async saved => (await import('./yield-execution.js')).reconcileYieldOperation(liveClient(), resolveBundlerUrl(), saved),
@@ -602,6 +628,15 @@ async function step(d: RoundDeps, plan: PlanRow, portfolioId: number): Promise<s
   const all = target === 'all' || target >= pos.valueRaw;
   const wanted = all ? pos.valueRaw : target as bigint;
   if (pos.maxWithdrawRaw < wanted) return '[DCA_LIQUIDITY] vault 可領現金不足，下輪再試';
+  // The account's 24-hour buy limit has no room for even one batch: redeeming now would only move the period out of the
+  // vault to sit in the account as cash until the limit's window ends. It stays in the vault (and keeps earning), like a
+  // period due while the market is closed. 2026-11-26 portfolio 58: bought 60, sold everything and cashed out, then a
+  // 10 USDT period: cap 200% x 10 = 20, already bought 59.73 -> redeemed at 02:58 and unbuyable until 02:47 the next day.
+  // Room for at least one batch: redeemed as before (the planner buys what fits and keeps the rest for later rounds).
+  const room = await d.buyRoom(account, wanted, head.number);
+  if (room !== null && room.remainingRaw * 100n < MIN_ASSET_BATCH_RAW * 99n) {
+    return `[DCA_BUY_LIMIT] 帳戶 24 小時買入額度不夠買一批（領出後 cap ${usdt(room.capRaw)}、窗口內已買 ${usdt(room.boughtRaw)}、可買 ${usdt(room.remainingRaw)} USDT），本期留在 vault${room.windowEndsAt > 0n ? ` 到 ${new Date(Number(room.windowEndsAt) * 1000).toISOString()}` : ''}`;
+  }
   let shares = all ? pos.sharesRaw : await chain.sharesFor(vault, wanted, head.number, head.timestamp);
   if (shares > pos.sharesRaw) shares = pos.sharesRaw;
   if (shares === 0n) return '[DCA_ZERO_SHARES]';

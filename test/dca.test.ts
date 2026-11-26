@@ -204,6 +204,8 @@ function harness(opts: { balance?: bigint; classified?: bigint; shares?: bigint;
     reconcile: async () => { throw new Error('no receipt'); },
     credit: async (id, own, evidence) => { credited.push({ id, own, evidence }); return { id: String(credited.length + 40) }; },
     note: async (planId, note) => { notes.set(planId, note); }, noted: async planId => notes.get(planId) ?? null,
+    // The 24-hour buy limit has room unless a test says otherwise.
+    buyRoom: async () => ({ remainingRaw: maxUint256, capRaw: maxUint256, boughtRaw: 0n, windowEndsAt: 0n }),
   };
   return { deps, plans, actions, log, submitted, credited, state, cash, notes, setNow: (d: Date) => { now = d; } };
 }
@@ -575,6 +577,7 @@ test('2026-11-26 plan 9: every reason a due period was not redeemed is kept for 
   for (const [line, reason] of [[null, 'account_busy'], ['[DCA_PORTFOLIO_PAUSED] 組合暫停中，餘額留在 vault', 'portfolio_paused'], ['[MARKET_CLOSED] 美股休市，本期留在 vault 到開盤', 'market_closed'],
     ['[DCA_AUTHORIZATION_REQUIRED] 需要 owner 更新 session 權限（renewal）', 'authorization_required'], ['[DCA_APPROVAL_REQUIRED] 帳戶尚未授權 executor 領出', 'approval_required'],
     ['[PREVIOUS_INFLIGHT] 帳戶其他操作待對帳', 'account_busy'], ['[DCA_LIQUIDITY] vault 可領現金不足，下輪再試', 'vault_liquidity'], ['[DCA_VAULT_UNKNOWN]', 'temporarily_unavailable'],
+    ['[DCA_BUY_LIMIT] 帳戶 24 小時買入額度不夠買一批', 'buy_limit'],
     ['[DCA_VERSION_UNAVAILABLE]', 'temporarily_unavailable'], ['[DCA_ZERO_SHARES]', 'temporarily_unavailable'], ['[DCA_NOT_DUE]', null], ['[DCA_NOT_ACTIVE]', null],
     ['[DCA_REDEEMED] 第 1/2 期 10 USDT 已回到帳戶', null], ['[DCA_RECONCILED] confirmed', null], ['[DCA_EMPTY] vault 已無餘額，定投結束', null]] as const) assert.equal(waitingOfStep(line), reason, String(line));
   for (const [code, reason] of [['PAYMASTER_EXIT_INVALID', 'sponsorship_unavailable'], ['PAYMASTER_EXIT_AUTHORIZATION_PENDING', 'sponsorship_unavailable'], ['PAYMASTER_QUOTA_EXCEEDED', 'sponsorship_unavailable'],
@@ -657,6 +660,37 @@ test('2026-11-26 plan 9: every reason a due period was not redeemed is kept for 
   assert.deepEqual(await broken.round(), { checked: 1, credited: 0, blocked: 0 });
   assert.match(broken.logs.join('\n'), /plan 1: 等待原因未寫入：db down/);
   assert.equal(await broken.waiting(), null);
+});
+
+test('2026-11-26 portfolio 58: a period the 24-hour buy limit cannot buy even one batch of stays in the vault (buy_limit); room for a batch redeems as before', async () => {
+  const scene = (room: Awaited<ReturnType<DcaDeps['buyRoom']>>) => {
+    const h = harness({ allocation: ['0x' + '11'.repeat(20)], keyReady: true });
+    h.plans.push(dcaPlanRow());
+    h.state.shares = 20n * E18; h.state.value = 20n * E18;
+    const base = (h.deps.chain as () => DcaChain)(), approved: DcaChain = { ...base, earn: { ...base.earn, allowance: async () => maxUint256 } };
+    h.deps.chain = () => approved; h.deps.sessionKey = async () => testKey;
+    const asked: [string, bigint, bigint][] = [];
+    h.deps.buyRoom = async (a, incoming, block) => { asked.push([a, incoming, block]); return room; };
+    const logs: string[] = [];
+    return { h, logs, asked, round: () => runDcaRound({ dryRun: false, limit: 10, log: l => logs.push(l) }, h.deps) };
+  };
+  // What portfolio 58 had: cap after the redemption 200% x 10 = 20, bought 59.73 in the window -> nothing can be bought.
+  const windowEndsAt = BigInt(Date.parse('2026-11-27T02:47:13Z') / 1000);
+  const full = scene({ remainingRaw: 0n, capRaw: 20n * E18, boughtRaw: 5973n * E18 / 100n, windowEndsAt });
+  assert.deepEqual(await full.round(), { checked: 1, credited: 0, blocked: 0 });
+  assert.deepEqual(full.asked, [[account, 10n * E18, 100n]], 'asked for the period about to be redeemed, at the block of the vault reads');
+  assert.equal(full.h.submitted.length, 0, 'nothing is redeemed');
+  assert.match(full.logs.join('\n'), /plan 1: \[DCA_BUY_LIMIT\] 帳戶 24 小時買入額度不夠買一批（領出後 cap 20\.00、窗口內已買 59\.73、可買 0\.00 USDT），本期留在 vault 到 2026-11-27T02:47:13\.000Z/);
+  assert.equal(full.h.notes.get('1')?.reason, 'buy_limit');
+  assert.equal((await createDca(full.h.deps).get(7, owner)).plan?.waitingReason, 'buy_limit');
+  assert.equal(full.h.plans[0]?.periods_done, 0);
+  // Just under one batch (10 USDT, with 1% slack for the fee inside it) still waits; one batch of room redeems.
+  assert.equal((await scene({ remainingRaw: 989n * E18 / 100n, capRaw: 0n, boughtRaw: 0n, windowEndsAt: 0n }).round()).credited, 0);
+  for (const room of [{ remainingRaw: 99n * E18 / 10n, capRaw: 0n, boughtRaw: 0n, windowEndsAt: 0n }, { remainingRaw: 15n * E18, capRaw: 0n, boughtRaw: 0n, windowEndsAt: 0n }, null]) {
+    const ok = scene(room);
+    assert.deepEqual(await ok.round(), { checked: 1, credited: 1, blocked: 0 }, room === null ? 'an unreadable limit never holds a period back' : String(room.remainingRaw));
+    assert.equal(ok.h.plans[0]?.periods_done, 1);
+  }
 });
 
 test("DCA round for one portfolio (an owner's own buy): only the plan of that portfolio's account is stepped and credited", async () => {

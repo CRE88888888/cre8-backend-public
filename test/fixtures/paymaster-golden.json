@@ -1,0 +1,8 @@
+{
+  "source": "eth-infinitism/account-abstraction@7af70c8993a6f42973f520ae0752386a5032abe7 contracts/samples/VerifyingPaymaster.sol:getHash",
+  "chainId": 1337,
+  "validUntil": 1800000300,
+  "validAfter": 0,
+  "hash": "0xc27264e664c82a29b6a18dae6cfec7ba4f0ce90d256314e33112e31c32eeaf04",
+  "signature": "0x4ce09424392ebd6964ef70ef135f90eb9188773603154c36993383d48ad275c368befbcc07b35dfdaf1ac2bb2b19da516ec6d4c69c83e7a5730b2c231b1c2d851b"
+}

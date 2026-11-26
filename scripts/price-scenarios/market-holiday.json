@@ -1,0 +1,691 @@
+{
+  "version": 1,
+  "stepSeconds": 60,
+  "maxStepBps": 1,
+  "assets": {
+    "AAPLB": "356976000000000000000",
+    "AMZNB": "264729000000000000000",
+    "AVAX": "8019980000000000000",
+    "BABAB": "93783500000000000000",
+    "BTCB": "67123700000000000000000",
+    "CRCLB": "60586400000000000000",
+    "DJTB": "4586300000000000000",
+    "DOGE": "62730900000000000",
+    "ETH": "1906330000000000000000",
+    "EWYB": "140701000000000000000",
+    "GOOGLB": "293439000000000000000",
+    "HOODB": "76282500000000000000",
+    "INTCB": "58566900000000000000",
+    "METAB": "639072000000000000000",
+    "MRNAB": "221708000000000000000",
+    "MSFTB": "522467000000000000000",
+    "MSTRB": "107424000000000000000",
+    "MUB": "766962000000000000000",
+    "NFLXB": "61987300000000000000",
+    "NOKB": "8009990000000000000",
+    "NVDAB": "162413000000000000000",
+    "QQQB": "676113000000000000000",
+    "SGOVon": "102904000000000000000",
+    "SKHYB": "130353000000000000000",
+    "SNDKB": "863817000000000000000",
+    "SOL": "75800600000000000000",
+    "SPCXB": "136068000000000000000",
+    "SPYB": "752689000000000000000",
+    "TLTon": "83495600000000000000",
+    "TRX": "312407000000000000",
+    "TSLAB": "388543000000000000000",
+    "TSMB": "396058000000000000000",
+    "WBNB": "614427000000000000000",
+    "XAUt": "3866590000000000000000",
+    "XRP": "993055000000000000",
+    "USDC": "1000730000000000000",
+    "DAI": "1001540000000000000",
+    "LTC": "48359900000000000000",
+    "ABBVon": "293300000000000000000",
+    "ALABB": "216870000000000000000",
+    "AMATB": "370827000000000000000",
+    "AMDB": "508580000000000000000",
+    "APHon": "80710000000000000000",
+    "APLDon": "16720000000000000000",
+    "AVGOB": "319885000000000000000",
+    "AXPon": "324310000000000000000",
+    "BEB": "193880000000000000000",
+    "BLKon": "1214710000000000000000",
+    "CBRSB": "96700000000000000000",
+    "CEGon": "276090000000000000000",
+    "CIENon": "269330000000000000000",
+    "COHRB": "225190000000000000000",
+    "CORZon": "12720000000000000000",
+    "CRDOB": "132890000000000000000",
+    "CRMB": "215204000000000000000",
+    "CRWVB": "48980000000000000000",
+    "CVXon": "210780000000000000000",
+    "GEVB": "829340000000000000000",
+    "GLDon": "379530000000000000000",
+    "GOOGon": "286010000000000000000",
+    "GPROB": "880000000000000000",
+    "IEFon": "91800000000000000000",
+    "IRENB": "21410000000000000000",
+    "IVVon": "756050000000000000000",
+    "KOon": "96030000000000000000",
+    "LLYB": "1430490000000000000000",
+    "MAon": "655810000000000000000",
+    "NBISB": "141450000000000000000",
+    "NEMon": "125160000000000000000",
+    "ORCLB": "120098000000000000000",
+    "PANWon": "330890000000000000000",
+    "PYPLB": "60156400000000000000",
+    "SHAZB": "23930000000000000000",
+    "STXB": "506423000000000000000",
+    "UBERon": "71170000000000000000",
+    "VRTon": "200470000000000000000",
+    "VSTB": "133920000000000000000",
+    "Von": "422160000000000000000",
+    "ADA": "150164000000000000",
+    "LINK": "9127500000000000000",
+    "BCH": "204300000000000000000",
+    "NEAR": "3133340000000000000",
+    "UNI": "5024790000000000000",
+    "ZEC": "897060000000000000000",
+    "TONCOIN": "1051000000000000000",
+    "DOT": "719267000000000000",
+    "SHIB": "3880000000000",
+    "PEPE": "3928280000000",
+    "AAVE": "105860000000000000000",
+    "Cake": "1615720000000000000",
+    "FIL": "614694000000000000",
+    "ATOM": "1280000000000000000",
+    "AMCB": "2920000000000000000",
+    "ANTB": "300000000000000000000",
+    "BMNRB": "15710000000000000000",
+    "BNCB": "3530000000000000000",
+    "COINB": "112370000000000000000",
+    "CYPHB": "1850000000000000000",
+    "GMEB": "26310000000000000000",
+    "MRVLB": "147983000000000000000",
+    "PDDB": "86360000000000000000",
+    "PENGB": "45030000000000000000",
+    "RDDTB": "92970000000000000000",
+    "SOXLB": "50872500000000000000",
+    "TQQQB": "53091500000000000000"
+  },
+  "timeline": [
+    {
+      "steps": 120,
+      "mode": "sideways",
+      "stepBps": 1
+    }
+  ],
+  "overrides": {
+    "AAPLB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "AMZNB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "BABAB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "CRCLB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "DJTB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "EWYB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "GOOGLB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "HOODB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "INTCB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "METAB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "MRNAB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "MSFTB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "MSTRB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "MUB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "NFLXB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "NOKB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "NVDAB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "QQQB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "SGOVon": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "SKHYB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "SNDKB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "SPCXB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "SPYB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "TLTon": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "TSLAB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "TSMB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "ETH": [
+      {
+        "steps": 30,
+        "mode": "rise",
+        "stepBps": 1
+      },
+      {
+        "steps": 60,
+        "mode": "paused",
+        "stepBps": 0
+      },
+      {
+        "steps": 30,
+        "mode": "fall",
+        "stepBps": 1
+      }
+    ],
+    "ABBVon": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "ALABB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "AMATB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "AMDB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "APHon": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "APLDon": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "AVGOB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "AXPon": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "BEB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "BLKon": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "CBRSB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "CEGon": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "CIENon": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "COHRB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "CORZon": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "CRDOB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "CRMB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "CRWVB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "CVXon": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "GEVB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "GLDon": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "GOOGon": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "GPROB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "IEFon": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "IRENB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "IVVon": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "KOon": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "LLYB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "MAon": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "NBISB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "NEMon": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "ORCLB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "PANWon": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "PYPLB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "SHAZB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "STXB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "UBERon": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "VRTon": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "VSTB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "Von": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "AMCB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "ANTB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "BMNRB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "BNCB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "COINB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "CYPHB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "GMEB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "MRVLB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "PDDB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "PENGB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "RDDTB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "SOXLB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ],
+    "TQQQB": [
+      {
+        "steps": 120,
+        "mode": "closed",
+        "stepBps": 0
+      }
+    ]
+  }
+}

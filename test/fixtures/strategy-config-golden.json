@@ -1,0 +1,60 @@
+[
+  {
+    "config": {
+      "domain": "cre8.strategy.execution",
+      "schemaVersion": 1,
+      "chainId": 56,
+      "execution": {
+        "kind": "hold"
+      },
+      "allocation": {
+        "assets": [
+          {
+            "address": "0x55d398326f99059ff775485246999027b3197955",
+            "weightBps": 10000
+          }
+        ]
+      },
+      "schedule": {
+        "kind": "funding"
+      },
+      "idleYield": {
+        "enabled": false
+      },
+      "activeAt": "1794700800"
+    },
+    "canonical": "{\"domain\":\"cre8.strategy.execution\",\"schemaVersion\":1,\"chainId\":56,\"execution\":{\"kind\":\"hold\"},\"allocation\":{\"assets\":[{\"address\":\"0x55d398326f99059ff775485246999027b3197955\",\"weightBps\":10000}]},\"schedule\":{\"kind\":\"funding\"},\"idleYield\":{\"enabled\":false},\"activeAt\":\"1794700800\"}",
+    "hash": "0x53199d17b7bd2bde6f0ba7cb1cd73849516981b58abf8768fd19bdd50bdcdc31"
+  },
+  {
+    "config": {
+      "domain": "cre8.strategy.execution",
+      "schemaVersion": 1,
+      "chainId": 97,
+      "execution": {
+        "kind": "stack"
+      },
+      "allocation": {
+        "assets": [
+          {
+            "address": "0x6de69565f250146c67d56be5aa15b6f181fce4d7",
+            "weightBps": 5000
+          },
+          {
+            "address": "0xbd7d814e02c9f69af391a8ba4c1787769f2ddd4b",
+            "weightBps": 5000
+          }
+        ]
+      },
+      "schedule": {
+        "kind": "funding"
+      },
+      "idleYield": {
+        "enabled": false
+      },
+      "activeAt": "1794700800"
+    },
+    "canonical": "{\"domain\":\"cre8.strategy.execution\",\"schemaVersion\":1,\"chainId\":97,\"execution\":{\"kind\":\"stack\"},\"allocation\":{\"assets\":[{\"address\":\"0x6de69565f250146c67d56be5aa15b6f181fce4d7\",\"weightBps\":5000},{\"address\":\"0xbd7d814e02c9f69af391a8ba4c1787769f2ddd4b\",\"weightBps\":5000}]},\"schedule\":{\"kind\":\"funding\"},\"idleYield\":{\"enabled\":false},\"activeAt\":\"1794700800\"}",
+    "hash": "0x43ede6359f7b305ddc23bc828bf45d87e2aa778276ce018bca8995f9639e0a0d"
+  }
+]

@@ -1,0 +1,160 @@
+name: CI
+
+# 只在「會改變產物」的事件上跑：
+#   pull_request        → 別人的 PR 也要驗
+#   push to main        → 部署前的最後一道
+#   workflow_dispatch   → 手動重跑
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一分支的新 push 會取消舊的執行 —— org 是 Free plan，private repo 每月只有 2000 分鐘。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: typecheck + unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.4'   # 與 Dockerfile 的 oven/bun:1.4 及 engines（>=1.4）一致；升版要跟 lockfile 一起升
+
+      # `--frozen-lockfile`：lockfile 與 package.json 不一致時**直接失敗**，
+      # 而不是安靜地裝一組新的依賴。與 Dockerfile 的安裝方式相同。
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      # src + test + scripts 三份 tsconfig（tsconfig.scripts.json 排除的兩支 script 是已知債）。
+      - name: Typecheck
+        run: bun run typecheck
+
+      # 只跑不需要 Postgres 的測試檔。
+      #
+      # 為什麼不是整個 `bun test`：auth session 存在 Postgres（auth_sessions），所以 auth / renewal /
+      # portfolios / operator / strategies 的 HTTP 測試沒有真 DB 就會 503 失敗；而 migration 在另一個
+      # private repo（CRE88888888/db），CI 要拿到它需要額外的 token，所以這裡不起 postgres service。
+      #
+      # DATABASE_URL 給一個連不上的假值：scheduler / snapshot.integration 的 `after()` 會呼叫 query()，
+      # 沒有 DATABASE_URL 時 getConfig() 會同步 throw（不是被 .catch 吃掉的 rejected promise），
+      # 變成「Unhandled error between tests」。給假值後 DB 測試照設計 skip。
+      # 需要 fork 的測試（ANVIL_RPC_URL，預設 127.0.0.1:8545）在 CI 上連不到，同樣會自己 skip。
+      #
+      # 新增測試檔時：不需要 DB 的就加進這個清單。
+      - name: Unit tests (no DB)
+        env:
+          DATABASE_URL: postgres://ci:ci@127.0.0.1:1/unused
+        run: >-
+          bun test
+          test/relayer-nonce-consumption.test.ts
+          test/mix-publication-nonce.test.ts
+          test/mix-publication.test.ts
+          test/mix-registration.test.ts
+          test/mix-chain.test.ts
+          test/mix-flows.test.ts
+          test/mix-scheduler.test.ts
+          test/mix-runtime.test.ts
+          test/mix-sponsorship.test.ts
+          test/mix-approval.test.ts
+          test/mix-domain.test.ts
+          test/mix-preview.test.ts
+          test/user-media.test.ts
+          test/cash-earn.test.ts
+          test/dca.test.ts
+          test/strategy-earn.test.ts
+          test/strategy-earn-mainnet.test.ts
+          test/strategy-earn-routing.test.ts
+          test/strategy-rewards.test.ts
+          test/strategy-earn-routing-v2.test.ts
+          test/strategy-earn-batches.test.ts
+          test/strategy-earn-v2.test.ts
+          test/strategy-earn-v2-chain.test.ts
+          test/waitlist-tasks.test.ts
+          test/waitlist-gate.test.ts
+          test/mix-http.test.ts
+          test/model-returns.test.ts
+          test/info-drafter.test.ts
+          test/info-collectors.test.ts
+          test/info-http.test.ts
+          test/assets.test.ts
+          test/asset-exposure.test.ts
+          test/yield-domain.test.ts
+          test/yield-reader.test.ts
+          test/overview.test.ts
+          test/yield-snapshot.test.ts
+          test/yield-http.test.ts
+          test/yield-scheduler.test.ts
+          test/alerts.test.ts
+          test/alerts-waiting.test.ts
+          test/chain.enroll.test.ts
+          test/account-deployment.test.ts
+          test/registry-versioning.test.ts
+          test/strategy-detail-last-good.test.ts
+          test/enrollment-sponsorship.test.ts
+          test/drift.test.ts
+          test/deployment.test.ts
+          test/worker-health.test.ts
+          test/alto.test.ts
+          test/executor-migration.test.ts
+          test/testnet-profile.test.ts
+          test/testnet-launch-funds.test.ts
+          test/price-keeper.test.ts
+          test/price-keeper.rpc.test.ts
+          test/user-operation.test.ts
+          test/yield-permissions.test.ts
+          test/yield-execution.test.ts
+          test/yield-paymaster.test.ts
+          test/yield-receipt.test.ts
+          test/yield-golden.test.ts
+          test/sync-testnet-profile.test.ts
+          test/funding.test.ts
+          test/faucet.test.ts
+          test/gas-faucet.test.ts
+          test/paymaster.test.ts
+          test/paymaster-allowlist.test.ts
+          test/paymaster.rpc.test.ts
+          test/points.test.ts
+          test/welcome-grants.test.ts
+          test/relayer-outbox.test.ts
+          test/holdings-scan.test.ts
+          test/kernel.test.ts
+          test/notify.test.ts
+          test/permissions.test.ts
+          test/positions.test.ts
+          test/preflight.test.ts
+          test/pricing.test.ts
+          test/pricing.crosscheck.test.ts
+          test/rebalance-plan.test.ts
+          test/asset-plan.test.ts
+          test/execution-batch.test.ts
+          test/fee-window.test.ts
+          test/new-money-plan.test.ts
+          test/last-child-fee.test.ts
+          test/strategy-runtime.test.ts
+          test/cash-reconciliation.test.ts
+          test/mix-cash-withdrawal-source.test.ts
+          test/chain-read-only.test.ts
+          test/scheduler-error-log.test.ts
+          test/status-timeout.test.ts
+          test/strategy-cash-row.test.ts
+          test/strategy-earn-sponsor.test.ts
+          test/sponsor-flows.test.ts
+          test/mix-strategy-earn.test.ts
+          test/strategy-earn-venus.test.ts
+          test/rpc-transport.test.ts
+          test/withdrawal-scan-cache.test.ts
+          test/mix-node-lag.test.ts
+          test/reconcile-identity.test.ts
+          test/trading-calendar.test.ts
+          test/scheduler.test.ts
+          test/server.test.ts
+          test/snapshot.integration.test.ts
+          test/snapshot.scan.test.ts

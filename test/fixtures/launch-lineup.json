@@ -1,0 +1,553 @@
+{
+  "schema_version": 1,
+  "source": "docs/research/2026-11-20-launch-lineup/lineup.json (backend#168 approved 2026-11-20)",
+  "funds": [
+    {
+      "id": "mag7",
+      "name": "Mag7",
+      "category": "theme",
+      "components": [
+        {
+          "asset_id": "AAPLB",
+          "role": "core",
+          "weight_bps": 1429
+        },
+        {
+          "asset_id": "MSFTB",
+          "role": "core",
+          "weight_bps": 1428
+        },
+        {
+          "asset_id": "GOOGLB",
+          "role": "core",
+          "weight_bps": 1429
+        },
+        {
+          "asset_id": "AMZNB",
+          "role": "core",
+          "weight_bps": 1429
+        },
+        {
+          "asset_id": "NVDAB",
+          "role": "core",
+          "weight_bps": 1428
+        },
+        {
+          "asset_id": "METAB",
+          "role": "core",
+          "weight_bps": 1429
+        },
+        {
+          "asset_id": "TSLAB",
+          "role": "core",
+          "weight_bps": 1428
+        }
+      ]
+    },
+    {
+      "id": "everyday",
+      "name": "每天在用的公司",
+      "category": "theme",
+      "components": [
+        {
+          "asset_id": "AAPLB",
+          "role": "core",
+          "weight_bps": 1584
+        },
+        {
+          "asset_id": "AMZNB",
+          "role": "core",
+          "weight_bps": 1584
+        },
+        {
+          "asset_id": "NFLXB",
+          "role": "core",
+          "weight_bps": 1583
+        },
+        {
+          "asset_id": "GOOGLB",
+          "role": "core",
+          "weight_bps": 1583
+        },
+        {
+          "asset_id": "METAB",
+          "role": "core",
+          "weight_bps": 1583
+        },
+        {
+          "asset_id": "MSFTB",
+          "role": "core",
+          "weight_bps": 1583
+        },
+        {
+          "asset_id": "RDDTB",
+          "role": "satellite",
+          "weight_bps": 500
+        }
+      ]
+    },
+    {
+      "id": "ai-chips",
+      "name": "AI 晶片",
+      "category": "theme",
+      "components": [
+        {
+          "asset_id": "NVDAB",
+          "role": "core",
+          "weight_bps": 2125
+        },
+        {
+          "asset_id": "TSMB",
+          "role": "core",
+          "weight_bps": 2125
+        },
+        {
+          "asset_id": "INTCB",
+          "role": "core",
+          "weight_bps": 2125
+        },
+        {
+          "asset_id": "SKHYB",
+          "role": "core",
+          "weight_bps": 2125
+        },
+        {
+          "asset_id": "AVGOB",
+          "role": "satellite",
+          "weight_bps": 500
+        },
+        {
+          "asset_id": "MRVLB",
+          "role": "satellite",
+          "weight_bps": 500
+        },
+        {
+          "asset_id": "PENGB",
+          "role": "satellite",
+          "weight_bps": 500
+        }
+      ]
+    },
+    {
+      "id": "ai-memory",
+      "name": "AI 記憶體",
+      "category": "theme",
+      "components": [
+        {
+          "asset_id": "SKHYB",
+          "role": "core",
+          "weight_bps": 3333
+        },
+        {
+          "asset_id": "MUB",
+          "role": "core",
+          "weight_bps": 3334
+        },
+        {
+          "asset_id": "SNDKB",
+          "role": "core",
+          "weight_bps": 3333
+        }
+      ]
+    },
+    {
+      "id": "ai-models",
+      "name": "AI 模型公司",
+      "category": "theme",
+      "components": [
+        {
+          "asset_id": "ANTB",
+          "role": "core",
+          "weight_bps": 1667
+        },
+        {
+          "asset_id": "AMZNB",
+          "role": "core",
+          "weight_bps": 1667
+        },
+        {
+          "asset_id": "GOOGLB",
+          "role": "core",
+          "weight_bps": 1667
+        },
+        {
+          "asset_id": "MSFTB",
+          "role": "core",
+          "weight_bps": 1666
+        },
+        {
+          "asset_id": "SPCXB",
+          "role": "core",
+          "weight_bps": 1666
+        },
+        {
+          "asset_id": "METAB",
+          "role": "core",
+          "weight_bps": 1667
+        }
+      ]
+    },
+    {
+      "id": "new-giants",
+      "name": "新上市巨頭",
+      "category": "theme",
+      "components": [
+        {
+          "asset_id": "SPCXB",
+          "role": "core",
+          "weight_bps": 5000
+        },
+        {
+          "asset_id": "ANTB",
+          "role": "core",
+          "weight_bps": 5000
+        }
+      ]
+    },
+    {
+      "id": "korea-semiconductors",
+      "name": "韓國半導體",
+      "category": "theme",
+      "components": [
+        {
+          "asset_id": "SKHYB",
+          "role": "core",
+          "weight_bps": 5000
+        },
+        {
+          "asset_id": "EWYB",
+          "role": "core",
+          "weight_bps": 5000
+        }
+      ]
+    },
+    {
+      "id": "china",
+      "name": "中概股",
+      "category": "theme",
+      "components": [
+        {
+          "asset_id": "BABAB",
+          "role": "core",
+          "weight_bps": 5000
+        },
+        {
+          "asset_id": "PDDB",
+          "role": "core",
+          "weight_bps": 5000
+        }
+      ]
+    },
+    {
+      "id": "crypto-treasuries",
+      "name": "幣股財庫",
+      "category": "theme",
+      "components": [
+        {
+          "asset_id": "MSTRB",
+          "role": "core",
+          "weight_bps": 3166
+        },
+        {
+          "asset_id": "BMNRB",
+          "role": "core",
+          "weight_bps": 3167
+        },
+        {
+          "asset_id": "BNCB",
+          "role": "core",
+          "weight_bps": 3167
+        },
+        {
+          "asset_id": "CYPHB",
+          "role": "satellite",
+          "weight_bps": 500
+        }
+      ]
+    },
+    {
+      "id": "bitcoin-plus",
+      "name": "比特幣加強版",
+      "category": "theme",
+      "components": [
+        {
+          "asset_id": "BTCB",
+          "role": "core",
+          "weight_bps": 3334
+        },
+        {
+          "asset_id": "MSTRB",
+          "role": "core",
+          "weight_bps": 3333
+        },
+        {
+          "asset_id": "COINB",
+          "role": "core",
+          "weight_bps": 3333
+        }
+      ]
+    },
+    {
+      "id": "bnb",
+      "name": "BNB 生態",
+      "category": "theme",
+      "components": [
+        {
+          "asset_id": "WBNB",
+          "role": "core",
+          "weight_bps": 5000
+        },
+        {
+          "asset_id": "BNCB",
+          "role": "core",
+          "weight_bps": 5000
+        }
+      ]
+    },
+    {
+      "id": "crypto-infrastructure",
+      "name": "幣圈基礎設施",
+      "category": "theme",
+      "components": [
+        {
+          "asset_id": "CRCLB",
+          "role": "core",
+          "weight_bps": 3333
+        },
+        {
+          "asset_id": "COINB",
+          "role": "core",
+          "weight_bps": 3334
+        },
+        {
+          "asset_id": "HOODB",
+          "role": "core",
+          "weight_bps": 3333
+        }
+      ]
+    },
+    {
+      "id": "meme",
+      "name": "迷因股",
+      "category": "theme",
+      "components": [
+        {
+          "asset_id": "GMEB",
+          "role": "core",
+          "weight_bps": 4500
+        },
+        {
+          "asset_id": "DOGE",
+          "role": "core",
+          "weight_bps": 4500
+        },
+        {
+          "asset_id": "AMCB",
+          "role": "satellite",
+          "weight_bps": 500
+        },
+        {
+          "asset_id": "DJTB",
+          "role": "satellite",
+          "weight_bps": 500
+        }
+      ]
+    },
+    {
+      "id": "gold-bitcoin",
+      "name": "黃金加比特幣",
+      "category": "theme",
+      "components": [
+        {
+          "asset_id": "XAUt",
+          "role": "core",
+          "weight_bps": 5000
+        },
+        {
+          "asset_id": "BTCB",
+          "role": "core",
+          "weight_bps": 5000
+        }
+      ]
+    },
+    {
+      "id": "us-market",
+      "name": "美股大盤",
+      "category": "theme",
+      "components": [
+        {
+          "asset_id": "QQQB",
+          "role": "core",
+          "weight_bps": 5000
+        },
+        {
+          "asset_id": "SPYB",
+          "role": "core",
+          "weight_bps": 5000
+        }
+      ]
+    },
+    {
+      "id": "pelosi",
+      "name": "Pelosi",
+      "category": "person",
+      "components": [
+        {
+          "asset_id": "NVDAB",
+          "role": "core",
+          "weight_bps": 1900
+        },
+        {
+          "asset_id": "GOOGLB",
+          "role": "core",
+          "weight_bps": 1900
+        },
+        {
+          "asset_id": "MSFTB",
+          "role": "core",
+          "weight_bps": 1900
+        },
+        {
+          "asset_id": "AMZNB",
+          "role": "core",
+          "weight_bps": 1900
+        },
+        {
+          "asset_id": "INTCB",
+          "role": "core",
+          "weight_bps": 1900
+        },
+        {
+          "asset_id": "AVGOB",
+          "role": "satellite",
+          "weight_bps": 500
+        }
+      ]
+    },
+    {
+      "id": "trump",
+      "name": "川普持倉",
+      "category": "person",
+      "components": [
+        {
+          "asset_id": "NVDAB",
+          "role": "core",
+          "weight_bps": 1250
+        },
+        {
+          "asset_id": "AAPLB",
+          "role": "core",
+          "weight_bps": 1250
+        },
+        {
+          "asset_id": "MSFTB",
+          "role": "core",
+          "weight_bps": 1250
+        },
+        {
+          "asset_id": "AMZNB",
+          "role": "core",
+          "weight_bps": 1250
+        },
+        {
+          "asset_id": "METAB",
+          "role": "core",
+          "weight_bps": 1250
+        },
+        {
+          "asset_id": "TSLAB",
+          "role": "core",
+          "weight_bps": 1250
+        },
+        {
+          "asset_id": "GOOGLB",
+          "role": "core",
+          "weight_bps": 1250
+        },
+        {
+          "asset_id": "NFLXB",
+          "role": "core",
+          "weight_bps": 1250
+        }
+      ]
+    },
+    {
+      "id": "duan",
+      "name": "段永平",
+      "category": "person",
+      "components": [
+        {
+          "asset_id": "AAPLB",
+          "role": "core",
+          "weight_bps": 2500
+        },
+        {
+          "asset_id": "PDDB",
+          "role": "core",
+          "weight_bps": 2500
+        },
+        {
+          "asset_id": "NVDAB",
+          "role": "core",
+          "weight_bps": 2500
+        },
+        {
+          "asset_id": "TSLAB",
+          "role": "core",
+          "weight_bps": 2500
+        }
+      ]
+    },
+    {
+      "id": "musk",
+      "name": "馬斯克宇宙",
+      "category": "person",
+      "components": [
+        {
+          "asset_id": "TSLAB",
+          "role": "core",
+          "weight_bps": 3166
+        },
+        {
+          "asset_id": "SPCXB",
+          "role": "core",
+          "weight_bps": 3167
+        },
+        {
+          "asset_id": "BTCB",
+          "role": "core",
+          "weight_bps": 3167
+        },
+        {
+          "asset_id": "DOGE",
+          "role": "satellite",
+          "weight_bps": 500
+        }
+      ]
+    },
+    {
+      "id": "soxl",
+      "name": "三倍半導體",
+      "category": "leveraged",
+      "components": [
+        {
+          "asset_id": "SOXLB",
+          "role": "core",
+          "weight_bps": 10000
+        }
+      ]
+    },
+    {
+      "id": "tqqq",
+      "name": "三倍納指",
+      "category": "leveraged",
+      "components": [
+        {
+          "asset_id": "TQQQB",
+          "role": "core",
+          "weight_bps": 10000
+        }
+      ]
+    }
+  ]
+}

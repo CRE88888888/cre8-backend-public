@@ -1,0 +1,178 @@
+[
+  {
+    "name": "mixed_daily_weekly",
+    "config": {
+      "chainId": 56,
+      "execution": {
+        "kind": "per_asset",
+        "numeraire": "0x55d398326f99059ff775485246999027b3197955",
+        "rebalance": "none",
+        "assets": [
+          {
+            "asset": "0x00000000000000000000000000000000000000a1",
+            "weightBps": 3000,
+            "execution": {
+              "kind": "stack",
+              "every": "daily",
+              "weekday": null,
+              "timeUtc": "01:00",
+              "slices": 12
+            },
+            "yield": null
+          },
+          {
+            "asset": "0x00000000000000000000000000000000000000b2",
+            "weightBps": 2000,
+            "execution": {
+              "kind": "stack",
+              "every": "weekly",
+              "weekday": 1,
+              "timeUtc": "01:00",
+              "slices": 52
+            },
+            "yield": null
+          },
+          {
+            "asset": "0x55d398326f99059ff775485246999027b3197955",
+            "weightBps": 5000,
+            "yield": null
+          }
+        ]
+      },
+      "allocation": {
+        "assets": [
+          {
+            "address": "0x00000000000000000000000000000000000000a1",
+            "weightBps": 3000
+          },
+          {
+            "address": "0x00000000000000000000000000000000000000b2",
+            "weightBps": 2000
+          },
+          {
+            "address": "0x55d398326f99059ff775485246999027b3197955",
+            "weightBps": 5000
+          }
+        ]
+      },
+      "schedule": {
+        "kind": "funding"
+      },
+      "activeAt": "1794700800"
+    },
+    "canonical": "{\"domain\":\"cre8.strategy.execution\",\"schemaVersion\":2,\"chainId\":56,\"execution\":{\"kind\":\"per_asset\",\"numeraire\":\"0x55d398326f99059ff775485246999027b3197955\",\"rebalance\":\"none\",\"assets\":[{\"asset\":\"0x00000000000000000000000000000000000000a1\",\"weightBps\":3000,\"execution\":{\"kind\":\"stack\",\"every\":\"daily\",\"weekday\":null,\"timeUtc\":\"01:00\",\"slices\":12},\"yield\":null},{\"asset\":\"0x00000000000000000000000000000000000000b2\",\"weightBps\":2000,\"execution\":{\"kind\":\"stack\",\"every\":\"weekly\",\"weekday\":1,\"timeUtc\":\"01:00\",\"slices\":52},\"yield\":null},{\"asset\":\"0x55d398326f99059ff775485246999027b3197955\",\"weightBps\":5000,\"yield\":null}]},\"allocation\":{\"assets\":[{\"address\":\"0x00000000000000000000000000000000000000a1\",\"weightBps\":3000},{\"address\":\"0x00000000000000000000000000000000000000b2\",\"weightBps\":2000},{\"address\":\"0x55d398326f99059ff775485246999027b3197955\",\"weightBps\":5000}]},\"schedule\":{\"kind\":\"funding\"},\"idleYield\":{\"enabled\":false},\"activeAt\":\"1794700800\"}",
+    "hash": "0xb5360673f1fcca69805bd617fd5164961f64bb72ceb2464cdaefc3b300c5afbf"
+  },
+  {
+    "name": "all_hold_monthly",
+    "config": {
+      "chainId": 56,
+      "execution": {
+        "kind": "per_asset",
+        "numeraire": "0x55d398326f99059ff775485246999027b3197955",
+        "rebalance": "monthly",
+        "assets": [
+          {
+            "asset": "0x00000000000000000000000000000000000000a1",
+            "weightBps": 3000,
+            "execution": {
+              "kind": "hold"
+            },
+            "yield": null
+          },
+          {
+            "asset": "0x00000000000000000000000000000000000000b2",
+            "weightBps": 2000,
+            "execution": {
+              "kind": "hold"
+            },
+            "yield": null
+          },
+          {
+            "asset": "0x55d398326f99059ff775485246999027b3197955",
+            "weightBps": 5000,
+            "yield": null
+          }
+        ]
+      },
+      "allocation": {
+        "assets": [
+          {
+            "address": "0x00000000000000000000000000000000000000a1",
+            "weightBps": 3000
+          },
+          {
+            "address": "0x00000000000000000000000000000000000000b2",
+            "weightBps": 2000
+          },
+          {
+            "address": "0x55d398326f99059ff775485246999027b3197955",
+            "weightBps": 5000
+          }
+        ]
+      },
+      "schedule": {
+        "kind": "funding"
+      },
+      "activeAt": "1794700800"
+    },
+    "canonical": "{\"domain\":\"cre8.strategy.execution\",\"schemaVersion\":2,\"chainId\":56,\"execution\":{\"kind\":\"per_asset\",\"numeraire\":\"0x55d398326f99059ff775485246999027b3197955\",\"rebalance\":\"monthly\",\"assets\":[{\"asset\":\"0x00000000000000000000000000000000000000a1\",\"weightBps\":3000,\"execution\":{\"kind\":\"hold\"},\"yield\":null},{\"asset\":\"0x00000000000000000000000000000000000000b2\",\"weightBps\":2000,\"execution\":{\"kind\":\"hold\"},\"yield\":null},{\"asset\":\"0x55d398326f99059ff775485246999027b3197955\",\"weightBps\":5000,\"yield\":null}]},\"allocation\":{\"assets\":[{\"address\":\"0x00000000000000000000000000000000000000a1\",\"weightBps\":3000},{\"address\":\"0x00000000000000000000000000000000000000b2\",\"weightBps\":2000},{\"address\":\"0x55d398326f99059ff775485246999027b3197955\",\"weightBps\":5000}]},\"schedule\":{\"kind\":\"funding\"},\"idleYield\":{\"enabled\":false},\"activeAt\":\"1794700800\"}",
+    "hash": "0xe7455de6ebf0288a131422e69fb9b8b3b6272783b2604152b65cb3e74b5b3959"
+  },
+  {
+    "name": "all_hold_drift",
+    "config": {
+      "chainId": 56,
+      "execution": {
+        "kind": "per_asset",
+        "numeraire": "0x55d398326f99059ff775485246999027b3197955",
+        "rebalance": "drift",
+        "assets": [
+          {
+            "asset": "0x00000000000000000000000000000000000000a1",
+            "weightBps": 3000,
+            "execution": {
+              "kind": "hold"
+            },
+            "yield": null
+          },
+          {
+            "asset": "0x00000000000000000000000000000000000000b2",
+            "weightBps": 2000,
+            "execution": {
+              "kind": "hold"
+            },
+            "yield": null
+          },
+          {
+            "asset": "0x55d398326f99059ff775485246999027b3197955",
+            "weightBps": 5000,
+            "yield": null
+          }
+        ]
+      },
+      "allocation": {
+        "assets": [
+          {
+            "address": "0x00000000000000000000000000000000000000a1",
+            "weightBps": 3000
+          },
+          {
+            "address": "0x00000000000000000000000000000000000000b2",
+            "weightBps": 2000
+          },
+          {
+            "address": "0x55d398326f99059ff775485246999027b3197955",
+            "weightBps": 5000
+          }
+        ]
+      },
+      "schedule": {
+        "kind": "funding"
+      },
+      "activeAt": "1794700800"
+    },
+    "canonical": "{\"domain\":\"cre8.strategy.execution\",\"schemaVersion\":2,\"chainId\":56,\"execution\":{\"kind\":\"per_asset\",\"numeraire\":\"0x55d398326f99059ff775485246999027b3197955\",\"rebalance\":\"drift\",\"assets\":[{\"asset\":\"0x00000000000000000000000000000000000000a1\",\"weightBps\":3000,\"execution\":{\"kind\":\"hold\"},\"yield\":null},{\"asset\":\"0x00000000000000000000000000000000000000b2\",\"weightBps\":2000,\"execution\":{\"kind\":\"hold\"},\"yield\":null},{\"asset\":\"0x55d398326f99059ff775485246999027b3197955\",\"weightBps\":5000,\"yield\":null}]},\"allocation\":{\"assets\":[{\"address\":\"0x00000000000000000000000000000000000000a1\",\"weightBps\":3000},{\"address\":\"0x00000000000000000000000000000000000000b2\",\"weightBps\":2000},{\"address\":\"0x55d398326f99059ff775485246999027b3197955\",\"weightBps\":5000}]},\"schedule\":{\"kind\":\"funding\"},\"idleYield\":{\"enabled\":false},\"activeAt\":\"1794700800\"}",
+    "hash": "0x0ccea73993f1af2701030f4be26810c69259b4a9ba6f711a58f5e0a9761b3fa4"
+  }
+]

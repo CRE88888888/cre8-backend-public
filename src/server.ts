@@ -1,0 +1,1669 @@
+import { resumePausedJobsForMix, resumePausedJobsForPortfolio } from './strategy-job-recovery.js';
+import { configuredChainId } from './testnet-profile.js';
+import { createMixAssetList, createMixPreview } from './mix-preview.js';
+import { createUserMedia } from './user-media.js';
+import { createCashEarn } from './cash-earn.js';
+import { createStrategyEarn } from './strategy-earn.js';
+import { createDca } from './dca.js';
+import { createMixService } from './mixes.js';
+import { createInfoService, parseInfoFilters } from './info/service.js';
+import { createYieldService } from './yield-service.js';
+import { createServer as createHttpServer } from 'node:http';
+import { createPublicClient, http, toHex } from 'viem';
+import type { Address } from 'viem';
+import { activeChain } from './chain-object.js';
+import type { IncomingMessage, Server, ServerResponse } from 'node:http';
+import { alertCounts, healthStatusFor, listOpenAlerts } from './alerts.js';
+import type { AlertCounts } from './alerts.js';
+import { listPortfolioActivity, readOperatorActivity, readOperatorOverview, runOperatorClose, runOperatorRedeem } from './operator.js';
+import { readAssetExposureStatus, setAssetExposureCap } from './asset-exposure.js';
+import type { RedeemAmount } from './operator.js';
+import { createTradableProbeCache, EXECUTOR_ORACLE_ABI, ORACLE_OF_ABI, listPriceableAssets } from './assets.js';
+import type { PriceableAsset, TradableProbe } from './assets.js';
+import { authenticate, issueNonce, login, logout, parseLoginBody } from './auth.js';
+import { loginWithPrivy } from './privy.js';
+import { createWaitlistService } from './waitlist.js';
+import { resolveOperatorWallets } from './waitlist-access.js';
+export { resolveOperatorWallets } from './waitlist-access.js';
+import { createWaitlistInviteService } from './waitlist-invites.js';
+import { viewPassMatches, waitlistGate, waitlistOpenSignup } from './waitlist-gate.js';
+import { createWaitlistTaskService } from './waitlist-tasks.js';
+import { claimFaucetUsdt } from './faucet.js';
+import { claimFaucetGas } from './gas-faucet.js';
+import { PaymasterRetryTooSoonError, sponsorUserOperation } from './paymaster.js';
+import { createPointsService } from './points.js';
+import { RateLimitError, RequestRateLimiter } from './ratelimit.js';
+import { getConfig, getSessionKeyConfig } from './config.js';
+import { createPlatformStatusReader, getChain } from './chain.js';
+import { createOverview } from './overview.js';
+import { TESTNET_97 } from './testnet-profile.js';
+import { erc20Abi } from 'viem';
+import { query } from './db.js';
+import { AppError, ValidationError } from './errors.js';
+import { strategyVersionState, getStrategyWithVersionState, createStrategy, getStrategy, listStrategies, publishVersion, typedVersionInput, typedMinimumDeposit } from './strategies.js';
+import { createModelReader, dbModelStrategy } from './model-returns/service.js';
+import { emptyModel } from './model-returns/calculation.js';
+import { previewContributionAsync } from './contribution-preview.js';
+import { createPortfolioStrategyService } from './portfolio-strategies.js';
+import { listPortfolios, enrollPortfolio, preparePortfolioEnrollment, allocationMinimumDeposit, strategyMinimumDeposit } from './portfolios.js';
+import { buildRenewalParams, recordRenewalResult, resolveBundlerUrl } from './renewal.js';
+import {
+  OPERATOR_REBALANCE_ENV,
+  createPortfolioStatusReader,
+  operatorRebalanceEnabled,
+  previewOperatorRebalance,
+  runOperatorRebalance,
+} from './operator.js';
+import type { OperatorActivityRow, OperatorPlanPreview, OperatorRebalanceResult, PortfolioStatusReader } from './operator.js';
+import { noteLandedBlock, rpcTransport } from './rpc-transport.js';
+
+/** Hard cap on request bodies: strategy payloads are small; anything bigger is a mistake or an attack. */
+const MAX_BODY_BYTES = 1_000_000;
+
+/**
+ * Error codes that mean "the database is unreachable" rather than "your request is wrong".
+ * These become 503 so a load balancer can take the instance out of rotation.
+ */
+const DB_DOWN_CODES = new Set([
+  'ECONNREFUSED',
+  'ENOTFOUND',
+  'ETIMEDOUT',
+  'EHOSTUNREACH',
+  '08000',
+  '08001',
+  '08006',
+  '57P01',
+  '57P03',
+]);
+
+// ---------------------------------------------------------------------------
+// CORS
+// ---------------------------------------------------------------------------
+
+/** `CORS_ALLOWED_ORIGINS` 未設定時的預設值：vite dev server 的兩個常見 origin。 */
+export const DEFAULT_CORS_ALLOWED_ORIGINS: readonly string[] = ['http://localhost:5173', 'http://127.0.0.1:5173'];
+
+/** preflight 允許的方法：GET、POST 與私人組合的 PATCH（OPTIONS 是 preflight 本身）。 */
+export const CORS_ALLOWED_METHODS = 'GET, POST, PATCH, PUT, DELETE, OPTIONS';
+
+/** preflight 允許的請求標頭：`content-type` 給 JSON body，`authorization` 給 bearer token，`idempotency-key` 給私人組合建立重試。 */
+export const CORS_ALLOWED_HEADERS = 'authorization, content-type, idempotency-key';
+
+/** preflight 結果可以快取多久（秒）。10 分鐘：夠久到不做多餘的 preflight，夠短到改設定會生效。 */
+export const CORS_MAX_AGE_SECONDS = 600;
+
+export type CorsConfig = { allowedOrigins: readonly string[] };
+
+/**
+ * 解析 `CORS_ALLOWED_ORIGINS`（逗號分隔的**完整 origin**，例：`https://app.cre8.xyz`）。
+ *
+ * 刻意不支援 `*`：這支 API 用 `Authorization: Bearer` 認證，而 `*` 不能與 credentials 併用；就算硬用，
+ * 也等於讓任何網站讀到帶 token 的回應。空字串／未設定 = dev 預設，不是「全開」。
+ */
+export function resolveCorsConfig(env: NodeJS.ProcessEnv = process.env): CorsConfig {
+  const raw = env.CORS_ALLOWED_ORIGINS?.trim() ?? '';
+  const origins =
+    raw === ''
+      ? [...DEFAULT_CORS_ALLOWED_ORIGINS]
+      : raw
+          .split(',')
+          .map((origin) => origin.trim())
+          .filter((origin) => origin !== '');
+  return { allowedOrigins: origins.map((origin) => origin.toLowerCase()) };
+}
+
+/**
+ * 請求的 `Origin` 在清單裡就回傳**它的原樣字串**（要放進 `Access-Control-Allow-Origin`），否則 null。
+ *
+ * 回具體 origin 而不是 `*`：請求帶 `Authorization`，`*` 不能與 `access-control-allow-credentials` 併用，
+ * 而且會讓任何來源都讀得到回應。大小寫只影響比對（origin 的 scheme/host 本來就不分大小寫）。
+ */
+export function allowedCorsOrigin(origin: string | undefined, cors: CorsConfig): string | null {
+  if (typeof origin !== 'string' || origin === '') return null;
+  return cors.allowedOrigins.includes(origin.toLowerCase()) ? origin : null;
+}
+
+/**
+ * 把 CORS 標頭放到**所有**回應上（含錯誤），並處理 preflight。
+ *
+ * 用 `res.setHeader` 而不是 `sendJson()` 的參數是刻意的：`writeHead()` 會把 setHeader 過的值與它自己的
+ * 合併，所以 401／404／405 這些由 `sendError()`／`methodNotAllowed()` 送出的回應也一併帶到，不需要每個
+ * 分支都記得傳。
+ *
+ * 不在清單裡的 origin：**不送任何 CORS 標頭**，讓瀏覽器自己擋——但回應照常完成，不是 500，也不是
+ * 403。CORS 是瀏覽器的規則，不是認證；擋不擋得住取決於 `authenticate()`，與這裡無關。
+ */
+function applyCors(req: IncomingMessage, res: ServerResponse, cors: CorsConfig): void {
+  // 同一個 URL 會因為 Origin 不同而回應不同標頭，所以快取必須按 Origin 分開。
+  res.setHeader('vary', 'Origin');
+  const origin = allowedCorsOrigin(req.headers.origin, cors);
+  if (origin === null) return;
+
+  res.setHeader('access-control-allow-origin', origin);
+  res.setHeader('access-control-allow-credentials', 'true');
+}
+
+/** OPTIONS preflight：204 + 允許的方法／標頭／快取時間，不進路由（也不需要 token）。 */
+function sendPreflight(req: IncomingMessage, res: ServerResponse, cors: CorsConfig): void {
+  if (allowedCorsOrigin(req.headers.origin, cors) !== null) {
+    res.setHeader('access-control-allow-methods', CORS_ALLOWED_METHODS);
+    res.setHeader('access-control-allow-headers', CORS_ALLOWED_HEADERS);
+    res.setHeader('access-control-max-age', String(CORS_MAX_AGE_SECONDS));
+  }
+  res.writeHead(204, { 'content-length': '0' });
+  res.end();
+}
+
+// ---------------------------------------------------------------------------
+// bundler relay
+// ---------------------------------------------------------------------------
+
+/**
+ * `POST /bundler` 放行的方法：續期流程真的會用到的那六個，一個不多。
+ *
+ * **白名單，不是黑名單**：這支 relay 帶著使用者的 session token，能碰到 bundler 就等於能
+ * 代替使用者發 UserOp。黑名單（排除 `eth_sendRawTransaction` 之類）永遠會漏一個，白名單漏掉的
+ * 代價只是一個 403。
+ */
+export const BUNDLER_METHOD_WHITELIST: ReadonlySet<string> = new Set([
+  'eth_sendUserOperation',
+  'eth_estimateUserOperationGas',
+  'eth_getUserOperationReceipt',
+  'eth_getUserOperationByHash',
+  'eth_supportedEntryPoints',
+  'eth_chainId',
+]);
+
+/** 上游 timeout。gas 估算＋送 op 本來就要幾秒，30 秒是「正常慢」與「卡死」的分界。 */
+export const BUNDLER_TIMEOUT_MS = 30_000;
+
+/**
+ * Dependencies the routes need. Injectable so route tests can run without a database;
+ * production calls `createServer()` and gets the real implementations. Partial overrides are
+ * merged over the defaults, so a test can stub one dependency and leave the rest real.
+ */
+export type ServerDeps = {
+  /** Tests: owner-action reset of paused strategy jobs (src/strategy-job-recovery.ts). */
+  resumePausedJobs?: (portfolioId: number) => Promise<number>;
+  resumePausedMixJobs?: (mixId: number, wallet: string) => Promise<number>;
+  mixes: ReturnType<typeof createMixService>;
+  mixPreview: ReturnType<typeof createMixPreview>;
+  userMedia: ReturnType<typeof createUserMedia>;
+  cashEarn: ReturnType<typeof createCashEarn>;
+  strategyEarn: ReturnType<typeof createStrategyEarn>;
+  dca: ReturnType<typeof createDca>;
+  mixAssets: ReturnType<typeof createMixAssetList>;
+  modelReturns: ReturnType<typeof createModelReader>;
+  info: ReturnType<typeof createInfoService>;
+  previewContribution: typeof previewContributionAsync;
+  yieldService: ReturnType<typeof createYieldService>;
+  portfolioStrategies: ReturnType<typeof createPortfolioStrategyService>;
+  points: ReturnType<typeof createPointsService>;
+  claimFaucetUsdt: typeof claimFaucetUsdt;
+  claimFaucetGas: typeof claimFaucetGas;
+  sponsorUserOperation: typeof sponsorUserOperation;
+  privyLogin: typeof loginWithPrivy;
+  waitlist: ReturnType<typeof createWaitlistService>;
+  waitlistInvites: ReturnType<typeof createWaitlistInviteService>;
+  waitlistTasks: ReturnType<typeof createWaitlistTaskService>;
+  rateLimiter: RequestRateLimiter;
+  auth: { authenticate: typeof authenticate; issueNonce: typeof issueNonce; login: typeof login; logout: typeof logout };
+  /** Public platform snapshot, with a process-wide TTL cache and no wallet/DB reads. */
+  platformStatus: ReturnType<typeof createPlatformStatusReader>;
+  createStrategy: typeof createStrategy;
+  publishVersion: typeof publishVersion;
+  enrollPortfolio: typeof enrollPortfolio;
+  preparePortfolioEnrollment: typeof preparePortfolioEnrollment;
+  strategyVersionState: typeof strategyVersionState;
+  strategyDetail: typeof getStrategyWithVersionState;
+  /** DB-only strategy + versions (no chain reads); the list's model returns use this. */
+  strategyRecord: typeof getStrategy;
+  strategyExposure: typeof readAssetExposureStatus;
+  setExposureCap: typeof setAssetExposureCap;
+  listPortfolios: typeof listPortfolios;
+  buildRenewalParams: typeof buildRenewalParams;
+  recordRenewalResult: typeof recordRenewalResult;
+  /**
+   * `GET /portfolios/:id/status`。預設的那一份**帶 TTL 快取**（`createPortfolioStatusReader` 在
+   * `createServer()` 之前建好，所以快取跨請求存活）；測試換成 stub 就不必真的讀鏈。
+   */
+  portfolioActivity: (id: number, wallet: string) => Promise<unknown>;
+  /** operator 總覽（rebalance dashboard）。 */
+  operatorOverview: () => Promise<unknown>;
+  /** 把部位按比例賣成 numeraire（提領成 USDT 的前半段）。 */
+  operatorRedeem: (portfolioId: number, wallet: string, amount: RedeemAmount) => Promise<unknown>;
+  /** 清倉：把全部部位賣成 numeraire。 */
+  operatorClose: (portfolioId: number, wallet: string) => Promise<unknown>;
+  portfolioStatus: PortfolioStatusReader;
+  /** `GET /me/overview`（backend#216）：持倉、錢包 USDT、現金生息的快照，過期在背景刷新。 */
+  overview: ReturnType<typeof createOverview>;
+  /** `POST /portfolios/:id/rebalance`（會動錢；預設實作見 `operator.ts`）。 */
+  operatorRebalance: (portfolioId: number, wallet: string) => Promise<OperatorRebalanceResult>;
+  /**
+   * 營運端觸發某一輪再平衡（**不檢查 owner**）。
+   *
+   * `POST /portfolios/:id/rebalance` 會 `requireOwnedPortfolio`（那是給使用者的）。
+   * 營運端要跑的是別人的投組，所以另開一條：傳一個 no-op 的 `requireOwnedPortfolio`。
+   * HTTP 層先驗 SIWE + `OPERATOR_WALLETS` + 寫入開關，才允許跨 owner 操作；
+   * 鏈上 executor 另外驗 enrollment / asset allowlist / oracle 地板。
+   */
+  operatorForceRebalance: (portfolioId: number) => Promise<OperatorRebalanceResult>;
+  /** 營運端全域活動流：誰、在哪個策略上被處理（含成敗與前後漂移）。 */
+  operatorActivity: (limit: number) => Promise<OperatorActivityRow[]>;
+  /**
+   * 營運端的 dry-run 預覽（**不送交易、不花錢**）。
+   *
+   * 為什麼需要：`/portfolios/:id/plan` 會做 owner 檢查，營運端排查「為什麼某一檔沒被買」
+   * 時完全看不到規劃器的 note（只有 owner 看得到）。這支用 no-op 的 owner 檢查繞過，
+   * 權限模型與 `/operator/portfolios/:id/rebalance` 一致。
+   */
+  operatorPlanPreview: (portfolioId: number) => Promise<OperatorPlanPreview>;
+  /** 營運端代為清倉（**不檢查 owner**）。與 force rebalance 同一條權限模型。 */
+  operatorForceClose: (portfolioId: number) => Promise<unknown>;
+  /** 這一輪會做什麼（dry-run）。唯讀，所以**不**受 `ENABLE_OPERATOR_REBALANCE` 限制。 */
+  planPreview: (portfolioId: number, wallet: string) => Promise<OperatorPlanPreview>;
+  /**
+   * operator rebalance 的部署開關。不給 = 每次請求讀 `ENABLE_OPERATOR_REBALANCE`
+   * （與 CORS／bundler URL 同一個做法：env 的解析留在 server 層）。
+   */
+  operatorRebalanceEnabled: () => boolean;
+  /** 測試可注入白名單；未指定時每次請求從 `OPERATOR_WALLETS` 解析，預設拒絕所有人。 */
+  operatorWallets?: readonly string[];
+  /** CORS 允許清單。不給 = 每次請求從 `CORS_ALLOWED_ORIGINS` 解析（見 `resolveCorsConfig`）。 */
+  cors?: CorsConfig;
+  /**
+   * `POST /bundler` 的上游位址。不給 = 每次請求從 `BUNDLER_URL` 解析（見 `resolveBundlerUrl`），
+   * 與 CORS 同一個做法：env 的解析留在 server 層，`config.ts` 不用動。
+   */
+  bundlerUrl?: string;
+  /**
+   * 打上游用的 fetch。測試注入假 fetcher 就能斷言「白名單外的方法一次都沒送出去」——
+   * 那是「不轉發」唯一能證明的方式，光看回應碼證明不了。
+   */
+  bundlerFetch?: typeof fetch;
+  /** `GET /assets`：create fund 的資產選單。注入讓路由測試不必連 DB。 */
+  listAssets: () => Promise<PriceableAsset[]>;
+};
+
+// Keep only the current deployment; changed chain/RPC/executor must never reuse its probe.
+let assetProbeCache: {
+  chainId: number; rpcUrl: string; executor: Address;
+  read: () => Promise<TradableProbe | undefined>;
+} | undefined;
+
+/**
+ * `GET /assets` 的預設實作：DB 那一份 + 鏈上的「這個資產有沒有註冊 oracle」。
+ *
+ * 為什麼要問鏈：create fund 讓使用者選一個 router 報不出價的資產，等於建了一個**永遠不會執行**的策略，
+ * 而錯誤要到第一次再平衡才會以 `OracleNotSet` 出現（實際發生過：CRCLB / MUB）。
+ *
+ * 沒有 RPC 或沒有 executor 時回 `tradable: null`（未知）—— **不要預設成 true**：
+ * 那會把「查不到」變成「可以交易」。
+ */
+async function defaultListAssets(): Promise<PriceableAsset[]> {
+  let probe: TradableProbe | undefined;
+  try {
+    const config = getConfig();
+    // executor 位址在 session-key 設定裡（`getSessionKeyConfig` 才會檢查它有沒有設）。
+    const executor = (() => {
+      try {
+        return getSessionKeyConfig().executorAddress;
+      } catch {
+        return null;
+      }
+    })();
+    if (config.rpcUrl !== null && executor !== null) {
+      if (assetProbeCache === undefined || assetProbeCache.chainId !== config.chainId ||
+          assetProbeCache.rpcUrl !== config.rpcUrl || assetProbeCache.executor !== executor) {
+        const client = createPublicClient({ chain: activeChain(), transport: rpcTransport('server', config.rpcUrl) });
+        assetProbeCache = {
+          chainId: config.chainId, rpcUrl: config.rpcUrl, executor,
+          read: createTradableProbeCache(async () => {
+            const router = await client.readContract({ address: executor, abi: EXECUTOR_ORACLE_ABI, functionName: 'oracle' });
+            return {
+              router,
+              oracleOf: async (asset) => client.readContract({
+                address: router, abi: ORACLE_OF_ABI, functionName: 'oracleOf', args: [asset as Address],
+              }),
+            };
+          }),
+        };
+      }
+      probe = await assetProbeCache.read();
+    }
+  } catch {
+    // 查不到就回 null：讓 UI 顯示「未知」，而不是謊報可交易。
+    probe = undefined;
+  }
+  return listPriceableAssets(undefined, probe);
+}
+
+// 這三個要和 /me/overview 共用同一份（快取與狀態跨請求存活）。
+const defaultPortfolioStatus = createPortfolioStatusReader();
+const defaultCashEarn = createCashEarn();
+const defaultStrategyEarn = createStrategyEarn();
+const defaultOverview = createOverview({
+  // 只要 DB 的清單：gas 狀態是逐檔讀鏈，總覽用不到，換成立即回的假讀取（失敗會收成 gas: null）。
+  listPortfolios: (wallet) => listPortfolios(wallet, { getAccountGasBalance: async () => { throw new Error('skip'); }, getGasPriceWei: async () => 0n, minSessionGasWei: 0n }),
+  status: (id, wallet) => defaultPortfolioStatus(id, wallet),
+  strategyEarn: (id, wallet) => defaultStrategyEarn.portfolio(id, wallet),
+  cashEarn: (wallet) => defaultCashEarn.account(wallet),
+  walletUsdt: async (wallet) => {
+    if (configuredChainId() !== 97) throw new AppError(409, 'CASH_UNAVAILABLE', 'wallet cash is only on the testnet app');
+    return getChain().publicClient.readContract({ address: TESTNET_97.contracts.usdt, abi: erc20Abi, functionName: 'balanceOf', args: [wallet as Address] });
+  },
+});
+
+const defaultDeps: Omit<ServerDeps, 'rateLimiter'> = {
+  mixes: createMixService(),
+  mixPreview: createMixPreview(),
+  userMedia: createUserMedia(),
+  cashEarn: defaultCashEarn,
+  strategyEarn: defaultStrategyEarn,
+  dca: createDca(),
+  mixAssets: createMixAssetList(),
+  modelReturns: createModelReader(),
+  info: createInfoService(),
+  previewContribution: previewContributionAsync,
+  yieldService: createYieldService(),
+  portfolioStrategies: createPortfolioStrategyService(),
+  points: createPointsService(),
+  claimFaucetUsdt,
+  claimFaucetGas,
+  sponsorUserOperation,
+  privyLogin: loginWithPrivy,
+  waitlist: createWaitlistService({ openSignup: waitlistOpenSignup }),
+  waitlistInvites: createWaitlistInviteService(),
+  waitlistTasks: createWaitlistTaskService(),
+  auth: { authenticate, issueNonce, login, logout },
+  platformStatus: createPlatformStatusReader(),
+  createStrategy,
+  publishVersion,
+  enrollPortfolio, preparePortfolioEnrollment, strategyVersionState, strategyDetail: getStrategyWithVersionState, strategyRecord: getStrategy,
+  strategyExposure: readAssetExposureStatus, setExposureCap: setAssetExposureCap,
+  listPortfolios,
+  buildRenewalParams,
+  recordRenewalResult,
+  // 快取要跨請求存活，不能每個請求重建一份。
+  portfolioStatus: defaultPortfolioStatus,
+  overview: defaultOverview,
+  operatorRebalance: (portfolioId, wallet) => runOperatorRebalance(portfolioId, wallet, { resumeIfPaused: true }),
+  operatorActivity: (limit) => readOperatorActivity(limit),
+  // 與 force rebalance 用同一個「不檢查 owner」的注入；差別是這支只讀不送。
+  operatorPlanPreview: (portfolioId) =>
+    previewOperatorRebalance(portfolioId, 'operator', { requireOwnedPortfolio: async () => ({ id: portfolioId }) as never }),
+  operatorForceClose: (portfolioId) =>
+    runOperatorClose(portfolioId, 'operator', { requireOwnedPortfolio: async () => ({ id: portfolioId }) as never }),
+  // 營運端：同樣的送出管線，只是換掉 owner 檢查（見型別上的說明）。
+  operatorForceRebalance: (portfolioId) =>
+    runOperatorRebalance(portfolioId, 'operator', {
+      // 回傳一個假的 portfolio：這個路徑不讀它的欄位，只是要讓 owner 檢查通過。
+      requireOwnedPortfolio: async () => ({ id: portfolioId }) as never,
+    }),
+  planPreview: previewOperatorRebalance,
+  operatorRebalanceEnabled,
+  listAssets: defaultListAssets,
+  portfolioActivity: (id, wallet) => listPortfolioActivity(id, wallet),
+  operatorOverview: () => readOperatorOverview(),
+  operatorRedeem: (portfolioId, wallet, usdE8) => runOperatorRedeem(portfolioId, wallet, usdE8),
+  operatorClose: (portfolioId, wallet) => runOperatorClose(portfolioId, wallet),
+};
+
+export function createServer(overrides: Partial<ServerDeps> = {}): Server {
+  const deps: ServerDeps = { ...defaultDeps, ...overrides, rateLimiter: overrides.rateLimiter ?? new RequestRateLimiter() };
+  return createHttpServer((req, res) => {
+    void handleRequest(req, res, deps);
+  });
+}
+
+async function handleRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: ServerDeps,
+): Promise<void> {
+  const startedAt = Date.now();
+  const method = req.method ?? 'GET';
+  let path = req.url ?? '/';
+
+  res.on('finish', () => {
+    console.log(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        level: 'info',
+        msg: 'http_request',
+        method,
+        path,
+        status: res.statusCode,
+        durationMs: Date.now() - startedAt,
+      }),
+    );
+  });
+
+  try {
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    path = url.pathname;
+
+    // CORS 是每個回應都要做的事（含錯誤與 401），所以放在路由之前，不在任何一個 handler 裡。
+    const cors = deps.cors ?? resolveCorsConfig();
+    applyCors(req, res, cors);
+    // preflight 不進路由：它不帶 token、沒有 body，也不該被任何 method 檢查判成 405。
+    if (method === 'OPTIONS') {
+      sendPreflight(req, res, cors);
+      return;
+    }
+
+    await route(req, res, url, deps);
+  } catch (err) {
+    sendError(res, err);
+  }
+}
+
+async function route(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  deps: ServerDeps,
+): Promise<void> {
+  const method = req.method ?? 'GET';
+  const segments = url.pathname.split('/').filter((segment) => segment.length > 0);
+  const [root] = segments;
+
+  if (root === 'images' && segments.length === 2) {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    const image = await deps.userMedia.image(segments[1] ?? '');
+    const headers = { 'cache-control': 'public, max-age=31536000, immutable', etag: image.etag, 'x-content-type-options': 'nosniff',
+      'content-security-policy': "default-src 'none'", 'cross-origin-resource-policy': 'cross-origin' };
+    if (req.headers['if-none-match'] === image.etag) { res.writeHead(304, headers); res.end(); return; }
+    res.writeHead(200, { ...headers, 'content-type': image.contentType, 'content-length': image.bytes.length });
+    res.end(image.bytes);
+    return;
+  }
+
+  if (root === 'me' && segments[1] === 'profile' && segments.length <= 3) {
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    if (segments.length === 2) {
+      if (method === 'GET') { sendJson(res, 200, await deps.userMedia.profile(wallet)); return; }
+      if (method === 'PATCH') {
+        await deps.rateLimiter.wallet('plan', wallet);
+        sendJson(res, 200, await deps.userMedia.updateProfile(wallet, await readJsonBody(req))); return;
+      }
+      return methodNotAllowed(res, ['GET', 'PATCH']);
+    }
+    if (segments[2] === 'avatar') {
+      if (method === 'PUT') {
+        await deps.rateLimiter.wallet('plan', wallet);
+        sendJson(res, 200, await deps.userMedia.setAvatar(wallet, await readJsonBody(req))); return;
+      }
+      if (method === 'DELETE') { await deps.rateLimiter.wallet('plan', wallet); sendJson(res, 200, await deps.userMedia.deleteAvatar(wallet)); return; }
+      return methodNotAllowed(res, ['PUT', 'DELETE']);
+    }
+  }
+
+  // backend#216：「我的」頁一次要的數字，回快照（不現場讀鏈）。?fresh=1：剛做完交易，馬上在背景重讀。
+  if (root === 'me' && segments[1] === 'overview' && segments.length === 2) {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    sendJson(res, 200, await deps.overview.overview(wallet, { force: url.searchParams.get('fresh') === '1' }), { 'cache-control': 'no-store' });
+    return;
+  }
+
+  if (root === 'me' && segments[1] === 'mixes' && segments.length === 4 && segments[3] === 'cover') {
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    const id = parsePositiveInteger(segments[2] ?? '', 'mixId');
+    if (method !== 'PUT' && method !== 'DELETE') return methodNotAllowed(res, ['PUT', 'DELETE']);
+    await deps.rateLimiter.wallet('plan', wallet);
+    sendJson(res, 200, await deps.userMedia.setMixCover(wallet, id, method === 'PUT' ? await readJsonBody(req) : null)); return;
+  }
+
+  if (root === 'earn' && segments.length === 2 && segments[1] === 'vaults') {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    await deps.rateLimiter.mixPreview(deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
+    sendJson(res, 200, await deps.cashEarn.vaults(), { 'cache-control': 'public, max-age=30' });
+    return;
+  }
+
+  if (root === 'me' && segments[1] === 'earn' && segments.length <= 3) {
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    await deps.rateLimiter.wallet(displayRead(method), wallet);
+    if (segments.length === 2) {
+      if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+      sendJson(res, 200, await deps.cashEarn.account(wallet)); return;
+    }
+    const action = segments[2];
+    if (action === 'deposit' || action === 'withdraw' || action === 'confirm') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      const input = await readJsonBody(req);
+      sendJson(res, 200, action === 'deposit' ? await deps.cashEarn.deposit(wallet, input)
+        : action === 'withdraw' ? await deps.cashEarn.withdraw(wallet, input) : await deps.cashEarn.confirm(wallet, input));
+      return;
+    }
+  }
+
+  if (root === 'me' && segments[1] === 'mixes' && segments.length >= 2 && segments.length <= 4) {
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    if (segments.length === 2) {
+      if (method === 'GET') { await deps.rateLimiter.wallet('read', wallet); sendJson(res, 200, await deps.mixes.list(wallet)); return; }
+      if (method === 'POST') {
+        sendJson(res, 201, await deps.mixes.create(await readJsonBody(req), wallet, req.headers['idempotency-key'],
+          () => deps.rateLimiter.mixCreate(wallet, deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for'])))); return;
+      }
+      return methodNotAllowed(res, ['GET', 'POST']);
+    }
+    const id = parsePositiveInteger(segments[2] ?? '', 'mixId');
+    await deps.rateLimiter.wallet(segments.length === 3 ? displayRead(method) : 'plan', wallet);
+    if (segments.length === 3) {
+      if (method === 'GET') { sendJson(res, 200, await deps.mixes.get(id, wallet)); return; }
+      if (method === 'PATCH') {
+        const body = await readJsonBody(req);
+        if (typeof body === 'object' && body !== null && 'assets' in body) await deps.rateLimiter.mixCreate(wallet, deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
+        const patched = await deps.mixes.patch(id, wallet, body); await ownerActedOnMix(deps, id, wallet); sendJson(res, 200, patched); return;
+      }
+      return methodNotAllowed(res, ['GET', 'PATCH']);
+    }
+    if (['restart', 'confirm', 'enrollment-params', 'delete'].includes(segments[3] ?? '')) {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      const result = segments[3] === 'restart' ? await deps.mixes.restart(id, wallet) : segments[3] === 'delete' ? await deps.mixes.remove(id, wallet)
+        : segments[3] === 'confirm' ? await deps.mixes.confirm(id, wallet, await readJsonBody(req)) : await deps.mixes.prepare(id, wallet);
+      sendJson(res, 200, result); return;
+    }
+  }
+  if (root === 'mixes' && segments[1] === 'shared' && segments.length === 3) {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    await deps.rateLimiter.mixPreview(deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
+    sendJson(res, 200, await deps.mixes.shared(segments[2] ?? '')); return;
+  }
+
+  if (root === 'mixes' && segments.length === 2 && segments[1] === 'assets') {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    sendJson(res, 200, deps.mixAssets(), { 'cache-control': 'public, max-age=300' });
+    return;
+  }
+
+  if (root === 'mixes' && segments.length === 2 && segments[1] === 'preview') {
+    if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+    await deps.rateLimiter.mixPreview(deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
+    // Account-free. A session, when one is sent, only matters to the chain-97 market-hours bypass list (see createMixPreview).
+    const session = req.headers.authorization;
+    sendJson(res, 200, await deps.mixPreview(await readJsonBody(req), session === undefined ? undefined : () => deps.auth.authenticate(session)));
+    return;
+  }
+
+  if (root === 'info' && segments.length === 2 && ['events', 'markets'].includes(segments[1] ?? '')) {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    if (segments[1] === 'markets') { sendJson(res, 200, await deps.info.markets()); return; }
+    const filters = parseInfoFilters(url.searchParams);
+    if (filters.includeCollected) {
+      const wallet = await deps.auth.authenticate(req.headers.authorization);
+      const wallets = deps.operatorWallets ?? resolveOperatorWallets();
+      if (!wallets.some(allowed => allowed.toLowerCase() === wallet.toLowerCase())) throw new AppError(403, 'OPERATOR_FORBIDDEN', 'wallet is not authorized to review information');
+    }
+    sendJson(res, 200, await deps.info.events(filters));
+    return;
+  }
+
+  // Strategy earn (backend#199): per-portfolio borrow-into-vault; separate from wallet cash and Cash Earn.
+  if (root === 'strategy-earn' && segments.length === 2 && segments[1] === 'markets') {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    await deps.rateLimiter.mixPreview(deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
+    sendJson(res, 200, await deps.strategyEarn.markets(), { 'cache-control': 'public, max-age=60' });
+    return;
+  }
+  if (root === 'portfolios' && segments[2] === 'strategy-earn' && (segments.length === 3 || segments.length === 4)) {
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    await deps.rateLimiter.wallet(displayRead(method), wallet);
+    const id = parsePositiveInteger(segments[1] ?? '', 'portfolioId');
+    if (segments.length === 3) {
+      if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+      sendJson(res, 200, await deps.strategyEarn.portfolio(id, wallet)); return;
+    }
+    if (segments[3] === 'open' || segments[3] === 'close' || segments[3] === 'auto' || segments[3] === 'confirm' || segments[3] === 'rescue') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      const input = await readJsonBody(req);
+      sendJson(res, 200, segments[3] === 'open' ? await deps.strategyEarn.open(id, wallet, input)
+        : segments[3] === 'auto' ? await deps.strategyEarn.auto(id, wallet, input)
+        : segments[3] === 'confirm' ? await deps.strategyEarn.confirm(id, wallet, input)
+        : segments[3] === 'rescue' ? await deps.strategyEarn.rescue(id, wallet, input) : await deps.strategyEarn.close(id, wallet, input));
+      return;
+    }
+    // backend#204: activity from the verified ledger (db 0063), newest first.
+    if (segments[3] === 'activity') {
+      if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+      sendJson(res, 200, await deps.strategyEarn.activity(id, wallet)); return;
+    }
+    // Reward tokens (LISTA / XVS, db 0068): the owner's weekly signature for Lista's proof API. 404 while the feature is off.
+    if (segments[3] === 'rewards') {
+      if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+      sendJson(res, 200, await deps.strategyEarn.rewards(id, wallet)); return;
+    }
+    if (segments[3] === 'reward-signature') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      sendJson(res, 200, await deps.strategyEarn.rewardSignature(id, wallet, await readJsonBody(req))); return;
+    }
+  }
+
+  // DCA of every portfolio of the signed-in owner in one request: `portfolios[<id>]` = the body of GET /portfolios/<id>/dca.
+  if (root === 'me' && segments[1] === 'dca' && segments.length === 2) {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    await deps.rateLimiter.wallet('read', wallet);
+    sendJson(res, 200, await deps.dca.list(wallet), { 'cache-control': 'no-store' });
+    return;
+  }
+
+  // DCA (定投, docs/dca.zh-TW.md): the not-yet-invested total sits in a vault owned by the portfolio account.
+  if (root === 'portfolios' && segments[2] === 'dca' && (segments.length === 3 || segments.length === 4)) {
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    await deps.rateLimiter.wallet(segments.length === 3 ? displayRead(method) : 'plan', wallet);
+    const id = parsePositiveInteger(segments[1] ?? '', 'portfolioId');
+    if (segments.length === 3) {
+      if (method === 'GET') { sendJson(res, 200, await deps.dca.get(id, wallet)); return; }
+      if (method !== 'POST') return methodNotAllowed(res, ['GET', 'POST']);
+      sendJson(res, 200, await deps.dca.create(id, wallet, await readJsonBody(req))); return;
+    }
+    const action = segments[3];
+    if (action === 'confirm' || action === 'pause' || action === 'resume' || action === 'withdraw') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      const input = await readJsonBody(req);
+      sendJson(res, 200, action === 'confirm' ? await deps.dca.confirm(id, wallet, input)
+        : action === 'withdraw' ? await deps.dca.withdraw(id, wallet) : await deps.dca.setPaused(id, wallet, action === 'pause'));
+      return;
+    }
+  }
+
+  if(root==='yield'&&segments.length===2&&segments[1]==='markets'){
+    if(method!=='GET')return methodNotAllowed(res,['GET']);
+    const chainId=parsePositiveInteger(url.searchParams.get('chainId')??String(getConfig().chainId),'chainId');
+    sendJson(res,200,await deps.yieldService.markets(chainId));return;
+  }
+  if(root==='portfolios'&&segments.length===4&&segments[2]==='yield'&&['consent','exit','revoke'].includes(segments[3]??'')){
+    if(method!=='POST')return methodNotAllowed(res,['POST']);
+    const wallet=await deps.auth.authenticate(req.headers.authorization);
+    await deps.rateLimiter.wallet('plan',wallet);
+    const id=parsePositiveInteger(segments[1]??'','portfolioId'),input=await readJsonBody(req);
+    const result=segments[3]==='exit'?await deps.yieldService.exit(id,wallet,input):segments[3]==='revoke'?await deps.yieldService.revoke(id,wallet,input):await deps.yieldService.consent(id,wallet,input);
+    sendJson(res,200,result);return;
+  }
+  if (root === 'portfolios' && segments.length === 3 && ['execution', 'funding-lots', 'buy-funding', 'execution-state'].includes(segments[2] ?? '')) {
+    const action = segments[2];
+    const expected = action === 'execution' ? 'GET' : 'POST';
+    if (method !== expected) return methodNotAllowed(res, [expected]);
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    await deps.rateLimiter.wallet('plan', wallet);
+    const id = parsePositiveInteger(segments[1] ?? '', 'portfolioId');
+    if (action === 'execution') {
+      const execution=await deps.portfolioStrategies.read(id,wallet);
+      const lending=await deps.yieldService.status(id,wallet);
+      sendJson(res,200,lending===null?execution:{...execution,yield:lending});
+    } else {
+      const input = await readJsonBody(req);
+      const result = action === 'funding-lots' ? await deps.portfolioStrategies.funding(id, wallet, input)
+        : action === 'buy-funding' ? await deps.portfolioStrategies.buyFunding(id, wallet, input)
+        : await deps.portfolioStrategies.executionState(id, wallet, input);
+      if (action !== 'execution-state') await ownerActed(deps, id);
+      sendJson(res, 'state' in result && result.state === 'pending' ? 202 : 200, result);
+    }
+    return;
+  }
+
+  // Points administration has no chain write capability and does not require enabling rebalance.
+  // Authorize here before the general operator guard, without changing existing operator routes.
+  if (root === 'operator' && segments[1] === 'points' && segments.length === 3) {
+    const action = segments[2];
+    const expected = action === 'metrics' ? 'GET' : action === 'freeze' || action === 'sync' ? 'POST' : null;
+    if (expected !== null) {
+      if (method !== expected) return methodNotAllowed(res, [expected]);
+      const wallet = await deps.auth.authenticate(req.headers.authorization);
+      const wallets = deps.operatorWallets ?? resolveOperatorWallets();
+      if (!wallets.some((allowed) => allowed.toLowerCase() === wallet.toLowerCase())) throw new AppError(403, 'OPERATOR_FORBIDDEN', 'wallet is not authorized to use operator endpoints');
+      await deps.rateLimiter.wallet('plan', wallet);
+      const result = action === 'freeze' ? await deps.points.freeze(await readJsonBody(req), wallet)
+        : action === 'sync' ? await deps.points.sync() : await deps.points.metrics();
+      sendJson(res, 200, result);
+      return;
+    }
+  }
+
+  if ((root === 'points' && segments.length === 2 && ['me', 'history', 'leaderboard', 'tasks'].includes(segments[1] ?? '')) ||
+    (root === 'invites' && segments.length === 2 && ['me', 'bind'].includes(segments[1] ?? ''))) {
+    const expected = root === 'invites' && segments[1] === 'bind' ? 'POST' : 'GET';
+    if (method !== expected) return methodNotAllowed(res, [expected]);
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    await deps.rateLimiter.wallet('plan', wallet);
+    const params = Object.fromEntries(url.searchParams);
+    const result = root === 'invites' ? segments[1] === 'bind' ? await deps.points.bind(await readJsonBody(req), wallet) : await deps.points.invites(wallet)
+      : segments[1] === 'me' ? await deps.points.balance(wallet)
+      : segments[1] === 'history' ? await deps.points.history(wallet, params)
+      : segments[1] === 'leaderboard' ? await deps.points.leaderboard(params) : deps.points.tasks();
+    sendJson(res, 200, result);
+    return;
+  }
+
+  // 所有 /operator/* 共用同一道授權，不能只靠登入或鏈上的交易限制。
+  // 先驗登入（401），投組 POST 再驗寫入開關（403），最後驗身分；waitlist 只寫名單、不受再平衡開關影響。
+  if (root === 'operator') {
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    if (method === 'POST' && segments[1] === 'portfolios') requireOperatorRebalanceEnabled(deps);
+    const wallets = deps.operatorWallets ?? resolveOperatorWallets();
+    if (!wallets.some((allowed) => allowed.toLowerCase() === wallet.toLowerCase())) {
+      throw new AppError(403, 'OPERATOR_FORBIDDEN', 'wallet is not authorized to use operator endpoints');
+    }
+    if (segments.length === 4 && segments[1] === 'assets' && segments[3] === 'exposure-cap') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      await deps.rateLimiter.wallet('plan', wallet);
+      sendJson(res, 200, await deps.setExposureCap(segments[2] ?? '', await readJsonBody(req)));
+      return;
+    }
+    if (segments.length === 5 && segments[1] === 'info' && segments[2] === 'events' && segments[4] === 'review') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      await deps.rateLimiter.wallet('plan', wallet);
+      sendJson(res, 200, await deps.info.review(segments[3] ?? '', await readJsonBody(req), wallet));
+      return;
+    }
+    if (segments[1] === 'waitlist') {
+      if (segments[2] === 'invites') {
+        if (segments.length === 3) {
+          if (method === 'POST') sendJson(res, 200, await deps.waitlistInvites.issue(await readJsonBody(req), wallet));
+          else if (method === 'GET') sendJson(res, 200, await deps.waitlistInvites.list(url.searchParams));
+          else return methodNotAllowed(res, ['GET', 'POST']);
+          return;
+        }
+        if (segments.length === 4 && segments[3] === 'summary') {
+          if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+          sendJson(res, 200, await deps.waitlistInvites.summary(url.searchParams));
+          return;
+        }
+        if (segments.length === 5 && segments[4] === 'revoke') {
+          if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+          sendJson(res, 200, await deps.waitlistInvites.revoke(segments[3] ?? '', wallet));
+          return;
+        }
+      }
+      if (segments.length === 2) {
+        if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+        sendJson(res, 200, await deps.waitlist.list(url.searchParams));
+        return;
+      }
+      if (segments.length === 4 && (segments[3] === 'approve' || segments[3] === 'revoke')) {
+        if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+        sendJson(res, 200, await deps.waitlist.transition(segments[2] ?? '', segments[3] === 'approve' ? 'approved' : 'revoked', wallet));
+        return;
+      }
+    }
+    if (segments.length === 4 && segments[1] === 'portfolios') {
+      if (method === 'GET' && segments[3] === 'plan') await deps.rateLimiter.wallet('plan', wallet);
+      if (method === 'POST' && segments[3] === 'close') await deps.rateLimiter.wallet('close', wallet);
+    }
+  }
+
+  if (root === 'health' && segments.length === 1) {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    return health(res);
+  }
+
+  if (root === 'faucet' && segments.length === 2 && segments[1] === 'gas') {
+    if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    sendJson(res, 200, await deps.claimFaucetGas(await readJsonBody(req), wallet));
+    return;
+  }
+
+  if (root === 'faucet' && segments.length === 2 && segments[1] === 'usdt') {
+    if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    await deps.rateLimiter.wallet('plan', wallet);
+    const result = await deps.claimFaucetUsdt(await readJsonBody(req), wallet);
+    sendJson(res, result.replayed ? 200 : result.state === 'unknown' ? 202 : result.state === 'failed' ? 502 : 200, result);
+    return;
+  }
+
+  if (root === 'paymaster' && segments.length === 2 && segments[1] === 'sponsor') {
+    if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    // Reuse #59's bounded wallet/minute policy; daily money budgets are durable in 0027.
+    await deps.rateLimiter.wallet('plan', wallet);
+    const result = await deps.sponsorUserOperation(await readJsonBody(req), wallet);
+    sendJson(res, 200, { ...result, paymasterVerificationGasLimit: toHex(result.paymasterVerificationGasLimit),
+      paymasterPostOpGasLimit: toHex(result.paymasterPostOpGasLimit) });
+    return;
+  }
+
+  if (root === 'platform' && segments.length === 2 && segments[1] === 'status') {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    const status = await deps.platformStatus();
+    sendJson(res, status.globalPaused === null ? 503 : 200, status);
+    return;
+  }
+
+  // GET /assets — create fund 的資產選單。要認證：它是「站上可交易的東西」的內部清單，
+    // 公開的 /platform/status 不會公開這份資產清單。
+  if (root === 'assets' && segments.length === 1) {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    const wallet = await deps.auth.authenticate(req.headers.authorization);
+    await deps.rateLimiter.wallet('assets', wallet);
+    sendJson(res, 200, { assets: await deps.listAssets() });
+    return;
+  }
+
+  // Public switch state for the sign-in screen (deploy/waitlist-gate.json): whether X + Google gets in without a code,
+  // and whether the view-only pass is on. POST checks a pass; it grants no session and no waitlist approval.
+  if (root === 'waitlist' && segments.length === 2 && segments[1] === 'gate') {
+    if (method === 'GET') {
+      const gate = waitlistGate();
+      sendJson(res, 200, { openSignup: !gate.inviteRequired, viewPass: gate.accessCodeHash !== null });
+      return;
+    }
+    if (method !== 'POST') return methodNotAllowed(res, ['GET', 'POST']);
+    await deps.rateLimiter.auth(deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
+    const body: unknown = await readJsonBody(req);
+    const code = typeof body === 'object' && body !== null ? (body as { code?: unknown }).code : undefined;
+    if (!viewPassMatches(code)) throw new AppError(404, 'INVITE_INVALID', 'invite code is invalid');
+    sendJson(res, 200, { viewPass: true });
+    return;
+  }
+
+  if (root === 'waitlist' && segments.length === 2 && segments[1] === 'redeem') {
+    if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+    await deps.waitlistInvites.checkIp(deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
+    sendJson(res, 200, await deps.waitlistInvites.redeem(await readJsonBody(req)));
+    return;
+  }
+
+  // Bonus tasks (backend#198): under /waitlist because the cre8.finance worker forwards only /api/auth/* and /api/waitlist/*.
+  if (root === 'waitlist' && segments[1] === 'tasks' && (segments.length === 2 || segments.length === 3)) {
+    await deps.rateLimiter.auth(deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
+    if (segments.length === 2) {
+      if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+      sendJson(res, 200, await deps.waitlistTasks.tasks(req.headers.authorization));
+    } else {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      sendJson(res, 200, await deps.waitlistTasks.complete(req.headers.authorization, segments[2] ?? '', await readJsonBody(req)));
+    }
+    return;
+  }
+
+  if (root === 'waitlist' && segments.length === 2 && (segments[1] === 'join' || segments[1] === 'me')) {
+    await deps.rateLimiter.auth(deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
+    if (segments[1] === 'join') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      sendJson(res, 200, await deps.waitlist.join(await readJsonBody(req)));
+    } else {
+      if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+      sendJson(res, 200, await deps.waitlist.me(req.headers.authorization));
+    }
+    return;
+  }
+
+  if (root === 'auth') {
+    await deps.rateLimiter.auth(deps.rateLimiter.clientIp(req.socket.remoteAddress, req.headers['x-forwarded-for']));
+    if (segments.length === 2 && segments[1] === 'privy') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      sendJson(res, 200, await deps.privyLogin(await readJsonBody(req)));
+      return;
+    }
+    if (segments.length === 2 && segments[1] === 'logout') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      await deps.auth.logout(req.headers.authorization);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    if (segments.length === 2 && segments[1] === 'nonce') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      return nonceRoute(res, deps);
+    }
+    if (segments.length === 2 && segments[1] === 'login') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      return loginRoute(req, res, deps);
+    }
+  }
+
+  if (root === 'strategies') {
+    if(segments.length===2&&segments[1]==='preview-contribution'){
+      if(method!=='POST')return methodNotAllowed(res,['POST']);
+      await deps.rateLimiter.auth(deps.rateLimiter.clientIp(req.socket.remoteAddress,req.headers['x-forwarded-for']));
+      sendJson(res,200,await deps.previewContribution(await readJsonBody(req)));
+      return;
+    }
+    if (segments.length === 1) {
+      if (method === 'GET') return listRoute(res, url, deps);
+      if (method === 'POST') return createRoute(req, res, deps);
+      return methodNotAllowed(res, ['GET', 'POST']);
+    }
+    if (segments.length === 2) {
+      if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+      return detailRoute(res, parsePositiveInteger(segments[1] ?? '', 'strategy id'), deps);
+    }
+    if (segments.length === 4 && segments[2] === 'versions') {
+      if (segments[3] === 'cancel') throw new AppError(404, 'NOT_FOUND', 'route not found');
+      if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+      await deps.auth.authenticate(req.headers.authorization);
+      const version = parsePositiveInteger(segments[3] ?? '', 'version');
+      if (version > 65535) throw new ValidationError('INVALID_ID', 'version must fit uint16');
+      sendJson(res, 200, await deps.strategyVersionState(parsePositiveInteger(segments[1] ?? '', 'strategy id'), version));
+      return;
+    }
+    if (segments.length === 3 && segments[2] === 'versions') {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      return publishVersionRoute(
+        req,
+        res,
+        parsePositiveInteger(segments[1] ?? '', 'strategy id'),
+        deps,
+      );
+    }
+  }
+
+  if (root === 'portfolios') {
+    if (segments.length === 2 && (segments[1] === 'enrollment-params' || segments[1] === 'enrollment-confirm')) {
+      if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+      const wallet = await deps.auth.authenticate(req.headers.authorization);
+      await deps.rateLimiter.wallet(configuredChainId() === 97 ? segments[1] : 'portfolios', wallet);
+      const body = await readJsonBody(req);
+      if (typeof body === 'object' && body !== null && !Array.isArray(body) && 'mixId' in body) {
+        const id = parsePositiveInteger(String(body.mixId), 'mixId');
+        sendJson(res, 200, segments[1] === 'enrollment-confirm' ? await deps.mixes.confirm(id, wallet, { txHash: 'txHash' in body ? body.txHash : undefined }) : await deps.mixes.prepare(id, wallet));
+        return;
+      }
+      if (typeof body !== 'object' || body === null || Array.isArray(body) || !('strategyId' in body)) throw new ValidationError('INVALID_PORTFOLIO', 'strategyId is required');
+      const strategyId = parsePositiveInteger(String(body.strategyId), 'strategyId');
+      sendJson(res, 200, segments[1] === 'enrollment-confirm' ? await deps.enrollPortfolio(strategyId, wallet) : await deps.preparePortfolioEnrollment(strategyId, wallet));
+      return;
+    }
+
+    // `/portfolios` 有 GET（列表）與 POST（enroll）兩個 method，`/portfolios/:id/<action>` 有兩個子路由。
+    // 分派一律先看 segment 數量、再看 method：只看前綴的話 `POST /portfolios/:id/renewal-result` 會被
+    // 「POST /portfolios」吃掉（它也是 POST，只差在路徑長度）。
+    if (segments.length === 1) {
+      if (method === 'GET') return listPortfoliosRoute(req, res, deps);
+      if (method === 'POST') return enrollRoute(req, res, deps);
+      return methodNotAllowed(res, ['GET', 'POST']);
+    }
+    if (segments.length === 3) {
+      const portfolioId = () => parsePositiveInteger(segments[1] ?? '', 'portfolio id');
+      if (segments[2] === 'renewal-params') {
+        if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+        return renewalParamsRoute(req, res, portfolioId(), deps);
+      }
+      if (segments[2] === 'renewal-result') {
+        if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+        return renewalResultRoute(req, res, portfolioId(), deps);
+      }
+      if (segments[2] === 'status') {
+        if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+        return portfolioStatusRoute(req, res, portfolioId(), deps);
+      }
+      if (segments[2] === 'rebalance') {
+        if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+        return operatorRebalanceRoute(req, res, portfolioId(), deps);
+      }
+      if (segments[2] === 'close') {
+        if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+        const closeWallet = await deps.auth.authenticate(req.headers.authorization);
+        await deps.rateLimiter.wallet('close', closeWallet);
+        const closed = await deps.operatorClose(portfolioId(), closeWallet);
+        await ownerActed(deps, portfolioId());
+        sendJson(res, 200, closed);
+        return;
+      }
+      if (segments[2] === 'redeem') {
+        if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+        return redeemRoute(req, res, portfolioId(), deps);
+      }
+      if (segments[2] === 'activity') {
+        if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+        return portfolioActivityRoute(req, res, portfolioId(), deps);
+      }
+      if (segments[2] === 'plan') {
+        if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+        return planPreviewRoute(req, res, portfolioId(), deps);
+      }
+    }
+  }
+
+  // `GET /operator/portfolios/:id/plan` —— 營運端 dry-run 預覽（不送交易、不檢查 owner）。
+  if (root === 'operator' && segments.length === 4 && segments[1] === 'portfolios' && segments[3] === 'plan') {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    const id = Number(segments[2]);
+    if (!Number.isInteger(id) || id <= 0) throw new AppError(400, 'INVALID_ID', 'portfolio id must be a positive integer');
+    sendJson(res, 200, await deps.operatorPlanPreview(id));
+    return;
+  }
+
+  // `POST /operator/portfolios/:id/close` —— 營運端代為清倉（不檢查 owner）。
+  if (root === 'operator' && segments.length === 4 && segments[1] === 'portfolios' && segments[3] === 'close') {
+    if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+    const id = Number(segments[2]);
+    if (!Number.isInteger(id) || id <= 0) throw new AppError(400, 'INVALID_ID', 'portfolio id must be a positive integer');
+    sendJson(res, 200, await deps.operatorForceClose(id));
+    return;
+  }
+
+  // `POST /operator/portfolios/:id/rebalance` —— 營運端手動觸發一輪（不檢查 owner）。
+  if (root === 'operator' && segments.length === 4 && segments[1] === 'portfolios' && segments[3] === 'rebalance') {
+    if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+    const id = Number(segments[2]);
+    if (!Number.isInteger(id) || id <= 0) throw new AppError(400, 'INVALID_ID', 'portfolio id must be a positive integer');
+    sendJson(res, 200, await deps.operatorForceRebalance(id));
+    return;
+  }
+
+  // `GET /operator/activity?limit=50` —— 跨所有投組的操作歷史（誰、哪個策略、成敗）。
+  if (root === 'operator' && segments.length === 2 && segments[1] === 'activity') {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    const rawLimit = url.searchParams.get('limit');
+    const limit = rawLimit === null ? 50 : Number(rawLimit);
+    if (!Number.isFinite(limit) || limit <= 0) {
+      throw new AppError(400, 'INVALID_LIMIT', 'limit must be a positive integer');
+    }
+    sendJson(res, 200, { activity: await deps.operatorActivity(limit) });
+    return;
+  }
+
+  if (root === 'operator' && segments.length === 2 && segments[1] === 'overview') {
+    if (method !== 'GET') return methodNotAllowed(res, ['GET']);
+    sendJson(res, 200, await deps.operatorOverview());
+    return;
+  }
+
+  if (root === 'bundler' && segments.length === 1) {
+    if (method !== 'POST') return methodNotAllowed(res, ['POST']);
+    return bundlerRelayRoute(req, res, deps);
+  }
+
+  sendJson(res, 404, {
+    error: { code: 'NOT_FOUND', message: `no route for ${method} ${url.pathname}` },
+  });
+}
+
+/**
+ * GET /health — 200 when Postgres answers, 503 otherwise. chainId is the configured default chain.
+ *
+ * `alerts` 是排程器的未解決警示計數（見 `alerts.ts` 與 `db/migrations/0013`）。兩個規則決定它的形狀：
+ *   * 有 critical 未解決 → `status: "degraded"`，但 **HTTP 仍是 200**：實例還能服務，只是需要人看。
+ *     把 503 用在這裡會讓負載平衡器把一個能用的實例下線 —— 「該看一下」變成「服務中斷」。
+ *     503 留給它原本的理由：Postgres 掛掉。
+ *   * 讀警示失敗 → `alerts: null`，`status` 不受影響。health 不該因為告警表壞掉而掛，那會讓
+ *     真正的問題（DB 掛掉 vs 警示表掛掉）更難分辨。
+ */
+async function health(res: ServerResponse): Promise<void> {
+  const config = getConfig();
+  let db: 'ok' | 'down' = 'ok';
+  try {
+    await query('select 1');
+  } catch {
+    db = 'down';
+  }
+
+  let alerts: AlertCounts | null = null;
+  try {
+    alerts = alertCounts(await listOpenAlerts(query));
+  } catch {
+    alerts = null;
+  }
+
+  sendJson(res, db === 'ok' ? 200 : 503, {
+    status: healthStatusFor(db, alerts),
+    service: 'cre8-atp-backend',
+    chainId: config.chainId,
+    rpcConfigured: config.rpcUrl !== null,
+    db,
+    uptimeSeconds: Math.round(process.uptime()),
+    alerts,
+  });
+}
+
+/** POST /auth/nonce — mint a single-use nonce plus the EIP-4361 fields the wallet must sign. */
+function nonceRoute(res: ServerResponse, deps: ServerDeps): void {
+  sendJson(res, 200, deps.auth.issueNonce());
+}
+
+/** POST /auth/login — exchange { message, signature } for a bearer session token. */
+async function loginRoute(req: IncomingMessage, res: ServerResponse, deps: ServerDeps): Promise<void> {
+  const credentials = parseLoginBody(await readJsonBody(req));
+  const session = await deps.auth.login(credentials.message, credentials.signature);
+  sendJson(res, 200, session);
+}
+
+/** Model fields are optional for the strategy API, but a failure must be visible in the service log (backend#211). */
+export function modelReturnsFailed(route: 'list' | 'detail', log: (line: string) => void = line => console.error(line)) {
+  return (error: unknown): null => {
+    const reason = error instanceof Error ? `${error.name}: ${error.message}`.slice(0, 300) : typeof error;
+    log(`[model-returns] ${route} unavailable; strategies served without model fields: ${reason}`);
+    return null;
+  };
+}
+
+/** GET /strategies?limit=50&offset=0&provider=0x…&public=true */
+async function listRoute(res: ServerResponse, url: URL, deps: ServerDeps): Promise<void> {
+  const provider = url.searchParams.get('provider')?.trim() ?? '';
+  const page = await listStrategies({
+    limit: parseQueryInteger(url.searchParams.get('limit'), 'limit'),
+    offset: parseQueryInteger(url.searchParams.get('offset'), 'offset'),
+    provider: provider === '' ? undefined : provider,
+    isPublic: parseBoolean(url.searchParams.get('public'), 'public') ?? true,
+  });
+  const records = await Promise.all(page.items.map(item => deps.strategyRecord(item.id).then(dbModelStrategy, () => null)));
+  const models = await deps.modelReturns(records.filter(record => record !== null)).catch(modelReturnsFailed('list'));
+  sendJson(res, 200, { ...page, items: await Promise.all(page.items.map(async (item) => ({ ...item,
+    modelReturns: models?.get(item.id)?.modelReturns ?? null, minDepositUsdtWei: await strategyMinimumDeposit(item.id) }))) });
+}
+
+/** GET /strategies/:id — metadata plus version history (newest first). */
+async function detailRoute(res: ServerResponse, id: number, deps: ServerDeps): Promise<void> {
+  const strategy = await deps.strategyDetail(id);
+  const model = (await deps.modelReturns([strategy]).catch(modelReturnsFailed('detail')))?.get(id) ?? emptyModel();
+  const exposure = await deps.strategyExposure(id, getConfig().chainId, strategy.versions.flatMap(v => v.allocation.assets.map(a => a.address)), { cappedOnly: true });
+  const versions = strategy.versions.map((version) => ({ ...version,
+    allocation: { assets: version.allocation.assets.map(a => {
+      const state = exposure.find(e => e.address === a.address.toLowerCase());
+      return { ...a, buyPaused: state?.buyPaused ?? null, exposureCapUsdtWei: state?.exposureCapUsdtWei ?? null, currentExposureUsdtWei: state?.currentExposureUsdtWei ?? null };
+    }) }, minDepositUsdtWei: version.executionSchemaVersion !== 0 ? typedMinimumDeposit(version) : allocationMinimumDeposit(version.allocation) }));
+  sendJson(res, 200, { ...strategy, ...model, versions, minDepositUsdtWei: versions[0]?.minDepositUsdtWei ?? null });
+}
+
+/**
+ * POST /strategies — create metadata only; versions are published separately.
+ * Requires an operator's bearer token: the provider is the session wallet, and any `provider`
+ * in the body is ignored. Authentication and operator authorization run before reading the body.
+ */
+async function createRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: ServerDeps,
+): Promise<void> {
+  const provider = await deps.auth.authenticate(req.headers.authorization);
+  requireStrategyOperator(provider, deps);
+  await deps.rateLimiter.wallet('strategies', provider);
+  const body = await readJsonBody(req);
+  const strategy = await deps.createStrategy(body, provider);
+  sendJson(res, 201, { ...strategy, minDepositUsdtWei: null }, { location: `/strategies/${strategy.id}` });
+}
+
+/**
+ * POST /strategies/:id/versions — append a version; the created version record is the response.
+ * Requires an operator's bearer token; publishVersion still enforces ownership of the strategy.
+ */
+async function publishVersionRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  id: number,
+  deps: ServerDeps,
+): Promise<void> {
+  const provider = await deps.auth.authenticate(req.headers.authorization);
+  requireStrategyOperator(provider, deps);
+  await deps.rateLimiter.wallet('versions', provider);
+  const body = await readJsonBody(req);
+  // publishVersion expects an object; without this guard a JSON `null` body would be a 500.
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    throw new ValidationError('INVALID_VERSION', 'request body must be a JSON object');
+  }
+  const version = await deps.publishVersion(id, typedVersionInput(body), provider);
+  sendJson(res, 201, { ...version, minDepositUsdtWei: version.executionSchemaVersion !== 0 ? typedMinimumDeposit(version) : allocationMinimumDeposit(version.allocation) });
+}
+
+function requireStrategyOperator(wallet: string, deps: ServerDeps): void {
+  const wallets = deps.operatorWallets ?? resolveOperatorWallets();
+  if (!wallets.some(allowed => allowed.toLowerCase() === wallet.toLowerCase())) {
+    throw new AppError(403, 'OPERATOR_ONLY', 'only operator wallets may create strategies or publish versions');
+  }
+}
+
+/**
+ * POST /portfolios — enroll the authenticated wallet into a strategy (on-chain + DB).
+ * Body is { strategyId }. Requires a bearer token; the wallet is the session wallet.
+ */
+async function enrollRoute(req: IncomingMessage, res: ServerResponse, deps: ServerDeps): Promise<void> {
+  const provider = await deps.auth.authenticate(req.headers.authorization);
+  await deps.rateLimiter.wallet(configuredChainId() === 97 ? 'enrollment-params' : 'portfolios', provider);
+  const body = await readJsonBody(req);
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    throw new ValidationError('INVALID_PORTFOLIO', 'request body must be a JSON object');
+  }
+  if ('mixId' in body) {
+    sendJson(res, 200, await deps.mixes.prepare(parsePositiveInteger(String(body.mixId), 'mixId'), provider));
+    return;
+  }
+  const strategyId = parsePositiveInteger(String((body as Record<string, unknown>).strategyId ?? ''), 'strategyId');
+  if (configuredChainId() === 97) {
+    sendJson(res, 200, await deps.preparePortfolioEnrollment(strategyId, provider));
+    return;
+  }
+  const portfolio = await deps.enrollPortfolio(strategyId, provider);
+  sendJson(res, 201, portfolio, { location: `/portfolios/${portfolio.id}` });
+}
+
+/**
+ * GET /portfolios — 目前登入錢包的 portfolio 列表（含 gas 狀態與現行 session key）。
+ *
+ * 只回 token 對應錢包的列：`authenticate()` 給出的地址就是查詢條件，網址沒有任何「查誰」的參數，
+ * 所以不存在「改一個 query string 就讀到別人的 portfolio」這條路。
+ */
+async function listPortfoliosRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: ServerDeps,
+): Promise<void> {
+  const wallet = await deps.auth.authenticate(req.headers.authorization);
+  sendJson(res, 200, { portfolios: await deps.listPortfolios(wallet) });
+}
+
+/**
+ * GET /portfolios/:id/renewal-params — 派生一把新的 session key，回傳組 UserOp 所需的一切。
+ *
+ * 不簽章、不上鏈、不寫 DB：後端只做瀏覽器做不到的那件事（用 master seed 派生金鑰）。
+ */
+async function renewalParamsRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  id: number,
+  deps: ServerDeps,
+): Promise<void> {
+  const wallet = await deps.auth.authenticate(req.headers.authorization);
+  sendJson(res, 200, await deps.buildRenewalParams(id, wallet));
+}
+
+/**
+ * POST /portfolios/:id/renewal-result — 前端回報續期 UserOp 已上鏈，後端記進 `session_keys`。
+ *
+ * 鏈是權威：這裡只記錄，不驗證 txHash 是否真的上鏈，也不動舊的那一列。
+ */
+async function renewalResultRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  id: number,
+  deps: ServerDeps,
+): Promise<void> {
+  const wallet = await deps.auth.authenticate(req.headers.authorization);
+  const body = await readJsonBody(req);
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    throw new ValidationError('INVALID_RENEWAL', 'request body must be a JSON object');
+  }
+  sendJson(res, 200, await deps.recordRenewalResult(id, wallet, body as Record<string, unknown>));
+}
+
+// ---------------------------------------------------------------------------
+// GET /portfolios/:id/status ＋ POST /portfolios/:id/rebalance
+// ---------------------------------------------------------------------------
+
+/**
+ * `GET /portfolios/:id/status` — 這個 portfolio **現在**的持倉、目標、漂移與 blocked 原因。
+ *
+ * 刻意**不**放進 `GET /portfolios`：那個列表是頁面一進來就會打的，而這裡的每一列都要掃日誌＋
+ * 讀多個池＋定價。塞進去等於讓「看一眼清單」變成一件很貴的事。
+ *
+ * 擁有者檢查在 `portfolioStatus` 裡（`requireOwnedPortfolio`，與 `renewal-params` 同一條），
+ * 而且**在快取之前**：快取以 portfolioId 為 key，先查快取就等於讓別的錢包讀到算好的狀態。
+ */
+/** `GET /portfolios/:id/activity` — 最近幾輪的執行紀錄（含前後快照的漂移與總值）。 */
+async function portfolioActivityRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  id: number,
+  deps: ServerDeps,
+): Promise<void> {
+  const wallet = await deps.auth.authenticate(req.headers.authorization);
+  sendJson(res, 200, { activity: await deps.portfolioActivity(id, wallet) });
+}
+
+async function portfolioStatusRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  id: number,
+  deps: ServerDeps,
+): Promise<void> {
+  const wallet = await deps.auth.authenticate(req.headers.authorization);
+  sendJson(res, 200, await deps.portfolioStatus(id, wallet));
+}
+
+/**
+ * `GET /portfolios/:id/plan` — **dry-run**：這一輪會做什麼、不會做什麼、以及為什麼。
+ *
+ * 唯讀，所以**不**受 `ENABLE_OPERATOR_REBALANCE` 限制：它不寫 operations、不推進 `next_run_at`、
+ * 不送交易。生產環境（開關關著、排程器自己在跑）正是最需要它的情境 ——
+ * 「為什麼我的投組停住了」的答案不該要求先開一個能動錢的開關。
+ *
+ * 慢（實測 2–3 秒，要讀鏈、估價、算 impact），但它回答的正是「現在按下去會怎樣」。
+ */
+async function planPreviewRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  id: number,
+  deps: ServerDeps,
+): Promise<void> {
+  const wallet = await deps.auth.authenticate(req.headers.authorization);
+  await deps.rateLimiter.wallet('plan', wallet);
+  sendJson(res, 200, await deps.planPreview(id, wallet));
+}
+
+/**
+ * `POST /portfolios/:id/rebalance` — 對單一 portfolio 真的跑一次 live 再平衡。
+ *
+ * **這支端點預設停用**：`ENABLE_OPERATOR_REBALANCE` 不等於字面值
+ * `true` 就 403。一個「用 POST 就能讓伺服器動錢」的端點不該預設可用；生產環境可能永遠不該開它
+ * （那裡是排程器自己在跑）。
+ *
+ * 三個檢查的順序是刻意的：
+ *   ① `authenticate()` —— 沒有 token 是 401（與其他寫入路由一致，check 在 body 之前）。
+ *   ② `ENABLE_OPERATOR_REBALANCE` —— 沒開就 403，**在碰 DB 與鏈之前**。這是部署層的事實，
+ *      與「這個 portfolio 是誰的」無關，先講清楚比讓使用者等到擁有者檢查之後才知道便宜得多。
+ *   ③ 擁有者檢查 —— 在 `operatorRebalance` 裡（`requireOwnedPortfolio`）。
+ *
+ * 回應一律 200：`blocked`／`noop` 是**請求被正常處理之後的結果**，不是這支 API 的錯誤。
+ * 只有「沒開」「不是你的」「沒有這個 portfolio」「內部炸掉」才是 4xx/5xx。
+ */
+/**
+ * `POST /portfolios/:id/redeem` —— 把部位**按比例**賣成 numeraire。
+ *
+ * 首批 usd 保留 balance × usd / total；續作 sellUsdE8 是正整數字串（E8），忽略 usd，
+ * 依當下非現金 oracle 名義額重新分配，不保留首批各資產原始待賣量。
+ * remainingUsdE8 有值時可直接帶回 sellUsdE8；0 代表完成，null 代表尚未能規劃、只做對帳或送出結果未知。
+ *
+ * 首批 usd 最低 10 USDT（400 BELOW_MIN_SELL）；10 USDT 以上的部分賣出不套資產間再平衡的 50 USDT 門檻，
+ * 按比例有哪一檔不到 1 USDT 就集中賣其餘幾檔，開著加息時先賣沒抵押的（src/operator.ts allocateSale）。
+ */
+/**
+ * `/redeem` with an `Idempotency-Key`: the same key from the same wallet for the same portfolio and amount runs ONE sale.
+ * A repeat while the first is still running waits for it; a later repeat (10 minutes) gets the first answer again.
+ *
+ * Why: a round with several stocks can outlast the site proxy's 30 s (the browser gets 504 while the sale goes on here).
+ * Unlike `/close`, sending a partial sale again would sell twice; with the key the browser can simply ask again.
+ * Kept in this process (one api instance); a request without the header behaves as before.
+ */
+const REDEEM_REPLAY_TTL_MS = 10 * 60_000;
+const REDEEM_REPLAY_MAX = 2_000;
+const redeemReplays = new Map<string, { at: number; result: Promise<unknown> }>();
+function redeemOnce(key: string | null, run: () => Promise<unknown>): Promise<unknown> {
+  if (key === null) return run();
+  const now = Date.now();
+  for (const [seenKey, entry] of redeemReplays) if (now - entry.at > REDEEM_REPLAY_TTL_MS || redeemReplays.size > REDEEM_REPLAY_MAX) redeemReplays.delete(seenKey);
+  const seen = redeemReplays.get(key);
+  if (seen !== undefined) return seen.result;
+  const result = run();
+  // A failure is replayed too (the sale may have gone out before it threw); the handler below still reports it.
+  result.catch(() => {});
+  redeemReplays.set(key, { at: now, result });
+  return result;
+}
+
+async function redeemRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  id: number,
+  deps: ServerDeps,
+): Promise<void> {
+  const wallet = await deps.auth.authenticate(req.headers.authorization);
+  await deps.rateLimiter.wallet('redeem', wallet);
+  const body = await readJsonBody(req);
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) throw new AppError(400, 'INVALID_AMOUNT', 'body must contain usd or sellUsdE8');
+  const header = req.headers['idempotency-key'];
+  if (header !== undefined && (typeof header !== 'string' || !/^[A-Za-z0-9_.:-]{8,128}$/.test(header))) throw new AppError(400, 'INVALID_IDEMPOTENCY_KEY', 'Idempotency-Key must be 8-128 characters of A-Z a-z 0-9 _ . : -');
+  const replay = (amount: string) => header === undefined ? null : `${wallet.toLowerCase()}|${id}|${header}|${amount}`;
+  if ('sellUsdE8' in body) {
+    const sell: unknown = body.sellUsdE8;
+    if (typeof sell !== 'string' || !/^[0-9]+$/.test(sell) || sell.length > 78 || BigInt(sell) <= 0n || BigInt(sell) >= 2n ** 256n) {
+      throw new AppError(400, 'INVALID_AMOUNT', 'body.sellUsdE8 must be a positive E8 integer string');
+    }
+    const redeemed = await redeemOnce(replay(`sell:${sell}`), () => deps.operatorRedeem(id, wallet, { sellUsdE8: BigInt(sell) }));
+    await ownerActed(deps, id);
+    sendJson(res, 200, redeemed);
+    return;
+  }
+  const usd = (body as { usd?: unknown }).usd;
+  if (typeof usd !== 'number' || !Number.isFinite(usd) || usd <= 0) {
+    throw new AppError(400, 'INVALID_AMOUNT', 'body.usd must be a positive number');
+  }
+  // 8 位小數的整數（與 totalUsdE8 同一個刻度）。
+  const scaled = Math.round(usd * 1e8);
+  if (!Number.isSafeInteger(scaled) || scaled <= 0) throw new AppError(400, 'INVALID_AMOUNT', 'body.usd must fit a positive safe E8 integer');
+  const usdE8 = BigInt(scaled);
+  const redeemed = await redeemOnce(replay(`usd:${usdE8}`), () => deps.operatorRedeem(id, wallet, usdE8));
+  await ownerActed(deps, id);
+  sendJson(res, 200, redeemed);
+}
+
+async function operatorRebalanceRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  id: number,
+  deps: ServerDeps,
+): Promise<void> {
+  const wallet = await deps.auth.authenticate(req.headers.authorization);
+  requireOperatorRebalanceEnabled(deps);
+  sendJson(res, 200, await deps.operatorRebalance(id, wallet));
+}
+
+/** owner 手動再平衡與 /operator/portfolios/* 寫入共用同一個部署開關。 */
+function requireOperatorRebalanceEnabled(deps: ServerDeps): void {
+  const enabled = deps.operatorRebalanceEnabled ?? operatorRebalanceEnabled;
+  if (!enabled()) {
+    throw new AppError(
+      403,
+      'OPERATOR_REBALANCE_DISABLED',
+      `operator rebalance 需要 ${OPERATOR_REBALANCE_ENV}=true 才會啟用（這支端點會用 session key 送出鏈上交易、` +
+        '真的動到投組裡的錢；排程器自己在跑的時候不需要它）。這是部署層的開關，未啟用時這個端點不存在',
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POST /bundler — bundler relay
+// ---------------------------------------------------------------------------
+
+/**
+ * `POST /bundler` — 把前端的 JSON-RPC 原樣轉給 `BUNDLER_URL`，再把上游回應原樣回傳。
+ *
+ * 為什麼需要這支：alto v1.2.5 完全沒有 CORS 支援（`--help` 沒有相關選項，`OPTIONS` 回 404 且不帶任何
+ * `access-control-*`），所以**瀏覽器永遠無法直連 bundler** —— 這不是 dev 問題，生產環境一樣。
+ * 這支 API 已經有 CORS（`applyCors` 在路由之前跑），於是由後端代送。
+ *
+ * 兩件事刻意不做：
+ * 1. **不改寫 JSON-RPC 的錯誤形狀**：前端要靠 bundler 的 `code`／`message`／`data` 原文診斷 AA 錯誤，
+ *    重新包一層等於把唯一有用的線索丟掉。所以回應是「上游的 status 與 bytes」，不走 `sendJson`。
+ * 2. **不轉發白名單外的方法**：檢查在 `fetch` 之前，白名單外的請求連上游都碰不到。
+ */
+async function bundlerRelayRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: ServerDeps,
+): Promise<void> {
+  // token 先驗、body 後讀：順序與其他寫入路由一致（沒 token 又不合法的 body 是 401，不是 400）。
+  await deps.auth.authenticate(req.headers.authorization);
+
+  const raw = await readBodyText(req);
+  let request: unknown;
+  try {
+    request = JSON.parse(raw);
+  } catch {
+    throw new ValidationError('INVALID_JSON', 'request body must be valid JSON');
+  }
+
+  const method = jsonRpcMethod(request);
+  // ← 白名單檢查就在這一行，位置在下面的 `send()` 之前：非白名單的方法沒有機會打到上游。
+  if (!BUNDLER_METHOD_WHITELIST.has(method)) {
+    throw new AppError(
+      403,
+      'BUNDLER_METHOD_NOT_ALLOWED',
+      `bundler method ${JSON.stringify(method)} is not allowed; allowed: ${[...BUNDLER_METHOD_WHITELIST].join(', ')}`,
+    );
+  }
+
+  const upstream = deps.bundlerUrl ?? resolveBundlerUrl();
+  const send = deps.bundlerFetch ?? fetch;
+  let upstreamRes: Response;
+  try {
+    upstreamRes = await send(upstream, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      // 原樣轉發收到的 bytes：重新 stringify 會動到前端送出的內容，模糊掉「誰改了什麼」。
+      body: raw,
+      signal: AbortSignal.timeout(BUNDLER_TIMEOUT_MS),
+    });
+  } catch {
+    throw new AppError(502, 'BUNDLER_UNAVAILABLE', 'bundler unavailable; retry later');
+  }
+
+  const payload = await upstreamRes.text();
+  // The owner's own UserOp (buy transfer, Strategy Earn consent, withdrawal) landed: what this API reads for the request
+  // that follows (confirm, funding lot, rebalance, cash) must not be older than its block (src/rpc-transport.ts).
+  if (method === 'eth_getUserOperationReceipt') noteLandedBlock(userOpReceiptBlock(payload));
+  res.writeHead(upstreamRes.status, {
+    'content-type': upstreamRes.headers.get('content-type') ?? 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(payload),
+    'cache-control': 'no-store',
+  });
+  res.end(payload);
+}
+
+/** The block of a UserOp receipt in a bundler answer, or null (not mined yet, an error, or anything unexpected). */
+export function userOpReceiptBlock(payload: string): string | null {
+  try {
+    const block: unknown = (JSON.parse(payload) as { result?: { receipt?: { blockNumber?: unknown } } | null })?.result?.receipt?.blockNumber;
+    return typeof block === 'string' && /^0x[0-9a-fA-F]{1,16}$/.test(block) ? block : null;
+  } catch { return null; }
+}
+
+/** 取 JSON-RPC 的 `method`；讀不到就回空字串（= 一定不在白名單，回 403 而不是轉發一個殘缺請求）。 */
+function jsonRpcMethod(request: unknown): string {
+  if (typeof request !== 'object' || request === null) return '';
+  const method = (request as { method?: unknown }).method;
+  return typeof method === 'string' ? method : '';
+}
+
+async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+  const raw = await readBodyText(req);
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new ValidationError('INVALID_JSON', 'request body must be valid JSON');
+  }
+}
+
+/** 讀原始 body（有 1 MB 上限）。relay 要的是「bytes 原樣」，不是解析後的物件。 */
+async function readBodyText(req: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
+    size += buffer.length;
+    if (size > MAX_BODY_BYTES) {
+      throw new AppError(413, 'PAYLOAD_TOO_LARGE', `request body exceeds ${MAX_BODY_BYTES} bytes`);
+    }
+    chunks.push(buffer);
+  }
+
+  if (size === 0) {
+    throw new ValidationError('INVALID_JSON', 'request body is required and must be JSON');
+  }
+
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+function parsePositiveInteger(raw: string, name: string): number {
+  if (!/^[1-9]\d*$/.test(raw)) {
+    throw new ValidationError('INVALID_ID', `${name} must be a positive integer`);
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value)) {
+    throw new ValidationError('INVALID_ID', `${name} is out of range`);
+  }
+  return value;
+}
+
+function parseQueryInteger(raw: string | null, name: string): number | undefined {
+  if (raw === null) return undefined;
+  if (!/^-?\d+$/.test(raw)) {
+    throw new ValidationError('INVALID_QUERY', `${name} must be an integer`);
+  }
+  return Number(raw);
+}
+
+function parseBoolean(raw: string | null, name: string): boolean | undefined {
+  if (raw === null) return undefined;
+  if (raw === 'true') return true;
+  if (raw === 'false') return false;
+  throw new ValidationError('INVALID_QUERY', `${name} must be "true" or "false"`);
+}
+
+/**
+ * Which wallet budget a request on a display route uses. The App reads these on every load and after every action
+ * (My mixes, cash Earn, DCA, Strategy Earn): a GET counts against `read` (120/min by default). Everything else on
+ * the same routes stays in `plan` (30/min), which the writes and the paymaster's sponsorship share. Before 2026-11-26
+ * the reads were in `plan` too: 25 portfolios = 26 reads per load, and the 429 that followed also refused the next
+ * sponsorship request.
+ */
+function displayRead(method: string): 'read' | 'plan' {
+  return method === 'GET' ? 'read' : 'plan';
+}
+
+function methodNotAllowed(res: ServerResponse, allowed: string[]): void {
+  sendJson(
+    res,
+    405,
+    { error: { code: 'METHOD_NOT_ALLOWED', message: `method not allowed; use ${allowed.join(', ')}` } },
+    { allow: allowed.join(', ') },
+  );
+}
+
+function sendJson(
+  res: ServerResponse,
+  status: number,
+  body: unknown,
+  headers: Record<string, string> = {},
+): void {
+  const payload = JSON.stringify(body);
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(payload),
+    'cache-control': 'no-store',
+    ...headers,
+  });
+  res.end(payload);
+}
+
+function sendError(res: ServerResponse, err: unknown): void {
+  if (res.headersSent || res.writableEnded) {
+    res.end();
+    return;
+  }
+
+  if (err instanceof RateLimitError) {
+    res.setHeader('retry-after', String(err.retryAfterSeconds));
+    res.setHeader('access-control-expose-headers', 'Retry-After');
+  }
+  if (err instanceof AppError && err.status === 202 && err.code === 'ACCOUNT_DEPLOYMENT_PENDING') {
+    sendJson(res, 202, { accountDeployed: false, retryAfterSeconds: 3, error: { code: err.code, message: err.message } }, { 'retry-after': '3', 'access-control-expose-headers': 'Retry-After' });
+    return;
+  }
+  if (err instanceof AppError) {
+    sendJson(res, err.status, { error: { code: err.code, message: err.message,
+      ...(err instanceof PaymasterRetryTooSoonError ? { retryAt: err.retryAt } : {}) } });
+    return;
+  }
+
+  const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code?: unknown }).code) : '';
+  if (DB_DOWN_CODES.has(code)) {
+    sendJson(res, 503, { error: { code: 'DB_UNAVAILABLE', message: 'database unavailable' } });
+    return;
+  }
+
+  console.error(
+    JSON.stringify({
+      level: 'error',
+      msg: 'unhandled request error',
+      error: 'unexpected dependency or application failure',
+    }),
+  );
+  sendJson(res, 500, { error: { code: 'INTERNAL', message: 'internal server error' } });
+}
+
+/**
+ * The owner acted on a portfolio (buy, sell, edit; withdrawals in the paymaster): a strategy job paused after real
+ * failures runs again (src/strategy-job-recovery.ts). Never fails the owner's request.
+ */
+async function ownerActed(deps: ServerDeps, portfolioId: number): Promise<void> {
+  try { await (deps.resumePausedJobs ?? resumePausedJobsForPortfolio)(portfolioId); } catch { /* the next action or round retries */ }
+}
+async function ownerActedOnMix(deps: ServerDeps, mixId: number, wallet: string): Promise<void> {
+  try { await (deps.resumePausedMixJobs ?? resumePausedJobsForMix)(mixId, wallet); } catch { /* same */ }
+}

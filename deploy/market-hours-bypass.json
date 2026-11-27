@@ -1,7 +1,8 @@
 {
-  "note": "Chain 97 only. Owners whose portfolios ignore the stock-session rule (src/trading-calendar.ts `assetsMarketOpen`): buys, sells, rebalances, DCA and My mix all treat stock tokens as open, so an e2e run does not wait for the NYSE session (the tokens and prices on chain 97 are ours and the keeper keeps the pools fresh around the clock). Everyone else keeps the calendar. `chainId` must be 97: any other value names nobody, and the code never bypasses on another chain whatever this file says. Empty `owners` = the rule applies to everyone. 2026-11-26: the only owner is the e2e harness wallet (the same one as `canaryOwners` in strategy-earn-v2.json).",
+  "note": "Chain 97 only. Owners whose portfolios ignore the stock-session rule (src/trading-calendar.ts `assetsMarketOpen`): buys, sells, rebalances, DCA and My mix all treat stock tokens as open, so an e2e run does not wait for the NYSE session (the tokens and prices on chain 97 are ours and the keeper keeps the pools fresh around the clock). Everyone else keeps the calendar. `chainId` must be 97: any other value names nobody, and the code never bypasses on another chain whatever this file says. Empty `owners` = the rule applies to everyone. 2026-11-26: the e2e harness wallet (the same one as `canaryOwners` in strategy-earn-v2.json). 2026-11-27: plus the team's own app wallet, so the team can sell out of its test portfolios outside the session.",
   "chainId": 97,
   "owners": [
-    "0xD3Ab39B62E221bF9E8bA19fE19b2638767d3D6D9"
+    "0xD3Ab39B62E221bF9E8bA19fE19b2638767d3D6D9",
+    "0xEEa7f54DeDA94d1bCDf448A03C4f6C1F19fED94F"
   ]
 }

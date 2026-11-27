@@ -44,10 +44,10 @@ test('market-hours bypass: a listed test wallet trades stocks while the session 
   const canary='0xD3Ab39B62E221bF9E8bA19fE19b2638767d3D6D9', other='0x00000000000000000000000000000000000000a1';
   const closed=new Date('2026-11-26T16:00:00Z'), open=new Date('2026-11-23T15:00:00Z'), stock=T.assets.NVDAB.token;
   assert.equal(stockMarketOpen(closed),false,'Thanksgiving');
-  // The committed list: exactly the e2e harness wallet, chain 97.
+  // The committed list: the e2e harness wallet and the team's app wallet, chain 97.
   const text=readFileSync(new URL('../deploy/market-hours-bypass.json',import.meta.url),'utf8');
   assert.deepEqual(JSON.parse(text).chainId,97);
-  assert.deepEqual([...parseMarketHoursBypass(text)],[canary.toLowerCase()]);
+  assert.deepEqual([...parseMarketHoursBypass(text)],[canary.toLowerCase(),'0xeea7f54deda94d1bcdf448a03c4f6c1f19fed94f']);
   // Listed owner (any letter case): open. Everyone else, and a caller without an owner: the calendar, unchanged.
   for(const owner of [canary,canary.toLowerCase(),canary.toUpperCase().replace('0X','0x')]){
     assert.equal(assetsMarketOpen(97,[stock],closed,owner),true,owner);

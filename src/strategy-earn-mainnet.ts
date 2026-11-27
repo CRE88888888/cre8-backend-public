@@ -33,6 +33,7 @@ export type Stable = typeof STABLES[number];
 export const TOKENS_56: Record<Stable, string> = { USDT: '0x55d398326f99059ff775485246999027b3197955', USDC: '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d',
   USD1: '0x8d0d000ee44948fc98c9b98a4fa4921476f08b0d', U: '0xce24439f2d9c6a2289f741120fe202248b666666' };
 export const USDT_56 = TOKENS_56.USDT;
+export const WBNB_56 = '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c';
 export const VUSDT_56 = '0xfd5840cd36d94d7229439859c0112a4185bc0255';
 /** Available liquidity under this is shown as capacity-limited. */
 export const LISTA_LIMITED_USD = 50_000;
@@ -172,7 +173,32 @@ export async function readLista(f: Fetcher) {
     if (!eligible) continue;
     if (!supply[token] || cand.apyBps > supply[token]!.apyBps) supply[token] = cand;
   }
-  return { markets: [...bstock, ...general], supply, allVaults };
+  // BNB vault for the display-only slisBNB loop (WBNB): the largest eligible-looking Lista vault on WBNB.
+  let bnbVault: SupplyVault | null = null;
+  for (const v of (vaultList?.data?.list ?? []) as any[]) {
+    if (String(v.asset).toLowerCase() !== WBNB_56 || /exclusive/i.test(String(v.name)) || num(v.depositsUsd) < LISTA_VAULT_MIN_USD) continue;
+    const base = bps(num(v.apy)), inc = bps(num(v.emissionApy ?? 0));
+    const cand = { token: 'BNB' as unknown as Stable, venue: 'lista' as const, name: String(v.name), address: String(v.address).toLowerCase(), apyBps: base + inc, baseBps: base, incentiveBps: inc, tvlUsd: Math.round(num(v.depositsUsd)) };
+    if (!bnbVault || cand.tvlUsd! > bnbVault.tvlUsd!) bnbVault = cand;
+  }
+  return { markets: [...bstock, ...general], supply, allVaults, bnbVault };
+}
+/**
+ * Display only (2026-11-27, team): BNB's Extra Yield route is shown as the slisBNB loop on Lista: BNB is swapped into slisBNB,
+ * slisBNB is posted on the open-term slisBNB/BNB market, BNB is borrowed and put in a Lista BNB vault. Same formula as every
+ * route (carry = vault - borrow, ratio = tier cap), so it reads as paused while the BNB vault pays less than the borrow.
+ * The chain-97 executor does not run it; it only replaces what the app shows for WBNB.
+ */
+export function slisBnbLoopRoute(markets: readonly ListaMarket[], vault: SupplyVault | null): (Route & { via: 'slisBNB' }) | null {
+  if (!vault) return null;
+  const m = markets.filter(x => x.collateral === 'slisBNB' && x.loan === 'BNB' && Number(x.termType ?? 0) === 0 && num(x.liquidityUsd) >= MIN_LIQUIDITY_USD)
+    .sort((a, b) => (num(a.rate) - num(a.borrowEmissionApy ?? 0)) - (num(b.rate) - num(b.borrowEmissionApy ?? 0)))[0];
+  if (!m) return null;
+  const borrowApyBps = bps(num(m.rate)), incentiveBps = bps(num(m.borrowEmissionApy ?? 0)), lltvBps = bps(num(m.lltv)), ratioBps = targetRatioBps('WBNB', lltvBps);
+  const carryBps = vault.apyBps - (borrowApyBps - incentiveBps), liquidityUsd = Math.round(num(m.liquidityUsd));
+  return { protocol: 'lista', venue: 'lista', ratioBps, factorBps: lltvBps, extraBps: Math.trunc(carryBps * ratioBps / 10_000), loan: 'BNB' as unknown as Stable,
+    marketId: String(m.id).toLowerCase(), borrowApyBps, incentiveBps, netBorrowBps: borrowApyBps - incentiveBps, liquidityUsd, lltvBps, limited: liquidityUsd < LISTA_LIMITED_USD,
+    vault, carryBps, collateralIncentiveBps: 0, cross: null, via: 'slisBNB' };
 }
 
 export async function readAave(f: Fetcher, rpc = PUBLIC_RPC_56) {
@@ -284,7 +310,7 @@ export function createMainnetRates(deps: { fetch?: Fetcher; now?: () => number; 
     for (const m of deps.markets ?? []) {
       const input = { symbol: m.symbol, listaMarkets: listaLast?.markets ?? [], venusBorrow: venusLast?.borrow ?? {}, venusCollateral: venusLast?.collateral,
         venusIncentives: venusLast?.incentives, vaults };
-      const r = chooseRoute(input);
+      const r = m.symbol === 'WBNB' ? slisBnbLoopRoute(listaLast?.markets ?? [], listaLast?.bnbVault ?? null) ?? chooseRoute(input) : chooseRoute(input);
       if (r) routes[m.symbol] = r;
       options[m.symbol] = routeOptions(input);
     }
@@ -320,5 +346,6 @@ export function mainnetQuote(r: MainnetRates, _protocol: 'venus' | 'lista', symb
   return { open, reason: open ? null : 'negative_carry', venue: route.venue, borrowBps: route.borrowApyBps, borrowIncentiveBps: route.incentiveBps, vaultBps: route.vault.apyBps,
     vaultIncentiveBps: 0, collateralBps: 0, collateralIncentiveBps, ratioBps, factorBps: route.factorBps, carryBps, extraApyBps: open ? carryBps + collateralIncentiveBps : 0,
     limited: route.limited, loan: route.loan, marketId: route.marketId, liquidityUsd: route.liquidityUsd,
-    vault: { venue: route.vault.venue, name: route.vault.name, token: route.vault.token, address: route.vault.address, apyBps: route.vault.apyBps } };
+    vault: { venue: route.vault.venue, name: route.vault.name, token: route.vault.token, address: route.vault.address, apyBps: route.vault.apyBps },
+    ...('via' in route && route.via ? { via: route.via as string } : {}) };
 }

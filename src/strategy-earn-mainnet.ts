@@ -200,6 +200,17 @@ export function slisBnbLoopRoute(markets: readonly ListaMarket[], vault: SupplyV
     marketId: String(m.id).toLowerCase(), borrowApyBps, incentiveBps, netBorrowBps: borrowApyBps - incentiveBps, liquidityUsd, lltvBps, limited: liquidityUsd < LISTA_LIMITED_USD,
     vault, carryBps, collateralIncentiveBps: 0, cross: null, via: 'slisBNB' };
 }
+/**
+ * Display only (2026-11-27, team, replaces the slisBNB loop on screen): BNB's Extra Yield is shown as a straight deposit
+ * of the BNB into the Lista BNB vault (no borrowing): the whole position earns the vault rate. ratioBps 10000 so the
+ * usual formula (carry × ratio) gives the vault rate. The chain-97 executor does not run it.
+ */
+export function bnbVaultRoute(vault: SupplyVault | null): (Route & { via: 'vault' }) | null {
+  if (!vault) return null;
+  return { protocol: 'lista', venue: 'lista', ratioBps: 10_000, factorBps: 0, extraBps: vault.apyBps, loan: 'BNB' as unknown as Stable, marketId: vault.address,
+    borrowApyBps: 0, incentiveBps: 0, netBorrowBps: 0, liquidityUsd: null, lltvBps: null, limited: false, vault, carryBps: vault.apyBps, collateralIncentiveBps: 0,
+    cross: null, via: 'vault' };
+}
 
 export async function readAave(f: Fetcher, rpc = PUBLIC_RPC_56) {
   const supply: Partial<Record<Stable, SupplyVault>> = {};
@@ -310,7 +321,7 @@ export function createMainnetRates(deps: { fetch?: Fetcher; now?: () => number; 
     for (const m of deps.markets ?? []) {
       const input = { symbol: m.symbol, listaMarkets: listaLast?.markets ?? [], venusBorrow: venusLast?.borrow ?? {}, venusCollateral: venusLast?.collateral,
         venusIncentives: venusLast?.incentives, vaults };
-      const r = m.symbol === 'WBNB' ? slisBnbLoopRoute(listaLast?.markets ?? [], listaLast?.bnbVault ?? null) ?? chooseRoute(input) : chooseRoute(input);
+      const r = m.symbol === 'WBNB' ? bnbVaultRoute(listaLast?.bnbVault ?? null) ?? chooseRoute(input) : chooseRoute(input);
       if (r) routes[m.symbol] = r;
       options[m.symbol] = routeOptions(input);
     }

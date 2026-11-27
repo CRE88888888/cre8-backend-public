@@ -39,6 +39,10 @@ export const LISTA_LIMITED_USD = 50_000;
 export const LISTA_VAULT_MIN_USD = 1_000_000;
 /** Markets with less available than this are not usable at all. */
 export const MIN_LIQUIDITY_USD = 1_000;
+/** Per-asset floor under MIN_LIQUIDITY_USD. BNCB (2026-11-27, team): its only Lista market (BNCB/U) is small, so it is used
+ * from 100 USD available; the route still shows as capacity-limited (`limited`). */
+export const MIN_LIQUIDITY_USD_BY_ASSET: Readonly<Record<string, number>> = { BNCB: 100 };
+export const minLiquidityUsd = (symbol: string) => MIN_LIQUIDITY_USD_BY_ASSET[symbol] ?? MIN_LIQUIDITY_USD;
 /** Venus pausedActionsBitmap bits (ComptrollerInterface Action enum). */
 const VENUS_MINT = 1 << 0, VENUS_BORROW = 1 << 2, VENUS_ENTER_MARKET = 1 << 7;
 /** Strategy tier per asset (cre8-contracts deployments/testnet-97.json `borrow.markets[].tier`) and the contract's tier caps. */
@@ -214,7 +218,7 @@ export function routeOptions(input: RouteInput): RouteOption[] {
     const vault = input.vaults[loan];
     if (!vault) continue;
     const b = input.venusBorrow[loan];
-    if (venusCf && b && (b.liquidityUsd === undefined || b.liquidityUsd >= MIN_LIQUIDITY_USD)) {
+    if (venusCf && b && (b.liquidityUsd === undefined || b.liquidityUsd >= minLiquidityUsd(input.symbol))) {
       const netBorrowBps = b.borrowApyBps - b.incentiveBps, ratioBps = targetRatioBps(input.symbol, venusCf.factorBps), carryBps = vault.apyBps - netBorrowBps;
       const inc = input.venusIncentives?.[input.symbol] ?? 0;
       options.push({ protocol: 'venus', venue: 'venus', ratioBps, factorBps: venusCf.factorBps, extraBps: Math.trunc(carryBps * ratioBps / 10_000) + inc, loan,
@@ -222,7 +226,7 @@ export function routeOptions(input: RouteInput): RouteOption[] {
         limited: b.liquidityUsd !== undefined && b.liquidityUsd < LISTA_LIMITED_USD, vault, carryBps, collateralIncentiveBps: inc,
         ...(venusCf.roomUsd === undefined ? {} : { collateralRoomUsd: venusCf.roomUsd }) });
     }
-    for (const m of input.listaMarkets.filter(x => x.collateral === collateral && x.loan === loan && Number(x.termType ?? 0) === 0 && num(x.liquidityUsd) >= MIN_LIQUIDITY_USD)) {
+    for (const m of input.listaMarkets.filter(x => x.collateral === collateral && x.loan === loan && Number(x.termType ?? 0) === 0 && num(x.liquidityUsd) >= minLiquidityUsd(input.symbol))) {
       const borrowApyBps = bps(num(m.rate)), incentiveBps = bps(num(m.borrowEmissionApy ?? 0)), liquidityUsd = Math.round(num(m.liquidityUsd));
       const lltvBps = bps(num(m.lltv)), ratioBps = targetRatioBps(input.symbol, lltvBps), carryBps = vault.apyBps - (borrowApyBps - incentiveBps);
       options.push({ protocol: 'lista', venue: 'lista', ratioBps, factorBps: lltvBps, extraBps: Math.trunc(carryBps * ratioBps / 10_000), loan, marketId: String(m.id).toLowerCase(),

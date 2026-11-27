@@ -179,3 +179,12 @@ test('activity: route changes come from db 0069 only when a v2 deployment is con
   const on = await createStrategyEarn({ chainId: 97, chain: () => { throw new Error('unused'); }, owned, query, v2 }).activity(3, account);
   assert.deepEqual(on.activity.map(a => [a.kind, a.message, 'messageZh' in a ? a.messageZh : null]), [['migrate', 'Moved QQQB to a better rate', 'QQQB 换到更好的利率'], ['open', 'Earn extra turned on for QQQB: 1 QQQB put to work.', null]]);
 });
+
+test('BNCB: its small Lista market counts from 100 USD available (still limited); other assets keep the 1,000 USD floor', () => {
+  const u: SupplyVault = { token: 'U', venue: 'lista', name: 'Lista U Vault', address: '0xu', apyBps: 214, baseBps: 214, incentiveBps: 0, tvlUsd: 37_000_000 };
+  const small = (collateral: string) => [{ id: '0xb', collateral, loan: 'U', rate: '0.0098', borrowEmissionApy: '0', liquidityUsd: '143', lltv: '0.5' }];
+  const bnc = chooseRoute({ symbol: 'BNCB', listaMarkets: small('BNCB'), venusBorrow: {}, vaults: { U: u } });
+  assert.equal(bnc?.loan, 'U'); assert.equal(bnc?.limited, true); assert.equal(bnc?.ratioBps, 2000);
+  assert.equal(chooseRoute({ symbol: 'BMNRB', listaMarkets: small('BMNRB'), venusBorrow: {}, vaults: { U: u } }), null);
+  assert.equal(chooseRoute({ symbol: 'BNCB', listaMarkets: [{ ...small('BNCB')[0]!, liquidityUsd: '99' }], venusBorrow: {}, vaults: { U: u } }), null);
+});
